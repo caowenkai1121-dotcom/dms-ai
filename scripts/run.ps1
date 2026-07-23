@@ -6,7 +6,7 @@ Start-Process -FilePath ".\target\debug\dms-ai-server.exe" -WorkingDirectory (Ge
 for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Milliseconds 500
     try {
-        $r = Invoke-RestMethod http://127.0.0.1:8100/health -TimeoutSec 2
+        $r = Invoke-RestMethod http://127.0.0.1:8100/api/health -TimeoutSec 2
         Write-Host "health: $($r | ConvertTo-Json -Depth 5)"
         break
     } catch {}

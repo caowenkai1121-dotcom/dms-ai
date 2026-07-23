@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState { mysql, pg });
     let app = Router::new()
-        .route("/health", get(health))
+        .route("/api/health", get(health))
         .with_state(state);
 
     tracing::info!("dms-ai server listening on {}", cfg.listen);

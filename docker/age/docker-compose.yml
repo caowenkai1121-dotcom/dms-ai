@@ -9,7 +9,7 @@ services:
     ports:
       - "15433:5432"
     volumes:
-      - dms_ai_pgdata:/var/lib/postgresql/data
+      - dms_ai_pgdata:/var/lib/postgresql
       - ./init:/docker-entrypoint-initdb.d:ro
 
 volumes:
