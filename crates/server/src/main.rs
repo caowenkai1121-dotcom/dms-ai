@@ -1,67 +1,63 @@
-//! dms-ai 服务端 M0 骨架：配置加载 + 双库连通（MySQL 只读 / PG）+ /health。
+//! dms-ai 服务端：M0 骨架（/api/health）+ M1 权限内核（principal/scope/inject + scope 判官子命令）。
+
+mod db;
+mod inject;
+mod principal;
+mod scope;
 
 use std::sync::Arc;
 
 use axum::{extract::State, routing::get, Json, Router};
-use serde::Deserialize;
-use sqlx::{mysql::MySqlPoolOptions, postgres::PgPoolOptions, MySqlPool, PgPool};
-
-#[derive(Deserialize, Clone)]
-struct Settings {
-    mysql_url: String,
-    pg_url: String,
-    #[serde(default = "default_listen")]
-    listen: String,
-}
-
-fn default_listen() -> String {
-    "127.0.0.1:8100".into()
-}
+use sqlx::{MySqlPool, PgPool};
 
 struct AppState {
     mysql: MySqlPool,
     pg: PgPool,
 }
 
-fn load_settings() -> anyhow::Result<Settings> {
-    // 就近找 settings.json：优先当前目录，其次仓库根（cargo run 时 cwd=仓库根）
-    for p in ["settings.json", "../settings.json", "../../settings.json"] {
-        if let Ok(s) = std::fs::read_to_string(p) {
-            return Ok(serde_json::from_str(&s)?);
-        }
-    }
-    anyhow::bail!("settings.json 未找到（参考 settings.example.json）")
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 日志一律走 stderr：stdout 留给子命令的 JSON 输出（判官脚本要解析）
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let cfg = load_settings()?;
+    let cfg = db::load_settings()?;
 
-    // 🔴 红线：DMS 生产库只读——每个连接建立时把会话设为 READ ONLY，
-    // 任何写语句在 MySQL 层直接报错，代码层再有疏漏也写不进去。
-    let mysql = MySqlPoolOptions::new()
-        .max_connections(10)
-        .after_connect(|conn, _| {
-            Box::pin(async move {
-                use sqlx::Executor;
-                conn.execute("SET SESSION TRANSACTION READ ONLY").await?;
-                Ok(())
+    // 判官子命令：scope <login_name> [role_code] —— 输出权限集合 JSON + t_sales_order 注入示例
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "scope" {
+        let mysql = db::mysql_pool(&cfg.mysql_url).await?;
+        let login = &args[2];
+        let role = args.get(3).map(|s| s.as_str());
+        let p = principal::load_principal(&mysql, login, role).await?;
+        let sets = scope::compute_scope(&mysql, &p).await?;
+        let demo = inject::inject(
+            "SELECT COUNT(*) AS cnt FROM t_sales_order so WHERE so.deleted_flag = 0",
+            &sets,
+        )?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "principal": p,
+                "sets": {
+                    "employee_ids": sets.employee_ids,
+                    "employee_codes": sets.employee_codes,
+                    "customer_codes": sets.customer_codes,
+                    "unrestricted": sets.is_unrestricted(),
+                },
+                "demo_sql": demo,
             })
-        })
-        .connect(&cfg.mysql_url)
-        .await?;
+        );
+        return Ok(());
+    }
 
-    let pg = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&cfg.pg_url)
-        .await?;
+    let mysql = db::mysql_pool(&cfg.mysql_url).await?;
+    let pg = db::pg_pool(&cfg.pg_url).await?;
 
     let state = Arc::new(AppState { mysql, pg });
     let app = Router::new()
@@ -75,7 +71,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    // MySQL：连通 + 只读会话双确认
     let mysql_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(&st.mysql)
         .await
@@ -85,7 +80,6 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
         .await
         .unwrap_or(0)
         == 1;
-    // PG：连通 + 扩展清单
     let pg_exts: Vec<String> = sqlx::query_scalar("SELECT extname FROM pg_extension ORDER BY 1")
         .fetch_all(&st.pg)
         .await
