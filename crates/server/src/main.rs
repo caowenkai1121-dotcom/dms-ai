@@ -63,6 +63,15 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 子命令：review-pending —— 批量复核 pending 语料（SuperSonic MemoryReviewTask）
+    if args.len() >= 2 && args[1] == "review-pending" {
+        let pg = db::pg_pool(&cfg.pg_url).await?;
+        let client = llm_client(&cfg);
+        let n = pipeline::review_all_pending(&client, &pg, 100).await?;
+        println!("复核处理 {n} 条 pending 语料");
+        return Ok(());
+    }
+
     // 子命令：check-sql "<sql>" —— SchemaCorrector 字段校验冒烟
     if args.len() >= 3 && args[1] == "check-sql" {
         let pg = db::pg_pool(&cfg.pg_url).await?;

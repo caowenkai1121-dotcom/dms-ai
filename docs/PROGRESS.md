@@ -162,6 +162,16 @@
 - `chat.rs::last_question`：取会话最近一轮 user 问题（本轮未落库，取到上一轮）。api_ask 按 conv_id 取 prev 传入。
 - **验收**：单测 48/48；连库——同会话「本月销售额」(1.66亿)→追问「那上个月呢」改写成上月销售额(1.81亿, ≠本月)，route=direct-agg。
 
+## M6i SuperSonic 深度移植⑤：记忆复核闭环（2026-07-23，已验收）
+- 移植 SuperSonic MemoryReviewTask：成功问答不再无脑当范例，经 LLM 复核质量把关，判错的剔除不进 few-shot（防错误 SQL 当范例传播）。
+- `meta.sql_exemplar` 加 status（pending/enabled/disabled）；回写时 pending；ask 成功后 `tokio::spawn` 异步 fast LLM 复核（判 SQL 是否正确回答问题→opinion POSITIVE/NEGATIVE）；
+  few-shot 召回 `status != 'disabled'`（剔除判错的）。CLI `review-pending` 批量复核存量（对齐 SuperSonic 定时扫 pending）。
+- **验收**：单测 48/48；批量复核 20 条→17 enabled+3 disabled；被剔除的正是 M6d 修过的坏 SQL（本月销售额按商品分类用'其他/未分类'全归一——旧 LLM 拐错表产物）+活动台账问题 SQL，复核精准。
+
+## SuperSonic 移植累计（5 件）
+SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表(M6g)、多会话 conversation(M5c)、rewriteMultiTurn 追问改写(M6h)、MemoryReviewTask 记忆复核(M6i)。
+待搬(需 embed)：向量召回、语义缓存。待搬(纯逻辑)：聚合函数名归一、默认时间范围、术语/维度注册表。
+
 ## 下一步（M6c/M7）
 - 指标注册表扩充(库存/售后率/毛利等) + 维度注册表；embed 向量召回激活。
 - M7 判官门禁：回归题集 ≥50 例 + 并发 + 安全审计。

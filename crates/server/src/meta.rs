@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS meta.sql_exemplar(
   embedding vector(512),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+-- 复核态（移植 SuperSonic MemoryReviewTask）：pending 未复核 / enabled 复核通过 / disabled 判错剔除
+ALTER TABLE meta.sql_exemplar ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'pending';
 -- 指标注册表（移植 SuperSonic 语义层 MetricResp 最小可用）：指标名→口径单一事实源
 CREATE TABLE IF NOT EXISTS meta.metric(
   metric_code text PRIMARY KEY,

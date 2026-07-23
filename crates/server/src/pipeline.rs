@@ -93,10 +93,10 @@ fn build_system_prompt(p: &Principal, today: &str) -> String {
 }
 
 async fn fewshot_block(pg: &PgPool, question: &str) -> String {
-    // few-shot：trgm 相似历史问答（向量召回 M4 接 embed 后升级）
+    // few-shot：trgm 相似历史问答；复核判错的(disabled)剔除，只用高质量语料
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT question, sql FROM meta.sql_exemplar
-         WHERE question != $1
+         WHERE question != $1 AND status != 'disabled'
          ORDER BY word_similarity($1, question) DESC LIMIT 2",
     )
     .bind(question)
@@ -368,16 +368,26 @@ pub async fn ask(
         let injected = inject::inject(&candidate, &sets)?;
         match execute(mysql, &injected).await {
             Ok((columns, rows)) => {
-                // few-shot 回写：跑通且有结果的问答沉淀为语料（自进化闭环）
+                // few-shot 回写：跑通且有结果的问答沉淀为语料（status=pending 待复核）
                 if !rows.is_empty() {
-                    let _ = sqlx::query(
+                    let inserted = sqlx::query(
                         "INSERT INTO meta.sql_exemplar(question, sql) SELECT $1, $2
                          WHERE NOT EXISTS (SELECT 1 FROM meta.sql_exemplar WHERE question = $1)",
                     )
                     .bind(question)
                     .bind(&candidate)
                     .execute(pg)
-                    .await;
+                    .await
+                    .map(|r| r.rows_affected() > 0)
+                    .unwrap_or(false);
+                    // 记忆复核（移植 SuperSonic MemoryReviewTask）：异步 LLM 复核质量，判错标 disabled 剔除
+                    if inserted {
+                        let (llm2, pg2) = (llm.clone(), pg.clone());
+                        let (q2, sql2) = (question.to_string(), candidate.clone());
+                        tokio::spawn(async move {
+                            review_exemplar(&llm2, &pg2, &q2, &sql2).await;
+                        });
+                    }
                 }
                 let row_count = rows.len();
                 let view = crate::viewspec::build(&columns, &rows);
@@ -400,6 +410,44 @@ pub async fn ask(
         }
     }
     anyhow::bail!("生成失败（自修后仍不可用）")
+}
+
+/// 记忆复核（移植 SuperSonic MemoryReviewTask）：fast LLM 判 SQL 是否正确回答问题。
+/// POSITIVE→enabled（进 few-shot），NEGATIVE→disabled（剔除，不当范例传播）。
+async fn review_exemplar(llm: &LlmClient, pg: &PgPool, question: &str, sql: &str) {
+    let system = "你是资深数据工程师，审核一条 SQL 是否正确回答了给定问题（口径合理、表/字段对、无明显错误）。\
+                  日期过滤是否精确不必挑剔。只输出一行：opinion=POSITIVE 或 opinion=NEGATIVE。";
+    let user = format!("问题：{question}\nSQL：\n{sql}\n审核结论：");
+    let status = match llm.chat(&llm.model_fast, system, &user).await {
+        Ok(r) => {
+            if r.to_uppercase().contains("NEGATIVE") {
+                "disabled"
+            } else {
+                "enabled"
+            }
+        }
+        Err(_) => return, // 复核失败保持 pending，下次再议
+    };
+    let _ = sqlx::query("UPDATE meta.sql_exemplar SET status = $1 WHERE question = $2")
+        .bind(status)
+        .bind(question)
+        .execute(pg)
+        .await;
+}
+
+/// 批量复核 pending 语料（移植 SuperSonic MemoryReviewTask 定时扫 pending）。返回处理条数。
+pub async fn review_all_pending(llm: &LlmClient, pg: &PgPool, limit: i64) -> anyhow::Result<usize> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT question, sql FROM meta.sql_exemplar WHERE status = 'pending' LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pg)
+    .await?;
+    let n = rows.len();
+    for (q, sql) in rows {
+        review_exemplar(llm, pg, &q, &sql).await;
+    }
+    Ok(n)
 }
 
 /// 图关系查询 → AskResult（表格形态）。查询失败/空结果返回 None（回落 LLM）。
