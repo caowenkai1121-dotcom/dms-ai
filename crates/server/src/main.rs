@@ -1,6 +1,7 @@
 //! dms-ai 服务端：M0 骨架（/api/health）+ M1 权限内核（principal/scope/inject + scope 判官子命令）。
 
 mod db;
+mod direct;
 mod inject;
 mod llm;
 mod meta;

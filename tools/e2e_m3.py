@@ -25,11 +25,17 @@ def check(name, cond, detail=""):
     cases.append((name, cond, detail))
     print(f"{'✅' if cond else '❌'} {name}{(' · ' + detail) if detail else ''}")
 
-# 1. 超管全量
+# 1. 超管全量（走确定性快路径 direct-agg）
 r = ask("admin", "本月销售额是多少")
 v_admin = float(r["rows"][0][0]) if r.get("rows") and r["rows"][0][0] else 0
 check("超管本月销售额", v_admin > 1e8, f"值={v_admin:,.0f} route={r.get('route')} {r.get('elapsed_ms')}ms")
+check("走确定性快路径", r.get("route") == "direct-agg", f"route={r.get('route')} 耗时={r.get('elapsed_ms')}ms")
 check("超管 SQL 无权限注入", "customer_code in" not in r.get("sql", "").lower(), "")
+
+# 1b. 单号直查（direct-doc）
+rd = ask("admin", "帮我查下 HJXH-DXO2026072300384")
+check("单号直查出卡", rd.get("route") == "direct-doc" and rd.get("row_count", 0) >= 1,
+      f"route={rd.get('route')} 列={len(rd.get('columns', []))} {rd.get('elapsed_ms')}ms")
 
 # 2. 限权注入 + 值更小 + 越权隔离
 r2 = ask("tanlibo", "本月销售额是多少", "city_manager")

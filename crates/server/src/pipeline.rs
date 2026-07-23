@@ -240,6 +240,26 @@ pub async fn ask(
     let t0 = std::time::Instant::now();
     let sets = scope::compute_scope(mysql, p).await?;
 
+    // 确定性快路径（单号直查/高频聚合）：命中即 0-LLM 秒出，仍走安全校验+权限注入+只读执行
+    if let Some(hit) = crate::direct::try_direct(question) {
+        if is_safe_select(&hit.sql).is_ok() {
+            let injected = inject::inject(&hit.sql, &sets)?;
+            if let Ok((columns, rows)) = execute(mysql, &injected).await {
+                let row_count = rows.len();
+                return Ok(AskResult {
+                    sql: injected,
+                    columns,
+                    truncated: row_count >= MAX_ROWS,
+                    row_count,
+                    rows,
+                    elapsed_ms: t0.elapsed().as_millis(),
+                    route: hit.route,
+                });
+            }
+            // 确定性 SQL 执行失败（列漂移等）→ 静默回落 LLM
+        }
+    }
+
     let mut sql = generate_sql(llm, pg, p, question).await?;
     let mut route = "llm".to_string();
 
