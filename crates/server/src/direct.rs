@@ -81,6 +81,7 @@ fn sales_breakdown(question: &str) -> Option<DirectHit> {
         Some(p) => format!(" AND {}", p.replace("order_time", "o.order_time")),
         None => String::new(),
     };
+    let lim = detect_top_n(question); // "前5/前十"→5/10，默认 50
     let base_where = format!(
         "o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199'){time_and}"
     );
@@ -97,7 +98,7 @@ fn sales_breakdown(question: &str) -> Option<DirectHit> {
              ) dd
              JOIN t_goods g ON g.goods_code = dd.sku_code AND g.deleted_flag = 0
              LEFT JOIN t_goods_category cat ON g.goods_category_code = cat.id
-             GROUP BY COALESCE(cat.category_name,'未分类') ORDER BY `销售额` DESC LIMIT 50"
+             GROUP BY COALESCE(cat.category_name,'未分类') ORDER BY `销售额` DESC LIMIT {lim}"
         ),
         // 以下维度金额用单头 total_amount
         SalesDim::Province => format!(
@@ -105,24 +106,24 @@ fn sales_breakdown(question: &str) -> Option<DirectHit> {
              FROM t_sales_order o
              LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0
              WHERE {base_where}
-             GROUP BY COALESCE(NULLIF(cus.province,''),'未知') ORDER BY `销售额` DESC LIMIT 50"
+             GROUP BY COALESCE(NULLIF(cus.province,''),'未知') ORDER BY `销售额` DESC LIMIT {lim}"
         ),
         SalesDim::Owner => format!(
             "SELECT COALESCE(e.actual_name, o.owner_manager) AS `业务员`, SUM(o.total_amount) AS `销售额`
              FROM t_sales_order o
              LEFT JOIN t_employee e ON e.employee_id = o.owner_manager
              WHERE {base_where}
-             GROUP BY COALESCE(e.actual_name, o.owner_manager) ORDER BY `销售额` DESC LIMIT 50"
+             GROUP BY COALESCE(e.actual_name, o.owner_manager) ORDER BY `销售额` DESC LIMIT {lim}"
         ),
         SalesDim::Customer => format!(
             "SELECT COALESCE(o.customer_name,'未知') AS `客户`, SUM(o.total_amount) AS `销售额`
              FROM t_sales_order o WHERE {base_where}
-             GROUP BY COALESCE(o.customer_name,'未知') ORDER BY `销售额` DESC LIMIT 50"
+             GROUP BY COALESCE(o.customer_name,'未知') ORDER BY `销售额` DESC LIMIT {lim}"
         ),
         SalesDim::Shop => format!(
             "SELECT COALESCE(o.shop_name,'未知') AS `门店`, SUM(o.total_amount) AS `销售额`
              FROM t_sales_order o WHERE {base_where}
-             GROUP BY COALESCE(o.shop_name,'未知') ORDER BY `销售额` DESC LIMIT 50"
+             GROUP BY COALESCE(o.shop_name,'未知') ORDER BY `销售额` DESC LIMIT {lim}"
         ),
         SalesDim::Month => format!(
             "SELECT DATE_FORMAT(o.order_time,'%Y-%m') AS `月份`, SUM(o.total_amount) AS `销售额`
@@ -249,6 +250,40 @@ fn agg_template(question: &str) -> Option<DirectHit> {
     })
 }
 
+/// "前N/topN" → 限制条数（中文数字支持），默认 50
+fn detect_top_n(q: &str) -> usize {
+    const CN: &[(&str, usize)] = &[
+        ("十", 10), ("两", 2), ("一", 1), ("二", 2), ("三", 3), ("四", 4),
+        ("五", 5), ("六", 6), ("七", 7), ("八", 8), ("九", 9),
+    ];
+    // "前N" / "前十"
+    if let Some(pos) = q.find('前') {
+        let after = &q[pos + '前'.len_utf8()..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            if (1..=200).contains(&n) {
+                return n;
+            }
+        }
+        for (cn, v) in CN {
+            if after.starts_with(cn) {
+                return *v;
+            }
+        }
+    }
+    // "topN"
+    let lower = q.to_lowercase();
+    if let Some(pos) = lower.find("top") {
+        let digits: String = lower[pos + 3..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            if (1..=200).contains(&n) {
+                return n;
+            }
+        }
+    }
+    50
+}
+
 /// 时间窗 → 上一期谓词 + 环比标签
 fn prev_window(q: &str) -> Option<(&'static str, &'static str)> {
     if q.contains("今天") || q.contains("今日") {
@@ -336,6 +371,23 @@ mod tests {
     fn agg_needs_time_and_metric() {
         assert!(agg_template("销售额").is_none()); // 无时间窗
         assert!(agg_template("本月天气").is_none()); // 无指标
+    }
+
+    #[test]
+    fn top_n_detect() {
+        assert_eq!(detect_top_n("本月销售额前5的省份"), 5);
+        assert_eq!(detect_top_n("销售额前十的客户"), 10);
+        assert_eq!(detect_top_n("前三名商品分类"), 3);
+        assert_eq!(detect_top_n("销售额top20省份"), 20);
+        assert_eq!(detect_top_n("各省份销售额"), 50); // 无前N默认
+    }
+
+    #[test]
+    fn sales_breakdown_top_n() {
+        let h = sales_breakdown("本月销售额前5的省份").unwrap();
+        assert!(h.sql.contains("LIMIT 5"), "{}", h.sql);
+        let h2 = sales_breakdown("本月销售额按客户").unwrap();
+        assert!(h2.sql.contains("LIMIT 50"), "{}", h2.sql);
     }
 
     #[test]
