@@ -115,9 +115,107 @@ pub async fn schema_check(pg: &PgPool, sql: &str) -> anyhow::Result<Option<Strin
     Ok(Some(hint))
 }
 
+/// GroupByCorrector（移植 SuperSonic）：select 同时含聚合列和裸维度列却漏 GROUP BY 时，
+/// 用裸维度列补上 GROUP BY（MySQL only_full_group_by 下漏 group by 直接报错）。纯 AST，确定性。
+/// 保守门控：单表非复杂 SQL、已有 group by 不动、无聚合或无裸列不动。
+pub fn fix_group_by(sql: &str) -> Option<String> {
+    use sqlparser::ast::{
+        GroupByExpr, Query, Select, SelectItem, SetExpr, Statement,
+    };
+    let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let Statement::Query(q) = &mut stmts[0] else {
+        return None;
+    };
+    // 只处理顶层单 Select（子查询/union 跳过，防误伤）
+    let Query { body, .. } = q.as_mut();
+    let SetExpr::Select(sel) = body.as_mut() else {
+        return None;
+    };
+    let sel: &mut Select = sel.as_mut();
+    // 已有 group by 不动
+    if let GroupByExpr::Expressions(v, _) = &sel.group_by {
+        if !v.is_empty() {
+            return None;
+        }
+    } else {
+        return None; // GROUP BY ALL 等不处理
+    }
+    // 分离聚合项与裸维度项
+    let mut has_agg = false;
+    let mut dims: Vec<sqlparser::ast::Expr> = vec![];
+    for item in &sel.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => Some(e),
+            SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+            _ => return None, // 有 * 通配等，不处理
+        };
+        if let Some(e) = expr {
+            if expr_has_agg(e) {
+                has_agg = true;
+            } else {
+                dims.push(e.clone());
+            }
+        }
+    }
+    // 需同时有聚合和裸维度才补
+    if !has_agg || dims.is_empty() {
+        return None;
+    }
+    sel.group_by = GroupByExpr::Expressions(dims, vec![]);
+    Some(stmts[0].to_string())
+}
+
+/// 表达式是否含聚合函数
+fn expr_has_agg(e: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    const AGG: &[&str] = &["sum", "count", "avg", "max", "min", "group_concat"];
+    match e {
+        Expr::Function(f) => f
+            .name
+            .0
+            .last()
+            .map(|p| AGG.contains(&p.value.to_lowercase().as_str()))
+            .unwrap_or(false),
+        Expr::BinaryOp { left, right, .. } => expr_has_agg(left) || expr_has_agg(right),
+        Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } | Expr::Cast { expr: e, .. } => expr_has_agg(e),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn norm(s: &str) -> String {
+        s.to_lowercase().replace(' ', "")
+    }
+
+    #[test]
+    fn adds_missing_group_by() {
+        // 省份 + SUM(金额) 漏 GROUP BY → 补
+        let out = fix_group_by("SELECT province, SUM(total_amount) FROM t_sales_order").unwrap();
+        assert!(norm(&out).contains("groupbyprovince"), "{out}");
+    }
+
+    #[test]
+    fn keeps_existing_group_by() {
+        assert!(fix_group_by("SELECT province, SUM(x) FROM t GROUP BY province").is_none());
+    }
+
+    #[test]
+    fn pure_aggregate_untouched() {
+        // 纯聚合无维度 → 不补
+        assert!(fix_group_by("SELECT SUM(total_amount) FROM t_sales_order").is_none());
+    }
+
+    #[test]
+    fn no_aggregate_untouched() {
+        // 明细查询无聚合 → 不补
+        assert!(fix_group_by("SELECT a, b FROM t").is_none());
+    }
 
     #[test]
     fn collects_alias_and_cols() {

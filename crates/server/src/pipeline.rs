@@ -304,6 +304,10 @@ pub async fn ask(
             route = "llm+schema-fix".into();
         }
     }
+    // GroupByCorrector（移植 SuperSonic）：漏 GROUP BY 确定性补全（不调 LLM）
+    if let Some(fixed) = crate::corrector::fix_group_by(&sql) {
+        sql = fixed;
+    }
 
     for attempt in 0..2 {
         let candidate = ensure_limit(&sql);
