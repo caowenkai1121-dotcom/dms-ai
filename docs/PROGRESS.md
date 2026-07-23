@@ -19,6 +19,16 @@
 - **验收**：单测 9/9；`tools/judge_scope.py` 判官 6/6 全绿（city_manager/XXJL/STYY01/financial_accounting/provincial_general_manager/admin，Python 按 Java 独立复刻 vs Rust CLI 集合逐一致 + t_sales_order 行级 COUNT 同快照一致）；无角色员工 fail-closed exit=1。
 - 坑：①tracing 必须走 stderr（sqlx 慢查询 WARN 混 stdout 毁 JSON）②现网实时写入使两次 COUNT 差 1——判官改单语句双子查询同快照。
 
+## M2 语义层+检索（2026-07-23，已验收）
+- `meta.rs`：PG `meta` schema（table_doc/column_doc/kw_force/pitfall/sql_exemplar 含 vector(512) 预留）；
+  `meta sync` 采集 MySQL information_schema → 244 表/5488 列（备份表过滤：数字尾/bak_/copy/backups/del_log + 陈旧行清理）；
+  `retrieve` 三路召回 = 关键词强制补表(必入) + word_similarity trgm 排序（中文短问句 similarity 不行，word_similarity 才行）。
+- 资产迁移：旧库 skill_memory **234 条**全量入 meta.pitfall（45 pitfall/142 码表/26 值域/20 列修正/1 路由，tools/migrate_pitfalls.py）；
+  20 表 ⚠️ schema 警告 + 关键词强制补表（含核心域主表保底：销售/订单/客户/商品/员工/门店）。
+- pitfall 触发词形态=「表名.列名」——按**召回表名**匹配（旧设计：trigger 锚到会被检索到的表名上）。
+- **验收**：单测 11/11；六问冒烟主表全命中（余额/销售/买过/市场费用/库存/分类排行），pitfall 召回 2~5 条/问。
+- 坑：①information_schema 文本列被 sqlx 误识 LONGBLOB→全部 CAST AS CHAR（旧项目同款坑复发）；②TABLE_ROWS 是 BIGINT UNSIGNED→CAST AS SIGNED。
+
 ## 下一步
-- M2 语义层+检索（information_schema 采集→PG、指标/维度建模、词典+BM25+向量三路召回、口径规则库迁移）。
-- M1 遗留：绑定注册表迁 PG 元数据（M2 一并）；scope 结果加进程内缓存（当日过期，对齐 Java Redis 缓存策略）。
+- M3 NL2SQL 流水线：LLM→S2SQL→Corrector（吃 pitfall/警告）→Translator→只读执行；确定性模板（单号直查/高频聚合）；parse/execute 两段式 API；embed 服务接入激活向量召回与 few-shot。
+- 遗留：inject 绑定注册表迁 PG；scope 进程内缓存（当日过期）；code_dict 142 条用于结果 CASE 翻译。

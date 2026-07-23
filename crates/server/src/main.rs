@@ -2,6 +2,7 @@
 
 mod db;
 mod inject;
+mod meta;
 mod principal;
 mod scope;
 
@@ -28,8 +29,39 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = db::load_settings()?;
 
-    // 判官子命令：scope <login_name> [role_code] —— 输出权限集合 JSON + t_sales_order 注入示例
     let args: Vec<String> = std::env::args().collect();
+
+    // M2 子命令：meta sync —— 采集 schema 入 PG 并播种警告/强制补表
+    if args.len() >= 3 && args[1] == "meta" && args[2] == "sync" {
+        let mysql = db::mysql_pool(&cfg.mysql_url).await?;
+        let pg = db::pg_pool(&cfg.pg_url).await?;
+        meta::migrate(&pg).await?;
+        let (nt, nc) = meta::sync_schema(&mysql, &pg).await?;
+        meta::seed(&pg).await?;
+        println!("{}", serde_json::json!({ "tables": nt, "columns": nc }));
+        return Ok(());
+    }
+
+    // M2 子命令：retrieve "<问题>" —— 三路召回冒烟
+    if args.len() >= 3 && args[1] == "retrieve" {
+        let pg = db::pg_pool(&cfg.pg_url).await?;
+        let ctxs = meta::retrieve(&pg, &args[2], 6).await?;
+        let table_names: Vec<String> = ctxs.iter().map(|c| c.table_name.clone()).collect();
+        let pitfalls = meta::recall_pitfalls(&pg, &args[2], &table_names, 5).await?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "tables": ctxs.iter().map(|c| serde_json::json!({
+                    "table": c.table_name, "score": c.score, "forced": c.forced,
+                })).collect::<Vec<_>>(),
+                "pitfalls": pitfalls,
+                "schema_chars": ctxs.iter().map(|c| c.schema_text.len()).sum::<usize>(),
+            })
+        );
+        return Ok(());
+    }
+
+    // 判官子命令：scope <login_name> [role_code] —— 输出权限集合 JSON + t_sales_order 注入示例
     if args.len() >= 3 && args[1] == "scope" {
         let mysql = db::mysql_pool(&cfg.mysql_url).await?;
         let login = &args[2];
