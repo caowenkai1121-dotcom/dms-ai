@@ -177,7 +177,13 @@
 - **验收**：单测 48/48；口语化问题「顾客都买了些啥东西」「门店铺货」「钱货两清的单据」向量语义召回相关表(词典召回弱)，无备份表污染。
 - ⚠️ 依赖 embed 服务常驻：`python tools/embed_service.py serve 8077`（掉线熔断降级不报错）。
 
-## SuperSonic 移植累计（7 件）
+## M6l SuperSonic 深度移植⑦：语义缓存（快，2026-07-23，已验收）
+- 移植 SuperSonic 向量召回近义问答思想 + 旧项目护栏：近义历史问答命中即 0-LLM 秒出。
+- `pipeline::try_semantic_cache`（direct 后 generate 前，非追问）：embed 问句→向量找最近义 enabled 语料(embedding<=>query，余弦距离<0.12)→**时间词/数字词护栏全等**(防"上月"命中"本月"、"前5"命中"前10")→复用其 SQL(数据实时查+权限按当轮注入)。
+- 回写 spawn 加存问句向量(query 侧，与查询一致)；embed_service.py build 给存量 enabled 语料补向量。
+- **验收**：单测 50/50(+时间/数字护栏)；连库——「昨天销售订单明细」近义命中 semantic-cache 4s(vs LLM 19s)；负面「上月销售额前五省份」时间词护栏拦住不误命中本月缓存(走 direct-agg)。
+
+## SuperSonic 移植累计（8 件）
 SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表(M6g)、多会话 conversation(M5c)、rewriteMultiTurn 追问改写(M6h)、MemoryReviewTask 记忆复核(M6i)。
 待搬(需 embed)：向量召回、语义缓存。待搬(纯逻辑)：聚合函数名归一、默认时间范围、术语/维度注册表。
 

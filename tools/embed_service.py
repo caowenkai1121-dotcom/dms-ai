@@ -42,6 +42,15 @@ def build():
     cur.execute("DROP INDEX IF EXISTS meta.idx_doc_hnsw")
     cur.execute("CREATE INDEX idx_doc_hnsw ON meta.table_doc USING hnsw (embedding vector_cosine_ops)")
     print(f'完成：{len(rows)} 表向量化 + HNSW 索引', flush=True)
+    # 语料问句向量（供语义缓存召回；问句侧 query embedding，与 Rust 回写一致）
+    cur.execute("SELECT id, question FROM meta.sql_exemplar WHERE status='enabled' AND embedding IS NULL")
+    ex = cur.fetchall()
+    if ex:
+        evecs = embed([r[1] for r in ex], is_query=True)
+        for (eid, _), v in zip(ex, evecs):
+            cur.execute("UPDATE meta.sql_exemplar SET embedding = %s WHERE id = %s",
+                        ('[' + ','.join(f'{x:.6f}' for x in v) + ']', eid))
+        print(f'完成：{len(ex)} 条语料问句向量化', flush=True)
     pg.close()
 
 def serve(port=8077):

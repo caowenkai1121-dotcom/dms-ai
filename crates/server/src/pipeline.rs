@@ -340,6 +340,13 @@ pub async fn ask(
         }
     }
 
+    // 语义缓存（移植 SuperSonic 向量召回近义问答 + 旧项目护栏）：近义历史问答命中即 0-LLM 秒出
+    if prev_question.is_none() && !is_followup(question) {
+        if let Some(r) = try_semantic_cache(pg, mysql, question, &sets, t0).await {
+            return Ok(r);
+        }
+    }
+
     let mut sql = generate_sql(llm, pg, p, question).await?;
     let mut route = "llm".to_string();
 
@@ -380,12 +387,22 @@ pub async fn ask(
                     .await
                     .map(|r| r.rows_affected() > 0)
                     .unwrap_or(false);
-                    // 记忆复核（移植 SuperSonic MemoryReviewTask）：异步 LLM 复核质量，判错标 disabled 剔除
+                    // 异步：记忆复核（质量把关）+ 存问句向量（供语义缓存召回）
                     if inserted {
                         let (llm2, pg2) = (llm.clone(), pg.clone());
                         let (q2, sql2) = (question.to_string(), candidate.clone());
                         tokio::spawn(async move {
                             review_exemplar(&llm2, &pg2, &q2, &sql2).await;
+                            if let Some(v) = crate::embed::embed_query(&q2).await {
+                                let vlit = crate::embed::to_pgvector(&v);
+                                let _ = sqlx::query(
+                                    "UPDATE meta.sql_exemplar SET embedding = $1::vector WHERE question = $2",
+                                )
+                                .bind(&vlit)
+                                .bind(&q2)
+                                .execute(&pg2)
+                                .await;
+                            }
                         });
                     }
                 }
@@ -433,6 +450,80 @@ async fn review_exemplar(llm: &LlmClient, pg: &PgPool, question: &str, sql: &str
         .bind(question)
         .execute(pg)
         .await;
+}
+
+/// 时间词集合（护栏：命中缓存的问题时间词必须与本问全等，"上月"≠"本月"）
+fn time_tokens(q: &str) -> std::collections::BTreeSet<&'static str> {
+    ["今天", "昨天", "前天", "本月", "上月", "上个月", "这个月", "本周", "上周", "今年", "去年", "本季度"]
+        .into_iter()
+        .filter(|t| q.contains(t))
+        .collect()
+}
+
+/// 数字词集合（护栏："前5"≠"前10"）
+fn number_tokens(q: &str) -> std::collections::BTreeSet<String> {
+    let mut set = std::collections::BTreeSet::new();
+    let mut cur = String::new();
+    for c in q.chars() {
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            set.insert(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        set.insert(cur);
+    }
+    set
+}
+
+/// 语义缓存：向量找近义已复核语料，时间/数字词护栏全等则复用其 SQL（0-LLM）。
+async fn try_semantic_cache(
+    pg: &PgPool,
+    mysql: &MySqlPool,
+    question: &str,
+    sets: &ScopeSets,
+    t0: std::time::Instant,
+) -> Option<AskResult> {
+    let vec = crate::embed::embed_query(question).await?;
+    let vlit = crate::embed::to_pgvector(&vec);
+    // 最近义的一条 enabled 语料 + 余弦距离
+    let row = sqlx::query_as::<_, (String, String, f64)>(
+        "SELECT question, sql, (embedding <=> $1::vector) AS dist FROM meta.sql_exemplar
+         WHERE status = 'enabled' AND embedding IS NOT NULL AND question != $2
+         ORDER BY embedding <=> $1::vector LIMIT 1",
+    )
+    .bind(&vlit)
+    .bind(question)
+    .fetch_optional(pg)
+    .await
+    .ok()
+    .flatten()?;
+    let (hit_q, hit_sql, dist) = row;
+    if dist > 0.12 {
+        return None; // 不够近
+    }
+    // 护栏：时间词、数字词集合必须全等（否则语义近似会把上月命中本月）
+    if time_tokens(question) != time_tokens(&hit_q) || number_tokens(question) != number_tokens(&hit_q) {
+        return None;
+    }
+    // 命中：复用 SQL（数据实时查、权限按当轮用户注入）
+    let candidate = ensure_limit(&hit_sql);
+    is_safe_select(&candidate).ok()?;
+    let injected = inject::inject(&candidate, sets).ok()?;
+    let (columns, rows) = execute(mysql, &injected).await.ok()?;
+    let row_count = rows.len();
+    let view = crate::viewspec::build(&columns, &rows);
+    Some(AskResult {
+        sql: injected,
+        columns,
+        truncated: row_count >= MAX_ROWS,
+        row_count,
+        rows,
+        elapsed_ms: t0.elapsed().as_millis(),
+        route: "semantic-cache".into(),
+        view,
+    })
 }
 
 /// 批量复核 pending 语料（移植 SuperSonic MemoryReviewTask 定时扫 pending）。返回处理条数。
@@ -556,5 +647,19 @@ mod tests {
         // 2026-07-23 = epoch day 20657
         let (y, m, d) = civil_from_days(20657);
         assert_eq!((y, m, d), (2026, 7, 23));
+    }
+
+    #[test]
+    fn cache_time_guard() {
+        // 本月 ≠ 上月：护栏必须拦
+        assert_ne!(time_tokens("本月销售额"), time_tokens("上月销售额"));
+        // 同时间词：可命中
+        assert_eq!(time_tokens("本月销售额是多少"), time_tokens("查本月销售额"));
+    }
+
+    #[test]
+    fn cache_number_guard() {
+        assert_ne!(number_tokens("前5的省份"), number_tokens("前10的省份"));
+        assert_eq!(number_tokens("销售额"), number_tokens("营业额")); // 都无数字
     }
 }
