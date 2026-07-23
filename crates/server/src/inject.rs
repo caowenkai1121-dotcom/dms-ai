@@ -286,4 +286,16 @@ mod tests {
         let s = sets(&[1], &[], &[]);
         assert!(inject("DELETE FROM t_sales_order", &s).is_err());
     }
+
+    #[test]
+    fn backtick_table_injected() {
+        // 🔴 M3 e2e 抓获的真实翻车：LLM 生成反引号表名，注入器必须照样命中
+        let s = sets(&[42], &[], &["C9"]);
+        let out = inject(
+            "SELECT SUM(`total_goods_amount`) AS `销售额` FROM `t_sales_order` WHERE `deleted_flag` = 0",
+            &s,
+        )
+        .unwrap();
+        assert!(norm(&out).contains("owner_managerin(42)"), "{out}");
+    }
 }

@@ -9,6 +9,14 @@ pub struct Settings {
     pub pg_url: String,
     #[serde(default = "default_listen")]
     pub listen: String,
+    #[serde(default)]
+    pub llm_base_url: String,
+    #[serde(default)]
+    pub llm_api_key: String,
+    #[serde(default)]
+    pub llm_model_fast: String,
+    #[serde(default)]
+    pub llm_model_precise: String,
 }
 
 fn default_listen() -> String {

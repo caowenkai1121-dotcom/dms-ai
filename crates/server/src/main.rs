@@ -2,18 +2,30 @@
 
 mod db;
 mod inject;
+mod llm;
 mod meta;
+mod pipeline;
 mod principal;
 mod scope;
 
 use std::sync::Arc;
 
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
 use sqlx::{MySqlPool, PgPool};
 
 struct AppState {
     mysql: MySqlPool,
     pg: PgPool,
+    llm: llm::LlmClient,
+}
+
+fn llm_client(cfg: &db::Settings) -> llm::LlmClient {
+    llm::LlmClient::new(&cfg.llm_base_url, &cfg.llm_api_key, &cfg.llm_model_fast, &cfg.llm_model_precise)
 }
 
 #[tokio::main]
@@ -61,6 +73,17 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // M3 子命令：ask <login_name> "<问题>" [role_code] —— 完整问答链
+    if args.len() >= 4 && args[1] == "ask" {
+        let mysql = db::mysql_pool(&cfg.mysql_url).await?;
+        let pg = db::pg_pool(&cfg.pg_url).await?;
+        let client = llm_client(&cfg);
+        let p = principal::load_principal(&mysql, &args[2], args.get(4).map(|s| s.as_str())).await?;
+        let r = pipeline::ask(&client, &mysql, &pg, &p, &args[3]).await?;
+        println!("{}", serde_json::to_string(&r)?);
+        return Ok(());
+    }
+
     // 判官子命令：scope <login_name> [role_code] —— 输出权限集合 JSON + t_sales_order 注入示例
     if args.len() >= 3 && args[1] == "scope" {
         let mysql = db::mysql_pool(&cfg.mysql_url).await?;
@@ -90,16 +113,40 @@ async fn main() -> anyhow::Result<()> {
 
     let mysql = db::mysql_pool(&cfg.mysql_url).await?;
     let pg = db::pg_pool(&cfg.pg_url).await?;
+    meta::migrate(&pg).await?;
 
-    let state = Arc::new(AppState { mysql, pg });
+    let state = Arc::new(AppState { mysql, pg, llm: llm_client(&cfg) });
     let app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/ask", post(api_ask))
         .with_state(state);
 
     tracing::info!("dms-ai server listening on {}", cfg.listen);
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct AskReq {
+    question: String,
+    /// M5 前的临时身份传递；SSO 换签后改从会话取
+    login_name: String,
+    role_code: Option<String>,
+}
+
+async fn api_ask(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<AskReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
+    let p = principal::load_principal(&st.mysql, &req.login_name, req.role_code.as_deref())
+        .await
+        .map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+    let r = pipeline::ask(&st.llm, &st.mysql, &st.pg, &p, &req.question)
+        .await
+        .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    Ok(Json(serde_json::to_value(r).unwrap()))
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {

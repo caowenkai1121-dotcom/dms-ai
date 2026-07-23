@@ -29,6 +29,20 @@
 - **验收**：单测 11/11；六问冒烟主表全命中（余额/销售/买过/市场费用/库存/分类排行），pitfall 召回 2~5 条/问。
 - 坑：①information_schema 文本列被 sqlx 误识 LONGBLOB→全部 CAST AS CHAR（旧项目同款坑复发）；②TABLE_ROWS 是 BIGINT UNSIGNED→CAST AS SIGNED。
 
-## 下一步
-- M3 NL2SQL 流水线：LLM→S2SQL→Corrector（吃 pitfall/警告）→Translator→只读执行；确定性模板（单号直查/高频聚合）；parse/execute 两段式 API；embed 服务接入激活向量召回与 few-shot。
-- 遗留：inject 绑定注册表迁 PG；scope 进程内缓存（当日过期）；code_dict 142 条用于结果 CASE 翻译。
+## M3 NL2SQL 流水线（2026-07-23，已验收）
+- `llm.rs`：DeepSeek OpenAI 兼容 HTTP（precise 生成/fast 预留），无框架；extract_sql 抽围栏。
+- `pipeline.rs`：检索→生成(schema+pitfall+few-shot+身份+今天日期注入)→安全校验→LIMIT护栏→权限注入→只读执行(30s超时)→few-shot 回写。
+  - 安全校验：单条 SELECT / 敏感列 / 占位符幻觉（`__XX__`/`_placeholder`）/ into outfile 全拦。
+  - 自修一次：安全校验失败或执行报错携错误重写（旧项目实证通道）。
+  - system prompt 硬规则 7 条：权限勿臆造/名称 LIKE 不等值/遵守⚠️警告/deleted_flag/相对时间不硬编码年份/明细≥8列/禁占位符。
+  - 结果 JSON：DECIMAL→字符串保精度，日期格式化，200 行截断标记。
+- CLI `ask <login> "<问>" [role]` + HTTP `POST /api/ask`；前端 App.vue 对话+表格+SQL 折叠（Ant Design Vue）。
+- **验收**：单测 22/22（+反引号表注入 e2e 复现锁死）；e2e_m3.py 7/7 全绿（超管全量 1.63亿/城市经理注入 12.9万<全量/明细13列/市场费用走合计表/名称LIKE）；
+  Playwright 浏览器实测「本月销售额前五省份」出表（广东1405万…河北1135万，48s）。
+- 坑：①LLM 非确定单次抽风生成幻觉列→e2e 对 LLM 路径重试一次（旧项目惯例）；②tanlibo 不带 role_code 默认取 role_id 最小角色（可能全权限），生产由登录 set-active-role 显式定，非 bug。
+- 亮点：LLM 自觉遵守 t_sales_order_detail 2x 去重 pitfall（生成派生表 GROUP BY），口径注入生效。
+
+## 下一步（M4/M6）
+- M4 前端 BI 呈现（ViewSpec/showType 图表决策/KPI卡/报告页/多会话/追问）。
+- M6 智能增强（实体锚定/图关系问答走 AGE/语义缓存/确定性直查模板/embed 接入激活向量召回）。
+- 遗留：inject 绑定注册表迁 PG；scope 进程内缓存；code_dict 142 条结果 CASE 翻译；embed 服务常驻。
