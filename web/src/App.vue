@@ -298,6 +298,11 @@ function isMetric(t: Turn, ci: number): boolean {
               <!-- 结论洞察（SuperSonic textSummary） -->
               <div v-if="t.result.view.insight" class="insight">💡 {{ t.result.view.insight }}</div>
 
+              <!-- 空结果友好引导 -->
+              <div v-if="t.result.row_count === 0" class="empty-hint">
+                未找到数据。可能：① 该口径本期无记录　② 数据权限范围内无此数据　③ 换个说法试试（指定时间范围或实体全称）
+              </div>
+
               <template v-for="(b, bi) in t.result.view.blocks" :key="bi">
                 <!-- KPI 卡 -->
                 <div v-if="b.type === 'kpis'" class="kpi-row">
@@ -327,8 +332,8 @@ function isMetric(t: Turn, ci: number): boolean {
                   <BiChart :kind="b.kind!" :columns="t.result.view.columns" :rows="t.result.rows" :x="b.x!" :y="b.y!" :top="b.top" />
                 </div>
 
-                <!-- 表格 -->
-                <div v-else-if="b.type === 'table'" class="tbl-wrap">
+                <!-- 表格（0 行时不渲染空表，由 empty-hint 引导） -->
+                <div v-else-if="b.type === 'table' && t.result.row_count > 0" class="tbl-wrap">
                   <table>
                     <thead>
                       <tr>
@@ -344,8 +349,8 @@ function isMetric(t: Turn, ci: number): boolean {
                 </div>
               </template>
 
-              <!-- 下钻 chips -->
-              <div v-if="t.result.view.interact?.drill?.length" class="drill">
+              <!-- 下钻 chips（有数据才显示） -->
+              <div v-if="t.result.row_count > 0 && t.result.view.interact?.drill?.length" class="drill">
                 <span class="drill-t">换个维度看：</span>
                 <span v-for="d in t.result.view.interact.drill" :key="d" class="pill" @click="drill(d, t.question || turns[ti - 1]?.question || '')">按{{ d }} ↓</span>
               </div>
@@ -415,6 +420,7 @@ function isMetric(t: Turn, ci: number): boolean {
 .res-meta .sql-toggle { margin-left: auto; cursor: pointer; color: var(--primary); }
 .sql { background: var(--bg-main); border: 1px solid var(--divider); border-radius: var(--radius-lg); padding: 10px 12px; overflow-x: auto; margin-bottom: 10px; font-family: var(--font-mono); font-size: 12px; color: var(--text-regular); white-space: pre-wrap; }
 .insight { background: var(--primary-light); border-left: 3px solid var(--primary); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 12px; font-size: 13px; color: var(--text-regular); line-height: 1.6; }
+.empty-hint { background: var(--warning-bg); border-left: 3px solid var(--warning-text); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 12px; font-size: 13px; color: var(--text-regular); line-height: 1.7; }
 /* KPI 卡 */
 .kpi-row { display: flex; gap: 14px; flex-wrap: wrap; margin: 4px 0 12px; }
 .metric-card { flex: 1; min-width: 180px; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 16px 18px; box-shadow: var(--shadow-sm); position: relative; overflow: hidden; }
