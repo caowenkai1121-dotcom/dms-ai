@@ -82,7 +82,13 @@
 - 坑：agtype 类型 sqlx 不识别→外层包 `::text` cast 再解析（string 带引号 unquote、number 裸数字 parse）。
 - **验收**：单测 39/39（+relation_detect/graph esc/unquote）；Playwright 实测「买过烤肠的客户」graph 38ms 单色柱图 TOP20+表格（鸣望 7475万降序）。
 
-## 下一步（M4续/M5/M6c）
-- M4 续：下钻交互(requery 0-LLM)/多会话/追问上下文/报告页。
-- M5 三端打通（DMS SSO 换签+嵌入页；企微应用）。
-- M6c：图关系+行级权限（限权用户也能用图，按 scope.customer_codes 过滤）；实体锚定；语义缓存(接 embed)；graph sync 定时刷新。
+## M4c 下钻交互（2026-07-23，已验收，彻底参考 SuperSonic）
+- 对齐 SuperSonic DrillDownDimensions + onLoadData 参数化重查（recommendedDimensions）。
+- 后端 viewspec.rs `interact.drill`：有指标结果时推断可下钻维度（DIM_POOL=省份/商品分类/业务员/客户/门店/月份，剔除结果已用维度）。
+- 前端 App.vue 结果底部下钻 chips「换个维度看：按X↓」，点击=原问题+"按X"参数化重问（lastQuestion 追踪）。
+- **验收**：单测 39/39；vue-tsc 过；Playwright 下钻链实测——「本月销售额」KPI卡→点「按省份」→31省单色柱图+表格(广东1424万降序)，chips 更新剔除省份。
+- 注：当前下钻走 LLM 重问（务实版）；SuperSonic 是纯 0-LLM 语义层重查——我方无语义层，SQL 改写下钻通用性差，LLM 重问更稳。dateShift 已有 0-LLM(prev_window)。
+
+## 下一步（M5/M6c）
+- M5 三端打通（DMS SSO 换签+嵌入页；企微应用）——走向最终交付形态。
+- M6c：图关系+行级权限；实体锚定；语义缓存(接 embed)；SchemaCorrector(执行前幻觉列拦截)；graph sync 定时刷新。

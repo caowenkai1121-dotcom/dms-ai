@@ -82,10 +82,42 @@ pub struct Kpi {
     pub delta: Option<Delta>,
 }
 
+/// 交互声明（对齐 SuperSonic recommendedDimensions/DrillDownDimensions）：
+/// 可下钻的维度——前端渲染 chips，点击后带"按X"重问（参数化下钻）。
+#[derive(Serialize, Default)]
+pub struct Interact {
+    pub drill: Vec<String>,
+}
+
 #[derive(Serialize)]
 pub struct ViewSpec {
     pub columns: Vec<ColumnSpec>,
     pub blocks: Vec<Block>,
+    #[serde(skip_serializing_if = "drill_empty")]
+    pub interact: Interact,
+}
+
+fn drill_empty(i: &Interact) -> bool {
+    i.drill.is_empty()
+}
+
+/// 常用下钻维度池（对齐主表已知维度）。剔除结果里已出现的维度。
+const DIM_POOL: &[&str] = &["省份", "商品分类", "业务员", "客户", "门店", "月份"];
+
+fn infer_drill(specs: &[ColumnSpec], has_metric: bool) -> Vec<String> {
+    if !has_metric {
+        return vec![]; // 无指标（明细/实体卡）不下钻
+    }
+    let used: String = specs.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join("");
+    DIM_POOL
+        .iter()
+        .filter(|d| {
+            // 该维度关键词未在结果列名出现才建议
+            let key = d.chars().take(2).collect::<String>();
+            !used.contains(&key)
+        })
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// 列名 → 语义
@@ -174,6 +206,13 @@ pub fn patch_kpi_delta(view: &mut ViewSpec, cur: f64, prev: f64, label: String) 
     }
 }
 
+/// 组装 ViewSpec 并推断下钻维度（has_metric 从列 role 判定）
+fn mk(specs: Vec<ColumnSpec>, blocks: Vec<Block>) -> ViewSpec {
+    let has_metric = specs.iter().any(|c| c.role == Role::Metric);
+    let drill = infer_drill(&specs, has_metric);
+    ViewSpec { columns: specs, blocks, interact: Interact { drill } }
+}
+
 /// 决策树（SuperSonic getMsgContentType 对齐 + 增强）
 pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
     let specs: Vec<ColumnSpec> = columns
@@ -204,7 +243,7 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
             })
             .collect();
         blocks.push(Block::Kpis { items });
-        return ViewSpec { columns: specs, blocks };
+        return mk(specs, blocks);
     }
 
     // 2. 单行多列 → 实体卡（单据卡）
@@ -216,7 +255,7 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
             .map(|(i, name)| (name.clone(), rows[0][i].clone()))
             .collect();
         blocks.push(Block::Entity { pairs });
-        return ViewSpec { columns: specs, blocks };
+        return mk(specs, blocks);
     }
 
     // 3. 有时间列 + ≥2 行 + ≥1 指标 → 趋势线图
@@ -228,7 +267,7 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
             top: None,
         });
         blocks.push(Block::Table);
-        return ViewSpec { columns: specs, blocks };
+        return mk(specs, blocks);
     }
 
     // 4. 恰一类别列 + 恰一指标列 → 饼/柱
@@ -244,12 +283,12 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
             blocks.push(Block::Chart { kind: ChartKind::Bar, x, y: vec![y], top });
         }
         blocks.push(Block::Table);
-        return ViewSpec { columns: specs, blocks };
+        return mk(specs, blocks);
     }
 
     // 5. 兜底表格
     blocks.push(Block::Table);
-    ViewSpec { columns: specs, blocks }
+    mk(specs, blocks)
 }
 
 fn cell_f64(v: &Value) -> Option<f64> {

@@ -15,7 +15,8 @@ interface Block {
   y?: number[]
   top?: number | null
 }
-interface ViewSpec { columns: ColSpec[]; blocks: Block[] }
+interface Interact { drill?: string[] }
+interface ViewSpec { columns: ColSpec[]; blocks: Block[]; interact?: Interact }
 interface AskResult {
   sql: string; columns: string[]; rows: unknown[][]; row_count: number
   truncated: boolean; elapsed_ms: number; route: string; view: ViewSpec
@@ -34,9 +35,17 @@ const routeLabel: Record<string, string> = {
 }
 
 const cols = computed(() => result.value?.view.columns ?? [])
+const lastQuestion = ref('')
+
+// 下钻：原问题 + "按X" 参数化重问（对齐 SuperSonic onLoadData 追加维度）
+function drill(dim: string) {
+  question.value = `${lastQuestion.value} 按${dim}`
+  ask()
+}
 
 async function ask() {
   if (!question.value.trim() || loading.value) return
+  lastQuestion.value = question.value
   loading.value = true
   error.value = ''
   result.value = null
@@ -129,6 +138,13 @@ const tableData = computed(() =>
                 size="small" :pagination="{ pageSize: 20, hideOnSinglePage: true }" />
             </a-card>
           </template>
+
+          <!-- 下钻维度 chips（SuperSonic 招牌交互） -->
+          <div v-if="result.view.interact?.drill?.length" style="margin-top: 4px">
+            <span style="color: #888; font-size: 13px; margin-right: 8px">换个维度看：</span>
+            <a-tag v-for="d in result.view.interact.drill" :key="d" color="blue"
+              style="cursor: pointer; user-select: none" @click="drill(d)">按{{ d }} ↓</a-tag>
+          </div>
         </div>
       </a-spin>
     </a-layout-content>
