@@ -156,6 +156,12 @@
 - 前端 App.vue：convs 列表 + curConvId；侧栏列会话(标题+时间+删除, 当前高亮)；新建=建 conv 切过去清空；点击=回放 msgs 重建 turns；send 无会话先建、带 conv_id、成功刷侧栏。归属校验防越权。
 - **验收**：vue-tsc 过；Playwright 实测——同会话内「本月销售额」「今天销售额」两问归**一条会话**(两轮对话)，侧栏一条(标题=首问)；新建→侧栏两条(新会话空+旧会话)、主区回欢迎语、当前高亮；切换回放/删除工作。
 
+## M6h SuperSonic 深度移植④：多轮追问改写（2026-07-23，已验收）
+- 移植 SuperSonic rewriteMultiTurn（NL2SQLParser.rewriteMultiTurn）：短追问结合会话上一轮问题改写成完整独立问题，直击「上下文不理解」。
+- `pipeline.rs`：is_followup(≤14字+追问/指代词 那/再/呢/按/上个/它/该...) → rewrite_followup(fast 模型结合上一轮 question 改写) → 改写后走完整管线。
+- `chat.rs::last_question`：取会话最近一轮 user 问题（本轮未落库，取到上一轮）。api_ask 按 conv_id 取 prev 传入。
+- **验收**：单测 48/48；连库——同会话「本月销售额」(1.66亿)→追问「那上个月呢」改写成上月销售额(1.81亿, ≠本月)，route=direct-agg。
+
 ## 下一步（M6c/M7）
 - 指标注册表扩充(库存/售后率/毛利等) + 维度注册表；embed 向量召回激活。
 - M7 判官门禁：回归题集 ≥50 例 + 并发 + 安全审计。

@@ -250,14 +250,50 @@ fn cell_to_json(row: &sqlx::mysql::MySqlRow, i: usize, ty: &str) -> serde_json::
 }
 
 /// 完整问答链：生成 → 校验 → 注入 → 执行；SQL 报错时携错误自修一次（旧项目实证通道）。
+/// 追问识别：短问句且含追问/指代词，需结合上一轮上下文改写
+fn is_followup(q: &str) -> bool {
+    let n = q.chars().count();
+    if n > 14 {
+        return false;
+    }
+    const MARK: &[&str] = &[
+        "那", "再", "呢", "按", "换", "上个", "下个", "它", "这个", "这张", "该", "此",
+        "前", "后", "同比", "环比", "拆", "分开", "对比", "上月", "下月", "去年",
+    ];
+    MARK.iter().any(|m| q.contains(m))
+}
+
+/// 多轮追问改写（移植 SuperSonic rewriteMultiTurn）：短追问结合上一轮问题改写成完整独立问题。
+async fn rewrite_followup(llm: &LlmClient, question: &str, prev: Option<&str>) -> String {
+    let Some(prev_q) = prev else {
+        return question.to_string();
+    };
+    if !is_followup(question) {
+        return question.to_string();
+    }
+    let system = "你把用户的追问结合上一轮问题改写成一个完整、独立、可单独理解的问题。只输出改写后的问题本身，不要解释、不要引号。若追问已经完整则原样输出。";
+    let user = format!("上一轮问题：{prev_q}\n本轮追问：{question}\n改写为完整问题：");
+    match llm.chat(&llm.model_fast, system, &user).await {
+        Ok(r) => {
+            let rewritten = r.trim().trim_matches('"').trim_matches('。').to_string();
+            if rewritten.is_empty() { question.to_string() } else { rewritten }
+        }
+        Err(_) => question.to_string(),
+    }
+}
+
 pub async fn ask(
     llm: &LlmClient,
     mysql: &MySqlPool,
     pg: &PgPool,
     p: &Principal,
     question: &str,
+    prev_question: Option<&str>,
 ) -> anyhow::Result<AskResult> {
     let t0 = std::time::Instant::now();
+    // 多轮追问改写：把"那上个月呢"结合上一轮改写成"上月销售额"再走管线
+    let rewritten = rewrite_followup(llm, question, prev_question).await;
+    let question: &str = &rewritten;
     let sets = scope::compute_scope_cached(mysql, p).await?;
 
     // 图关系快路径（AGE，0-LLM）：仅全权限用户（图无行级权限，限权回落 LLM 走注入）

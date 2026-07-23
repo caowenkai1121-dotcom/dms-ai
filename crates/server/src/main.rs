@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         let pg = db::pg_pool(&cfg.pg_url).await?;
         let client = llm_client(&cfg);
         let p = principal::load_principal(&mysql, &args[2], args.get(4).map(|s| s.as_str())).await?;
-        let r = pipeline::ask(&client, &mysql, &pg, &p, &args[3]).await?;
+        let r = pipeline::ask(&client, &mysql, &pg, &p, &args[3], None).await?;
         println!("{}", serde_json::to_string(&r)?);
         return Ok(());
     }
@@ -246,7 +246,12 @@ async fn api_ask(
     let p = principal::load_principal(&st.mysql, &login_name, role_code.as_deref())
         .await
         .map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
-    let r = pipeline::ask(&st.llm, &st.mysql, &st.pg, &p, &req.question)
+    // 多轮追问改写用的上一轮问题（同会话）
+    let prev = match req.conv_id {
+        Some(cid) => chat::last_question(&st.pg, cid).await.ok().flatten(),
+        None => None,
+    };
+    let r = pipeline::ask(&st.llm, &st.mysql, &st.pg, &p, &req.question, prev.as_deref())
         .await
         .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let payload = serde_json::to_value(&r).unwrap();

@@ -111,6 +111,16 @@ pub async fn save_msg(
     Ok(())
 }
 
+/// 会话最近一轮用户问题（用于多轮追问改写；本轮 user 尚未落库，取到的是上一轮）
+pub async fn last_question(pg: &PgPool, conv_id: i64) -> anyhow::Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT question FROM chat.msg WHERE conv_id = $1 AND role = 'user' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(conv_id)
+    .fetch_optional(pg)
+    .await?)
+}
+
 pub async fn delete_conv(pg: &PgPool, conv_id: i64, login: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM chat.conv WHERE id = $1 AND login_name = $2")
         .bind(conv_id)
