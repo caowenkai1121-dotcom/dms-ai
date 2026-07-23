@@ -14,7 +14,7 @@ interface Block {
   x?: number; y?: number[]; top?: number | null
 }
 interface Interact { drill?: string[] }
-interface ViewSpec { columns: ColSpec[]; blocks: Block[]; interact?: Interact }
+interface ViewSpec { columns: ColSpec[]; blocks: Block[]; interact?: Interact; insight?: string }
 interface AskResult {
   sql: string; columns: string[]; rows: unknown[][]; row_count: number
   truncated: boolean; elapsed_ms: number; route: string; view: ViewSpec
@@ -279,6 +279,9 @@ function isMetric(t: Turn, ci: number): boolean {
               </div>
               <pre v-if="t.showSql" class="sql">{{ t.result.sql }}</pre>
 
+              <!-- 结论洞察（SuperSonic textSummary） -->
+              <div v-if="t.result.view.insight" class="insight">💡 {{ t.result.view.insight }}</div>
+
               <template v-for="(b, bi) in t.result.view.blocks" :key="bi">
                 <!-- KPI 卡 -->
                 <div v-if="b.type === 'kpis'" class="kpi-row">
@@ -395,6 +398,7 @@ function isMetric(t: Turn, ci: number): boolean {
 .res-meta .route-badge { font-weight: 600; color: var(--primary); background: var(--primary-bg); padding: 1px 8px; border-radius: var(--radius-full); }
 .res-meta .sql-toggle { margin-left: auto; cursor: pointer; color: var(--primary); }
 .sql { background: var(--bg-main); border: 1px solid var(--divider); border-radius: var(--radius-lg); padding: 10px 12px; overflow-x: auto; margin-bottom: 10px; font-family: var(--font-mono); font-size: 12px; color: var(--text-regular); white-space: pre-wrap; }
+.insight { background: var(--primary-light); border-left: 3px solid var(--primary); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 12px; font-size: 13px; color: var(--text-regular); line-height: 1.6; }
 /* KPI 卡 */
 .kpi-row { display: flex; gap: 14px; flex-wrap: wrap; margin: 4px 0 12px; }
 .metric-card { flex: 1; min-width: 180px; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 16px 18px; box-shadow: var(--shadow-sm); position: relative; overflow: hidden; }

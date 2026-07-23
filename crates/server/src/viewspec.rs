@@ -95,6 +95,9 @@ pub struct ViewSpec {
     pub blocks: Vec<Block>,
     #[serde(skip_serializing_if = "drill_empty")]
     pub interact: Interact,
+    /// 结论洞察（移植 SuperSonic textSummary）：排行占比/趋势涨跌一句话解读
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insight: Option<String>,
 }
 
 fn drill_empty(i: &Interact) -> bool {
@@ -208,11 +211,98 @@ pub fn patch_kpi_delta(view: &mut ViewSpec, cur: f64, prev: f64, label: String) 
     }
 }
 
-/// 组装 ViewSpec 并推断下钻维度（has_metric 从列 role 判定）
-fn mk(specs: Vec<ColumnSpec>, blocks: Vec<Block>) -> ViewSpec {
+/// 组装 ViewSpec：推断下钻维度 + 结论洞察（has_metric 从列 role 判定）
+fn mk(specs: Vec<ColumnSpec>, blocks: Vec<Block>, rows: &[Vec<Value>]) -> ViewSpec {
     let has_metric = specs.iter().any(|c| c.role == Role::Metric);
     let drill = infer_drill(&specs, has_metric);
-    ViewSpec { columns: specs, blocks, interact: Interact { drill } }
+    let insight = compute_insight(&specs, rows);
+    ViewSpec { columns: specs, blocks, interact: Interact { drill }, insight }
+}
+
+/// 结论洞察（移植 SuperSonic textSummary）：排行占比+CR3集中度 / 趋势涨跌，确定性 0-LLM。
+fn compute_insight(specs: &[ColumnSpec], rows: &[Vec<Value>]) -> Option<String> {
+    let metric_idx: Vec<usize> = specs.iter().enumerate().filter(|(_, s)| s.role == Role::Metric).map(|(i, _)| i).collect();
+    if metric_idx.len() != 1 {
+        return None;
+    }
+    let mi = metric_idx[0];
+    let cat_i = specs.iter().position(|s| s.role == Role::Category);
+    let time_i = specs.iter().position(|s| s.role == Role::Time);
+    let sem = specs[mi].semantic;
+    let unit = |v: f64| match sem {
+        Semantic::Money => format!("¥{}", compress(v)),
+        Semantic::Percent => format!("{:.1}%", v),
+        _ => compress(v),
+    };
+
+    // 排行（类别+单指标，≥5 行）：榜首占比 + 前三合计占比（CR3）
+    if let Some(ci) = cat_i {
+        if rows.len() >= 5 {
+            let is_geo = matches!(specs[ci].semantic, Semantic::Geo);
+            let mut vals: Vec<(String, f64)> = rows
+                .iter()
+                .filter_map(|r| {
+                    let v = cell_f64(&r[mi])?;
+                    let raw = r.get(ci).map(val_str).unwrap_or_default();
+                    let mut name = if is_geo { province_cn(&raw).map(|s| s.to_string()).unwrap_or(raw) } else { raw };
+                    if name.trim().is_empty() {
+                        name = "未知".to_string();
+                    }
+                    Some((name, v))
+                })
+                .collect();
+            let total: f64 = vals.iter().map(|(_, v)| v).sum();
+            if total > 0.0 && vals.len() >= 3 {
+                vals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top = &vals[0];
+                let cr3: f64 = vals.iter().take(3).map(|(_, v)| v).sum();
+                return Some(format!(
+                    "榜首「{}」{}，占 {:.1}%；前三合计占 {:.1}%（共 {} 项）",
+                    top.0, unit(top.1), top.1 / total * 100.0, cr3 / total * 100.0, vals.len()
+                ));
+            }
+        }
+    }
+    // 趋势（时间+单指标，≥2 行）：首末对比涨跌
+    if let Some(_ti) = time_i {
+        if rows.len() >= 2 {
+            let first = cell_f64(&rows[0][mi])?;
+            let last = cell_f64(&rows[rows.len() - 1][mi])?;
+            if first.abs() > f64::EPSILON {
+                let pct = (last - first) / first * 100.0;
+                let dir = if pct >= 0.0 { "增长" } else { "下降" };
+                return Some(format!(
+                    "从 {} 到 {}，整体{} {:.1}%",
+                    unit(first), unit(last), dir, pct.abs()
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn val_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 省级区划码 → 省名（insight 里 geo 列翻名，与前端 format.ts 一致）
+fn province_cn(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "110000" => "北京", "120000" => "天津", "130000" => "河北", "140000" => "山西",
+        "150000" => "内蒙古", "210000" => "辽宁", "220000" => "吉林", "230000" => "黑龙江",
+        "310000" => "上海", "320000" => "江苏", "330000" => "浙江", "340000" => "安徽",
+        "350000" => "福建", "360000" => "江西", "370000" => "山东", "410000" => "河南",
+        "420000" => "湖北", "430000" => "湖南", "440000" => "广东", "450000" => "广西",
+        "460000" => "海南", "500000" => "重庆", "510000" => "四川", "520000" => "贵州",
+        "530000" => "云南", "540000" => "西藏", "610000" => "陕西", "620000" => "甘肃",
+        "630000" => "青海", "640000" => "宁夏", "650000" => "新疆", "710000" => "台湾",
+        "810000" => "香港", "820000" => "澳门",
+        _ => return None,
+    })
 }
 
 /// 决策树（SuperSonic getMsgContentType 对齐 + 增强）
@@ -246,7 +336,7 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
             })
             .collect();
         blocks.push(Block::Kpis { items });
-        return mk(specs, blocks);
+        return mk(specs, blocks, rows);
     }
 
     // 2. 单行多列 → 实体卡（单据卡）
@@ -258,14 +348,14 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
             .map(|(i, name)| (name.clone(), rows[0][i].clone()))
             .collect();
         blocks.push(Block::Entity { pairs });
-        return mk(specs, blocks);
+        return mk(specs, blocks, rows);
     }
 
     // 3. 明细/多维形态 → 纯表格（对齐 SuperSonic：categoryField>1 或有 id 列 → TABLE）。
     //    防止 200 行订单明细被误画成趋势线（每行不同订单，时间轴无意义）。
     if rows.len() > 1 && (cat_idx.len() > 1 || !id_idx.is_empty()) {
         blocks.push(Block::Table);
-        return mk(specs, blocks);
+        return mk(specs, blocks, rows);
     }
 
     // 4. 有时间列 + ≥2 行 + ≥1 指标 + 类别≤1（趋势序列，非明细）→ 趋势线图
@@ -277,7 +367,7 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
             top: None,
         });
         blocks.push(Block::Table);
-        return mk(specs, blocks);
+        return mk(specs, blocks, rows);
     }
 
     // 4. 恰一类别列 + 恰一指标列 → 饼/柱
@@ -293,12 +383,24 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
             blocks.push(Block::Chart { kind: ChartKind::Bar, x, y: vec![y], top });
         }
         blocks.push(Block::Table);
-        return mk(specs, blocks);
+        return mk(specs, blocks, rows);
     }
 
     // 5. 兜底表格
     blocks.push(Block::Table);
-    mk(specs, blocks)
+    mk(specs, blocks, rows)
+}
+
+/// 万/亿压缩（对齐前端 format.ts：亿2位/万1位）
+fn compress(n: f64) -> String {
+    let abs = n.abs();
+    if abs >= 1e8 {
+        format!("{:.2}亿", n / 1e8)
+    } else if abs >= 1e4 {
+        format!("{:.1}万", n / 1e4)
+    } else {
+        format!("{:.0}", n)
+    }
 }
 
 fn cell_f64(v: &Value) -> Option<f64> {

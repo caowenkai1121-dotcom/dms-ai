@@ -183,7 +183,14 @@
 - 回写 spawn 加存问句向量(query 侧，与查询一致)；embed_service.py build 给存量 enabled 语料补向量。
 - **验收**：单测 50/50(+时间/数字护栏)；连库——「昨天销售订单明细」近义命中 semantic-cache 4s(vs LLM 19s)；负面「上月销售额前五省份」时间词护栏拦住不误命中本月缓存(走 direct-agg)。
 
-## SuperSonic 移植累计（8 件）
+## M6n SuperSonic 深度移植⑧：结论洞察 textSummary（细节丰富，2026-07-23，已验收）
+- 移植 SuperSonic textSummary：排行/趋势结果自动附一句确定性数据解读(0-LLM)。
+- `viewspec::compute_insight`：①排行(类别+单指标≥5行)→榜首占比+CR3集中度(前三合计占%)；②趋势(时间+指标≥2行)→首末涨跌%。geo 列翻省名、空串归"未知"、金额万亿压缩。
+- 前端 App.vue：AI 气泡结论区显示 insight(💡 靛蓝左边框洞察条)。
+- **验收**：单测 50/50；连库+Playwright——排行「榜首未知¥5743.8万占34.5%；前三合计64.5%（共32项）」、趋势「从¥2.25亿到¥1.66亿整体下降26.1%」。
+- 顺带修 sales_breakdown 省份 COALESCE→NULLIF(空串归未知)。
+
+## SuperSonic 移植累计（9 件）
 SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表(M6g)、多会话 conversation(M5c)、rewriteMultiTurn 追问改写(M6h)、MemoryReviewTask 记忆复核(M6i)。
 待搬(需 embed)：向量召回、语义缓存。待搬(纯逻辑)：聚合函数名归一、默认时间范围、术语/维度注册表。
 

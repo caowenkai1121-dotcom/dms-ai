@@ -101,11 +101,11 @@ fn sales_breakdown(question: &str) -> Option<DirectHit> {
         ),
         // 以下维度金额用单头 total_amount
         SalesDim::Province => format!(
-            "SELECT COALESCE(cus.province,'未知') AS `省份`, SUM(o.total_amount) AS `销售额`
+            "SELECT COALESCE(NULLIF(cus.province,''),'未知') AS `省份`, SUM(o.total_amount) AS `销售额`
              FROM t_sales_order o
              LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0
              WHERE {base_where}
-             GROUP BY COALESCE(cus.province,'未知') ORDER BY `销售额` DESC LIMIT 50"
+             GROUP BY COALESCE(NULLIF(cus.province,''),'未知') ORDER BY `销售额` DESC LIMIT 50"
         ),
         SalesDim::Owner => format!(
             "SELECT COALESCE(e.actual_name, o.owner_manager) AS `业务员`, SUM(o.total_amount) AS `销售额`
