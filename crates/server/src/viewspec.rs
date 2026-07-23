@@ -166,8 +166,10 @@ fn is_numeric_col(rows: &[Vec<Value>], i: usize) -> bool {
 /// 列名 + 数据 → role
 fn infer_role(name: &str, rows: &[Vec<Value>], i: usize) -> Role {
     let n = name;
-    // 时间
-    if n.contains("时间") || n.contains("日期") || n.ends_with("date") || n.ends_with("time") {
+    // 时间（趋势线 x 轴）：含时间/日期关键词，或月份/季度/年月等时间维度
+    if n.contains("时间") || n.contains("日期") || n.contains("月份") || n.contains("季度")
+        || n.contains("年月") || n.ends_with("date") || n.ends_with("time")
+    {
         return Role::Time;
     }
     // 编码/单号：名称信号 + 值非纯聚合数字
