@@ -67,10 +67,19 @@ pub enum ChartKind {
 }
 
 #[derive(Serialize)]
+pub struct Delta {
+    pub pct: f64,
+    pub dir: &'static str, // "up" | "down" | "flat"
+    pub label: String,     // "较上月" 等
+}
+
+#[derive(Serialize)]
 pub struct Kpi {
     pub label: String,
     pub value: Value,
     pub semantic: Semantic,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<Delta>,
 }
 
 #[derive(Serialize)]
@@ -146,10 +155,24 @@ fn infer_role(name: &str, rows: &[Vec<Value>], i: usize) -> Role {
     Role::Category
 }
 
-const PIE_MAX: usize = 6;
+const PIE_MAX: usize = 10; // 对齐 SuperSonic 桌面阈值
 const BAR_MAX: usize = 50;
-const BAR_TOP: usize = 18;
+const BAR_TOP: usize = 20; // 对齐 SuperSonic Trend slice(0,20)
 const ENTITY_MIN_COLS: usize = 6;
+
+/// 单指标 KPI 环比补丁：view 首块为单项 Kpis 时，按当前/上期值算 Δ%。
+pub fn patch_kpi_delta(view: &mut ViewSpec, cur: f64, prev: f64, label: String) {
+    if let Some(Block::Kpis { items }) = view.blocks.first_mut() {
+        if items.len() == 1 {
+            if prev.abs() < f64::EPSILON {
+                return; // 上期为 0，环比无意义
+            }
+            let pct = (cur - prev) / prev * 100.0;
+            let dir = if pct > 0.05 { "up" } else if pct < -0.05 { "down" } else { "flat" };
+            items[0].delta = Some(Delta { pct: (pct * 10.0).round() / 10.0, dir, label });
+        }
+    }
+}
 
 /// 决策树（SuperSonic getMsgContentType 对齐 + 增强）
 pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
@@ -177,6 +200,7 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
                 label: specs[i].name.clone(),
                 value: rows[0][i].clone(),
                 semantic: specs[i].semantic,
+                delta: None,
             })
             .collect();
         blocks.push(Block::Kpis { items });
@@ -272,8 +296,8 @@ mod tests {
         let rows: Vec<Vec<Value>> = (0..30).map(|i| vec![json!(format!("省{i}")), json!(i.to_string())]).collect();
         let v = build(&cols(&["省份", "销售额"]), &rows);
         match &v.blocks[0] {
-            Block::Chart { kind: ChartKind::Bar, top: Some(18), .. } => {}
-            b => panic!("expected bar top18, got {}", serde_json::to_string(b).unwrap()),
+            Block::Chart { kind: ChartKind::Bar, top: Some(20), .. } => {}
+            b => panic!("expected bar top20, got {}", serde_json::to_string(b).unwrap()),
         }
     }
 
@@ -311,5 +335,24 @@ mod tests {
         let rows = vec![vec![json!("广东"), json!("50.5")], vec![json!("山东"), json!("30.2")]];
         let v = build(&cols(&["省份", "占比"]), &rows);
         assert!(matches!(v.blocks[0], Block::Chart { kind: ChartKind::Bar, .. }));
+    }
+
+    #[test]
+    fn kpi_delta_up_down_and_zero() {
+        let mut v = build(&cols(&["销售额"]), &[vec![json!("120")]]);
+        patch_kpi_delta(&mut v, 120.0, 100.0, "较上月".into());
+        if let Block::Kpis { items } = &v.blocks[0] {
+            let d = items[0].delta.as_ref().unwrap();
+            assert_eq!(d.dir, "up");
+            assert_eq!(d.pct, 20.0);
+        } else {
+            panic!("no kpi");
+        }
+        // 上期为 0 → 不填 delta
+        let mut v2 = build(&cols(&["销售额"]), &[vec![json!("120")]]);
+        patch_kpi_delta(&mut v2, 120.0, 0.0, "较上月".into());
+        if let Block::Kpis { items } = &v2.blocks[0] {
+            assert!(items[0].delta.is_none());
+        }
     }
 }

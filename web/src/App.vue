@@ -4,7 +4,8 @@ import BiChart from './BiChart.vue'
 import { fmt, type Semantic } from './format'
 
 interface ColSpec { name: string; role: string; semantic: Semantic }
-interface Kpi { label: string; value: unknown; semantic: Semantic }
+interface Delta { pct: number; dir: 'up' | 'down' | 'flat'; label: string }
+interface Kpi { label: string; value: unknown; semantic: Semantic; delta?: Delta }
 interface Block {
   type: 'kpis' | 'entity' | 'chart' | 'table'
   items?: Kpi[]
@@ -102,6 +103,11 @@ const tableData = computed(() =>
                 style="flex: 1; min-width: 200px; box-shadow: 0 1px 6px rgba(0,0,0,0.08)">
                 <div style="color: #888; font-size: 13px; letter-spacing: 0.05em">{{ k.label }}</div>
                 <div style="font-size: 28px; font-weight: 700; color: #1677ff; margin-top: 6px">{{ fmt(k.value, k.semantic) }}</div>
+                <div v-if="k.delta" style="margin-top: 6px; font-size: 13px"
+                  :style="{ color: k.delta.dir === 'up' ? '#cf1322' : k.delta.dir === 'down' ? '#389e0d' : '#888' }">
+                  <span>{{ k.delta.dir === 'up' ? '▲' : k.delta.dir === 'down' ? '▼' : '—' }}</span>
+                  {{ Math.abs(k.delta.pct) }}% <span style="color: #aaa">{{ k.delta.label }}</span>
+                </div>
               </a-card>
             </div>
 

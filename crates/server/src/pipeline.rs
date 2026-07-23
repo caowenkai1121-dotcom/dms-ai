@@ -58,6 +58,15 @@ pub fn is_safe_select(sql: &str) -> anyhow::Result<()> {
 }
 
 /// LIMIT 护栏：非纯聚合且无 LIMIT → 追加 LIMIT 200
+/// JSON 单元格 → f64（DECIMAL 存字符串，数字直取）
+fn cell_num(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 fn ensure_limit(sql: &str) -> String {
     let upper = sql.to_uppercase();
     if upper.contains("LIMIT") {
@@ -247,7 +256,20 @@ pub async fn ask(
             let injected = inject::inject(&hit.sql, &sets)?;
             if let Ok((columns, rows)) = execute(mysql, &injected).await {
                 let row_count = rows.len();
-                let view = crate::viewspec::build(&columns, &rows);
+                let mut view = crate::viewspec::build(&columns, &rows);
+                // KPI 环比：单指标聚合时查上期算 Δ%
+                if let Some((prev_sql, label)) = &hit.prev {
+                    if let (Some(cur), Ok(prev_inj)) = (
+                        rows.first().and_then(|r| r.first()).and_then(cell_num),
+                        inject::inject(prev_sql, &sets),
+                    ) {
+                        if let Ok((_, prow)) = execute(mysql, &prev_inj).await {
+                            if let Some(prev) = prow.first().and_then(|r| r.first()).and_then(cell_num) {
+                                crate::viewspec::patch_kpi_delta(&mut view, cur, prev, label.clone());
+                            }
+                        }
+                    }
+                }
                 return Ok(AskResult {
                     sql: injected,
                     columns,

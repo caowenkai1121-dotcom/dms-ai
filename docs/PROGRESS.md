@@ -62,7 +62,16 @@
   KPI卡「本月销售额 ¥1.64亿」1060ms、环形图「前五省份」单色明度+省名、表格金额格式化。
 - 坑：饼图默认彩虹→改单色明度阶(榜首最深)；bodyStyle 须对象非字符串；省份存区划码→format 翻名。
 
+## M4b SuperSonic 规格对齐 + KPI 自动环比（2026-07-23，已验收）
+- probe-ss-view 回传 SuperSonic chat-sdk 完整源码级规格（决策树顺序/showType 枚举/图表阈值/getFormattedValue/环比 statistics/下钻 requery）。
+- 校准：①Pie 阈值 6→10（对齐桌面）②Bar TOP 18→20（对齐 Trend slice20）③万压缩 2位→1位（对齐 getFormattedValue：亿2位/万1位）。
+- **KPI 自动环比**（对齐 aggregateInfo.metricInfos.statistics）：direct-agg 单指标时平移时间窗查上期算 Δ%——
+  direct.rs prev_window(本月→上月/今天→昨天/今年→去年…)、viewspec.rs patch_kpi_delta(上期0跳过/±0.05阈值判 up/down/flat)、
+  前端 KPI 卡 ▲红▼绿 chip + 标签。实测「本月销售额 ¥1.64亿 ▼9.4% 较上月」1518ms。
+- 验收：Rust 单测 36/36（+patch_kpi_delta 分支）；vue-tsc 过；Playwright 环比 chip 实测。
+- SuperSonic 规格待用清单（下步）：下钻 requery（recommendedDimensions+onLoadData）/showType='more' 参考列剔除/authorized 列权限/趋势多指标 slice20。
+
 ## 下一步（M4续/M6b/M5）
-- M4 续（等 probe-ss-view SuperSonic 规格）：KPI 环比 chip/榜首金/下钻交互(requery)/多会话/追问/报告页。
-- M6b：scope 进程内缓存提速；实体锚定；图关系走 AGE；语义缓存(接 embed)。
+- M4 续：下钻交互(requery 参数化重查 0-LLM)/多会话/追问上下文/报告页。
+- M6b：scope 进程内缓存提速（限权用户 11s→亚秒）；实体锚定；图关系走 AGE；语义缓存(接 embed)。
 - M5 三端打通（DMS SSO 换签+嵌入页；企微应用）。

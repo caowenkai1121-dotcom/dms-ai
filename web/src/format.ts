@@ -38,11 +38,11 @@ export function fmt(v: unknown, semantic: Semantic = 'none'): string {
   return String(v)
 }
 
-/** 万/亿压缩（金额/大数用） */
+/** 万/亿压缩（对齐 SuperSonic getFormattedValue：亿 2 位、万 1 位） */
 export function compress(n: number): string {
   const abs = Math.abs(n)
   if (abs >= 1e8) return `${round(n / 1e8, 2)}亿`
-  if (abs >= 1e4) return `${round(n / 1e4, 2)}万`
+  if (abs >= 1e4) return `${round(n / 1e4, 1)}万`
   return grouping(round(n, 2))
 }
 

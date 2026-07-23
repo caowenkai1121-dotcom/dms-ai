@@ -2,10 +2,12 @@
 //! 命中即秒级零幻觉出结果，跳过 LLM；未命中回落 pipeline 的 LLM 路径。
 //! 生成的 SQL 仍过 is_safe_select + 权限注入 + 只读执行（复用 pipeline），权限不旁路。
 
-/// 确定性命中：SQL（未注入）+ 路由标签
+/// 确定性命中：SQL（未注入）+ 路由标签 + 可选上期查询（KPI 环比）
 pub struct DirectHit {
     pub sql: String,
     pub route: String,
+    /// (上期 SQL, 环比标签如"较上月")——仅高频聚合单指标时有
+    pub prev: Option<(String, String)>,
 }
 
 pub fn try_direct(question: &str) -> Option<DirectHit> {
@@ -48,6 +50,7 @@ fn sniff_doc_code(question: &str) -> Option<DirectHit> {
             return Some(DirectHit {
                 sql: format!("SELECT * FROM {table} WHERE {col} = '{safe}' LIMIT 1"),
                 route: "direct-doc".into(),
+                prev: None,
             });
         }
     }
@@ -83,13 +86,38 @@ fn agg_template(question: &str) -> Option<DirectHit> {
     } else {
         return None;
     };
-    Some(DirectHit {
-        sql: format!(
+    let base = |pred: &str| {
+        format!(
             "SELECT {metric} FROM t_sales_order \
-             WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND {time_pred}"
-        ),
+             WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND {pred}"
+        )
+    };
+    // 上期查询（环比）：平移时间窗
+    let prev = prev_window(question).map(|(pred, label)| (base(pred), label.to_string()));
+    Some(DirectHit {
+        sql: base(time_pred),
         route: "direct-agg".into(),
+        prev,
     })
+}
+
+/// 时间窗 → 上一期谓词 + 环比标签
+fn prev_window(q: &str) -> Option<(&'static str, &'static str)> {
+    if q.contains("今天") || q.contains("今日") {
+        Some(("DATE(order_time) = CURDATE() - INTERVAL 1 DAY", "较昨天"))
+    } else if q.contains("昨天") || q.contains("昨日") {
+        Some(("DATE(order_time) = CURDATE() - INTERVAL 2 DAY", "较前天"))
+    } else if q.contains("本月") || q.contains("这个月") {
+        Some(("order_time >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH,'%Y-%m-01') AND order_time < DATE_FORMAT(CURDATE(),'%Y-%m-01')", "较上月"))
+    } else if q.contains("上月") || q.contains("上个月") {
+        Some(("order_time >= DATE_FORMAT(CURDATE() - INTERVAL 2 MONTH,'%Y-%m-01') AND order_time < DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH,'%Y-%m-01')", "较上上月"))
+    } else if q.contains("本周") || q.contains("这周") {
+        Some(("YEARWEEK(order_time, 1) = YEARWEEK(CURDATE() - INTERVAL 7 DAY, 1)", "较上周"))
+    } else if q.contains("今年") {
+        Some(("YEAR(order_time) = YEAR(CURDATE()) - 1", "较去年"))
+    } else {
+        None
+    }
 }
 
 /// 相对时间词 → MySQL 谓词（基于 CURDATE()，零硬编码年份）
