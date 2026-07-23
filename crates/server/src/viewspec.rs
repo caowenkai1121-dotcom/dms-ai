@@ -228,6 +228,7 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
     let metric_idx: Vec<usize> = specs.iter().enumerate().filter(|(_, s)| s.role == Role::Metric).map(|(i, _)| i).collect();
     let cat_idx: Vec<usize> = specs.iter().enumerate().filter(|(_, s)| s.role == Role::Category).map(|(i, _)| i).collect();
     let time_idx: Vec<usize> = specs.iter().enumerate().filter(|(_, s)| s.role == Role::Time).map(|(i, _)| i).collect();
+    let id_idx: Vec<usize> = specs.iter().enumerate().filter(|(_, s)| s.role == Role::Id).map(|(i, _)| i).collect();
 
     let mut blocks: Vec<Block> = vec![];
 
@@ -258,8 +259,15 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
         return mk(specs, blocks);
     }
 
-    // 3. 有时间列 + ≥2 行 + ≥1 指标 → 趋势线图
-    if !time_idx.is_empty() && rows.len() >= 2 && !metric_idx.is_empty() {
+    // 3. 明细/多维形态 → 纯表格（对齐 SuperSonic：categoryField>1 或有 id 列 → TABLE）。
+    //    防止 200 行订单明细被误画成趋势线（每行不同订单，时间轴无意义）。
+    if rows.len() > 1 && (cat_idx.len() > 1 || !id_idx.is_empty()) {
+        blocks.push(Block::Table);
+        return mk(specs, blocks);
+    }
+
+    // 4. 有时间列 + ≥2 行 + ≥1 指标 + 类别≤1（趋势序列，非明细）→ 趋势线图
+    if !time_idx.is_empty() && rows.len() >= 2 && !metric_idx.is_empty() && cat_idx.len() <= 1 {
         blocks.push(Block::Chart {
             kind: ChartKind::Line,
             x: time_idx[0],

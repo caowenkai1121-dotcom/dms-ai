@@ -61,7 +61,99 @@ fn strip_relation_words(q: &str) -> String {
 }
 
 pub fn try_direct(question: &str) -> Option<DirectHit> {
-    sniff_doc_code(question).or_else(|| agg_template(question))
+    sniff_doc_code(question)
+        .or_else(|| sales_breakdown(question))
+        .or_else(|| agg_template(question))
+}
+
+/// 销售额按维度下钻（0-LLM 确定性模板，口径固化——修复 LLM 下钻拐到营销表算错的问题）。
+/// 连接键已连库坐实：detail.sku_code=t_goods.goods_code、goods.goods_category_code=cat.id。
+fn sales_breakdown(question: &str) -> Option<DirectHit> {
+    // 必须是销售额类 + 时间窗 + 维度
+    if !(question.contains("销售额") || question.contains("销售总额") || question.contains("营业额") || question.contains("卖了多少")) {
+        return None;
+    }
+    let time_pred = time_window(question)?.replace("order_time", "o.order_time");
+    let dim = detect_sales_dim(question)?;
+    let base_where = format!(
+        "o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND {time_pred}"
+    );
+    let sql = match dim {
+        // 商品分类走明细（金额在明细级）。o 先过滤（时间窗+权限，订单数少）驱动，
+        // JOIN detail 相关连接（sales_order_code 有索引，不全表扫），DISTINCT 去 2x 重复行。
+        SalesDim::Category => format!(
+            "SELECT COALESCE(cat.category_name,'未分类') AS `商品分类`, SUM(dd.amount) AS `销售额`
+             FROM (
+               SELECT DISTINCT d.sales_order_code, d.sku_code, d.box_quantity, d.bag_quantity, d.amount
+               FROM t_sales_order o
+               JOIN t_sales_order_detail d ON d.sales_order_code = o.sales_order_code AND d.deleted_flag = 0
+               WHERE {base_where}
+             ) dd
+             JOIN t_goods g ON g.goods_code = dd.sku_code AND g.deleted_flag = 0
+             LEFT JOIN t_goods_category cat ON g.goods_category_code = cat.id
+             GROUP BY COALESCE(cat.category_name,'未分类') ORDER BY `销售额` DESC LIMIT 50"
+        ),
+        // 以下维度金额用单头 total_amount
+        SalesDim::Province => format!(
+            "SELECT COALESCE(cus.province,'未知') AS `省份`, SUM(o.total_amount) AS `销售额`
+             FROM t_sales_order o
+             LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0
+             WHERE {base_where}
+             GROUP BY COALESCE(cus.province,'未知') ORDER BY `销售额` DESC LIMIT 50"
+        ),
+        SalesDim::Owner => format!(
+            "SELECT COALESCE(e.actual_name, o.owner_manager) AS `业务员`, SUM(o.total_amount) AS `销售额`
+             FROM t_sales_order o
+             LEFT JOIN t_employee e ON e.employee_id = o.owner_manager
+             WHERE {base_where}
+             GROUP BY COALESCE(e.actual_name, o.owner_manager) ORDER BY `销售额` DESC LIMIT 50"
+        ),
+        SalesDim::Customer => format!(
+            "SELECT COALESCE(o.customer_name,'未知') AS `客户`, SUM(o.total_amount) AS `销售额`
+             FROM t_sales_order o WHERE {base_where}
+             GROUP BY COALESCE(o.customer_name,'未知') ORDER BY `销售额` DESC LIMIT 50"
+        ),
+        SalesDim::Shop => format!(
+            "SELECT COALESCE(o.shop_name,'未知') AS `门店`, SUM(o.total_amount) AS `销售额`
+             FROM t_sales_order o WHERE {base_where}
+             GROUP BY COALESCE(o.shop_name,'未知') ORDER BY `销售额` DESC LIMIT 50"
+        ),
+        SalesDim::Month => format!(
+            "SELECT DATE_FORMAT(o.order_time,'%Y-%m') AS `月份`, SUM(o.total_amount) AS `销售额`
+             FROM t_sales_order o WHERE {base_where}
+             GROUP BY DATE_FORMAT(o.order_time,'%Y-%m') ORDER BY `月份`"
+        ),
+    };
+    Some(DirectHit { sql, route: "direct-agg".into(), prev: None })
+}
+
+#[derive(Debug, PartialEq)]
+enum SalesDim {
+    Province,
+    Category,
+    Owner,
+    Customer,
+    Shop,
+    Month,
+}
+
+fn detect_sales_dim(q: &str) -> Option<SalesDim> {
+    // 顺序敏感：分类先于客户（"客户分类"罕见），业务员先于客户
+    if q.contains("分类") || q.contains("品类") || q.contains("类别") {
+        Some(SalesDim::Category)
+    } else if q.contains("省") {
+        Some(SalesDim::Province)
+    } else if q.contains("业务员") || q.contains("经理") || q.contains("负责人") || q.contains("员工") {
+        Some(SalesDim::Owner)
+    } else if q.contains("门店") || q.contains("店") {
+        Some(SalesDim::Shop)
+    } else if q.contains("客户") {
+        Some(SalesDim::Customer)
+    } else if q.contains("月份") || q.contains("按月") || q.contains("每月") || q.contains("各月") {
+        Some(SalesDim::Month)
+    } else {
+        None
+    }
 }
 
 /// 单据前缀 → (表, 主号列)。后缀字母区分单据类型，区分度足够（免 UNION 探测开销）。
@@ -238,6 +330,27 @@ mod tests {
     fn agg_needs_time_and_metric() {
         assert!(agg_template("销售额").is_none()); // 无时间窗
         assert!(agg_template("本月天气").is_none()); // 无指标
+    }
+
+    #[test]
+    fn sales_breakdown_dims() {
+        // 商品分类下钻走确定性模板，用 t_sales_order/detail 正确口径（非 marketing_goods）
+        let h = sales_breakdown("本月销售额是多少 按商品分类").unwrap();
+        assert!(h.sql.contains("t_goods_category"), "{}", h.sql);
+        assert!(h.sql.contains("t_sales_order_detail"), "{}", h.sql);
+        assert!(!h.sql.contains("marketing_goods"), "{}", h.sql);
+        assert!(h.sql.contains("NOT IN ('0','108','199')"), "{}", h.sql);
+        assert_eq!(h.route, "direct-agg");
+        // 省份下钻 JOIN t_customer
+        let p = sales_breakdown("本月销售额 按省份").unwrap();
+        assert!(p.sql.contains("t_customer") && p.sql.contains("province"), "{}", p.sql);
+        // 业务员下钻 JOIN t_employee
+        let o = sales_breakdown("本月销售额按业务员").unwrap();
+        assert!(o.sql.contains("t_employee") && o.sql.contains("owner_manager"), "{}", o.sql);
+        // 无维度不命中（交给 agg_template）
+        assert!(sales_breakdown("本月销售额是多少").is_none());
+        // 非销售额不命中
+        assert!(sales_breakdown("本月订单数按省份").is_none());
     }
 
     #[test]

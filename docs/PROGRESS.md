@@ -119,6 +119,14 @@
 - **验收**：vue-tsc 过；Playwright 明暗双主题实测——本月销售额→气泡 KPI 卡 ¥1.66亿 ▼8.4%较上月 321ms+下钻 chips；暗色深空底协调。
 - 🔴 修真 bug：Vue3 深响应式下 `push(obj)` 后数组存 reactive 代理，改原始引用不触发更新→改用 `turns.value[len-1]` 取代理引用（否则 loading 永不清、结果不渲染）；fetch 加 100s AbortController 超时兜底(防 LLM 挂起永久 loading)。
 
+## M6d 用户实测三问修复（2026-07-23，已验收）
+用户 admin 实测报三问，全部定位+修复：
+- **Q1 结果错**（本月销售额按商品分类→28801 全未分类）：根因=下钻走 LLM 丢原口径，LLM 拐到 t_marketing_goods(营销表)用参考价算。修=**销售额下钻确定性模板**（direct.rs sales_breakdown，0-LLM）覆盖省份/客户/业务员/门店/月份/商品分类，连接键连库坐实(detail.sku_code=goods.goods_code、goods.goods_category_code=cat.id)，有效订单口径。**81s→10s，答案对**(脆皮烤肠3000万/虎皮肉肠2203万...)。
+- **Q3 图表错**（昨天订单明细→200 行画成趋势线）：根因=决策树趋势线判定抢在多类别前，明细有时间列就画折线。修=对齐 SuperSonic 顺序，**明细/多维(category>1 或有 id 列)→纯表格**，趋势线加 category≤1 约束。明细→table 不配图。
+- **Q2 慢**（81s）：Q1 确定性模板 81s→10s；无 JOIN 维度(省份/客户/月份)更快。
+- 商品分类模板提速：o 先过滤(本月订单少)驱动 JOIN detail 相关连接(sales_order_code 索引)，避免 detail 277万全表去重(曾 60s 超时→10s)。
+- **验收**：单测 41/41(+sales_breakdown_dims)；连库 Q1 direct-agg 10s 正确；Q3 明细→table；Playwright 下钻链+暗色主题实测。
+
 ## 下一步（M6c/M5c）
 - M6c：图关系+行级权限；实体锚定；语义缓存(接 embed)；SchemaCorrector(执行前幻觉列拦截)；graph sync 定时刷新。
 - M5c：端#1 SM4 登录转发（密钥 1024lab__1024lab + 图形验证码流程）；企微/DMS 真 token 生产联调。
