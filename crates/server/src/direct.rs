@@ -208,7 +208,9 @@ fn sniff_doc_code(question: &str) -> Option<DirectHit> {
 
 /// 高频销售聚合模板：时间窗 + 单指标，无维度、无实体（含则回落 LLM 做 GROUP BY/实体锚定）。
 fn agg_template(question: &str) -> Option<DirectHit> {
-    const DIM_WORDS: &[&str] = &["排行", "排名", "前", "各", "按", "分类", "省", "市", "区域", "门店", "客户", "商品", "占比", "对比", "趋势", "明细"];
+    // 维度词（触发分组下钻，回落 sales_breakdown/LLM）。不含"客户/商品"——它们是实体名常见字，
+    // "各客户/按商品"靠"各/按"拦，避免误伤"成交客户数""商品销量"这类指标问句。
+    const DIM_WORDS: &[&str] = &["排行", "排名", "前", "各", "按", "分类", "省", "市", "区域", "门店", "占比", "对比", "趋势", "明细"];
     if DIM_WORDS.iter().any(|w| question.contains(w)) {
         return None;
     }
@@ -218,6 +220,7 @@ fn agg_template(question: &str) -> Option<DirectHit> {
     for w in [
         "今天", "今日", "昨天", "昨日", "本月", "这个月", "上月", "上个月", "本周", "这周", "今年",
         "销售额", "销售总额", "营业额", "订单数", "多少单", "几单", "客单价", "卖了多少",
+        "成交客户数", "成交客户", "客户数", "多少客户",
         "是多少", "多少", "有", "的", "呢", "吗", "总共", "一共", "了", "查", "查询", "看看", "帮我",
     ] {
         stripped = stripped.replace(w, "");
@@ -226,7 +229,9 @@ fn agg_template(question: &str) -> Option<DirectHit> {
         return None;
     }
     let time_pred = time_window(question)?;
-    let metric = if question.contains("订单数") || question.contains("多少单") || question.contains("几单") {
+    let metric = if question.contains("客户数") || question.contains("成交客户") || question.contains("多少客户") {
+        "COUNT(DISTINCT customer_code) AS `成交客户数`"
+    } else if question.contains("订单数") || question.contains("多少单") || question.contains("几单") {
         "COUNT(DISTINCT sales_order_code) AS `订单数`"
     } else if question.contains("客单价") {
         "ROUND(SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0), 2) AS `客单价`"
