@@ -248,7 +248,16 @@ pub async fn ask(
     question: &str,
 ) -> anyhow::Result<AskResult> {
     let t0 = std::time::Instant::now();
-    let sets = scope::compute_scope(mysql, p).await?;
+    let sets = scope::compute_scope_cached(mysql, p).await?;
+
+    // 图关系快路径（AGE，0-LLM）：仅全权限用户（图无行级权限，限权回落 LLM 走注入）
+    if sets.is_unrestricted() {
+        if let Some(rel) = crate::direct::detect_relation(question) {
+            if let Some(r) = try_graph(pg, &rel, t0).await {
+                return Ok(r);
+            }
+        }
+    }
 
     // 确定性快路径（单号直查/高频聚合）：命中即 0-LLM 秒出，仍走安全校验+权限注入+只读执行
     if let Some(hit) = crate::direct::try_direct(question) {
@@ -333,6 +342,50 @@ pub async fn ask(
         }
     }
     anyhow::bail!("生成失败（自修后仍不可用）")
+}
+
+/// 图关系查询 → AskResult（表格形态）。查询失败/空结果返回 None（回落 LLM）。
+async fn try_graph(
+    pg: &PgPool,
+    rel: &crate::direct::Relation,
+    t0: std::time::Instant,
+) -> Option<AskResult> {
+    use crate::direct::Relation;
+    let (entity_label, rows_data) = match rel {
+        Relation::BuyersOfGoods(name) => ("客户", crate::graph::buyers_of_goods(pg, name, 50).await.ok()?),
+        Relation::GoodsOfCustomer(name) => ("商品", crate::graph::goods_of_customer(pg, name, 50).await.ok()?),
+        Relation::Copurchase(name) => ("商品", crate::graph::copurchase(pg, name, 50).await.ok()?),
+    };
+    if rows_data.is_empty() {
+        return None;
+    }
+    let columns = vec![
+        format!("{entity_label}编码"),
+        format!("{entity_label}名称"),
+        "购买额".to_string(),
+    ];
+    let rows: Vec<Vec<serde_json::Value>> = rows_data
+        .iter()
+        .map(|g| {
+            vec![
+                serde_json::Value::from(g.code.clone()),
+                serde_json::Value::from(g.name.clone()),
+                serde_json::Value::from(format!("{:.2}", g.amount)),
+            ]
+        })
+        .collect();
+    let row_count = rows.len();
+    let view = crate::viewspec::build(&columns, &rows);
+    Some(AskResult {
+        sql: format!("[AGE 图查询] {rel:?}"),
+        columns,
+        truncated: false,
+        row_count,
+        rows,
+        elapsed_ms: t0.elapsed().as_millis(),
+        route: "graph".into(),
+        view,
+    })
 }
 
 async fn repair(

@@ -12,13 +12,14 @@
 
 use serde::Serialize;
 use sqlx::MySqlPool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use crate::principal::Principal;
 
 pub const SENTINEL: i64 = -1;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct ScopeSets {
     /// 空 = 该维度不注入（放行）；[-1] = 哨兵拒绝
     pub employee_ids: Vec<i64>,
@@ -55,6 +56,36 @@ impl BaseView {
             _ => None,
         }
     }
+}
+
+/// 进程内 scope 缓存：key=(登录名,角色)，当日过期（对齐 Java Redis 当日缓存策略）。
+/// 权限集合计算含多次连库查询（部门/下属/客户集合），限权用户单次 ~10s；命中缓存后亚秒。
+type CacheMap = HashMap<(String, String), (ScopeSets, u64)>;
+static SCOPE_CACHE: OnceLock<Mutex<CacheMap>> = OnceLock::new();
+
+fn epoch_day() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86400)
+        .unwrap_or(0)
+}
+
+pub async fn compute_scope_cached(mysql: &MySqlPool, p: &Principal) -> anyhow::Result<ScopeSets> {
+    let key = (p.login_name.clone(), p.role_code.clone());
+    let today = epoch_day();
+    let cache = SCOPE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some((sets, day)) = map.get(&key) {
+            if *day == today {
+                return Ok(sets.clone());
+            }
+        }
+    }
+    let sets = compute_scope(mysql, p).await?;
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, (sets.clone(), today));
+    }
+    Ok(sets)
 }
 
 pub async fn compute_scope(mysql: &MySqlPool, p: &Principal) -> anyhow::Result<ScopeSets> {

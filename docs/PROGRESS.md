@@ -71,7 +71,18 @@
 - 验收：Rust 单测 36/36（+patch_kpi_delta 分支）；vue-tsc 过；Playwright 环比 chip 实测。
 - SuperSonic 规格待用清单（下步）：下钻 requery（recommendedDimensions+onLoadData）/showType='more' 参考列剔除/authorized 列权限/趋势多指标 slice20。
 
-## 下一步（M4续/M6b/M5）
-- M4 续：下钻交互(requery 参数化重查 0-LLM)/多会话/追问上下文/报告页。
-- M6b：scope 进程内缓存提速（限权用户 11s→亚秒）；实体锚定；图关系走 AGE；语义缓存(接 embed)。
+## M6b scope 缓存 + AGE 图关系问答（2026-07-23，已验收）
+- **scope 进程内缓存**（scope.rs::compute_scope_cached）：key=(登录名,角色)，当日过期（对齐 Java Redis）。
+  限权用户第二问 **15.2s→3.4s**（省 ~11s 权限集合连库计算）。CLI 跨进程不共享，服务同进程受益。
+- **AGE 图关系问答**（graph.rs，0-LLM）：客户-购买-商品图。
+  - `graph sync`：MySQL 聚合有效订单口径的客户-商品边（277万明细→**2591客户/455商品/98759边**），UNWIND 批量建点建边入 AGE，239s 一次性。
+  - 三类查询：buyers_of_goods(买过X的客户)/goods_of_customer(X买过什么)/copurchase(买X还买什么)，name 正则匹配+sum(amount) ORDER BY。
+  - pipeline 图前置（仅全权限用户——图无行级权限，限权回落 LLM 走注入）；detect_relation 识别+剥词抽实体名。
+  - **实测：图查询 11~38ms**（vs MySQL 关系查询 6~20s，快 300~1800 倍，兑现 AGE 选型）。
+- 坑：agtype 类型 sqlx 不识别→外层包 `::text` cast 再解析（string 带引号 unquote、number 裸数字 parse）。
+- **验收**：单测 39/39（+relation_detect/graph esc/unquote）；Playwright 实测「买过烤肠的客户」graph 38ms 单色柱图 TOP20+表格（鸣望 7475万降序）。
+
+## 下一步（M4续/M5/M6c）
+- M4 续：下钻交互(requery 0-LLM)/多会话/追问上下文/报告页。
 - M5 三端打通（DMS SSO 换签+嵌入页；企微应用）。
+- M6c：图关系+行级权限（限权用户也能用图，按 scope.customer_codes 过滤）；实体锚定；语义缓存(接 embed)；graph sync 定时刷新。

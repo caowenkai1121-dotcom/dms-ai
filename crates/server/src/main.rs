@@ -2,6 +2,7 @@
 
 mod db;
 mod direct;
+mod graph;
 mod inject;
 mod llm;
 mod meta;
@@ -53,6 +54,15 @@ async fn main() -> anyhow::Result<()> {
         let (nt, nc) = meta::sync_schema(&mysql, &pg).await?;
         meta::seed(&pg).await?;
         println!("{}", serde_json::json!({ "tables": nt, "columns": nc }));
+        return Ok(());
+    }
+
+    // M6b 子命令：graph sync —— 聚合客户-商品购买边入 AGE 图
+    if args.len() >= 3 && args[1] == "graph" && args[2] == "sync" {
+        let mysql = db::mysql_pool(&cfg.mysql_url).await?;
+        let pg = db::pg_pool(&cfg.pg_url).await?;
+        let (nc, ng, ne) = graph::sync(&mysql, &pg).await?;
+        println!("{}", serde_json::json!({ "customers": nc, "goods": ng, "edges": ne }));
         return Ok(());
     }
 

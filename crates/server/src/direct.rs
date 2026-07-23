@@ -10,6 +10,56 @@ pub struct DirectHit {
     pub prev: Option<(String, String)>,
 }
 
+/// 图关系问题类型（AGE 图查询）
+#[derive(Debug, PartialEq)]
+pub enum Relation {
+    /// 买过某商品的客户（含实体名）
+    BuyersOfGoods(String),
+    /// 某客户买过什么
+    GoodsOfCustomer(String),
+    /// 买某商品还买什么（共购）
+    Copurchase(String),
+}
+
+/// 识别图关系问题并抽实体名。顺序敏感：共购(还买)先于买过，买过先于"X买了"。
+pub fn detect_relation(q: &str) -> Option<Relation> {
+    // 共购：买X还买 / 买了X还买什么
+    if (q.contains("还买") || q.contains("还购买") || q.contains("关联购买") || q.contains("一起买")) && q.contains("买") {
+        let name = strip_relation_words(q);
+        if !name.is_empty() {
+            return Some(Relation::Copurchase(name));
+        }
+    }
+    // 买过 X 的客户 / 哪些客户买过 X
+    if (q.contains("买过") || q.contains("购买过") || q.contains("买了")) && (q.contains("客户") || q.contains("哪些") || q.contains("门店")) {
+        let name = strip_relation_words(q);
+        if !name.is_empty() {
+            return Some(Relation::BuyersOfGoods(name));
+        }
+    }
+    // X 买过什么 / X 买了哪些商品
+    if (q.contains("买过什么") || q.contains("买了什么") || q.contains("买过哪些") || q.contains("买了哪些") || q.contains("购买清单")) {
+        let name = strip_relation_words(q);
+        if !name.is_empty() {
+            return Some(Relation::GoodsOfCustomer(name));
+        }
+    }
+    None
+}
+
+/// 剥关系词/疑问词，剩下实体名
+fn strip_relation_words(q: &str) -> String {
+    let mut s = q.to_string();
+    for w in [
+        "还买过什么", "还买什么", "还买了什么", "还购买", "还买", "关联购买", "一起买",
+        "买过什么", "买了什么", "买过哪些", "买了哪些", "购买清单", "购买过", "买过", "买了",
+        "的客户", "哪些客户", "哪些门店", "哪些", "客户", "门店", "商品", "有", "的", "是", "什么", "都", "买",
+    ] {
+        s = s.replace(w, "");
+    }
+    s.trim().to_string()
+}
+
 pub fn try_direct(question: &str) -> Option<DirectHit> {
     sniff_doc_code(question).or_else(|| agg_template(question))
 }
@@ -188,5 +238,14 @@ mod tests {
     fn agg_needs_time_and_metric() {
         assert!(agg_template("销售额").is_none()); // 无时间窗
         assert!(agg_template("本月天气").is_none()); // 无指标
+    }
+
+    #[test]
+    fn relation_detect() {
+        assert_eq!(detect_relation("买过烤肠的客户有哪些"), Some(Relation::BuyersOfGoods("烤肠".into())));
+        assert_eq!(detect_relation("恒众买过什么"), Some(Relation::GoodsOfCustomer("恒众".into())));
+        // 共购：还买优先
+        assert_eq!(detect_relation("买烤肠的还买什么"), Some(Relation::Copurchase("烤肠".into())));
+        assert!(detect_relation("本月销售额").is_none());
     }
 }
