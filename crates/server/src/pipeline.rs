@@ -23,6 +23,33 @@ pub struct AskResult {
     pub elapsed_ms: u128,
     pub route: String,
     pub view: crate::viewspec::ViewSpec,
+    /// 复合问题的子结果（deepagents 拆解-合并）；单结果时为空
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subs: Vec<SubResult>,
+}
+
+/// 复合子问题结果（deepagents SubAgent 收敛：每子问题一句题目 + 完整结果）
+#[derive(Serialize)]
+pub struct SubResult {
+    pub question: String,
+    pub result: AskResult,
+}
+
+impl AskResult {
+    /// 复合容器：主体空，subs 装各子结果，前端分面板渲染
+    fn compound(subs: Vec<SubResult>, elapsed_ms: u128) -> Self {
+        AskResult {
+            sql: "[复合问题拆解]".into(),
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            truncated: false,
+            elapsed_ms,
+            route: "compound".into(),
+            view: crate::viewspec::build(&[], &[]),
+            subs,
+        }
+    }
 }
 
 const MAX_ROWS: usize = 200;
@@ -293,6 +320,30 @@ async fn rewrite_followup(llm: &LlmClient, question: &str, prev: Option<&str>) -
     }
 }
 
+/// 复合问题识别（deepagents planning 门控）：明确「分别/对比」+ 需多维度/口径拆解
+fn is_compound(q: &str) -> bool {
+    q.contains("分别") || (q.contains("对比") && q.matches('和').count() + q.matches('与').count() >= 1)
+}
+
+/// 拆解复合问题为独立子问题（fast 模型，deepagents write_todos 思想）
+async fn split_questions(llm: &LlmClient, question: &str) -> Vec<String> {
+    let system = "把用户的复合问题拆成 2-3 个可独立查询的子问题，每个子问题自包含（含时间/维度）。只输出 JSON 字符串数组，如 [\"各省销售额\",\"各商品分类销量\"]，不要解释。";
+    match llm.chat(&llm.model_fast, system, question).await {
+        Ok(r) => {
+            // 抽 JSON 数组
+            let start = r.find('[');
+            let end = r.rfind(']');
+            if let (Some(s), Some(e)) = (start, end) {
+                if let Ok(v) = serde_json::from_str::<Vec<String>>(&r[s..=e]) {
+                    return v.into_iter().filter(|s| !s.trim().is_empty()).take(3).collect();
+                }
+            }
+            vec![]
+        }
+        Err(_) => vec![],
+    }
+}
+
 pub async fn ask(
     llm: &LlmClient,
     mysql: &MySqlPool,
@@ -304,7 +355,35 @@ pub async fn ask(
     let t0 = std::time::Instant::now();
     // 多轮追问改写：把"那上个月呢"结合上一轮改写成"上月销售额"再走管线
     let rewritten = rewrite_followup(llm, question, prev_question).await;
-    let question: &str = &rewritten;
+
+    // 复合问题拆解（deepagents P0：规划→多步查询→合并）：拆子问题并行执行，各自独立
+    if is_compound(&rewritten) {
+        let subs_q = split_questions(llm, &rewritten).await;
+        if subs_q.len() >= 2 {
+            let futs = subs_q.iter().map(|q| ask_single(llm, mysql, pg, p, q));
+            let results = futures::future::join_all(futs).await;
+            let subs: Vec<SubResult> = subs_q
+                .into_iter()
+                .zip(results)
+                .filter_map(|(q, r)| r.ok().map(|res| SubResult { question: q, result: res }))
+                .collect();
+            if !subs.is_empty() {
+                return Ok(AskResult::compound(subs, t0.elapsed().as_millis()));
+            }
+        }
+    }
+
+    ask_single(llm, mysql, pg, p, &rewritten).await
+}
+
+async fn ask_single(
+    llm: &LlmClient,
+    mysql: &MySqlPool,
+    pg: &PgPool,
+    p: &Principal,
+    question: &str,
+) -> anyhow::Result<AskResult> {
+    let t0 = std::time::Instant::now();
     let sets = scope::compute_scope_cached(mysql, p).await?;
 
     // 图关系快路径（AGE，0-LLM）：仅全权限用户（图无行级权限，限权回落 LLM 走注入）
@@ -345,6 +424,7 @@ pub async fn ask(
                     elapsed_ms: t0.elapsed().as_millis(),
                     route: hit.route,
                     view,
+                    subs: vec![],
                 });
             }
             // 确定性 SQL 执行失败（列漂移等）→ 静默回落 LLM
@@ -352,7 +432,7 @@ pub async fn ask(
     }
 
     // 语义缓存（移植 SuperSonic 向量召回近义问答 + 旧项目护栏）：近义历史问答命中即 0-LLM 秒出
-    if prev_question.is_none() && !is_followup(question) {
+    if !is_followup(question) {
         if let Some(r) = try_semantic_cache(pg, mysql, question, &sets, t0).await {
             return Ok(r);
         }
@@ -428,6 +508,7 @@ pub async fn ask(
                     elapsed_ms: t0.elapsed().as_millis(),
                     route,
                     view,
+                    subs: vec![],
                 });
             }
             Err(e) if attempt == 0 => {
@@ -534,6 +615,7 @@ async fn try_semantic_cache(
         elapsed_ms: t0.elapsed().as_millis(),
         route: "semantic-cache".into(),
         view,
+        subs: vec![],
     })
 }
 
@@ -593,6 +675,7 @@ async fn try_graph(
         elapsed_ms: t0.elapsed().as_millis(),
         route: "graph".into(),
         view,
+        subs: vec![],
     })
 }
 

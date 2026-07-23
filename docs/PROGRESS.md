@@ -190,7 +190,15 @@
 - **验收**：单测 50/50；连库+Playwright——排行「榜首未知¥5743.8万占34.5%；前三合计64.5%（共32项）」、趋势「从¥2.25亿到¥1.66亿整体下降26.1%」。
 - 顺带修 sales_breakdown 省份 COALESCE→NULLIF(空串归未知)。
 
-## SuperSonic 移植累计（9 件）
+## M6u deepagents P0 移植：复杂问题拆解-并行-合并（2026-07-23，已验收）
+- probe-deepagents 源码级调研 deepagents(langchain-ai)，四大支柱：planning(write_todos)/subagents(task隔离)/虚拟FS/detailed prompt。
+- 移植最高价值 P0 = 复杂问题「规划→多步查询→合并」（对标其 text-to-sql-agent 简单直连 vs 复杂先规划分流 + deep_research 子代理并行范式）。
+- `pipeline`：is_compound(明确「分别/对比+和」门控)→split_questions(fast 拆≤3子问题,write_todos 思想)→**并行执行各子问题**(futures::join_all,各走完整 ask_single 管线,独立上下文=deepagents subagent 隔离)→AskResult::compound 合并 subs。
+- `ResultPanel.vue` 组件（result→完整呈现，主气泡+子面板复用）；复合时多子面板（🔹子问题标题+ResultPanel）。
+- **验收**：单测52/52; 连库+Playwright——「分别统计各省销售额和各商品分类销量」→route=compound 拆2子并行(各省销售额 direct-agg 34行 + 各商品分类销量 llm 64行)，之前一条SQL超时90s；前端多子面板渲染。
+- 遗留：商品分类「销量」列口径(detail 数量列/item_type)下轮优化。
+
+## SuperSonic 移植累计（9 件）+ deepagents 1 件
 SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表(M6g)、多会话 conversation(M5c)、rewriteMultiTurn 追问改写(M6h)、MemoryReviewTask 记忆复核(M6i)。
 待搬(需 embed)：向量召回、语义缓存。待搬(纯逻辑)：聚合函数名归一、默认时间范围、术语/维度注册表。
 
