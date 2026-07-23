@@ -137,10 +137,22 @@
   ①字段白名单校验✅ ②聚合函数名归一 ③group by 补全 ④select 补 groupby 字段+去重 ⑤自一致性投票(N次多数表决) ⑥默认时间范围+补下界 ⑦关键词→聚合/时间规则抽取 ⑧权限注入✅(已有) ⑨prompt 硬规则+结构化 schema 串。
   待做 P1(需轻量元数据)：值链接纠正、指标 defaultAgg 展开。
 
-## 下一步（SuperSonic 移植续/M6c）
-- Corrector 续：group by 补全、自一致性投票、默认时间范围。
-- 语义层（等 ss-semantic 规格）：指标/维度/术语注册表 + 术语路由（根治 Q1 类用错表）。
-- embed 向量召回激活（vector 列已预留）。
+## M6g SuperSonic 深度移植③：指标注册表（语义层核心，2026-07-23，已验收）
+- ss-semantic agent 源码级深挖 SuperSonic 语义层（MetricResp/DimensionResp/SchemaElement/知识库/prompt 装配/记忆闭环），产出移植规格。
+- 移植最高价值件 **指标注册表**（meta.metric，对应 SuperSonic MetricResp 最小可用）：指标名+别名→来源表+聚合表达式+口径过滤+说明，**口径单一事实源**。
+  首批 5 指标（口径旧项目连库验证）：销售额/订单数/客单价(t_sales_order 有效订单剔0/108/199)、市场费用(t_market_total_expense 合计表)、售后单数。
+- `recall_metrics`：问句命中指标名/别名→注入 prompt「指标口径卡」（最高优先级，禁止 LLM 自选表/改算法），对齐 SuperSonic PromptHelper 的 Metrics 段。
+- 配套修 sales_breakdown：触发词加「业绩」+ 时间窗可选（对齐 SuperSonic「问题没提时间就别加」）——「各区域经理业绩」现走 owner 确定性模板。
+- **验收**：单测 48/48；连库——「各区域经理业绩」route=direct-agg 用对 t_sales_order(月月 5.8亿/蓝莓 1.1亿)；「本月市场费用」LLM+指标卡引导用对 t_market_total_expense(不再拐专项子表)。
+- 语义层其余（HanLP trie 词典/pgvector 向量召回/记忆复核闭环 chat_memory）规格已存(ss-semantic)，按需后续移植；当前指标注册表已直击 Q1 类用错表根因。
+
+## SuperSonic 移植进度小结
+已移植：SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表+口径注入(M6g)、ViewSpec 图表决策/KPI环比/下钻(早期)、few-shot(trgm)、权限注入。
+待移植(按需)：聚合函数名归一、默认时间范围、自一致性投票(成本高跳过)、维度/术语注册表、embed 向量召回、记忆复核闭环。
+
+## 下一步（M6c/M7）
+- 指标注册表扩充(库存/售后率/毛利等) + 维度注册表；embed 向量召回激活。
+- M7 判官门禁：回归题集 ≥50 例 + 并发 + 安全审计。
 - M6c：图关系+行级权限；实体锚定；语义缓存(接 embed)；SchemaCorrector(执行前幻觉列拦截)；graph sync 定时刷新。
 - M5c：端#1 SM4 登录转发（密钥 1024lab__1024lab + 图形验证码流程）；企微/DMS 真 token 生产联调。
 - M7 判官门禁：回归题集扩到 ≥50 例；并发；安全审计。

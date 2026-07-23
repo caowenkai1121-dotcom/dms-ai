@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS meta.sql_exemplar(
   embedding vector(512),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+-- 指标注册表（移植 SuperSonic 语义层 MetricResp 最小可用）：指标名→口径单一事实源
+CREATE TABLE IF NOT EXISTS meta.metric(
+  metric_code text PRIMARY KEY,
+  name text NOT NULL,
+  aliases text[] NOT NULL DEFAULT '{}',
+  source_table text NOT NULL,
+  agg_expr text NOT NULL,
+  scope_filter text NOT NULL DEFAULT '',
+  description text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT 'active'
+);
 "#;
     for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         sqlx::query(stmt).execute(pg).await?;
@@ -233,7 +244,73 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
         .execute(pg)
         .await?;
     }
+    seed_metrics(pg).await?;
     Ok(())
+}
+
+/// 首批指标注册（口径全部旧项目连库验证过——单一事实源，根治 LLM 用错表/算错口径）
+async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
+    // (code, name, aliases, source_table, agg_expr, scope_filter, description)
+    const METRICS: &[(&str, &str, &[&str], &str, &str, &str, &str)] = &[
+        ("sales_amount", "销售额", &["销售总额", "营业额", "销售业绩", "业绩", "卖了多少"],
+         "t_sales_order", "SUM(total_amount)",
+         "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
+         "有效订单销售金额（剔除暂存0/无效108/作废199）"),
+        ("order_count", "订单数", &["订单量", "单量", "成交订单数", "多少单"],
+         "t_sales_order", "COUNT(DISTINCT sales_order_code)",
+         "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
+         "有效订单数（按单号去重）"),
+        ("avg_order_value", "客单价", &["单均", "平均客单"],
+         "t_sales_order", "SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)",
+         "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
+         "有效订单客单价=销售额/订单数"),
+        ("market_expense", "市场费用", &["营销费用", "费用总额", "推广费"],
+         "t_market_total_expense", "SUM(expense_amount)",
+         "deleted_flag = 0",
+         "泛指市场/营销费用一律用合计摘要表 t_market_total_expense，勿用费用族专项子表（会漏10倍级）"),
+        ("aftersales_count", "售后单数", &["退货数", "售后量", "退货单数"],
+         "t_after_sales_order_header", "COUNT(DISTINCT after_sales_code)",
+         "deleted_flag = 0",
+         "售后单数（按售后单号去重）"),
+    ];
+    for (code, name, aliases, src, agg, scope, desc) in METRICS {
+        sqlx::query(
+            "INSERT INTO meta.metric(metric_code, name, aliases, source_table, agg_expr, scope_filter, description)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT (metric_code) DO UPDATE SET
+               name=$2, aliases=$3, source_table=$4, agg_expr=$5, scope_filter=$6, description=$7",
+        )
+        .bind(code)
+        .bind(name)
+        .bind(aliases.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .bind(src)
+        .bind(agg)
+        .bind(scope)
+        .bind(desc)
+        .execute(pg)
+        .await?;
+    }
+    Ok(())
+}
+
+/// 召回命中的指标口径卡（问句含指标名或别名）→ 注入 prompt 让 LLM 严格按口径
+pub async fn recall_metrics(pg: &PgPool, question: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String, Vec<String>, String, String, String, String)> = sqlx::query_as(
+        "SELECT name, aliases, source_table, agg_expr, scope_filter, description
+         FROM meta.metric WHERE status = 'active'",
+    )
+    .fetch_all(pg)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(name, aliases, ..)| {
+            question.contains(name.as_str()) || aliases.iter().any(|a| question.contains(a.as_str()))
+        })
+        .map(|(name, _aliases, src, agg, scope, desc)| {
+            let filter = if scope.is_empty() { String::new() } else { format!("；口径过滤：{scope}") };
+            format!("【{name}】= {agg}，来源表 {src}{filter}。说明：{desc}")
+        })
+        .collect())
 }
 
 pub struct TableCtx {

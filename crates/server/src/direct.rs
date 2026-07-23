@@ -69,14 +69,20 @@ pub fn try_direct(question: &str) -> Option<DirectHit> {
 /// 销售额按维度下钻（0-LLM 确定性模板，口径固化——修复 LLM 下钻拐到营销表算错的问题）。
 /// 连接键已连库坐实：detail.sku_code=t_goods.goods_code、goods.goods_category_code=cat.id。
 fn sales_breakdown(question: &str) -> Option<DirectHit> {
-    // 必须是销售额类 + 时间窗 + 维度
-    if !(question.contains("销售额") || question.contains("销售总额") || question.contains("营业额") || question.contains("卖了多少")) {
+    // 必须是销售额类 + 维度（时间窗可选，无则查全部）
+    if !(question.contains("销售额") || question.contains("销售总额") || question.contains("营业额")
+        || question.contains("卖了多少") || question.contains("业绩") || question.contains("销售业绩"))
+    {
         return None;
     }
-    let time_pred = time_window(question)?.replace("order_time", "o.order_time");
     let dim = detect_sales_dim(question)?;
+    // 有时间窗则加时间过滤，无则查全部（对齐 SuperSonic：问题没提时间就别加）
+    let time_and = match time_window(question) {
+        Some(p) => format!(" AND {}", p.replace("order_time", "o.order_time")),
+        None => String::new(),
+    };
     let base_where = format!(
-        "o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND {time_pred}"
+        "o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199'){time_and}"
     );
     let sql = match dim {
         // 商品分类走明细（金额在明细级）。o 先过滤（时间窗+权限，订单数少）驱动，

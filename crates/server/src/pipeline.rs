@@ -121,12 +121,22 @@ pub async fn generate_sql(
 ) -> anyhow::Result<String> {
     let ctxs = meta::retrieve(pg, question, 6).await?;
     let table_names: Vec<String> = ctxs.iter().map(|c| c.table_name.clone()).collect();
+    let metrics = meta::recall_metrics(pg, question).await.unwrap_or_default();
     let pitfalls = meta::recall_pitfalls(pg, question, &table_names, 6).await?;
     let fewshot = fewshot_block(pg, question).await;
 
     let today = chrono_today();
     let system = build_system_prompt(p, &today);
-    let mut user = String::from("## 可用表结构\n");
+    let mut user = String::new();
+    // 指标口径卡（移植 SuperSonic 语义层）——最高优先级，命中即必须严格遵守，杜绝自选表/算法
+    if !metrics.is_empty() {
+        user.push_str("## 指标口径（问题命中以下指标，必须严格按此口径，禁止自己选表或改算法）\n");
+        for m in &metrics {
+            user.push_str(&format!("- {m}\n"));
+        }
+        user.push('\n');
+    }
+    user.push_str("## 可用表结构\n");
     for c in &ctxs {
         user.push_str(&c.schema_text);
     }
