@@ -205,6 +205,21 @@ function onKey(e: KeyboardEvent) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
 }
 
+// CSV 导出（SuperSonic chat-sdk 气泡脚 ⬇CSV）：从结果 rows 生成 CSV 下载
+function exportCsv(t: Turn) {
+  if (!t.result) return
+  const { columns, rows } = t.result
+  const esc = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`
+  let csv = '﻿' + columns.map(esc).join(',') + '\n' // BOM 防 Excel 中文乱码
+  for (const r of rows) csv += r.map(esc).join(',') + '\n'
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `${(t.question || 'dms-export').slice(0, 20)}.csv`
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
 // 表格：指标列右对齐 + 语义格式化
 function cell(t: Turn, ri: number, ci: number): string {
   const v = t.result!.rows[ri][ci]
@@ -275,7 +290,8 @@ function isMetric(t: Turn, ci: number): boolean {
               <div class="res-meta">
                 <span class="route-badge">{{ routeLabel[t.result.route] || t.result.route }}</span>
                 <span>{{ t.result.row_count }} 行{{ t.result.truncated ? '·截断200' : '' }} · {{ t.result.elapsed_ms }}ms</span>
-                <a class="sql-toggle" @click="t.showSql = !t.showSql">{{ t.showSql ? '隐藏' : '查看' }} SQL</a>
+                <a v-if="t.result.row_count > 0" class="sql-toggle" style="margin-left: auto" @click="exportCsv(t)">⬇ 导出 CSV</a>
+                <a class="sql-toggle" :style="t.result.row_count > 0 ? '' : 'margin-left: auto'" @click="t.showSql = !t.showSql">{{ t.showSql ? '隐藏' : '查看' }} SQL</a>
               </div>
               <pre v-if="t.showSql" class="sql">{{ t.result.sql }}</pre>
 
