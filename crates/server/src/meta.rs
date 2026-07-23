@@ -338,6 +338,10 @@ async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
          "t_winc_stock_report", "SUM(stock_amount)",
          "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)",
          "库存金额必须取最新快照(每日全量快照,直接SUM会累加虚增)"),
+        ("sales_qty", "销量", &["销售量", "出货量", "卖了多少箱", "销售数量"],
+         "t_sales_order_detail(JOIN t_sales_order 有效订单)", "SUM(box_quantity)",
+         "d.item_type = '1'（商品行）",
+         "销量=商品行箱数：item_type分列(1商品行/2赠品/3结算行)，销量只取 item_type='1' 的 box_quantity；须 JOIN t_sales_order 且 o.order_status NOT IN('0','108','199')；detail 有2x重复须先按(单号,sku,数量)去重"),
     ];
     for (code, name, aliases, src, agg, scope, desc) in METRICS {
         sqlx::query(
