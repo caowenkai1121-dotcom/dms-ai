@@ -168,7 +168,16 @@
   few-shot 召回 `status != 'disabled'`（剔除判错的）。CLI `review-pending` 批量复核存量（对齐 SuperSonic 定时扫 pending）。
 - **验收**：单测 48/48；批量复核 20 条→17 enabled+3 disabled；被剔除的正是 M6d 修过的坏 SQL（本月销售额按商品分类用'其他/未分类'全归一——旧 LLM 拐错表产物）+活动台账问题 SQL，复核精准。
 
-## SuperSonic 移植累计（5 件）
+## M6k SuperSonic 深度移植⑥：embed 向量召回（双召回补齐，2026-07-23，已验收）
+- 移植 SuperSonic 双召回的向量半（EmbeddingMapper/MetaEmbeddingService）：词典/trgm 召回不足时，语义向量召回补上。
+- `tools/embed_service.py`：bge-small-zh-v1.5(512维 fastembed 本地自包含)，build 给 meta.table_doc 算 embedding+HNSW 余弦索引，serve :8077 HTTP。
+- `embed.rs`：Rust embed 客户端(reqwest 调 :8077，3s 超时，300s 熔断防挂起)；`to_pgvector` 字面量。
+- `meta::retrieve` 三路召回：关键词强制 + **向量召回(embedding <=> query，HNSW)** + trgm。embed 挂则熔断降级(不阻塞)。
+- 配套补 is_backup_table：_back/_history/_delete_history 结尾 + 6位日期段(YYMMDD)——清掉备份表污染(246→243 表)。
+- **验收**：单测 48/48；口语化问题「顾客都买了些啥东西」「门店铺货」「钱货两清的单据」向量语义召回相关表(词典召回弱)，无备份表污染。
+- ⚠️ 依赖 embed 服务常驻：`python tools/embed_service.py serve 8077`（掉线熔断降级不报错）。
+
+## SuperSonic 移植累计（7 件）
 SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表(M6g)、多会话 conversation(M5c)、rewriteMultiTurn 追问改写(M6h)、MemoryReviewTask 记忆复核(M6i)。
 待搬(需 embed)：向量召回、语义缓存。待搬(纯逻辑)：聚合函数名归一、默认时间范围、术语/维度注册表。
 

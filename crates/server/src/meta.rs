@@ -77,8 +77,13 @@ fn is_backup_table(name: &str) -> bool {
         || name.contains("_copy")
         || name.ends_with("_del_log")
         || name.ends_with("_bak")
+        || name.ends_with("_back")
         || name.ends_with("_backup")
         || name.ends_with("_backups")
+        || name.ends_with("_history")
+        || name.ends_with("_delete_history")
+        // 6 位日期备份段（YYMMDD，如 t_xxx_260515_01）
+        || name.split('_').any(|seg| seg.len() == 6 && seg.chars().all(|c| c.is_ascii_digit()))
         // bak_sales_order_20251016_01 形态：含 8 位日期段
         || name.split('_').any(|seg| seg.len() == 8 && seg.chars().all(|c| c.is_ascii_digit()))
 }
@@ -349,6 +354,31 @@ pub async fn retrieve(pg: &PgPool, question: &str, k: usize) -> anyhow::Result<V
     }
 
     // word_similarity：短问句在长文档中的非对称匹配，中文场景优于 similarity
+    // 向量召回（移植 SuperSonic 双召回的向量半）：语义相似补词典/trgm 不足。embed 挂则降级
+    if let Some(vec) = crate::embed::embed_query(question).await {
+        let vlit = crate::embed::to_pgvector(&vec);
+        let hits: Vec<(String,)> = sqlx::query_as(
+            "SELECT table_name FROM meta.table_doc WHERE embedding IS NOT NULL
+             ORDER BY embedding <=> $1::vector LIMIT $2",
+        )
+        .bind(&vlit)
+        .bind(k as i64)
+        .fetch_all(pg)
+        .await
+        .unwrap_or_default();
+        for (t,) in hits {
+            if out.len() >= k {
+                break;
+            }
+            if out.iter().any(|c| c.table_name == t) {
+                continue;
+            }
+            if let Some(text) = render_schema(pg, &t).await? {
+                out.push(TableCtx { table_name: t, schema_text: text, score: 0.9, forced: false });
+            }
+        }
+    }
+
     let ranked: Vec<(String, f32)> = sqlx::query_as(
         "SELECT table_name, word_similarity($1, search_doc) AS s FROM meta.table_doc
          ORDER BY s DESC LIMIT $2",

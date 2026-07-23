@@ -4,6 +4,7 @@ mod auth;
 mod chat;
 mod corrector;
 mod db;
+mod embed;
 mod direct;
 mod graph;
 mod inject;
