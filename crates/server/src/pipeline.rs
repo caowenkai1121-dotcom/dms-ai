@@ -124,6 +124,7 @@ pub async fn generate_sql(
     let ctxs = meta::retrieve(pg, question, 6).await?;
     let table_names: Vec<String> = ctxs.iter().map(|c| c.table_name.clone()).collect();
     let metrics = meta::recall_metrics(pg, question).await.unwrap_or_default();
+    let terms = meta::recall_terms(pg, question).await.unwrap_or_default();
     let pitfalls = meta::recall_pitfalls(pg, question, &table_names, 6).await?;
     let fewshot = fewshot_block(pg, question).await;
 
@@ -135,6 +136,14 @@ pub async fn generate_sql(
         user.push_str("## 指标口径（问题命中以下指标，必须严格按此口径，禁止自己选表或改算法）\n");
         for m in &metrics {
             user.push_str(&format!("- {m}\n"));
+        }
+        user.push('\n');
+    }
+    // 业务术语（移植 SuperSonic DomainTerms）——帮 LLM 理解黑话
+    if !terms.is_empty() {
+        user.push_str("## 业务术语（问题命中，按此理解）\n");
+        for t in &terms {
+            user.push_str(&format!("- {t}\n"));
         }
         user.push('\n');
     }

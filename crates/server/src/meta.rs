@@ -51,6 +51,13 @@ CREATE TABLE IF NOT EXISTS meta.sql_exemplar(
 );
 -- 复核态（移植 SuperSonic MemoryReviewTask）：pending 未复核 / enabled 复核通过 / disabled 判错剔除
 ALTER TABLE meta.sql_exemplar ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'pending';
+-- 术语注册表（移植 SuperSonic DomainTerms）：业务黑话→标准口径
+CREATE TABLE IF NOT EXISTS meta.term(
+  term text PRIMARY KEY,
+  definition text NOT NULL,
+  aliases text[] NOT NULL DEFAULT '{}',
+  status text NOT NULL DEFAULT 'active'
+);
 -- 指标注册表（移植 SuperSonic 语义层 MetricResp 最小可用）：指标名→口径单一事实源
 CREATE TABLE IF NOT EXISTS meta.metric(
   metric_code text PRIMARY KEY,
@@ -252,7 +259,47 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
         .await?;
     }
     seed_metrics(pg).await?;
+    seed_terms(pg).await?;
     Ok(())
+}
+
+/// 首批业务术语（DomainTerms）：黑话→标准口径，注入 prompt 帮 LLM 理解
+async fn seed_terms(pg: &PgPool) -> anyhow::Result<()> {
+    const TERMS: &[(&str, &str, &[&str])] = &[
+        ("GMV", "成交总额=销售额(SUM(total_amount) 有效订单口径)", &["成交额", "成交总额"]),
+        ("动销", "统计期内有销售记录的商品(在 t_sales_order_detail 出现过的 sku)", &["在售", "有销量"]),
+        ("成交客户数", "下过有效订单的去重客户数 COUNT(DISTINCT customer_code)", &["下单客户数", "成交客户"]),
+        ("复购", "同一客户在统计期内有效订单数≥2(COUNT DISTINCT sales_order_code GROUP BY customer_code HAVING>=2)", &["复购客户", "二次购买"]),
+        ("客单价", "销售额/订单数=SUM(total_amount)/COUNT(DISTINCT sales_order_code)", &["单均", "平均客单"]),
+    ];
+    for (term, def, aliases) in TERMS {
+        sqlx::query(
+            "INSERT INTO meta.term(term, definition, aliases) VALUES ($1,$2,$3)
+             ON CONFLICT (term) DO UPDATE SET definition=$2, aliases=$3",
+        )
+        .bind(term)
+        .bind(def)
+        .bind(aliases.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .execute(pg)
+        .await?;
+    }
+    Ok(())
+}
+
+/// 召回命中的业务术语（问句含术语名/别名）→ 注入 prompt DomainTerms 段
+pub async fn recall_terms(pg: &PgPool, question: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String, String, Vec<String>)> = sqlx::query_as(
+        "SELECT term, definition, aliases FROM meta.term WHERE status = 'active'",
+    )
+    .fetch_all(pg)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(term, _, aliases)| {
+            question.contains(term.as_str()) || aliases.iter().any(|a| question.contains(a.as_str()))
+        })
+        .map(|(term, def, _)| format!("{term} = {def}"))
+        .collect())
 }
 
 /// 首批指标注册（口径全部旧项目连库验证过——单一事实源，根治 LLM 用错表/算错口径）
