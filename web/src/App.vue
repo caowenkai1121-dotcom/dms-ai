@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import BiChart from './BiChart.vue'
 import { fmt, type Semantic } from './format'
 
@@ -25,6 +25,8 @@ interface AskResult {
 const question = ref('')
 const loginName = ref('admin')
 const roleCode = ref('')
+const sessionToken = ref('')      // SSO 换签后的会话 token（端#2 DMS 嵌入）
+const embedded = ref(false)       // 嵌入模式：隐藏登录名输入框
 const loading = ref(false)
 const error = ref('')
 const result = ref<AskResult | null>(null)
@@ -36,6 +38,30 @@ const routeLabel: Record<string, string> = {
 
 const cols = computed(() => result.value?.view.columns ?? [])
 const lastQuestion = ref('')
+
+// 端#2 DMS 嵌入：URL 带 dms_token → SSO 换会话 token（免登）
+onMounted(async () => {
+  const p = new URLSearchParams(location.search)
+  const dmsToken = p.get('dms_token')
+  if (!dmsToken) return
+  embedded.value = true
+  try {
+    const resp = await fetch('/api/sso', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dms_token: dmsToken, role_code: p.get('role') || null }),
+    })
+    const d = await resp.json()
+    if (resp.ok) {
+      sessionToken.value = d.token
+      loginName.value = d.login_name
+    } else {
+      error.value = `SSO 认证失败：${d.error || ''}`
+    }
+  } catch (e) {
+    error.value = `SSO 认证失败：${e}`
+  }
+})
 
 // 下钻：原问题 + "按X" 参数化重问（对齐 SuperSonic onLoadData 追加维度）
 function drill(dim: string) {
@@ -50,10 +76,17 @@ async function ask() {
   error.value = ''
   result.value = null
   try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (sessionToken.value) headers.Authorization = `Bearer ${sessionToken.value}`
     const resp = await fetch('/api/ask', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: question.value, login_name: loginName.value, role_code: roleCode.value || null }),
+      headers,
+      // 会话 token 优先；无 token 时用 login_name（开发/独立模式）
+      body: JSON.stringify({
+        question: question.value,
+        login_name: sessionToken.value ? null : loginName.value,
+        role_code: roleCode.value || null,
+      }),
     })
     const data = await resp.json()
     if (!resp.ok) error.value = data.error || '请求失败'
@@ -84,10 +117,13 @@ const tableData = computed(() =>
       皇家小虎 · DMS 智能取数
     </a-layout-header>
     <a-layout-content style="padding: 24px; max-width: 1120px; margin: 0 auto; width: 100%">
-      <a-space style="margin-bottom: 12px">
+      <a-space v-if="!embedded" style="margin-bottom: 12px">
         <a-input v-model:value="loginName" addon-before="登录名" style="width: 200px" />
         <a-input v-model:value="roleCode" addon-before="角色" placeholder="留空取默认" style="width: 220px" />
       </a-space>
+      <div v-else style="margin-bottom: 12px; color: #888; font-size: 13px">
+        已登录：<b>{{ loginName || '认证中…' }}</b>（DMS 免登）
+      </div>
       <a-input-search
         v-model:value="question"
         placeholder="例如：本月销售额是多少 / 本月销售额前五的省份 / 查一下昨天的订单明细"

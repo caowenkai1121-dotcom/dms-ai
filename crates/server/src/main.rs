@@ -1,5 +1,6 @@
 //! dms-ai 服务端：M0 骨架（/api/health）+ M1 权限内核（principal/scope/inject + scope 判官子命令）。
 
+mod auth;
 mod db;
 mod direct;
 mod graph;
@@ -25,6 +26,7 @@ struct AppState {
     mysql: MySqlPool,
     pg: PgPool,
     llm: llm::LlmClient,
+    dms_base_url: String,
 }
 
 fn llm_client(cfg: &db::Settings) -> llm::LlmClient {
@@ -127,9 +129,15 @@ async fn main() -> anyhow::Result<()> {
     let pg = db::pg_pool(&cfg.pg_url).await?;
     meta::migrate(&pg).await?;
 
-    let state = Arc::new(AppState { mysql, pg, llm: llm_client(&cfg) });
+    let state = Arc::new(AppState {
+        mysql,
+        pg,
+        llm: llm_client(&cfg),
+        dms_base_url: cfg.dms_base_url.clone(),
+    });
     let app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/sso", post(api_sso))
         .route("/api/ask", post(api_ask))
         .with_state(state);
 
@@ -140,25 +148,64 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[derive(serde::Deserialize)]
+struct SsoReq {
+    /// DMS 的 x-access-token（iframe 嵌入时由 DMS 前端透传）
+    dms_token: String,
+    /// DMS 当前激活角色（可选，前端知道）
+    role_code: Option<String>,
+}
+
+/// SSO 换签：验真 DMS token → 颁自有会话 token
+async fn api_sso(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<SsoReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
+    let login_name = auth::verify_dms_token(&st.dms_base_url, &req.dms_token)
+        .await
+        .map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?;
+    let token = auth::issue(login_name.clone(), req.role_code.clone());
+    Ok(Json(serde_json::json!({ "token": token, "login_name": login_name })))
+}
+
+#[derive(serde::Deserialize)]
 struct AskReq {
     question: String,
-    /// M5 前的临时身份传递；SSO 换签后改从会话取
-    login_name: String,
+    /// 开发/内网模式的直接身份传递；生产走 Authorization Bearer 会话 token
+    login_name: Option<String>,
     role_code: Option<String>,
 }
 
 async fn api_ask(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<AskReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
-    let p = principal::load_principal(&st.mysql, &req.login_name, req.role_code.as_deref())
+    // 身份来源优先级：Authorization Bearer 会话 token > body.login_name（开发）
+    let (login_name, role_code) = match bearer(&headers).and_then(|t| auth::resolve(&t)) {
+        Some((ln, rc)) => (ln, rc),
+        None => match req.login_name.clone() {
+            Some(ln) => (ln, req.role_code.clone()),
+            None => return Err(err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name".into())),
+        },
+    };
+    let p = principal::load_principal(&st.mysql, &login_name, role_code.as_deref())
         .await
         .map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
     let r = pipeline::ask(&st.llm, &st.mysql, &st.pg, &p, &req.question)
         .await
         .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     Ok(Json(serde_json::to_value(r).unwrap()))
+}
+
+fn bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(|s| s.to_string())
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {

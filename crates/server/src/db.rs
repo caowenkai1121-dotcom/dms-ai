@@ -17,6 +17,12 @@ pub struct Settings {
     pub llm_model_fast: String,
     #[serde(default)]
     pub llm_model_precise: String,
+    #[serde(default = "default_dms_base")]
+    pub dms_base_url: String,
+}
+
+fn default_dms_base() -> String {
+    "http://1.95.167.10/dms".into()
 }
 
 fn default_listen() -> String {

@@ -89,6 +89,16 @@
 - **验收**：单测 39/39；vue-tsc 过；Playwright 下钻链实测——「本月销售额」KPI卡→点「按省份」→31省单色柱图+表格(广东1424万降序)，chips 更新剔除省份。
 - 注：当前下钻走 LLM 重问（务实版）；SuperSonic 是纯 0-LLM 语义层重查——我方无语义层，SQL 改写下钻通用性差，LLM 重问更稳。dateShift 已有 0-LLM(prev_window)。
 
-## 下一步（M5/M6c）
-- M5 三端打通（DMS SSO 换签+嵌入页；企微应用）——走向最终交付形态。
+## M5a 三端认证 + DMS SSO 嵌入（2026-07-23，已验收）
+- `auth.rs`：会话 token 体系（uuid，12h 闲置 TTL 活跃滑动续期，>1000 项清理）+ DMS token 验真（调 getLoginInfo 拿 loginName）。
+- 端点：`POST /api/sso`（验真 DMS token→颁会话 token）；`POST /api/ask` 身份优先级 = Authorization Bearer 会话 token > body.login_name（开发）。
+- 前端：嵌入 boot（URL dms_token→自动 SSO→隐藏登录框「DMS 免登」）+ ask 带 Bearer。
+- DMS 登录用国密 SM4 ECB（密钥 `1024lab__1024lab` 硬编码）+ 图形验证码（无法自动化，故 SSO 走验真路线不自登录）。
+- **验收**：单测 40/40（+auth issue/resolve）；vue-tsc 过；
+  **SSO 端到端对接生产 DMS**：假 token→getLoginInfo 返回 code 30007→我方正确验真失败透传原因；
+  前端嵌入 boot Playwright 实测（URL dms_token→免登框→自动 SSO→失败提示准确）。
+- 配置指引：docs/EMBED.md（DMS 外链菜单 frameUrl=?dms_token={token}，零 DMS 源码改动嵌入首页）。
+
+## 下一步（M5b/M6c）
+- M5b：企微 OAuth（userid→员工映射→会话 token，corpid wwd8304eb63d2cb14c）；端#1 SM4 登录转发。
 - M6c：图关系+行级权限；实体锚定；语义缓存(接 embed)；SchemaCorrector(执行前幻觉列拦截)；graph sync 定时刷新。
