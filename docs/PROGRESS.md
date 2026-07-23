@@ -99,6 +99,19 @@
   前端嵌入 boot Playwright 实测（URL dms_token→免登框→自动 SSO→失败提示准确）。
 - 配置指引：docs/EMBED.md（DMS 外链菜单 frameUrl=?dms_token={token}，零 DMS 源码改动嵌入首页）。
 
-## 下一步（M5b/M6c）
-- M5b：企微 OAuth（userid→员工映射→会话 token，corpid wwd8304eb63d2cb14c）；端#1 SM4 登录转发。
+## M5b 企微 OAuth 端#3（2026-07-23，已验收）
+- `wework.rs`：access_token(进程内缓存 2h) + code→userid(auth/getuserinfo) + userid→手机号(user/get) + 手机号→t_employee.phone→login_name。
+- `/api/wework/login?code=` → 完整链 → 会话 token → 302 到 `/#token=xxx`（fragment 不进服务端日志）；前端 boot 读 fragment token 免登+清 fragment。
+- 映射依据：**phone 全员覆盖(3515/3515)最可靠**；open_id 是 24 位内部 id 非企微 userid。
+- **验收**：单测 40/40；vue-tsc 过；
+  **企微 API 真调**：gettoken errcode 0 拿到 token；getuserinfo 真调（当前 IP 未白名单→errcode 60020，证明对接正确，生产加 IP 白名单即可）。
+- 配置指引 docs/EMBED.md 企微段（授权链接/回调链/可信 IP 白名单）。
+
+## 三端认证全打通（阶段小结）
+- 端#1 独立 Web：login_name（开发）；端#2 DMS 嵌入：SSO 验真(对接生产 DMS 坐实)；端#3 企微：OAuth(对接企微 API 坐实)。
+- 三端权限计算一致：principal 从 DMS 生产库只读现算，1:1 复刻 @DataScope。
+
+## 下一步（M6c/M5c）
 - M6c：图关系+行级权限；实体锚定；语义缓存(接 embed)；SchemaCorrector(执行前幻觉列拦截)；graph sync 定时刷新。
+- M5c：端#1 SM4 登录转发（密钥 1024lab__1024lab + 图形验证码流程）；企微/DMS 真 token 生产联调。
+- M7 判官门禁：回归题集扩到 ≥50 例；并发；安全审计。

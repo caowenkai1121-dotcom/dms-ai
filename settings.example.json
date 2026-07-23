@@ -5,5 +5,9 @@
   "llm_base_url": "https://api.deepseek.com",
   "llm_api_key": "sk-***",
   "llm_model_fast": "deepseek-v4-flash",
-  "llm_model_precise": "deepseek-v4-pro"
+  "llm_model_precise": "deepseek-v4-pro",
+  "dms_base_url": "http://HOST/dms",
+  "wework_corpid": "ww***",
+  "wework_secret": "***",
+  "wework_agentid": ""
 }

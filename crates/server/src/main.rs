@@ -11,6 +11,7 @@ mod pipeline;
 mod principal;
 mod scope;
 mod viewspec;
+mod wework;
 
 use std::sync::Arc;
 
@@ -27,6 +28,7 @@ struct AppState {
     pg: PgPool,
     llm: llm::LlmClient,
     dms_base_url: String,
+    wework: wework::WeworkCfg,
 }
 
 fn llm_client(cfg: &db::Settings) -> llm::LlmClient {
@@ -134,10 +136,16 @@ async fn main() -> anyhow::Result<()> {
         pg,
         llm: llm_client(&cfg),
         dms_base_url: cfg.dms_base_url.clone(),
+        wework: wework::WeworkCfg {
+            corpid: cfg.wework_corpid.clone(),
+            secret: cfg.wework_secret.clone(),
+            agentid: cfg.wework_agentid.clone(),
+        },
     });
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sso", post(api_sso))
+        .route("/api/wework/login", get(api_wework_login))
         .route("/api/ask", post(api_ask))
         .with_state(state);
 
@@ -166,6 +174,31 @@ async fn api_sso(
         .map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?;
     let token = auth::issue(login_name.clone(), req.role_code.clone());
     Ok(Json(serde_json::json!({ "token": token, "login_name": login_name })))
+}
+
+#[derive(serde::Deserialize)]
+struct WeworkQuery {
+    code: String,
+}
+
+/// 企微 OAuth 回调：code → 员工 → 会话 token，302 重定向前端带 token
+async fn api_wework_login(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<WeworkQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match wework::login_by_code(&st.wework, &st.mysql, &q.code).await {
+        Ok(login_name) => {
+            let token = auth::issue(login_name, None);
+            // 重定向前端，会话 token 走 fragment（不进服务端日志）
+            axum::response::Redirect::to(&format!("/#token={token}")).into_response()
+        }
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]

@@ -39,6 +39,17 @@ const routeLabel: Record<string, string> = {
 const cols = computed(() => result.value?.view.columns ?? [])
 const lastQuestion = ref('')
 
+// 端#3 企微：OAuth 回调 302 → /#token=xxx（fragment 不进服务端日志）
+onMounted(() => {
+  const tm = location.hash.match(/token=([^&]+)/)
+  if (tm) {
+    sessionToken.value = tm[1]
+    embedded.value = true
+    loginName.value = '企微用户'
+    history.replaceState(null, '', location.pathname) // 清 fragment 防泄漏
+  }
+})
+
 // 端#2 DMS 嵌入：URL 带 dms_token → SSO 换会话 token（免登）
 onMounted(async () => {
   const p = new URLSearchParams(location.search)

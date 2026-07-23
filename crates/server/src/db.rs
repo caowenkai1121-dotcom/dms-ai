@@ -19,6 +19,12 @@ pub struct Settings {
     pub llm_model_precise: String,
     #[serde(default = "default_dms_base")]
     pub dms_base_url: String,
+    #[serde(default)]
+    pub wework_corpid: String,
+    #[serde(default)]
+    pub wework_secret: String,
+    #[serde(default)]
+    pub wework_agentid: String,
 }
 
 fn default_dms_base() -> String {

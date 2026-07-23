@@ -36,6 +36,25 @@ DMS 智能助手三端形态：①独立 Web ②DMS 首页嵌入 ③企业微信
 - 前端嵌入 boot：URL dms_token → 隐藏登录框 → 自动 SSO → 失败提示准确。
 - 真 token 成功路径（DMS 登录需图形验证码，无法自动化）：代码逻辑对称，getLoginInfo 返回 data.loginName（LoginService.java:464 getLoginResult）；生产嵌入时由 DMS 前端透传真 token 即可。
 
-## 待做（M5 续）
-- 企微 OAuth：`/api/wework/callback?code=` → 企微 userid → t_employee 映射（手机号/loginName 对照表）→ 会话 token。企微配置：corpid `wwd8304eb63d2cb14c`（secret 在凭证档，不入库）。
+## 端#3 企业微信（已实现）
+
+企微自建应用 OAuth 网页授权：
+
+1. **企微后台配置**（应用管理 → 自建应用）：
+   - 可信域名/网页授权回调域 = 助手 host
+   - **可信 IP**：把助手服务器公网 IP 加入白名单（否则 getuserinfo 报 errcode 60020）
+   - corpid `wwd8304eb63d2cb14c`、secret、agentid（存 settings.json，gitignore 不入库）
+2. **授权链接**（企微工作台点应用图标 / 菜单）：
+   `https://open.weixin.qq.com/connect/oauth2/authorize?appid={corpid}&redirect_uri={助手host}/api/wework/login&response_type=code&scope=snsapi_base&agentid={agentid}#wechat_redirect`
+3. **回调链**（已实现 `wework.rs` + `/api/wework/login`）：
+   `code` → `auth/getuserinfo`(userid) → `user/get`(手机号) → 匹配 `t_employee.phone`(全员覆盖) → login_name → 颁会话 token → 302 到 `/#token=xxx`。
+4. **前端** boot 读 fragment `#token=` → 会话 token（免登，清 fragment 防泄漏）。
+
+### 已验证（2026-07-23）
+- gettoken 真调成功（access_token 拿到，2h 缓存）。
+- getuserinfo 真调（假 code + 当前 IP 未加白名单 → errcode 60020，证明对接正确，生产加 IP 白名单即可）。
+- 映射：t_employee.phone 3515/3515 全覆盖，最可靠（open_id 是内部 id 非企微 userid）。
+
+## 待做
 - 端#1 独立登录：SM4 加密（密钥 `1024lab__1024lab`，DMS 前端同款）转发 DMS `/login`（含验证码流程）。
+- 企微应用可信 IP 白名单（生产部署时配）。
