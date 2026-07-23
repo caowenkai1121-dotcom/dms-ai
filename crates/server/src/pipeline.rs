@@ -22,6 +22,7 @@ pub struct AskResult {
     pub truncated: bool,
     pub elapsed_ms: u128,
     pub route: String,
+    pub view: crate::viewspec::ViewSpec,
 }
 
 const MAX_ROWS: usize = 200;
@@ -246,6 +247,7 @@ pub async fn ask(
             let injected = inject::inject(&hit.sql, &sets)?;
             if let Ok((columns, rows)) = execute(mysql, &injected).await {
                 let row_count = rows.len();
+                let view = crate::viewspec::build(&columns, &rows);
                 return Ok(AskResult {
                     sql: injected,
                     columns,
@@ -254,6 +256,7 @@ pub async fn ask(
                     rows,
                     elapsed_ms: t0.elapsed().as_millis(),
                     route: hit.route,
+                    view,
                 });
             }
             // 确定性 SQL 执行失败（列漂移等）→ 静默回落 LLM
@@ -288,6 +291,7 @@ pub async fn ask(
                     .await;
                 }
                 let row_count = rows.len();
+                let view = crate::viewspec::build(&columns, &rows);
                 return Ok(AskResult {
                     sql: injected,
                     columns,
@@ -296,6 +300,7 @@ pub async fn ask(
                     rows,
                     elapsed_ms: t0.elapsed().as_millis(),
                     route,
+                    view,
                 });
             }
             Err(e) if attempt == 0 => {

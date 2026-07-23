@@ -52,7 +52,17 @@
   限权用户 direct-agg 值 12.9万=LLM 路径值（口径逐字一致），注入✅。
 - 遗留：scope 计算连库慢（限权用户 11s，多在部门/客户集合查询）→ 加进程内缓存（当日过期，对齐 Java Redis）是下一优化点。
 
-## 下一步（M4/M6b）
-- M4 前端 BI 呈现（列语义 showType 图表决策/KPI卡/报告页/多会话/追问）。
-- M6b：scope 缓存提速；实体锚定（商品/客户模糊→编码）；图关系问答走 AGE；语义缓存(接 embed)；code_dict 142 条结果 CASE 翻译。
+## M4 前端 BI 呈现（2026-07-23，基础已验收）
+- 深度参考 SuperSonic chat-sdk（列语义 showType + getMsgContentType 决策树）+ 旧项目 ViewSpec V2 方案（第186轮）。
+- 后端 `viewspec.rs`：列语义推断（role=metric/category/time/id + semantic=money/count/percent/geo/customer/goods/order）
+  + 决策树 build()：①单行全指标→KPI卡 ②单行多列→实体卡 ③时间列+≥2行→趋势线 ④1类别+1指标：≤6全正非%→环形饼/≤50→柱(>18 TOP18收纳) ⑤兜底表格。AskResult 加 view 字段。
+- 前端 `format.ts`（金额万/亿压缩¥、千分位、百分比、省码→省名字典）+ `BiChart.vue`（ECharts 封装：柱渐变/环形/趋势，单色明度纪律、TOP收纳、数值标签）
+  + `App.vue` 按 view.blocks 渲染 KPI卡/实体卡/图表/表格（指标列右对齐+语义格式化）。
+- **验收**：Rust 单测 35/35（viewspec 7）；vue-tsc 通过；Playwright 三形态实测——
+  KPI卡「本月销售额 ¥1.64亿」1060ms、环形图「前五省份」单色明度+省名、表格金额格式化。
+- 坑：饼图默认彩虹→改单色明度阶(榜首最深)；bodyStyle 须对象非字符串；省份存区划码→format 翻名。
+
+## 下一步（M4续/M6b/M5）
+- M4 续（等 probe-ss-view SuperSonic 规格）：KPI 环比 chip/榜首金/下钻交互(requery)/多会话/追问/报告页。
+- M6b：scope 进程内缓存提速；实体锚定；图关系走 AGE；语义缓存(接 embed)。
 - M5 三端打通（DMS SSO 换签+嵌入页；企微应用）。

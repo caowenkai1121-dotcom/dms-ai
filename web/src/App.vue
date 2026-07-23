@@ -1,14 +1,23 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
+import BiChart from './BiChart.vue'
+import { fmt, type Semantic } from './format'
 
+interface ColSpec { name: string; role: string; semantic: Semantic }
+interface Kpi { label: string; value: unknown; semantic: Semantic }
+interface Block {
+  type: 'kpis' | 'entity' | 'chart' | 'table'
+  items?: Kpi[]
+  pairs?: [string, unknown][]
+  kind?: 'bar' | 'line' | 'pie'
+  x?: number
+  y?: number[]
+  top?: number | null
+}
+interface ViewSpec { columns: ColSpec[]; blocks: Block[] }
 interface AskResult {
-  sql: string
-  columns: string[]
-  rows: unknown[][]
-  row_count: number
-  truncated: boolean
-  elapsed_ms: number
-  route: string
+  sql: string; columns: string[]; rows: unknown[][]; row_count: number
+  truncated: boolean; elapsed_ms: number; route: string; view: ViewSpec
 }
 
 const question = ref('')
@@ -19,6 +28,12 @@ const error = ref('')
 const result = ref<AskResult | null>(null)
 const showSql = ref(false)
 
+const routeLabel: Record<string, string> = {
+  'direct-doc': '单号直查', 'direct-agg': '快速聚合', llm: 'AI 生成', 'llm+repair': 'AI 生成(自修)',
+}
+
+const cols = computed(() => result.value?.view.columns ?? [])
+
 async function ask() {
   if (!question.value.trim() || loading.value) return
   loading.value = true
@@ -28,11 +43,7 @@ async function ask() {
     const resp = await fetch('/api/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question: question.value,
-        login_name: loginName.value,
-        role_code: roleCode.value || null,
-      }),
+      body: JSON.stringify({ question: question.value, login_name: loginName.value, role_code: roleCode.value || null }),
     })
     const data = await resp.json()
     if (!resp.ok) error.value = data.error || '请求失败'
@@ -43,50 +54,76 @@ async function ask() {
     loading.value = false
   }
 }
+
+// 表格列（Ant Table）
+const tableCols = computed(() =>
+  cols.value.map((c, i) => ({
+    title: c.name, dataIndex: i, key: i, ellipsis: true,
+    align: c.role === 'metric' ? 'right' : 'left',
+    customRender: ({ text }: { text: unknown }) => fmt(text, c.semantic),
+  }))
+)
+const tableData = computed(() =>
+  (result.value?.rows ?? []).map((r, i) => ({ key: i, ...Object.fromEntries(r.map((v, j) => [j, v])) }))
+)
 </script>
 
 <template>
   <a-layout style="min-height: 100vh">
-    <a-layout-header style="background: #001529; color: #fff; font-size: 18px; font-weight: 600">
-      DMS AI · 智能取数
+    <a-layout-header style="background: #001529; color: #fff; font-size: 18px; font-weight: 600; display: flex; align-items: center">
+      皇家小虎 · DMS 智能取数
     </a-layout-header>
-    <a-layout-content style="padding: 24px; max-width: 1080px; margin: 0 auto; width: 100%">
+    <a-layout-content style="padding: 24px; max-width: 1120px; margin: 0 auto; width: 100%">
       <a-space style="margin-bottom: 12px">
         <a-input v-model:value="loginName" addon-before="登录名" style="width: 200px" />
         <a-input v-model:value="roleCode" addon-before="角色" placeholder="留空取默认" style="width: 220px" />
       </a-space>
       <a-input-search
         v-model:value="question"
-        placeholder="例如：本月销售额是多少 / 查一下昨天的订单明细"
-        enter-button="提问"
-        size="large"
-        :loading="loading"
-        @search="ask"
+        placeholder="例如：本月销售额是多少 / 本月销售额前五的省份 / 查一下昨天的订单明细"
+        enter-button="提问" size="large" :loading="loading" @search="ask"
       />
 
       <a-alert v-if="error" type="error" :message="error" show-icon style="margin-top: 16px" />
 
-      <a-spin :spinning="loading" tip="生成中…" style="margin-top: 16px; display: block">
-        <template v-if="result">
-          <a-card style="margin-top: 16px">
-            <template #title>
-              结果（{{ result.row_count }} 行{{ result.truncated ? '，已截断至 200' : '' }}）
-            </template>
-            <template #extra>
-              <a-tag>{{ result.route }}</a-tag>
-              <a-tag color="blue">{{ result.elapsed_ms }}ms</a-tag>
-              <a @click="showSql = !showSql">{{ showSql ? '隐藏' : '查看' }} SQL</a>
-            </template>
-            <pre v-if="showSql" style="background: #f5f5f5; padding: 12px; overflow-x: auto; font-size: 12px">{{ result.sql }}</pre>
-            <a-table
-              :columns="result.columns.map((c, i) => ({ title: c, dataIndex: i, key: i, ellipsis: true }))"
-              :data-source="result.rows.map((r, i) => ({ key: i, ...Object.fromEntries(r.map((v, j) => [j, v])) }))"
-              :scroll="{ x: true }"
-              size="small"
-              :pagination="{ pageSize: 20 }"
-            />
-          </a-card>
-        </template>
+      <a-spin :spinning="loading" tip="生成中…" style="margin-top: 16px; display: block; min-height: 40px">
+        <div v-if="result">
+          <div style="display: flex; gap: 8px; align-items: center; margin: 16px 0 8px; color: #888; font-size: 13px">
+            <a-tag color="blue">{{ routeLabel[result.route] || result.route }}</a-tag>
+            <span>{{ result.row_count }} 行{{ result.truncated ? '（截断至 200）' : '' }} · {{ result.elapsed_ms }}ms</span>
+            <a style="margin-left: auto" @click="showSql = !showSql">{{ showSql ? '隐藏' : '查看' }} SQL</a>
+          </div>
+          <pre v-if="showSql" style="background: #f5f5f5; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px">{{ result.sql }}</pre>
+
+          <template v-for="(b, bi) in result.view.blocks" :key="bi">
+            <!-- KPI 卡带 -->
+            <div v-if="b.type === 'kpis'" style="display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px">
+              <a-card v-for="(k, ki) in b.items" :key="ki" :bordered="false"
+                style="flex: 1; min-width: 200px; box-shadow: 0 1px 6px rgba(0,0,0,0.08)">
+                <div style="color: #888; font-size: 13px; letter-spacing: 0.05em">{{ k.label }}</div>
+                <div style="font-size: 28px; font-weight: 700; color: #1677ff; margin-top: 6px">{{ fmt(k.value, k.semantic) }}</div>
+              </a-card>
+            </div>
+
+            <!-- 实体卡（单据卡） -->
+            <a-card v-else-if="b.type === 'entity'" title="单据详情" style="margin-bottom: 16px">
+              <a-descriptions bordered size="small" :column="2">
+                <a-descriptions-item v-for="(p, pi) in b.pairs" :key="pi" :label="p[0]">{{ p[1] }}</a-descriptions-item>
+              </a-descriptions>
+            </a-card>
+
+            <!-- 图表 -->
+            <a-card v-else-if="b.type === 'chart'" style="margin-bottom: 16px">
+              <BiChart :kind="b.kind!" :columns="cols" :rows="result.rows" :x="b.x!" :y="b.y!" :top="b.top" />
+            </a-card>
+
+            <!-- 表格 -->
+            <a-card v-else-if="b.type === 'table'" style="margin-bottom: 16px" :body-style="{ padding: '0' }">
+              <a-table :columns="tableCols" :data-source="tableData" :scroll="{ x: true }"
+                size="small" :pagination="{ pageSize: 20, hideOnSinglePage: true }" />
+            </a-card>
+          </template>
+        </div>
       </a-spin>
     </a-layout-content>
   </a-layout>

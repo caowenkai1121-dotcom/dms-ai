@@ -8,6 +8,7 @@ mod meta;
 mod pipeline;
 mod principal;
 mod scope;
+mod viewspec;
 
 use std::sync::Arc;
 
