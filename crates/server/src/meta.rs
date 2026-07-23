@@ -274,6 +274,18 @@ async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
          "t_after_sales_order_header", "COUNT(DISTINCT after_sales_code)",
          "deleted_flag = 0",
          "售后单数（按售后单号去重）"),
+        ("refund_amount", "退款额", &["售后退款", "退款金额", "售后金额"],
+         "t_after_sales_order_header", "SUM(refund_amount)",
+         "deleted_flag = 0",
+         "售后退款金额"),
+        ("stock_qty", "库存量", &["库存数量", "存货量", "库存"],
+         "t_winc_stock_report", "SUM(stock_quantity)",
+         "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)",
+         "库存必须取最新快照(每日全量快照,直接SUM会把多天累加虚增几十倍)"),
+        ("stock_amount", "库存金额", &["库存额", "存货金额", "库存价值"],
+         "t_winc_stock_report", "SUM(stock_amount)",
+         "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)",
+         "库存金额必须取最新快照(每日全量快照,直接SUM会累加虚增)"),
     ];
     for (code, name, aliases, src, agg, scope, desc) in METRICS {
         sqlx::query(
