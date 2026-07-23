@@ -87,7 +87,9 @@ fn build_system_prompt(p: &Principal, today: &str) -> String {
 4. 有 deleted_flag 列的表加 deleted_flag=0；不确定列是否存在就别加。
 5. 时间相对词（本月/上月/今年）基于【今天】用日期函数写；绝不硬编码年份数字。
 6. 明细类查询给 8 列以上业务字段并 ORDER BY 时间 DESC；聚合类不受此限。
-7. 绝不发明占位符（如 '__XX__'、'xxx_PLACEHOLDER'）。"#,
+7. 绝不发明占位符（如 '__XX__'、'xxx_PLACEHOLDER'）。
+8. 时间过滤用比较运算符（列 >= '起' AND 列 < '止'），绝不用 YEAR()/DATE_FORMAT() 包裹列做过滤（包裹后走不了索引，大表全表扫）。
+9. 问题没明确提时间范围时，聚合类不要自行加时间过滤（查全部），除非是"最近/趋势"类语义。"#,
         p.actual_name, p.login_name, p.employee_id
     )
 }
