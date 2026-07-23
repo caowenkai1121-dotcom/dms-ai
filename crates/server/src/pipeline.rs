@@ -65,10 +65,19 @@ pub fn is_safe_select(sql: &str) -> anyhow::Result<()> {
         anyhow::bail!("只允许 SELECT");
     }
     let lower = sql.to_lowercase();
-    for kw in ["login_pwd", "password", "into outfile", "into dumpfile"] {
+    // 🔴 只读红线（移植 deepagents text-to-sql-agent 硬拦范式）：AST 之外的显式第二道防线。
+    // DMS 生产库只读是铁律——DML/DDL 一律拦（尾空格避免误伤 deleted_flag/created_time/updated_time）。
+    const FORBIDDEN: &[&str] = &[
+        "insert ", "update ", "delete ", "drop ", "alter ", "truncate ",
+        "create ", "replace ", "merge ", "grant ", "revoke ", "into outfile", "into dumpfile",
+    ];
+    for kw in FORBIDDEN {
         if lower.contains(kw) {
-            anyhow::bail!("SQL 含禁用项: {kw}");
+            anyhow::bail!("只读红线：禁止写操作 [{}]", kw.trim());
         }
+    }
+    if lower.contains("login_pwd") || lower.contains("password") {
+        anyhow::bail!("SQL 含敏感列");
     }
     // 占位符幻觉防线（旧项目实证：LLM 会编 '__ORDER_CODE__'/'xxx_PLACEHOLDER' 恒空自信答 0）
     if lower.contains("__") && lower.contains("'") {
@@ -728,6 +737,16 @@ mod tests {
     fn rejects_placeholder() {
         assert!(is_safe_select("SELECT * FROM t WHERE code = '__ORDER_CODE__'").is_err());
         assert!(is_safe_select("SELECT * FROM t WHERE code = 'X_PLACEHOLDER'").is_err());
+    }
+
+    #[test]
+    fn readonly_redline() {
+        // 只读红线：DML/DDL 硬拦
+        assert!(is_safe_select("DELETE FROM t_sales_order").is_err());
+        assert!(is_safe_select("DROP TABLE t").is_err());
+        assert!(is_safe_select("UPDATE t SET a=1").is_err());
+        // 但 deleted_flag/created_time/updated_time 列名不误伤
+        assert!(is_safe_select("SELECT deleted_flag, created_time, updated_time FROM t_sales_order WHERE deleted_flag = 0").is_ok());
     }
 
     #[test]
