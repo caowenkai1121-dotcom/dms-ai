@@ -111,6 +111,14 @@
 - 端#1 独立 Web：login_name（开发）；端#2 DMS 嵌入：SSO 验真(对接生产 DMS 坐实)；端#3 企微：OAuth(对接企微 API 坐实)。
 - 三端权限计算一致：principal 从 DMS 生产库只读现算，1:1 复刻 @DataScope。
 
+## M4d 界面重构：复刻旧 V1「皇家小虎·数据智能」对话流 BI（2026-07-23，已验收，用户指定）
+- 参考旧 dms-copilot `static/index.html`（V1 成熟单文件前端）的设计语言与布局，用 Vue3 复刻。
+- `theme.css`：靛蓝 #4051d3 主题 tokens（明暗双主题，brand-ink 渐变/shadow/radius 体系）。
+- App.vue 重构为**对话流 ChatBI**：左侧栏（🐯皇家小虎 logo+明暗切换/会话历史/健康点+🔒纯查询模式）+ 主区（数据智能 brand 顶栏/气泡对话流/快捷 pill/输入栏 Enter 发送）。
+- 气泡内结果面板：meta 行(路由 badge+行数+耗时+查看SQL) + KPI 卡(顶部靛蓝渐变条+大数字+环比chip) + 实体卡 + 图表卡 + double-bezel 表格(品牌底线+hover 强调条+斑马) + 下钻 chips。移除 AntDesignVue，纯自制 UI 对齐 V1。
+- **验收**：vue-tsc 过；Playwright 明暗双主题实测——本月销售额→气泡 KPI 卡 ¥1.66亿 ▼8.4%较上月 321ms+下钻 chips；暗色深空底协调。
+- 🔴 修真 bug：Vue3 深响应式下 `push(obj)` 后数组存 reactive 代理，改原始引用不触发更新→改用 `turns.value[len-1]` 取代理引用（否则 loading 永不清、结果不渲染）；fetch 加 100s AbortController 超时兜底(防 LLM 挂起永久 loading)。
+
 ## 下一步（M6c/M5c）
 - M6c：图关系+行级权限；实体锚定；语义缓存(接 embed)；SchemaCorrector(执行前幻觉列拦截)；graph sync 定时刷新。
 - M5c：端#1 SM4 登录转发（密钥 1024lab__1024lab + 图形验证码流程）；企微/DMS 真 token 生产联调。
