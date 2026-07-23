@@ -35,16 +35,73 @@ const routeLabel: Record<string, string> = {
 }
 const QUICK = ['本月销售额是多少', '本月销售额前五的省份', '买过烤肠的客户有哪些', '查一下昨天的订单明细', '各区域经理业绩']
 
+interface Conv { id: number; title: string; time: string }
+
 const question = ref('')
 const loginName = ref('admin')
 const roleCode = ref('')
 const sessionToken = ref('')
 const embedded = ref(false)
 const turns = ref<Turn[]>([])
+const convs = ref<Conv[]>([])        // 会话列表（一个会话含多轮）
+const curConvId = ref<number | null>(null)
 const chatEl = ref<HTMLElement>()
 const health = ref('检查中…')
 const healthOk = ref(false)
 const theme = ref(localStorage.getItem('theme') || 'light')
+
+function authHeaders(json = true): Record<string, string> {
+  const h: Record<string, string> = {}
+  if (json) h['Content-Type'] = 'application/json'
+  if (sessionToken.value) h.Authorization = `Bearer ${sessionToken.value}`
+  return h
+}
+function loginQuery(): string {
+  return sessionToken.value ? '' : `?login_name=${encodeURIComponent(loginName.value)}`
+}
+
+async function loadConvs() {
+  try {
+    const r = await (await fetch(`/api/convs${loginQuery()}`, { headers: authHeaders(false) })).json()
+    convs.value = r.convs || []
+  } catch { convs.value = [] }
+}
+
+// 新建会话（后端建 conv，切过去，清空对话流）
+async function newSession() {
+  try {
+    const r = await (await fetch('/api/conv/new', {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ login_name: sessionToken.value ? null : loginName.value }),
+    })).json()
+    curConvId.value = r.id
+    turns.value = []
+    question.value = ''
+    await loadConvs()
+  } catch (e) { pushError(`新建会话失败：${e}`) }
+}
+
+// 打开会话：回放该会话所有消息
+async function openConv(id: number) {
+  if (id === curConvId.value) return
+  curConvId.value = id
+  turns.value = []
+  try {
+    const r = await (await fetch(`/api/conv/${id}`, { headers: authHeaders(false) })).json()
+    for (const m of r.msgs || []) {
+      if (m.role === 'user') turns.value.push({ role: 'user', question: m.question })
+      else turns.value.push({ role: 'ai', result: m.result || undefined })
+    }
+    scrollDown()
+  } catch (e) { pushError(`打开会话失败：${e}`) }
+}
+
+async function delConv(id: number, ev: Event) {
+  ev.stopPropagation()
+  await fetch(`/api/conv/${id}${loginQuery()}`, { method: 'DELETE', headers: authHeaders(false) })
+  if (id === curConvId.value) { curConvId.value = null; turns.value = [] }
+  await loadConvs()
+}
 
 function applyTheme() {
   document.documentElement.setAttribute('data-theme', theme.value)
@@ -64,6 +121,7 @@ onMounted(() => {
     history.replaceState(null, '', location.pathname)
   }
   checkHealth()
+  loadConvs()
 })
 
 // 端#2 DMS 嵌入：URL dms_token → SSO
@@ -101,33 +159,29 @@ async function scrollDown() {
   chatEl.value?.scrollTo({ top: chatEl.value.scrollHeight, behavior: 'smooth' })
 }
 
-function newSession() {
-  turns.value = []
-  question.value = ''
-}
-
 async function send(q?: string) {
   const text = (q ?? question.value).trim()
   if (!text) return
-  const ai = turns.value.find((t) => t.loading)
-  if (ai) return // 有进行中的问答
+  if (turns.value.find((t) => t.loading)) return // 有进行中的问答
+  // 无当前会话则先建一个（同一会话内多轮归一，不再一问一会话）
+  if (curConvId.value == null) {
+    await newSession()
+  }
   turns.value.push({ role: 'user', question: text })
   turns.value.push({ role: 'ai', loading: true })
-  // 取数组里的 reactive 代理（深响应式下改原始引用不触发更新）
   const aiTurn = turns.value[turns.value.length - 1]
   question.value = ''
   scrollDown()
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 100000) // 100s 兜底，防 LLM 挂起永久 loading
+  const timer = setTimeout(() => ctrl.abort(), 100000)
   try {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-    if (sessionToken.value) headers.Authorization = `Bearer ${sessionToken.value}`
     const resp = await fetch('/api/ask', {
-      method: 'POST', headers, signal: ctrl.signal,
+      method: 'POST', headers: authHeaders(), signal: ctrl.signal,
       body: JSON.stringify({
         question: text,
         login_name: sessionToken.value ? null : loginName.value,
         role_code: roleCode.value || null,
+        conv_id: curConvId.value,
       }),
     })
     const data = await resp.json()
@@ -139,6 +193,7 @@ async function send(q?: string) {
     clearTimeout(timer)
     aiTurn.loading = false
     scrollDown()
+    loadConvs() // 刷新侧栏标题/时间
   }
 }
 
@@ -172,8 +227,12 @@ function isMetric(t: Turn, ci: number): boolean {
         <div class="sec-t">会话 <button class="btn-sm" @click="newSession">+ 新建</button></div>
       </div>
       <div class="hist">
-        <div v-if="!turns.length" class="hist-empty">开始提问，会话记录显示在这里</div>
-        <div v-for="(t, i) in turns.filter(x => x.role === 'user')" :key="i" class="hist-item">{{ t.question }}</div>
+        <div v-if="!convs.length" class="hist-empty">还没有会话，点「+ 新建」或直接提问</div>
+        <div v-for="c in convs" :key="c.id" class="hist-item" :class="{ active: c.id === curConvId }" @click="openConv(c.id)">
+          <span class="hi-title">{{ c.title }}</span>
+          <span class="hi-time">{{ c.time }}</span>
+          <button class="hi-del" title="删除会话" @click="delConv(c.id, $event)">×</button>
+        </div>
       </div>
       <div class="sec side-ft">
         <div class="health"><span class="dot" :class="{ ok: healthOk }"></span>{{ health }}</div>
@@ -191,7 +250,7 @@ function isMetric(t: Turn, ci: number): boolean {
           <input v-model="roleCode" class="mini-inp" placeholder="角色(默认)" style="width: 120px" />
         </template>
         <span v-else class="dms-user">已登录 <b>{{ loginName || '认证中…' }}</b> · DMS 免登</span>
-        <button class="btn-sm" @click="newSession">清空对话</button>
+        <button class="btn-sm" @click="newSession">+ 新会话</button>
       </div>
 
       <div class="chat" ref="chatEl">
@@ -300,8 +359,14 @@ function isMetric(t: Turn, ci: number): boolean {
 .sec-t { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: .4px; display: flex; align-items: center; justify-content: space-between; }
 .hist { flex: 1; overflow-y: auto; padding: 8px 10px; min-height: 0; }
 .hist-empty { font-size: 12px; color: var(--text-faint); padding: 8px; }
-.hist-item { font-size: 13px; color: var(--text-regular); padding: 7px 10px; border-radius: var(--radius-md); cursor: default; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hist-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-regular); padding: 7px 10px; border-radius: var(--radius-md); cursor: pointer; }
 .hist-item:hover { background: var(--bg-hover); }
+.hist-item.active { background: var(--primary-light); color: var(--primary); }
+.hist-item .hi-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hist-item .hi-time { font-size: 11px; color: var(--text-faint); flex-shrink: 0; }
+.hist-item .hi-del { opacity: 0; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 15px; line-height: 1; flex-shrink: 0; }
+.hist-item:hover .hi-del { opacity: 1; }
+.hist-item .hi-del:hover { color: var(--error-text); }
 .side-ft { margin-top: auto; }
 .health { font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 6px; }
 .health .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }

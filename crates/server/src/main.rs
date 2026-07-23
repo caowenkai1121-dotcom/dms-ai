@@ -1,6 +1,7 @@
 //! dms-ai 服务端：M0 骨架（/api/health）+ M1 权限内核（principal/scope/inject + scope 判官子命令）。
 
 mod auth;
+mod chat;
 mod corrector;
 mod db;
 mod direct;
@@ -141,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
     let mysql = db::mysql_pool(&cfg.mysql_url).await?;
     let pg = db::pg_pool(&cfg.pg_url).await?;
     meta::migrate(&pg).await?;
+    chat::migrate(&pg).await?;
 
     let state = Arc::new(AppState {
         mysql,
@@ -158,6 +160,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sso", post(api_sso))
         .route("/api/wework/login", get(api_wework_login))
         .route("/api/ask", post(api_ask))
+        .route("/api/convs", get(api_convs))
+        .route("/api/conv/new", post(api_conv_new))
+        .route("/api/conv/{id}", get(api_conv_msgs).delete(api_conv_delete))
         .with_state(state);
 
     tracing::info!("dms-ai server listening on {}", cfg.listen);
@@ -218,6 +223,16 @@ struct AskReq {
     /// 开发/内网模式的直接身份传递；生产走 Authorization Bearer 会话 token
     login_name: Option<String>,
     role_code: Option<String>,
+    /// 归属会话 id（多轮问答存进同一会话）
+    conv_id: Option<i64>,
+}
+
+/// 从 header/body 解析身份（Bearer 会话 token 优先，回退 login_name）
+fn resolve_identity(headers: &axum::http::HeaderMap, ln: &Option<String>, rc: &Option<String>) -> Option<(String, Option<String>)> {
+    match bearer(headers).and_then(|t| auth::resolve(&t)) {
+        Some((l, r)) => Some((l, r)),
+        None => ln.clone().map(|l| (l, rc.clone())),
+    }
 }
 
 async fn api_ask(
@@ -226,21 +241,70 @@ async fn api_ask(
     Json(req): Json<AskReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
-    // 身份来源优先级：Authorization Bearer 会话 token > body.login_name（开发）
-    let (login_name, role_code) = match bearer(&headers).and_then(|t| auth::resolve(&t)) {
-        Some((ln, rc)) => (ln, rc),
-        None => match req.login_name.clone() {
-            Some(ln) => (ln, req.role_code.clone()),
-            None => return Err(err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name".into())),
-        },
-    };
+    let (login_name, role_code) = resolve_identity(&headers, &req.login_name, &req.role_code)
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name".into()))?;
     let p = principal::load_principal(&st.mysql, &login_name, role_code.as_deref())
         .await
         .map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
     let r = pipeline::ask(&st.llm, &st.mysql, &st.pg, &p, &req.question)
         .await
         .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    Ok(Json(serde_json::to_value(r).unwrap()))
+    let payload = serde_json::to_value(&r).unwrap();
+    // 存会话消息（用户问 + AI 结果），首问顺手设标题
+    if let Some(cid) = req.conv_id {
+        let _ = chat::save_msg(&st.pg, cid, "user", &req.question, None).await;
+        let _ = chat::save_msg(&st.pg, cid, "ai", &req.question, Some(&payload)).await;
+    }
+    Ok(Json(payload))
+}
+
+#[derive(serde::Deserialize)]
+struct ConvQuery {
+    login_name: Option<String>,
+}
+
+async fn api_convs(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ConvQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (login, _) = resolve_identity(&headers, &q.login_name, &None)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "未认证" }))))?;
+    let convs = chat::list_convs(&st.pg, &login).await.unwrap_or_default();
+    Ok(Json(serde_json::json!({ "convs": convs })))
+}
+
+async fn api_conv_new(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(q): Json<ConvQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (login, _) = resolve_identity(&headers, &q.login_name, &None)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "未认证" }))))?;
+    let id = chat::new_conv(&st.pg, &login)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))))?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+async fn api_conv_msgs(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let msgs = chat::conv_msgs(&st.pg, id).await.unwrap_or_default();
+    Ok(Json(serde_json::json!({ "msgs": msgs })))
+}
+
+async fn api_conv_delete(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    axum::extract::Query(q): axum::extract::Query<ConvQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (login, _) = resolve_identity(&headers, &q.login_name, &None)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "未认证" }))))?;
+    let _ = chat::delete_conv(&st.pg, id, &login).await;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 fn bearer(headers: &axum::http::HeaderMap) -> Option<String> {

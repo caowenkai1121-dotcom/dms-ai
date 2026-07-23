@@ -150,6 +150,12 @@
 已移植：SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表+口径注入(M6g)、ViewSpec 图表决策/KPI环比/下钻(早期)、few-shot(trgm)、权限注入。
 待移植(按需)：聚合函数名归一、默认时间范围、自一致性投票(成本高跳过)、维度/术语注册表、embed 向量召回、记忆复核闭环。
 
+## M5c 多会话持久化（2026-07-23，已验收，用户反复反馈）
+- 修复「一问一会话」错误模型：一个会话(conv)含多轮问答(msg)，侧栏列会话(非单个问题)，对齐 SuperSonic conversation。
+- 后端 `chat.rs`：PG chat.conv/chat.msg（按 login_name 归属，级联删除）；端点 GET /api/convs、POST /api/conv/new、GET /api/conv/{id}(回放)、DELETE /api/conv/{id}；ask 带 conv_id 存 user+ai 消息(payload=结果 jsonb)，首问设标题(前18字)。
+- 前端 App.vue：convs 列表 + curConvId；侧栏列会话(标题+时间+删除, 当前高亮)；新建=建 conv 切过去清空；点击=回放 msgs 重建 turns；send 无会话先建、带 conv_id、成功刷侧栏。归属校验防越权。
+- **验收**：vue-tsc 过；Playwright 实测——同会话内「本月销售额」「今天销售额」两问归**一条会话**(两轮对话)，侧栏一条(标题=首问)；新建→侧栏两条(新会话空+旧会话)、主区回欢迎语、当前高亮；切换回放/删除工作。
+
 ## 下一步（M6c/M7）
 - 指标注册表扩充(库存/售后率/毛利等) + 维度注册表；embed 向量召回激活。
 - M7 判官门禁：回归题集 ≥50 例 + 并发 + 安全审计。
