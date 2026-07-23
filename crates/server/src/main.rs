@@ -1,6 +1,7 @@
 //! dms-ai 服务端：M0 骨架（/api/health）+ M1 权限内核（principal/scope/inject + scope 判官子命令）。
 
 mod auth;
+mod corrector;
 mod db;
 mod direct;
 mod graph;
@@ -58,6 +59,16 @@ async fn main() -> anyhow::Result<()> {
         let (nt, nc) = meta::sync_schema(&mysql, &pg).await?;
         meta::seed(&pg).await?;
         println!("{}", serde_json::json!({ "tables": nt, "columns": nc }));
+        return Ok(());
+    }
+
+    // 子命令：check-sql "<sql>" —— SchemaCorrector 字段校验冒烟
+    if args.len() >= 3 && args[1] == "check-sql" {
+        let pg = db::pg_pool(&cfg.pg_url).await?;
+        match corrector::schema_check(&pg, &args[2]).await? {
+            Some(hint) => println!("发现幻觉列:\n{hint}"),
+            None => println!("OK 字段全部合法"),
+        }
         return Ok(());
     }
 

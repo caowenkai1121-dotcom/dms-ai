@@ -297,6 +297,14 @@ pub async fn ask(
     let mut sql = generate_sql(llm, pg, p, question).await?;
     let mut route = "llm".to_string();
 
+    // SchemaCorrector（移植 SuperSonic）：执行前字段白名单校验，幻觉列携真实列清单自修一次
+    if let Ok(Some(hint)) = crate::corrector::schema_check(pg, &ensure_limit(&sql)).await {
+        if let Ok(fixed) = repair(llm, pg, p, question, &sql, &hint).await {
+            sql = fixed;
+            route = "llm+schema-fix".into();
+        }
+    }
+
     for attempt in 0..2 {
         let candidate = ensure_limit(&sql);
         if let Err(e) = is_safe_select(&candidate) {

@@ -127,7 +127,20 @@
 - 商品分类模板提速：o 先过滤(本月订单少)驱动 JOIN detail 相关连接(sales_order_code 索引)，避免 detail 277万全表去重(曾 60s 超时→10s)。
 - **验收**：单测 41/41(+sales_breakdown_dims)；连库 Q1 direct-agg 10s 正确；Q3 明细→table；Playwright 下钻链+暗色主题实测。
 
-## 下一步（M6c/M5c）
+## M6e SuperSonic 深度移植①：SchemaCorrector 字段白名单校验（2026-07-23，已验收）
+- ss-corrector agent 源码级深挖 SuperSonic Corrector 全家，产出移植规格（commit de60be3）。核心结论：控幻觉=LLM 产 SQL→纯 AST 校正器按字典掰回合法形态。
+- 移植最高价值件 **SchemaCorrector.correctFieldName**（`corrector.rs`）：sqlparser visitor 提取「表别名→表」+「前缀.列」引用，对 meta.column_doc 真实列清单校验，
+  幻觉列（前缀映射到 meta 已知物理表但列不存在）→ 携该表**真实可用列清单**自修一次（比执行报 1054 更早+纠正更准）。派生表/CTE 别名列、裸列、中文别名跳过防误伤。
+- pipeline：generate→schema_check→有幻觉则 repair(hint)→execute，route=llm+schema-fix。
+- **验收**：单测 44/44；CLI 连库实测——幻觉列 receiver_name(真名 receiver)拦截+列清单、幻觉外键 category_code(真名 goods_category_code)拦截、正常 SQL/派生表别名不误伤。命中旧项目两真坑(幽灵列/幻觉外键)。
+- SuperSonic Corrector 移植清单（ss-corrector 规格，P0 可直接移植/无需语义层）：
+  ①字段白名单校验✅ ②聚合函数名归一 ③group by 补全 ④select 补 groupby 字段+去重 ⑤自一致性投票(N次多数表决) ⑥默认时间范围+补下界 ⑦关键词→聚合/时间规则抽取 ⑧权限注入✅(已有) ⑨prompt 硬规则+结构化 schema 串。
+  待做 P1(需轻量元数据)：值链接纠正、指标 defaultAgg 展开。
+
+## 下一步（SuperSonic 移植续/M6c）
+- Corrector 续：group by 补全、自一致性投票、默认时间范围。
+- 语义层（等 ss-semantic 规格）：指标/维度/术语注册表 + 术语路由（根治 Q1 类用错表）。
+- embed 向量召回激活（vector 列已预留）。
 - M6c：图关系+行级权限；实体锚定；语义缓存(接 embed)；SchemaCorrector(执行前幻觉列拦截)；graph sync 定时刷新。
 - M5c：端#1 SM4 登录转发（密钥 1024lab__1024lab + 图形验证码流程）；企微/DMS 真 token 生产联调。
 - M7 判官门禁：回归题集扩到 ≥50 例；并发；安全审计。
