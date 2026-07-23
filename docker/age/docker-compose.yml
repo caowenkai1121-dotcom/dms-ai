@@ -1,0 +1,16 @@
+services:
+  dms-ai-pg:
+    build: .
+    container_name: dms-ai-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: dmsai_pg_2026
+      POSTGRES_DB: dms_ai
+    ports:
+      - "15433:5432"
+    volumes:
+      - dms_ai_pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  dms_ai_pgdata:

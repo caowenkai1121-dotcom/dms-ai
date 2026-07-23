@@ -1,0 +1,5 @@
+{
+  "mysql_url": "mysql://USER:PASSWORD@HOST:3306/xh_dms",
+  "pg_url": "postgres://postgres:PASSWORD@localhost:15433/dms_ai",
+  "listen": "127.0.0.1:8100"
+}
