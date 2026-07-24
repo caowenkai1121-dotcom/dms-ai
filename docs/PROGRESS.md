@@ -214,6 +214,12 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
+## M7c M6c 收尾：AGE 图 nightly 定时刷新（2026-07-24）
+- 服务启动 spawn 图刷新循环：`secs_until_next_3am` 算下个本地 03:00（chrono::Local，DST/歧义兜底 1h），睡到低谷期一次性全量重建（~4min，MySQL 只读聚合无压力）。
+- 失败记 warn 次日重试不拖垮服务；结果落 `AppState.graph_status`（Arc<Mutex<String>>），`/api/health` 新增 `graph_sync` 字段可观测（never/ok 时间戳 三元组/fail 原因）。
+- 设计说明：图无行级权限仍仅全权限用户走图前置（M6b 语义不变）；当日增量订单次日 03:00 补齐，图问答为关系型场景（买过X的客户）对时效不敏感。
+- 验收：cargo check 过；单测 +1（next_3am 必在 (60s,24h]）（20 轮门禁批量跑+health 实测）。
+
 ## M7b SuperSonic 深度移植⑫：ValueLinker 值链接纠正（2026-07-24）
 - 移植 SuperSonic 值链接（SchemaMapper value mapping）：编码列上「中文名直写」确定性换码，直击 pitfall 反复出现的真坑——`invoice_status='已开票'` 必返 0 行（库存码 2）、`paid_way='可开票余额支付'` 等值必返 0 行（真库逗号组合值须 LIKE）。
 - `meta.value_map` 码表（表,列,中文名,码,match_kind）：种子 11 组全部来自 pitfall 已坐实教训——invoice_status(11码)/invoice_type(普专票)/order_status(暂存0/无效108/作废199)/paid_way(ZX01等值+余额类like)/balance_type(5码,在线支付15/99歧义不收录)/bill_status/account_mode/item_type(1商品2赠品3结算)。

@@ -32,6 +32,8 @@ struct AppState {
     llm: llm::LlmClient,
     dms_base_url: String,
     wework: wework::WeworkCfg,
+    /// AGE 图最近定时刷新结果（健康检查可见）
+    graph_status: Arc<std::sync::Mutex<String>>,
 }
 
 fn llm_client(cfg: &db::Settings) -> llm::LlmClient {
@@ -154,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
     meta::migrate(&pg).await?;
     chat::migrate(&pg).await?;
 
+    let graph_status = Arc::new(std::sync::Mutex::new(String::from("never")));
     let state = Arc::new(AppState {
         mysql,
         pg,
@@ -164,7 +167,37 @@ async fn main() -> anyhow::Result<()> {
             secret: cfg.wework_secret.clone(),
             agentid: cfg.wework_agentid.clone(),
         },
+        graph_status: graph_status.clone(),
     });
+
+    // M6c：AGE 图 nightly 定时刷新（本地 03:00 低谷期，一次性全量重建 ~4min；
+    // 失败记 warn 次日重试，不影响服务）。图数据当日增量靠次日刷新补齐。
+    {
+        let mysql = state.mysql.clone();
+        let pg = state.pg.clone();
+        tokio::spawn(async move {
+            loop {
+                let wait = secs_until_next_3am();
+                tracing::info!("graph sync 定时刷新：{wait}s 后（下个本地 03:00）执行");
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                tracing::info!("graph sync 定时刷新开始");
+                let msg = match graph::sync(&mysql, &pg).await {
+                    Ok((c, g, e)) => {
+                        format!("ok {} customers={c} goods={g} edges={e}", chrono::Local::now().format("%F %T"))
+                    }
+                    Err(e) => {
+                        format!("fail {} {e}", chrono::Local::now().format("%F %T"))
+                    }
+                };
+                if msg.starts_with("ok") {
+                    tracing::info!("graph sync 完成：{msg}");
+                } else {
+                    tracing::warn!("graph sync 失败（次日重试）：{msg}");
+                }
+                *graph_status.lock().unwrap() = msg;
+            }
+        });
+    }
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sso", post(api_sso))
@@ -322,6 +355,19 @@ async fn api_conv_delete(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// 距下一个本地 03:00 的秒数（AGE 图 nightly 刷新，对齐业务低谷）
+fn secs_until_next_3am() -> u64 {
+    let now = chrono::Local::now();
+    let Some(t3) = now.date_naive().and_hms_opt(3, 0, 0) else {
+        return 3600;
+    };
+    let Some(today3) = t3.and_local_timezone(chrono::Local).single() else {
+        return 3600;
+    };
+    let target = if now < today3 { today3 } else { today3 + chrono::Duration::days(1) };
+    (target - now).num_seconds().max(60) as u64
+}
+
 fn bearer(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)?
@@ -331,8 +377,7 @@ fn bearer(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let mysql_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
+async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {    let mysql_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(&st.mysql)
         .await
         .is_ok();
@@ -350,5 +395,16 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "ok": mysql_ok && mysql_readonly && !pg_exts.is_empty(),
         "mysql": { "connected": mysql_ok, "session_read_only": mysql_readonly },
         "pg": { "extensions": pg_exts },
+        "graph_sync": st.graph_status.lock().map(|s| s.clone()).unwrap_or_default(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn next_3am_within_a_day() {
+        // 下次 03:00 必在 (60s, 24h] 内
+        let s = super::secs_until_next_3am();
+        assert!((60..=24 * 3600).contains(&s), "{s}");
+    }
 }
