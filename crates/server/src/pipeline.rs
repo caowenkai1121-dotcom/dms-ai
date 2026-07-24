@@ -474,6 +474,10 @@ async fn ask_single(
     if let Ok(Some(fixed)) = crate::corrector::correct_agg(pg, question, &sql).await {
         sql = fixed;
     }
+    // ValueLinker（移植 SuperSonic 值链接）：编码列中文名直写确定性换码（写中文名必返 0 行的真坑）
+    if let Ok(Some(fixed)) = crate::corrector::correct_value(pg, &sql).await {
+        sql = fixed;
+    }
 
     for attempt in 0..2 {
         let candidate = ensure_limit(&sql);

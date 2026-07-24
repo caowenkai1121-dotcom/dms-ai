@@ -214,6 +214,13 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
+## M7b SuperSonic 深度移植⑫：ValueLinker 值链接纠正（2026-07-24）
+- 移植 SuperSonic 值链接（SchemaMapper value mapping）：编码列上「中文名直写」确定性换码，直击 pitfall 反复出现的真坑——`invoice_status='已开票'` 必返 0 行（库存码 2）、`paid_way='可开票余额支付'` 等值必返 0 行（真库逗号组合值须 LIKE）。
+- `meta.value_map` 码表（表,列,中文名,码,match_kind）：种子 11 组全部来自 pitfall 已坐实教训——invoice_status(11码)/invoice_type(普专票)/order_status(暂存0/无效108/作废199)/paid_way(ZX01等值+余额类like)/balance_type(5码,在线支付15/99歧义不收录)/bill_status/account_mode/item_type(1商品2赠品3结算)。
+- `corrector.rs` Linker（sqlparser **VisitMut**）：`col='名'`（含镜像）→eq 换码 / like 列改写 `LIKE '%码%'`；`IN('名1','名2')` 逐项换（like 列跳过）；门控=带前缀且前缀映射 meta 已知表，裸列/已是码/码表无名全不动。
+- pipeline 接线：correct_agg 后 correct_value（AST 校正链：schema→groupby→agg→value，全确定性 0-LLM）。
+- 验收：cargo check 过；单测 +8（eq/镜像/like改写/IN逐项/like列IN跳过/裸列不动/已是码不动/无名不动）（20 轮门禁批量跑）。
+
 ## M7a 注册表扩充②：开票/活动指标 + 品牌维度（2026-07-24，口径 PG 元数据+码表教训坐实）
 - 坐实方式：本地 PG meta.column_doc（MySQL information_schema 采集）+ meta.pitfall 码表教训，不猜口径。
 - 指标 +3：

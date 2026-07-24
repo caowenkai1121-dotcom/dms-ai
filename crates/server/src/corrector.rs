@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use core::ops::ControlFlow;
-use sqlparser::ast::{Expr, TableFactor, Visit, Visitor};
+use sqlparser::ast::{Expr, TableFactor, Visit, VisitMut, Visitor, VisitorMut};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use sqlx::PgPool;
@@ -113,6 +113,163 @@ pub async fn schema_check(pg: &PgPool, sql: &str) -> anyhow::Result<Option<Strin
         hint.push('\n');
     }
     Ok(Some(hint))
+}
+
+/// 值链接码表：(表,列) → [(中文名, 码, match_kind)]。match_kind: eq=等值换码 / like=组合值列须 LIKE '%码%'
+pub type ValueMaps = HashMap<(String, String), Vec<(String, String, String)>>;
+
+/// ValueLinker（移植 SuperSonic 值链接纠正）：编码列上「中文名直写」确定性换码。
+/// 真坑：invoice_status='已开票' 必返 0 行（库存码 2）；paid_way='可开票余额支付' 等值必返 0 行（组合值须 LIKE）。
+/// 门控：带前缀列且前缀映射到 meta 已知物理表（裸列/派生表不碰）；eq 列换码值，like 列 '=' 改写 LIKE '%码%'；
+/// IN 列表逐项换（like 列跳过）；已是码值/无名命中不动。
+struct Linker<'a> {
+    aliases: &'a HashMap<String, String>,
+    maps: &'a ValueMaps,
+    changed: bool,
+}
+
+impl<'a> Linker<'a> {
+    /// 「前缀.列」解析出 (表,列)。裸列不解析（防误伤）。
+    fn resolve_key(&self, e: &Expr) -> Option<(String, String)> {
+        let Expr::CompoundIdentifier(parts) = e else { return None };
+        if parts.len() < 2 {
+            return None;
+        }
+        let prefix = parts[parts.len() - 2].value.to_lowercase();
+        let col = parts[parts.len() - 1].value.to_lowercase();
+        let table = self.aliases.get(&prefix)?;
+        Some((table.clone(), col))
+    }
+
+    /// 在 (表,列) 的码表里按中文名找 (码,kind)
+    fn find(&self, key: &(String, String), name: &str) -> Option<(String, String)> {
+        self.maps
+            .get(key)?
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, c, k)| (c.clone(), k.clone()))
+    }
+}
+
+impl<'a> VisitorMut for Linker<'a> {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        match e {
+            // col = '中文名'（及镜像 '中文名' = col）→ 换码；like 列改 LIKE '%码%'
+            Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } => {
+                // 找出哪一侧是列、哪一侧是字符串字面量
+                let (col_side, lit_side_is_right) = if matches!(left.as_ref(), Expr::CompoundIdentifier(_))
+                    && matches!(right.as_ref(), Expr::Value(sqlparser::ast::Value::SingleQuotedString(_)))
+                {
+                    (true, true)
+                } else if matches!(right.as_ref(), Expr::CompoundIdentifier(_))
+                    && matches!(left.as_ref(), Expr::Value(sqlparser::ast::Value::SingleQuotedString(_)))
+                {
+                    (false, false)
+                } else {
+                    return ControlFlow::Continue(());
+                };
+                let _ = col_side;
+                let (col_expr, lit_expr) = if lit_side_is_right {
+                    (left.as_ref(), right.as_ref())
+                } else {
+                    (right.as_ref(), left.as_ref())
+                };
+                let Some(key) = self.resolve_key(col_expr) else { return ControlFlow::Continue(()) };
+                let Expr::Value(sqlparser::ast::Value::SingleQuotedString(name)) = lit_expr else {
+                    return ControlFlow::Continue(());
+                };
+                let Some((code, kind)) = self.find(&key, name) else {
+                    return ControlFlow::Continue(());
+                };
+                if kind == "like" {
+                    // 组合值列：'=' 改写 LIKE '%码%'（等值必返 0 行）
+                    let new_expr = Expr::Like {
+                        negated: false,
+                        any: false,
+                        expr: Box::new(col_expr.clone()),
+                        pattern: Box::new(Expr::Value(sqlparser::ast::Value::SingleQuotedString(
+                            format!("%{code}%"),
+                        ))),
+                        escape_char: None,
+                    };
+                    *e = new_expr;
+                } else if lit_side_is_right {
+                    *right = Box::new(Expr::Value(sqlparser::ast::Value::SingleQuotedString(code)));
+                } else {
+                    *left = Box::new(Expr::Value(sqlparser::ast::Value::SingleQuotedString(code)));
+                }
+                self.changed = true;
+            }
+            // col IN ('名1','名2') → 逐项换码（like 列跳过）
+            Expr::InList { expr, list, negated: false } => {
+                let Some(key) = self.resolve_key(expr) else { return ControlFlow::Continue(()) };
+                let mut replaced: Vec<(usize, String)> = vec![];
+                for (i, item) in list.iter().enumerate() {
+                    if let Expr::Value(sqlparser::ast::Value::SingleQuotedString(name)) = item {
+                        if let Some((code, kind)) = self.find(&key, name) {
+                            if kind == "eq" {
+                                replaced.push((i, code));
+                            }
+                        }
+                    }
+                }
+                for (i, code) in replaced {
+                    list[i] = Expr::Value(sqlparser::ast::Value::SingleQuotedString(code));
+                    self.changed = true;
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// ValueLinker 纯核（可单测）：解析别名 → VisitMut 换码。
+pub fn link_values_with(
+    sql: &str,
+    aliases: &HashMap<String, String>,
+    maps: &ValueMaps,
+) -> Option<String> {
+    let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
+    if maps.is_empty() {
+        return None;
+    }
+    let mut linker = Linker { aliases, maps, changed: false };
+    for s in &mut stmts {
+        // VisitMut 节点 trait 方法名同为 visit；Linker 只实现 VisitorMut，解析唯一
+        let _ = VisitMut::visit(s, &mut linker);
+    }
+    if linker.changed {
+        Some(stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n"))
+    } else {
+        None
+    }
+}
+
+/// ValueLinker 入口：加载涉及表的码表 → 换码。
+pub async fn correct_value(pg: &PgPool, sql: &str) -> anyhow::Result<Option<String>> {
+    let (amap, _) = collect(sql)?;
+    let tables: HashSet<String> = amap.values().cloned().collect();
+    if tables.is_empty() {
+        return Ok(None);
+    }
+    let mut maps: ValueMaps = HashMap::new();
+    for t in &tables {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT column_name, name, code, match_kind FROM meta.value_map WHERE lower(table_name) = $1",
+        )
+        .bind(t)
+        .fetch_all(pg)
+        .await?;
+        for (col, name, code, kind) in rows {
+            maps.entry((t.clone(), col.to_lowercase()))
+                .or_insert_with(Vec::new)
+                .push((name, code, kind));
+        }
+    }
+    Ok(link_values_with(sql, &amap, &maps))
 }
 
 /// AggCorrector 入口：问句命中指标 → agg_expr 解析规则 → normalize_agg 归一。
@@ -531,5 +688,125 @@ mod tests {
         // 规则列不匹配 → 不动
         let rules = vec![("sum".into(), "total_amount".into(), false)];
         assert!(normalize_agg("SELECT AVG(o.refund_amount) FROM t_x o", &rules).is_none());
+    }
+
+    fn vmaps() -> (HashMap<String, String>, ValueMaps) {
+        let mut aliases = HashMap::new();
+        aliases.insert("h".to_string(), "t_invoice_apply_header".to_string());
+        aliases.insert("o".to_string(), "t_sales_order".to_string());
+        let mut maps: ValueMaps = HashMap::new();
+        maps.insert(
+            ("t_invoice_apply_header".into(), "invoice_status".into()),
+            vec![
+                ("已开票".into(), "2".into(), "eq".into()),
+                ("开票失败".into(), "5".into(), "eq".into()),
+            ],
+        );
+        maps.insert(
+            ("t_sales_order".into(), "paid_way".into()),
+            vec![
+                ("在线支付".into(), "ZX01".into(), "eq".into()),
+                ("可开票余额支付".into(), "ZZ05".into(), "like".into()),
+            ],
+        );
+        (aliases, maps)
+    }
+
+    #[test]
+    fn value_eq_swapped() {
+        // 中文名直写必返 0 行 → 换码
+        let (a, m) = vmaps();
+        let out = link_values_with(
+            "SELECT * FROM t_invoice_apply_header h WHERE h.invoice_status = '已开票'",
+            &a,
+            &m,
+        )
+        .unwrap();
+        assert!(norm(&out).contains("invoice_status='2'"), "{out}");
+    }
+
+    #[test]
+    fn value_mirror_eq_swapped() {
+        // 镜像形态 '名' = col 也换
+        let (a, m) = vmaps();
+        let out = link_values_with(
+            "SELECT * FROM t_invoice_apply_header h WHERE '已开票' = h.invoice_status",
+            &a,
+            &m,
+        )
+        .unwrap();
+        assert!(norm(&out).contains("'2'=h.invoice_status"), "{out}");
+    }
+
+    #[test]
+    fn value_like_rewritten() {
+        // 组合值列：'=' 改写 LIKE '%码%'（等值必返 0 行）
+        let (a, m) = vmaps();
+        let out = link_values_with(
+            "SELECT * FROM t_sales_order o WHERE o.paid_way = '可开票余额支付'",
+            &a,
+            &m,
+        )
+        .unwrap();
+        assert!(norm(&out).contains("like'%zz05%'"), "{out}");
+    }
+
+    #[test]
+    fn value_in_list_swapped() {
+        let (a, m) = vmaps();
+        let out = link_values_with(
+            "SELECT * FROM t_invoice_apply_header h WHERE h.invoice_status IN ('已开票','开票失败')",
+            &a,
+            &m,
+        )
+        .unwrap();
+        assert!(norm(&out).contains("in('2','5')"), "{out}");
+    }
+
+    #[test]
+    fn value_like_kind_in_list_skipped() {
+        // like 列在 IN 列表里跳过（语义须 OR LIKE，保守不动）
+        let (a, m) = vmaps();
+        assert!(link_values_with(
+            "SELECT * FROM t_sales_order o WHERE o.paid_way IN ('可开票余额支付')",
+            &a,
+            &m,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn value_bare_col_untouched() {
+        // 裸列无前缀 → 不解析不动
+        let (a, m) = vmaps();
+        assert!(link_values_with(
+            "SELECT * FROM t_invoice_apply_header h WHERE invoice_status = '已开票'",
+            &a,
+            &m,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn value_already_code_untouched() {
+        let (a, m) = vmaps();
+        assert!(link_values_with(
+            "SELECT * FROM t_invoice_apply_header h WHERE h.invoice_status = '2'",
+            &a,
+            &m,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn value_unknown_name_untouched() {
+        // 码表无名（非编码值或正常字符串）→ 不动
+        let (a, m) = vmaps();
+        assert!(link_values_with(
+            "SELECT * FROM t_invoice_apply_header h WHERE h.invoice_status = '进行中'",
+            &a,
+            &m,
+        )
+        .is_none());
     }
 }

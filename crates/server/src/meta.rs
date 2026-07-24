@@ -79,6 +79,15 @@ CREATE TABLE IF NOT EXISTS meta.dimension(
   description text NOT NULL DEFAULT '',
   status text NOT NULL DEFAULT 'active'
 );
+-- 值链接码表（移植 SuperSonic ValueLinking）：编码列 中文名→码，写中文名必返0行的确定性纠正依据
+CREATE TABLE IF NOT EXISTS meta.value_map(
+  table_name text NOT NULL,
+  column_name text NOT NULL,
+  name text NOT NULL,
+  code text NOT NULL,
+  match_kind text NOT NULL DEFAULT 'eq', -- eq=等值换码 / like=组合值列须 LIKE '%码%'
+  PRIMARY KEY(table_name, column_name, name)
+);
 "#;
     for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         sqlx::query(stmt).execute(pg).await?;
@@ -270,7 +279,62 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
     }
     seed_metrics(pg).await?;
     seed_dimensions(pg).await?;
+    seed_value_maps(pg).await?;
     seed_terms(pg).await?;
+    Ok(())
+}
+
+/// 值链接码表种子（全部来自 meta.pitfall 已连库坐实的码表教训——不猜字典）
+async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
+    // (table, column, [(name, code)], match_kind)
+    const MAPS: &[(&str, &str, &[(&str, &str)], &str)] = &[
+        // InvoiceStatusEnum（pitfall 坐实，真库现存 0/1/2/3/5）
+        ("t_invoice_apply_header", "invoice_status",
+         &[("未申请", "0"), ("开票申请中", "1"), ("已开票", "2"), ("冲红申请中", "3"),
+           ("已冲红", "4"), ("开票失败", "5"), ("部分开票", "6"), ("待确认", "7"),
+           ("审核通过", "8"), ("驳回", "9"), ("暂存", "10")], "eq"),
+        // InvoiceTypeEnum（t_invoice_apply_header 与 t_customer 同体系）
+        ("t_invoice_apply_header", "invoice_type",
+         &[("增值税普通发票", "1"), ("普票", "1"), ("增值税专用发票", "2"), ("专票", "2")], "eq"),
+        ("t_customer", "invoice_type",
+         &[("增值税普通发票", "1"), ("普票", "1"), ("增值税专用发票", "2"), ("专票", "2")], "eq"),
+        // 有效订单口径（pitfall 坐实 0暂存/108无效/199作废）
+        ("t_sales_order", "order_status",
+         &[("暂存", "0"), ("无效", "108"), ("作废", "199")], "eq"),
+        // PayWayEnum：真库有逗号组合值——ZX01 纯值可等值，余额类必须 LIKE 含组合（pitfall 坐实）
+        ("t_sales_order", "paid_way", &[("在线支付", "ZX01")], "eq"),
+        ("t_sales_order", "paid_way",
+         &[("信控余额支付", "ZZ01"), ("市场费用支付", "ZF02"), ("不开票余额支付", "ZZ04"),
+           ("可开票余额支付", "ZZ05"), ("设备押金支付", "ZZ07")], "like"),
+        // 账余类型（pitfall 坐实；15/99 双码在线支付歧义不收录）
+        ("t_customer_balance", "balance_type",
+         &[("信控", "1"), ("市场费用", "3"), ("可开票余额", "8"), ("不可开票余额", "9"),
+           ("设备押金", "10")], "eq"),
+        // AccountBillStatusEnum（Java 枚举坐实）+ account_mode
+        ("t_account_bill_header", "bill_status",
+         &[("待确认", "0"), ("已确认", "1"), ("部分开票", "2"), ("已开票", "3"), ("拒绝", "4")], "eq"),
+        ("t_account_bill_header", "account_mode",
+         &[("月结", "M"), ("半月", "HM"), ("周结", "WK")], "eq"),
+        // 明细行类型（M6w 坐实：1商品行/2赠品/3结算行）
+        ("t_sales_order_detail", "item_type",
+         &[("商品行", "1"), ("赠品", "2"), ("结算行", "3")], "eq"),
+    ];
+    for (table, col, pairs, kind) in MAPS {
+        for (name, code) in *pairs {
+            sqlx::query(
+                "INSERT INTO meta.value_map(table_name, column_name, name, code, match_kind)
+                 VALUES ($1,$2,$3,$4,$5)
+                 ON CONFLICT (table_name, column_name, name) DO UPDATE SET code=$4, match_kind=$5",
+            )
+            .bind(table)
+            .bind(col)
+            .bind(name)
+            .bind(code)
+            .bind(kind)
+            .execute(pg)
+            .await?;
+        }
+    }
     Ok(())
 }
 
