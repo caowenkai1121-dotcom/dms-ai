@@ -162,6 +162,17 @@ pub async fn generate_sql(
     let metrics = meta::recall_metrics(pg, question).await.unwrap_or_default();
     let dims = meta::recall_dimensions(pg, question).await.unwrap_or_default();
     let terms = meta::recall_terms(pg, question).await.unwrap_or_default();
+    // 元素向量召回（SuperSonic SchemaMapper）：substring 命中之外的语义双保险；按元素名去重
+    let elems: Vec<String> = meta::recall_elements(pg, question, 8)
+        .await
+        .into_iter()
+        .filter(|(name, _)| {
+            !metrics.iter().any(|m| m.contains(name.as_str()))
+                && !dims.iter().any(|d| d.contains(name.as_str()))
+                && !terms.iter().any(|t| t.contains(name.as_str()))
+        })
+        .map(|(_, card)| card)
+        .collect();
     let pitfalls = meta::recall_pitfalls(pg, question, &table_names, 6).await?;
     let fewshot = fewshot_block(pg, question).await;
 
@@ -189,6 +200,14 @@ pub async fn generate_sql(
         user.push_str("## 业务术语（问题命中，按此理解）\n");
         for t in &terms {
             user.push_str(&format!("- {t}\n"));
+        }
+        user.push('\n');
+    }
+    // 元素向量召回（移植 SuperSonic SchemaMapper）——语义近邻补充，与上方命中去重
+    if !elems.is_empty() {
+        user.push_str("## 语义召回元素（向量近邻命中，按此口径/含义理解）\n");
+        for e in &elems {
+            user.push_str(&format!("- {e}\n"));
         }
         user.push('\n');
     }
@@ -464,18 +483,22 @@ async fn ask_single(
         if let Ok(fixed) = repair(llm, pg, p, question, &sql, &hint).await {
             sql = fixed;
             route = "llm+schema-fix".into();
+            meta::log_correction(pg, "schema-fix", question, &hint).await;
         }
     }
     // GroupByCorrector（移植 SuperSonic）：漏 GROUP BY 确定性补全（不调 LLM）
     if let Some(fixed) = crate::corrector::fix_group_by(&sql) {
+        meta::log_correction(pg, "groupby-fix", question, &format!("补 GROUP BY：{}", sql.chars().take(150).collect::<String>())).await;
         sql = fixed;
     }
     // AggCorrector（移植 SuperSonic correctAggFunction）：命中指标的聚合列归一到注册表默认聚合
     if let Ok(Some(fixed)) = crate::corrector::correct_agg(pg, question, &sql).await {
+        meta::log_correction(pg, "agg-fix", question, &format!("聚合归一：{} → {}", sql.chars().take(120).collect::<String>(), fixed.chars().take(120).collect::<String>())).await;
         sql = fixed;
     }
     // ValueLinker（移植 SuperSonic 值链接）：编码列中文名直写确定性换码（写中文名必返 0 行的真坑）
     if let Ok(Some(fixed)) = crate::corrector::correct_value(pg, &sql).await {
+        meta::log_correction(pg, "value-fix", question, &format!("码值换写：{} → {}", sql.chars().take(120).collect::<String>(), fixed.chars().take(120).collect::<String>())).await;
         sql = fixed;
     }
 

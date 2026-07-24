@@ -51,6 +51,23 @@ def build():
             cur.execute("UPDATE meta.sql_exemplar SET embedding = %s WHERE id = %s",
                         ('[' + ','.join(f'{x:.6f}' for x in v) + ']', eid))
         print(f'完成：{len(ex)} 条语料问句向量化', flush=True)
+    # 元素注册表向量（SuperSonic SchemaMapper 元素召回；search_text 变了自动 NULL 待重建）
+    cur.execute("CREATE TABLE IF NOT EXISTS meta.element("
+                "element_id text PRIMARY KEY, kind text NOT NULL, name text NOT NULL,"
+                "aliases text[] NOT NULL DEFAULT '{}', ref_expr text NOT NULL DEFAULT '',"
+                "description text NOT NULL DEFAULT '', search_text text NOT NULL DEFAULT '',"
+                "status text NOT NULL DEFAULT 'active')")
+    cur.execute(f"ALTER TABLE meta.element ADD COLUMN IF NOT EXISTS embedding vector({DIM})")
+    cur.execute("SELECT element_id, search_text FROM meta.element WHERE status='active' AND embedding IS NULL")
+    els = cur.fetchall()
+    if els:
+        evecs = embed([r[1] for r in els], is_query=False)
+        for (eid, _), v in zip(els, evecs):
+            cur.execute("UPDATE meta.element SET embedding = %s WHERE element_id = %s",
+                        ('[' + ','.join(f'{x:.6f}' for x in v) + ']', eid))
+        print(f'完成：{len(els)} 元素向量化', flush=True)
+    cur.execute("DROP INDEX IF EXISTS meta.idx_element_hnsw")
+    cur.execute("CREATE INDEX idx_element_hnsw ON meta.element USING hnsw (embedding vector_cosine_ops)")
     pg.close()
 
 def serve(port=8077):

@@ -66,6 +66,16 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 引擎 A1 子命令：meta autodiscover —— 字典码列自动对码注册（数据驱动，字典变了重跑即自适应）
+    if args.len() >= 3 && args[1] == "meta" && args[2] == "autodiscover" {
+        let mysql = db::mysql_pool(&cfg.mysql_url).await?;
+        let pg = db::pg_pool(&cfg.pg_url).await?;
+        meta::migrate(&pg).await?;
+        let r = meta::autodiscover_dict_columns(&mysql, &pg).await?;
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+
     // 子命令：review-pending —— 批量复核 pending 语料（SuperSonic MemoryReviewTask）
     if args.len() >= 2 && args[1] == "review-pending" {
         let pg = db::pg_pool(&cfg.pg_url).await?;

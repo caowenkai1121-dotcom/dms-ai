@@ -214,6 +214,33 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
+## M8b S2 元素级向量召回（SuperSonic SchemaMapper）+ B+ 纠错反哺（2026-07-24）
+- **元素注册表 meta.element**：metric/dimension/value/term 四注册表统一为可召回元素（SuperSonic SchemaElement）；
+  `sync_elements` 幂等同步（search_text 变化自动清向量待重建），挂接 meta sync 与 autodiscover 尾部。
+- `recall_elements`：问句 embed → HNSW 近邻（余弦距离 <0.35）→ 渲染口径卡，embed 缺席熔断降级；
+  pipeline 注入「语义召回元素」段，与 substring 命中按元素名去重——口语化问法不再靠关键词穷举（自适应召回层）。
+- embed_service.py build 支持元素向量化 + HNSW（900 元素已建）。
+- **B+ 纠错反哺环**：meta.correction_log + pipeline 四校正器（schema/groupby/agg/value）出手即记录（kind/question/detail），
+  为「同错累计≥3 升格 pitfall」攒数据（升格器 S4）。
+- 验收：cargo check 过（连库问答验收留 20 轮门禁）。
+
+## M8a 自适应·自进化重构：总纲 + 引擎 A1 字典码列自动对码（2026-07-24，用户战略纠偏）
+- **用户纠偏**：此前改动太「查 A 改 A」点状化，要的是自适应、自进化——一切知识是数据不是代码，一切组合是通用装配不是模板，用得越多越聪明。
+- `docs/ADAPTIVE-REFACTOR.md` 总纲：点状硬编码清单退役计划；SuperSonic/deepagents 全功能映射表；自进化三引擎（A 自动发现/B 使用中学习/C 失败复盘）；S1→S6 路线。
+- **引擎 A1**（meta.autodiscover_dict_columns + CLI `meta autodiscover`）：
+  码型后缀列(*_code/_type/_status/_class/_mode/_way/_level)+小表(row_estimate<100万) → 只读 DISTINCT 抽样(≤61值) → 值集 ⊆ dict key 码集(覆盖≥80% 且 2~60 值)
+  → 自动注册 value_map(eq,字典全码)+dimension(CASE 翻名)。人工种子优先不覆盖；幂等重跑（字典变了重跑即自适应）。
+- 实跑三坑：①cargo run/build 在 Git Bash 下用残缺 mingw 链接失败（crt2.o），须 WinLibs mingw64 前置 PATH（build.ps1 同款）；②旧服务进程锁 exe(os error 5)，先停后建；③row_estimate 严重失真（29 行表真实扫描分钟级）致探针悬挂 → 单探针 10s tokio 超时跳过。
+- 实跑结果：**854 候选 → 843 探针（10s/探针超时）→ 65 注册干净资产**（全 name 对齐或大集合直通，零撞车）：
+  order_status 销售订单状态全 12 码、after_sales 售后订单状态、shop_type/level 门店类型/等级、company_code 所属公司 ×11 表一致、
+  expense_type 费用类型、帐余业务类型 23 码、payment_terms 付款条件、channel_code 渠道细分 11 码、warehouse 仓库类型等。
+  元素注册表 900 元素（74 维度+12 指标+5 术语+809 码值）全部向量化（HNSW）。
+- 防误配两轮血泪（都转成单测锁死）：①数值小码集互相撞车（menu_type 撞对账单状态、wms_type 撞 28 项发票类型）；
+  ②含字母码的字典也是撞车磁铁（data_scope_type={1,2} 撞联系人类型、审批状态撞设备处置状态）。
+  终版规则：**注释点名优先**（注释写「数据字典 X」只评 X）+ ≥8 值 cov=1.0 直通 + 名称对齐（≥3 字公共子串）；alpha 码闸门全撤。
+  **自适应必须带精度闸：错误映射比没有映射更糟，宁缺毋滥。**
+- 验收：cargo check 过；单测 +3（dict_match 基本/拒绝/撞车守卫+注释点名）（批量跑留门禁）；实跑三轮收敛。
+
 ## M7g embed 服务常驻化（2026-07-24，语义缓存/向量召回不掉线）
 - `scripts/run.ps1` 重写为全栈联动：PG 容器缺席自动 `docker compose up -d` → embed 服务(:8077) 缺席自动拉起（模型加载轮询 20s）→ 编译启动后端；embed 失败明确打印「熔断降级」不装死。
 - `tools/embed_service.py` 补 `GET /health`（{"ok","model","dim"}）——原来只有 POST /embed，健康探测无从谈起。

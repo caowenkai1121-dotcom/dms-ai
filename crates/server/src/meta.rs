@@ -88,6 +88,27 @@ CREATE TABLE IF NOT EXISTS meta.value_map(
   match_kind text NOT NULL DEFAULT 'eq', -- eq=等值换码 / like=组合值列须 LIKE '%码%'
   PRIMARY KEY(table_name, column_name, name)
 );
+-- 元素注册表（移植 SuperSonic SchemaElement）：metric/dimension/value/term 统一为可向量召回的元素
+CREATE TABLE IF NOT EXISTS meta.element(
+  element_id text PRIMARY KEY,       -- kind:标识
+  kind text NOT NULL,                -- metric / dimension / value / term
+  name text NOT NULL,
+  aliases text[] NOT NULL DEFAULT '{}',
+  ref_expr text NOT NULL DEFAULT '', -- agg_expr / 维度取值表达式 / 码值 / 术语定义
+  description text NOT NULL DEFAULT '',
+  search_text text NOT NULL DEFAULT '', -- 名+别名+描述（向量化文本）
+  status text NOT NULL DEFAULT 'active'
+);
+ALTER TABLE meta.element ADD COLUMN IF NOT EXISTS embedding vector(512);
+-- 纠错反哺日志（自进化引擎B+）：确定性校正器每次出手都记录，同错累计→升格 pitfall 教训
+CREATE TABLE IF NOT EXISTS meta.correction_log(
+  id bigserial PRIMARY KEY,
+  kind text NOT NULL,        -- schema-fix / groupby-fix / agg-fix / value-fix
+  question text NOT NULL,
+  detail text NOT NULL,      -- 纠正要点（幻觉列名/聚合改写/码值换写等）
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_correction_kind ON meta.correction_log(kind, created_at);
 "#;
     for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         sqlx::query(stmt).execute(pg).await?;
@@ -281,7 +302,133 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
     seed_dimensions(pg).await?;
     seed_value_maps(pg).await?;
     seed_terms(pg).await?;
+    sync_elements(pg).await?;
     Ok(())
+}
+
+/// 元素注册表同步（SuperSonic SchemaElement 统一层）：
+/// metric/dimension/value_map/term 四注册表 → 统一元素（向量化召回的原子单位）。
+/// 幂等 upsert；元素变更后重跑即可（search_text 变了需重跑 embed build 补向量）。
+pub async fn sync_elements(pg: &PgPool) -> anyhow::Result<()> {
+    // metric
+    let metrics: Vec<(String, String, Vec<String>, String, String)> = sqlx::query_as(
+        "SELECT metric_code, name, aliases, agg_expr, description FROM meta.metric WHERE status = 'active'",
+    )
+    .fetch_all(pg)
+    .await?;
+    for (code, name, aliases, agg, desc) in metrics {
+        upsert_element(pg, &format!("metric:{code}"), "metric", &name, &aliases, &agg, &desc).await?;
+    }
+    // dimension
+    let dims: Vec<(String, String, Vec<String>, String, String)> = sqlx::query_as(
+        "SELECT dim_code, name, aliases, expr, description FROM meta.dimension WHERE status = 'active'",
+    )
+    .fetch_all(pg)
+    .await?;
+    for (code, name, aliases, expr, desc) in dims {
+        upsert_element(pg, &format!("dimension:{code}"), "dimension", &name, &aliases, &expr, &desc).await?;
+    }
+    // value（码值也是元素：「已开票」「线下客户」应能向量命中）
+    let vals: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT table_name, column_name, name, code FROM meta.value_map",
+    )
+    .fetch_all(pg)
+    .await?;
+    for (table, col, name, code) in vals {
+        let id = format!("value:{table}.{col}:{code}");
+        let desc = format!("{table}.{col} 的码值 {code}");
+        upsert_element(pg, &id, "value", &name, &[], &code, &desc).await?;
+    }
+    // term
+    let terms: Vec<(String, String, Vec<String>)> =
+        sqlx::query_as("SELECT term, definition, aliases FROM meta.term WHERE status = 'active'")
+            .fetch_all(pg)
+            .await?;
+    for (term, def, aliases) in terms {
+        upsert_element(pg, &format!("term:{term}"), "term", &term, &aliases, &def, "").await?;
+    }
+    Ok(())
+}
+
+/// 单元素幂等 upsert（search_text=名+别名+描述 截 500 字；文本变化时清 embedding 待重建）
+async fn upsert_element(
+    pg: &PgPool,
+    id: &str,
+    kind: &str,
+    name: &str,
+    aliases: &[String],
+    ref_expr: &str,
+    desc: &str,
+) -> anyhow::Result<()> {
+    let search = {
+        let mut s = name.to_string();
+        if !aliases.is_empty() {
+            s.push_str(&format!("（{}）", aliases.join("、")));
+        }
+        if !desc.is_empty() {
+            s.push_str(&format!("：{desc}"));
+        }
+        s.chars().take(500).collect::<String>()
+    };
+    sqlx::query(
+        "INSERT INTO meta.element(element_id, kind, name, aliases, ref_expr, description, search_text)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (element_id) DO UPDATE SET
+           kind=$2, name=$3, aliases=$4, ref_expr=$5, description=$6, search_text=$7,
+           embedding = CASE WHEN meta.element.search_text = $7 THEN meta.element.embedding ELSE NULL END",
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(name)
+    .bind(aliases.to_vec())
+    .bind(ref_expr)
+    .bind(desc)
+    .bind(&search)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
+/// 纠错反哺日志（引擎 B+）：校正器出手即记录，供同错累计升格 pitfall（自进化，不静默修）
+pub async fn log_correction(pg: &PgPool, kind: &str, question: &str, detail: &str) {
+    let _ = sqlx::query("INSERT INTO meta.correction_log(kind, question, detail) VALUES ($1,$2,$3)")
+        .bind(kind)
+        .bind(question.chars().take(200).collect::<String>())
+        .bind(detail.chars().take(500).collect::<String>())
+        .execute(pg)
+        .await;
+}
+
+/// 元素级向量召回（移植 SuperSonic SchemaMapper）：问句 embed → ANN 近邻元素。
+/// 返回 (元素名, 渲染卡) 供 pipeline 与 substring 命中去重合并——口语化问法的语义双保险。
+/// embed 服务缺席自动降级为空（熔断在 embed 客户端内）。
+pub async fn recall_elements(pg: &PgPool, question: &str, limit: usize) -> Vec<(String, String)> {
+    let Some(vec) = crate::embed::embed_query(question).await else {
+        return vec![];
+    };
+    let lit = crate::embed::to_pgvector(&vec);
+    let rows: Vec<(String, String, String, String, f64)> = sqlx::query_as(
+        "SELECT element_id, kind, name, ref_expr, (embedding <=> $1::vector) AS dist
+         FROM meta.element WHERE status = 'active' AND embedding IS NOT NULL
+         ORDER BY embedding <=> $1::vector LIMIT $2",
+    )
+    .bind(&lit)
+    .bind(limit as i64)
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .filter(|(_, _, _, _, dist)| *dist < 0.35) // 余弦距离阈值：语义相关才入
+        .map(|(id, kind, name, ref_expr, _)| {
+            let card = match kind.as_str() {
+                "metric" => format!("【指标·{name}】= {ref_expr}"),
+                "dimension" => format!("【维度·{name}】分组取值 {ref_expr}"),
+                "value" => format!("【码值·{name}】编码列码值（{id}）"),
+                _ => format!("【术语·{name}】{ref_expr}"),
+            };
+            (name, card)
+        })
+        .collect()
 }
 
 /// 值链接码表种子（全部来自 meta.pitfall 已连库坐实的码表教训——不猜字典）
@@ -661,6 +808,237 @@ pub async fn recall_pitfalls(
         .collect())
 }
 
+/// A1 自动发现引擎：字典码列自动对码（数据驱动注册——字典变了重跑即自适应，不再需要手工播种）。
+/// 候选=码型后缀列(*_code/_type/_status/_class/_mode/_way/_level)+小表(row_estimate<100万)；
+/// 只读 DISTINCT 抽样(≤61 值)；值集 ⊆ 某 dict key 码集(覆盖≥80% 且 ≥2 值)→
+/// 自动注册 value_map(eq 换码,字典全码)+dimension(CASE 翻名)。人工种子优先：已覆盖 (表,列) 跳过。
+pub async fn autodiscover_dict_columns(
+    mysql: &MySqlPool,
+    pg: &PgPool,
+) -> anyhow::Result<serde_json::Value> {
+    use std::collections::{HashMap, HashSet};
+
+    // 1. 生产字典（t_dict_key/value，全量小表）
+    let dict_rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT CAST(k.key_code AS CHAR), CAST(k.key_name AS CHAR),
+                CAST(v.value_code AS CHAR), CAST(v.value_name AS CHAR)
+         FROM t_dict_key k
+         JOIN t_dict_value v ON v.dict_key_id = k.dict_key_id AND v.deleted_flag = 0
+         WHERE k.deleted_flag = 0",
+    )
+    .fetch_all(mysql)
+    .await?;
+    let mut dicts: HashMap<String, (String, Vec<(String, String)>)> = HashMap::new();
+    for (kc, kn, vc, vn) in dict_rows {
+        dicts.entry(kc).or_insert_with(|| (kn, vec![])).1.push((vc, vn));
+    }
+
+    // 2. 候选列（码型后缀 + 小表）
+    let cands: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.table_name, c.column_name, c.col_comment
+         FROM meta.column_doc c
+         JOIN meta.table_doc t ON t.table_name = c.table_name
+         WHERE t.row_estimate < 1000000
+           AND c.column_name ~ '(_code|_type|_status|_class|_mode|_way|_level)$'
+         ORDER BY c.table_name, c.ordinal",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    // 3. 人工已覆盖的 (表,列)（value_map + dimension expr 提及）→ 跳过
+    let manual_vm: HashSet<(String, String)> =
+        sqlx::query_as::<_, (String, String)>("SELECT DISTINCT table_name, column_name FROM meta.value_map")
+            .fetch_all(pg)
+            .await?
+            .into_iter()
+            .map(|(t, c)| (t.to_lowercase(), c.to_lowercase()))
+            .collect();
+    let manual_dims: Vec<(String, String)> =
+        sqlx::query_as("SELECT source_table, expr FROM meta.dimension WHERE status = 'active'")
+            .fetch_all(pg)
+            .await?;
+
+    // 4. 有 deleted_flag 的表集合（拼 WHERE 用；部分表无此列）
+    let del_tables: HashSet<String> =
+        sqlx::query_as::<_, (String,)>("SELECT DISTINCT table_name FROM meta.column_doc WHERE column_name = 'deleted_flag'")
+            .fetch_all(pg)
+            .await?
+            .into_iter()
+            .map(|(t,)| t)
+            .collect();
+
+    let mut probed = 0usize;
+    let mut skipped_manual = 0usize;
+    let mut registered: Vec<serde_json::Value> = vec![];
+
+    for (table, col, comment) in &cands {
+        if is_backup_table(table) || is_sensitive_col(col) {
+            continue;
+        }
+        let key = (table.to_lowercase(), col.to_lowercase());
+        if manual_vm.contains(&key)
+            || manual_dims.iter().any(|(src, expr)| src.contains(table.as_str()) && expr.contains(col.as_str()))
+        {
+            skipped_manual += 1;
+            continue;
+        }
+        // 只读抽样（生产库连接池会话级 READ ONLY 兜底）。单探针 10s 超时：
+        // row_estimate 可能严重失真（29 行的表真实扫描分钟级），悬挂探针跳过不拖全局
+        let where_del = if del_tables.contains(table) { "WHERE deleted_flag = 0" } else { "" };
+        let probe_sql =
+            format!("SELECT DISTINCT CAST(`{col}` AS CHAR) FROM `{table}` {where_del} LIMIT 61");
+        let probe_fut = sqlx::query_as::<_, (Option<String>,)>(&probe_sql).fetch_all(mysql);
+        let rows: Vec<(Option<String>,)> =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), probe_fut).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    tracing::warn!("autodiscover 抽样失败 {table}.{col}: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!("autodiscover 抽样超时(10s)跳过 {table}.{col}");
+                    continue;
+                }
+            };
+        probed += 1;
+        let values: Vec<String> = rows
+            .into_iter()
+            .filter_map(|(v,)| v)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        let Some((dict_key, dict_name, pairs, coverage)) = best_dict_match(&values, &dicts, comment) else {
+            continue;
+        };
+
+        // 注册 value_map（eq）——字典全码注册，未来新值也自适应
+        for (code, name) in &pairs {
+            sqlx::query(
+                "INSERT INTO meta.value_map(table_name, column_name, name, code, match_kind)
+                 VALUES ($1,$2,$3,$4,'eq')
+                 ON CONFLICT (table_name, column_name, name) DO UPDATE SET code=$4, match_kind='eq'",
+            )
+            .bind(table)
+            .bind(col)
+            .bind(name)
+            .bind(code)
+            .execute(pg)
+            .await?;
+        }
+        // 注册 dimension（CASE 翻名；码数 >60 仅注册值映射，CASE 过长伤 prompt）
+        if pairs.len() <= 60 {
+            let cases: String = pairs
+                .iter()
+                .map(|(c, n)| format!("WHEN '{}' THEN '{}'", c.replace('\'', ""), n.replace('\'', "")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let expr = format!("CASE `{col}` {cases} END");
+            let dim_code: String = format!("auto_{table}_{col}").chars().take(80).collect();
+            let dim_name =
+                if comment.trim().is_empty() { dict_name.clone() } else { comment.trim().to_string() };
+            let desc =
+                format!("自动发现：编码列对码字典 {dict_name}({dict_key})，抽样覆盖率 {coverage:.0}%");
+            sqlx::query(
+                "INSERT INTO meta.dimension(dim_code, name, aliases, source_table, expr, description)
+                 VALUES ($1,$2,'{}',$3,$4,$5)
+                 ON CONFLICT (dim_code) DO UPDATE SET name=$2, source_table=$3, expr=$4, description=$5",
+            )
+            .bind(&dim_code)
+            .bind(&dim_name)
+            .bind(table)
+            .bind(&expr)
+            .bind(&desc)
+            .execute(pg)
+            .await?;
+        }
+        registered.push(serde_json::json!({
+            "table": table, "column": col, "dict": dict_key, "dict_name": dict_name,
+            "distinct_values": values.len(), "coverage": coverage,
+        }));
+    }
+
+    // 新注册的维度/码值同步进元素注册表（向量化召回原子单位）
+    sync_elements(pg).await?;
+
+    Ok(serde_json::json!({
+        "dict_keys": dicts.len(),
+        "candidates": cands.len(),
+        "probed": probed,
+        "skipped_manual": skipped_manual,
+        "registered_count": registered.len(),
+        "registered": registered,
+    }))
+}
+
+/// 值集对码：找覆盖率最高的 dict key。防误配硬闸（两轮实跑教训）：
+///   教训① 数值小码集互相撞车（menu_type 撞对账单状态、wms_type 撞 28 项发票类型）；
+///   教训② 含字母码的字典一样是撞车磁铁（data_scope_type={1,2} 撞联系人类型、审批状态撞设备处置状态）——
+///          小值集证据本质不足，除名称对齐外无捷径。
+/// 规则：A. 注释点名优先：列注释里出现某 dict 的 key_code/key_name（如「数据字典 MARKETING_GOODS_CATEGORY」）→ 只评该字典；
+///        B. 直通：覆盖率 100% 且 ≥8 个不同值；
+///        C. 名称对齐：列注释与字典名有 ≥3 字连续公共子串。
+/// 值集需 2~60 个不同值，覆盖 ≥80%。纯函数可单测。
+fn best_dict_match(
+    values: &[String],
+    dicts: &std::collections::HashMap<String, (String, Vec<(String, String)>)>,
+    col_comment: &str,
+) -> Option<(String, String, Vec<(String, String)>, f64)> {
+    use std::collections::HashSet;
+    let uniq: HashSet<&String> = values.iter().collect();
+    if uniq.len() < 2 || uniq.len() > 60 {
+        return None;
+    }
+    // A. 注释点名的字典优先（只评点名的；点名了但不匹配也宁缺毋滥）
+    let comment_low = col_comment.to_lowercase();
+    let named: Vec<&String> = dicts
+        .keys()
+        .filter(|kc| {
+            (!kc.is_empty() && kc.len() >= 4 && comment_low.contains(&kc.to_lowercase()))
+                || dicts
+                    .get(*kc)
+                    .map(|(kn, _)| !kn.is_empty() && kn.len() >= 3 && col_comment.contains(kn.as_str()))
+                    .unwrap_or(false)
+        })
+        .collect();
+    let candidates: Vec<&String> = if !named.is_empty() {
+        named
+    } else {
+        dicts.keys().collect()
+    };
+    let mut best: Option<(String, String, Vec<(String, String)>, f64, usize)> = None;
+    for kc in candidates {
+        let (kn, pairs) = &dicts[kc];
+        let codes: HashSet<&String> = pairs.iter().map(|(c, _)| c).collect();
+        let hit = uniq.iter().filter(|v| codes.contains(**v)).count();
+        let cov = hit as f64 / uniq.len() as f64;
+        if hit < 2 || cov < 0.8 {
+            continue;
+        }
+        let pass = (cov >= 1.0 && uniq.len() >= 8) || name_aligns(col_comment, kn);
+        if !pass {
+            continue;
+        }
+        let better = match &best {
+            Some((_, _, _, bcov, bhit)) => (cov, hit) > (*bcov, *bhit),
+            None => true,
+        };
+        if better {
+            best = Some((kc.clone(), kn.clone(), pairs.clone(), cov, hit));
+        }
+    }
+    best.map(|(kc, kn, pairs, cov, _)| (kc, kn, pairs, cov))
+}
+
+/// 名称对齐：列注释与字典名存在 ≥3 字连续公共子串（CJK 3-gram 双向包含判定）
+fn name_aligns(comment: &str, dict_name: &str) -> bool {
+    let c: Vec<char> = comment.chars().collect();
+    let d: Vec<char> = dict_name.chars().collect();
+    let has_common_3gram = |a: &[char], b: &[char]| {
+        b.windows(3).any(|w| a.windows(3).any(|x| x == w))
+    };
+    c.len() >= 3 && d.len() >= 3 && (has_common_3gram(&c, &d) || has_common_3gram(&d, &c))
+}
+
 /// bare schema 渲染：⚠️ 警告进表头注释（LLM 读 schema 必见），敏感列剔除
 async fn render_schema(pg: &PgPool, table: &str) -> anyhow::Result<Option<String>> {
     let doc: Option<(String, String, String)> = sqlx::query_as(
@@ -725,5 +1103,102 @@ mod tests {
         // 未命中
         assert!(!dim_hit("本月销售额", "省份", &aliases(&["各省"])));
         assert!(!dim_hit("库存量", "门店", &aliases(&["店铺", "终端"])));
+    }
+
+    #[test]
+    fn dict_match_basic() {
+        let mut dicts = std::collections::HashMap::new();
+        dicts.insert(
+            "CustClassif".to_string(),
+            (
+                "客户分类".to_string(),
+                vec![
+                    ("01".into(), "货架店铺".into()),
+                    ("04".into(), "线下客户".into()),
+                    ("06".into(), "其他财务专用".into()),
+                ],
+            ),
+        );
+        let vals = vec!["04".to_string(), "06".to_string(), "01".to_string()];
+        // 小集合（3 值）须名称对齐：注释「客户分类」与字典名「客户分类」对齐 → 过
+        let (kc, kn, _, cov) = best_dict_match(&vals, &dicts, "客户分类").unwrap();
+        assert_eq!(kc, "CustClassif");
+        assert_eq!(kn, "客户分类");
+        assert!((cov - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dict_match_rejects() {
+        let mut dicts = std::collections::HashMap::new();
+        dicts.insert(
+            "K".to_string(),
+            ("k".to_string(), vec![("01".into(), "a".into()), ("02".into(), "b".into())]),
+        );
+        // 单值不匹配（<2 个不同值）
+        assert!(best_dict_match(&["01".to_string()], &dicts, "任意注释").is_none());
+        // 覆盖率不足（2/4=50% < 80%）
+        let mixed = vec!["01".to_string(), "02".to_string(), "xx".to_string(), "yy".to_string()];
+        assert!(best_dict_match(&mixed, &dicts, "任意注释").is_none());
+        // 值过多（非码列）
+        let many: Vec<String> = (0..80).map(|i| i.to_string()).collect();
+        assert!(best_dict_match(&many, &dicts, "任意注释").is_none());
+    }
+
+    #[test]
+    fn dict_match_collision_guard() {
+        // 实跑误配复现：menu_type 值{0,1,2} ⊆ 对账单状态码 —— 小集合+名称不对齐 → 拒
+        let mut dicts = std::collections::HashMap::new();
+        dicts.insert(
+            "BillStatus".to_string(),
+            (
+                "对账单状态".to_string(),
+                vec![
+                    ("0".into(), "待确认".into()),
+                    ("1".into(), "已确认".into()),
+                    ("2".into(), "部分开票".into()),
+                    ("3".into(), "已开票".into()),
+                    ("4".into(), "拒绝".into()),
+                ],
+            ),
+        );
+        let vals = vec!["0".to_string(), "1".to_string(), "2".to_string()];
+        assert!(best_dict_match(&vals, &dicts, "菜单类型").is_none());
+        // 含字母码的字典一样是撞车磁铁（data_scope_type={1,2} 撞联系人类型的教训）→ 拒
+        let mut dicts2 = std::collections::HashMap::new();
+        dicts2.insert(
+            "ContactType".to_string(),
+            (
+                "联系人类型".to_string(),
+                vec![("1".into(), "业务".into()), ("2".into(), "财务".into()), ("Y1".into(), "主联系人".into())],
+            ),
+        );
+        assert!(best_dict_match(&vals, &dicts2, "数据范围id").is_none());
+        // ≥8 个不同值 cov=1.0 → 大集合直通
+        let nine: Vec<String> = (0..9).map(|i| i.to_string()).collect();
+        dicts.get_mut("BillStatus").unwrap().1.extend([
+            ("5".into(), "x5".into()),
+            ("6".into(), "x6".into()),
+            ("7".into(), "x7".into()),
+            ("8".into(), "x8".into()),
+        ]);
+        assert!(best_dict_match(&nine, &dicts, "任意列注释").is_some());
+        // 注释点名优先：注释写了「数据字典 K」→ 只评 K（值 ⊆ K 即中，不被其他字典抢）
+        let mut dicts3 = std::collections::HashMap::new();
+        dicts3.insert(
+            "GOODS_CAT".to_string(),
+            ("商品分类字典".to_string(), vec![("A".into(), "肠类".into()), ("B".into(), "挞类".into())]),
+        );
+        dicts3.insert(
+            "CustClassif".to_string(),
+            ("客户分类".to_string(), vec![("A".into(), "货架".into()), ("B".into(), "线下".into())]),
+        );
+        let ab = vec!["A".to_string(), "B".to_string()];
+        let (kc, ..) = best_dict_match(&ab, &dicts3, "商品分类（数据字典 GOODS_CAT）").unwrap();
+        assert_eq!(kc, "GOODS_CAT");
+        // 名称对齐判据
+        assert!(name_aligns("订单状态", "销售订单状态"));
+        assert!(name_aligns("所属公司", "所属公司"));
+        assert!(!name_aligns("数据范围类型", "合同类型"));
+        assert!(!name_aligns("菜单类型", "对账单状态"));
     }
 }
