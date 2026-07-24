@@ -21,6 +21,194 @@ pub enum Relation {
     Copurchase(String),
 }
 
+/// 指标定义（meta.metric 行）
+pub struct MetricDef {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub source_table: String,
+    pub agg_expr: String,
+    pub scope_filter: String,
+}
+
+/// 维度定义（meta.dimension 行）
+pub struct DimDef {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub source_table: String,
+    pub expr: String,
+}
+
+/// 通用组合器（S3，SuperSonic 语义层组合思想）：指标×维度 数据驱动装配，退役手工模板。
+/// 问句同时命中指标注册表与维度注册表 → 装配 GROUP BY 查询；v1 门控：
+/// 维度来源与指标同基表（dim.source_table 以 metric.source_table 开头）、口径无子查询、无实体残留。
+pub async fn try_compose(pg: &sqlx::PgPool, question: &str) -> Option<DirectHit> {
+    let metrics: Vec<(String, Vec<String>, String, String, String)> = sqlx::query_as(
+        "SELECT name, aliases, source_table, agg_expr, scope_filter FROM meta.metric WHERE status = 'active'",
+    )
+    .fetch_all(pg)
+    .await
+    .ok()?;
+    let dims: Vec<(String, Vec<String>, String, String)> = sqlx::query_as(
+        "SELECT name, aliases, source_table, expr FROM meta.dimension WHERE status = 'active'",
+    )
+    .fetch_all(pg)
+    .await
+    .ok()?;
+    let hit = |name: &str, aliases: &[String]| {
+        question.contains(name) || aliases.iter().any(|a| question.contains(a.as_str()))
+    };
+    let m = metrics.iter().find(|(n, a, ..)| hit(n, a))?;
+    let d = dims.iter().find(|(n, a, ..)| hit(n, a))?;
+    let metric = MetricDef {
+        name: m.0.clone(),
+        aliases: m.1.clone(),
+        source_table: m.2.clone(),
+        agg_expr: m.3.clone(),
+        scope_filter: m.4.clone(),
+    };
+    let dim = DimDef {
+        name: d.0.clone(),
+        aliases: d.1.clone(),
+        source_table: d.2.clone(),
+        expr: d.3.clone(),
+    };
+    compose_sql(&metric, &dim, question).map(|sql| DirectHit { sql, route: "direct-agg".into(), prev: None })
+}
+
+/// 组合 SQL 装配（纯函数可单测）
+fn compose_sql(m: &MetricDef, d: &DimDef, question: &str) -> Option<String> {
+    // 同基表门控（dim.source_table 形如 "t_sales_order o LEFT JOIN ..."）
+    if !d.source_table.starts_with(&m.source_table) {
+        return None;
+    }
+    // 口径含子查询不装配（子查询内裸列归属子查询表，限定会改错——库存快照类走 LLM）
+    if m.scope_filter.to_uppercase().contains("SELECT") || m.agg_expr.to_uppercase().contains("SELECT") {
+        return None;
+    }
+    // 基表别名
+    let alias = d.source_table.split_whitespace().nth(1)?.to_string();
+    // 实体守卫：剥掉时间/指标/维度/连接词/数词后有残留 = 实体问句（交 agg_template/LLM）
+    if has_entity_residue(question, m, d) {
+        return None;
+    }
+    // 时间窗：仅 t_sales_order 基表（order_time 已知）；其他基表带时间词不装配（防错配时间列）
+    let time_and = match time_window(question) {
+        Some(p) => {
+            if m.source_table != "t_sales_order" {
+                return None;
+            }
+            format!(" AND {}", p.replace("order_time", &format!("{alias}.order_time")))
+        }
+        None => String::new(),
+    };
+    let scope = if m.scope_filter.trim().is_empty() {
+        String::new()
+    } else {
+        qualify_cols(&m.scope_filter, &alias)
+    };
+    let where_sql = match (scope.is_empty(), time_and.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("WHERE {scope}"),
+        (true, false) => format!("WHERE {}", time_and.trim_start_matches(" AND ")),
+        (false, false) => format!("WHERE {scope}{time_and}"),
+    };
+    let agg = qualify_cols(&m.agg_expr, &alias);
+    let lim = detect_top_n(question);
+    // 时间维度按时间排序（趋势语义），其余按指标降序
+    let order = if d.expr.contains("DATE_FORMAT") || d.expr.contains("order_time") {
+        format!("ORDER BY {} LIMIT {lim}", d.expr)
+    } else {
+        format!("ORDER BY `{}` DESC LIMIT {lim}", m.name)
+    };
+    Some(format!(
+        "SELECT {} AS `{}`, {} AS `{}`\nFROM {}\n{}\nGROUP BY {}\n{order}",
+        d.expr, d.name, agg, m.name, d.source_table, where_sql, d.expr
+    ))
+}
+
+/// 实体守卫：剥词后有 CJK/字母数字残留 = 实体问句（纯函数）
+fn has_entity_residue(question: &str, m: &MetricDef, d: &DimDef) -> bool {
+    let mut s = question.to_string();
+    let mut words: Vec<String> = vec![m.name.clone(), d.name.clone()];
+    words.extend(m.aliases.iter().cloned());
+    words.extend(d.aliases.iter().cloned());
+    for w in [
+        "今天", "今日", "昨天", "昨日", "本月", "这个月", "上月", "上个月", "本周", "这周", "今年",
+        "按", "各", "的", "是多少", "多少", "排行", "排名", "前", "第", "top", "TOP", "对比", "和", "与",
+        "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "百",
+    ] {
+        s = s.replace(w, "");
+    }
+    for w in words {
+        s = s.replace(&w, "");
+    }
+    let s: String = s
+        .chars()
+        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"，。？?、,.~～".contains(*c))
+        .collect();
+    s.chars().any(|c| c.is_alphanumeric() || (c as u32) > 0x2E7F)
+}
+
+/// 裸列限定到基表别名：非函数、未限定、非关键字的标识符 → alias.col。
+/// 单引号字面量段原样跳过；已有前缀（a.col）的列原样跳过。纯函数可单测。
+fn qualify_cols(expr: &str, alias: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "AND", "OR", "NOT", "IN", "IS", "NULL", "DISTINCT", "CASE", "WHEN", "THEN", "ELSE", "END",
+        "AS", "ASC", "DESC", "LIKE", "BETWEEN", "EXISTS", "TRUE", "FALSE", "COALESCE", "NULLIF",
+        "DATE", "YEAR", "MONTH", "DAY", "CURDATE", "NOW", "INTERVAL", "YEARWEEK", "DATE_FORMAT",
+        "DATE_ADD", "DATE_SUB", "ROUND", "IF", "IFNULL",
+        "SUM", "COUNT", "AVG", "MAX", "MIN", "GROUP_CONCAT",
+    ];
+    let mut out = String::with_capacity(expr.len() + 16);
+    let mut in_quote = false;
+    let mut after_dot = false; // '.' 后的标识符=已被前缀限定的列，原样跳过
+    let mut tok = String::new();
+    let mut flush = |tok: &mut String, out: &mut String, qualify: bool| {
+        if tok.is_empty() {
+            return;
+        }
+        let up = tok.to_uppercase();
+        let word = tok.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false);
+        if qualify && word && !KEYWORDS.contains(&up.as_str()) {
+            out.push_str(&format!("{alias}.{tok}"));
+        } else {
+            out.push_str(tok);
+        }
+        tok.clear();
+    };
+    for c in expr.chars() {
+        if in_quote {
+            out.push(c);
+            if c == '\'' {
+                in_quote = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                flush(&mut tok, &mut out, !after_dot);
+                after_dot = false;
+                out.push(c);
+                in_quote = true;
+            }
+            '.' => {
+                // '.' 前的 token 是表前缀（原样），'.' 后的列已被限定（跳过）
+                flush(&mut tok, &mut out, false);
+                after_dot = true;
+                out.push(c);
+            }
+            c if c.is_alphanumeric() || c == '_' => tok.push(c),
+            _ => {
+                flush(&mut tok, &mut out, !after_dot);
+                after_dot = false;
+                out.push(c);
+            }
+        }
+    }
+    flush(&mut tok, &mut out, !after_dot);
+    out
+}
+
 /// 识别图关系问题并抽实体名。顺序敏感：共购(还买)先于买过，买过先于"X买了"。
 pub fn detect_relation(q: &str) -> Option<Relation> {
     // 共购：买X还买 / 买了X还买什么
@@ -431,5 +619,85 @@ mod tests {
         // 共购：还买优先
         assert_eq!(detect_relation("买烤肠的还买什么"), Some(Relation::Copurchase("烤肠".into())));
         assert!(detect_relation("本月销售额").is_none());
+    }
+
+    fn sales_metric() -> MetricDef {
+        MetricDef {
+            name: "销售额".into(),
+            aliases: vec!["业绩".into()],
+            source_table: "t_sales_order".into(),
+            agg_expr: "SUM(total_amount)".into(),
+            scope_filter: "deleted_flag = 0 AND order_status NOT IN ('0','108','199')".into(),
+        }
+    }
+    fn dim(name: &str, expr: &str) -> DimDef {
+        DimDef {
+            name: name.into(),
+            aliases: vec![],
+            source_table: "t_sales_order o LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0".into(),
+            expr: expr.into(),
+        }
+    }
+
+    #[test]
+    fn qualify_bare_cols() {
+        // 裸列限定、引号字面量跳过、已有前缀跳过、函数名跳过
+        assert_eq!(
+            qualify_cols("deleted_flag = 0 AND order_status NOT IN ('0','108','199')", "o"),
+            "o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199')"
+        );
+        assert_eq!(qualify_cols("SUM(total_amount)", "o"), "SUM(o.total_amount)");
+        assert_eq!(
+            qualify_cols("COUNT(DISTINCT sales_order_code)", "o"),
+            "COUNT(DISTINCT o.sales_order_code)"
+        );
+        assert_eq!(
+            qualify_cols("COALESCE(NULLIF(cus.province,''),'未知')", "o"),
+            "COALESCE(NULLIF(cus.province,''),'未知')"
+        );
+    }
+
+    #[test]
+    fn compose_province() {
+        let sql = compose_sql(&sales_metric(), &dim("省份", "COALESCE(NULLIF(cus.province,''),'未知')"), "本月销售额按省份").unwrap();
+        assert!(sql.contains("FROM t_sales_order o LEFT JOIN t_customer"), "{sql}");
+        assert!(sql.contains("SUM(o.total_amount)"), "{sql}");
+        assert!(sql.contains("o.deleted_flag = 0"), "{sql}");
+        assert!(sql.contains("o.order_time >="), "{sql}");
+        assert!(sql.contains("GROUP BY COALESCE(NULLIF(cus.province,''),'未知')"), "{sql}");
+    }
+
+    #[test]
+    fn compose_entity_question_skipped() {
+        // 实体残留（恒众餐饮）→ 不装配
+        assert!(compose_sql(&sales_metric(), &dim("客户", "COALESCE(o.customer_name,'未知')"), "恒众餐饮本月销售额按客户").is_none());
+    }
+
+    #[test]
+    fn compose_topn_and_no_time() {
+        let sql = compose_sql(&sales_metric(), &dim("省份", "cus.province"), "销售额前五省份").unwrap();
+        assert!(sql.contains("LIMIT 5"), "{sql}");
+        assert!(!sql.contains("order_time"), "{sql}"); // 没提时间不加（SuperSonic 对齐）
+    }
+
+    #[test]
+    fn compose_skips_mismatch() {
+        // 维度来源与指标不同基表（detail 驱动的商品分类）→ 不装配，交手工模板
+        let d = DimDef {
+            name: "商品分类".into(),
+            aliases: vec![],
+            source_table: "t_sales_order_detail d JOIN t_goods g ON g.goods_code = d.sku_code".into(),
+            expr: "COALESCE(cat.category_name,'未分类')".into(),
+        };
+        assert!(compose_sql(&sales_metric(), &d, "本月销售额按商品分类").is_none());
+        // 子查询口径（库存快照）→ 不装配
+        let stock = MetricDef {
+            name: "库存量".into(),
+            aliases: vec![],
+            source_table: "t_winc_stock_report".into(),
+            agg_expr: "SUM(stock_quantity)".into(),
+            scope_filter: "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)".into(),
+        };
+        assert!(compose_sql(&stock, &dim("省份", "cus.province"), "本月库存量按省份").is_none());
     }
 }

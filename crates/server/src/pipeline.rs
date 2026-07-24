@@ -432,8 +432,12 @@ async fn ask_single(
         }
     }
 
-    // 确定性快路径（单号直查/高频聚合）：命中即 0-LLM 秒出，仍走安全校验+权限注入+只读执行
-    if let Some(hit) = crate::direct::try_direct(question) {
+    // 确定性快路径：通用组合器（S3，指标×维度注册表装配）优先，手工模板（单号/聚合）兜底
+    let direct_hit = match crate::direct::try_compose(pg, question).await {
+        Some(h) => Some(h),
+        None => crate::direct::try_direct(question),
+    };
+    if let Some(hit) = direct_hit {
         if is_safe_select(&hit.sql).is_ok() {
             let injected = inject::inject(&hit.sql, &sets)?;
             if let Ok((columns, rows)) = execute(mysql, &injected).await {

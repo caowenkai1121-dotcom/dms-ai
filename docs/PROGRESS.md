@@ -214,6 +214,18 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
+## M8c S3 通用组合器①：指标×维度数据驱动装配（2026-07-24，退役手工模板第一步）
+- 移植 SuperSonic 语义层组合思想：问句=元素组合（指标×维度×时间窗），按注册表元数据装配 SQL，不按问题类型配模板。
+- `direct.rs::try_compose`：命中指标注册表+维度注册表 → `compose_sql` 装配
+  `SELECT dim.expr, metric.agg FROM dim.source_table(含JOIN) WHERE metric.scope(裸列限定基表别名) [时间窗] GROUP BY`。
+- v1 门控（宁缺毋滥，不装配就回落）：同基表（dim.source_table 以 metric.source_table 开头）、口径无子查询（库存快照类）、
+  实体守卫（剥时间/指标/维度/数词/连接词后有残留=实体问句，如「恒众餐饮本月销售额按客户」不装配）、
+  时间窗仅 t_sales_order 基表（order_time 已知）；时间维度按时间排序其余按指标降序。
+- `qualify_cols` 裸列限定器：引号字面量跳过/已有前缀跳过/函数名与 SQL 关键词白名单跳过。
+- pipeline：compose 优先、sales_breakdown 手工模板兜底（detail 驱动的商品分类/未命中维度词如「按省」仍走模板），LLM 最后。
+- 立刻兑现的组合（原模板没有）：订单数×任意注册维度、客户分类维度确定性化（原 LLM）。
+- 验收：cargo check 过；单测 +5（qualify 引号/前缀/函数、装配省份、实体守卫、前 N 无时间、门控跳过）（批量跑留门禁；重启并入 20 轮门禁）。
+
 ## M8b S2 元素级向量召回（SuperSonic SchemaMapper）+ B+ 纠错反哺（2026-07-24）
 - **元素注册表 meta.element**：metric/dimension/value/term 四注册表统一为可召回元素（SuperSonic SchemaElement）；
   `sync_elements` 幂等同步（search_text 变化自动清向量待重建），挂接 meta sync 与 autodiscover 尾部。
