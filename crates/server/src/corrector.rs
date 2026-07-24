@@ -115,6 +115,41 @@ pub async fn schema_check(pg: &PgPool, sql: &str) -> anyhow::Result<Option<Strin
     Ok(Some(hint))
 }
 
+/// AggCorrector 入口：问句命中指标 → agg_expr 解析规则 → normalize_agg 归一。
+pub async fn correct_agg(pg: &PgPool, question: &str, sql: &str) -> anyhow::Result<Option<String>> {
+    let rows: Vec<(String, Vec<String>, String)> =
+        sqlx::query_as("SELECT name, aliases, agg_expr FROM meta.metric WHERE status = 'active'")
+            .fetch_all(pg)
+            .await?;
+    // 列唯一命中一个指标才建规则（同列多指标歧义保守跳过）
+    let mut by_col: HashMap<String, (String, bool)> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    for (name, aliases, agg) in &rows {
+        let hit = question.contains(name.as_str())
+            || aliases.iter().any(|a| question.contains(a.as_str()));
+        if !hit {
+            continue;
+        }
+        if let Some((func, col, distinct)) = parse_agg_rule(agg) {
+            match by_col.get(&col) {
+                Some(prev) if *prev != (func.clone(), distinct) => {
+                    by_col.remove(&col);
+                    ambiguous.insert(col);
+                }
+                Some(_) => {}
+                None => {
+                    if !ambiguous.contains(&col) {
+                        by_col.insert(col, (func, distinct));
+                    }
+                }
+            }
+        }
+    }
+    let rules: Vec<AggRule> =
+        by_col.into_iter().map(|(col, (func, d))| (func, col, d)).collect();
+    Ok(normalize_agg(sql, &rules))
+}
+
 /// GroupByCorrector（移植 SuperSonic）：select 同时含聚合列和裸维度列却漏 GROUP BY 时，
 /// 用裸维度列补上 GROUP BY（MySQL only_full_group_by 下漏 group by 直接报错）。纯 AST，确定性。
 /// 保守门控：单表非复杂 SQL、已有 group by 不动、无聚合或无裸列不动。
@@ -185,6 +220,188 @@ fn expr_has_agg(e: &sqlparser::ast::Expr) -> bool {
     }
 }
 
+/// 聚合归一规则：(目标函数 lower, 聚合列 lower, 是否 DISTINCT)。从指标注册表 agg_expr 解析而来。
+pub type AggRule = (String, String, bool);
+
+/// 解析指标 agg_expr → AggRule。只接受单聚合形态（SUM(x)/COUNT(DISTINCT x)）；
+/// 客单价 SUM(x)/NULLIF(COUNT...,0) 这类复合表达式保守跳过（无法映射单一默认聚合）。
+pub fn parse_agg_rule(agg_expr: &str) -> Option<AggRule> {
+    use sqlparser::ast::{FunctionArg, FunctionArguments, SelectItem, SetExpr, Statement};
+    let stmts = Parser::parse_sql(&MySqlDialect {}, &format!("SELECT {agg_expr}")).ok()?;
+    let Statement::Query(q) = &stmts[0] else { return None };
+    let SetExpr::Select(sel) = q.body.as_ref() else { return None };
+    let [SelectItem::UnnamedExpr(Expr::Function(f))] = &sel.projection[..] else { return None };
+    let FunctionArguments::List(l) = &f.args else { return None };
+    if l.args.len() != 1 {
+        return None;
+    }
+    let col = match &l.args[0] {
+        FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => last_ident(e)?,
+        _ => return None, // COUNT(*) 等
+    };
+    let func = f.name.0.last()?.value.to_lowercase();
+    let distinct = matches!(
+        l.duplicate_treatment,
+        Some(sqlparser::ast::DuplicateTreatment::Distinct)
+    );
+    Some((func, col, distinct))
+}
+
+/// 取标识符末段（t.col→col）。非标识符表达式返回 None。
+fn last_ident(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Identifier(p) => Some(p.value.to_lowercase()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.to_lowercase()),
+        _ => None,
+    }
+}
+
+/// AggCorrector（移植 SuperSonic correctAggFunction）：命中指标的聚合列归一到注册表默认聚合。
+/// 问「订单数」LLM 写 COUNT(sales_order_code) → COUNT(DISTINCT sales_order_code)；
+/// 问「销售额」写 AVG(total_amount) → SUM(total_amount)。口径以注册表为单一事实源。
+/// 保守门控：仅顶层 SELECT 投影（子查询/WHERE 不碰）、列唯一命中一个指标、
+/// 目标函数已被同列其他聚合占用则不改（防改出重复列）、COUNT(*) 不碰。
+pub fn normalize_agg(sql: &str, rules: &[AggRule]) -> Option<String> {
+    use sqlparser::ast::{Query, SelectItem, SetExpr, Statement};
+    if rules.is_empty() {
+        return None;
+    }
+    let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let Statement::Query(q) = &mut stmts[0] else { return None };
+    let Query { body, .. } = q.as_mut();
+    let SetExpr::Select(sel) = body.as_mut() else { return None };
+    let sel = sel.as_mut();
+
+    // 占用集：同列已被目标函数占用（如 SELECT SUM(x), AVG(x) 对比问法），改名会撞出重复列 → 该规则停用改名
+    let occupied: HashSet<(String, String)> = rules
+        .iter()
+        .filter(|r| {
+            sel.projection.iter().any(|item| {
+                let e = match item {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                    _ => return false,
+                };
+                proj_has_func_over(e, &r.0, &r.1)
+            })
+        })
+        .map(|r| (r.0.clone(), r.1.clone()))
+        .collect();
+    let mut changed = false;
+    for item in &mut sel.projection {
+        let e = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        rewrite_agg(e, rules, &occupied, &mut changed);
+    }
+    if changed {
+        Some(stmts[0].to_string())
+    } else {
+        None
+    }
+}
+
+/// 投影表达式中是否已存在 func(col) 形态（只下钻安全包装层，不进子查询）
+fn proj_has_func_over(e: &Expr, func: &str, col: &str) -> bool {
+    use sqlparser::ast::FunctionArguments;
+    match e {
+        Expr::Function(f) => {
+            let name_ok = f
+                .name
+                .0
+                .last()
+                .map(|p| p.value.eq_ignore_ascii_case(func))
+                .unwrap_or(false);
+            let col_ok = match &f.args {
+                FunctionArguments::List(l) if l.args.len() == 1 => match &l.args[0] {
+                    sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(a)) => {
+                        last_ident(a).map(|c| c == col).unwrap_or(false)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            (name_ok && col_ok)
+                || match &f.args {
+                    FunctionArguments::List(l) => l.args.iter().any(|a| {
+                        matches!(a, sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(x)) if proj_has_func_over(x, func, col))
+                    }),
+                    _ => false,
+                }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            proj_has_func_over(left, func, col) || proj_has_func_over(right, func, col)
+        }
+        Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } | Expr::Cast { expr: x, .. } => {
+            proj_has_func_over(x, func, col)
+        }
+        _ => false,
+    }
+}
+
+/// 归一改写（只下钻安全包装层；子查询/Case 等停钻防误伤）
+fn rewrite_agg(
+    e: &mut Expr,
+    rules: &[AggRule],
+    occupied: &HashSet<(String, String)>,
+    changed: &mut bool,
+) {
+    use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
+    match e {
+        Expr::Function(f) => {
+            let FunctionArguments::List(l) = &mut f.args else { return };
+            if l.args.len() != 1 {
+                return;
+            }
+            let col = match &l.args[0] {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(a)) => {
+                    match last_ident(a) {
+                        Some(c) => c,
+                        None => return,
+                    }
+                }
+                _ => return, // COUNT(*) 不碰
+            };
+            let Some(rule) = rules.iter().find(|r| r.1 == col) else { return };
+            let node_func = f
+                .name
+                .0
+                .last()
+                .map(|p| p.value.to_lowercase())
+                .unwrap_or_default();
+            let node_distinct = matches!(l.duplicate_treatment, Some(DuplicateTreatment::Distinct));
+            if node_func == rule.0 {
+                // 函数已对，补 DISTINCT（COUNT(code)→COUNT(DISTINCT code)）
+                if rule.2 && !node_distinct {
+                    l.duplicate_treatment = Some(DuplicateTreatment::Distinct);
+                    *changed = true;
+                }
+            } else if matches!(node_func.as_str(), "sum" | "count" | "avg" | "max" | "min")
+                && !occupied.contains(&(rule.0.clone(), rule.1.clone()))
+            {
+                // 函数名归一到指标默认聚合（目标形态未占用才改），并采用规则的 DISTINCT 形态
+                if let Some(p) = f.name.0.last_mut() {
+                    p.value = rule.0.to_uppercase();
+                }
+                l.duplicate_treatment =
+                    if rule.2 { Some(DuplicateTreatment::Distinct) } else { None };
+                *changed = true;
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_agg(left, rules, occupied, changed);
+            rewrite_agg(right, rules, occupied, changed);
+        }
+        Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } | Expr::Cast { expr: x, .. } => {
+            rewrite_agg(x, rules, occupied, changed);
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +456,80 @@ mod tests {
         // 派生表别名 dd 不进 aliases（不会误判其列为幻觉）
         let (amap, _) = collect("SELECT dd.amount FROM (SELECT amount FROM t_x) dd").unwrap();
         assert!(!amap.contains_key("dd"));
+    }
+
+    #[test]
+    fn agg_rule_parsed() {
+        assert_eq!(
+            parse_agg_rule("SUM(total_amount)"),
+            Some(("sum".into(), "total_amount".into(), false))
+        );
+        assert_eq!(
+            parse_agg_rule("COUNT(DISTINCT sales_order_code)"),
+            Some(("count".into(), "sales_order_code".into(), true))
+        );
+        // 复合表达式（客单价）保守跳过
+        assert!(parse_agg_rule("SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)").is_none());
+    }
+
+    #[test]
+    fn agg_distinct_filled() {
+        // 问订单数：COUNT(sales_order_code) → COUNT(DISTINCT sales_order_code)
+        let rules = vec![("count".into(), "sales_order_code".into(), true)];
+        let out = normalize_agg(
+            "SELECT COUNT(o.sales_order_code) AS `订单数` FROM t_sales_order o",
+            &rules,
+        )
+        .unwrap();
+        assert!(norm(&out).contains("count(distincto.sales_order_code)"), "{out}");
+    }
+
+    #[test]
+    fn agg_func_normalized() {
+        // 问销售额：AVG(total_amount) → SUM(total_amount)
+        let rules = vec![("sum".into(), "total_amount".into(), false)];
+        let out = normalize_agg("SELECT AVG(o.total_amount) FROM t_sales_order o", &rules).unwrap();
+        assert!(norm(&out).contains("sum(o.total_amount)"), "{out}");
+    }
+
+    #[test]
+    fn agg_correct_untouched() {
+        let rules = vec![("sum".into(), "total_amount".into(), false)];
+        assert!(normalize_agg("SELECT SUM(o.total_amount) FROM t_sales_order o", &rules).is_none());
+    }
+
+    #[test]
+    fn agg_count_star_untouched() {
+        let rules = vec![("count".into(), "sales_order_code".into(), true)];
+        assert!(normalize_agg("SELECT COUNT(*) FROM t_sales_order", &rules).is_none());
+    }
+
+    #[test]
+    fn agg_occupied_rename_skipped() {
+        // 同列已有 SUM 占用（对比问法）→ AVG 不改名，防撞出重复 SUM 列
+        let rules = vec![("sum".into(), "total_amount".into(), false)];
+        assert!(normalize_agg(
+            "SELECT SUM(o.total_amount), AVG(o.total_amount) FROM t_sales_order o",
+            &rules,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn agg_subquery_untouched() {
+        // 子查询内的聚合不碰（保守）
+        let rules = vec![("sum".into(), "total_amount".into(), false)];
+        assert!(normalize_agg(
+            "SELECT t.c FROM (SELECT AVG(o.total_amount) AS c FROM t_sales_order o) t",
+            &rules,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn agg_other_column_untouched() {
+        // 规则列不匹配 → 不动
+        let rules = vec![("sum".into(), "total_amount".into(), false)];
+        assert!(normalize_agg("SELECT AVG(o.refund_amount) FROM t_x o", &rules).is_none());
     }
 }

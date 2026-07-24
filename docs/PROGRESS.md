@@ -214,9 +214,17 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
-## SuperSonic 移植累计（10 件）+ deepagents 2 件
-SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表(M6g)、多会话 conversation(M5c)、rewriteMultiTurn 追问改写(M6h)、MemoryReviewTask 记忆复核(M6i)、embed 向量召回(M6k)、语义缓存(M6l)、textSummary 洞察(M6n)、术语注册表(M6q)、维度注册表(M6x)。deepagents：复杂问题拆解-并行-合并(M6u)、只读红线预检(M6v)。
-待搬(纯逻辑)：聚合函数名归一、默认时间范围+补下界、自一致性投票(成本高暂缓)、值链接纠正(需轻量元数据)。
+## M6y SuperSonic 深度移植⑪：AggCorrector 聚合函数名归一（2026-07-24）
+- 移植 SuperSonic correctAggFunction：命中指标卡的聚合列必须归一到注册表默认聚合（口径单一事实源再落一刀）。
+  问「订单数」LLM 写 COUNT(sales_order_code) → **COUNT(DISTINCT sales_order_code)**；问「销售额」写 AVG(total_amount) → **SUM(total_amount)**。
+- `corrector.rs`：`parse_agg_rule`（agg_expr 解出 (函数,列,DISTINCT)，客单价类复合表达式保守跳过）+ `normalize_agg`（纯 AST 改写，可单测）+ `correct_agg`（问句命中指标→建规则，同列多指标歧义跳过）。
+- 保守门控：仅顶层 SELECT 投影（子查询/WHERE 不碰）；COUNT(\*) 不碰；同列已被目标函数占用（SUM/AVG 对比问法）不改名防撞重复列；只下钻 Nested/Cast/Unary/BinaryOp 包装层。
+- pipeline 接线：fix_group_by 后 correct_agg（两个纯 AST 校正串行，均不调 LLM）。
+- 验收：cargo check 过；单测 +8（规则解析/复合跳过/DISTINCT 补齐/函数归一/已正确不动/COUNT(\*)不动/占用守卫/子查询不碰/异列不动）（20 轮门禁批量跑）。
+
+## SuperSonic 移植累计（11 件）+ deepagents 2 件
+SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表(M6g)、多会话 conversation(M5c)、rewriteMultiTurn 追问改写(M6h)、MemoryReviewTask 记忆复核(M6i)、embed 向量召回(M6k)、语义缓存(M6l)、textSummary 洞察(M6n)、术语注册表(M6q)、维度注册表(M6x)、AggCorrector 聚合归一(M6y)。deepagents：复杂问题拆解-并行-合并(M6u)、只读红线预检(M6v)。
+待搬(纯逻辑)：默认时间范围+补下界、自一致性投票(成本高暂缓)、值链接纠正(需轻量元数据)。
 
 ## 下一步（M6c/M7）
 - 指标注册表继续扩充(售后率/毛利等) + 维度注册表扩充(仓库/品牌/客户分类等，先连库坐实口径)。

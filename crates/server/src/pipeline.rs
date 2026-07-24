@@ -470,6 +470,10 @@ async fn ask_single(
     if let Some(fixed) = crate::corrector::fix_group_by(&sql) {
         sql = fixed;
     }
+    // AggCorrector（移植 SuperSonic correctAggFunction）：命中指标的聚合列归一到注册表默认聚合
+    if let Ok(Some(fixed)) = crate::corrector::correct_agg(pg, question, &sql).await {
+        sql = fixed;
+    }
 
     for attempt in 0..2 {
         let candidate = ensure_limit(&sql);
