@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS meta.correction_log(
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_correction_kind ON meta.correction_log(kind, created_at);
+-- JOIN 边注册表（SuperSonic JoinPath 思想）：表间可连接边+基数，组合器跨基表路径推导用
+CREATE TABLE IF NOT EXISTS meta.join_edge(
+  left_table text NOT NULL,
+  left_col text NOT NULL,
+  right_table text NOT NULL,
+  right_col text NOT NULL,
+  card text NOT NULL DEFAULT 'N:1',  -- left→right 基数：1:N(扇出,聚合危险) / N:1(收敛,安全)
+  note text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT 'active',
+  PRIMARY KEY(left_table, left_col, right_table, right_col)
+);
 "#;
     for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         sqlx::query(stmt).execute(pg).await?;
@@ -301,8 +312,39 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
     seed_metrics(pg).await?;
     seed_dimensions(pg).await?;
     seed_value_maps(pg).await?;
+    seed_join_edges(pg).await?;
     seed_terms(pg).await?;
     sync_elements(pg).await?;
+    Ok(())
+}
+
+/// JOIN 边种子（全部来自已连库坐实的模板连接键；cardinality 标注扇出方向）
+async fn seed_join_edges(pg: &PgPool) -> anyhow::Result<()> {
+    // (left_table, left_col, right_table, right_col, card, note)
+    const EDGES: &[(&str, &str, &str, &str, &str, &str)] = &[
+        ("t_sales_order", "sales_order_code", "t_sales_order_detail", "sales_order_code", "1:N",
+         "单头→明细扇出（且 detail 有 2x 重复行，须去重——SUM 单头列严禁走此边）"),
+        ("t_sales_order", "customer_code", "t_customer", "customer_code", "N:1", "订单→客户主档"),
+        ("t_sales_order", "owner_manager", "t_employee", "employee_id", "N:1", "订单→业务员"),
+        ("t_sales_order_detail", "sku_code", "t_goods", "goods_code", "N:1", "明细→商品主档"),
+        ("t_goods", "goods_category_code", "t_goods_category", "id", "N:1", "商品→分类"),
+    ];
+    for (lt, lc, rt, rc, card, note) in EDGES {
+        sqlx::query(
+            "INSERT INTO meta.join_edge(left_table, left_col, right_table, right_col, card, note)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             ON CONFLICT (left_table, left_col, right_table, right_col)
+             DO UPDATE SET card=$5, note=$6",
+        )
+        .bind(lt)
+        .bind(lc)
+        .bind(rt)
+        .bind(rc)
+        .bind(card)
+        .bind(note)
+        .execute(pg)
+        .await?;
+    }
     Ok(())
 }
 
@@ -569,7 +611,7 @@ async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
          "库存金额必须取最新快照(每日全量快照,直接SUM会累加虚增)"),
         ("sales_qty", "销量", &["销售量", "出货量", "卖了多少箱", "销售数量"],
          "t_sales_order_detail(JOIN t_sales_order 有效订单)", "SUM(box_quantity)",
-         "d.item_type = '1'（商品行）",
+         "item_type = '1'",
          "销量=商品行箱数：item_type分列(1商品行/2赠品/3结算行)，销量只取 item_type='1' 的 box_quantity；须 JOIN t_sales_order 且 o.order_status NOT IN('0','108','199')；detail 有2x重复须先按(单号,sku,数量)去重"),
         ("invoice_amount", "开票金额", &["开票额", "发票金额", "发票"],
          "t_invoice_apply_header", "SUM(invoice_amount)",

@@ -214,6 +214,15 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
+## M8d S3② join 边注册表 + 跨基表组合（2026-07-24，组合器 v2）
+- `meta.join_edge`（SuperSonic JoinPath 思想）：表间可连接边+**基数标注**（1:N 扇出/N:1 收敛），种子 5 边全部来自已坐实模板连接键（order↔detail/order→customer/order→employee/detail→goods/goods→category）。
+- compose_sql v2：同基表直拼保留；跨基表 **BFS 最短路径**（≤3 跳）拼 FROM 链（维度片段内部别名原样保留，metric 裸列限定到 b0）。
+- **扇出闸**：路径含 1:N 边时仅 COUNT(DISTINCT) 聚合可过——SUM 单头列走扇出边会按行数虚增（销售额×商品分类仍留手工模板，正因为它要 dd 去重）。
+- **时间桥**：order_time 不在 FROM 内时，经一条 join_edge 桥接 t_sales_order o_time（销量×本月 类可用）。
+- 修 sales_qty 注册：scope 去 d. 前缀改裸列（组合器自行限定别名）；注册表文本全角括注 strip_annotations 去除（半角括号是 SQL 语法不动）。
+- 新兑现组合：**销量×省份/客户/业务员/门店**（detail→order N:1 链）、**销量×商品分类带时间窗**（同基表+时间桥）。
+- 验收：cargo check 过；单测 +3（扇出拒绝/跨基表销量省份/时间桥），存量 5 个组合测试同步 4 参签名（批量跑留门禁）。
+
 ## M8c S3 通用组合器①：指标×维度数据驱动装配（2026-07-24，退役手工模板第一步）
 - 移植 SuperSonic 语义层组合思想：问句=元素组合（指标×维度×时间窗），按注册表元数据装配 SQL，不按问题类型配模板。
 - `direct.rs::try_compose`：命中指标注册表+维度注册表 → `compose_sql` 装配

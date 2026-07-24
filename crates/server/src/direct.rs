@@ -38,9 +38,19 @@ pub struct DimDef {
     pub expr: String,
 }
 
+/// JOIN 边（meta.join_edge 行）
+pub struct JoinEdge {
+    pub lt: String,
+    pub lc: String,
+    pub rt: String,
+    pub rc: String,
+    pub card: String, // lt→rt: "1:N"(扇出) / "N:1"(收敛)
+}
+
 /// 通用组合器（S3，SuperSonic 语义层组合思想）：指标×维度 数据驱动装配，退役手工模板。
-/// 问句同时命中指标注册表与维度注册表 → 装配 GROUP BY 查询；v1 门控：
-/// 维度来源与指标同基表（dim.source_table 以 metric.source_table 开头）、口径无子查询、无实体残留。
+/// 问句同时命中指标注册表与维度注册表 → 装配 GROUP BY 查询。门控（宁缺毋滥，装配不出就回落）：
+/// 同基表直拼 / 跨基表走 join_edge BFS 路径（≤3 跳，扇出边仅 COUNT(DISTINCT) 聚合可过）、
+/// 口径无子查询、实体守卫、时间窗=order_time 在 FROM 内或可经一条边桥接 t_sales_order。
 pub async fn try_compose(pg: &sqlx::PgPool, question: &str) -> Option<DirectHit> {
     let metrics: Vec<(String, Vec<String>, String, String, String)> = sqlx::query_as(
         "SELECT name, aliases, source_table, agg_expr, scope_filter FROM meta.metric WHERE status = 'active'",
@@ -54,6 +64,16 @@ pub async fn try_compose(pg: &sqlx::PgPool, question: &str) -> Option<DirectHit>
     .fetch_all(pg)
     .await
     .ok()?;
+    let edges: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT left_table, left_col, right_table, right_col, card FROM meta.join_edge WHERE status = 'active'",
+    )
+    .fetch_all(pg)
+    .await
+    .ok()?;
+    let edges: Vec<JoinEdge> = edges
+        .into_iter()
+        .map(|(lt, lc, rt, rc, card)| JoinEdge { lt, lc, rt, rc, card })
+        .collect();
     let hit = |name: &str, aliases: &[String]| {
         question.contains(name) || aliases.iter().any(|a| question.contains(a.as_str()))
     };
@@ -72,47 +92,159 @@ pub async fn try_compose(pg: &sqlx::PgPool, question: &str) -> Option<DirectHit>
         source_table: d.2.clone(),
         expr: d.3.clone(),
     };
-    compose_sql(&metric, &dim, question).map(|sql| DirectHit { sql, route: "direct-agg".into(), prev: None })
+    compose_sql(&metric, &dim, question, &edges)
+        .map(|sql| DirectHit { sql, route: "direct-agg".into(), prev: None })
+}
+
+/// 去注册表文本里的全角括注（维护给人类看的说明，不是 SQL 的一部分；半角括号是 SQL 语法不动）
+fn strip_annotations(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth: usize = 0;
+    for c in s.chars() {
+        match c {
+            '（' => depth += 1,
+            '）' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+/// BFS 找 metric 基表 → 维度驱动表 的最短 join 路径（≤3 跳）。返回 hop 序列。
+fn find_path<'a>(
+    from: &str,
+    to: &str,
+    edges: &'a [JoinEdge],
+) -> Option<Vec<(String, String, String, bool)>> {
+    // hop = (to_table, to_col, from_col, fanout)
+    if from == to {
+        return Some(vec![]);
+    }
+    let mut queue: std::collections::VecDeque<(String, Vec<(String, String, String, bool)>)> =
+        std::collections::VecDeque::new();
+    let mut visited = std::collections::HashSet::new();
+    queue.push_back((from.to_string(), vec![]));
+    visited.insert(from.to_string());
+    while let Some((cur, path)) = queue.pop_front() {
+        if path.len() >= 3 {
+            continue;
+        }
+        for e in edges {
+            let (next, to_col, from_col, fanout) = if e.lt == cur {
+                (e.rt.clone(), e.rc.clone(), e.lc.clone(), e.card == "1:N")
+            } else if e.rt == cur {
+                (e.lt.clone(), e.lc.clone(), e.rc.clone(), e.card == "N:1")
+            } else {
+                continue;
+            };
+            if visited.contains(&next) {
+                continue;
+            }
+            let mut p = path.clone();
+            p.push((next.clone(), to_col, from_col, fanout));
+            if next == to {
+                return Some(p);
+            }
+            visited.insert(next.clone());
+            queue.push_back((next, p));
+        }
+    }
+    None
+}
+
+/// 找两表间的直接边（时间桥用）
+fn find_edge<'a>(a: &str, b: &str, edges: &'a [JoinEdge]) -> Option<(&'a JoinEdge, bool)> {
+    // 返回 (edge, a_is_left)
+    edges.iter().find_map(|e| {
+        if e.lt == a && e.rt == b {
+            Some((e, true))
+        } else if e.rt == a && e.lt == b {
+            Some((e, false))
+        } else {
+            None
+        }
+    })
 }
 
 /// 组合 SQL 装配（纯函数可单测）
-fn compose_sql(m: &MetricDef, d: &DimDef, question: &str) -> Option<String> {
-    // 同基表门控（dim.source_table 形如 "t_sales_order o LEFT JOIN ..."）
-    if !d.source_table.starts_with(&m.source_table) {
-        return None;
+fn compose_sql(m: &MetricDef, d: &DimDef, question: &str, edges: &[JoinEdge]) -> Option<String> {
+    // 口径/来源去中文括注（注册表文本带人类说明）
+    let m_src = strip_annotations(&m.source_table);
+    let m_scope = strip_annotations(&m.scope_filter);
+    let m_agg = strip_annotations(&m.agg_expr);
+    if m_scope.to_uppercase().contains("SELECT") || m_agg.to_uppercase().contains("SELECT") {
+        return None; // 子查询内裸列归属子查询表，限定会改错——走 LLM
     }
-    // 口径含子查询不装配（子查询内裸列归属子查询表，限定会改错——库存快照类走 LLM）
-    if m.scope_filter.to_uppercase().contains("SELECT") || m.agg_expr.to_uppercase().contains("SELECT") {
-        return None;
-    }
-    // 基表别名
-    let alias = d.source_table.split_whitespace().nth(1)?.to_string();
-    // 实体守卫：剥掉时间/指标/维度/连接词/数词后有残留 = 实体问句（交 agg_template/LLM）
     if has_entity_residue(question, m, d) {
-        return None;
+        return None; // 实体问句（恒众餐饮本月销售额）→ agg_template/LLM
     }
-    // 时间窗：仅 t_sales_order 基表（order_time 已知）；其他基表带时间词不装配（防错配时间列）
+    let dim_base = d.source_table.split_whitespace().next()?.to_string();
+    let dim_alias = d.source_table.split_whitespace().nth(1)?.to_string();
+    let dim_rest: String = {
+        let mut parts = d.source_table.splitn(3, char::is_whitespace);
+        parts.next();
+        parts.next();
+        parts.next().unwrap_or("").to_string()
+    };
+
+    // FROM 装配 + 扇出检查 + 各表别名登记
+    let mut from: String;
+    let mut table_aliases: Vec<(String, String)> = vec![]; // (table, alias)
+    if dim_base == m_src {
+        // 同基表：直接用维度来源串（含其内部 JOIN 链）
+        from = d.source_table.clone();
+        table_aliases.push((dim_base.clone(), dim_alias.clone()));
+    } else {
+        // 跨基表：BFS 路径拼接；扇出边仅 COUNT(DISTINCT) 聚合可过（防 SUM 单头列虚增）
+        let path = find_path(&m_src, &dim_base, edges)?;
+        if path.iter().any(|h| h.3) && !m_agg.to_uppercase().starts_with("COUNT(DISTINCT") {
+            return None;
+        }
+        from = format!("{m_src} b0");
+        table_aliases.push((m_src.clone(), "b0".to_string()));
+        let mut prev_alias = "b0".to_string();
+        for (i, (to, to_col, from_col, _)) in path.iter().enumerate() {
+            let last = i == path.len() - 1;
+            let alias = if last { dim_alias.clone() } else { format!("b{}", i + 1) };
+            from.push_str(&format!(" JOIN {to} {alias} ON {alias}.{to_col} = {prev_alias}.{from_col}"));
+            table_aliases.push((to.clone(), alias.clone()));
+            prev_alias = alias;
+        }
+        if !dim_rest.is_empty() {
+            from.push(' ');
+            from.push_str(&dim_rest);
+        }
+    }
+    let base_alias = table_aliases[0].1.clone();
+
+    // 时间窗：order_time 在 FROM 内→用其别名；不在→可经一条边桥接 t_sales_order；否则不装配
     let time_and = match time_window(question) {
         Some(p) => {
-            if m.source_table != "t_sales_order" {
+            let alias = if let Some((_, a)) = table_aliases.iter().find(|(t, _)| t == "t_sales_order") {
+                a.clone()
+            } else if let Some((e, base_is_left)) = find_edge(&m_src, "t_sales_order", edges) {
+                let (c_base, c_ord) = if base_is_left { (&e.lc, &e.rc) } else { (&e.rc, &e.lc) };
+                from.push_str(&format!(
+                    " JOIN t_sales_order o_time ON o_time.{c_ord} = {base_alias}.{c_base}"
+                ));
+                "o_time".to_string()
+            } else {
                 return None;
-            }
+            };
             format!(" AND {}", p.replace("order_time", &format!("{alias}.order_time")))
         }
         None => String::new(),
     };
-    let scope = if m.scope_filter.trim().is_empty() {
-        String::new()
-    } else {
-        qualify_cols(&m.scope_filter, &alias)
-    };
+
+    let scope = if m_scope.trim().is_empty() { String::new() } else { qualify_cols(&m_scope, &base_alias) };
     let where_sql = match (scope.is_empty(), time_and.is_empty()) {
         (true, true) => String::new(),
         (false, true) => format!("WHERE {scope}"),
         (true, false) => format!("WHERE {}", time_and.trim_start_matches(" AND ")),
         (false, false) => format!("WHERE {scope}{time_and}"),
     };
-    let agg = qualify_cols(&m.agg_expr, &alias);
+    let agg = qualify_cols(&m_agg, &base_alias);
     let lim = detect_top_n(question);
     // 时间维度按时间排序（趋势语义），其余按指标降序
     let order = if d.expr.contains("DATE_FORMAT") || d.expr.contains("order_time") {
@@ -122,7 +254,7 @@ fn compose_sql(m: &MetricDef, d: &DimDef, question: &str) -> Option<String> {
     };
     Some(format!(
         "SELECT {} AS `{}`, {} AS `{}`\nFROM {}\n{}\nGROUP BY {}\n{order}",
-        d.expr, d.name, agg, m.name, d.source_table, where_sql, d.expr
+        d.expr, d.name, agg, m.name, from, where_sql, d.expr
     ))
 }
 
@@ -630,6 +762,15 @@ mod tests {
             scope_filter: "deleted_flag = 0 AND order_status NOT IN ('0','108','199')".into(),
         }
     }
+    fn qty_metric() -> MetricDef {
+        MetricDef {
+            name: "销量".into(),
+            aliases: vec![],
+            source_table: "t_sales_order_detail(JOIN t_sales_order 有效订单)".into(),
+            agg_expr: "SUM(box_quantity)".into(),
+            scope_filter: "item_type = '1'".into(),
+        }
+    }
     fn dim(name: &str, expr: &str) -> DimDef {
         DimDef {
             name: name.into(),
@@ -637,6 +778,23 @@ mod tests {
             source_table: "t_sales_order o LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0".into(),
             expr: expr.into(),
         }
+    }
+    fn cat_dim() -> DimDef {
+        DimDef {
+            name: "商品分类".into(),
+            aliases: vec![],
+            source_table: "t_sales_order_detail d JOIN t_goods g ON g.goods_code = d.sku_code AND g.deleted_flag = 0 LEFT JOIN t_goods_category cat ON g.goods_category_code = cat.id".into(),
+            expr: "COALESCE(cat.category_name,'未分类')".into(),
+        }
+    }
+    fn edges() -> Vec<JoinEdge> {
+        vec![
+            JoinEdge { lt: "t_sales_order".into(), lc: "sales_order_code".into(), rt: "t_sales_order_detail".into(), rc: "sales_order_code".into(), card: "1:N".into() },
+            JoinEdge { lt: "t_sales_order".into(), lc: "customer_code".into(), rt: "t_customer".into(), rc: "customer_code".into(), card: "N:1".into() },
+            JoinEdge { lt: "t_sales_order".into(), lc: "owner_manager".into(), rt: "t_employee".into(), rc: "employee_id".into(), card: "N:1".into() },
+            JoinEdge { lt: "t_sales_order_detail".into(), lc: "sku_code".into(), rt: "t_goods".into(), rc: "goods_code".into(), card: "N:1".into() },
+            JoinEdge { lt: "t_goods".into(), lc: "goods_category_code".into(), rt: "t_goods_category".into(), rc: "id".into(), card: "N:1".into() },
+        ]
     }
 
     #[test]
@@ -659,7 +817,7 @@ mod tests {
 
     #[test]
     fn compose_province() {
-        let sql = compose_sql(&sales_metric(), &dim("省份", "COALESCE(NULLIF(cus.province,''),'未知')"), "本月销售额按省份").unwrap();
+        let sql = compose_sql(&sales_metric(), &dim("省份", "COALESCE(NULLIF(cus.province,''),'未知')"), "本月销售额按省份", &edges()).unwrap();
         assert!(sql.contains("FROM t_sales_order o LEFT JOIN t_customer"), "{sql}");
         assert!(sql.contains("SUM(o.total_amount)"), "{sql}");
         assert!(sql.contains("o.deleted_flag = 0"), "{sql}");
@@ -670,26 +828,18 @@ mod tests {
     #[test]
     fn compose_entity_question_skipped() {
         // 实体残留（恒众餐饮）→ 不装配
-        assert!(compose_sql(&sales_metric(), &dim("客户", "COALESCE(o.customer_name,'未知')"), "恒众餐饮本月销售额按客户").is_none());
+        assert!(compose_sql(&sales_metric(), &dim("客户", "COALESCE(o.customer_name,'未知')"), "恒众餐饮本月销售额按客户", &edges()).is_none());
     }
 
     #[test]
     fn compose_topn_and_no_time() {
-        let sql = compose_sql(&sales_metric(), &dim("省份", "cus.province"), "销售额前五省份").unwrap();
+        let sql = compose_sql(&sales_metric(), &dim("省份", "cus.province"), "销售额前五省份", &edges()).unwrap();
         assert!(sql.contains("LIMIT 5"), "{sql}");
         assert!(!sql.contains("order_time"), "{sql}"); // 没提时间不加（SuperSonic 对齐）
     }
 
     #[test]
     fn compose_skips_mismatch() {
-        // 维度来源与指标不同基表（detail 驱动的商品分类）→ 不装配，交手工模板
-        let d = DimDef {
-            name: "商品分类".into(),
-            aliases: vec![],
-            source_table: "t_sales_order_detail d JOIN t_goods g ON g.goods_code = d.sku_code".into(),
-            expr: "COALESCE(cat.category_name,'未分类')".into(),
-        };
-        assert!(compose_sql(&sales_metric(), &d, "本月销售额按商品分类").is_none());
         // 子查询口径（库存快照）→ 不装配
         let stock = MetricDef {
             name: "库存量".into(),
@@ -698,6 +848,31 @@ mod tests {
             agg_expr: "SUM(stock_quantity)".into(),
             scope_filter: "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)".into(),
         };
-        assert!(compose_sql(&stock, &dim("省份", "cus.province"), "本月库存量按省份").is_none());
+        assert!(compose_sql(&stock, &dim("省份", "cus.province"), "本月库存量按省份", &edges()).is_none());
+    }
+
+    #[test]
+    fn compose_fanout_rejected_for_sum() {
+        // 单头 SUM × 明细驱动维度（1:N 扇出）→ 拒绝（防 total_amount 按行数虚增），交手工模板
+        assert!(compose_sql(&sales_metric(), &cat_dim(), "本月销售额按商品分类", &edges()).is_none());
+    }
+
+    #[test]
+    fn compose_qty_province_cross_base() {
+        // 销量(detail) × 省份(header→customer)：N:1 链扇出安全 → 装配
+        let sql = compose_sql(&qty_metric(), &dim("省份", "COALESCE(NULLIF(cus.province,''),'未知')"), "本月销量按省份", &edges()).unwrap();
+        assert!(sql.contains("FROM t_sales_order_detail b0 JOIN t_sales_order o ON o.sales_order_code = b0.sales_order_code"), "{sql}");
+        assert!(sql.contains("SUM(b0.box_quantity)"), "{sql}");
+        assert!(sql.contains("b0.item_type = '1'"), "{sql}");
+        assert!(sql.contains("o.order_time >="), "{sql}");
+    }
+
+    #[test]
+    fn compose_qty_category_time_bridge() {
+        // 销量 × 商品分类（同基表 detail）：时间窗经边桥接 t_sales_order o_time
+        let sql = compose_sql(&qty_metric(), &cat_dim(), "本月销量按商品分类", &edges()).unwrap();
+        assert!(sql.contains("JOIN t_sales_order o_time ON o_time.sales_order_code = d.sales_order_code"), "{sql}");
+        assert!(sql.contains("SUM(d.box_quantity)"), "{sql}");
+        assert!(sql.contains("o_time.order_time >="), "{sql}");
     }
 }
