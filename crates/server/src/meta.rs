@@ -69,6 +69,16 @@ CREATE TABLE IF NOT EXISTS meta.metric(
   description text NOT NULL DEFAULT '',
   status text NOT NULL DEFAULT 'active'
 );
+-- 维度注册表（移植 SuperSonic DimensionResp 最小可用）：维度名→分组取数口径单一事实源
+CREATE TABLE IF NOT EXISTS meta.dimension(
+  dim_code text PRIMARY KEY,
+  name text NOT NULL,
+  aliases text[] NOT NULL DEFAULT '{}',
+  source_table text NOT NULL,
+  expr text NOT NULL,
+  description text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT 'active'
+);
 "#;
     for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         sqlx::query(stmt).execute(pg).await?;
@@ -259,6 +269,7 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
         .await?;
     }
     seed_metrics(pg).await?;
+    seed_dimensions(pg).await?;
     seed_terms(pg).await?;
     Ok(())
 }
@@ -379,6 +390,76 @@ pub async fn recall_metrics(pg: &PgPool, question: &str) -> anyhow::Result<Vec<S
         .map(|(name, _aliases, src, agg, scope, desc)| {
             let filter = if scope.is_empty() { String::new() } else { format!("；口径过滤：{scope}") };
             format!("【{name}】= {agg}，来源表 {src}{filter}。说明：{desc}")
+        })
+        .collect())
+}
+
+/// 首批维度注册（取数口径全部来自 direct.rs 已连库坐实的确定性模板——单一事实源，根治 LLM 分组乱 JOIN/取错列）
+async fn seed_dimensions(pg: &PgPool) -> anyhow::Result<()> {
+    // (code, name, aliases, source_table, expr, description)
+    const DIMENSIONS: &[(&str, &str, &[&str], &str, &str, &str)] = &[
+        ("province", "省份", &["各省", "省市", "区域", "地区"],
+         "t_sales_order o LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0",
+         "COALESCE(NULLIF(cus.province,''),'未知')",
+         "省份在客户主档 t_customer.province（订单表无此列），存行政区划码；空串归'未知'"),
+        ("owner", "业务员", &["经理", "负责人", "销售员"],
+         "t_sales_order o LEFT JOIN t_employee e ON e.employee_id = o.owner_manager",
+         "COALESCE(e.actual_name, o.owner_manager)",
+         "业务员=订单 owner_manager（employee_id），JOIN t_employee 翻 actual_name 姓名，查不到回退工号"),
+        ("customer", "客户", &["客户名", "经销商"],
+         "t_sales_order o",
+         "COALESCE(o.customer_name,'未知')",
+         "客户直接取订单头 customer_name（快照名，免 JOIN）；需客户主档属性才 JOIN t_customer"),
+        ("shop", "门店", &["店铺", "终端"],
+         "t_sales_order o",
+         "COALESCE(o.shop_name,'未知')",
+         "门店取订单头 shop_name（快照名，免 JOIN）"),
+        ("goods_category", "商品分类", &["品类", "类别"],
+         "t_sales_order_detail d JOIN t_goods g ON g.goods_code = d.sku_code AND g.deleted_flag = 0 LEFT JOIN t_goods_category cat ON g.goods_category_code = cat.id",
+         "COALESCE(cat.category_name,'未分类')",
+         "分类在 t_goods_category.category_name，连接键 sku_code=goods_code→goods_category_code=cat.id；无分类归'未分类'"),
+        ("month", "月份", &["按月", "每月", "各月", "月度"],
+         "t_sales_order o",
+         "DATE_FORMAT(o.order_time,'%Y-%m')",
+         "月份用 DATE_FORMAT 截到 '%Y-%m'，GROUP BY 与 SELECT 同表达式"),
+    ];
+    for (code, name, aliases, src, expr, desc) in DIMENSIONS {
+        sqlx::query(
+            "INSERT INTO meta.dimension(dim_code, name, aliases, source_table, expr, description)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             ON CONFLICT (dim_code) DO UPDATE SET
+               name=$2, aliases=$3, source_table=$4, expr=$5, description=$6",
+        )
+        .bind(code)
+        .bind(name)
+        .bind(aliases.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .bind(src)
+        .bind(expr)
+        .bind(desc)
+        .execute(pg)
+        .await?;
+    }
+    Ok(())
+}
+
+/// 维度命中判定（问句含维度名或别名）
+fn dim_hit(question: &str, name: &str, aliases: &[String]) -> bool {
+    question.contains(name) || aliases.iter().any(|a| question.contains(a.as_str()))
+}
+
+/// 召回命中的维度口径卡（问句含维度名或别名）→ 注入 prompt 让 LLM 按此分组取数
+pub async fn recall_dimensions(pg: &PgPool, question: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String, Vec<String>, String, String, String)> = sqlx::query_as(
+        "SELECT name, aliases, source_table, expr, description
+         FROM meta.dimension WHERE status = 'active'",
+    )
+    .fetch_all(pg)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(name, aliases, ..)| dim_hit(question, name, aliases))
+        .map(|(name, _aliases, src, expr, desc)| {
+            format!("【{name}】分组取值 {expr}，来源 {src}。说明：{desc}")
         })
         .collect())
 }
@@ -536,5 +617,18 @@ mod tests {
         assert!(is_sensitive_col("login_pwd"));
         assert!(is_sensitive_col("api_token"));
         assert!(!is_sensitive_col("customer_code"));
+    }
+
+    #[test]
+    fn dimension_hit_matching() {
+        let aliases = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 名命中
+        assert!(dim_hit("本月销售额按省份", "省份", &aliases(&["各省"])));
+        // 别名命中
+        assert!(dim_hit("各区域经理业绩", "业务员", &aliases(&["经理", "负责人"])));
+        assert!(dim_hit("销售额按品类", "商品分类", &aliases(&["品类", "类别"])));
+        // 未命中
+        assert!(!dim_hit("本月销售额", "省份", &aliases(&["各省"])));
+        assert!(!dim_hit("库存量", "门店", &aliases(&["店铺", "终端"])));
     }
 }

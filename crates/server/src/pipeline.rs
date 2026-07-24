@@ -160,6 +160,7 @@ pub async fn generate_sql(
     let ctxs = meta::retrieve(pg, question, 6).await?;
     let table_names: Vec<String> = ctxs.iter().map(|c| c.table_name.clone()).collect();
     let metrics = meta::recall_metrics(pg, question).await.unwrap_or_default();
+    let dims = meta::recall_dimensions(pg, question).await.unwrap_or_default();
     let terms = meta::recall_terms(pg, question).await.unwrap_or_default();
     let pitfalls = meta::recall_pitfalls(pg, question, &table_names, 6).await?;
     let fewshot = fewshot_block(pg, question).await;
@@ -172,6 +173,14 @@ pub async fn generate_sql(
         user.push_str("## 指标口径（问题命中以下指标，必须严格按此口径，禁止自己选表或改算法）\n");
         for m in &metrics {
             user.push_str(&format!("- {m}\n"));
+        }
+        user.push('\n');
+    }
+    // 维度口径卡（移植 SuperSonic DimensionResp）——按此维度分组时必须用此取值表达式/连接键
+    if !dims.is_empty() {
+        user.push_str("## 维度口径（问题命中以下维度，分组取数必须按此口径，禁止自己臆造连接键）\n");
+        for d in &dims {
+            user.push_str(&format!("- {d}\n"));
         }
         user.push('\n');
     }

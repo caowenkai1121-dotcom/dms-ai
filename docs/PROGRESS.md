@@ -198,13 +198,28 @@
 - **验收**：单测52/52; 连库+Playwright——「分别统计各省销售额和各商品分类销量」→route=compound 拆2子并行(各省销售额 direct-agg 34行 + 各商品分类销量 llm 64行)，之前一条SQL超时90s；前端多子面板渲染。
 - 遗留：商品分类「销量」列口径(detail 数量列/item_type)下轮优化。
 
-## SuperSonic 移植累计（9 件）+ deepagents 1 件
-SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表(M6g)、多会话 conversation(M5c)、rewriteMultiTurn 追问改写(M6h)、MemoryReviewTask 记忆复核(M6i)。
-待搬(需 embed)：向量召回、语义缓存。待搬(纯逻辑)：聚合函数名归一、默认时间范围、术语/维度注册表。
+## M6v deepagents P3 移植：SQL 预检只读红线硬拦（2026-07-23，已验收）
+- is_safe_select 加显式只读红线（INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE/REPLACE/MERGE/GRANT/REVOKE，尾空格防误伤 deleted_flag/created_time 等列名）。
+- 与数据库层 READ ONLY + AST Query 校验形成三道只读防线（DMS 只读铁律）。验收：单测 53/53。
+
+## M6w 销量指标 — 修复商品分类销量 0（M6u 遗留，2026-07-23，已验收）
+- meta.metric 加「销量」：SUM(box_quantity) item_type='1' 商品行（item_type 分列 1商品/2赠品/3结算），JOIN 有效订单+detail 2x 去重；清毒化语义缓存。
+- 连库「各商品分类销量」用对口径（脆皮烤肠 189 万箱/商用蛋挞 147 万箱，之前全 0）。
+
+## M6x SuperSonic 深度移植⑩：维度注册表（DimensionResp，2026-07-24）
+- 移植 SuperSonic DimensionResp 最小可用：维度名+别名→来源表+取值表达式，**分组取数口径单一事实源**，根治 LLM 分组乱 JOIN/取错列（与指标注册表互补）。
+- `meta.dimension` + `seed_dimensions` 首批 6 维（口径全部取自 direct.rs 已连库坐实的确定性模板）：
+  省份(t_customer.province 区划码,空串归未知)/业务员(owner_manager→t_employee.actual_name)/客户(订单头 customer_name 快照)/门店(shop_name 快照)/商品分类(sku_code→goods→category 链)/月份(DATE_FORMAT '%Y-%m')。
+- `recall_dimensions` 问句命中维度名/别名→注入 prompt「维度口径卡」（禁止臆造连接键），pipeline 注入位置在指标卡后、术语前。
+- 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
+- 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
+
+## SuperSonic 移植累计（10 件）+ deepagents 2 件
+SchemaCorrector 字段校验(M6e)、GroupBy 补全(M6f)、指标注册表(M6g)、多会话 conversation(M5c)、rewriteMultiTurn 追问改写(M6h)、MemoryReviewTask 记忆复核(M6i)、embed 向量召回(M6k)、语义缓存(M6l)、textSummary 洞察(M6n)、术语注册表(M6q)、维度注册表(M6x)。deepagents：复杂问题拆解-并行-合并(M6u)、只读红线预检(M6v)。
+待搬(纯逻辑)：聚合函数名归一、默认时间范围+补下界、自一致性投票(成本高暂缓)、值链接纠正(需轻量元数据)。
 
 ## 下一步（M6c/M7）
-- 指标注册表扩充(库存/售后率/毛利等) + 维度注册表；embed 向量召回激活。
-- M7 判官门禁：回归题集 ≥50 例 + 并发 + 安全审计。
-- M6c：图关系+行级权限；实体锚定；语义缓存(接 embed)；SchemaCorrector(执行前幻觉列拦截)；graph sync 定时刷新。
-- M5c：端#1 SM4 登录转发（密钥 1024lab__1024lab + 图形验证码流程）；企微/DMS 真 token 生产联调。
-- M7 判官门禁：回归题集扩到 ≥50 例；并发；安全审计。
+- 指标注册表继续扩充(售后率/毛利等) + 维度注册表扩充(仓库/品牌/客户分类等，先连库坐实口径)。
+- M6c：图关系+行级权限；实体锚定；graph sync 定时刷新。
+- M5c：端#1 SM4 登录转发（密钥 1024lab__1024lab + 图形验证码流程）；企微/DMS 真 token 生产联调（企微 errcode 60020 → 生产加可信 IP 白名单）。
+- M7 判官门禁：回归题集扩到 ≥50 例 + 并发 + 安全审计。
