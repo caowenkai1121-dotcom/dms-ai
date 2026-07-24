@@ -214,6 +214,17 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
+## M7f 维度注册表扩充②：客户分类/类型（字典坐实）+ 商品分类模板误伤修复（2026-07-24）
+- **坐实方式**：`tools/probe_values.py` 只读探针（SET SESSION TRANSACTION READ ONLY，小表 GROUP BY 抽样）——
+  customer_class 100% 填充（04线下客户占 96%）、customer_type Z001/Z002 两值、group1/business_type/sale_platform 全 NULL 死列（不做）；
+  字典表 t_dict_key/t_dict_value 坐实码表：CustClassif(01货架~99外部客户的店铺 7码)、CUST_TYPE(Z001~Z005 5码)。
+- 维度 +2：**客户分类**/**客户类型**（CASE 翻名免字典 JOIN，NULL 归'未分类'，desc 注明字典 key 来源）。
+- value_map +2 组：customer_class 7 码/customer_type 5 码（「线下客户的销售额」类过滤问句直写中文名→确定性换码）。
+- **修真 bug**：「本月销售额按客户分类」被 detect_sales_dim 的「分类」抢先命中商品分类模板=答非所问——
+  客户分类/客户类别/客户类型/客户种类 前置拦截回落 LLM（维度卡接管）。
+- 回归题集 +2（E16 过滤换码/E17 客户分类不误走），累计 53 题。
+- 验收：cargo check 过；单测 +2 断言（客户分类/类型不命中商品模板）（批量跑留门禁）。
+
 ## M7e 前端体验：loading 耗时 + 错误重试 + 发送防抖（2026-07-24）
 - **loading 假死感消除**：thinking 气泡实时跳动已耗时秒数（1s interval，查询结束清）+ 「大数据量查询约需 10~60 秒」预期提示。
 - **错误可恢复**：错误气泡加 ⚠️ 图标 + 「↻ 重试」按钮（取上一轮用户问题原样重发，避免手敲）。

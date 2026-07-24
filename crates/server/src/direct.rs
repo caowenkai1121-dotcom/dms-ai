@@ -146,6 +146,11 @@ enum SalesDim {
 
 fn detect_sales_dim(q: &str) -> Option<SalesDim> {
     // 顺序敏感：分类先于客户（"客户分类"罕见），业务员先于客户
+    // 「客户分类/客户类型」是客户维度（字典码 CustClassif/CUST_TYPE），不是商品分类——
+    // 无确定性模板，回落 LLM 由维度口径卡接管（误走商品分类模板=答非所问）
+    if q.contains("客户分类") || q.contains("客户类别") || q.contains("客户类型") || q.contains("客户种类") {
+        return None;
+    }
     if q.contains("分类") || q.contains("品类") || q.contains("类别") {
         Some(SalesDim::Category)
     } else if q.contains("省") {
@@ -414,6 +419,9 @@ mod tests {
         assert!(sales_breakdown("本月销售额是多少").is_none());
         // 非销售额不命中
         assert!(sales_breakdown("本月订单数按省份").is_none());
+        // 「客户分类/客户类型」是客户维度（CustClassif/CUST_TYPE 字典码），不是商品分类——回落 LLM 维度卡接管
+        assert!(sales_breakdown("本月销售额按客户分类").is_none());
+        assert!(sales_breakdown("销售额按客户类型").is_none());
     }
 
     #[test]

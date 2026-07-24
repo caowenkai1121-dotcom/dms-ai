@@ -59,6 +59,8 @@
     { "name": "E14-昨天销售订单明细", "login": "admin", "q": "昨天销售订单明细", "llm": true, "min_cols": 8 },
     { "name": "E15-专票换码", "login": "admin", "q": "本月专票开了多少金额", "llm": true,
       "sql_contains": ["invoice_type"], "sql_not_contains": ["专票"] },
+    { "name": "E16-线下客户过滤换码", "login": "admin", "q": "线下客户本月销售额", "llm": true, "sql_contains": ["customer_class"] },
+    { "name": "E17-客户分类不误走商品分类", "login": "admin", "q": "本月销售额按客户分类", "llm": true, "sql_contains": ["customer_class"] },
 
     { "name": "F01-图-买过烤肠的客户", "login": "admin", "q": "买过烤肠的客户", "route": "graph", "min_rows": 1, "requires_graph": true },
     { "name": "F02-图-共购推荐", "login": "admin", "q": "买过烤肠的客户还买过什么", "route": "graph", "requires_graph": true },

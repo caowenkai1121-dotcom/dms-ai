@@ -318,6 +318,13 @@ async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
         // 明细行类型（M6w 坐实：1商品行/2赠品/3结算行）
         ("t_sales_order_detail", "item_type",
          &[("商品行", "1"), ("赠品", "2"), ("结算行", "3")], "eq"),
+        // 客户分类/类型（字典 key=CustClassif/CUST_TYPE 探针坐实，过滤问句换码）
+        ("t_customer", "customer_class",
+         &[("货架店铺", "01"), ("新媒体店铺", "02"), ("社团店铺", "03"), ("线下客户", "04"),
+           ("内部客户", "05"), ("其他财务专用", "06"), ("外部客户的店铺", "99")], "eq"),
+        ("t_customer", "customer_type",
+         &[("一般销售客户", "Z001"), ("财务专用客户", "Z002"), ("关联方客户", "Z003"),
+           ("货架店铺", "Z004"), ("客户终端仓", "Z005")], "eq"),
     ];
     for (table, col, pairs, kind) in MAPS {
         for (name, code) in *pairs {
@@ -502,6 +509,14 @@ async fn seed_dimensions(pg: &PgPool) -> anyhow::Result<()> {
          "t_sales_order_detail d JOIN t_goods g ON g.goods_code = d.sku_code AND g.deleted_flag = 0",
          "COALESCE(NULLIF(g.brand_name,''),'未归属')",
          "品牌在商品主档 t_goods.brand_name（明细行无品牌列），连接键 d.sku_code = g.goods_code；空串归'未归属'"),
+        ("customer_class", "客户分类", &["客户类别"],
+         "t_sales_order o LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0",
+         "COALESCE(CASE cus.customer_class WHEN '01' THEN '货架店铺' WHEN '02' THEN '新媒体店铺' WHEN '03' THEN '社团店铺' WHEN '04' THEN '线下客户' WHEN '05' THEN '内部客户' WHEN '06' THEN '其他财务专用' WHEN '99' THEN '外部客户的店铺' END,'未分类')",
+         "客户分类=t_customer.customer_class 编码列（字典 key=CustClassif 已坐实：真库 04线下客户占 96%），CASE 翻名免字典 JOIN；NULL 归'未分类'"),
+        ("customer_type", "客户类型", &["客户种类"],
+         "t_sales_order o LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0",
+         "COALESCE(CASE cus.customer_type WHEN 'Z001' THEN '一般销售客户' WHEN 'Z002' THEN '财务专用客户' WHEN 'Z003' THEN '关联方客户' WHEN 'Z004' THEN '货架店铺' WHEN 'Z005' THEN '客户终端仓' END,'未分类')",
+         "客户类型=t_customer.customer_type 编码列（字典 key=CUST_TYPE 已坐实：Z001一般销售/Z002财务专用为主），CASE 翻名免字典 JOIN；NULL 归'未分类'"),
     ];
     for (code, name, aliases, src, expr, desc) in DIMENSIONS {
         sqlx::query(
