@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import ResultPanel from './ResultPanel.vue'
 import type { Semantic } from './format'
 
@@ -28,6 +28,7 @@ interface Turn {
   result?: AskResult
   error?: string
   loading?: boolean
+  elapsed?: number // loading 已耗时秒（慢查询有预期）
   showSql?: boolean
 }
 
@@ -51,6 +52,7 @@ const chatEl = ref<HTMLElement>()
 const health = ref('检查中…')
 const healthOk = ref(false)
 const theme = ref(localStorage.getItem('theme') || 'light')
+const sending = computed(() => turns.value.some((t) => t.loading))
 
 function authHeaders(json = true): Record<string, string> {
   const h: Record<string, string> = {}
@@ -170,10 +172,13 @@ async function send(q?: string) {
     await newSession()
   }
   turns.value.push({ role: 'user', question: text })
-  turns.value.push({ role: 'ai', loading: true })
+  turns.value.push({ role: 'ai', loading: true, elapsed: 0 })
   const aiTurn = turns.value[turns.value.length - 1]
   question.value = ''
   scrollDown()
+  // 已耗时实时跳动（大查询 10~60s 有预期，不再是「假死」）
+  const t0 = Date.now()
+  const tick = setInterval(() => { aiTurn.elapsed = Math.floor((Date.now() - t0) / 1000) }, 1000)
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 100000)
   try {
@@ -193,6 +198,7 @@ async function send(q?: string) {
     aiTurn.error = ctrl.signal.aborted ? '查询超时（>100s），请重试或换个问法' : String(e)
   } finally {
     clearTimeout(timer)
+    clearInterval(tick)
     aiTurn.loading = false
     scrollDown()
     loadConvs() // 刷新侧栏标题/时间
@@ -278,8 +284,15 @@ function exportCsv(t: Turn) {
           </div>
           <!-- AI 气泡 -->
           <div v-else class="turn">
-            <div v-if="t.loading" class="thinking"><span class="spin"></span>分析中…</div>
-            <div v-else-if="t.error" class="bubble err">{{ t.error }}</div>
+            <div v-if="t.loading" class="thinking">
+              <span class="spin"></span>
+              <span>分析中… <b class="elapsed">{{ t.elapsed ?? 0 }}s</b></span>
+              <span class="thinking-hint">大数据量查询约需 10~60 秒</span>
+            </div>
+            <div v-else-if="t.error" class="bubble err">
+              <div>⚠️ {{ t.error }}</div>
+              <a v-if="turns[ti - 1]?.question" class="retry" @click="send(turns[ti - 1]?.question)">↻ 重试</a>
+            </div>
             <div v-else-if="t.result" class="bubble ai">
               <div class="res-meta">
                 <span class="route-badge">{{ routeLabel[t.result.route] || t.result.route }}</span>
@@ -311,7 +324,7 @@ function exportCsv(t: Turn) {
       <!-- 输入栏 -->
       <div class="inputbar">
         <textarea v-model="question" placeholder="用自然语言提问，Enter 发送，Shift+Enter 换行…" @keydown="onKey" rows="1"></textarea>
-        <button class="send" :disabled="!question.trim()" @click="send()">发送</button>
+        <button class="send" :disabled="!question.trim() || sending" @click="send()">{{ sending ? '查询中' : '发送' }}</button>
       </div>
     </div>
   </div>
@@ -357,6 +370,10 @@ function exportCsv(t: Turn) {
 .bubble.ai { margin-right: auto; width: fit-content; max-width: min(100%, 1120px); background: var(--bg-card); border: 1px solid var(--border); box-shadow: var(--shadow-sm); border-radius: 12px 12px 12px 4px; }
 .bubble.err { margin-right: auto; background: var(--error-bg); border: 1px solid var(--error-ring); color: var(--error-text); border-radius: 12px; }
 .thinking { display: inline-flex; align-items: center; gap: 10px; background: var(--bg-card); border: 1px solid var(--border); padding: 10px 14px; border-radius: 12px; font-size: 13px; color: var(--text-regular); box-shadow: var(--shadow-sm); width: fit-content; }
+.thinking .elapsed { color: var(--primary); font-variant-numeric: tabular-nums; }
+.thinking-hint { font-size: 11px; color: var(--text-faint); border-left: 1px solid var(--divider); padding-left: 10px; }
+.bubble.err .retry { display: inline-block; margin-top: 8px; font-size: 12px; color: var(--primary); cursor: pointer; }
+.bubble.err .retry:hover { text-decoration: underline; }
 .spin { width: 14px; height: 14px; border: 2px solid var(--primary); border-top-color: transparent; border-radius: 50%; animation: dnSpin .7s linear infinite; }
 @keyframes dnSpin { to { transform: rotate(360deg); } }
 .res-meta { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-muted); margin-bottom: 10px; }
