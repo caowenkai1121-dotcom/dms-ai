@@ -59,6 +59,18 @@ def serve(port=8077):
     print(f'embed 服务就绪 :{port}（{MODEL}, {DIM}维）', flush=True)
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a): pass
+        def do_GET(self):
+            # 健康检查（run.ps1 常驻化轮询用）
+            if self.path == '/health':
+                resp = json.dumps({'ok': True, 'model': MODEL, 'dim': DIM}).encode()
+                self.send_response(200)
+            else:
+                resp = b'{"error":"not found"}'
+                self.send_response(404)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
         def do_POST(self):
             n = int(self.headers.get('Content-Length', 0))
             try:

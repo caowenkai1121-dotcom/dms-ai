@@ -214,6 +214,12 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
+## M7g embed 服务常驻化（2026-07-24，语义缓存/向量召回不掉线）
+- `scripts/run.ps1` 重写为全栈联动：PG 容器缺席自动 `docker compose up -d` → embed 服务(:8077) 缺席自动拉起（模型加载轮询 20s）→ 编译启动后端；embed 失败明确打印「熔断降级」不装死。
+- `tools/embed_service.py` 补 `GET /health`（{"ok","model","dim"}）——原来只有 POST /embed，健康探测无从谈起。
+- 坑：PowerShell 5.1 对无 BOM 的 UTF-8 .ps1 按 ANSI 读→中文注释毁字符串→语法错误；scripts/*.ps1 必须 UTF-8 **带 BOM**（PSParser 语法校验过）。
+- 验收：py_compile + ps1 PSParser 语法过（全栈拉起实测留 20 轮门禁）。
+
 ## M7f 维度注册表扩充②：客户分类/类型（字典坐实）+ 商品分类模板误伤修复（2026-07-24）
 - **坐实方式**：`tools/probe_values.py` 只读探针（SET SESSION TRANSACTION READ ONLY，小表 GROUP BY 抽样）——
   customer_class 100% 填充（04线下客户占 96%）、customer_type Z001/Z002 两值、group1/business_type/sale_platform 全 NULL 死列（不做）；
