@@ -214,6 +214,15 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
+## M7d M7 判官门禁：回归题集框架（2026-07-24，51 题 + 1 关系断言 ≥50）
+- `tools/regression_cases.json` 题集覆盖全里程碑行为面：
+  A 确定性聚合×12（direct-agg 路由/KPI环比/有效订单口径/客户数去重）、B 下钻模板×11（六维度/LIMIT前N/趋势饼柱形态）、C 单号直查、D 权限注入×3（城市经理含注入+超管无注入）、
+  E LLM 路径口径卡×15（市场费用合计表/名称LIKE/明细≥8列纯表格/销量item_type/开票筛状态+换码/库存快照/售后DISTINCT/品牌维度卡/专票值链接）、
+  F 图问答×4（买过X/共购/客户买过/限权回落不走图）、G 复合拆解×2、H 安全红线×3（DML 不得出现于执行 SQL）。
+  rules：城市经理值 < 超管全量（权限隔离数值断言）。
+- `tools/regression.py` runner：CLI ask 驱动；断言 路由/SQL含禁(忽略大小写空白)/行数/列数/view0/chart_kind/JSON片段/红线DML扫描；LLM 题重试 1 次（旧惯例）；embed/graph 依赖缺席自动 ⏭️ 跳过不算失败；--filter 按名筛题。
+- 验收：py_compile + JSON 解析过（51 题 1 规则）；全量连库执行 = 20 轮门禁动作。
+
 ## M7c M6c 收尾：AGE 图 nightly 定时刷新（2026-07-24）
 - 服务启动 spawn 图刷新循环：`secs_until_next_3am` 算下个本地 03:00（chrono::Local，DST/歧义兜底 1h），睡到低谷期一次性全量重建（~4min，MySQL 只读聚合无压力）。
 - 失败记 warn 次日重试不拖垮服务；结果落 `AppState.graph_status`（Arc<Mutex<String>>），`/api/health` 新增 `graph_sync` 字段可观测（never/ok 时间戳 三元组/fail 原因）。
