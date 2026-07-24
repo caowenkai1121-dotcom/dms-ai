@@ -353,6 +353,18 @@ async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
          "t_sales_order_detail(JOIN t_sales_order 有效订单)", "SUM(box_quantity)",
          "d.item_type = '1'（商品行）",
          "销量=商品行箱数：item_type分列(1商品行/2赠品/3结算行)，销量只取 item_type='1' 的 box_quantity；须 JOIN t_sales_order 且 o.order_status NOT IN('0','108','199')；detail 有2x重复须先按(单号,sku,数量)去重"),
+        ("invoice_amount", "开票金额", &["开票额", "发票金额", "发票"],
+         "t_invoice_apply_header", "SUM(invoice_amount)",
+         "deleted_flag = 0 AND invoice_status = '2'",
+         "开票金额必须筛 invoice_status='2'(已开票,码表InvoiceStatusEnum 0未申请/1申请中/2已开票/3冲红申请中/4已冲红/5失败/6部分开票),不筛会把申请中/失败虚增；发票双流并行(老表 t_invoice_apply_header IO*单 + 新表 t_invoice_new_apply_header SQ*单,交集为0),问全量发票须 UNION ALL 两表"),
+        ("activity_expense", "活动费用", &["活动经费", "市场活动费用"],
+         "t_activity_main", "SUM(total_amount)",
+         "deleted_flag = 0",
+         "市场活动费用合计金额；status 分 暂存/待申请/已申请/完成(暂存未生效)，只算生效活动加 status IN('已申请','完成')"),
+        ("activity_count", "活动场次", &["活动数量", "多少场活动", "办了多少活动"],
+         "t_activity_main", "COUNT(DISTINCT activity_no)",
+         "deleted_flag = 0",
+         "市场活动场次数(按活动编号 activity_no 去重)；status 暂存/待申请/已申请/完成"),
     ];
     for (code, name, aliases, src, agg, scope, desc) in METRICS {
         sqlx::query(
@@ -422,6 +434,10 @@ async fn seed_dimensions(pg: &PgPool) -> anyhow::Result<()> {
          "t_sales_order o",
          "DATE_FORMAT(o.order_time,'%Y-%m')",
          "月份用 DATE_FORMAT 截到 '%Y-%m'，GROUP BY 与 SELECT 同表达式"),
+        ("brand", "品牌", &["牌子", "各品牌"],
+         "t_sales_order_detail d JOIN t_goods g ON g.goods_code = d.sku_code AND g.deleted_flag = 0",
+         "COALESCE(NULLIF(g.brand_name,''),'未归属')",
+         "品牌在商品主档 t_goods.brand_name（明细行无品牌列），连接键 d.sku_code = g.goods_code；空串归'未归属'"),
     ];
     for (code, name, aliases, src, expr, desc) in DIMENSIONS {
         sqlx::query(

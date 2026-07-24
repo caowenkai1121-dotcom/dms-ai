@@ -214,6 +214,15 @@
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
 
+## M7a 注册表扩充②：开票/活动指标 + 品牌维度（2026-07-24，口径 PG 元数据+码表教训坐实）
+- 坐实方式：本地 PG meta.column_doc（MySQL information_schema 采集）+ meta.pitfall 码表教训，不猜口径。
+- 指标 +3：
+  - **开票金额** SUM(invoice_amount) 筛 invoice_status='2'（码表 InvoiceStatusEnum 坐实：0未申请/1申请中/2已开票/…，不筛把申请中/失败虚增）；desc 带发票双流并行教训（老表 IO* + 新表 SQ* 交集为0，全量须 UNION ALL）。
+  - **活动费用** SUM(total_amount) / **活动场次** COUNT(DISTINCT activity_no)（t_activity_main，status 暂存/待申请/已申请/完成语义入 desc）。
+- 维度 +1：**品牌** = t_goods.brand_name（明细行无品牌列，连接键 d.sku_code=g.goods_code，空串归'未归属'）。
+- 客户分类维度暂缓：t_customer 有 customer_class/customer_type/group1 三个候选列，值域（码 or 名）未坐实，不猜。
+- 验收：cargo check 过（种子数据随服务启动 upsert；连库问答验收留 20 轮门禁）。
+
 ## M6z 多指标图表形态：分组柱 + 多序列趋势 + 双值轴（2026-07-24，M4b 待用清单收尾）
 - 补齐 SuperSonic 多指标呈现规格（待用清单最后一件「趋势多指标」）：
   - viewspec 决策树加 4b：**一类别 + ≥2 指标 → 分组柱图**（TOP20 收纳照旧），不再落纯表格；趋势分支本已透传多指标（双序列）。
