@@ -386,6 +386,14 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
         return mk(specs, blocks, rows);
     }
 
+    // 4b. 恰一类别列 + ≥2 指标列 → 分组柱图（对齐 SuperSonic：多指标同类别并排呈现）
+    if cat_idx.len() == 1 && metric_idx.len() >= 2 && rows.len() <= BAR_MAX {
+        let top = if rows.len() > BAR_TOP { Some(BAR_TOP) } else { None };
+        blocks.push(Block::Chart { kind: ChartKind::Bar, x: cat_idx[0], y: metric_idx.clone(), top });
+        blocks.push(Block::Table);
+        return mk(specs, blocks, rows);
+    }
+
     // 5. 兜底表格
     blocks.push(Block::Table);
     mk(specs, blocks, rows)
@@ -461,6 +469,34 @@ mod tests {
         let v = build(&cols(&["下单时间", "销售额"]), &rows);
         assert!(matches!(v.blocks[0], Block::Chart { kind: ChartKind::Line, .. }));
         assert_eq!(v.columns[0].role, Role::Time);
+    }
+
+    #[test]
+    fn category_multi_metric_grouped_bar() {
+        // 一类别 + 两指标 → 分组柱（y 含两个指标列），不再落纯表格
+        let rows = vec![
+            vec![json!("广东"), json!("100"), json!("5")],
+            vec![json!("山东"), json!("90"), json!("4")],
+        ];
+        let v = build(&cols(&["省份", "销售额", "订单数"]), &rows);
+        match &v.blocks[0] {
+            Block::Chart { kind: ChartKind::Bar, y, .. } => assert_eq!(y.len(), 2),
+            b => panic!("expected grouped bar, got {}", serde_json::to_string(b).unwrap()),
+        }
+    }
+
+    #[test]
+    fn time_multi_metric_line_series() {
+        // 时间 + 两指标 → 双序列趋势线
+        let rows = vec![
+            vec![json!("2026-07-01"), json!("10"), json!("2")],
+            vec![json!("2026-07-02"), json!("20"), json!("3")],
+        ];
+        let v = build(&cols(&["下单时间", "销售额", "订单数"]), &rows);
+        match &v.blocks[0] {
+            Block::Chart { kind: ChartKind::Line, y, .. } => assert_eq!(y.len(), 2),
+            b => panic!("expected multi-series line, got {}", serde_json::to_string(b).unwrap()),
+        }
     }
 
     #[test]

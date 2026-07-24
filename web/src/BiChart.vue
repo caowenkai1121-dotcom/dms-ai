@@ -67,23 +67,38 @@ function render() {
   }
 
   const isBar = props.kind === 'bar'
+  const multi = props.y.length > 1
+  // 多序列配色（单序列保持品牌单色纪律；多序列必须可区分，对齐 SuperSonic 多指标序列）
+  const SERIES = ['#1677ff', '#13c2c2', '#fa8c16', '#722ed1', '#eb2f96']
+  // 双指标且语义不同（如 金额 vs 单量）→ 双值轴，量纲悬殊不互相压扁
+  const dual = props.y.length === 2 && ySem(props.y[0]) !== ySem(props.y[1])
+  const yAxis: any = dual
+    ? [
+        { type: 'value', axisLabel: { formatter: (v: number) => compress(v) }, splitLine: { lineStyle: { type: 'dashed', opacity: 0.5 } } },
+        { type: 'value', axisLabel: { formatter: (v: number) => compress(v) }, splitLine: { show: false } },
+      ]
+    : { type: 'value', axisLabel: { formatter: (v: number) => compress(v) }, splitLine: { lineStyle: { type: 'dashed', opacity: 0.5 } } }
   chart.setOption({
-    grid: { left: 8, right: 16, bottom: 8, top: 32, containLabel: true },
+    grid: { left: 8, right: dual ? 8 : 16, bottom: 8, top: 32, containLabel: true },
     tooltip: { trigger: 'axis', valueFormatter: (v: any) => fmtVal(Number(v)) },
-    legend: props.y.length > 1 ? { top: 0 } : undefined,
+    legend: multi ? { top: 0 } : undefined,
     xAxis: { type: 'category', data: catList, axisLabel: { interval: 0, rotate: catList.length > 8 ? 35 : 0 } },
-    yAxis: { type: 'value', axisLabel: { formatter: (v: number) => compress(v) }, splitLine: { lineStyle: { type: 'dashed', opacity: 0.5 } } },
-    series: props.y.map((yi) => ({
+    yAxis,
+    series: props.y.map((yi, si) => ({
       name: props.columns[yi]?.name,
       type: props.kind,
+      yAxisIndex: dual ? si : 0,
       data: dataIdx.map((i) => toNum(props.rows[i][yi]) ?? 0),
       barMaxWidth: 34,
+      barGap: '15%',
       itemStyle: isBar
-        ? { borderRadius: [4, 4, 0, 0], color: new echarts.graphic.LinearGradient(0, 1, 0, 0, [{ offset: 0, color: GRAD[0] }, { offset: 1, color: GRAD[1] }]) }
-        : { color: PRIMARY },
-      areaStyle: props.kind === 'line' ? { opacity: 0.08 } : undefined,
+        ? multi
+          ? { borderRadius: [4, 4, 0, 0], color: SERIES[si % SERIES.length] }
+          : { borderRadius: [4, 4, 0, 0], color: new echarts.graphic.LinearGradient(0, 1, 0, 0, [{ offset: 0, color: GRAD[0] }, { offset: 1, color: GRAD[1] }]) }
+        : { color: multi ? SERIES[si % SERIES.length] : PRIMARY },
+      areaStyle: props.kind === 'line' ? { opacity: multi ? 0 : 0.08 } : undefined,
       smooth: props.kind === 'line',
-      label: props.y.length === 1 && catList.length <= 24 ? { show: true, position: isBar ? 'top' : 'top', formatter: (p: any) => fmtVal(p.value), fontSize: 10, color: '#666' } : undefined,
+      label: !multi && catList.length <= 24 ? { show: true, position: isBar ? 'top' : 'top', formatter: (p: any) => fmtVal(p.value), fontSize: 10, color: '#666' } : undefined,
     })),
   })
 }
