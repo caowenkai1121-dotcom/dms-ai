@@ -276,6 +276,13 @@ pub async fn generate_sql(
         }
         user.push('\n');
     }
+    // 规则时间解析（SuperSonic TimeRangeParser）：时间是 BI 最高频错误源，能规则算出的
+    // 区间直接给 LLM，别让它自己拼日期函数（「近三个月」「第二季度」「6月」这类最易错）。
+    if let Some(tpl) = crate::direct::time_predicate(question) {
+        user.push_str(&format!(
+            "## 时间范围（已按问句规则解析，直接照用；{{}} 处填该表的时间列，如订单用 order_time）\n{tpl}\n\n"
+        ));
+    }
     // 码值提示（SuperSonic value mapping 的生成前置版）：问句里的中文值 → 该列真实码。
     // ValueLinker 只能事后换码；这一层让 LLM 一开始就知道「湖南=430000」「线下客户=04」，
     // 避免它漏写过滤或猜到别的列（实测猜过 customer_channel）。

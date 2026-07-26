@@ -777,7 +777,7 @@ fn agg_template(question: &str) -> Option<DirectHit> {
     // 上期查询（环比）：平移时间窗
     let prev = prev_window(question).map(|(pred, label)| (base(pred), label.to_string()));
     Some(DirectHit {
-        sql: base(time_pred),
+        sql: base(&time_pred),
         route: "direct-agg".into(),
         prev,
     })
@@ -839,22 +839,154 @@ fn prev_window(q: &str) -> Option<(&'static str, &'static str)> {
 }
 
 /// 相对时间词 → MySQL 谓词（基于 CURDATE()，零硬编码年份）
-fn time_window(q: &str) -> Option<&'static str> {
-    if q.contains("今天") || q.contains("今日") {
-        Some("DATE(order_time) = CURDATE()")
-    } else if q.contains("昨天") || q.contains("昨日") {
-        Some("DATE(order_time) = CURDATE() - INTERVAL 1 DAY")
-    } else if q.contains("本月") || q.contains("这个月") {
-        Some("order_time >= DATE_FORMAT(CURDATE(),'%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'), INTERVAL 1 MONTH)")
-    } else if q.contains("上月") || q.contains("上个月") {
-        Some("order_time >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH,'%Y-%m-01') AND order_time < DATE_FORMAT(CURDATE(),'%Y-%m-01')")
-    } else if q.contains("本周") || q.contains("这周") {
-        Some("YEARWEEK(order_time, 1) = YEARWEEK(CURDATE(), 1)")
-    } else if q.contains("今年") {
-        Some("YEAR(order_time) = YEAR(CURDATE())")
-    } else {
-        None
+/// 中文数字 → 阿拉伯数字（仅覆盖 1~99，够用于「近三个月」「第二季度」这类问法）
+fn cn_num(s: &str) -> Option<u32> {
+    const D: &[(&str, u32)] = &[
+        ("零", 0), ("一", 1), ("两", 2), ("二", 2), ("三", 3), ("四", 4),
+        ("五", 5), ("六", 6), ("七", 7), ("八", 8), ("九", 9),
+    ];
+    if let Ok(n) = s.parse::<u32>() {
+        return Some(n);
     }
+    let c: Vec<&str> = s.split("").filter(|x| !x.is_empty()).collect();
+    let val = |x: &str| D.iter().find(|(k, _)| *k == x).map(|(_, v)| *v);
+    match c.as_slice() {
+        [a] if *a == "十" => Some(10),
+        [a] => val(a),
+        ["十", b] => val(b).map(|v| 10 + v),               // 十二
+        [a, "十"] => val(a).map(|v| v * 10),                // 三十
+        [a, "十", b] => Some(val(a)? * 10 + val(b)?),       // 三十五
+        _ => None,
+    }
+}
+
+/// 抽「近/过去/最近 N 天|周|月|年」里的 N 与单位
+fn recent_n(q: &str) -> Option<(u32, &'static str)> {
+    for lead in ["最近", "过去", "近"] {
+        let Some(pos) = q.find(lead) else { continue };
+        let rest: String = q[pos + lead.len()..].chars().take(6).collect();
+        let num: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || "零一两二三四五六七八九十".contains(*c))
+            .collect();
+        if num.is_empty() {
+            continue;
+        }
+        let Some(n) = cn_num(&num) else { continue };
+        let tail = &rest[num.len()..];
+        let unit = if tail.starts_with('天') || tail.starts_with('日') {
+            "DAY"
+        } else if tail.starts_with('周') || tail.starts_with("个周") || tail.starts_with('星') {
+            "WEEK"
+        } else if tail.starts_with('月') || tail.starts_with("个月") {
+            "MONTH"
+        } else if tail.starts_with('年') {
+            "YEAR"
+        } else {
+            continue;
+        };
+        if n >= 1 && n <= 60 {
+            return Some((n, unit));
+        }
+    }
+    None
+}
+
+/// 规则时间解析（移植 SuperSonic TimeRangeParser 思路）：问句 → 半开区间 [起, 止)。
+/// 返回的是**列名占位为 `{}` 的谓词模板**，调用方填真实时间列。
+/// 时间是 BI 最高频错误源；能规则解析的一律不交给 LLM 猜。
+pub fn time_predicate(q: &str) -> Option<String> {
+    // 近 N 天/周/月/年（含中文数字）
+    if let Some((n, unit)) = recent_n(q) {
+        return Some(format!(
+            "{{}} >= DATE_SUB(CURDATE(), INTERVAL {n} {unit}) AND {{}} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
+        ));
+    }
+    // 第 N 季度 / 本季度 / 上季度
+    if let Some(pos) = q.find("季度") {
+        let head: String = q[..pos].chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+        let qn = ["一", "二", "三", "四"]
+            .iter()
+            .position(|c| head.contains(c))
+            .map(|i| i as u32 + 1)
+            .or_else(|| head.chars().rev().find(|c| ('1'..='4').contains(c)).and_then(|c| c.to_digit(10)));
+        if let Some(n) = qn {
+            let start_month = (n - 1) * 3 + 1;
+            return Some(format!(
+                "{{}} >= DATE_FORMAT(CONCAT(YEAR(CURDATE()),'-{start_month:02}-01'),'%Y-%m-%d') \
+                 AND {{}} < DATE_ADD(DATE_FORMAT(CONCAT(YEAR(CURDATE()),'-{start_month:02}-01'),'%Y-%m-%d'), INTERVAL 3 MONTH)"
+            ));
+        }
+        if head.contains('本') || head.contains('这') {
+            return Some("QUARTER({}) = QUARTER(CURDATE()) AND YEAR({}) = YEAR(CURDATE())".into());
+        }
+        if head.contains('上') {
+            return Some(
+                "{} >= DATE_SUB(MAKEDATE(YEAR(CURDATE()),1) + INTERVAL QUARTER(CURDATE())*3-3 MONTH, INTERVAL 3 MONTH) \
+                 AND {} < MAKEDATE(YEAR(CURDATE()),1) + INTERVAL QUARTER(CURDATE())*3-3 MONTH"
+                    .into(),
+            );
+        }
+    }
+    // 上半年 / 下半年（本年度）
+    if q.contains("上半年") {
+        return Some(
+            "{} >= DATE_FORMAT(CURDATE(),'%Y-01-01') AND {} < DATE_FORMAT(CURDATE(),'%Y-07-01')".into(),
+        );
+    }
+    if q.contains("下半年") {
+        return Some(
+            "{} >= DATE_FORMAT(CURDATE(),'%Y-07-01') AND {} < DATE_FORMAT(DATE_ADD(CURDATE(), INTERVAL 1 YEAR),'%Y-01-01')".into(),
+        );
+    }
+    // N 月 / N 月份（本年度；「上个月」等相对词在下方兜底，先排除）
+    if !q.contains("个月") && !q.contains("上月") {
+        if let Some(pos) = q.find('月') {
+            let head: String = q[..pos].chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
+            let num: String = head
+                .chars()
+                .filter(|c| c.is_ascii_digit() || "一两二三四五六七八九十".contains(*c))
+                .collect();
+            if let Some(m) = cn_num(&num).filter(|m| (1..=12).contains(m)) {
+                return Some(format!(
+                    "{{}} >= DATE_FORMAT(CONCAT(YEAR(CURDATE()),'-{m:02}-01'),'%Y-%m-%d') \
+                     AND {{}} < DATE_ADD(DATE_FORMAT(CONCAT(YEAR(CURDATE()),'-{m:02}-01'),'%Y-%m-%d'), INTERVAL 1 MONTH)"
+                ));
+            }
+        }
+    }
+    // 相对词兜底
+    let p = if q.contains("今天") || q.contains("今日") {
+        "DATE({}) = CURDATE()"
+    } else if q.contains("昨天") || q.contains("昨日") {
+        "DATE({}) = CURDATE() - INTERVAL 1 DAY"
+    } else if q.contains("前天") {
+        "DATE({}) = CURDATE() - INTERVAL 2 DAY"
+    } else if q.contains("本月") || q.contains("这个月") || q.contains("当月") {
+        "{} >= DATE_FORMAT(CURDATE(),'%Y-%m-01') AND {} < DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'), INTERVAL 1 MONTH)"
+    } else if q.contains("上月") || q.contains("上个月") {
+        "{} >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH,'%Y-%m-01') AND {} < DATE_FORMAT(CURDATE(),'%Y-%m-01')"
+    } else if q.contains("本周") || q.contains("这周") {
+        "YEARWEEK({}, 1) = YEARWEEK(CURDATE(), 1)"
+    } else if q.contains("上周") {
+        "YEARWEEK({}, 1) = YEARWEEK(CURDATE() - INTERVAL 1 WEEK, 1)"
+    } else if q.contains("今年") || q.contains("本年") || q.contains("年初至今") {
+        "YEAR({}) = YEAR(CURDATE())"
+    } else if q.contains("去年") {
+        "YEAR({}) = YEAR(CURDATE()) - 1"
+    } else {
+        return None;
+    };
+    Some(p.to_string())
+}
+
+/// 谓词模板填入真实时间列
+pub fn fill_time_col(tpl: &str, col: &str) -> String {
+    tpl.replace("{}", col)
+}
+
+fn time_window(q: &str) -> Option<String> {
+    time_predicate(q).map(|tpl| fill_time_col(&tpl, "order_time"))
 }
 
 #[cfg(test)]
@@ -1189,5 +1321,65 @@ mod tests {
         // 长词优先剥离：不因先剥"客户"而在"客户分类"上留下"分类"
         let w2: Vec<String> = ["销售额", "客户", "客户分类"].iter().map(|s| s.to_string()).collect();
         assert!(!has_residue("本月客户分类销售额", &w2));
+    }
+
+    // ── 规则时间解析（SuperSonic TimeRangeParser 思路）──
+    fn tp(q: &str) -> String {
+        time_predicate(q).unwrap_or_else(|| panic!("未解析: {q}"))
+    }
+
+    #[test]
+    fn time_recent_n_with_cn_numbers() {
+        assert!(tp("近7天销售额").contains("INTERVAL 7 DAY"));
+        assert!(tp("最近三个月销售额").contains("INTERVAL 3 MONTH"));
+        assert!(tp("过去两周订单数").contains("INTERVAL 2 WEEK"));
+        assert!(tp("近十天销量").contains("INTERVAL 10 DAY"));
+        assert!(tp("最近十五天销售额").contains("INTERVAL 15 DAY"));
+    }
+
+    #[test]
+    fn time_quarter_and_half_year() {
+        assert!(tp("第二季度销售额").contains("-04-01"));
+        assert!(tp("三季度销售额").contains("-07-01"));
+        assert!(tp("上半年销售额").contains("-01-01"));
+        assert!(tp("下半年销售额").contains("-07-01"));
+    }
+
+    #[test]
+    fn time_explicit_month() {
+        assert!(tp("6月销售额").contains("-06-01"));
+        assert!(tp("十二月销量").contains("-12-01"));
+        // 「上个月/本月」不得被当成 N 月解析
+        assert!(tp("上个月销售额").contains("INTERVAL 1 MONTH"));
+        assert!(tp("本月销售额").contains("%Y-%m-01"));
+    }
+
+    #[test]
+    fn time_relative_words() {
+        assert!(tp("今天销售额").contains("CURDATE()"));
+        assert!(tp("前天订单数").contains("INTERVAL 2 DAY"));
+        assert!(tp("上周销售额").contains("YEARWEEK"));
+        assert!(tp("去年销售额").contains("YEAR(CURDATE()) - 1"));
+        assert!(time_predicate("销售额是多少").is_none(), "无时间词不得臆造时间窗");
+    }
+
+    #[test]
+    fn time_col_is_parameterized() {
+        // 谓词模板列名可填——同一解析结果给不同表用不同时间列
+        let tpl = time_predicate("本月").unwrap();
+        assert!(fill_time_col(&tpl, "after_sales_time").contains("after_sales_time"));
+        assert!(!fill_time_col(&tpl, "after_sales_time").contains("{}"));
+    }
+
+    #[test]
+    fn cn_num_parses() {
+        assert_eq!(cn_num("3"), Some(3));
+        assert_eq!(cn_num("三"), Some(3));
+        assert_eq!(cn_num("十"), Some(10));
+        assert_eq!(cn_num("十二"), Some(12));
+        assert_eq!(cn_num("三十"), Some(30));
+        assert_eq!(cn_num("三十五"), Some(35));
+        assert_eq!(cn_num("两"), Some(2));
+        assert_eq!(cn_num("abc"), None);
     }
 }
