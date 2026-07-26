@@ -28,6 +28,9 @@ pub struct MetricDef {
     pub source_table: String,
     pub agg_expr: String,
     pub scope_filter: String,
+    /// 去重键（逗号分隔列）：该来源表含系统级重复行时必填，聚合前须按这些列 DISTINCT。
+    /// 空=表无重复问题。t_sales_order_detail 实测 100.7 万行原始 vs 83.2 万去重后。
+    pub dedup_keys: String,
 }
 
 /// 维度定义（meta.dimension 行）
@@ -52,8 +55,8 @@ pub struct JoinEdge {
 /// 同基表直拼 / 跨基表走 join_edge BFS 路径（≤3 跳，扇出边仅 COUNT(DISTINCT) 聚合可过）、
 /// 口径无子查询、实体守卫、时间窗=order_time 在 FROM 内或可经一条边桥接 t_sales_order。
 pub async fn try_compose(pg: &sqlx::PgPool, question: &str) -> Option<DirectHit> {
-    let metrics: Vec<(String, Vec<String>, String, String, String)> = sqlx::query_as(
-        "SELECT name, aliases, source_table, agg_expr, scope_filter FROM meta.metric WHERE status = 'active'",
+    let metrics: Vec<(String, Vec<String>, String, String, String, String)> = sqlx::query_as(
+        "SELECT name, aliases, source_table, agg_expr, scope_filter, dedup_keys FROM meta.metric WHERE status = 'active'",
     )
     .fetch_all(pg)
     .await
@@ -74,6 +77,12 @@ pub async fn try_compose(pg: &sqlx::PgPool, question: &str) -> Option<DirectHit>
         .into_iter()
         .map(|(lt, lc, rt, rc, card)| JoinEdge { lt, lc, rt, rc, card })
         .collect();
+    // 表级标准口径（SuperSonic model filter）：JOIN 到的表恒需附加的过滤
+    let scopes: Vec<(String, String)> =
+        sqlx::query_as("SELECT table_name, filter FROM meta.table_scope")
+            .fetch_all(pg)
+            .await
+            .unwrap_or_default();
     let hit = |name: &str, aliases: &[String]| {
         question.contains(name) || aliases.iter().any(|a| question.contains(a.as_str()))
     };
@@ -85,6 +94,7 @@ pub async fn try_compose(pg: &sqlx::PgPool, question: &str) -> Option<DirectHit>
         source_table: m.2.clone(),
         agg_expr: m.3.clone(),
         scope_filter: m.4.clone(),
+        dedup_keys: m.5.clone(),
     };
     let dim = DimDef {
         name: d.0.clone(),
@@ -92,7 +102,7 @@ pub async fn try_compose(pg: &sqlx::PgPool, question: &str) -> Option<DirectHit>
         source_table: d.2.clone(),
         expr: d.3.clone(),
     };
-    compose_sql(&metric, &dim, question, &edges)
+    compose_sql_with(&metric, &dim, question, &edges, &scopes)
         .map(|sql| DirectHit { sql, route: "direct-agg".into(), prev: None })
 }
 
@@ -186,14 +196,29 @@ fn find_edge<'a>(a: &str, b: &str, edges: &'a [JoinEdge]) -> Option<(&'a JoinEdg
     })
 }
 
-/// 组合 SQL 装配（纯函数可单测）
+/// 组合 SQL 装配（纯函数可单测）。无表级口径的简化入口，测试与旧调用点用。
+#[cfg(test)]
 fn compose_sql(m: &MetricDef, d: &DimDef, question: &str, edges: &[JoinEdge]) -> Option<String> {
+    compose_sql_with(m, d, question, edges, &[])
+}
+
+/// 组合 SQL 装配（带表级标准口径）
+fn compose_sql_with(
+    m: &MetricDef,
+    d: &DimDef,
+    question: &str,
+    edges: &[JoinEdge],
+    table_scopes: &[(String, String)],
+) -> Option<String> {
     // 口径/来源去中文括注（注册表文本带人类说明）
     let m_src = strip_annotations(&m.source_table);
     let m_scope = strip_annotations(&m.scope_filter);
     let m_agg = strip_annotations(&m.agg_expr);
     if m_scope.to_uppercase().contains("SELECT") || m_agg.to_uppercase().contains("SELECT") {
         return None; // 子查询内裸列归属子查询表，限定会改错——走 LLM
+    }
+    if m_src.to_uppercase().contains(" UNION ") {
+        return None; // 多流来源（发票新老双表）须 UNION ALL 合并，模板拼不出——交 LLM 按口径卡写
     }
     if has_entity_residue(question, m, d) {
         return None; // 实体问句（恒众餐饮本月销售额）→ agg_template/LLM
@@ -206,6 +231,15 @@ fn compose_sql(m: &MetricDef, d: &DimDef, question: &str, edges: &[JoinEdge]) ->
         parts.next();
         parts.next().unwrap_or("").to_string()
     };
+
+    // 去重键：来源表含系统级重复行（ETL 双写）时，基表换成 DISTINCT 子查询再聚合，
+    // 否则 SUM 直接虚增（实测明细 100.7 万行 vs 去重 83.2 万行，销量虚高 41%）。
+    let dedup: Vec<String> = m
+        .dedup_keys
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     // FROM 装配 + 扇出检查 + 各表别名登记
     let mut from: String;
@@ -256,14 +290,60 @@ fn compose_sql(m: &MetricDef, d: &DimDef, question: &str, edges: &[JoinEdge]) ->
         None => String::new(),
     };
 
-    let scope = if m_scope.trim().is_empty() { String::new() } else { qualify_cols(&m_scope, &base_alias) };
+    let mut scope = if m_scope.trim().is_empty() { String::new() } else { qualify_cols(&m_scope, &base_alias) };
+    let agg = qualify_cols(&m_agg, &base_alias);
+
+    // 去重装配：基表 → (SELECT DISTINCT 键 FROM 基表 WHERE 口径) 别名。
+    // 安全门控：外层对基表引用的所有列必须都在去重键里，否则子查询取不到 → 宁可不装配（回落 LLM）。
+    if !dedup.is_empty() {
+        let mut refs = base_col_refs(&from, &base_alias);
+        refs.extend(base_col_refs(&agg, &base_alias));
+        refs.extend(base_col_refs(&d.expr, &base_alias));
+        refs.extend(base_col_refs(&time_and, &base_alias));
+        if !refs.iter().all(|c| dedup.contains(c)) {
+            return None;
+        }
+        let keys = dedup.join(", ");
+        let inner_where = if m_scope.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {m_scope}")
+        };
+        let sub = format!("(SELECT DISTINCT {keys} FROM {m_src}{inner_where}) {base_alias}");
+        // 替换 FROM 首段的 `基表 别名`（同基表分支）或 `基表 b0`（跨基表分支）
+        let head = format!("{m_src} {base_alias}");
+        if !from.starts_with(&head) {
+            return None;
+        }
+        from = format!("{sub}{}", &from[head.len()..]);
+        scope.clear(); // 口径过滤已下推进子查询
+    }
+
+    // 表级标准口径：FROM 中每张登记表按其别名附加恒成立过滤（明细指标桥接订单主表时
+    // 漏掉「有效订单」是数值虚增的头号来源——评测抓获销量虚高 41%）。
+    // 跳过已被去重子查询替换的基表（其口径已下推）。
+    let mut scope_parts: Vec<String> = vec![];
+    if !scope.is_empty() {
+        scope_parts.push(scope.clone());
+    }
+    for (t, alias) in from_table_aliases(&from) {
+        if !dedup.is_empty() && alias == base_alias {
+            continue;
+        }
+        if let Some((_, f)) = table_scopes.iter().find(|(tn, _)| *tn == t) {
+            let qualified = qualify_cols(f, &alias);
+            if !scope_parts.contains(&qualified) {
+                scope_parts.push(qualified);
+            }
+        }
+    }
+    let scope = scope_parts.join(" AND ");
     let where_sql = match (scope.is_empty(), time_and.is_empty()) {
         (true, true) => String::new(),
         (false, true) => format!("WHERE {scope}"),
         (true, false) => format!("WHERE {}", time_and.trim_start_matches(" AND ")),
         (false, false) => format!("WHERE {scope}{time_and}"),
     };
-    let agg = qualify_cols(&m_agg, &base_alias);
     let lim = detect_top_n(question);
     // 时间维度按时间排序（趋势语义），其余按指标降序
     let order = if d.expr.contains("DATE_FORMAT") || d.expr.contains("order_time") {
@@ -275,6 +355,72 @@ fn compose_sql(m: &MetricDef, d: &DimDef, question: &str, edges: &[JoinEdge]) ->
         "SELECT {} AS `{}`, {} AS `{}`\nFROM {}\n{}\nGROUP BY {}\n{order}",
         d.expr, d.name, agg, m.name, from, where_sql, d.expr
     ))
+}
+
+/// 从 FROM 串里解析出 (真实表名, 别名) 列表：`t_x a JOIN t_y b ON ...` / `(子查询) a`。
+/// 纯文本扫描（组合器自己拼的串形态固定），子查询段跳过。纯函数可单测。
+fn from_table_aliases(from: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = vec![];
+    // 去掉括号内内容（子查询/ON 条件里的函数），避免误把子查询里的表当作 FROM 项
+    let mut flat = String::with_capacity(from.len());
+    let mut depth = 0usize;
+    for c in from.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                flat.push(' ');
+            }
+            _ if depth == 0 => flat.push(c),
+            _ => {}
+        }
+    }
+    let toks: Vec<&str> = flat.split_whitespace().collect();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        let is_table_pos = i == 0 || toks[i - 1].eq_ignore_ascii_case("join") || toks[i - 1].eq_ignore_ascii_case("from");
+        if is_table_pos && t.starts_with("t_") {
+            if let Some(a) = toks.get(i + 1) {
+                if !a.eq_ignore_ascii_case("on") && !a.eq_ignore_ascii_case("join") {
+                    out.push((t.to_string(), a.trim_end_matches(',').to_string()));
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push((t.to_string(), t.to_string()));
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 收集 SQL 片段里对某别名的列引用（`别名.列`），小写去重。纯函数可单测。
+fn base_col_refs(frag: &str, alias: &str) -> Vec<String> {
+    let pat = format!("{alias}.");
+    let mut out: Vec<String> = vec![];
+    let lower = frag.to_lowercase();
+    let pat = pat.to_lowercase();
+    let mut from = 0usize;
+    while let Some(pos) = lower[from..].find(&pat) {
+        let start = from + pos;
+        // 前一个字符必须是非标识符字符（防 xo.col 里的 o. 误命中）
+        let prev_ok = start == 0
+            || !lower[..start]
+                .chars()
+                .next_back()
+                .map(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                .unwrap_or(false);
+        let col: String = lower[start + pat.len()..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if prev_ok && !col.is_empty() && !out.contains(&col) {
+            out.push(col);
+        }
+        from = start + pat.len();
+    }
+    out
 }
 
 /// 实体守卫：剥词后有 CJK/字母数字残留 = 实体问句（纯函数）
@@ -630,7 +776,9 @@ fn detect_top_n(q: &str) -> usize {
             }
         }
     }
-    50
+    // 未提 TopN → 不截断到小值：分组基数常超 50（商品分类 60 个），
+    // 截断会让"各分类销量"静默少 10 个分类且用户无感（评测抓获）。对齐全局 MAX_ROWS。
+    200
 }
 
 /// 时间窗 → 上一期谓词 + 环比标签
@@ -728,7 +876,8 @@ mod tests {
         assert_eq!(detect_top_n("销售额前十的客户"), 10);
         assert_eq!(detect_top_n("前三名商品分类"), 3);
         assert_eq!(detect_top_n("销售额top20省份"), 20);
-        assert_eq!(detect_top_n("各省份销售额"), 50); // 无前N默认
+        // 无前N默认 200（对齐全局 MAX_ROWS）：50 会把 60 个商品分类静默截成 50
+        assert_eq!(detect_top_n("各省份销售额"), 200);
     }
 
     #[test]
@@ -736,7 +885,7 @@ mod tests {
         let h = sales_breakdown("本月销售额前5的省份").unwrap();
         assert!(h.sql.contains("LIMIT 5"), "{}", h.sql);
         let h2 = sales_breakdown("本月销售额按客户").unwrap();
-        assert!(h2.sql.contains("LIMIT 50"), "{}", h2.sql);
+        assert!(h2.sql.contains("LIMIT 200"), "{}", h2.sql);
     }
 
     #[test]
@@ -779,6 +928,7 @@ mod tests {
             source_table: "t_sales_order".into(),
             agg_expr: "SUM(total_amount)".into(),
             scope_filter: "deleted_flag = 0 AND order_status NOT IN ('0','108','199')".into(),
+            dedup_keys: String::new(),
         }
     }
     fn qty_metric() -> MetricDef {
@@ -788,6 +938,7 @@ mod tests {
             source_table: "t_sales_order_detail(JOIN t_sales_order 有效订单)".into(),
             agg_expr: "SUM(box_quantity)".into(),
             scope_filter: "item_type = '1'".into(),
+            dedup_keys: "sales_order_code,sku_code,sku_name,box_quantity,amount".into(),
         }
     }
     fn dim(name: &str, expr: &str) -> DimDef {
@@ -866,6 +1017,7 @@ mod tests {
             source_table: "t_winc_stock_report".into(),
             agg_expr: "SUM(stock_quantity)".into(),
             scope_filter: "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)".into(),
+            dedup_keys: String::new(),
         };
         assert!(compose_sql(&stock, &dim("省份", "cus.province"), "本月库存量按省份", &edges()).is_none());
     }
@@ -880,9 +1032,10 @@ mod tests {
     fn compose_qty_province_cross_base() {
         // 销量(detail) × 省份(header→customer)：N:1 链扇出安全 → 装配
         let sql = compose_sql(&qty_metric(), &dim("省份", "COALESCE(NULLIF(cus.province,''),'未知')"), "本月销量按省份", &edges()).unwrap();
-        assert!(sql.contains("FROM t_sales_order_detail b0 JOIN t_sales_order o ON o.sales_order_code = b0.sales_order_code"), "{sql}");
+        // 基表走去重子查询（明细含系统级重复行），口径过滤下推进子查询
+        assert!(sql.contains("FROM (SELECT DISTINCT sales_order_code, sku_code, sku_name, box_quantity, amount FROM t_sales_order_detail WHERE item_type = '1') b0"), "{sql}");
+        assert!(sql.contains("JOIN t_sales_order o ON o.sales_order_code = b0.sales_order_code"), "{sql}");
         assert!(sql.contains("SUM(b0.box_quantity)"), "{sql}");
-        assert!(sql.contains("b0.item_type = '1'"), "{sql}");
         assert!(sql.contains("o.order_time >="), "{sql}");
     }
 
@@ -893,5 +1046,82 @@ mod tests {
         assert!(sql.contains("JOIN t_sales_order o_time ON o_time.sales_order_code = d.sales_order_code"), "{sql}");
         assert!(sql.contains("SUM(d.box_quantity)"), "{sql}");
         assert!(sql.contains("o_time.order_time >="), "{sql}");
+    }
+
+    #[test]
+    fn dedup_subquery_for_detail_metric() {
+        // 明细类指标（含系统级重复行）必须走 DISTINCT 子查询，否则 SUM 虚增 41%（评测抓获）
+        let sql = compose_sql(&qty_metric(), &cat_dim(), "本月销量按商品分类", &edges()).unwrap();
+        assert!(sql.contains("SELECT DISTINCT sales_order_code, sku_code, sku_name, box_quantity, amount"), "{sql}");
+        assert!(sql.contains("WHERE item_type = '1') d"), "口径过滤下推进子查询: {sql}");
+        // 外层不再重复加口径过滤
+        assert_eq!(sql.matches("item_type").count(), 1, "{sql}");
+    }
+
+    #[test]
+    fn dedup_skipped_when_col_not_in_keys() {
+        // 外层引用了不在去重键里的列 → 子查询取不到 → 不装配（回落 LLM），绝不出错数
+        let m = MetricDef {
+            name: "销量".into(), aliases: vec![],
+            source_table: "t_sales_order_detail".into(),
+            agg_expr: "SUM(box_quantity)".into(),
+            scope_filter: "item_type = '1'".into(),
+            dedup_keys: "sales_order_code,sku_code".into(), // 缺 box_quantity
+        };
+        assert!(compose_sql(&m, &cat_dim(), "本月销量按商品分类", &edges()).is_none());
+    }
+
+    #[test]
+    fn no_dedup_metric_unchanged() {
+        // 无去重键的指标保持原装配（不引入子查询开销）
+        let sql = compose_sql(&sales_metric(), &dim("省份", "cus.province"), "本月销售额按省份", &edges()).unwrap();
+        assert!(!sql.contains("SELECT DISTINCT"), "{sql}");
+    }
+
+    #[test]
+    fn base_col_refs_extracts() {
+        assert_eq!(base_col_refs("SUM(d.box_quantity)", "d"), vec!["box_quantity"]);
+        assert_eq!(base_col_refs("g.goods_code = d.sku_code AND d.sku_code > 0", "d"), vec!["sku_code"]);
+        // 别名前缀不得被相似别名误命中
+        assert!(base_col_refs("xd.foo", "d").is_empty());
+        assert!(base_col_refs("COALESCE(cat.category_name,'未分类')", "d").is_empty());
+    }
+
+    fn scopes() -> Vec<(String, String)> {
+        vec![
+            ("t_sales_order".into(), "deleted_flag = 0 AND order_status NOT IN ('0','108','199')".into()),
+            ("t_customer".into(), "deleted_flag = 0".into()),
+        ]
+    }
+
+    #[test]
+    fn table_scope_applied_to_bridge() {
+        // 明细指标经时间桥 JOIN 订单主表 → 必须带上有效订单口径（漏则销量虚高 41%，评测抓获）
+        let sql = compose_sql_with(&qty_metric(), &cat_dim(), "本月销量按商品分类", &edges(), &scopes()).unwrap();
+        assert!(sql.contains("o_time.order_status NOT IN ('0','108','199')"), "{sql}");
+        assert!(sql.contains("o_time.deleted_flag = 0"), "{sql}");
+    }
+
+    #[test]
+    fn table_scope_not_duplicated_for_metric_base() {
+        // 指标基表本身已有 scope_filter → 不重复叠加同一条件
+        let sql = compose_sql_with(&sales_metric(), &dim("省份", "cus.province"), "本月销售额按省份", &edges(), &scopes()).unwrap();
+        assert_eq!(sql.matches("order_status NOT IN").count(), 1, "{sql}");
+        // 维度侧 JOIN 的客户表也吃到表级口径
+        assert!(sql.contains("cus.deleted_flag = 0"), "{sql}");
+    }
+
+    #[test]
+    fn from_table_aliases_parses() {
+        let f = "t_sales_order_detail d JOIN t_goods g ON g.goods_code = d.sku_code JOIN t_sales_order o_time ON o_time.sales_order_code = d.sales_order_code";
+        let got = from_table_aliases(f);
+        assert_eq!(got, vec![
+            ("t_sales_order_detail".to_string(), "d".to_string()),
+            ("t_goods".to_string(), "g".to_string()),
+            ("t_sales_order".to_string(), "o_time".to_string()),
+        ]);
+        // 去重子查询形态：括号内不算 FROM 项
+        let f2 = "(SELECT DISTINCT a, b FROM t_sales_order_detail WHERE item_type = '1') d JOIN t_goods g ON g.goods_code = d.sku_code";
+        assert_eq!(from_table_aliases(f2), vec![("t_goods".to_string(), "g".to_string())]);
     }
 }

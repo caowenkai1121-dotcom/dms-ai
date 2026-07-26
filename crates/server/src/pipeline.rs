@@ -571,6 +571,12 @@ async fn ask_single(
         meta::log_correction(pg, "agg-fix", question, &format!("聚合归一：{} → {}", sql.chars().take(120).collect::<String>(), fixed.chars().take(120).collect::<String>())).await;
         sql = fixed;
     }
+    // 口径过滤补全（移植 SuperSonic 指标 filter 恒生效）：漏注册表 scope_filter 则补
+    // （评测抓获：问「本月有多少个订单」LLM 漏有效订单过滤，数字虚高 17%）
+    if let Ok(Some(fixed)) = crate::corrector::correct_caliber(pg, question, &sql).await {
+        meta::log_correction(pg, "caliber-fix", question, &format!("口径补全：{} → {}", sql.chars().take(120).collect::<String>(), fixed.chars().take(120).collect::<String>())).await;
+        sql = fixed;
+    }
     // ValueLinker（移植 SuperSonic 值链接）：编码列中文名直写确定性换码（写中文名必返 0 行的真坑）
     if let Ok(Some(fixed)) = crate::corrector::correct_value(pg, &sql).await {
         meta::log_correction(pg, "value-fix", question, &format!("码值换写：{} → {}", sql.chars().take(120).collect::<String>(), fixed.chars().take(120).collect::<String>())).await;

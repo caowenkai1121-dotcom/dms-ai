@@ -1,0 +1,137 @@
+{
+  "_doc": "执行级评测题集（SuperSonic evaluation exec-only 思路）：不比 SQL 文本，比【生成 SQL 与 gold SQL 各自执行的结果集】。gold 口径均来自 PROGRESS 已坐实教训，写死在此作为回归基准。tags 供分层统计。",
+  "cases": [
+    {
+      "name": "E01-本月销售额",
+      "login": "admin",
+      "q": "本月销售额是多少",
+      "tags": [
+        "聚合",
+        "时间",
+        "金额口径"
+      ],
+      "gold_sql": "SELECT SUM(total_amount) AS `销售额` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
+    },
+    {
+      "name": "E02-本月订单数",
+      "login": "admin",
+      "q": "本月有多少个订单",
+      "tags": [
+        "聚合",
+        "时间",
+        "去重计数"
+      ],
+      "gold_sql": "SELECT COUNT(DISTINCT sales_order_code) AS `订单数` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
+    },
+    {
+      "name": "E03-各省销售额",
+      "login": "admin",
+      "q": "本月各省销售额",
+      "tags": [
+        "分组",
+        "跨表",
+        "时间"
+      ],
+      "gold_sql": "SELECT COALESCE(NULLIF(cus.province,''),'未知') AS `省份`, SUM(o.total_amount) AS `销售额` FROM t_sales_order o LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0 WHERE o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND o.order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) GROUP BY COALESCE(NULLIF(cus.province,''),'未知') ORDER BY `销售额` DESC"
+    },
+    {
+      "name": "E04-成交客户数",
+      "login": "admin",
+      "q": "本月成交客户数",
+      "tags": [
+        "聚合",
+        "术语",
+        "去重计数"
+      ],
+      "gold_sql": "SELECT COUNT(DISTINCT customer_code) AS `客户数` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
+    },
+    {
+      "name": "E05-销量按商品分类",
+      "login": "admin",
+      "q": "本月各商品分类销量",
+      "tags": [
+        "分组",
+        "明细口径",
+        "去重",
+        "跨表"
+      ],
+      "gold_sql": "SELECT COALESCE(cat.category_name,'未分类') AS `商品分类`, SUM(t.box_quantity) AS `销量` FROM (SELECT DISTINCT d.sales_order_code, d.sku_code, d.sku_name, d.box_quantity, d.amount FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code WHERE d.item_type = '1' AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND o.order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)) t JOIN t_goods g ON g.goods_code = t.sku_code AND g.deleted_flag = 0 LEFT JOIN t_goods_category cat ON g.goods_category_code = cat.id GROUP BY COALESCE(cat.category_name,'未分类') ORDER BY `销量` DESC"
+    },
+    {
+      "name": "E06-客户销售额TOP10",
+      "login": "admin",
+      "q": "本月销售额前10的客户",
+      "tags": [
+        "排行",
+        "TopN",
+        "分组"
+      ],
+      "gold_sql": "SELECT customer_name AS `客户`, SUM(total_amount) AS `销售额` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) GROUP BY customer_name ORDER BY `销售额` DESC LIMIT 10"
+    },
+    {
+      "name": "E07-库存量最新快照",
+      "login": "admin",
+      "q": "现在总库存量是多少",
+      "tags": [
+        "快照口径",
+        "聚合"
+      ],
+      "gold_sql": "SELECT SUM(stock_quantity) AS `库存量` FROM t_winc_stock_report WHERE product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)"
+    },
+    {
+      "name": "E08-已开票金额",
+      "login": "admin",
+      "q": "本月开票金额",
+      "tags": [
+        "码值筛选",
+        "聚合",
+        "时间"
+      ],
+      "gold_sql": "SELECT SUM(amt) AS `开票金额` FROM (SELECT invoice_amount AS amt FROM t_invoice_apply_header WHERE deleted_flag = 0 AND invoice_status = '2' AND apply_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND apply_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) UNION ALL SELECT invoice_amount FROM t_invoice_new_apply_header WHERE deleted_flag = 0 AND invoice_status = '2' AND apply_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND apply_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)) u",
+      "note": "时间列 apply_time（Java ApplicationListHeaderMapper 权威；invoice_time 本库全 NULL）；必须 UNION ALL 新老双表——实测本月新表 275 单 2819 万 vs 老表 16 单 73 万，只查老表漏算 97%"
+    },
+    {
+      "name": "E09-售后单数",
+      "login": "admin",
+      "q": "本月售后单有多少",
+      "tags": [
+        "聚合",
+        "去重计数",
+        "时间"
+      ],
+      "gold_sql": "SELECT COUNT(DISTINCT after_sales_code) AS `售后单数` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)",
+      "note": "时间列 after_sales_time 为 Java AfterSalesOrdeMapper.xml 权威口径（本月=DATE_FORMAT %Y%m）"
+    },
+    {
+      "name": "E10-客单价",
+      "login": "admin",
+      "q": "本月客单价",
+      "tags": [
+        "派生指标",
+        "术语"
+      ],
+      "gold_sql": "SELECT ROUND(SUM(total_amount) / NULLIF(COUNT(DISTINCT sales_order_code),0), 2) AS `客单价` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
+    },
+    {
+      "name": "E11-权限隔离-城市经理销售额",
+      "login": "tanlibo",
+      "role": "city_manager",
+      "q": "本月销售额是多少",
+      "tags": [
+        "权限",
+        "聚合"
+      ],
+      "gold_sql": "SELECT SUM(total_amount) AS `销售额` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
+    },
+    {
+      "name": "E12-上月销售额",
+      "login": "admin",
+      "q": "上月销售额",
+      "tags": [
+        "时间",
+        "聚合"
+      ],
+      "gold_sql": "SELECT SUM(total_amount) AS `销售额` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) AND order_time < DATE_FORMAT(CURDATE(), '%Y-%m-01')"
+    }
+  ]
+}

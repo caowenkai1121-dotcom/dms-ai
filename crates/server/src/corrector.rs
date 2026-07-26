@@ -307,6 +307,191 @@ pub async fn correct_agg(pg: &PgPool, question: &str, sql: &str) -> anyhow::Resu
     Ok(normalize_agg(sql, &rules))
 }
 
+/// 口径过滤补全（移植 SuperSonic 语义层「指标 filter 恒生效」）：问句命中指标、
+/// SQL 主表就是该指标来源表，却漏了注册表的 scope_filter 条件 → AND 补上。
+/// 直击评测抓到的真缺陷：问「本月有多少个订单」LLM 漏 order_status 有效订单过滤，数字虚高 17%。
+///
+/// 保守门控（宁可不补也不误伤）：
+/// - 反向问法（含"全部/所有状态/包括已取消/含作废"）整体跳过——用户明确要全量
+/// - 仅顶层单 Select、FROM 恰一张表（多表 JOIN 的别名归属复杂，交 LLM）
+/// - scope_filter 含子查询（库存快照类）跳过
+/// - 逐个原子条件比对：SQL 已含该列的任何条件就不补（用户可能在查特定状态）
+pub fn add_scope_filter(sql: &str, source_table: &str, scope_filter: &str) -> Option<String> {
+    use sqlparser::ast::{Query, SetExpr, Statement, TableFactor};
+    if scope_filter.trim().is_empty() || scope_filter.to_uppercase().contains("SELECT") {
+        return None;
+    }
+    let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let Statement::Query(q) = &mut stmts[0] else { return None };
+    if q.with.is_some() {
+        return None;
+    }
+    let Query { body, .. } = q.as_mut();
+    let SetExpr::Select(sel) = body.as_mut() else { return None };
+    let sel = sel.as_mut();
+    // FROM 恰一张表且就是指标来源表
+    let [twj] = &sel.from[..] else { return None };
+    if !twj.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, alias, .. } = &twj.relation else { return None };
+    let table = name.0.last()?.to_string().trim_matches('`').to_lowercase();
+    if table != source_table.to_lowercase() {
+        return None;
+    }
+    let prefix = alias.as_ref().map(|a| a.name.value.clone());
+
+    // WHERE 已涉及的列（含前缀剥离、反引号剥离）
+    let mut present: HashSet<String> = HashSet::new();
+    if let Some(w) = &sel.selection {
+        collect_where_cols(w, &mut present);
+    }
+    // 逐个原子条件（按顶层 AND 切）补齐缺失的
+    let mut added: Vec<String> = vec![];
+    for cond in split_top_and(scope_filter) {
+        let Some(col) = first_ident_of(&cond) else { continue };
+        if present.contains(&col) {
+            continue;
+        }
+        let qualified = match &prefix {
+            Some(p) => format!("{p}.{cond}"),
+            None => cond.clone(),
+        };
+        added.push(qualified);
+    }
+    if added.is_empty() {
+        return None;
+    }
+    let extra = added.join(" AND ");
+    let expr = Parser::new(&MySqlDialect {})
+        .try_with_sql(&extra)
+        .and_then(|mut p| p.parse_expr())
+        .ok()?;
+    sel.selection = Some(match sel.selection.take() {
+        Some(existing) => Expr::BinaryOp {
+            left: Box::new(Expr::Nested(Box::new(existing))),
+            op: sqlparser::ast::BinaryOperator::And,
+            right: Box::new(expr),
+        },
+        None => expr,
+    });
+    Some(stmts[0].to_string())
+}
+
+/// scope_filter 按顶层 AND 切成原子条件（不解析括号内部；口径过滤都是简单 AND 串）
+fn split_top_and(filter: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    let chars: Vec<char> = filter.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '(' => {
+                depth += 1;
+                cur.push('(');
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(')');
+            }
+            _ if depth == 0
+                && chars[i..].len() >= 5
+                && chars[i..i + 5].iter().collect::<String>().eq_ignore_ascii_case(" and ") =>
+            {
+                out.push(cur.trim().to_string());
+                cur.clear();
+                i += 5;
+                continue;
+            }
+            c => cur.push(c),
+        }
+        i += 1;
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+/// 取条件串里的第一个标识符（列名），小写去反引号
+fn first_ident_of(cond: &str) -> Option<String> {
+    let t: String = cond
+        .trim()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '`')
+        .collect();
+    let t = t.trim_matches('`').to_lowercase();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+/// 收集 WHERE 中出现的列名（末段小写）
+fn collect_where_cols(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::Identifier(i) => {
+            out.insert(i.value.trim_matches('`').to_lowercase());
+        }
+        Expr::CompoundIdentifier(parts) => {
+            if let Some(p) = parts.last() {
+                out.insert(p.value.trim_matches('`').to_lowercase());
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_where_cols(left, out);
+            collect_where_cols(right, out);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
+            collect_where_cols(expr, out)
+        }
+        Expr::InList { expr, .. } | Expr::InSubquery { expr, .. } => collect_where_cols(expr, out),
+        Expr::Between { expr, low, high, .. } => {
+            collect_where_cols(expr, out);
+            collect_where_cols(low, out);
+            collect_where_cols(high, out);
+        }
+        Expr::IsNull(e) | Expr::IsNotNull(e) => collect_where_cols(e, out),
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            collect_where_cols(expr, out);
+            collect_where_cols(pattern, out);
+        }
+        Expr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(l) = &f.args {
+                for a in &l.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) = a
+                    {
+                        collect_where_cols(e, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 口径过滤补全的 DB 包装：命中的指标逐个尝试补
+pub async fn correct_caliber(pg: &PgPool, question: &str, sql: &str) -> anyhow::Result<Option<String>> {
+    // 反向问法：用户明确要全量/含无效状态 → 整体不补
+    const OPT_OUT: &[&str] = &["全部状态", "所有状态", "包括已取消", "含已取消", "包含作废", "含作废", "不限状态"];
+    if OPT_OUT.iter().any(|w| question.contains(w)) {
+        return Ok(None);
+    }
+    let hits = crate::meta::recall_metric_hits(pg, question).await?;
+    let mut cur = sql.to_string();
+    let mut changed = false;
+    for m in &hits {
+        if let Some(next) = add_scope_filter(&cur, &m.source_table, &m.scope_filter) {
+            cur = next;
+            changed = true;
+        }
+    }
+    Ok(changed.then_some(cur))
+}
+
 /// GroupByCorrector（移植 SuperSonic）：select 同时含聚合列和裸维度列却漏 GROUP BY 时，
 /// 用裸维度列补上 GROUP BY（MySQL only_full_group_by 下漏 group by 直接报错）。纯 AST，确定性。
 /// 保守门控：单表非复杂 SQL、已有 group by 不动、无聚合或无裸列不动。
@@ -808,5 +993,78 @@ mod tests {
             &m,
         )
         .is_none());
+    }
+
+    // ── 口径过滤补全（correct_caliber 的纯函数核心）──
+    const ORDER_SCOPE: &str = "deleted_flag = 0 AND order_status NOT IN ('0','108','199')";
+
+    #[test]
+    fn caliber_adds_missing_status_filter() {
+        // 评测抓获的真缺陷：LLM 只写 deleted_flag，漏有效订单状态过滤
+        let sql = "SELECT COUNT(*) FROM t_sales_order WHERE deleted_flag = 0 AND order_time >= '2026-07-01'";
+        let out = add_scope_filter(sql, "t_sales_order", ORDER_SCOPE).unwrap();
+        let n = out.to_lowercase().replace(' ', "");
+        assert!(n.contains("order_statusnotin('0','108','199')"), "{out}");
+        // 已有的 deleted_flag 不重复补
+        assert_eq!(n.matches("deleted_flag").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn caliber_no_change_when_complete() {
+        let sql = "SELECT COUNT(*) FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199')";
+        assert!(add_scope_filter(sql, "t_sales_order", ORDER_SCOPE).is_none());
+    }
+
+    #[test]
+    fn caliber_respects_user_status_filter() {
+        // 用户显式查某状态 → 该列已出现，不覆盖用户意图
+        let sql = "SELECT COUNT(*) FROM t_sales_order WHERE order_status = '104'";
+        let out = add_scope_filter(sql, "t_sales_order", ORDER_SCOPE).unwrap();
+        let n = out.to_lowercase().replace(' ', "");
+        assert!(!n.contains("notin('0','108','199')"), "不得覆盖用户状态条件: {out}");
+        assert!(n.contains("deleted_flag=0"), "缺失的 deleted_flag 仍要补: {out}");
+    }
+
+    #[test]
+    fn caliber_qualifies_with_alias() {
+        let sql = "SELECT COUNT(*) FROM t_sales_order o WHERE o.deleted_flag = 0";
+        let out = add_scope_filter(sql, "t_sales_order", ORDER_SCOPE).unwrap();
+        assert!(out.to_lowercase().replace(' ', "").contains("o.order_statusnotin"), "{out}");
+    }
+
+    #[test]
+    fn caliber_skips_join_and_other_tables() {
+        // 多表 JOIN 跳过（别名归属复杂）
+        assert!(add_scope_filter(
+            "SELECT COUNT(*) FROM t_sales_order o JOIN t_customer c ON c.customer_code = o.customer_code WHERE o.deleted_flag = 0",
+            "t_sales_order", ORDER_SCOPE).is_none());
+        // 主表非该指标来源表 → 不碰
+        assert!(add_scope_filter("SELECT COUNT(*) FROM t_customer", "t_sales_order", ORDER_SCOPE).is_none());
+    }
+
+    #[test]
+    fn caliber_skips_subquery_filter_and_empty() {
+        // 快照类 scope_filter 含子查询 → 跳过
+        assert!(add_scope_filter(
+            "SELECT SUM(stock_quantity) FROM t_winc_stock_report",
+            "t_winc_stock_report",
+            "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)").is_none());
+        assert!(add_scope_filter("SELECT 1 FROM t_sales_order", "t_sales_order", "").is_none());
+    }
+
+    #[test]
+    fn caliber_adds_where_when_absent() {
+        let sql = "SELECT COUNT(*) FROM t_sales_order";
+        let out = add_scope_filter(sql, "t_sales_order", ORDER_SCOPE).unwrap();
+        let n = out.to_lowercase().replace(' ', "");
+        assert!(n.contains("wheredeleted_flag=0andorder_statusnotin"), "{out}");
+    }
+
+    #[test]
+    fn split_top_and_basics() {
+        assert_eq!(split_top_and(ORDER_SCOPE),
+                   vec!["deleted_flag = 0", "order_status NOT IN ('0','108','199')"]);
+        // 括号内的 and 不切
+        assert_eq!(split_top_and("a = 1 AND (b = 2 and c = 3)"), vec!["a = 1", "(b = 2 and c = 3)"]);
     }
 }

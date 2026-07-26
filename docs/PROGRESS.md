@@ -224,6 +224,29 @@
 - 顺带修 2 个只验过 cargo check 的历史坏单测：viewspec「订单数」被 Semantic::Order 抢先判定永不算指标列（Count 前移，M6z 分组柱/双序列因此失效）；direct::strip_annotations 不剥 ASCII 中文括注（`t_sales_order_detail(JOIN ...)` 基表名带尾巴 → 组合器恒 None，M8d 两测挂）。
 - 验收：单测 **89/89 全绿**（+7 inject 新测：fail-closed 拒绝/超管放行/via EXISTS 三断言/头表在场跳过/CTE 豁免/物流 via）。
 
+## M9d 蓝图第 1 期④：执行级评测门禁 + 它抓到的 5 个真缺陷（2026-07-26，准确率 72.7%→100%）
+- **门禁**（移植 SuperSonic evaluation exec-only 思路）：`tools/evaluation.py` + `tools/eval_cases.json`（12 题跨聚合/分组/时间/权限/口径）。
+  不比 SQL 文本，比**生成 SQL 与 gold SQL 各自执行的结果集**（行排序归一 + 0.5% 浮点容差 + 列名不比）——「SQL 看着对、数字错」才拦得住（既有 regression.py 的片段断言对下述 5 个缺陷全部放行）。
+  顺带产出 p50/p95 延迟基线、tags 分层通过率、`eval_error_case.json`、带 commit hash 的 `eval_baseline.csv`。
+  新增 CLI `exec-sql <login> "<sql>" [role]` 跑 gold（**三道防线一个不少**：只读红线 → 权限注入 → 只读连接）。
+- **门禁首跑即抓 5 个真缺陷（全部已修）**：
+  1. **口径过滤漏注入**：问「本月有多少个订单」LLM 写 COUNT(*) 且漏 order_status 有效订单过滤 → 数字虚高 17%。
+     修：新校正器 `corrector::correct_caliber`（SuperSonic「指标 filter 恒生效」）——命中指标且主表匹配时按顶层 AND 逐条补缺失口径；
+     反向问法（全部/含取消/不限状态）、多表 JOIN、子查询口径、用户已写该列条件 全部保守跳过。
+  2. **指标召回漏口语问法**：「有多少个订单」不含"订单数"三字 → 指标未命中 → 口径卡与口径补全全部失效。修：补口语别名（多少个订单/几单/订单笔数…）。
+  3. **时间列口径缺失**：`invoice_time` 本库**全 NULL（0/2280）**，LLM 用它必返 NULL；售后 after_sales_time vs created_time 摇摆。
+     修：`meta.metric` 加 **time_col**（Java mapper 权威 + 连库核实非空：订单 order_time / 售后 after_sales_time / 开票 apply_time），口径卡钉死「时间过滤【必须】用 X 列」。
+  4. **明细重复行虚增 41%**：`t_sales_order_detail` 系统级 2x 重复（实测 100.7 万行 vs 去重 83.2 万），组合器直接 SUM。
+     修：`meta.metric` 加 **dedup_keys**，组合器基表换为 `(SELECT DISTINCT 键 FROM 表 WHERE 口径) 别名` 并把口径下推；
+     **安全门控**：外层对基表引用的列必须全在去重键内，否则不装配（回落 LLM），绝不出错数。
+  5. **JOIN 主表漏表级口径**：明细指标经时间桥 JOIN t_sales_order 未带「有效订单」→ 虚增。
+     修：新增 `meta.table_scope`（SuperSonic 数据模型 model filter）——表被任何查询触及时恒成立的过滤，组合器按 FROM 中别名自动附加（去重子查询已下推的基表跳过）。
+- **顺带修的架构缺陷**：`meta::seed` **只在 `meta sync` 子命令跑**，服务/CLI 启动都不 seed → 注册表种子改了永不生效（新增 time_col 在评测里全空才暴露）。
+  修：统一 `bootstrap_meta`（migrate → seed → 权限档案灌表+加载），服务/ask/exec-sql 三条路径共用。
+- **口径修正（连库坐实，注册表即真相）**：开票金额来源 = **老表 UNION ALL 新表**（实测本月新表 275 单 2819 万 vs 老表 16 单 73 万，只查老表漏算 97%）；组合器遇 UNION 来源不装配交 LLM。
+- 分组默认 LIMIT 50 → **200**（60 个商品分类被静默截成 50，用户无感）。
+- 验收：**评测 12/12 = 100%**（起点 72.7%）；单测 **139/139**（+15：口径补全 8 / 去重装配 4 / 表级口径 3）；p50 18.9s p95 33.3s。
+
 ## M8d S3② join 边注册表 + 跨基表组合（2026-07-24，组合器 v2）
 - `meta.join_edge`（SuperSonic JoinPath 思想）：表间可连接边+**基数标注**（1:N 扇出/N:1 收敛），种子 5 边全部来自已坐实模板连接键（order↔detail/order→customer/order→employee/detail→goods/goods→category）。
 - compose_sql v2：同基表直拼保留；跨基表 **BFS 最短路径**（≤3 跳）拼 FROM 链（维度片段内部别名原样保留，metric 裸列限定到 b0）。

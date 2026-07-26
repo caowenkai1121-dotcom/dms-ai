@@ -36,6 +36,18 @@ struct AppState {
     graph_status: Arc<std::sync::Mutex<String>>,
 }
 
+/// 元数据启动引导：建表 → 种子 upsert（指标/维度/术语/码表/join 边）→ 权限档案灌表+加载。
+/// 三条路径（服务/ask/exec-sql）统一走这里——否则改注册表种子后不跑 `meta sync` 永不生效
+/// （真踩过：新增 metric.time_col 种子在评测里全空，口径卡缺时间列钉不住）。
+async fn bootstrap_meta(pg: &PgPool) -> anyhow::Result<()> {
+    meta::migrate(pg).await?;
+    meta::seed(pg).await?;
+    inject::seed_rules(pg).await?;
+    let n = inject::load_rules(pg).await?;
+    tracing::info!("元数据引导完成：scope_binding 权限档案 {n} 张表");
+    Ok(())
+}
+
 fn llm_client(cfg: &db::Settings) -> llm::LlmClient {
     llm::LlmClient::new(&cfg.llm_base_url, &cfg.llm_api_key, &cfg.llm_model_fast, &cfg.llm_model_precise)
 }
@@ -136,13 +148,36 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 4 && args[1] == "ask" {
         let mysql = db::mysql_pool(&cfg.mysql_url).await?;
         let pg = db::pg_pool(&cfg.pg_url).await?;
-        meta::migrate(&pg).await?;
-        inject::seed_rules(&pg).await?;
-        inject::load_rules(&pg).await?;
+        bootstrap_meta(&pg).await?;
         let client = llm_client(&cfg);
         let p = principal::load_principal(&mysql, &args[2], args.get(4).map(|s| s.as_str())).await?;
         let r = pipeline::ask(&client, &mysql, &pg, &p, &args[3], None).await?;
         println!("{}", serde_json::to_string(&r)?);
+        return Ok(());
+    }
+
+    // 评测子命令：exec-sql <login_name> "<sql>" [role_code] —— 以该用户身份执行给定 SQL。
+    // 三道防线一个不少（只读红线 → 权限注入 → 只读连接），供 tools/evaluation.py 跑 gold SQL 对拍。
+    if args.len() >= 4 && args[1] == "exec-sql" {
+        let mysql = db::mysql_pool(&cfg.mysql_url).await?;
+        let pg = db::pg_pool(&cfg.pg_url).await?;
+        bootstrap_meta(&pg).await?;
+        let p = principal::load_principal(&mysql, &args[2], args.get(4).map(|s| s.as_str())).await?;
+        let sets = scope::compute_scope_cached(&mysql, &p).await?;
+        pipeline::is_safe_select(&args[3])?;
+        let injected = inject::inject(&args[3], &sets)?;
+        let t0 = std::time::Instant::now();
+        let (columns, rows) = pipeline::execute(&mysql, &injected).await?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "sql": injected,
+                "columns": columns,
+                "rows": rows,
+                "row_count": rows.len(),
+                "elapsed_ms": t0.elapsed().as_millis() as u64,
+            })
+        );
         return Ok(());
     }
 
@@ -175,12 +210,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mysql = db::mysql_pool(&cfg.mysql_url).await?;
     let pg = db::pg_pool(&cfg.pg_url).await?;
-    meta::migrate(&pg).await?;
+    bootstrap_meta(&pg).await?;
     chat::migrate(&pg).await?;
-    // 权限档案：种子灌表 + 加载注册表（fail-closed 依据，必须成功）
-    inject::seed_rules(&pg).await?;
-    let n_rules = inject::load_rules(&pg).await?;
-    tracing::info!("scope_binding 权限档案加载 {n_rules} 张表");
 
     let graph_status = Arc::new(std::sync::Mutex::new(String::from("never")));
     let state = Arc::new(AppState {

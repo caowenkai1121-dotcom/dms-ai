@@ -69,6 +69,17 @@ CREATE TABLE IF NOT EXISTS meta.metric(
   description text NOT NULL DEFAULT '',
   status text NOT NULL DEFAULT 'active'
 );
+-- 默认时间列（SuperSonic 分区时间维度）：同表多时间列语义不同且有全 NULL 坑列，口径必须钉死
+ALTER TABLE meta.metric ADD COLUMN IF NOT EXISTS time_col text NOT NULL DEFAULT '';
+-- 去重键：来源表含系统级重复行（ETL 双写）时聚合前须按这些列 DISTINCT，否则数值虚增
+ALTER TABLE meta.metric ADD COLUMN IF NOT EXISTS dedup_keys text NOT NULL DEFAULT '';
+-- 表级标准口径（SuperSonic 数据模型 model filter）：无论谁 JOIN 这张表都恒成立的过滤。
+-- 解决「明细类指标 JOIN 订单主表却漏掉有效订单过滤 → 数值虚增」（评测抓获销量虚高 41%）。
+CREATE TABLE IF NOT EXISTS meta.table_scope(
+  table_name text PRIMARY KEY,
+  filter text NOT NULL,
+  note text NOT NULL DEFAULT ''
+);
 -- 维度注册表（移植 SuperSonic DimensionResp 最小可用）：维度名→分组取数口径单一事实源
 CREATE TABLE IF NOT EXISTS meta.dimension(
   dim_code text PRIMARY KEY,
@@ -335,12 +346,34 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
     seed_dimensions(pg).await?;
     seed_value_maps(pg).await?;
     seed_join_edges(pg).await?;
+    seed_table_scopes(pg).await?;
     seed_terms(pg).await?;
     sync_elements(pg).await?;
     Ok(())
 }
 
 /// JOIN 边种子（全部来自已连库坐实的模板连接键；cardinality 标注扇出方向）
+/// 表级标准口径种子：该表被任何查询触及时都应成立的过滤（口径单一事实源）
+async fn seed_table_scopes(pg: &PgPool) -> anyhow::Result<()> {
+    const SCOPES: &[(&str, &str, &str)] = &[
+        ("t_sales_order",
+         "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
+         "有效订单：剔除暂存0/无效108/作废199。明细类指标 JOIN 订单主表时同样适用（漏则销量/金额虚增）"),
+        ("t_customer", "deleted_flag = 0", "客户主档软删过滤"),
+        ("t_goods", "deleted_flag = 0", "商品主档软删过滤"),
+    ];
+    for (t, f, note) in SCOPES {
+        sqlx::query(
+            "INSERT INTO meta.table_scope(table_name, filter, note) VALUES ($1,$2,$3)
+             ON CONFLICT (table_name) DO UPDATE SET filter=$2, note=$3",
+        )
+        .bind(t).bind(f).bind(note)
+        .execute(pg)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn seed_join_edges(pg: &PgPool) -> anyhow::Result<()> {
     // (left_table, left_col, right_table, right_col, card, note)
     const EDGES: &[(&str, &str, &str, &str, &str, &str)] = &[
@@ -644,63 +677,90 @@ pub async fn recall_terms(pg: &PgPool, question: &str) -> anyhow::Result<Vec<Str
 
 /// 首批指标注册（口径全部旧项目连库验证过——单一事实源，根治 LLM 用错表/算错口径）
 async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
-    // (code, name, aliases, source_table, agg_expr, scope_filter, description)
-    const METRICS: &[(&str, &str, &[&str], &str, &str, &str, &str)] = &[
+    // (code, name, aliases, source_table, agg_expr, scope_filter, time_col, dedup_keys, description)
+    // time_col = 默认时间列（DMS Java mapper 权威口径 + 连库核实非空）；空=该指标无时间语义（快照类）
+    // dedup_keys = 来源表含系统级重复行时的去重键；空=该表无重复问题
+    const METRICS: &[(&str, &str, &[&str], &str, &str, &str, &str, &str, &str)] = &[
         ("sales_amount", "销售额", &["销售总额", "营业额", "销售业绩", "业绩", "卖了多少"],
          "t_sales_order", "SUM(total_amount)",
          "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
+         "order_time",
+         "",
          "有效订单销售金额（剔除暂存0/无效108/作废199）"),
-        ("order_count", "订单数", &["订单量", "单量", "成交订单数", "多少单"],
+        // 别名须覆盖口语问法：「有多少个订单」不含"订单数"三字，漏召回则口径卡与口径补全全失效（评测抓获）
+        ("order_count", "订单数", &["订单量", "单量", "成交订单数", "多少单", "多少个订单", "多少订单", "几个订单", "几单", "订单笔数", "下了多少"],
          "t_sales_order", "COUNT(DISTINCT sales_order_code)",
          "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
+         "order_time",
+         "",
          "有效订单数（按单号去重）"),
         ("avg_order_value", "客单价", &["单均", "平均客单"],
          "t_sales_order", "SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)",
          "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
+         "order_time",
+         "",
          "有效订单客单价=销售额/订单数"),
         ("market_expense", "市场费用", &["营销费用", "费用总额", "推广费"],
          "t_market_total_expense", "SUM(expense_amount)",
          "deleted_flag = 0",
+         "created_time",
+         "",
          "泛指市场/营销费用一律用合计摘要表 t_market_total_expense，勿用费用族专项子表（会漏10倍级）"),
-        ("aftersales_count", "售后单数", &["退货数", "售后量", "退货单数"],
+        ("aftersales_count", "售后单数", &["退货数", "售后量", "退货单数", "售后单有多少", "多少售后", "几个售后单"],
          "t_after_sales_order_header", "COUNT(DISTINCT after_sales_code)",
          "deleted_flag = 0",
+         "after_sales_time",
+         "",
          "售后单数（按售后单号去重）"),
         ("refund_amount", "退款额", &["售后退款", "退款金额", "售后金额"],
          "t_after_sales_order_header", "SUM(refund_amount)",
          "deleted_flag = 0",
+         "after_sales_time",
+         "",
          "售后退款金额"),
         ("stock_qty", "库存量", &["库存数量", "存货量", "库存"],
          "t_winc_stock_report", "SUM(stock_quantity)",
          "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)",
+         "",
+         "",
          "库存必须取最新快照(每日全量快照,直接SUM会把多天累加虚增几十倍)"),
         ("stock_amount", "库存金额", &["库存额", "存货金额", "库存价值"],
          "t_winc_stock_report", "SUM(stock_amount)",
          "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)",
+         "",
+         "",
          "库存金额必须取最新快照(每日全量快照,直接SUM会累加虚增)"),
         ("sales_qty", "销量", &["销售量", "出货量", "卖了多少箱", "销售数量"],
          "t_sales_order_detail(JOIN t_sales_order 有效订单)", "SUM(box_quantity)",
          "item_type = '1'",
+         "order_time",
+         "sales_order_code,sku_code,sku_name,box_quantity,amount",
          "销量=商品行箱数：item_type分列(1商品行/2赠品/3结算行)，销量只取 item_type='1' 的 box_quantity；须 JOIN t_sales_order 且 o.order_status NOT IN('0','108','199')；detail 有2x重复须先按(单号,sku,数量)去重"),
         ("invoice_amount", "开票金额", &["开票额", "发票金额", "发票"],
-         "t_invoice_apply_header", "SUM(invoice_amount)",
+         "t_invoice_apply_header UNION ALL t_invoice_new_apply_header", "SUM(invoice_amount)",
          "deleted_flag = 0 AND invoice_status = '2'",
-         "开票金额必须筛 invoice_status='2'(已开票,码表InvoiceStatusEnum 0未申请/1申请中/2已开票/3冲红申请中/4已冲红/5失败/6部分开票),不筛会把申请中/失败虚增；发票双流并行(老表 t_invoice_apply_header IO*单 + 新表 t_invoice_new_apply_header SQ*单,交集为0),问全量发票须 UNION ALL 两表"),
+         "apply_time",
+         "",
+         "开票金额必须筛 invoice_status='2'(已开票,码表InvoiceStatusEnum 0未申请/1申请中/2已开票/3冲红申请中/4已冲红/5失败/6部分开票),不筛会把申请中/失败虚增；【发票双流并行,必须 UNION ALL 两表】老表 t_invoice_apply_header(IO*单,存量少)+新表 t_invoice_new_apply_header(SQ*单,当前主流,实测本月 275 单 2819 万 vs 老表 16 单 73 万),交集为0,只查一张表必严重漏算"),
         ("activity_expense", "活动费用", &["活动经费", "市场活动费用"],
          "t_activity_main", "SUM(total_amount)",
          "deleted_flag = 0",
+         "created_time",
+         "",
          "市场活动费用合计金额；status 分 暂存/待申请/已申请/完成(暂存未生效)，只算生效活动加 status IN('已申请','完成')"),
         ("activity_count", "活动场次", &["活动数量", "多少场活动", "办了多少活动"],
          "t_activity_main", "COUNT(DISTINCT activity_no)",
          "deleted_flag = 0",
+         "created_time",
+         "",
          "市场活动场次数(按活动编号 activity_no 去重)；status 暂存/待申请/已申请/完成"),
     ];
-    for (code, name, aliases, src, agg, scope, desc) in METRICS {
+    for (code, name, aliases, src, agg, scope, tcol, dedup, desc) in METRICS {
         sqlx::query(
-            "INSERT INTO meta.metric(metric_code, name, aliases, source_table, agg_expr, scope_filter, description)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)
+            "INSERT INTO meta.metric(metric_code, name, aliases, source_table, agg_expr, scope_filter, time_col, dedup_keys, description)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
              ON CONFLICT (metric_code) DO UPDATE SET
-               name=$2, aliases=$3, source_table=$4, agg_expr=$5, scope_filter=$6, description=$7",
+               name=$2, aliases=$3, source_table=$4, agg_expr=$5, scope_filter=$6, time_col=$7, dedup_keys=$8, description=$9",
         )
         .bind(code)
         .bind(name)
@@ -708,6 +768,8 @@ async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
         .bind(src)
         .bind(agg)
         .bind(scope)
+        .bind(tcol)
+        .bind(dedup)
         .bind(desc)
         .execute(pg)
         .await?;
@@ -715,10 +777,21 @@ async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 召回命中的指标口径卡（问句含指标名或别名）→ 注入 prompt 让 LLM 严格按口径
-pub async fn recall_metrics(pg: &PgPool, question: &str) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String, Vec<String>, String, String, String, String)> = sqlx::query_as(
-        "SELECT name, aliases, source_table, agg_expr, scope_filter, description
+/// 命中的指标（结构化，供口径卡渲染与口径校正器共用——单一事实源）
+pub struct MetricHit {
+    pub name: String,
+    pub source_table: String,
+    pub agg_expr: String,
+    pub scope_filter: String,
+    pub time_col: String,
+    pub dedup_keys: String,
+    pub description: String,
+}
+
+/// 召回命中的指标（问句含指标名或别名）
+pub async fn recall_metric_hits(pg: &PgPool, question: &str) -> anyhow::Result<Vec<MetricHit>> {
+    let rows: Vec<(String, Vec<String>, String, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT name, aliases, source_table, agg_expr, scope_filter, time_col, dedup_keys, description
          FROM meta.metric WHERE status = 'active'",
     )
     .fetch_all(pg)
@@ -728,11 +801,37 @@ pub async fn recall_metrics(pg: &PgPool, question: &str) -> anyhow::Result<Vec<S
         .filter(|(name, aliases, ..)| {
             question.contains(name.as_str()) || aliases.iter().any(|a| question.contains(a.as_str()))
         })
-        .map(|(name, _aliases, src, agg, scope, desc)| {
-            let filter = if scope.is_empty() { String::new() } else { format!("；口径过滤：{scope}") };
-            format!("【{name}】= {agg}，来源表 {src}{filter}。说明：{desc}")
+        .map(|(name, _aliases, source_table, agg_expr, scope_filter, time_col, dedup_keys, description)| MetricHit {
+            name,
+            source_table,
+            agg_expr,
+            scope_filter,
+            time_col,
+            dedup_keys,
+            description,
         })
         .collect())
+}
+
+/// 指标口径卡文本（注入 prompt 让 LLM 严格按口径）
+pub fn metric_card(m: &MetricHit) -> String {
+    let filter = if m.scope_filter.is_empty() { String::new() } else { format!("；口径过滤：{}", m.scope_filter) };
+    // 时间列是最高频错误源（同表多个时间列语义不同，且有全 NULL 的坑列）——口径卡必须钉死
+    let tcol = if m.time_col.is_empty() {
+        String::new()
+    } else {
+        format!("；时间过滤【必须】用 {} 列", m.time_col)
+    };
+    let dedup = if m.dedup_keys.is_empty() {
+        String::new()
+    } else {
+        format!("；⚠️该表含系统级重复行，聚合前【必须】先按 ({}) DISTINCT 去重再算，否则数值虚增", m.dedup_keys)
+    };
+    format!("【{}】= {}，来源表 {}{}{}{}。说明：{}", m.name, m.agg_expr, m.source_table, filter, tcol, dedup, m.description)
+}
+
+pub async fn recall_metrics(pg: &PgPool, question: &str) -> anyhow::Result<Vec<String>> {
+    Ok(recall_metric_hits(pg, question).await?.iter().map(metric_card).collect())
 }
 
 /// 首批维度注册（取数口径全部来自 direct.rs 已连库坐实的确定性模板——单一事实源，根治 LLM 分组乱 JOIN/取错列）
