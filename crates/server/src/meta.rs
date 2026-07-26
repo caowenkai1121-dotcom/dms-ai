@@ -666,12 +666,19 @@ pub async fn recall_terms(pg: &PgPool, question: &str) -> anyhow::Result<Vec<Str
     )
     .fetch_all(pg)
     .await?;
-    Ok(rows
+    let matched: Vec<(usize, String)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (term, _, aliases))| match_word(question, term, aliases).map(|w| (i, w)))
+        .collect();
+    let pairs: Vec<(String, String)> =
+        matched.iter().map(|(i, w)| (rows[*i].0.clone(), w.clone())).collect();
+    Ok(map_filter(&pairs)
         .into_iter()
-        .filter(|(term, _, aliases)| {
-            question.contains(term.as_str()) || aliases.iter().any(|a| question.contains(a.as_str()))
+        .map(|k| {
+            let (term, def, _) = &rows[matched[k].0];
+            format!("{term} = {def}")
         })
-        .map(|(term, def, _)| format!("{term} = {def}"))
         .collect())
 }
 
@@ -777,6 +784,64 @@ async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 问句对某元素的命中：返回命中词（名或最长命中别名），未命中返回 None。
+/// 取最长——同一元素多个别名同时命中时，长词更具体（"多少个订单" 优于 "多少单"）。
+pub fn match_word(question: &str, name: &str, aliases: &[String]) -> Option<String> {
+    let mut best: Option<String> = None;
+    let mut consider = |w: &str| {
+        if !w.is_empty() && question.contains(w) {
+            let better = best.as_ref().map(|b| w.chars().count() > b.chars().count()).unwrap_or(true);
+            if better {
+                best = Some(w.to_string());
+            }
+        }
+    };
+    consider(name);
+    for a in aliases {
+        consider(a);
+    }
+    best
+}
+
+/// MapFilter（移植 SuperSonic SchemaMapper 命中净化五规则的中文适配版）：
+/// 召回命中往往互相干扰——问「库存金额」会同时命中指标「库存量」(别名"库存")；
+/// autodiscover 把列注释当维度名导致同名重复 10 条。不净化则口径卡互相打架且 prompt 膨胀。
+///
+/// 输入 (元素名, 命中词)，输出保留下标（保持原序）：
+/// - R1 命中词 <2 字 剔除（中文单字无区分度）
+/// - R2 同名去重（保留首个）
+/// - R3 命中词被另一命中词真包含 → 剔除较短者（"客户" vs "客户分类" 取后者）
+/// - R4 同一命中词多元素命中时，元素名==命中词（满分）优先，其余剔除
+pub fn map_filter(hits: &[(String, String)]) -> Vec<usize> {
+    let words: Vec<&str> = hits.iter().map(|(_, w)| w.as_str()).collect();
+    // R4 预备：哪些命中词存在满分元素
+    let exact_words: std::collections::HashSet<&str> = hits
+        .iter()
+        .filter(|(n, w)| n == w)
+        .map(|(_, w)| w.as_str())
+        .collect();
+    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out = vec![];
+    for (i, (name, word)) in hits.iter().enumerate() {
+        if word.chars().count() < 2 {
+            continue; // R1
+        }
+        if !seen_names.insert(name.as_str()) {
+            continue; // R2
+        }
+        // R3：存在更长且真包含本命中词的命中 → 本条让位
+        if words.iter().any(|w| w.len() > word.len() && w.contains(word.as_str())) {
+            continue;
+        }
+        // R4：同词有满分命中而本条非满分 → 让位
+        if name != word && exact_words.contains(word.as_str()) {
+            continue;
+        }
+        out.push(i);
+    }
+    out
+}
+
 /// 命中的指标（结构化，供口径卡渲染与口径校正器共用——单一事实源）
 pub struct MetricHit {
     pub name: String,
@@ -796,19 +861,20 @@ pub async fn recall_metric_hits(pg: &PgPool, question: &str) -> anyhow::Result<V
     )
     .fetch_all(pg)
     .await?;
-    Ok(rows
+    // 命中 + MapFilter 净化（"库存金额" 不该同时拖出 "库存量"）
+    let matched: Vec<(usize, String)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (name, aliases, ..))| match_word(question, name, aliases).map(|w| (i, w)))
+        .collect();
+    let pairs: Vec<(String, String)> =
+        matched.iter().map(|(i, w)| (rows[*i].0.clone(), w.clone())).collect();
+    Ok(map_filter(&pairs)
         .into_iter()
-        .filter(|(name, aliases, ..)| {
-            question.contains(name.as_str()) || aliases.iter().any(|a| question.contains(a.as_str()))
-        })
-        .map(|(name, _aliases, source_table, agg_expr, scope_filter, time_col, dedup_keys, description)| MetricHit {
-            name,
-            source_table,
-            agg_expr,
-            scope_filter,
-            time_col,
-            dedup_keys,
-            description,
+        .map(|k| {
+            let (name, _a, source_table, agg_expr, scope_filter, time_col, dedup_keys, description) =
+                rows[matched[k].0].clone();
+            MetricHit { name, source_table, agg_expr, scope_filter, time_col, dedup_keys, description }
         })
         .collect())
 }
@@ -894,6 +960,22 @@ async fn seed_dimensions(pg: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 列注释 → 干净维度名：截到首个分隔符（中英文冒号/括号/逗号/斜杠/空格）之前。
+/// 结果须是 2~8 字的纯中文词；否则 None（调用方退回字典名）。
+pub fn clean_dim_name(comment: &str) -> Option<String> {
+    let head: String = comment
+        .trim()
+        .chars()
+        .take_while(|c| !":：(（)）,，、/ \t".contains(*c))
+        .collect();
+    let n = head.chars().count();
+    if (2..=8).contains(&n) && head.chars().all(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)) {
+        Some(head)
+    } else {
+        None
+    }
+}
+
 /// 维度命中判定（问句含维度名或别名）
 fn dim_hit(question: &str, name: &str, aliases: &[String]) -> bool {
     question.contains(name) || aliases.iter().any(|a| question.contains(a.as_str()))
@@ -907,10 +989,19 @@ pub async fn recall_dimensions(pg: &PgPool, question: &str) -> anyhow::Result<Ve
     )
     .fetch_all(pg)
     .await?;
-    Ok(rows
+    // 命中 + MapFilter 净化。维度表被 autodiscover 灌入过列注释原文（同名重复 10 条、
+    // 名字带码值说明），不净化会重复注入同一张卡并淹没真正的维度口径。
+    let matched: Vec<(usize, String)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (name, aliases, ..))| match_word(question, name, aliases).map(|w| (i, w)))
+        .collect();
+    let pairs: Vec<(String, String)> =
+        matched.iter().map(|(i, w)| (rows[*i].0.clone(), w.clone())).collect();
+    Ok(map_filter(&pairs)
         .into_iter()
-        .filter(|(name, aliases, ..)| dim_hit(question, name, aliases))
-        .map(|(name, _aliases, src, expr, desc)| {
+        .map(|k| {
+            let (name, _a, src, expr, desc) = rows[matched[k].0].clone();
             format!("【{name}】分组取值 {expr}，来源 {src}。说明：{desc}")
         })
         .collect())
@@ -1144,8 +1235,12 @@ pub async fn autodiscover_dict_columns(
                 .join(" ");
             let expr = format!("CASE `{col}` {cases} END");
             let dim_code: String = format!("auto_{table}_{col}").chars().take(80).collect();
-            let dim_name =
-                if comment.trim().is_empty() { dict_name.clone() } else { comment.trim().to_string() };
+            // 维度名取列注释的**首段**：注释常是「配送状态：100:待配送, 200:配送中」这种带码值说明的长句，
+            // 整句当维度名既不可能被问句命中，又污染注册表（同名重复十几条）。清洗不出就退回字典名。
+            let dim_name = match clean_dim_name(comment) {
+                Some(n) => n,
+                None => dict_name.clone(),
+            };
             let desc =
                 format!("自动发现：编码列对码字典 {dict_name}({dict_key})，抽样覆盖率 {coverage:.0}%");
             sqlx::query(
@@ -1410,5 +1505,65 @@ mod tests {
         assert!(name_aligns("所属公司", "所属公司"));
         assert!(!name_aligns("数据范围类型", "合同类型"));
         assert!(!name_aligns("菜单类型", "对账单状态"));
+    }
+
+    // ── MapFilter 召回净化（SuperSonic SchemaMapper 五规则中文适配）──
+    fn hits(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(n, w)| (n.to_string(), w.to_string())).collect()
+    }
+    fn kept(v: &[(&str, &str)]) -> Vec<String> {
+        let h = hits(v);
+        map_filter(&h).into_iter().map(|i| h[i].0.clone()).collect()
+    }
+
+    #[test]
+    fn map_filter_longest_wins() {
+        // 问「库存金额」不该同时拖出「库存量」(别名"库存")——两张口径卡打架
+        assert_eq!(kept(&[("库存量", "库存"), ("库存金额", "库存金额")]), vec!["库存金额"]);
+        assert_eq!(kept(&[("客户", "客户"), ("客户分类", "客户分类")]), vec!["客户分类"]);
+    }
+
+    #[test]
+    fn map_filter_dedups_same_name() {
+        // autodiscover 把同名列注册成多条维度 → 只留一条
+        assert_eq!(kept(&[("所属公司编码", "公司编码"), ("所属公司编码", "公司编码")]), vec!["所属公司编码"]);
+    }
+
+    #[test]
+    fn map_filter_drops_single_char() {
+        assert!(kept(&[("费用", "费")]).is_empty());
+    }
+
+    #[test]
+    fn map_filter_exact_beats_partial() {
+        // 同一命中词下，名字与命中词完全相等的（满分）胜出
+        assert_eq!(
+            kept(&[("订单状态(0:暂存 108:无效)", "订单状态"), ("订单状态", "订单状态")]),
+            vec!["订单状态"]
+        );
+    }
+
+    #[test]
+    fn map_filter_keeps_unrelated() {
+        // 不同概念互不影响
+        assert_eq!(kept(&[("销售额", "销售额"), ("省份", "各省")]), vec!["销售额", "省份"]);
+    }
+
+    #[test]
+    fn match_word_takes_longest_alias() {
+        let al: Vec<String> = ["多少单", "多少个订单"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(match_word("本月有多少个订单", "订单数", &al).as_deref(), Some("多少个订单"));
+        assert_eq!(match_word("本月销售额", "订单数", &al), None);
+    }
+
+    #[test]
+    fn clean_dim_name_cuts_at_separator() {
+        assert_eq!(clean_dim_name("配送状态：100:待配送, 200:配送中").as_deref(), Some("配送状态"));
+        assert_eq!(clean_dim_name("行类型（赠品，正品，结算）").as_deref(), Some("行类型"));
+        assert_eq!(clean_dim_name("所属公司编码").as_deref(), Some("所属公司编码"));
+        // 非中文/超长/过短 → None（退回字典名）
+        assert_eq!(clean_dim_name("status"), None);
+        assert_eq!(clean_dim_name("云之家附件上传状态说明补充文字"), None);
+        assert_eq!(clean_dim_name("是"), None);
     }
 }

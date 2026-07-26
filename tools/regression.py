@@ -1,7 +1,7 @@
 # M7 判官门禁回归 runner：连库跑 regression_cases.json 全量题集，断言路由/SQL/视图/权限/红线。
 # 用法: python tools/regression.py [--filter 关键词]
 # 约定: LLM 路径非确定重试 1 次（旧项目惯例）; embed/graph 依赖缺席自动跳过不计失败。
-import json, subprocess, sys, socket
+import json, re, subprocess, sys, socket
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,7 +38,40 @@ def ask(login, question, role=None, retries=1):
             last = {"error": r.stderr.strip()[-300:]}
     return last
 
-DML = ["insert", "update", "delete", "drop", "truncate", "alter", "create", "replace", "merge", "grant", "revoke"]
+DML = ["insert", "update", "delete", "drop", "truncate", "alter", "create", "merge", "grant", "revoke"]
+
+def sql_tokens(sql):
+    """SQL → 小写标识符 token 集合。先剥字符串字面量与注释，再按非标识符字符切。
+    对齐 Rust is_safe_select 的词法判定——子串匹配会把 deleted_flag 判成 delete、
+    created_time 判成 update（H01-H03 曾因此假红）。"""
+    s, out, i, n = sql, [], 0, len(sql)
+    buf = []
+    while i < n:
+        c = s[i]
+        if c in "'\"":                      # 字符串字面量整段丢弃
+            q, i = c, i + 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2; continue
+                if s[i] == q:
+                    if i + 1 < n and s[i + 1] == q:
+                        i += 2; continue
+                    i += 1; break
+                i += 1
+            buf.append(" ")
+        elif s.startswith("--", i) or c == "#":   # 行注释
+            while i < n and s[i] != "\n":
+                i += 1
+        elif s.startswith("/*", i):               # 块注释
+            j = s.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            buf.append(" ")
+        else:
+            buf.append(c); i += 1
+    for tok in re.split(r"[^A-Za-z0-9_]+", "".join(buf)):
+        if tok:
+            out.append(tok.lower())
+    return out
 
 def run_case(c, results):
     name = c["name"]
@@ -53,8 +86,13 @@ def run_case(c, results):
     nsql = norm(sql)
 
     if c.get("type") == "redline":
-        # 红线：执行出去的 SQL 绝不含 DML（报错/拒绝也算守住）
-        bad = [k for k in DML if k in nsql]
+        # 红线：执行出去的 SQL 绝不含 DML 语句（报错/拒绝也算守住）。
+        # 按 token 判定——deleted_flag/created_time 这类列名不得算作 DML。
+        toks = sql_tokens(sql)
+        bad = sorted({k for k in DML if k in toks})
+        # 有 SQL 时必须是 SELECT/WITH 开头（AST 级只读红线的外部复核）
+        if toks and toks[0] not in ("select", "with"):
+            bad.append(f"首token={toks[0]}")
         ok = not bad
         results.append((name, ok, f"sql_dml={bad or '无'} route={j.get('route')}"))
         return

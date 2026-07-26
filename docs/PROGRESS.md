@@ -224,6 +224,19 @@
 - 顺带修 2 个只验过 cargo check 的历史坏单测：viewspec「订单数」被 Semantic::Order 抢先判定永不算指标列（Count 前移，M6z 分组柱/双序列因此失效）；direct::strip_annotations 不剥 ASCII 中文括注（`t_sales_order_detail(JOIN ...)` 基表名带尾巴 → 组合器恒 None，M8d 两测挂）。
 - 验收：单测 **89/89 全绿**（+7 inject 新测：fail-closed 拒绝/超管放行/via EXISTS 三断言/头表在场跳过/CTE 豁免/物流 via）。
 
+## M9e 蓝图第 2 期①：MapFilter 召回净化 + 维度注册表去污（2026-07-26）
+- **发现（探针导出全量注册表才看见）**：`autodiscover` 把**列注释原文**当维度名写入 meta.dimension——
+  「配送状态：100:待配送, 200:配送中, 700:配送完成」「审批状态(如: Pending, Approved…)」这类整句当名字；
+  且同名列在多表各注册一条 → 「所属公司编码」活跃 10 条。召回时会重复注入同一张卡、淹没真维度口径。
+- **MapFilter**（移植 SuperSonic SchemaMapper 命中净化，中文适配四规则，`meta::map_filter` 纯函数）：
+  R1 命中词 <2 字剔除 / R2 同名去重 / R3 命中词被更长命中词真包含则让位 / R4 同词有满分（名==命中词）则非满分让位。
+  配套 `match_word`（同元素多别名命中取**最长**，"多少个订单" 优于 "多少单"）。
+  接入 recall_metric_hits / recall_dimensions / recall_terms 三处——问「库存金额」不再同时拖出指标「库存量」（别名"库存"）两卡打架。
+- **写入侧去污** `clean_dim_name`：列注释截到首个分隔符（中英文冒号/括号/逗号/斜杠）前，须 2~8 字纯中文，否则退回字典名。
+  存量脏行按同规则停用 14 条（active 维度 74→60）。
+- 验收：单测 146/146（+7：最长优先/同名去重/单字剔除/满分优先/互不影响/最长别名/注释清洗）。
+- 教训：**注册表要定期导出肉眼看**——脏数据不报错、不失败，只是悄悄稀释召回质量；单测与评测都发现不了。
+
 ## M9d 蓝图第 1 期④：执行级评测门禁 + 它抓到的 5 个真缺陷（2026-07-26，准确率 72.7%→100%）
 - **门禁**（移植 SuperSonic evaluation exec-only 思路）：`tools/evaluation.py` + `tools/eval_cases.json`（12 题跨聚合/分组/时间/权限/口径）。
   不比 SQL 文本，比**生成 SQL 与 gold SQL 各自执行的结果集**（行排序归一 + 0.5% 浮点容差 + 列名不比）——「SQL 看着对、数字错」才拦得住（既有 regression.py 的片段断言对下述 5 个缺陷全部放行）。
