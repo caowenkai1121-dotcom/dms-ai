@@ -224,6 +224,24 @@
 - 顺带修 2 个只验过 cargo check 的历史坏单测：viewspec「订单数」被 Semantic::Order 抢先判定永不算指标列（Count 前移，M6z 分组柱/双序列因此失效）；direct::strip_annotations 不剥 ASCII 中文括注（`t_sales_order_detail(JOIN ...)` 基表名带尾巴 → 组合器恒 None，M8d 两测挂）。
 - 验收：单测 **89/89 全绿**（+7 inject 新测：fail-closed 拒绝/超管放行/via EXISTS 三断言/头表在场跳过/CTE 豁免/物流 via）。
 
+## M9f 回归失败清单驱动的三修 + EXPLAIN 预检（2026-07-26，回归 48/54 逐条定位）
+- 先修**回归脚本自身的假红**：红线判定用子串匹配，`deleted_flag` 被判 delete、`created_time` 被判 update
+  → H01-H03 长期假失败（与 M9b 修的 Rust 侧同款 bug）。改 token 化判定 + 复核首 token 必为 select/with。
+- **E16【真缺陷】**：「线下客户本月销售额」被手工模板 `sales_breakdown` 装配成「全部客户 TOP200」——
+  "线下"这个客户分类限定**被静默丢弃**，答非所问（组合器有 `has_entity_residue` 守卫，手工模板没有）。
+  修：守卫抽成通用 `has_residue(问句, 已消化词)`，手工模板按命中维度接入 `consumed_words`；
+  长词优先剥离（防「客户分类」被「客户」拆散后残留「分类」）。单测钉住三类值过滤问句必回落 LLM。
+- **E13**：`COUNT(*)` 不按指标口径归一。头表一单一行时数值虽同，**JOIN 明细后按行数虚增**。
+  修：命中唯一「计数+去重」指标时改写为 `COUNT(DISTINCT 主键)`；多指标歧义或非去重规则保守跳过。
+- **E08/E15 是题目 bug**：SQL 完全正确（双表 UNION + invoice_status='2'），但中文列别名
+  ``AS `本月已开票金额` `` 含"已开票"被判禁词。禁词断言改为带引号字面量 `'已开票'` 才算命中。
+- G01 复合拆解复测为通过（route=compound）；B03 为 MySQL 连接抖动噪声。
+- **EXPLAIN 预翻译验证**（SuperSonic 解析期 dry-run）：execute 前 `EXPLAIN` 毫秒级验证列名/语法/类型，
+  失败喂 repair 重试一次。**纯增益设计**：仅当数据库明确报错才判定；超时/连接故障不判定——
+  网络抖动不该触发改写（可能把本来对的 SQL 改坏，还白花一次 LLM）。
+- 顺带风险自查：受限用户（城市经理）跨 10 域实测，**fail-closed 无一误伤**（核心表 scoped/via、维表 global 覆盖到位）。
+- 验收：单测 151/151。
+
 ## M9e 蓝图第 2 期①：MapFilter 召回净化 + 维度注册表去污（2026-07-26）
 - **发现（探针导出全量注册表才看见）**：`autodiscover` 把**列注释原文**当维度名写入 meta.dimension——
   「配送状态：100:待配送, 200:配送中, 700:配送完成」「审批状态(如: Pending, Approved…)」这类整句当名字；
