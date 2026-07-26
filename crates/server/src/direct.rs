@@ -423,27 +423,43 @@ fn base_col_refs(frag: &str, alias: &str) -> Vec<String> {
     out
 }
 
-/// 实体守卫：剥词后有 CJK/字母数字残留 = 实体问句（纯函数）
-fn has_entity_residue(question: &str, m: &MetricDef, d: &DimDef) -> bool {
+/// 残留守卫（纯函数）：把问句里被模板/组合器「消化掉」的词剥光后，
+/// 若还剩实义字（CJK/字母数字）→ 说明问句含模板表达不了的限定（实体名、值过滤、
+/// 未支持的维度），必须回落 LLM，绝不能装配一条**丢掉限定**的 SQL 静默答错。
+///
+/// 真实翻车（回归 E16 抓获）：「线下客户本月销售额」被销售额×客户模板装配成
+/// 「全部客户 TOP200 销售额」——"线下"这个客户分类过滤被静默丢弃，答非所问。
+fn has_residue(question: &str, consumed: &[String]) -> bool {
     let mut s = question.to_string();
-    let mut words: Vec<String> = vec![m.name.clone(), d.name.clone()];
-    words.extend(m.aliases.iter().cloned());
-    words.extend(d.aliases.iter().cloned());
+    // 先剥业务词（长词优先，防"客户分类"被"客户"拆散后留下"分类"）
+    let mut words: Vec<&String> = consumed.iter().collect();
+    words.sort_by_key(|w| std::cmp::Reverse(w.chars().count()));
+    for w in words {
+        s = s.replace(w.as_str(), "");
+    }
+    // 再剥通用虚词/时间词/排序词
     for w in [
         "今天", "今日", "昨天", "昨日", "本月", "这个月", "上月", "上个月", "本周", "这周", "今年",
-        "按", "各", "的", "是多少", "多少", "排行", "排名", "前", "第", "top", "TOP", "对比", "和", "与",
+        "上周", "去年", "近", "最近", "天", "周", "月", "年", "季度", "至今",
+        "按", "各", "的", "是多少", "多少", "有", "查", "查询", "统计", "看看", "帮我", "我", "一下",
+        "排行", "排名", "前", "第", "名", "top", "TOP", "对比", "和", "与", "分别",
         "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "百",
     ] {
         s = s.replace(w, "");
     }
-    for w in words {
-        s = s.replace(&w, "");
-    }
     let s: String = s
         .chars()
-        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"，。？?、,.~～".contains(*c))
+        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"，。？?、,.~～!！:：".contains(*c))
         .collect();
     s.chars().any(|c| c.is_alphanumeric() || (c as u32) > 0x2E7F)
+}
+
+/// 组合器专用：消化词 = 指标名/别名 + 维度名/别名
+fn has_entity_residue(question: &str, m: &MetricDef, d: &DimDef) -> bool {
+    let mut words: Vec<String> = vec![m.name.clone(), d.name.clone()];
+    words.extend(m.aliases.iter().cloned());
+    words.extend(d.aliases.iter().cloned());
+    has_residue(question, &words)
 }
 
 /// 裸列限定到基表别名：非函数、未限定、非关键字的标识符 → alias.col。
@@ -561,6 +577,11 @@ fn sales_breakdown(question: &str) -> Option<DirectHit> {
         return None;
     }
     let dim = detect_sales_dim(question)?;
+    // 残留守卫：模板只会「指标×维度」，问句里若还剩实义词（如「**线下**客户本月销售额」的
+    // 客户分类限定），装配出来的 SQL 会静默丢掉该限定 → 必须回落 LLM。
+    if has_residue(question, &consumed_words(&dim)) {
+        return None;
+    }
     // 有时间窗则加时间过滤，无则查全部（对齐 SuperSonic：问题没提时间就别加）
     let time_and = match time_window(question) {
         Some(p) => format!(" AND {}", p.replace("order_time", "o.order_time")),
@@ -627,6 +648,23 @@ enum SalesDim {
     Customer,
     Shop,
     Month,
+}
+
+/// 该模板能「消化」的词：销售额同义词 + 命中维度的全部触发词/输出词。
+/// 剥这些词后仍有实义残留 = 模板表达不了的限定 → 回落 LLM。
+fn consumed_words(dim: &SalesDim) -> Vec<String> {
+    let mut w: Vec<&str> = vec![
+        "销售额", "销售总额", "营业额", "卖了多少", "销售业绩", "业绩", "销售",
+    ];
+    w.extend(match dim {
+        SalesDim::Category => vec!["商品分类", "商品品类", "分类", "品类", "类别", "商品"],
+        SalesDim::Province => vec!["省份", "各省", "省市", "省", "地区", "区域"],
+        SalesDim::Owner => vec!["业务员", "销售员", "经理", "负责人", "员工", "人员"],
+        SalesDim::Customer => vec!["客户", "客户名", "经销商"],
+        SalesDim::Shop => vec!["门店", "店铺", "终端", "店"],
+        SalesDim::Month => vec!["月份", "按月", "每月", "各月", "月度", "趋势"],
+    });
+    w.into_iter().map(|s| s.to_string()).collect()
 }
 
 fn detect_sales_dim(q: &str) -> Option<SalesDim> {
@@ -1123,5 +1161,33 @@ mod tests {
         // 去重子查询形态：括号内不算 FROM 项
         let f2 = "(SELECT DISTINCT a, b FROM t_sales_order_detail WHERE item_type = '1') d JOIN t_goods g ON g.goods_code = d.sku_code";
         assert_eq!(from_table_aliases(f2), vec![("t_goods".to_string(), "g".to_string())]);
+    }
+
+    #[test]
+    fn breakdown_rejects_value_filtered_question() {
+        // 回归 E16 抓获：模板只会「指标×维度」，问句带值过滤(线下客户/某省/某商品)必须回落 LLM，
+        // 否则装配出的 SQL 静默丢掉限定 → 答非所问（曾把「线下客户销售额」答成全部客户 TOP200）
+        assert!(sales_breakdown("线下客户本月销售额").is_none());
+        assert!(sales_breakdown("恒众餐饮本月销售额按客户").is_none());
+        assert!(sales_breakdown("烤肠本月销售额按省份").is_none());
+    }
+
+    #[test]
+    fn breakdown_accepts_clean_questions() {
+        // 纯「指标×维度(×时间×TopN)」问句照常走确定性模板
+        for q in ["本月各省销售额", "销售额前5的客户", "各商品分类销售额", "本月销售额按业务员",
+                  "本月各门店销售额", "各月销售额趋势"] {
+            assert!(sales_breakdown(q).is_some(), "{q}");
+        }
+    }
+
+    #[test]
+    fn has_residue_basics() {
+        let w: Vec<String> = ["销售额", "客户"].iter().map(|s| s.to_string()).collect();
+        assert!(has_residue("线下客户本月销售额", &w));
+        assert!(!has_residue("本月客户销售额排行前十", &w));
+        // 长词优先剥离：不因先剥"客户"而在"客户分类"上留下"分类"
+        let w2: Vec<String> = ["销售额", "客户", "客户分类"].iter().map(|s| s.to_string()).collect();
+        assert!(!has_residue("本月客户分类销售额", &w2));
     }
 }

@@ -698,6 +698,7 @@ fn rewrite_agg(
             if l.args.len() != 1 {
                 return;
             }
+            let node_name = f.name.0.last().map(|p| p.value.to_lowercase()).unwrap_or_default();
             let col = match &l.args[0] {
                 sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(a)) => {
                     match last_ident(a) {
@@ -705,7 +706,26 @@ fn rewrite_agg(
                         None => return,
                     }
                 }
-                _ => return, // COUNT(*) 不碰
+                // COUNT(*) → 命中「计数类去重指标」时按口径改写为 COUNT(DISTINCT 主键)。
+                // 头表一单一行时两者数值相同，但一旦 JOIN 明细就会按行数虚增——口径以注册表为准。
+                // 仅在恰有一条 count+DISTINCT 规则时改（多指标歧义保守跳过）。
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)
+                    if node_name == "count" =>
+                {
+                    let cnt: Vec<&AggRule> =
+                        rules.iter().filter(|r| r.0 == "count" && r.2).collect();
+                    if let [rule] = cnt[..] {
+                        l.args[0] = sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(
+                                sqlparser::ast::Ident::new(rule.1.clone()),
+                            )),
+                        );
+                        l.duplicate_treatment = Some(DuplicateTreatment::Distinct);
+                        *changed = true;
+                    }
+                    return;
+                }
+                _ => return,
             };
             let Some(rule) = rules.iter().find(|r| r.1 == col) else { return };
             let node_func = f
@@ -841,9 +861,15 @@ mod tests {
     }
 
     #[test]
-    fn agg_count_star_untouched() {
+    fn agg_count_star_follows_metric_caliber() {
+        // 语义变更（回归 E13）：COUNT(*) 命中唯一「计数+去重」指标时按口径归一为 COUNT(DISTINCT 主键)。
+        // 原先一律不碰——头表一单一行时数值虽同，但 JOIN 明细后 COUNT(*) 按行数虚增。
         let rules = vec![("count".into(), "sales_order_code".into(), true)];
-        assert!(normalize_agg("SELECT COUNT(*) FROM t_sales_order", &rules).is_none());
+        let out = normalize_agg("SELECT COUNT(*) FROM t_sales_order", &rules).unwrap();
+        assert!(out.to_uppercase().replace(' ', "").contains("COUNT(DISTINCTSALES_ORDER_CODE)"), "{out}");
+        // 非去重计数规则不触发（COUNT(*) 与 COUNT(col) 在 NULL 上语义不同，不擅改）
+        let plain = vec![("count".into(), "sales_order_code".into(), false)];
+        assert!(normalize_agg("SELECT COUNT(*) FROM t_sales_order", &plain).is_none());
     }
 
     #[test]
@@ -1066,5 +1092,27 @@ mod tests {
                    vec!["deleted_flag = 0", "order_status NOT IN ('0','108','199')"]);
         // 括号内的 and 不切
         assert_eq!(split_top_and("a = 1 AND (b = 2 and c = 3)"), vec!["a = 1", "(b = 2 and c = 3)"]);
+    }
+
+    #[test]
+    fn count_star_normalized_to_distinct() {
+        // 回归 E13：问「售后单数」LLM 写 COUNT(*)，口径要求 COUNT(DISTINCT after_sales_code)。
+        // 头表一单一行时数值相同，但 JOIN 明细后 COUNT(*) 会按行数虚增 → 按注册表口径归一。
+        let rules = vec![("count".to_string(), "after_sales_code".to_string(), true)];
+        let out = normalize_agg("SELECT COUNT(*) FROM t_after_sales_order_header", &rules).unwrap();
+        assert!(out.to_uppercase().replace(' ', "").contains("COUNT(DISTINCTAFTER_SALES_CODE)"), "{out}");
+    }
+
+    #[test]
+    fn count_star_untouched_when_ambiguous() {
+        // 两条计数去重规则 → 不知该用哪个主键，保守不改
+        let rules = vec![
+            ("count".to_string(), "after_sales_code".to_string(), true),
+            ("count".to_string(), "sales_order_code".to_string(), true),
+        ];
+        assert!(normalize_agg("SELECT COUNT(*) FROM t", &rules).is_none());
+        // 无计数去重规则（只有 SUM 类指标）→ 不碰
+        let sum_only = vec![("sum".to_string(), "total_amount".to_string(), false)];
+        assert!(normalize_agg("SELECT COUNT(*) FROM t", &sum_only).is_none());
     }
 }

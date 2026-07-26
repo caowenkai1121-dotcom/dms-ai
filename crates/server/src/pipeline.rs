@@ -54,6 +54,8 @@ impl AskResult {
 
 const MAX_ROWS: usize = 200;
 const EXEC_TIMEOUT_SECS: u64 = 30;
+/// EXPLAIN 只解析不取数，正常亚秒级；超时不判定（跳过预检照常执行）
+const EXPLAIN_TIMEOUT_SECS: u64 = 8;
 
 /// 安全校验：单条 SELECT、无敏感列、无占位符幻觉。
 pub fn is_safe_select(sql: &str) -> anyhow::Result<()> {
@@ -325,6 +327,26 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// 预翻译验证：MySQL `EXPLAIN <SQL>` 只做解析+优化不取数，毫秒级即可暴露
+/// 不存在的列/表、语法错、类型不匹配。比等真执行报错更早、更省生产库。
+/// 只读安全（EXPLAIN SELECT 无副作用；SQL 已经过 is_safe_select 锁定为单条 Query）。
+///
+/// 返回 Some(错误) 仅当**数据库明确判定 SQL 有问题**；超时/连接故障返回 None ——
+/// 优化必须纯增益：网络抖动不该触发一次改写（可能把本来对的 SQL 改坏，还多花一次 LLM）。
+async fn explain_check(mysql: &MySqlPool, sql: &str) -> Option<String> {
+    let stmt = format!("EXPLAIN {sql}");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(EXPLAIN_TIMEOUT_SECS),
+        sqlx::query(&stmt).fetch_all(mysql),
+    )
+    .await
+    {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => e.as_database_error().map(|db| db.message().to_string()),
+        Err(_) => None,
+    }
+}
+
 /// 执行只读 SQL → JSON 表格
 pub async fn execute(mysql: &MySqlPool, sql: &str) -> anyhow::Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
     let rows = tokio::time::timeout(
@@ -594,6 +616,17 @@ async fn ask_single(
             anyhow::bail!("SQL 安全校验未通过: {e}");
         }
         let injected = inject::inject(&candidate, &sets)?;
+        // 预翻译验证（SuperSonic 解析期 dry-run 移植）：EXPLAIN 毫秒级验证列名/语法/类型，
+        // 比等真执行报错更早——大表 SQL 可能扫十几秒才失败，且失败信息一样但白占生产库。
+        // 只对首轮做（第二轮已是 repair 结果，直接执行看真结果）。
+        if attempt == 0 {
+            if let Some(err) = explain_check(mysql, &injected).await {
+                meta::log_correction(pg, "explain-fail", question, &err).await;
+                sql = repair(llm, pg, p, question, &candidate, &err).await?;
+                route = "llm+repair".into();
+                continue;
+            }
+        }
         match execute(mysql, &injected).await {
             Ok((columns, rows)) => {
                 // few-shot 回写：跑通且有结果的问答沉淀为语料（status=pending 待复核）
