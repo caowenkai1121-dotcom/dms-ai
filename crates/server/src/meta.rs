@@ -579,6 +579,30 @@ pub async fn recall_elements(pg: &PgPool, question: &str, limit: usize) -> Vec<(
 async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
     // (table, column, [(name, code)], match_kind)
     const MAPS: &[(&str, &str, &[(&str, &str)], &str)] = &[
+        // 省份=行政区划码（实测 t_customer.province 存 '430000' 这类 6 位码，不是省名）。
+        // 缺这组映射时问「湖南省销售额」LLM 无从下手——实测直接漏掉省份过滤答成全量。
+        ("t_customer", "province",
+         &[("北京", "110000"), ("天津", "120000"), ("河北", "130000"), ("山西", "140000"),
+           ("内蒙古", "150000"), ("辽宁", "210000"), ("吉林", "220000"), ("黑龙江", "230000"),
+           ("上海", "310000"), ("江苏", "320000"), ("浙江", "330000"), ("安徽", "340000"),
+           ("福建", "350000"), ("江西", "360000"), ("山东", "370000"), ("河南", "410000"),
+           ("湖北", "420000"), ("湖南", "430000"), ("广东", "440000"), ("广西", "450000"),
+           ("海南", "460000"), ("重庆", "500000"), ("四川", "510000"), ("贵州", "520000"),
+           ("云南", "530000"), ("西藏", "540000"), ("陕西", "610000"), ("甘肃", "620000"),
+           ("青海", "630000"), ("宁夏", "640000"), ("新疆", "650000"), ("台湾", "710000"),
+           ("香港", "810000"), ("澳门", "820000")], "eq"),
+        // 客户分类（字典 CustClassif，与 meta.dimension customer_class 的 CASE 同源）：
+        // 「线下客户」这类问法必须换成 '04'，否则 LLM 会去猜别的列（实测猜到了 customer_channel）
+        ("t_customer", "customer_class",
+         &[("货架店铺", "01"), ("新媒体店铺", "02"), ("社团店铺", "03"), ("线下客户", "04"),
+           ("内部客户", "05"), ("其他财务专用", "06"), ("外部客户的店铺", "99")], "eq"),
+        // 客户类型（字典 CUST_TYPE）
+        ("t_customer", "customer_type",
+         &[("一般销售客户", "Z001"), ("财务专用客户", "Z002"), ("关联方客户", "Z003"),
+           ("货架店铺", "Z004"), ("客户终端仓", "Z005")], "eq"),
+        // 售后类型（SystemConsant.java L148-149 / AfterSalesServiceImpl L1218-1222；Java 无枚举类）
+        ("t_after_sales_order_header", "after_sales_type",
+         &[("退货", "1"), ("退款", "2"), ("中台售后", "3")], "eq"),
         // InvoiceStatusEnum（pitfall 坐实，真库现存 0/1/2/3/5）
         ("t_invoice_apply_header", "invoice_status",
          &[("未申请", "0"), ("开票申请中", "1"), ("已开票", "2"), ("冲红申请中", "3"),
@@ -958,6 +982,41 @@ async fn seed_dimensions(pg: &PgPool) -> anyhow::Result<()> {
         .await?;
     }
     Ok(())
+}
+
+/// 码值提示：问句里出现的中文值若是某编码列的码名 → 直接告诉 LLM 该列存码及对应码值。
+/// ValueLinker（correct_value）只能在 LLM **已写出** `col='中文名'` 时换码；
+/// 问「湖南省销售额」LLM 压根不知道 province 存的是 '430000'，实测直接漏掉省份过滤答成全量。
+/// 这一层把「值→列→码」在生成前就摆给 LLM，是确定性的（不依赖向量召回）。
+pub async fn recall_value_hints(pg: &PgPool, question: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT table_name, column_name, name, code, match_kind FROM meta.value_map",
+    )
+    .fetch_all(pg)
+    .await?;
+    let matched: Vec<(usize, String)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, name, ..))| name.chars().count() >= 2 && question.contains(name.as_str()))
+        .map(|(i, (_, _, name, ..))| (i, name.clone()))
+        .collect();
+    // 同名多列（如"货架店铺"既是 customer_class 又是 customer_type）全部保留——
+    // 由 LLM 结合问句选列；MapFilter 仅做包含关系净化（"线下客户" 压过 "客户"）
+    let pairs: Vec<(String, String)> = matched
+        .iter()
+        .map(|(i, w)| (format!("{}.{}:{}", rows[*i].0, rows[*i].1, rows[*i].2), w.clone()))
+        .collect();
+    Ok(map_filter(&pairs)
+        .into_iter()
+        .map(|k| {
+            let (t, c, name, code, kind) = &rows[matched[k].0];
+            if kind == "like" {
+                format!("「{name}」在 {t}.{c} 列的码是 '{code}'，该列是逗号组合值，必须用 {c} LIKE '%{code}%'")
+            } else {
+                format!("「{name}」在 {t}.{c} 列存的是编码 '{code}'，过滤必须写 {c} = '{code}'（写中文名必返 0 行）")
+            }
+        })
+        .collect())
 }
 
 /// 列注释 → 干净维度名：截到首个分隔符（中英文冒号/括号/逗号/斜杠/空格）之前。

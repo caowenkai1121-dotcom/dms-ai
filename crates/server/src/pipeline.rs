@@ -276,6 +276,17 @@ pub async fn generate_sql(
         }
         user.push('\n');
     }
+    // 码值提示（SuperSonic value mapping 的生成前置版）：问句里的中文值 → 该列真实码。
+    // ValueLinker 只能事后换码；这一层让 LLM 一开始就知道「湖南=430000」「线下客户=04」，
+    // 避免它漏写过滤或猜到别的列（实测猜过 customer_channel）。
+    let value_hints = meta::recall_value_hints(pg, question).await.unwrap_or_default();
+    if !value_hints.is_empty() {
+        user.push_str("## 取值编码（问句里的这些词是编码列的值名，过滤必须用码，不能写中文名）\n");
+        for v in &value_hints {
+            user.push_str(&format!("- {v}\n"));
+        }
+        user.push('\n');
+    }
     // 元素向量召回（移植 SuperSonic SchemaMapper）——语义近邻补充，与上方命中去重
     if !elems.is_empty() {
         user.push_str("## 语义召回元素（向量近邻命中，按此口径/含义理解）\n");

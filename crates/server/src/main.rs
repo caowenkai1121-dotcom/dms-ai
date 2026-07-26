@@ -260,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sso", post(api_sso))
         .route("/api/wework/login", get(api_wework_login))
         .route("/api/ask", post(api_ask))
+        .route("/api/roles", get(api_roles))
         .route("/api/convs", get(api_convs))
         .route("/api/conv/new", post(api_conv_new))
         .route("/api/conv/{id}", get(api_conv_msgs).delete(api_conv_delete))
@@ -374,6 +375,19 @@ async fn api_ask(
 #[derive(serde::Deserialize)]
 struct ConvQuery {
     login_name: Option<String>,
+}
+
+/// 可选角色列表：多角色账号必须显式选角色（1:1 对齐 DMS「请选择登录角色」，
+/// 不替用户默认选——不同角色数据权限档差异巨大）
+async fn api_roles(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ConvQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (login, active) = resolve_identity(&headers, &q.login_name, &None)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "未认证" }))))?;
+    let roles = principal::list_roles(&st.mysql, &login).await.unwrap_or_default();
+    Ok(Json(serde_json::json!({ "roles": roles, "active": active })))
 }
 
 async fn api_convs(

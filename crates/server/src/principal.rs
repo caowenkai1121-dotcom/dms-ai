@@ -15,7 +15,14 @@ pub struct Principal {
     pub role_code: String,
 }
 
-/// 按登录名加载员工与激活角色。role_code=None 时取该员工第一个角色（role_id 升序）。
+/// 按登录名加载员工与激活角色。
+///
+/// 🔴 role_code=None 的语义 1:1 对齐 Java `DataScope.getCurrentRole`：
+/// 该方法从登录会话取 roleCode，**取不到就抛「请选择登录角色」——DMS 绝不替用户默认选角色**。
+/// 我们原先「取 role_id 最小的一个」是自造语义：多角色用户（如 tanlibo 同时有 admin 与
+/// city_manager）不传 role_code 时会被静默授予 admin 的**全量数据权限**（实测 unrestricted=true），
+/// 而同一账号选 city_manager 只能看 27 家客户——这是三端（SSO/企微）不传角色时的越权面。
+/// 现在：多角色必须显式指定（错误信息列出可选角色）；单角色无歧义则沿用该角色。
 /// 无任何角色 → Err（fail-closed，对齐 Java「角色未正确设定」抛错行为）。
 pub async fn load_principal(
     mysql: &MySqlPool,
@@ -49,10 +56,14 @@ pub async fn load_principal(
             .find(|(_, c)| c.trim() == rc)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("该账号无角色 {rc}"))?,
-        None => match roles.first().cloned() {
-            Some(r) => r,
-            None if administrator_flag => (0, "admin".into()),
-            None => anyhow::bail!("该账号无任何角色（fail-closed 拒绝）"),
+        None => match roles.len() {
+            1 => roles[0].clone(),
+            0 if administrator_flag => (0, "admin".into()),
+            0 => anyhow::bail!("该账号无任何角色（fail-closed 拒绝）"),
+            _ => anyhow::bail!(
+                "请选择登录角色（该账号有多个角色，权限档不同，不能替你默认选）：{}",
+                roles.iter().map(|(_, c)| c.trim()).collect::<Vec<_>>().join(" / ")
+            ),
         },
     };
 
@@ -65,4 +76,18 @@ pub async fn load_principal(
         role_id,
         role_code: role_code.trim().to_string(),
     })
+}
+
+/// 该账号的可选角色列表（多角色时前端/三端据此让用户选，对齐 DMS 登录选角色）
+pub async fn list_roles(mysql: &MySqlPool, login_name: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT r.role_code FROM t_employee e
+         JOIN t_role_employee re ON re.employee_id = e.employee_id
+         JOIN t_role r ON r.role_id = re.role_id
+         WHERE e.login_name = ? AND e.deleted_flag = 0 ORDER BY r.role_id",
+    )
+    .bind(login_name)
+    .fetch_all(mysql)
+    .await?;
+    Ok(rows.into_iter().map(|(c,)| c.trim().to_string()).collect())
 }
