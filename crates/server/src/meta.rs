@@ -537,8 +537,9 @@ async fn seed_pitfalls(pg: &PgPool) -> anyhow::Result<()> {
           全量 SUM(refund_amount) 与 SUM(actual_refund_amount) 差 0.002%，但『仅完成单』口径与全量差约 1.2%——\
           注册表现行口径为不按状态过滤，问『实际退了多少』才筛状态"),
         ("t_after_sales_order_header",
-         "return_reason='中台作废' 有 23790 条，与 after_sales_type='3'(中台售后) 高度重合；\
-          现行『售后单数/退款额』口径不剔除中台单，若用户语义是真实客户售后需显式说明该差异"),
+         "after_sales_type：1退货 2退款 3中台售后。【默认口径：售后单数/退款额一律不加 after_sales_type 过滤】\
+          （中台售后 23843 单也是真实售后单）；只有用户明确说『退货类/退款类/剔除中台』时才加对应条件。\
+          切勿自作主张写 after_sales_type != '3'——那会漏算约 72% 的售后单"),
         ("t_customer",
          "province 存 6 位行政区划码（430000=湖南 410000=河南 440000=广东…）不是省名：\
           按省过滤必须用码，展示时再翻名；空串归'未知'"),

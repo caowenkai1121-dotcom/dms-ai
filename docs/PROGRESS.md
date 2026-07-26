@@ -224,6 +224,25 @@
 - 顺带修 2 个只验过 cargo check 的历史坏单测：viewspec「订单数」被 Semantic::Order 抢先判定永不算指标列（Count 前移，M6z 分组柱/双序列因此失效）；direct::strip_annotations 不剥 ASCII 中文括注（`t_sales_order_detail(JOIN ...)` 基表名带尾巴 → 组合器恒 None，M8d 两测挂）。
 - 验收：单测 **89/89 全绿**（+7 inject 新测：fail-closed 拒绝/超管放行/via EXISTS 三断言/头表在场跳过/CTE 豁免/物流 via）。
 
+## M9h/M9i 口径教训种子 + 规则时间解析（2026-07-26，第 3 期开工）
+- **口径教训种子** `meta::seed_pitfalls`（8 条，连库实测坐实直接 active）+ 表警告 3 条，
+  来自六域并行作题 workflow 的 33 条疑点：赠品用 item_type 勿用 is_gift（冲突 537+2591 行）、
+  商品排行分组键歧义（按码/按名冠军不同）、费用分组必须用 expense_item_name、province 存行政区划码等。
+- **⚠️ 立刻被评测抓到的自伤**：新种的「中台售后」教训措辞含"若用户语义是真实客户售后需显式说明"，
+  LLM 读后**主动加了 `after_sales_type != '3'`**，售后单数 1176→329（漏 72%）。
+  教训：**pitfall 措辞会直接改写 LLM 行为，必须先写死默认口径再讲例外**；已改为
+  「默认一律不加 after_sales_type 过滤；只有用户明确说退货类/剔除中台才加」。
+- **规则时间解析** `direct::time_predicate`（移植 SuperSonic TimeRangeParser）：
+  原 `time_window` 只认 6 种相对词且列名硬编码 order_time → 现产出**列名占位 `{}` 的谓词模板**，
+  覆盖 近/过去/最近 N 天|周|月|年（中文数字 三/十/十五/两）、第N季度·本/上季度、上下半年、
+  N月份（含十二月且不误吃"上个月"）、今天·昨天·前天·本/上周·本/上月·今年·去年；
+  解析结果注入 prompt「时间范围」段——LLM 不再自己拼日期函数。
+- 评测工具加固：连库抖动重试（10054/10060 退避 3 次）+ 题间 2s 节流
+  （38 题连跑把远程 MySQL 打到拒连，14 题假失败）；`cell()` 归一剥 %/千分位/货币符。
+- 判定不做并记录理由：aho-corasick 精确词典层（需新增依赖违反项目红线，且元素不足 150 个
+  substring+MapFilter 已够）；MySQL 方言归一（蓝图基于"目标库是 PG"的误解，我们本就查 MySQL）。
+- 验收：单测 157/157。
+
 ## M9f 回归失败清单驱动的三修 + EXPLAIN 预检（2026-07-26，回归 48/54 逐条定位）
 - 先修**回归脚本自身的假红**：红线判定用子串匹配，`deleted_flag` 被判 delete、`created_time` 被判 update
   → H01-H03 长期假失败（与 M9b 修的 Rust 侧同款 bug）。改 token 化判定 + 复核首 token 必为 select/with。
