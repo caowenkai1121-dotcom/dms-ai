@@ -304,6 +304,10 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
         ("t_marketing_zone_product", "【⚠️营销专区商品配置表(仅十几行,start_time 常空)，不是商品上架记录！『新上架/新品』用 t_goods：on_sale=1(上架中)+created_time 近N天(近似新上架时间)】"),
         ("t_new_market_product", "【⚠️运营位配置表(人工挑选的展示清单)，不是商品上架记录！『新上架/新品的销售表现』用 t_goods：on_sale=1+created_time 近N天 为新品集，再 JOIN 订单明细算销售】"),
         ("t_customer_price", "【⚠️每行=一个客户×商品的现行价目档，本库【无价格变更历史】：『调整/变更次数』不可算。goods_name 带『重复-』前缀是人工标记脏档宜排除；price=9999 哨兵必须排除】"),
+        // ── 以下来自 2026-07-26 六域并行作题 workflow 的连库实测疑点 ──
+        ("t_activity_promoter_fee", "【⚠️person_type 已退化(3828 行空串+2036 行 NULL，仅 7 行有码)，按人员类型统计临促费用不可行；is_expense 列注释称『1是0否』但全表【全 NULL】，按它过滤必得 0 行假结论。时间列 start_date 与 created_time 在年粒度差异<0.02%】"),
+        ("t_master_shop", "【⚠️门店维度在本库基本不可用：t_sales_order.shop_name 20.6 万单中 20.5 万单为空(仅约 1000 单有值/419 个门店)，按门店分组的经营分析无意义，应向用户说明而非答出稀疏结果】"),
+        ("t_invoice_apply_header", "【⚠️发票双流并行且【两表都在持续写入】：老表 IO* 单今年 1925 单 7612 万 > 新表 t_invoice_new_apply_header SQ* 单 826 单 6986 万，交集为 0。问全量开票必须 UNION ALL 两表(只查一张漏 52%)；时间列用 apply_time——invoice_time 全表【全 NULL】】"),
     ];
     for (t, w) in WARNS {
         sqlx::query("UPDATE meta.table_doc SET warn = $2 WHERE table_name = $1")
@@ -347,6 +351,7 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
     seed_value_maps(pg).await?;
     seed_join_edges(pg).await?;
     seed_table_scopes(pg).await?;
+    seed_pitfalls(pg).await?;
     seed_terms(pg).await?;
     sync_elements(pg).await?;
     Ok(())
@@ -505,6 +510,51 @@ pub async fn log_failure(pg: &PgPool, kind: &str, question: &str, sql: &str, err
         .bind(error.chars().take(500).collect::<String>())
         .execute(pg)
         .await;
+}
+
+/// 口径教训种子（幂等）：连库实测坐实的坑，直接 active 参与召回。
+/// 与 save_lesson_candidate（复盘产物，需复核）区分——这些是人工/workflow 已验证的。
+async fn seed_pitfalls(pg: &PgPool) -> anyhow::Result<()> {
+    // (触发表, 教训)
+    const LESSONS: &[(&str, &str)] = &[
+        ("t_sales_order_detail",
+         "筛赠品/正品一律用 item_type（1正品 2赠品 3结算行，SystemConsant.java L38-39 权威）；\
+          is_gift 列与之冲突（item_type='1' 但 is_gift=1 有 537 行，item_type='2' 但 is_gift=0 有 2591 行），勿用 is_gift"),
+        ("t_sales_order_detail",
+         "商品排行必须先定分组键：真库 sku_code 344 个 / sku_name 427 个 /(code,name) 组合 488（一码多名与一名多码并存），\
+          按名分组冠军是蛋挞液、按码分组冠军是原味烤肠——答案完全不同。默认按 sku_name 分组并在结论里注明口径"),
+        ("t_sales_order_detail",
+         "明细 2x 重复行集中在【非有效订单】的明细上：JOIN 有效订单后重复率<0.01%，整表 item_type='1' 则 100.7万→83.2万(21%)。\
+          即『必须 JOIN t_sales_order 并筛有效订单』比 DISTINCT 更关键，两者都要有"),
+        ("t_market_total_expense",
+         "费用按项目分组必须用 expense_item_name（名称），不能用 expense_item（编码）——两列全库 48673 行取值 100% 不同；\
+          本表现库 item_type 全为 '0' 无合计行，不必额外筛"),
+        ("t_activity_main",
+         "活动时间列有歧义：created_time 集中在 2026-05~07，start_date 跨 2026-04~08（含未来日期）。\
+          问『某月办了几场活动』须先明确按创建时间还是按活动开始时间，默认用 created_time 并注明"),
+        ("t_after_sales_order_header",
+         "退款额口径：actual_refund_amount 仅在 after_sales_status IN ('4','5') 时有值（其余为 0）。\
+          全量 SUM(refund_amount) 与 SUM(actual_refund_amount) 差 0.002%，但『仅完成单』口径与全量差约 1.2%——\
+          注册表现行口径为不按状态过滤，问『实际退了多少』才筛状态"),
+        ("t_after_sales_order_header",
+         "return_reason='中台作废' 有 23790 条，与 after_sales_type='3'(中台售后) 高度重合；\
+          现行『售后单数/退款额』口径不剔除中台单，若用户语义是真实客户售后需显式说明该差异"),
+        ("t_customer",
+         "province 存 6 位行政区划码（430000=湖南 410000=河南 440000=广东…）不是省名：\
+          按省过滤必须用码，展示时再翻名；空串归'未知'"),
+    ];
+    for (t, lesson) in LESSONS {
+        sqlx::query(
+            "INSERT INTO meta.pitfall(kind, trigger_words, lesson, status)
+             SELECT 'pitfall', $1, $2, 'active'
+             WHERE NOT EXISTS (SELECT 1 FROM meta.pitfall WHERE trigger_words = $1 AND lesson = $2)",
+        )
+        .bind(t)
+        .bind(lesson)
+        .execute(pg)
+        .await?;
+    }
+    Ok(())
 }
 
 /// 存候选教训（复盘产物）：status='candidate' 不参与召回，复核启用后生效；同 trigger+lesson 去重

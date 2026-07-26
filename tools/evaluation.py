@@ -15,7 +15,24 @@ CASES = json.loads((ROOT / "tools" / "eval_cases.json").read_text(encoding="utf-
 FLOAT_TOL = 0.005  # 相对容差 0.5%：DECIMAL 舍入与 ROUND 位数差异不算错
 
 
-def run(args):
+TRANSIENT = ("error communicating with database", "os error 10054", "os error 10060",
+             "pool timed out", "Connection reset")
+
+
+def run(args, tries=3):
+    # 连库抖动重试：批量评测会把远程 MySQL 打到拒连（实测 38 题跑到一半全线 10054），
+    # 这类失败与 SQL 对错无关，退避重试而非记为失败。
+    for attempt in range(tries):
+        out = _run_once(args)
+        err = out.get("error", "")
+        if err and any(t in err for t in TRANSIENT) and attempt < tries - 1:
+            time.sleep(5 * (attempt + 1))
+            continue
+        return out
+    return out
+
+
+def _run_once(args):
     r = subprocess.run([str(EXE), *args], capture_output=True, text=True,
                        encoding="utf-8", cwd=str(ROOT))
     if r.returncode != 0:
@@ -44,12 +61,14 @@ def exec_gold(c):
 
 
 def cell(v):
-    """单元格归一：数字按浮点比，其余按去空白字符串比"""
+    """单元格归一：数字按浮点比，其余按去空白字符串比。
+    百分比/千分位/货币符号只是呈现差异（'95.81%' 与 95.81 是同一答案），统一剥掉再比。"""
     if v is None:
         return None
     s = str(v).strip()
+    body = s.rstrip("%").replace(",", "").lstrip("¥$")
     try:
-        return float(s.replace(",", ""))
+        return float(body)
     except ValueError:
         return s
 
@@ -88,6 +107,7 @@ def main():
     for c in CASES:
         if flt and flt not in c["name"]:
             continue
+        time.sleep(2)   # 题间节流：连续 30+ 题猛打远程 MySQL 会把它打到拒连（实测 os error 10054）
         t0 = time.time()
         got = ask(c)
         ms = int((time.time() - t0) * 1000)
