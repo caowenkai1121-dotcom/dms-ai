@@ -64,22 +64,31 @@ pub fn is_safe_select(sql: &str) -> anyhow::Result<()> {
     if !matches!(stmts[0], Statement::Query(_)) {
         anyhow::bail!("只允许 SELECT");
     }
-    let lower = sql.to_lowercase();
-    // 🔴 只读红线（移植 deepagents text-to-sql-agent 硬拦范式）：AST 之外的显式第二道防线。
-    // DMS 生产库只读是铁律——DML/DDL 一律拦（尾空格避免误伤 deleted_flag/created_time/updated_time）。
+    // MySQL 可执行注释（/*! */、/*+ */）会被 sqlparser 当注释忽略但 MySQL 照跑——直接拒
+    if sql.contains("/*!") || sql.contains("/*+") {
+        anyhow::bail!("只读红线：禁止可执行注释");
+    }
+    // 🔴 只读红线（移植 deepagents text-to-sql-agent 硬拦范式）：AST 已锁 Query，
+    // 此处是防 parser 盲区的第二道防线。剥掉字符串字面量与注释后按词边界扫——
+    // 不误伤 remark LIKE '%update %' 类字面量，也不漏 "delete\nfrom" 换行形态；
+    // update_time/deleted_flag 等带下划线列名是独立 token 不受影响。
+    // 注：REPLACE 不入列（REPLACE() 是合法字符串函数；REPLACE INTO 语句已被 AST 层拒）。
+    let stripped = strip_literals_and_comments(sql).to_lowercase();
     const FORBIDDEN: &[&str] = &[
-        "insert ", "update ", "delete ", "drop ", "alter ", "truncate ",
-        "create ", "replace ", "merge ", "grant ", "revoke ", "into outfile", "into dumpfile",
+        "insert", "update", "delete", "drop", "alter", "truncate",
+        "create", "merge", "grant", "revoke", "outfile", "dumpfile",
     ];
-    for kw in FORBIDDEN {
-        if lower.contains(kw) {
-            anyhow::bail!("只读红线：禁止写操作 [{}]", kw.trim());
+    for tok in stripped.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        if FORBIDDEN.contains(&tok) {
+            anyhow::bail!("只读红线：禁止写操作 [{tok}]");
         }
     }
-    if lower.contains("login_pwd") || lower.contains("password") {
+    if stripped.contains("login_pwd") || stripped.contains("password") {
         anyhow::bail!("SQL 含敏感列");
     }
     // 占位符幻觉防线（旧项目实证：LLM 会编 '__ORDER_CODE__'/'xxx_PLACEHOLDER' 恒空自信答 0）
+    // 注意：占位符藏在字面量里，须查原文而非 stripped
+    let lower = sql.to_lowercase();
     if lower.contains("__") && lower.contains("'") {
         for frag in sql.split('\'') {
             if frag.starts_with("__") && frag.ends_with("__") {
@@ -103,9 +112,71 @@ fn cell_num(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
+/// 词法剥离：去掉字符串字面量（'…'/"…"，支持 \ 转义与 '' 重复转义）与注释（--、#、/* */）。
+/// 安全关键词扫描专用——字面量里的敏感词不再干扰判定。
+fn strip_literals_and_comments(sql: &str) -> String {
+    let b: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            q @ ('\'' | '"') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            '-' if i + 1 < b.len() && b[i + 1] == '-' => {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '#' => {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < b.len() && b[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                out.push(' ');
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn ensure_limit(sql: &str) -> String {
-    let upper = sql.to_uppercase();
-    if upper.contains("LIMIT") {
+    // AST 判定是否已有 LIMIT/FETCH——字面量含 "limit" 不再误判为已限流（漏判=无界扫描）
+    let has_limit = Parser::parse_sql(&MySqlDialect {}, sql)
+        .ok()
+        .and_then(|stmts| stmts.into_iter().next())
+        .map(|s| match s {
+            Statement::Query(q) => q.limit.is_some() || q.fetch.is_some(),
+            _ => true,
+        })
+        .unwrap_or_else(|| sql.to_uppercase().contains("LIMIT"));
+    if has_limit {
         return sql.to_string();
     }
     format!("{} LIMIT {}", sql.trim().trim_end_matches(';'), MAX_ROWS)
@@ -856,6 +927,34 @@ mod tests {
     fn limit_appended() {
         assert!(ensure_limit("SELECT * FROM t").ends_with("LIMIT 200"));
         assert_eq!(ensure_limit("SELECT * FROM t LIMIT 5"), "SELECT * FROM t LIMIT 5");
+    }
+
+    #[test]
+    fn literal_keywords_not_blocked() {
+        // 字面量里的敏感词不误拦（AST 化后旧子串扫描的误伤修复）
+        assert!(is_safe_select("SELECT * FROM t WHERE remark LIKE '%update %'").is_ok());
+        assert!(is_safe_select("SELECT * FROM t WHERE note = 'please delete me'").is_ok());
+        // REPLACE() 字符串函数合法（REPLACE INTO 语句被 AST 层拒）
+        assert!(is_safe_select("SELECT REPLACE(name, 'a', 'b') FROM t").is_ok());
+    }
+
+    #[test]
+    fn executable_comment_rejected() {
+        assert!(is_safe_select("SELECT /*! 1 */ a FROM t").is_err());
+        assert!(is_safe_select("SELECT /*+ hint */ a FROM t").is_err());
+    }
+
+    #[test]
+    fn limit_literal_not_fooled() {
+        // 字面量含 "limit" 不算已限流——必须仍追加 LIMIT（漏判=无界扫描）
+        assert!(ensure_limit("SELECT * FROM t WHERE remark = 'limit'").ends_with("LIMIT 200"));
+    }
+
+    #[test]
+    fn strip_literals_basics() {
+        assert_eq!(strip_literals_and_comments("a 'x''y' b"), "a   b");
+        assert_eq!(strip_literals_and_comments("a -- drop t\nb"), "a \nb");
+        assert_eq!(strip_literals_and_comments("a /* delete */ b"), "a   b");
     }
 
     #[test]
