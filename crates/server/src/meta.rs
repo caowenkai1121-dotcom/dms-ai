@@ -109,6 +109,16 @@ CREATE TABLE IF NOT EXISTS meta.correction_log(
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_correction_kind ON meta.correction_log(kind, created_at);
+-- 失败复盘日志（自进化引擎C）：执行报错/超时/0行 记录，报错类由 LLM 复盘产出候选教训
+CREATE TABLE IF NOT EXISTS meta.failure_log(
+  id bigserial PRIMARY KEY,
+  kind text NOT NULL,        -- exec-error / zero-rows
+  question text NOT NULL,
+  sql text NOT NULL DEFAULT '',
+  error text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_failure_kind ON meta.failure_log(kind, created_at);
 -- JOIN 边注册表（SuperSonic JoinPath 思想）：表间可连接边+基数，组合器跨基表路径推导用
 CREATE TABLE IF NOT EXISTS meta.join_edge(
   left_table text NOT NULL,
@@ -119,6 +129,18 @@ CREATE TABLE IF NOT EXISTS meta.join_edge(
   note text NOT NULL DEFAULT '',
   status text NOT NULL DEFAULT 'active',
   PRIMARY KEY(left_table, left_col, right_table, right_col)
+);
+-- 表权限档案（fail-closed）：scoped=注入条件 / global=Java 无 @DataScope 审定全量可见 / via=独查借头表条件
+CREATE TABLE IF NOT EXISTS meta.scope_binding(
+  table_name text PRIMARY KEY,
+  mode text NOT NULL DEFAULT 'scoped',
+  customer_col text,
+  owner_col text,
+  owner_kind text,          -- ids | codes
+  via_table text,
+  via_local_col text,
+  via_remote_col text,
+  note text NOT NULL DEFAULT ''
 );
 "#;
     for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -439,6 +461,53 @@ pub async fn log_correction(pg: &PgPool, kind: &str, question: &str, detail: &st
         .bind(detail.chars().take(500).collect::<String>())
         .execute(pg)
         .await;
+}
+
+/// 失败记录（引擎 C）：执行报错/0 行落日志，报错类供 LLM 复盘产出候选教训
+pub async fn log_failure(pg: &PgPool, kind: &str, question: &str, sql: &str, error: &str) {
+    let _ = sqlx::query("INSERT INTO meta.failure_log(kind, question, sql, error) VALUES ($1,$2,$3,$4)")
+        .bind(kind)
+        .bind(question.chars().take(200).collect::<String>())
+        .bind(sql.chars().take(2000).collect::<String>())
+        .bind(error.chars().take(500).collect::<String>())
+        .execute(pg)
+        .await;
+}
+
+/// 存候选教训（复盘产物）：status='candidate' 不参与召回，复核启用后生效；同 trigger+lesson 去重
+pub async fn save_lesson_candidate(pg: &PgPool, trigger_tables: &str, lesson: &str) -> bool {
+    sqlx::query(
+        "INSERT INTO meta.pitfall(kind, trigger_words, lesson, status)
+         SELECT 'pitfall', $1, $2, 'candidate'
+         WHERE NOT EXISTS (SELECT 1 FROM meta.pitfall WHERE trigger_words = $1 AND lesson = $2)",
+    )
+    .bind(trigger_tables)
+    .bind(lesson)
+    .execute(pg)
+    .await
+    .map(|r| r.rows_affected() > 0)
+    .unwrap_or(false)
+}
+
+/// 从 SQL 提取物理表名（复盘教训的锚定触发词）
+pub fn extract_tables(sql: &str) -> String {
+    let mut tabs: Vec<String> = vec![];
+    let mut cur = String::new();
+    let push = |cur: &str, tabs: &mut Vec<String>| {
+        if cur.starts_with("t_") && cur.len() > 2 && cur.len() < 60 && !tabs.contains(&cur.to_string()) {
+            tabs.push(cur.to_string());
+        }
+    };
+    for c in sql.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else {
+            push(&cur, &mut tabs);
+            cur.clear();
+        }
+    }
+    push(&cur, &mut tabs);
+    tabs.join(",")
 }
 
 /// 元素级向量召回（移植 SuperSonic SchemaMapper）：问句 embed → ANN 近邻元素。

@@ -1,0 +1,223 @@
+{
+ "summary": "SuperSonic 问答链路是双层架构：chat-server 层（ChatQueryParser→ParseResultProcessor→ChatQueryExecutor→ExecuteResultProcessor，SPI 顺序由 launchers/standalone/resources/META-INF/spring.factories 决定）编排 Agent/插件/多轮/记忆；headless-chat 层由 ChatWorkflowEngine 状态机驱动 MAPPING→PARSING→S2SQL_CORRECTING→TRANSLATING→PHYSICAL_SQL_CORRECTING。映射有 6 个 Mapper（向量/HanLP双Trie+数据库LIKE/过滤器/分区时间/术语/全字段兜底），配合 MapModeEnum 四档递进重试与 MapFilter 净化；解析是 LLM(few-shot召回+self-consistency投票+失败升温重试) 与规则(元素共现 QueryMatcher) 双轨；修正是 8 个 Corrector 按序管道；翻译层把 S2SQL 名称换 bizName 并推导 ontology join。记忆闭环为 执行成功→PENDING→LLM/人工复核→写入向量库→few-shot 复用。dms-ai 已移植主干，缺口集中在：递进映射调度、规则双轨兜底、映射净化、SC投票、Corrector 细节（时间兜底/Select补全/Having/Where值换码）、联想搜索与插件体系。",
+ "mechanisms": [
+  {
+   "name": "MapMode四档递进映射调度与全字段兜底",
+   "source_files": [
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/parser/NL2SQLParser.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/AllFieldMapper.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/BaseMatchStrategy.java"
+   ],
+   "how_it_works": "NL2SQLParser.parse 对每个数据集先用 Text2SQLType.ONLY_RULE 依次跑 MapModeEnum.STRICT、MODERATE 两档映射解析；两档都无结果才降级 LOOSE；LLM 阶段失败后再用 MapModeEnum.ALL 触发 AllFieldMapper 把数据集全部指标维度以 similarity=0.1 塞入 mapInfo 重试。阈值动态化在 BaseMatchStrategy.getThreshold：STRICT 恒为 1.0（只认全匹配），否则 threshold - mode*((threshold-minThreshold)/4) 且不低于 minThreshold。EmbeddingMapper.accept 只在 LOOSE 或 LLM_OR_RULE 时生效（向量召回只作兜底）。每个数据集取排序后 top1 parse，最终按 SemanticParseInfo.sort 汇总取 PARSER_SHOW_COUNT=3 条。",
+   "dms_status": "missing",
+   "value": "直击『准确』：先严后宽避免宽松映射污染高置信结果，也给『快』留了短路（严格档命中即停）；ALL 兜底保证 LLM 总有 schema 可用不至于空手而归。",
+   "migration_sketch": "在 Rust 侧把 mapper 管道参数化为 MapMode 枚举（strict/moderate/loose/all），axum handler 里写一个循环：strict+moderate 先跑（纯规则、无 LLM），空则 loose（触发向量召回），LLM 解析失败再 all（全量 schema 注入 prompt）。阈值公式直接照抄 getThreshold。",
+   "effort": "M"
+  },
+  {
+   "name": "KeywordMapper 双策略词典映射（HanLP双Trie滑窗 + 数据库名称编辑距离）",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/KeywordMapper.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/HanlpDictMatchStrategy.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/SingleMatchStrategy.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/knowledge/SearchService.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/DatabaseMatchStrategy.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/knowledge/helper/NatureHelper.java"
+   ],
+   "how_it_works": "策略一 HanlpDictMatchStrategy：SingleMatchStrategy.detect 以 HanLP 分词 offset 为步长做双层滑窗切出 detectSegment 并发探测；每段走 SearchService 的前缀 BinTrie + 反转后缀 Trie（suffixSearch 把词反转建树），相似度=EditDistanceUtils 编辑距离，按相似度降序+词长降序去重，维度值单独限额 MAPPER_DIMENSION_VALUE_SIZE=1、总量 MAPPER_DETECTION_SIZE=8；名称阈值0.3/维度值0.5。词性(nature)编码为 `_modelId_elementId[_metric|_dimension|后缀]`，NatureHelper.changeModel2DataSet 把 model 级词典映射到多个 dataset。KeywordMapper.doDimValueAliasLogic 再把维度值别名经 KnowledgeBaseService.getDimValueAlias 与 SchemaValueMap(bizName/alias→techName) 双重换码。策略二 DatabaseMatchStrategy：对全部指标维度名做 name.contains(detectSegment)+编辑距离过滤，且当 mapInfo 尚无任何命中时阈值自动减半（0.3→0.15）放宽兜底。",
+   "dms_status": "partial",
+   "value": "这是 SuperSonic『准确』的地基：零 LLM 成本的确定性映射，比纯向量召回精确得多；dms-ai 的 ValueLinker/维度注册表只覆盖了值换码，缺前后缀 Trie、滑窗、双阈值与 contains 兜底。",
+   "migration_sketch": "Rust 无 HanLP，用 jieba-rs 分词 + 自建 fst/trie（前缀树 crate 或 BTreeMap range 扫描）实现 prefix/suffix 检索；nature 编码可简化为 (dataset_id, element_id, kind) 三元组存 payload。编辑距离用 strsim。DatabaseMatch 直接在 PG 注册表上 ILIKE + strsim 阈值减半逻辑。",
+   "effort": "L"
+  },
+  {
+   "name": "MapFilter 映射结果净化规则集",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/MapFilter.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/BaseMapper.java"
+   ],
+   "how_it_works": "每个 Mapper.doMap 后强制执行 MapFilter.filter：①filterByDataSetId 剔除请求范围外数据集；②filterByDetectWordLenLessThanOne 删除探测词≤1字的命中（llmMatched 豁免）；③twoCharactersMustEqual 要求≤2字的词必须 similarity=1 全匹配；④filterByExactMatch 同一 detectWord 分组内若存在满分命中则丢弃所有非满分；⑤filterInExactMatch 满分词之间若互相包含（如“订单量”包含“订单”）只保留最长词。另外 BaseMapper.addToSchemaMap 对同元素同词去重时保留相似度更高的一条（VALUE 类型还要求 word 相等才算重复）。",
+   "dms_status": "missing",
+   "value": "dms-ai 已有 EmbeddingMapper 向量召回，但缺这层净化会把短词、包含词、低分噪声直接送进 prompt，是『准确』最廉价的提升点。",
+   "migration_sketch": "在 Rust 映射结果聚合处加一个纯函数 pipeline：Vec<ElementMatch> 依次过 5 条规则（HashMap 分组即可），单元测试对照 Java 语义。工作量小、收益直接。",
+   "effort": "S"
+  },
+  {
+   "name": "EmbeddingMatchStrategy 完整版细节（批量/阈值豁免/LLM二筛）",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/EmbeddingMatchStrategy.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/MapperConfig.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/BatchMatchStrategy.java"
+   ],
+   "how_it_works": "detectByBatch 把滑窗文本片段按 EMBEDDING_MAPPER_BATCH=50 分批并发检索，每文本取 top5，关键细节：阈值0.9过滤时若 result.getQuery().contains(retrieval.getQuery())（召回词是原句子串）则豁免阈值；每批限量 roundNumber*片段数。可选 EMBEDDING_MAPPER_USE_LLM：先用 HanLP 词性过滤（v/d/a 等词性剔除）取有效片段，召回后把 {userText, retrievedInfo} 塞进 LLM_FILTER_PROMPT 让大模型返回相关 id 数组做二次筛选，命中的标 llmMatched=true（后续 MapFilter 豁免其长度限制）。",
+   "dms_status": "partial",
+   "value": "dms-ai 已有 EmbeddingMapper，但『子串豁免阈值』『LLM 二筛+llmMatched 豁免』这两个细节直接影响召回率/精确率平衡。",
+   "migration_sketch": "pgvector 检索后在 Rust 侧补 contains 豁免逻辑；LLM 二筛做成可配置开关（默认关，控成本），prompt 照抄 LLM_FILTER_PROMPT 并复用 dms 现有模型配置。",
+   "effort": "S"
+  },
+  {
+   "name": "规则解析器族：QueryMatcher 元素共现 + 数据集启发式路由 + 查询类型判定",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/query/rule/RuleSemanticQuery.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/query/rule/QueryMatcher.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/query/rule/metric/MetricTopNQuery.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/HeuristicDataSetResolver.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/QueryTypeParser.java"
+   ],
+   "how_it_works": "每种查询模式（MetricModel/MetricFilter/MetricGroupBy/MetricTopN(正则'最大|最高|最多')/DetailDimension/DetailValue…）注册一个 QueryMatcher，声明各 SchemaElementType 的 REQUIRED/OPTIONAL/UNUSED 与 AT_LEAST/AT_MOST 数量约束；RuleSemanticQuery.resolve 用候选元素共现矩阵匹配出所有可行模式，fillParseInfo 把 VALUE 归并成维度过滤器（单值EQUALS/多值IN），score=Σ各类型最高相似度×探测词长。多数据集时 HeuristicDataSetResolver 按 maxDatasetSimilarity→maxMetricSimilarity→totalSimilarity→maxMetricUseCnt 四级比较选唯一数据集。QueryTypeParser 以『SQL含聚合函数』判 AGGREGATE/DETAIL（dms 的 getMsgContentType 图表决策依赖此语义）。规则产物经 buildS2Sql 转成结构化请求再生成 SQL，与 LLM 产物同台按 score 竞争。",
+   "dms_status": "missing",
+   "value": "LLM 不可用/超时时的零成本降级路径，同时是『快』的短路径：简单问题（一个指标+一个维度值）根本不用调 LLM。",
+   "migration_sketch": "dms-ai 可做精简版：只实现 3 种模式（指标趋势/指标过滤/明细），用 Rust enum + 匹配函数表达共现约束；score 竞争与 LLM 结果合并复用现有 parse 候选结构。数据集路由 dms 单库场景可映射为『主题域路由』。",
+   "effort": "L"
+  },
+  {
+   "name": "规则时间解析与聚合词识别（TimeRangeParser/AggregateTypeParser）",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/rule/TimeRangeParser.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/rule/AggregateTypeParser.java"
+   ],
+   "how_it_works": "TimeRangeParser 三级 fallback：①RECENT_PATTERN_CN 正则匹配『近/过去N(个)天|周|月|年』，中文数字用 zhNumParse 栈算法（一二三…十百千万亿）解析；②\\b\\d{8}\\b 匹配 yyyyMMdd 且支持两个日期构成区间；③xkzhangsan TimeNLPUtil 兜底解析『上个月』『今年』等自然语言时间。解析出 DateConf(BETWEEN,start,end,detectWord)，仅当数据集含分区时间维度才写入 parseInfo.dateInfo，且 detectWord 长度加进 parse score。AggregateTypeParser 用 8 组正则（最大|峰值|最高…→MAX 等）统计出现次数取最多者，NONE 时才覆盖。",
+   "dms_status": "missing",
+   "value": "dms-ai 目前全靠 LLM 理解时间，规则前置解析可锁定确定性时间范围注入 prompt/SQL 校验，防止 LLM 算错日期——这是 BI 场景最高频的错误来源。",
+   "migration_sketch": "Rust 用 regex crate 照抄三个 pattern，中文数字栈算法直译；产物作为 hint 注入 S2SQL prompt 的 SideInfo，并在 corrector 阶段校验 LLM 生成的时间条件是否与规则解析一致，不一致以规则为准。",
+   "effort": "M"
+  },
+  {
+   "name": "Few-shot 动态选取 + self-consistency 并发投票 + 失败升温重试",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/PromptHelper.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/OnePassSCSqlGenStrategy.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/ResponseHelper.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/LLMSqlParser.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/LLMResponseService.java"
+   ],
+   "how_it_works": "PromptHelper.getFewShotExemplars：先从 agent 记忆向量库召回补足 PARSER_EXEMPLAR_RECALL_NUMBER=10 条，similarity>0.989 的『近似同题』必进 prompt；其余按相似度截尾后随机 shuffle，保证 mostSimilar 必在；为每轮 self-consistency（PARSER_SELF_CONSISTENCY_NUMBER）生成不同 exemplar 组合。OnePassSCSqlGenStrategy.generate 用 parallelStream 并发发多个 prompt（INSTRUCTION 7条规则：禁止幻觉列/时间必须比较运算符/禁日期函数/嵌套聚合用with/别名下划线包裹等），ResponseHelper.selfConsistencyVote 对输出 SQL 多数票取胜并输出各 SQL 权重；LLMResponseService.getDeduplicationSqlResp 用 SqlValidHelper.equals 做 SQL 语义级去重+合法性校验，每个去重后 SQL 生成一个候选 parse，score=问题长度×(1+票占比)。LLMSqlParser.tryParse 失败重试 recallMaxRetries 次，重试前若 temperature=0 则调到 0.5 增随机性。",
+   "dms_status": "partial",
+   "value": "dms-ai 有 exemplar 记忆但缺投票与去重竞争机制；SC 投票是 SuperSonic 提升 text2sql 准确率的核心手段，升温重试是廉价的稳定性保险。",
+   "migration_sketch": "Rust 侧用 tokio join_all 并发 N 次调用（N 可配默认1，重要查询升到3），投票用 HashMap 计数；SQL 等价判定可先用 sqlparser-rs AST 归一化比较。升温重试直接在 LLM client 封装层实现。",
+   "effort": "M"
+  },
+  {
+   "name": "LLMReq Schema 裁剪与 Prompt Schema DSL / SideInfo 构造",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/LLMRequestService.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/PromptHelper.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/ParserConfig.java"
+   ],
+   "how_it_works": "LLMRequestService.getLlmReq：映射元素数≤PARSER_FIELDS_COUNT_THRESHOLD 时给全量 schema，否则只给映射命中的指标/维度（token 控制）；VALUE/ID 类命中且非继承的转成 ElementValue 链接值（PARSER_LINKING_VALUE_ENABLE 可关，出于数据安全）；TERM 命中带 name/description/alias 注入。PromptHelper.buildSchemaStr 生成紧凑 DSL：Metrics=[<名 ALIAS '..' FORMAT 'percent' COMMENT '..' AGGREGATE 'SUM'>], Dimensions=[<名 DATATYPE FORMAT COMMENT>], Values=[<字段='值'>]，外加 DatabaseType/Version、PartitionTimeField、PrimaryKeyField。buildSideInformation 拼 CurrentDate、PriorKnowledge、DomainTerms=[<术语 COMMENT '解释'>]，并按 MySQL<8.0/ClickHouse<20.4 注入『数据库不支持with』提示。",
+   "dms_status": "partial",
+   "value": "dms-ai 有指标/术语/维度注册表，但『按映射结果裁剪 schema』『FORMAT/AGGREGATE 元信息进 prompt』『数据库能力提示』直接影响准确率与 token 成本。",
+   "migration_sketch": "dms 的 prompt 构造函数增加：命中元素优先+阈值裁剪；注册表补 default_agg/format 字段并进 DSL；SideInfo 固定注入当前日期与 PG 版本能力。纯 prompt 工程改造。",
+   "effort": "S"
+  },
+  {
+   "name": "Corrector 完整管道的未移植环节（Time/Select/Having/Where/removeUnmappedFilterValue/双LLM修正）",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/RuleSqlCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/TimeCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/SelectCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/HavingCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/WhereCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/SchemaCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/LLMSqlCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/LLMPhysicalSqlCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/S2SqlDateHelper.java"
+   ],
+   "how_it_works": "执行序：SchemaCorrector(聚合函数归一AggregateEnum→值链接反推字段名replaceFieldNameByValue→值换码→字段白名单replaceFields)→TimeCorrector→GrammarCorrector(Select→Where→GroupBy→Agg→Having→removeSameFieldFromSelect)。dms 未移植的关键环节：①TimeCorrector：SQL 无分区时间条件时按数据集 QueryConfig 的 TimeDefaultConfig(CURRENT/RECENT/LAST+unit+period) 经 S2SqlDateHelper 算默认日期区间补 where（先 addParenthesisToWhere 防 or 优先级问题），只有上界无下界时补下界；无分区维度的数据集则删除日期条件。②SelectCorrector：groupBy 字段补进 select，但 where 中已有等值(=)条件的字段免补（结果列去冗余）。③HavingCorrector：把指标过滤条件按 defaultAgg 包装进 HAVING。④WhereCorrector：外部 queryFilters 拼成条件注入 + SchemaValueMap 的 bizName/alias→techName 值替换。⑤SchemaCorrector.removeUnmappedFilterValue：where 中等值维度过滤若值未被 mapper 链接过则整条删除（防 LLM 幻觉值）。⑥LLMSqlCorrector/LLMPhysicalSqlCorrector：双 LLM 评审器（opinion=POSITIVE/NEGATIVE+修正SQL），后者在翻译成物理 SQL 后做性能优化（谓词下推/JOIN序）。所有 corrector 均 isComplexSQL 短路保护复杂 SQL。",
+   "dms_status": "partial",
+   "value": "dms-ai 已有 Schema白名单/GroupBy/Agg 三件，缺的时间兜底与幻觉值删除是『准确』的最后防线，Select 补全直接决定图表可用性（维度列缺失画不出分组图）。",
+   "migration_sketch": "基于 sqlparser-rs AST 在 dms 现有 corrector 链追加：time_corrector(读维度注册表的分区时间+默认时间配置)、select_corrector、where_value_mapper(值换码已有可扩)、unmapped_value_remover(对照 ValueLinker 命中集)。LLM 修正器可先只做开关式接入。",
+   "effort": "M"
+  },
+  {
+   "name": "ChatWorkflowEngine 状态机与语义翻译层（S2SQL→物理SQL）",
+   "source_files": [
+    "headless/server/src/main/java/com/tencent/supersonic/headless/server/utils/ChatWorkflowEngine.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/DefaultSemanticTranslator.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/SqlQueryParser.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/cache/DefaultQueryCache.java",
+    "launchers/standalone/src/main/resources/META-INF/spring.factories"
+   ],
+   "how_it_works": "S2ChatLayerService.parse 启动状态机：MAPPING(空mapInfo才执行)→PARSING→S2SQL_CORRECTING→TRANSLATING(每个候选parse都预翻译验证，失败带errMsg)→PHYSICAL_SQL_CORRECTING→FINISHED，任何阶段失败立即置 FAILED 短路。翻译层是 QueryParser SPI 链：SqlVariableParser(变量替换)→StructQueryParser→SqlQueryParser(名称/别名→bizName 的 replaceFields、中文别名加反引号 replaceAliasWithBackticks、按查询字段推导 OntologyQuery 归属模型最小 join 集、AggOption 判定)→DefaultDimValueParser→Dim/MetricExpressionParser(表达式展开)→MetricRatioParser(同环比)→OntologyQueryParser，随后 with 语句合并内外层 SQL（不支持 with 的库降级为子查询内联），QueryOptimizer(方言改写/ResultLimitOptimizer 强制限行) 收尾；JdbcExecutor 执行前经 DefaultQueryCache 以 modelIds+请求MD5 为 key 查缓存。关键设计：parse 阶段就完成翻译（querySQL 随 parse 返回），execute 只是执行已翻译 SQL。",
+   "dms_status": "partial",
+   "value": "dms-ai 有语义缓存与 translator 概念；值得吸收的是『parse 即预翻译验证』（把 SQL 错误在选择阶段暴露而非执行阶段）、中文别名反引号、强制 limit 优化器——直接服务『准确』『快』。",
+   "migration_sketch": "dms 的 parse 接口在返回候选前先对生成 SQL 做 PG EXPLAIN 预检（等价于 TRANSLATING 验证）；结果限行在 SQL 改写层强插 LIMIT；缓存 key 采用 dataset+归一化SQL MD5。状态机可用简单枚举+loop 实现。",
+   "effort": "M"
+  },
+  {
+   "name": "多轮上下文继承：ChatContext + 规则级 dateInfo/filter 继承 + rewriteMultiTurn 完整对照",
+   "source_files": [
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/parser/NL2SQLParser.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/executor/SqlExecutor.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/query/rule/RuleSemanticQuery.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/pojo/ChatContext.java"
+   ],
+   "how_it_works": "三层上下文：①SqlExecutor 执行成功后把 parseInfo 存入 chatId 级 ChatContext（DB持久化），作为下轮 contextParseInfo；②RuleSemanticQuery.fillDateConfByInherited：本轮无时间且上下轮同为明细/同为指标查询时继承上轮 dateInfo 并标 inherited=true（继承的 VALUE 不再送 LLM 链接值，见 LLMRequestService getMappedValues 的 isInherited 过滤）；③rewriteMultiTurn：仅当 agent 开启 REWRITE_MULTI_TURN 且上一条成功查询有 correctedS2SQL 才触发（否则跳过省一次LLM），先对当前问题做 map 得到 current_schema，与 history question/schema/SQL 一起进改写 prompt，改写结果回写 queryText。getHistoryQueries 只取最近1条 SUCCESS 记录。",
+   "dms_status": "partial",
+   "value": "dms-ai 已有 rewriteMultiTurn，但缺『histSQL 为空跳过』的性能守卫、『当前问题先 map 再进 prompt』的 schema 对照、规则级 dateInfo/filter 继承（不必每次追问都走 LLM 改写）。",
+   "migration_sketch": "dms 的 conversation 表已存 parse 结果，补：改写前置条件判断；把上轮命中元素与本轮 mapper 命中一起格式化进改写 prompt（generateSchemaPrompt 的 metrics/dimensions/values 三段式）；时间继承在规则层做，省 LLM 调用。",
+   "effort": "S"
+  },
+  {
+   "name": "记忆闭环完整版：PENDING创建去重→复核→向量库同步→启动重放",
+   "source_files": [
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/executor/SqlExecutor.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/service/impl/MemoryServiceImpl.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/memory/MemoryReviewTask.java",
+    "common/src/main/java/com/tencent/supersonic/common/service/impl/ExemplarServiceImpl.java"
+   ],
+   "how_it_works": "SqlExecutor 仅在 LLMSqlQuery 模式且执行 SUCCESS 时创建 memory（question/dbSchema/sideInfo/s2sql 取自 parse 时存入 properties 的 Text2SQLExemplar），MemoryServiceImpl.createMemory 按『同 agent 同 question 已有 ENABLED』去重跳过。MemoryReviewTask @Scheduled(60s) 只处理 llmReviewRet 与 humanReviewRet 均为空的记忆，LLM 输出 opinion=(POSITIVE|NEGATIVE),comment=... 正则解析，POSITIVE 直接置 ENABLED 并 storeExemplar 写入 agent 级向量集合（memoryCollectionName(agentId)）；人工在 updateMemory 里 ENABLED→storeExemplar、ENABLED 转 DISABLED/PENDING→removeExemplar，保证 DB 状态与向量库严格同步。启动时 MemoryServiceImpl.run 与 ExemplarServiceImpl.run 分别重放 ENABLED 记忆和 s2-exemplar.json 系统样例到向量库（向量库可重建）。exemplar 检索时把 similarity 带回用于 few-shot 筛选。",
+   "dms_status": "partial",
+   "value": "dms-ai 有 MemoryReviewTask，但『创建去重』『状态流转与向量库双写一致性』『启动重放（向量库当缓存不当真相源）』『系统内置样例文件』是长期运行不腐化的关键。",
+   "migration_sketch": "PG 存记忆真相源（status/llm_review/human_review 列），pgvector 集合仅存 ENABLED；用 Rust 定时任务(tokio interval)复核；服务启动时全量重放 ENABLED 到 pgvector；内置 exemplar 用 JSON 文件随部署加载。",
+   "effort": "M"
+  },
+  {
+   "name": "执行后处理器族：流式数据解读/相似指标推荐/异常提示改写/相似问题推荐",
+   "source_files": [
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/processor/execute/DataInterpretProcessor.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/processor/execute/MetricRecommendProcessor.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/processor/parse/ErrorMsgRewriteProcessor.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/processor/parse/QueryRecommendProcessor.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/processor/execute/MetricRatioCalcProcessor.java"
+   ],
+   "how_it_works": "execute 后按 SPI 序跑4个处理器：①MetricRecommendProcessor：AGGREGATE 且指标≤5时用首个指标名做向量检索（filterCondition 限定 modelId+METRIC）补足相似指标进 parseInfo.metrics 供前端切换；②DimensionRecommendProcessor 同理推荐维度；③DataInterpretProcessor（dms 的 textSummary 原型）：流式模式下用静态 resultCache<queryId,StringBuffer> 累积 token，前端轮询 getTextSummary 读缓存，onComplete 回写 chatQueryDO.queryResult.textSummary 并清缓存；解读的 question 优先取改写后问题（信息量更大）。parse 后处理器：④ErrorMsgRewriteProcessor：解析失败时把 errorMsg+usedExemplars+agent.examples 交 LLM 改写成引导性话术（默认开启）；⑤QueryRecommendProcessor：CompletableFuture 异步从 agent 记忆库召回5条相似问题写入 chatQueryDO.similarQueries 做『猜你想问』。",
+   "dms_status": "partial",
+   "value": "dms-ai 有 textSummary，缺相似指标/维度推荐（『智能』『漂亮』的交互加分项）、失败话术改写（体验兜底）、相似问题推荐（引导用户问对问题）。",
+   "migration_sketch": "指标推荐直接查 pgvector 指标注册表集合 top5 过滤已选；错误改写复用 dms LLM 客户端加一个小 prompt；相似问题查记忆集合；流式解读用 SSE 替代轮询+静态缓存（axum 天然支持）。",
+   "effort": "M"
+  },
+  {
+   "name": "输入联想 RetrieveService + Agent/Plugin 扩展体系",
+   "source_files": [
+    "headless/server/src/main/java/com/tencent/supersonic/headless/server/service/impl/RetrieveServiceImpl.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/mapper/SearchMatchStrategy.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/plugin/PluginManager.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/plugin/recognize/embedding/EmbeddingRecallRecognizer.java",
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/agent/Agent.java"
+   ],
+   "how_it_works": "联想：SearchMatchStrategy 对输入每个分词起点切成 regText(已确定前文)+detectSegment(待补全)，对后者做前后缀 Trie 检索，RetrieveServiceImpl 取 detectSegment 最长的一组，优先推荐指标/维度补全；若命中的是维度值且无指标词，按 useCnt 降序补拼『值+高频指标』组合建议（isComplete=false），限10条。Plugin：插件配置 exampleQuestions 向量化存 preset collection（id 编码 pluginId*1000+序号），EmbeddingRecallRecognizer 召回后经 PluginManager.resolve 校验该插件绑定数据集是否被 mapInfo 命中、SEMANTIC 类型参数(paramOptions)对应元素是否被识别到，命中则生成 WEB_PAGE/WEB_SERVICE 类型 parse（score=问题长度×相似度）与 SQL parse 同台竞争；PluginExecutor 执行时把识别出的 VALUE/ID 填进 webPage 参数或调用 webservice。Agent 通过 toolConfig JSON 声明 DATASET/PLUGIN 工具集与 chatAppConfig（每个 LLM 能力点独立开关+模型配置+可覆盖 prompt）。",
+   "dms_status": "missing",
+   "value": "联想直接提升『漂亮/智能』的第一触点体验；Agent 的 chatAppConfig『每能力点独立模型+prompt 开关』设计值得 dms-ai 吸收（不同环节用不同档模型控成本）；Plugin 体系对 dms 当前优先级低。",
+   "migration_sketch": "联想：基于指标/维度/维度值注册表建前缀索引（PG pg_trgm 或内存 fst），Vue3 输入框 debounce 调 axum /suggest。chatAppConfig 思想落地为 dms 配置表：每个 LLM 环节(解析/改写/复核/解读)独立 model+prompt+enable。Plugin 暂缓。",
+   "effort": "L"
+  }
+ ],
+ "gotchas": [
+  "执行顺序全靠 launchers/standalone/src/main/resources/META-INF/spring.factories 的 SPI 声明序，代码里看不出来：Mapper 序为 Embedding→Keyword→QueryFilter→PartitionTime→TermDesc→AllField；Parser 序为 LLMSqlParser 在 RuleSqlParser 之前，但 RuleSqlParser 开头有 candidateQueries 非空即返回的守卫——实际语义是『LLM 成功则规则不跑，LLM 失败规则兜底』，移植时极易搞反。",
+  "BaseSemanticCorrector.correct 和 BaseMapper.map 都 catch Exception 只打日志，修正/映射失败会静默放行带病 SQL 进入下游；dms 移植时应改为显式错误传播或至少标记降级。",
+  "BaseSemanticCorrector.removeDateIfExist 是真 bug：removeFieldNames 先 new HashSet<>() 再 removeIf，集合恒空，整个函数实际是 no-op——SchemaCorrector.removeDateFields 对无分区维度数据集的日期清理从未生效，移植时不要照抄，应自行实现『收集 SQL 中的日期字段再删』。",
+  "PluginManager.getEmbeddingId 也是 bug：循环里只调 addQueryId 从不往 embeddingIdSet 里 add，插件删除/更新时向量清理永远删不掉旧向量。",
+  "DataInterpretProcessor 的 resultCache 是静态非并发 HashMap（流式并发有竞态），且 question 覆盖条件写反：\"\".equals(context.get(\"queryText\")) 应为非空判断——改写后问题实际从未被用于解读。",
+  "EmbeddingMatchStrategy 的 LLM 二筛借用的是 REWRITE_MULTI_TURN 的模型配置（chatAppConfig.get(\"REWRITE_MULTI_TURN\")），并非独立配置项，不开多轮改写时会退回默认模型，配置语义有隐藏耦合。",
+  "MapModeEnum LOOSE 阶段跑过 EmbeddingMapper 后，LLM_OR_RULE 阶段会再跑一遍（EmbeddingMapper 源码 TODO 注释自认重复浪费）；dms 实现时应传递已映射状态避免双倍向量检索。",
+  "PARSER_SELF_CONSISTENCY_NUMBER 默认为 1，即开箱并没有真正的多路投票；PARSER_RULE_CORRECTOR_ENABLE 默认 false，规则修正链默认整体关闭（依赖 LLM 自身质量）——对照默认值理解各机制的实际启用状态，别高估默认流水线。",
+  "nature 词性编码 `_modelId_elementId_类型后缀` 以 model 为单位建词典，查询时 NatureHelper.changeModel2DataSet 才换算成 dataset 维度（一 model 多 dataset 会展开成多条）；维度值的 nature 没有类型后缀，靠 isDimensionValueDataSetId 的排除法判断，实现时容易漏。",
+  "HanlpDictMatchStrategy 阈值是编辑距离相似度且名称阈值仅 0.3，噪声全靠 MapFilter 五条规则兜底净化——只抄召回不抄净化会明显劣化。",
+  "LLMSqlParser 重试时将 temperature 从 0 改为 0.5（写回共享的 chatModelConfig 对象，有副作用污染后续请求的风险）。",
+  "SqlExecutor 只在 queryMode==LLM_S2SQL 且执行 SUCCESS 时写记忆；记忆的 dbSchema/sideInfo 是 parse 时刻的快照（存 parseInfo.properties），不是执行时重新构造的——schema 变更后旧记忆可能误导 few-shot，SuperSonic 靠人工/LLM 复核兜底。",
+  "ChatWorkflowEngine 在 parse 阶段就对每个候选做 TRANSLATING 预翻译（调 SemanticLayerService.translate），SQL 错误在选择前暴露；execute 阶段直接用 querySQL（含物理修正），二者若不同步会执行旧 SQL。",
+  "HavingCorrector.addHavingToSelect 是从未被调用的死代码；GroupByCorrector 受 s2.corrector.additional.information 环境变量额外开关控制，容易被环境配置悄悄关掉。",
+  "PromptHelper.getFewShotExemplars 的 similarity>0.989『近似同题必选』与截尾洗牌逻辑分支多且互相耦合（same/noSame/mostSimilar 三集合），直译容易出 off-by-one；建议重写为：must-have(≈同题)+top1最像+随机补足的三段式。"
+ ]
+}

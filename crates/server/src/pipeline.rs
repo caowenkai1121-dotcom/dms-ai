@@ -551,6 +551,10 @@ async fn ask_single(
                     }
                 }
                 let row_count = rows.len();
+                // 0 行也记录（攒数据找「中文名直写/口径过严」模式，不触发复盘——0 行常常是正确答案）
+                if row_count == 0 {
+                    meta::log_failure(pg, "zero-rows", question, &injected, "").await;
+                }
                 let view = crate::viewspec::build(&columns, &rows);
                 return Ok(AskResult {
                     sql: injected,
@@ -568,10 +572,65 @@ async fn ask_single(
                 sql = repair(llm, pg, p, question, &candidate, &e.to_string()).await?;
                 route = "llm+repair".into();
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // 引擎 C 失败复盘：记录 + 异步 LLM 复盘产出候选教训（候选态不召回，复核启用才生效）
+                meta::log_failure(pg, "exec-error", question, &injected, &e.to_string()).await;
+                let (llm2, pg2) = (llm.clone(), pg.clone());
+                let (q2, sql2, err2) = (question.to_string(), injected.clone(), e.to_string());
+                tokio::spawn(async move {
+                    review_failure(&llm2, &pg2, &q2, &sql2, &err2).await;
+                });
+                return Err(e);
+            }
         }
     }
     anyhow::bail!("生成失败（自修后仍不可用）")
+}
+
+/// 失败复盘（引擎 C）：fast LLM 分析「问题+SQL+MySQL 错误」的根因，产出候选教训。
+/// 教训格式对齐存量 pitfall（一句话口径知识）；判无教训（纯权限无数据/问题无解）则 NO_LESSON 不落。
+async fn review_failure(llm: &LlmClient, pg: &PgPool, question: &str, sql: &str, error: &str) {
+    let system = "你是资深数据工程师，复盘一条执行失败的取数 SQL。判断根因类别：\
+                  ①表/列用错 ②口径错误（过滤条件/码值/去重）③权限注入冲突 ④性能超时 ⑤问题本身合理但无数据。\
+                  若是①②③④且能给出可复用教训，输出一行 lesson=...（≤80字，「表X.列Y是…」式口径知识，禁止复述错误原文）；\
+                  若是⑤或无法确定通用教训，只输出 lesson=NO_LESSON。";
+    let user = format!("问题：{question}\nSQL：\n{sql}\n执行错误：{error}");
+    let Ok(resp) = llm.chat(&llm.model_fast, system, &user).await else { return };
+    let Some(lesson) = resp.trim().strip_prefix("lesson=") else { return };
+    let lesson = lesson.trim();
+    if lesson.is_empty() || lesson == "NO_LESSON" || lesson.len() > 200 {
+        return;
+    }
+    let tables = meta::extract_tables(sql);
+    if !tables.is_empty() {
+        meta::save_lesson_candidate(pg, &tables, lesson).await;
+    }
+}
+
+/// 候选教训复核（对齐 MemoryReviewTask 思想）：LLM 判候选教训是否正确通用 → active/disabled。
+pub async fn review_lessons(llm: &LlmClient, pg: &PgPool, limit: i64) -> anyhow::Result<usize> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT id, trigger_words, lesson FROM meta.pitfall WHERE status = 'candidate' ORDER BY id LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pg)
+    .await?;
+    let mut n = 0;
+    for (id, trig, lesson) in rows {
+        let system = "你是资深数据工程师，审核一条自动复盘产出的取数教训。\
+                      判 enabled：口径合理、表述通用可复用、不是错误原文复述、不是一次性的具体问题细节。\
+                      否则判 disabled。只输出一行 verdict=enabled 或 verdict=disabled。";
+        let user = format!("锚定：{trig}\n教训：{lesson}");
+        let Ok(resp) = llm.chat(&llm.model_fast, system, &user).await else { continue };
+        let verdict = if resp.contains("verdict=enabled") { "active" } else { "disabled" };
+        sqlx::query("UPDATE meta.pitfall SET status = $1 WHERE id = $2")
+            .bind(verdict)
+            .bind(id)
+            .execute(pg)
+            .await?;
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// 记忆复核（移植 SuperSonic MemoryReviewTask）：fast LLM 判 SQL 是否正确回答问题。

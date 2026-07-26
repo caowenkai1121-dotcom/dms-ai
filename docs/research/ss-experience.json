@@ -1,0 +1,199 @@
+{
+ "summary": "SuperSonic 呈现核心在 webapp/packages/chat-sdk：ChatItem 两阶段 parse/execute，ParseTip 把语义解析渲染成\"可编辑的结构化摘要\"（筛选值/操作符/时间范围可改后重查），ExecuteItem 按 getMsgContentType 决策树在 7 种内容组件间选择（Text/指标卡/表格/趋势/柱/饼/Markdown），图卡底部挂两级下钻+关联指标切换，走 queryData 局部刷新不产生新消息；textSummary 用 500ms 轮询\"伪流式\"后补，图表先出总结后到。\"漂亮\"来自列 showType 语义驱动、统一数字格式化（万/亿/千分位/percent）、12 色板、渐变圆角柱、日期补零趋势图、同环比红绿箭头（后端 MetricRatioCalcProcessor 并行计算）。评测两套：evaluation/ 是 Spider 式管线（exec 结果集比对+SQL 结构部分匹配+难度分层+error_case.json），benchmark/ 是业务题批量冒烟（解析/执行成功率与耗时统计）。",
+ "mechanisms": [
+  {
+   "name": "图表决策树 getMsgContentType 完整版（对照已移植 ViewSpec）",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/ChatMsg/index.tsx",
+    "webapp/packages/chat-sdk/src/common/constants.ts"
+   ],
+   "how_it_works": "7 种类型按优先级判定：isSimpleMode→MARKDOWN；forceShowTable→TABLE（ExecuteItem 里图表右上角有'表格'Switch 强制切换）；无 queryColumns→TEXT；单行+单 NUMBER 列+queryMode 含 METRIC 或 LLM_S2SQL 且 columns.length===1→METRIC_CARD；类别列>1 或明细模式(TAG_DETAIL/ENTITY_DIMENSION) 或单行或(1类别0指标)→TABLE；有 DATE 列+指标≥1+类别≤1+非(多指标且有类别)+日期值确有变化→METRIC_TREND；类别≥1+恰1指标+行数≤10(移动端5)+全部非负→METRIC_PIE；类别≥1+1指标+行数≤50(移动5)+全部 isFinite→METRIC_BAR；兜底 TABLE。配套 getMsgStyle 动态宽度：柱图=行数*150px、表格=列数*150px、趋势/饼=calc(100vw-410px)。决策输入全靠列的 showType 语义标注(NUMBER/CATEGORY/DATE/more)",
+   "dms_status": "partial",
+   "value": "准确+漂亮：饼图'全非负+行数上限'、趋势图'日期值确有变化'、柱图'isFinite'这些护栏避免选错图型出丑图；动态宽度让消息卡随数据量伸缩",
+   "migration_sketch": "dms-ai 后端 ViewSpec 决策时补齐这些边界条件（饼图负值拒绝、趋势图日期恒定降级为卡/表、行数阈值分端）；Rust 侧在 QueryColumn 结构加 show_type 字段由指标/维度注册表回填；Vue3 组件按 view_type 分发，宽度策略进组件 computed",
+   "effort": "S"
+  },
+  {
+   "name": "两级下钻 DrillDownDimensions + 关联指标切换 MetricOptions（图卡底部交互条）",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/DrillDownDimensions/index.tsx",
+    "webapp/packages/chat-sdk/src/components/MetricOptions/index.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatMsg/index.tsx"
+   ],
+   "how_it_works": "后端返回 data.recommendedDimensions（推荐下钻维度），前端过滤掉已在 dimensionFilters/originDimensions 中的维度、上限 MAX_DIMENSION_COUNT=20；选一级维度后出现二级下钻区（排除一级已选 id）；onSelectDimension 调 queryData({...chatContext, dimensions: 原维度+下钻维度, metrics:[activeMetricField], dateInfo, parseId, queryId}) 局部刷新当前消息（不新增聊天气泡）。MetricOptions 用 recommendMetrics=chatContext.metrics 里未出现在 queryColumns 的指标做'推荐相关指标'点选切换，取消回默认指标。DateOptions 提供近7/30/60/90天等快捷周期切换（按 period=DAY/WEEK/MONTH 换档位）",
+   "dms_status": "missing",
+   "value": "智能+漂亮的核心交互：一问之后不用再打字即可下钻分组、换指标、换周期，报表从静态图变成可探索面板",
+   "migration_sketch": "axum 加 /api/chat/query-data 接口：接收 parse_id+改写后的 dimensions/metrics/date_info，复用已缓存的语义上下文重新生成 SQL（过 SchemaCorrector/权限内核）执行；推荐维度由维度注册表按数据集关联度返回 top20；Vue3 在图卡 footer 渲染两级 chips，选中态走 pinia 局部 state，loading 用 Spin 包图表",
+   "effort": "M"
+  },
+  {
+   "name": "指标卡同环比：MetricRatioCalcProcessor + PeriodCompareItem",
+   "source_files": [
+    "chat/server/src/main/java/com/tencent/supersonic/chat/server/processor/execute/MetricRatioCalcProcessor.java",
+    "webapp/packages/chat-sdk/src/components/ChatMsg/MetricCard/PeriodCompareItem.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatMsg/MetricTrend/MetricInfo.tsx"
+   ],
+   "how_it_works": "执行后处理器：仅 AGGREGATE 查询触发，取结果中最新日期行的指标值，CompletableFuture 并行发两路 ratio 查询 RATIO_ROLL(环比)/RATIO_OVER(同比)；对比口径按 period 自适应——日粒度=日环比+周同比(minusDays1/minusWeeks1)、周粒度=周环比+月同比、月粒度=月环比+年同比，getRatioDateConf 构造 DateMode.LIST 只查[当期,对比期]两天；结果写入 aggregateInfo.metricInfos[0].statistics（如{'日环比':'3.21%','周同比':'-1.05%'}）。前端 MetricCard/MetricInfo 遍历 statistics 渲染 PeriodCompareItem：含'-'判跌显绿降箭头，否则红升箭头；趋势图上方 MetricInfo 还展示'最新数据日期'",
+   "dms_status": "missing",
+   "value": "漂亮+智能：指标卡不只一个大数字，自动带同环比涨跌，是'报表细节丰富'最直接的体现",
+   "migration_sketch": "Rust 在执行结果处理链加 RatioProcessor：判定聚合+含日期查询后，用 tokio::join! 并行发两条对比期 SQL（复用同一 WHERE 换日期区间，PG 可用 lag/区间查询一次算出）；口径映射表(日→日环比/周同比…)做成 const；响应加 aggregate_info.statistics，Vue3 指标卡渲染红绿箭头",
+   "effort": "M"
+  },
+  {
+   "name": "数字格式化体系 getFormattedValue/formatByDataFormatType/formatNumberWithCN",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/utils/utils.ts",
+    "webapp/packages/chat-sdk/src/components/ChatMsg/MetricCard/index.tsx"
+   ],
+   "how_it_works": "三层：①getFormattedValue 自动选单位(≥1e8→亿留2位、≥1e4→万、<1 留3位、其余留1位)+千分位+去尾零；②formatByDataFormatType 按列元数据 dataFormatType(percent/decimal)+dataFormat.needMultiply100/decimalPlaces 格式化，percent 追加%（图表 series 数据也 *100 保持轴一致）；③指标卡 formatNumberWithCN(万缩写) 与 formatMetric(精确千分位) 可切换——值≥10000 时出现 SwapOutlined 图标点击互切。表格 NUMBER 列只做千分位（不缩写，保精确），坐标轴/tooltip/柱顶标签统一走同一套 formatter",
+   "dms_status": "partial",
+   "value": "漂亮的地基：所有数字出口（卡/表/轴/tooltip/标签）口径一致；'万/亿'中文单位+可切精确值兼顾扫读与核数",
+   "migration_sketch": "抽成 Vue3 工具模块 formatValue.ts 原样移植三个函数；关键是指标注册表把 data_format_type/decimal_places/need_multiply_100 作为指标元数据下发到 queryColumns，前端所有渲染点只认列元数据不再各自判断",
+   "effort": "S"
+  },
+  {
+   "name": "两阶段 parse/execute + 多候选解析选择 + dataCache",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/ChatItem/index.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatItem/ExpandParseTip.tsx"
+   ],
+   "how_it_works": "sendMsg 先调 chatParse 拿 selectedParses+candidateParses（合并取前5个 parseInfo）；单候选直接 onExecute；多候选且 agent.enableFeedback=1 时先渲染 ExpandParseTip 让用户点选，选中后带 parseId+queryId 再次 chatParse 确认，再 execute（用户选择行为即隐式反馈数据）。每个 parseId 的执行结果/错误缓存在 dataCache:Record<parseId,{tip,data}>，onSelectParseInfo 切换候选时命中缓存免重查。updateData 按 code(400/401/412 用 res.msg)/queryState/queryMode 分类出错误提示或数据",
+   "dms_status": "missing",
+   "value": "准确：解析歧义时把选择权交给用户而不是赌一个；候选切换零等待；用户点选还是天然的高质量反馈语料（可喂记忆复核）",
+   "migration_sketch": "dms-ai 的复合拆解已有并行子查询，可在'歧义度高'(如多数据集/多指标同分)时返回 candidate_parses 数组；Vue3 渲染候选卡片，点选后带 parse_id 调 execute；执行结果在前端按 parse_id Map 缓存；点选事件写入反馈表供 MemoryReviewTask 消费",
+   "effort": "M"
+  },
+  {
+   "name": "解析结果可编辑再查询：FilterItem + RangePicker 预设 + onRefresh",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/ChatItem/FilterItem.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatItem/ParseTip.tsx"
+   ],
+   "how_it_works": "ParseTip 把 dimensionFilters 渲染成可编辑控件：字符串/数组值→多选 Select（远程搜索 queryDimensionValues，debounce 500ms + fetchRef 计数防竞态，选1个自动 operator='='、多个自动'IN'）；数值→操作符 Select(>=/>/=/<=/<)+InputNumber；日期字符串(dayjs 校验)→DatePicker；_id 字段特殊处理为实体切换 SwitchEntity。时间用 RangePicker+renderExtraFooter 预设按钮（近7/14/30日、本周/本月/上月/本季度/本年，dayjs quarterOfYear 插件）。改完点'重新查询'按钮走 queryData({dimensions,metrics,dateInfo,dimensionFilters,parseId,queryId})",
+   "dms_status": "missing",
+   "value": "准确+智能：LLM 解析错了值/时间，用户原地修正即可，不用重新措辞提问；维度值下拉直接来自库里真实值（配合 ValueLinker 换码）",
+   "migration_sketch": "axum 加 /api/dimension-values 接口（维度注册表+权限过滤+ILIKE 搜索+limit)；解析响应携带结构化 dimension_filters（name/bizName/operator/value/elementID)；Vue3 按值类型分发 a-select(搜索)/a-input-number/a-range-picker 控件，重查复用下钻同一 query-data 接口",
+   "effort": "M"
+  },
+  {
+   "name": "SqlItem 六段 SQL 调试面板 + 一键导出调试日志",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/ChatItem/SqlItem.tsx"
+   ],
+   "how_it_works": "仅开发者+DebugMode 显示，六个可切换标签：Schema映射(llmReq.schema.fieldNameList/values/priorExts/terms 术语)、Few-shot示例(llmResp.sqlRespMap[0].fewShots 问题+SQL)、解析S2SQL(sqlInfo.parsedS2SQL，标注 LLM/Rule 来源)、修正S2SQL(correctedS2SQL)、物理SQL修正(correctedQuerySQL)、最终执行SQL(querySQL)；全部过 sql-formatter 格式化+Prism 高亮+CopyToClipboard；onExportLog 把问题+全部六段+异常日志拼成 supersonic-debug-{agentId}-{queryId}.log 下载。标题栏带 SQL 生成耗时(sqlTimeCost)",
+   "dms_status": "missing",
+   "value": "准确（排障效率）：SchemaCorrector/AggCorrector 每步产物可视化，坏 case 一键导出完整现场，回归门禁的错误分析直接受益",
+   "migration_sketch": "dms-ai 已有 corrector 链，只需在 parse 响应里透传 sql_info{parsed,corrected,final} 与 llm_req 摘要（脱敏后）；Vue3 用 tab+highlight.js 渲染，加导出按钮拼文本 Blob 下载；按用户角色（权限内核 isDeveloper）控制可见",
+   "effort": "S"
+  },
+  {
+   "name": "textSummary 伪流式后补（图表先出、总结轮询到位）",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/ChatItem/index.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatItem/ExecuteItem.tsx"
+   ],
+   "how_it_works": "onExecute 拿到数据立即渲染图表，同时若 queryState!=INVALID 则 setTimeout 500ms 启动 getSummary 递归：调 getExecuteSummary(queryId)，若返回 queryMode==null（总结未生成完）就仅合并 textSummary 字段 setData 并 500ms 后再轮询，直到完整返回。ExecuteItem 中 textSummary 用 ReactMarkdown 渲染在图表上方'总结:'区。效果：首屏出图 <1s，LLM 洞察几秒后无感补上",
+   "dms_status": "partial",
+   "value": "快+智能：LLM 总结不阻塞数据呈现；dms-ai 已有 textSummary 但若是同步等待则首屏慢，此处的异步后补模式是关键差异",
+   "migration_sketch": "axum 执行接口先返回数据，总结任务 tokio::spawn 异步生成写入 query 表；提供 GET /api/query/{id}/summary；Vue3 拿到数据后 SSE 或 500ms 轮询补 summary 字段（PG LISTEN/NOTIFY 可升级为推送）",
+   "effort": "S"
+  },
+  {
+   "name": "图表渲染细节配方（渐变柱/补零趋势/环形饼/12色板/实例复用）",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/ChatMsg/Bar/index.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatMsg/MetricTrend/MetricTrendChart.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatMsg/Pie/PieChart.tsx",
+    "webapp/packages/chat-sdk/src/utils/utils.ts"
+   ],
+   "how_it_works": "柱图：barWidth 20、borderRadius [10,10,0,0]、LinearGradient(主色→getLightenDarkenColor(+80) 变浅)、柱顶 label 显示格式化值、x 轴标签 rotate 30+truncate 200px；趋势图：normalizeTrendData 用 enumerateDaysBetweenDates 补齐缺失日期填0（仅当列名含 date/month）、groupByColumn 按类别分组后按'最后一个点的值'降序排 series 且只取前20组、smooth+showSymbol 仅单点、legend type:scroll、tooltip 自定义 HTML 按值降序+marker+定宽对齐+统一格式化；饼图：radius ['40%','70%'] 环形、borderColor #fff borderWidth 2 圆角10 分瓣、label 平时隐藏 emphasis 才在中心显示；12色 THEME_COLOR_LIST 循环取色；ECharts 实例 useRef 复用+clear、triggerResize 副作用统一 resize",
+   "dms_status": "partial",
+   "value": "漂亮的具体配方全在这：渐变圆角柱、白边环形饼、补零平滑趋势、tooltip 值排序定宽对齐，每一条都是可直接抄的视觉细节",
+   "migration_sketch": "Vue3 + echarts 按组件逐条移植 option 配方；normalizeTrendData/groupByColumn/getLightenDarkenColor 三个纯函数直接翻译 TS；把'列名含 date'的补零触发条件改为依赖列元数据 show_type==='DATE'（去掉命名耦合）；色板与 AntDesignVue token 统一",
+   "effort": "M"
+  },
+  {
+   "name": "列级权限占位：ApplyAuth / NoPermissionChart / queryAuthorization 提示",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/ChatMsg/ApplyAuth/index.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatMsg/NoPermissionChart/index.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatMsg/Table/index.tsx"
+   ],
+   "how_it_works": "每个 queryColumn 带 authorized 布尔：表格 render 时未授权列的每个单元格渲染 ApplyAuth（显示所属数据集名+申请权限链接，onApplyAuth 回调）；图表则整图替换为 NoPermissionChart 占位图；指标卡在 indicatorColumn 未授权时同样替换。另有 data.queryAuthorization.message 在内容区顶部渲染'提示：xxx'（行级权限裁剪说明）",
+   "dms_status": "partial",
+   "value": "权限目标直接相关：数据不可见但'存在感'可见，用户知道找谁申请而非以为系统坏了；行级裁剪有明示避免误读口径",
+   "migration_sketch": "dms-ai 权限内核（view_type/哨兵-1拒绝）在列裁剪时不删列而是标 authorized:false 返回；行级 datascope 生效时在响应加 authorization_message；Vue3 表格 cell/图表整体按 authorized 渲染占位组件",
+   "effort": "S"
+  },
+  {
+   "name": "相似问题推荐 SimilarQuestionItem（失败兜底引导）",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/ChatItem/SimilarQuestionItem.tsx",
+    "webapp/packages/chat-sdk/src/components/ChatItem/index.tsx"
+   ],
+   "how_it_works": "每条回答尾部挂'推荐相似问题'折叠区：默认收起、懒加载（展开时才调 querySimilarQuestions(queryId)），最多显示5条，点击直接 onSendMsg 发问。关键细节：defaultExpanded = parseTip!==''||executeTip!==''——解析或执行失败时自动展开，把死胡同变成引导；PLAIN_TEXT 模式不显示",
+   "dms_status": "missing",
+   "value": "智能：失败时自动给出路，成功时提供追问灵感；配合向量召回(EmbeddingMapper 已有)实现成本极低",
+   "migration_sketch": "复用 dms-ai 已有的语义缓存/向量库：按当前问题 embedding 召回历史高分问题 top5，axum 加 /api/query/{id}/similar；Vue3 折叠面板，失败态默认展开",
+   "effort": "S"
+  },
+  {
+   "name": "消息工具条 Tools：赞踩反馈+导出CSV/PNG+再试一次（方法注册模式）",
+   "source_files": [
+    "webapp/packages/chat-sdk/src/components/Tools/index.tsx",
+    "webapp/packages/chat-sdk/src/hooks/useExportByEcharts.ts",
+    "webapp/packages/chat-sdk/src/utils/utils.ts"
+   ],
+   "how_it_works": "每条消息底部工具条：LikeOutlined/DislikeOutlined 调 updateQAFeedback(queryId,5/1)（反馈分数落库，是记忆复核的数据源）；导出数据 exportCsvFile（列名用中文 name、加 ﻿ BOM 防 Excel 乱码）；导出图片走 ChartItemContext 的 register/call 方法注册模式——图表组件挂载时 register('downloadChartAsImage', fn)，工具条 call 触发，fn 内用 echarts getConnectedDataURL({type:'png',pixelRatio:2,backgroundColor:'#fff'})；仅最后一条消息显示'再试一次'：deleteQuery(queryId) 删记录后重走 parse 全流程",
+   "dms_status": "partial",
+   "value": "权限+智能闭环：赞踩直接喂 MemoryReviewTask 已移植的记忆复核；导出 CSV/PNG 是报表刚需；'再试一次'只在尾部避免历史消息被重写",
+   "migration_sketch": "axum 加 feedback 表(query_id,score)与 DELETE /api/query/{id}；MemoryReviewTask 消费 score<=1 的坏 case；Vue3 用 provide/inject 实现图表导出方法注册；CSV 导出前端拼 Blob 即可（注意 BOM）",
+   "effort": "S"
+  },
+  {
+   "name": "evaluation/：Spider 式 Text2SQL 评测管线（执行比对+结构部分匹配+难度分层）",
+   "source_files": [
+    "evaluation/evaluation.py",
+    "evaluation/build_pred_result.py",
+    "evaluation/build_models.py",
+    "evaluation/build_tables.py",
+    "evaluation/data/gold_example_dusql.txt",
+    "evaluation/data/internet.txt"
+   ],
+   "how_it_works": "四步全自动：build_table 从 tables_dusql.json 建 sqlite 库灌数据；build_models 通过 REST API 幂等自建 domain/model/agent（JWT HS512 直签 admin token）；get_pred_result 逐题（internet.txt 中文问题，与 gold_example_dusql.txt 的'SQL\\tdb'逐行对齐）调 /api/chat/query/parse 取 selectedParses[0].sqlInfo.querySQL；evaluate 双指标：①exec accuracy——eval_exec_match 双 SQL 都在 sqlite 执行，结果转 {列名:排序后的值列表} map 比较（列名去表前缀/反引号小写化、排除 sys_imp_date 时间列、行序无关）；②exact/partial match——get_sql 把 SQL 解析成结构树，分 select/select(no AGG)/where/where(no OP)/group/order/and-or/IUEN/keywords 九维打分（get_scores 是全对才得1的 all-or-nothing），DISABLE_VALUE=True 忽略字面值；eval_hardness 按 component1/2/others 计数分 easy/medium/hard/extra 四档分层报告；失败 case 连同 query/gold_sql/pred_sql/两侧结果集 map+耗时 max/min/avg 写 error_case.json",
+   "dms_status": "missing",
+   "value": "准确的回归门禁核心：exec 比对对'语义等价但写法不同'的 SQL 公平；难度分层能看出改动伤了哪一档；error_case.json 直接是修 bug 的工单",
+   "migration_sketch": "dms-ai 版：固定 PG 测试库+种子数据（docker compose 起）；评测集 YAML[{question,gold_sql,tags}]；Rust 或 Python 脚本逐题调 /api/parse 取 final_sql，两条 SQL 各在 PG 执行，结果集按'列名→排序值列表'比对（忽略别名差异、浮点容差）；不搞 Spider 结构树（工程量大），exec-only + 按 tags(聚合/明细/多轮/权限) 分层统计 + error_case.json 落盘；接 CI 门禁：通过率低于基线即红",
+   "effort": "M"
+  },
+  {
+   "name": "benchmark/：业务题批量冒烟（成功率+耗时统计）",
+   "source_files": [
+    "benchmark/benchmark.py",
+    "benchmark/benchmark.md"
+   ],
+   "how_it_works": "与 evaluation 的分工明确写在 benchmark.md：evaluation 是数据集上的模型横评，benchmark 是选定模型后业务问题的批量自动化冒烟。BatchTest 读 CSV 题库（单列 question），逐题 parse→execute（复用真实 chatId 会话），按 errorMsg 是否为 None 判解析/执行成功，parseTimeCost.parseTime 与 queryTimeCost 记耗时；DataFrameAppender 汇总打印：总数/解析成功数/执行成功数/解析均耗时/执行均耗时/总均耗时/最长/最短，明细落 res/{题库名}_{时间戳}.csv；SQL 正误靠人工查 s2_chat_parse 表标注（README 附标注 SQL 模板，含'请标记正确的SQL/是否正确/原因分类'占位列）",
+   "dms_status": "missing",
+   "value": "快+准确：上线前用真实业务题跑一遍，耗时分布直接对应'快'的目标；时间戳 CSV 天然形成版本间可对比的基线",
+   "migration_sketch": "一个 Python/Rust 小脚本即可：读 questions.csv 逐题调 dms-ai parse/execute API，统计成功率与 p50/p95 耗时，输出带 git commit hash 的 CSV；与 evaluation 管线共用 API client；加进发布 checklist",
+   "effort": "S"
+  }
+ ],
+ "gotchas": [
+  "决策树完全依赖列的 showType 语义标注（NUMBER/CATEGORY/DATE/more）：后端不给列打 showType 则 getMsgContentType 全部失效；showType==='more' 的列会被摘出当 referenceColumn（RAG 引用来源），不进图表",
+  "normalizeTrendData 的补零触发条件是列 bizName 是否 includes('date'/'month')——纯命名约定耦合，字段不叫 date 就不补缺失日期；且缺失日期填 0 而非 null，会拉低均值并在图上画出假谷底",
+  "getFormattedValue 会把 0 显示为 '-'（+formattedValue===0 时 return '-'），0 值被吞；formatByDecimalPlaces 对 0 返回数字 0 而非字符串，两函数口径不一致",
+  "趋势图 series 按'最后一个点的值'降序排序且只取前 20 个分组（sortedGroupKeys.slice(0,20)），超过 20 个类别的数据静默丢弃",
+  "evaluation 的 exec 比对是每列独立排序后比较（res_map 中 value_list.sort()），同列值相同但行错位也判对——宽松判分有假阳性风险；且硬编码忽略 sys_imp_date 列",
+  "evaluation 的 get_scores 是 all-or-nothing（count==total 才得 1），acc/rec/f1 并非传统定义；DISABLE_VALUE=True 使 where 字面值不参与结构匹配，只有 exec 模式校验值",
+  "getExecuteSummary 轮询递归（500ms）没有次数上限与超时——后端总结一直不返回 queryMode 时前端无限轮询",
+  "MetricRatioCalcProcessor 第127-128行疑似 bug：判断 metricInfoOver.getValue()!=null 却 setValue(metricInfoRoll.get().getValue())，同比值被环比值覆盖；移植时不要照抄",
+  "PeriodCompareItem 用 value.includes('-') 字符串判涨跌：'0%' 显示为上涨红箭头，空串/异常值也判涨",
+  "dataCache 以 parseId 为 key 缓存执行结果，切换候选免重查；但 onRefresh 用户改过筛选后写回同一 parseId，旧缓存被覆盖，切走再切回拿到的是改过的版本而非原始解析",
+  "benchmark.py 的 execute 请求写死 parseId:1，永远只测第一个候选解析；且 JWT secret 硬编码在脚本里（与 AuthenticationConfig.tokenAppSecret 一致），泄漏即可伪造任意用户",
+  "ECharts 实例复用时 MetricTrendChart/MultiMetricsTrendChart 调 instanceObj.clear() 而 Bar/Pie 不 clear，依赖 setOption 覆盖，series 数量变化时柱/饼图可能残留旧系列；容器宽度为 0 时 init 渲染空白，必须配合 triggerResize 机制",
+  "isMobile 用 UA 正则一次性求值（module 顶层），窗口缩放不会重新判定；饼图/柱图行数上限（5 vs 10/50）因此在桌面窄窗口下不生效",
+  "ChatItem 的多候选只取前 5 个（parses.slice(0,5)），且要求 parses[0] 有 properties.type 或 queryMode 才算解析成功，两个字段都缺即判失败走 PARSE_ERROR_TIP",
+  "表格导出 CSV 用列的中文 name 作表头且加 ﻿ BOM（否则 Excel 打开乱码）；导出图片用 getConnectedDataURL pixelRatio:2 才不糊，这两个细节容易漏"
+ ]
+}

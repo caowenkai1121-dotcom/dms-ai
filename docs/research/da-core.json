@@ -1,0 +1,190 @@
+{
+ "summary": "deepagents 不是新运行时，而是压在 langchain create_agent + langgraph 上的\"装配厂\"：create_deep_agent(graph.py) 按固定次序装配中间件洋葱 Skills→Filesystem→SubAgent(task)→Summarization→PatchToolCalls→(AsyncSubAgent)→用户中间件→Profile尾部→PromptCaching→Memory→HITL，全部行为经 wrap_model_call/wrap_tool_call 钩子改写\"本次请求\"而非持久 state。三大支柱：①Backend 协议(State/Store/Filesystem/Composite)统一文件、shell、落盘存储；②上下文经济学：大工具结果>20k token 驱逐落盘换 head+tail 预览、85% 阈值摘要压缩+历史 offload、旧工具参数预截断；③子代理隔离：task 工具剥离私有 state 后调用，只回传最后一条非空 AIMessage 或 structured_response。注意 write_todos 已从默认栈移除变 opt-in。对 dms-ai 最有价值的未移植件：三态权限+人审 interrupt、Rubric 自评迭代、摘要压缩、悬空工具调用修补、大结果落盘。",
+ "mechanisms": [
+  {
+   "name": "create_deep_agent 装配管线与中间件栈次序",
+   "source_files": [
+    "libs/deepagents/deepagents/graph.py",
+    "libs/deepagents/deepagents/_excluded_middleware.py"
+   ],
+   "how_it_works": "固定装配序：Skills→Filesystem→SubAgent→Summarization→PatchToolCalls→AsyncSubAgent→[用户中间件插入点]→profile.extra_middleware→_ToolExclusionMiddleware→AnthropicPromptCaching→Memory→HITL。_apply_custom_middleware 按 middleware.name 同名替换(保持栈位)，新增件插到核心段之后、缓存尾部之前；_REQUIRED_MIDDLEWARE(Filesystem/SubAgent)不可排除，excluded_middleware 命中即抛 ValueError。系统提示按 USER→BASE(profile.base_system_prompt)→SUFFIX 三段装配。DeepAgentState.messages 用 DeltaChannel(_messages_delta_reducer, snapshot_frequency=50) 把 checkpoint 增长从 O(N²) 降到 O(N)；返回图 with_config(recursion_limit=9999)。TodoListMiddleware 已移出默认栈变 opt-in(仅 _openai_codex.py profile 加回)。",
+   "dms_status": "partial",
+   "value": "对'快'：Memory 刻意放在 PromptCaching 之后，记忆更新不破坏 Anthropic 缓存前缀；同名替换让业务方外科式换单环节不重建管线，服务'智能'与可维护性。",
+   "effort": "M",
+   "migration_sketch": "Rust 侧用 trait AgentMiddleware{wrap_model_call/wrap_tool_call} + tower Layer 风格洋葱链(天然契合 axum)；装配器持有 Vec<Box<dyn Middleware>>，按 name() 做同名替换；系统提示三段拼装做成 PromptAssembler 结构体。dms-ai 不必全搬，先固化'核心段→用户段→缓存尾段'三区次序约定即可。"
+  },
+  {
+   "name": "task 子代理隔离与结果回传(已移植·对照完整版缺失细节)",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/subagents.py"
+   ],
+   "how_it_works": "SubAgentMiddleware 注册 task(description, subagent_type) 工具。_build_task_tool→_validate_and_prepare_state：复制父 state 并剥离 _EXCLUDED_STATE_KEYS{messages,todos,structured_response}+private_state_keys(PrivateStateAttr 标记字段)，只放入 HumanMessage(description)。回传 _return_command_with_state_update：优先 structured_response 序列化为 JSON；否则从结果 messages 倒序找最后一条非空文本 AIMessage(规避 Anthropic 偶发尾随空 end_turn 消息)；其余 state 键(排除私有)合并回父图。未知 subagent_type 返回友好错误字符串而非抛异常，让模型自纠。支持 SUBAGENT_RESPONSE_FORMAT_CONFIG_KEY 在调用时动态指定子代理结构化输出 schema。TASK_TOOL_DESCRIPTION 含 {available_agents} 占位符+明确指令'独立任务用单条消息并发多个 task 调用''报告不展示给用户需自行转述'。DEFAULT_SUBAGENT_PROMPT 告知子代理'调用方只看你最终一条消息'。",
+   "dms_status": "ported",
+   "value": "dms-ai 简化版易缺的关键细节：①state 剥离清单与私有键防泄漏(权限目标)；②最后非空消息回溯防空回传；③非法类型返回错误文本让模型自愈；④工具描述里的并发指令是并行拆解真正生效的前提；⑤structured_response JSON 回传使合并阶段可解析(准确目标)。",
+   "effort": "S",
+   "migration_sketch": "对照检查 dms-ai 的子任务执行器：补 state 白名单剥离、空消息回溯、错误自愈文案、子任务结构化输出(serde JSON schema)；在 task 工具描述中显式写'独立子问题必须一次性并发发起'。Rust 侧用 tokio::join_all 并发多子代理即可。"
+  },
+  {
+   "name": "复合问题拆解编排提示词(已移植·对照 deep_research 完整版)",
+   "source_files": [
+    "examples/deep_research/research_agent/prompts.py",
+    "examples/deep_research/agent.py"
+   ],
+   "how_it_works": "SUBAGENT_DELEGATION_INSTRUCTIONS 的核心是'反过度拆解偏置'：默认 1 个子代理，仅显式对比(A vs B→每实体1个)或明确独立维度(地域分割)才并行；禁止把'研究X'预拆成 overview/techniques/applications。硬限制：max_concurrent_research_units=3 并发上限、max_researcher_iterations=3 委派轮数上限。子代理 RESEARCHER_INSTRUCTIONS 配 think_tool：每次搜索后强制反思(找到什么/缺什么/够不够/是否继续)，并给工具调用预算(简单2-3次、复杂最多5次)+停止条件(3+来源即停、连续2次结果雷同即停)。合并阶段有引用合并协议：每个唯一 URL 全局唯一编号、连续无空洞。",
+   "dms_status": "ported",
+   "value": "dms-ai 拆解-并行-合并最易缺的三件事：①默认单代理偏置(避免简单问题被拆碎导致慢且贵)；②并发/轮数硬上限防失控；③合并协议(dms-ai 对应物=多子查询结果的指标口径对齐与去重)。直接影响'快'与'准确'。",
+   "effort": "S",
+   "migration_sketch": "纯提示词工程：在 dms-ai 拆解 prompt 中加入'默认不拆、仅显式对比/独立维度才拆'偏置与并发上限常量；子查询执行器加反思步(或轻量 think 记录)；合并 prompt 明确指标口径对齐规则(类比 URL 唯一编号)。"
+  },
+  {
+   "name": "大工具结果驱逐落盘(context 保护)",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/filesystem.py",
+    "libs/deepagents/deepagents/middleware/_message_eviction.py"
+   ],
+   "how_it_works": "FilesystemMiddleware.wrap_tool_call 拦截工具结果：文本超 tool_token_limit_before_evict(默认20000 token，按 NUM_CHARS_PER_TOKEN=4 字符近似)则 _offload_tool_message_content 写入 {artifacts_root}/large_tool_results/{sanitized_tool_call_id}，替换为 TOO_LARGE_TOOL_MSG(含路径+head 5 行/tail 5 行预览+read_file 分页指引)。TOOLS_EXCLUDED_FROM_EVICTION 排除 ls/glob/grep/read_file/edit/write/delete(自截断工具落盘只会诱导无限重读)。超大 HumanMessage(>50000 token)也在 wrap_model_call 中驱逐到 /conversation_history/{uuid}.md 并打 lc_evicted_to 标签，state 保留全文、仅模型请求中截断。execute 工具还有 capture-at-source：沙箱内直接 execute_with_offload 把输出写到目标路径避免回传大 payload。",
+   "dms_status": "missing",
+   "value": "dms-ai 跑大 SQL 结果集/全量 schema dump 时上下文瞬间爆炸，这是'快'和多轮'准确'的直接保护；预览+可分页回读兼顾洞察生成需要的全量数据。",
+   "effort": "M",
+   "migration_sketch": "axum 服务里给工具结果加字节阈值：超限写 PG 大对象或对象存储(键=tool_call_id)，消息替换为'结果已存 {id}，用 fetch_result(id, offset, limit) 分页读'+头尾预览；SQL 查询结果天然分页，直接存 result_id + 前 N 行预览即可。"
+  },
+  {
+   "name": "摘要压缩与会话历史 offload",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/summarization.py",
+    "libs/deepagents/deepagents/middleware/_overflow_clip.py"
+   ],
+   "how_it_works": "_DeepAgentsSummarizationMiddleware.wrap_model_call 流程：①按上次 _summarization_event 重建有效消息(不改写 state['messages']，仅私有事件字段记 cutoff_index+summary_message，可链式叠加，_compute_state_cutoff 做 -1 换算)；②token 只计一次共享；③预压缩 _truncate_args：旧消息中 write_file/edit_file 的大参数(>2000字符)截为前20字符+'...(argument truncated)'，常常免去整轮摘要；④触发阈值默认 ('fraction',0.85)、保留 ('fraction',0.10)(有模型 profile 时)；⑤摘要前先 _offload_to_backend 把被淘汰消息以 XML 格式追加到 /conversation_history/{thread_id}.md(内联 data:URL 媒体按 sha256[:16] 去重上传到 media/ 并替换为路径引用)；⑥摘要消息内嵌历史文件路径，模型可 read_file 回查；⑦模型报 ContextOverflowError 时兜底立即压缩重试(_clip_overflow_tail 处理保留尾巴仍超限)。另有 SummarizationToolMiddleware 暴露 compact_conversation 工具，达到自动阈值 50% 才允许手动压缩。",
+   "dms_status": "missing",
+   "value": "dms-ai 已有 rewriteMultiTurn 与多会话，但长会话上下文管理缺失；'历史 offload+摘要中嵌回查路径'兼得压缩与可追溯，是多轮追问'准确'不漂移的关键。",
+   "effort": "L",
+   "migration_sketch": "PG 存全量消息(不删)，会话表加 summarization_event(cutoff_id, summary_text)；构建请求时按 event 重建有效消息=摘要+cutoff 之后消息；触发条件用真实 tokenizer 或 4字符/token 近似；淘汰段落写 conversation_archive 表，摘要内注明 archive_id 供后续追问回查；旧 SQL 大参数先截断再考虑摘要。"
+  },
+  {
+   "name": "Backend 虚拟文件系统四层协议",
+   "source_files": [
+    "libs/deepagents/deepagents/backends/protocol.py",
+    "libs/deepagents/deepagents/backends/state.py",
+    "libs/deepagents/deepagents/backends/store.py",
+    "libs/deepagents/deepagents/backends/composite.py",
+    "libs/deepagents/deepagents/backends/filesystem.py"
+   ],
+   "how_it_works": "BackendProtocol 定义 ls/read/write/edit/delete/grep/glob/upload_files/download_files(+async 双胞胎)，返回结构化 ReadResult/WriteResult/GrepResult 等(ReadResult.__post_init__ 强校验分页字段一致性，防 next_offset 跳行)。StateBackend 把文件存 LangGraph state：经 CONFIG_KEY_READ(fresh=True) 读、CONFIG_KEY_SEND 写，同一超步内 read-your-writes；files 通道 reducer 以 None 值为删除标记。StoreBackend 存 langgraph BaseStore(跨线程持久)。FilesystemBackend 真实磁盘(virtual_mode 映射 root_dir)。CompositeBackend 按路径前缀路由(最长前缀优先，_route_for_path 剥前缀转发)，artifacts_root 决定 large_tool_results/conversation_history 落点；grep/glob 跨路由合并结果并回映射路径，错误短路不吞。SandboxBackendProtocol 增 execute；execute 只跑在 default backend 的 shell，_route_host_path_prompt 向模型注入'虚拟路径→宿主路径'映射表。",
+   "dms_status": "missing",
+   "value": "对 dms-ai：不需要全搬，但'统一存储协议+前缀路由'适合承载 报告草稿(会话级)/记忆(用户级持久)/大结果(对象存储) 三类介质，是权限隔离与'漂亮'报告工作流的地基。",
+   "effort": "L",
+   "migration_sketch": "Rust 定义 trait ArtifactStore{read/write/list/grep}，实现 SessionStore(PG 会话表)、UserStore(PG 用户命名空间)、BlobStore(大结果)；一个 PrefixRouter 按 /session/ /memory/ /results/ 路由。不建议移植 shell execute。"
+  },
+  {
+   "name": "文件工具族细节(read 分页防丢行/grep 字面量/glob 超时)",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/filesystem.py",
+    "libs/deepagents/deepagents/backends/utils.py"
+   ],
+   "how_it_works": "read_file：默认 100 行分页，行号从 offset+1 起、行号后两空格；超 5000 字符长行拆为 5.1/5.2 续行标记且不占 limit 预算；_truncate_paginated_read 在字节截断后重算最后完整行边界并修正 next_offset，保证'通告的续读偏移永不跳过未展示行'。edit_file 要求 old_string 唯一(否则 replace_all)，工具描述强制'先读后改、不得带行号前缀'。grep 是 LITERAL 非正则(描述反复强调，regex 需 execute rg)，默认 grep_max_count=1000 截断+引导性提示(GREP_TRUNCATION_NOTE)，无命中时 regex_literal_hint 提示用户可能误写了正则。glob 有 10s 超时+4 线程 BoundedSemaphore 防雪崩，超时返回引导缩小范围的错误。所有截断按 TOOL_RESULT_TOKEN_LIMIT*4 字符估算。",
+   "dms_status": "missing",
+   "value": "'截断必附续读指引/收窄建议'的工具反馈设计是 agent 自愈能力的核心，可直接平移到 dms-ai 的 SQL 结果分页、schema 浏览工具上，服务'准确'与'快'。",
+   "effort": "S",
+   "migration_sketch": "给 dms-ai 每个工具的截断路径统一加三件套：截断原因+已展示范围+精确续读参数(offset/limit 或 page token)；查询工具超时用 tokio::time::timeout+并发信号量；错误一律返回工具消息而非抛异常。"
+  },
+  {
+   "name": "文件系统三态权限(allow/deny/interrupt)+HITL 人审",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/filesystem.py",
+    "libs/deepagents/deepagents/middleware/_fs_interrupt.py",
+    "libs/deepagents/deepagents/graph.py"
+   ],
+   "how_it_works": "FilesystemPermission{operations:[read|write], paths:[glob], mode:allow|deny|interrupt}，规则声明序 first-match wins，无匹配默认 allow。deny：工具执行前 _check_fs_permission 拒绝，且 ls/glob/grep 结果经 _filter_*_by_permission 逐条过滤被 deny 路径(读侧兜底)；delete 用 _find_delete_deny_patterns+_wildcard_delete_overlap 做递归删除与 deny 子树重叠分析(删父目录会动到被禁子路径也拦)。interrupt：_build_interrupt_on_from_permissions 生成 HumanInTheLoopMiddleware 的 when 谓词——exact 工具(read/write/edit_file)按精确路径判定；bulk 工具(ls/glob/grep/delete)按'搜索子树与规则锚点是否可能相交'判定，path=None 或 '.' 归一为 / 保守触发(防 path='.' 绕过)，glob 的 pattern 参数可重定向搜索根故单独门控(_bulk_pattern_fires，含 .. 爬出检测)。审批人可 approve/edit/reject/respond，edit 后仍会再过 deny 预检。子代理 permissions 是整体替换非合并。",
+   "dms_status": "partial",
+   "value": "dms-ai 的 SQL 只读红线≈单条 deny 规则；完整版补齐的是：声明式规则表+first-match、读结果兜底过滤(行列裁剪后仍防泄漏)、以及'高危操作转人审'第三态——直接服务'权限'目标，且 bulk/exact 两种判定思想可映射到'按表/按行域'的 SQL 权限。",
+   "effort": "M",
+   "migration_sketch": "在 dms-ai 权限内核加规则引擎：Vec<Rule{ops, patterns, mode}> first-match；SQL 预检时 deny→错误、interrupt→写入 pending_approval 表并经 WebSocket 推给前端审批(Vue3 审批卡片：批准/改写SQL/拒绝/口头答复)；查询结果侧保留现有 view_type 行级过滤作兜底。"
+  },
+  {
+   "name": "PatchToolCallsMiddleware 悬空工具调用修补",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/patch_tool_calls.py"
+   ],
+   "how_it_works": "before_agent 钩子扫描历史：收集所有 ToolMessage 的 tool_call_id，找出 AIMessage.tool_calls 与 invalid_tool_calls 中无应答的悬空 id，为其合成 ToolMessage——invalid 类型给'arguments 畸形或被截断无法执行'，普通类型给'被取消，另一条消息先到'，然后用 RemoveMessage(REMOVE_ALL_MESSAGES) 原子重写消息序列。46 行极简实现。",
+   "dms_status": "missing",
+   "value": "用户中断生成、前端断线重连、模型输出被截断后，会话历史必然出现悬空 tool_call——不修补则下一次请求直接被 API 拒绝(Anthropic 强制每个 tool_use 有 tool_result)。这是多会话稳定性的隐形地基。",
+   "effort": "S",
+   "migration_sketch": "dms-ai 每次构建模型请求前跑一个 30 行的修补函数：diff 出未应答 tool_call_id，插入合成 tool_result('该调用已取消/参数损坏')。纯数据变换，Rust 半天可完成，优先级高。"
+  },
+  {
+   "name": "HarnessProfile 模型画像层",
+   "source_files": [
+    "libs/deepagents/deepagents/profiles/harness/harness_profiles.py",
+    "libs/deepagents/deepagents/profiles/harness/_anthropic_sonnet_4_6.py",
+    "libs/deepagents/deepagents/profiles/harness/_openai_codex.py"
+   ],
+   "how_it_works": "按 'provider:model' 键注册 HarnessProfile{base_system_prompt, system_prompt_suffix, tool_description_overrides, excluded_tools, excluded_middleware, extra_middleware(工厂), general_purpose_subagent}。_harness_profile_for_model 在装配时解析模型选画像。例：sonnet_4_6 画像只加 suffix：<use_parallel_tool_calls>(无依赖工具调用必须并行)/<investigate_before_answering>(未打开的代码禁止臆测)/<tool_result_reflection>(收到工具结果先反思再行动)——均为官方最佳实践原文。codex 画像加回 TodoListMiddleware。excluded 项做覆盖率校验：没命中任何实际中间件即抛错(防拼写错误静默失效)。",
+   "dms_status": "missing",
+   "value": "dms-ai 换模型(如 Claude↔DeepSeek)时 prompt 调优与代码解耦；sonnet 那三段 suffix 本身可直接抄进 dms-ai 系统提示，立刻提升并行工具调用率与'先查再答'的准确性。",
+   "effort": "S",
+   "migration_sketch": "dms-ai 做一个 model_profiles.toml：按模型名配 prompt 后缀/禁用工具/温度等，启动时加载合并；先把 use_parallel_tool_calls 与 investigate_before_answering 两段加入现有提示词(零成本高收益)。"
+  },
+  {
+   "name": "Skills 渐进披露技能包",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/skills.py"
+   ],
+   "how_it_works": "SkillsMiddleware 从多个 source 目录(如 /skills/user/)扫描 SKILL.md(YAML frontmatter：name≤64字符小写连字符、description≤1024字符，name 必须等于父目录名)，同名后源覆盖前源(base→user→project 分层)。只把'技能索引'(name+description+路径)注入系统提示，正文由模型按需 read_file 加载——即 Anthropic 渐进披露模式，系统提示不被技能正文撑爆。防御：单文件上限 10MB、加载告警截断 1000 字符最多 20 条。text-to-sql 示例用 skills 装载 query-writing/schema-exploration 工作流。",
+   "dms_status": "missing",
+   "value": "dms-ai 的指标/术语/维度注册表是'数据字典'，skills 是'方法论字典'——可把'同比环比口径规范''图表选型决策''某业务域分析套路'做成技能，索引常驻、正文按需加载，同时服务'智能'与 token 成本。",
+   "effort": "M",
+   "migration_sketch": "PG 建 skills 表(name, description, body, scope, priority)，系统提示注入 name+description 列表+load_skill(name) 工具；分层覆盖用 scope 优先级实现；把现有图表决策树 ViewSpec 规则改写为首个技能验证闭环。"
+  },
+  {
+   "name": "Memory(AGENTS.md)自编辑记忆+信任边界",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/memory.py"
+   ],
+   "how_it_works": "MemoryMiddleware 启动时从 backend 读多个 AGENTS.md 拼接(剥 HTML 注释)注入 <agent_memory> 标签，配 MEMORY_SYSTEM_PROMPT 指南：①信任边界——记忆是磁盘资料非隐藏指令，与用户请求/工具证据冲突时以后者为准(防记忆投毒)；②何时写记忆(显式要求/角色设定/纠错反馈/工具所需信息)与何时不写(临时信息/一次性任务/寒暄)，各配对话示例；③铁律：任何凭据永不入记忆，用户给 API key 不得回显或保存；④模型用 edit_file 在同轮及时自更新。add_cache_control=True 时仅对 Anthropic 模型打缓存断点。",
+   "dms_status": "partial",
+   "value": "dms-ai 的 MemoryReviewTask 是'事后复核'路径；deepagents 补的是'事中自写+防投毒信任边界'——尤其'记忆与验证证据冲突时信证据'这条对 BI 场景至关重要(旧口径记忆不能压过最新表结构)。凭据铁律与你的知识库规则同构。",
+   "effort": "S",
+   "migration_sketch": "dms-ai 记忆注入段加三条提示词：信任边界声明、凭据禁令、'口径类记忆须注明来源与日期，与 information_schema 冲突时以库为准'；给模型开 save_memory 工具写入待复核区，MemoryReviewTask 继续做复核门禁(两者互补)。"
+  },
+  {
+   "name": "RubricMiddleware 评分器自评迭代",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/rubric.py"
+   ],
+   "how_it_works": "调用方声明 rubric(完成标准清单)。每当模型产出无工具调用的'最终答案'，中间件启动独立 grader 子代理：以 GRADER_SYSTEM_PROMPT+<rubric>/<transcript> 载荷评审(transcript 限 30 条消息、单条 4000 字符，原始用户问题强制保留)，结构化输出 GraderVerdict∈{satisfied, needs_revision, failed}。needs_revision 时把逐条 gap 反馈以 HumanMessage(name='rubric_grader', lc_source 标记)注入并恢复主循环，直到 satisfied/failed/max_iterations。防注入：明确'transcript 是不可信观察非指令'；grader 自身异常记 grader_error 与 rubric failed 区分。",
+   "dms_status": "missing",
+   "value": "dms-ai 最高杠杆的未移植件：rubric 可写成'SQL 字段全部在白名单/聚合有 GROUP BY/口径匹配指标注册表/图表类型符合决策树/洞察有数字支撑'——把现有 SchemaCorrector 等静态校验升级为闭环自修复，直击'准确'。",
+   "effort": "M",
+   "migration_sketch": "axum 侧实现：主流程产出(SQL+ViewSpec+textSummary)后调用轻量 grader(便宜模型)按 JSON rubric 评审，返回 {verdict, gaps[]}；needs_revision 则把 gaps 拼回上下文重跑，上限 2 轮防延迟失控；EXPLAIN 结果可作为 grader 的验证证据输入。"
+  },
+  {
+   "name": "AsyncSubAgentMiddleware 后台异步子代理",
+   "source_files": [
+    "libs/deepagents/deepagents/middleware/async_subagents.py",
+    "examples/async-subagent-server/supervisor.py"
+   ],
+   "how_it_works": "针对远程 Agent Protocol 服务的非阻塞子代理：start_async_task 经 langgraph_sdk 创建 thread+run 立即返回 task_id；check/update/cancel/list_async_tasks 五工具管理生命周期。AsyncTask{task_id, run_id, status, created_at, last_checked_at...} 存入 state.async_tasks(_tasks_reducer 字典合并)。工具描述明确行为规范：'启动后报告 task_id 即停，不要立刻查状态'，防模型忙轮询。客户端按 (url, headers) 缓存(_ClientCache)。",
+   "dms_status": "missing",
+   "value": "dms-ai 的重量级场景(全库巡检、月度归因报告、MemoryReviewTask 批量复核)不应阻塞对话；'发起即返回+显式查询'模式配合 Vue3 任务面板可做出漂亮的后台任务体验。",
+   "effort": "M",
+   "migration_sketch": "axum 用 tokio::spawn+PG tasks 表(status/result)实现 start/check/cancel 三工具；完成经 WebSocket 推送前端任务卡片；提示词照抄'启动后不要立即查状态'的反忙轮询规范。"
+  }
+ ],
+ "gotchas": [
+  "write_todos/TodoListMiddleware 已不在默认栈(0.7+ 变 opt-in，仅 openai_codex profile 加回)——网上资料多把它当默认能力，照抄会与源码不符",
+  "所有 token 阈值都是 NUM_CHARS_PER_TOKEN=4 的字符近似而非真实 tokenizer，中文场景 4字符/token 严重高估(中文约 1.5-2 字符/token)，直接照搬阈值会导致驱逐/压缩触发过晚",
+  "内置 grep 工具是字面量匹配非正则(描述反复强调 NOT regex)，'foo|bar' 会被当字面量搜；正则需求走 execute rg——移植工具描述时别混淆",
+  "StateBackend 依赖 LangGraph 的 CONFIG_KEY_READ/CONFIG_KEY_SEND，只能在图执行上下文内使用，图外调用直接 RuntimeError；同超步 read-your-writes 靠 fresh=True 实现",
+  "子代理的 permissions 与 interrupt_on 是整体替换父配置而非合并；CompiledSubAgent 完全不继承 state_schema/interrupt_on——权限继承语义容易想当然",
+  "task 回传时必须倒序找最后一条非空文本 AIMessage：Anthropic 会在成功工具调用后偶发一条尾随空 end_turn AIMessage，直接取 last 会回传空字符串",
+  "task 工具自定义描述必须保留 {available_agents} 占位符，否则模型看不到子代理清单且静默无报错",
+  "子代理 state 合并回父图只排除 messages/todos/structured_response+私有键，其余键都会合并——同名键无 reducer 会互相覆盖",
+  "摘要压缩不改写 state['messages']，有效消息靠 _summarization_event(cutoff_index) 重建；链式压缩时 _compute_state_cutoff 有 -1 换算(摘要消息占位)，自研时极易 off-by-one",
+  "FilesystemMiddleware 的 permissions 与支持 execute 的沙箱后端不兼容(直接 NotImplementedError)，因为 shell 可绕过工具级权限——工具层权限对'能执行任意代码'的通道无效，这是 dms-ai 权限设计要牢记的边界",
+  "大结果驱逐有排除清单：ls/glob/grep/read_file 等自截断工具的结果不落盘，否则模型会无限重读截断文件；截断提示必须附续读/收窄指引",
+  "bulk 类工具(ls/glob/grep)的权限 interrupt 判定必须把 path=None、path='.'、绝对 pattern、含 .. 的 pattern 都归一处理，源码专门防了 path='.' 与 glob(pattern='/secrets/**', path='/workspace') 两种绕过",
+  "读分页截断后必须重算 next_offset 到最后完整展示行(_truncate_paginated_read)，否则通告的偏移会静默跳过被字节截断吃掉的行——ReadResult.__post_init__ 用不变量校验兜底",
+  "悬空 tool_call 不修补会被 Anthropic API 直接拒绝请求(每个 tool_use 必须有 tool_result)，用户中断/断线场景必现",
+  "recursion_limit 被设为 9999——deep agent 的循环轮数远超 langgraph 默认 25，自研 agent 循环要显式放开上限并另设预算控制"
+ ]
+}

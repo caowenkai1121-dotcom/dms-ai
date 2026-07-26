@@ -98,14 +98,33 @@ pub async fn try_compose(pg: &sqlx::PgPool, question: &str) -> Option<DirectHit>
 
 /// 去注册表文本里的全角括注（维护给人类看的说明，不是 SQL 的一部分；半角括号是 SQL 语法不动）
 fn strip_annotations(s: &str) -> String {
+    // 全角（）恒为注记；ASCII () 仅当组内含中文才是注记（否则是真 SQL 如 SUM(col)/IN('0','1')）
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut depth: usize = 0;
-    for c in s.chars() {
-        match c {
-            '（' => depth += 1,
-            '）' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => out.push(c),
-            _ => {}
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '（' || c == '(' {
+            let (open, close) = if c == '（' { ('（', '）') } else { ('(', ')') };
+            let mut depth = 1;
+            let mut j = i + 1;
+            while j < chars.len() && depth > 0 {
+                if chars[j] == open {
+                    depth += 1;
+                } else if chars[j] == close {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            let group: String = chars[i..j].iter().collect();
+            let has_cjk = group.chars().any(|ch| ('\u{4E00}'..='\u{9FFF}').contains(&ch));
+            if open == '(' && !has_cjk {
+                out.push_str(&group);
+            }
+            i = j;
+        } else {
+            out.push(c);
+            i += 1;
         }
     }
     out.trim().to_string()

@@ -138,10 +138,11 @@ fn infer_semantic(name: &str) -> Semantic {
         Semantic::Customer
     } else if n.contains("商品") || n.contains("SKU") || n.contains("sku") {
         Semantic::Goods
+    } else if n.contains('数') || n.contains("销量") || n.contains("笔数") {
+        // 「订单数/售后单数」是计数指标——必须先于 Order 判定，否则被"订单"抢走永远不算指标列
+        Semantic::Count
     } else if n.contains("单号") || n.contains("订单") {
         Semantic::Order
-    } else if n.contains('数') || n.contains("销量") || n.contains("笔数") {
-        Semantic::Count
     } else {
         Semantic::None
     }

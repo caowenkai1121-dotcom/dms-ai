@@ -85,6 +85,15 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 引擎 C 子命令：review-lessons —— 批量复核失败复盘产出的候选教训（candidate → active/disabled）
+    if args.len() >= 2 && args[1] == "review-lessons" {
+        let pg = db::pg_pool(&cfg.pg_url).await?;
+        let client = llm_client(&cfg);
+        let n = pipeline::review_lessons(&client, &pg, 100).await?;
+        println!("复核处理 {n} 条候选教训");
+        return Ok(());
+    }
+
     // 子命令：check-sql "<sql>" —— SchemaCorrector 字段校验冒烟
     if args.len() >= 3 && args[1] == "check-sql" {
         let pg = db::pg_pool(&cfg.pg_url).await?;
@@ -127,6 +136,9 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 4 && args[1] == "ask" {
         let mysql = db::mysql_pool(&cfg.mysql_url).await?;
         let pg = db::pg_pool(&cfg.pg_url).await?;
+        meta::migrate(&pg).await?;
+        inject::seed_rules(&pg).await?;
+        inject::load_rules(&pg).await?;
         let client = llm_client(&cfg);
         let p = principal::load_principal(&mysql, &args[2], args.get(4).map(|s| s.as_str())).await?;
         let r = pipeline::ask(&client, &mysql, &pg, &p, &args[3], None).await?;
@@ -165,6 +177,10 @@ async fn main() -> anyhow::Result<()> {
     let pg = db::pg_pool(&cfg.pg_url).await?;
     meta::migrate(&pg).await?;
     chat::migrate(&pg).await?;
+    // 权限档案：种子灌表 + 加载注册表（fail-closed 依据，必须成功）
+    inject::seed_rules(&pg).await?;
+    let n_rules = inject::load_rules(&pg).await?;
+    tracing::info!("scope_binding 权限档案加载 {n_rules} 张表");
 
     let graph_status = Arc::new(std::sync::Mutex::new(String::from("never")));
     let state = Arc::new(AppState {
@@ -299,6 +315,14 @@ async fn api_ask(
     let p = principal::load_principal(&st.mysql, &login_name, role_code.as_deref())
         .await
         .map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+    // 会话归属校验：非属主禁止读写（防越权借他人 conv_id 泄露上一问/写入消息）
+    if let Some(cid) = req.conv_id {
+        match chat::conv_owner(&st.pg, cid).await {
+            Ok(Some(owner)) if owner == login_name => {}
+            Ok(_) => return Err(err(StatusCode::FORBIDDEN, "无权访问该会话".into())),
+            Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        }
+    }
     // 多轮追问改写用的上一轮问题（同会话）
     let prev = match req.conv_id {
         Some(cid) => chat::last_question(&st.pg, cid).await.ok().flatten(),
@@ -311,7 +335,7 @@ async fn api_ask(
     // 存会话消息（用户问 + AI 结果），首问顺手设标题
     if let Some(cid) = req.conv_id {
         let _ = chat::save_msg(&st.pg, cid, "user", &req.question, None).await;
-        let _ = chat::save_msg(&st.pg, cid, "ai", &req.question, Some(&payload)).await;
+        let _ = chat::save_msg(&st.pg, cid, "ai", "", Some(&payload)).await;
     }
     Ok(Json(payload))
 }
@@ -347,8 +371,17 @@ async fn api_conv_new(
 
 async fn api_conv_msgs(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<i64>,
+    axum::extract::Query(q): axum::extract::Query<ConvQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (login, _) = resolve_identity(&headers, &q.login_name, &None)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "未认证" }))))?;
+    // 会话归属校验（防越权读他人会话）
+    match chat::conv_owner(&st.pg, id).await {
+        Ok(Some(owner)) if owner == login => {}
+        _ => return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "无权访问该会话" })))),
+    }
     let msgs = chat::conv_msgs(&st.pg, id).await.unwrap_or_default();
     Ok(Json(serde_json::json!({ "msgs": msgs })))
 }

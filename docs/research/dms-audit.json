@@ -1,0 +1,157 @@
+{
+ "modules": [
+  {
+   "file": "crates/server/src/main.rs",
+   "loc": 429,
+   "role": "入口：axum 路由(/api/health、/api/sso、/api/wework/login、/api/ask、/api/convs、/api/conv/{id})+8 个 CLI 子命令(meta sync/autodiscover、review-pending、review-lessons、check-sql、graph sync、retrieve、ask、scope)+AGE 图 nightly 03:00 定时重建(secs_until_next_3am)"
+  },
+  {
+   "file": "crates/server/src/pipeline.rs",
+   "loc": 881,
+   "role": "NL2SQL 主流水线：ask/ask_single 路由(图→direct→语义缓存→LLM)+generate_sql prompt 装配(五路口径卡)+四校正器接线+repair 自修+execute 只读执行+few-shot 回写+review_exemplar/review_failure/review_lessons 记忆复核闭环+try_semantic_cache(时间/数字词护栏)"
+  },
+  {
+   "file": "crates/server/src/meta.rs",
+   "loc": 1303,
+   "role": "语义层元数据(最大文件)：migrate 建 12 张 meta 表、sync_schema 采集 244 表/5488 列、seed 系列硬编码种子(20 条⚠️警告/kw_force/12 指标/9 维度/value_map/join_edge/术语)、retrieve 三路召回、recall_* 五路口径卡、autodiscover_dict_columns 字典自动对码(best_dict_match 防撞车闸)、sync_elements 元素统一注册、log_correction/log_failure"
+  },
+  {
+   "file": "crates/server/src/direct.rs",
+   "loc": 878,
+   "role": "确定性快路径(0-LLM)：try_compose 通用组合器(指标×维度装配+find_path BFS≤3跳+扇出闸+时间桥+qualify_cols 裸列限定+has_entity_residue 实体守卫)、try_direct(sniff_doc_code 单号直查/sales_breakdown 六维度模板/agg_template 时间窗聚合+prev_window 环比)、detect_relation 图问题识别"
+  },
+  {
+   "file": "crates/server/src/corrector.rs",
+   "loc": 812,
+   "role": "四件纯 AST 校正器(移植 SuperSonic)：schema_check 字段白名单(幻觉列携真实列清单)、fix_group_by 补全、correct_agg/normalize_agg 聚合归一(parse_agg_rule)、correct_value/link_values_with 值链接换码(eq 换码/like 改写)"
+  },
+  {
+   "file": "crates/server/src/viewspec.rs",
+   "loc": 545,
+   "role": "ViewSpec 呈现协议：infer_role/infer_semantic 列语义推断、build 决策树(KPI卡/实体卡/趋势线/饼柱/分组柱/表格)、patch_kpi_delta 环比、compute_insight 确定性洞察(CR3/首末涨跌)、infer_drill 下钻推荐"
+  },
+  {
+   "file": "crates/server/src/scope.rs",
+   "loc": 403,
+   "role": "数据权限集合计算：compute_scope 1:1 复刻 Java DefaultEmployee(基础档 MAX view_type 0/1/2/3/10、定制档 101 下属递归/102 分组/103 团队、哨兵-1 拒绝 vs 空集放行、超管短路)+compute_scope_cached 当日进程内缓存"
+  },
+  {
+   "file": "crates/server/src/inject.rs",
+   "loc": 301,
+   "role": "权限 SQL AST 注入器：inject 递归下钻 CTE/子查询/UNION，binding_of 硬编码 8 张表列绑定，build_condition 按 Java 段顺序 OR 拼接"
+  },
+  {
+   "file": "crates/server/src/graph.rs",
+   "loc": 196,
+   "role": "AGE 图问答：sync 聚合客户-商品 BOUGHT 边(UNWIND 批量建点建边)、buyers_of_goods/goods_of_customer/copurchase 三类 Cypher 查询、agtype ::text 包裹解析"
+  },
+  {
+   "file": "crates/server/src/chat.rs",
+   "loc": 139,
+   "role": "多会话持久化：chat.conv/chat.msg 表、list_convs/new_conv/conv_msgs/save_msg(首问设标题)/last_question(供追问改写)/delete_conv/conv_owner"
+  },
+  {
+   "file": "crates/server/src/wework.rs",
+   "loc": 107,
+   "role": "企微 OAuth 端#3：login_by_code 全链(code→userid→手机号→t_employee.login_name)，access_token 进程内缓存"
+  },
+  {
+   "file": "crates/server/src/llm.rs",
+   "loc": 99,
+   "role": "LLM 客户端：LlmClient.chat(OpenAI 兼容 HTTP，fast/precise 双模型)+extract_sql 围栏抽取"
+  },
+  {
+   "file": "crates/server/src/auth.rs",
+   "loc": 93,
+   "role": "三端统一认证：issue/resolve 会话 token(uuid，12h 滑动续期)+verify_dms_token SSO 验真(调 DMS getLoginInfo)"
+  },
+  {
+   "file": "crates/server/src/principal.rs",
+   "loc": 68,
+   "role": "当前用户加载：load_principal 员工+单激活角色，无角色 fail-closed(超管例外)"
+  },
+  {
+   "file": "crates/server/src/db.rs",
+   "loc": 66,
+   "role": "配置与连接池：load_settings 就近找 settings.json、mysql_pool 连接级 SET SESSION TRANSACTION READ ONLY 只读红线、pg_pool"
+  },
+  {
+   "file": "crates/server/src/embed.rs",
+   "loc": 51,
+   "role": "向量服务客户端：embed_query 调本地 bge :8077(3s 超时+300s 熔断静默降级)、to_pgvector 字面量"
+  },
+  {
+   "file": "web/src/App.vue",
+   "loc": 435,
+   "role": "对话流 ChatBI 主界面：会话侧栏/DMS SSO 与企微 fragment 双 boot/send 防抖+耗时跳动/drill 参数化下钻/exportCsv/明暗主题"
+  },
+  {
+   "file": "web/src/BiChart.vue",
+   "loc": 126,
+   "role": "ECharts 封装：单色明度纪律、TOP 收纳、多序列区分色板、双语义双值轴"
+  },
+  {
+   "file": "web/src/ResultPanel.vue",
+   "loc": 81,
+   "role": "按 view.blocks 分发渲染 KPI/实体卡/图表/表格+insight 洞察条+下钻 chips(复合子面板复用)"
+  },
+  {
+   "file": "web/src/format.ts",
+   "loc": 58,
+   "role": "数值格式化：fmt 按语义、compress 万/亿压缩、省级区划码翻省名"
+  },
+  {
+   "file": "web/src/theme.css",
+   "loc": 37,
+   "role": "靛蓝主题 tokens(明暗双主题变量)"
+  },
+  {
+   "file": "web/src/main.ts",
+   "loc": 6,
+   "role": "Vue3 应用入口(createApp+pinia)"
+  }
+ ],
+ "ported_inventory": [
+  "权限内核 1:1 复刻 Java @DataScope：scope::compute_scope(基础档 MAX view_type、定制档 101/102/103、哨兵 in(-1) 拒绝 vs 空集放行、超管短路)+inject::inject AST 注入(CTE/子查询/UNION 递归、反引号表名测试锁死)+principal::load_principal fail-closed；tools/judge_scope.py 判官对拍 6/6",
+  "三道只读防线：db::mysql_pool 连接级 READ ONLY + pipeline::is_safe_select(单 SELECT AST+FORBIDDEN 关键词+敏感列+占位符幻觉)+ensure_limit 护栏 LIMIT 200",
+  "语义层 12 张 PG 元数据表(meta::migrate)：table_doc/column_doc/kw_force/pitfall/sql_exemplar/term/metric/dimension/value_map/element/correction_log/failure_log/join_edge，全部幂等 upsert",
+  "三路召回 meta::retrieve(kw_force 强制补表+向量 embedding<=>+word_similarity trgm)+五路口径卡注入 prompt(recall_metrics/recall_dimensions/recall_terms/recall_elements/recall_pitfalls)",
+  "确定性快路径 0-LLM 四层：direct::sniff_doc_code 单号直查(HJXH-/SPC- 前缀)、agg_template 时间窗×指标(prev_window 环比)、sales_breakdown 六维度模板、try_compose 通用组合器(注册表装配+join_edge BFS+扇出闸防 SUM 虚增+时间桥+has_entity_residue 实体守卫)",
+  "四件 AST 校正器(corrector.rs)：schema_check 字段白名单幻觉列自修、fix_group_by 确定性补全、correct_agg 聚合归一(COUNT→COUNT DISTINCT 等)、correct_value 值链接换码(eq/like 双模式)；每次出手 meta::log_correction 记录",
+  "语义缓存 try_semantic_cache：余弦距离<0.12 命中已复核语料+time_tokens/number_tokens 护栏全等(防上月命中本月)，复用 SQL 但权限按当轮注入",
+  "多轮追问改写 rewrite_followup(is_followup ≤14 字+标记词门控，fast 模型结合 chat::last_question)+复合问题拆解 is_compound→split_questions→futures::join_all 并行→AskResult::compound 多子面板",
+  "记忆复核闭环：few-shot 回写 sql_exemplar(pending)→异步 review_exemplar 判 enabled/disabled；失败复盘 review_failure 产候选教训(save_lesson_candidate candidate 态)→review_lessons 批量复核启用；zero-rows/exec-error 落 failure_log",
+  "引擎 A1 字典码列自动对码 meta::autodiscover_dict_columns：码型后缀+小表 DISTINCT 抽样(10s 超时)、best_dict_match 三闸(注释点名优先/≥8 值 cov=1.0 直通/name_aligns 3-gram 名称对齐)，自动注册 value_map+dimension，实跑 65 项零撞车",
+  "AGE 图问答：graph::sync 聚合 2591 客户/455 商品/9.8 万 BOUGHT 边、buyers_of_goods/goods_of_customer/copurchase、detect_relation 识别抽实体，仅全权限用户走图(限权回落 LLM 注入)，main.rs nightly 03:00 定时重建+health 可观测 graph_status",
+  "ViewSpec 呈现协议：viewspec::build 决策树(单行全指标→KPI/单行多列→实体卡/明细多维→表格/时间→趋势线/1 类别 1 指标→饼柱/1 类别多指标→分组柱)+patch_kpi_delta 环比+compute_insight 确定性洞察+infer_drill 下钻推荐",
+  "三端认证：auth::issue/resolve 会话 token(12h 滑动续期)+verify_dms_token DMS SSO+wework::login_by_code 企微 OAuth 全链+main.rs resolve_identity Bearer 优先回退 login_name",
+  "多会话持久化 chat.rs：conv/msg 级联删除、首问自动设标题、回放；前端 App.vue 侧栏会话管理",
+  "embed 客户端 embed.rs：本地 bge 512 维 :8077，3s 超时+300s 熔断，缺席全链路静默降级(retrieve/语义缓存/元素召回均判 None 回退)",
+  "scope 进程内当日缓存 compute_scope_cached(限权用户 15.2s→3.4s)",
+  "前端对话流 BI：App.vue 双 boot(dms_token SSO/企微 fragment token)+CSV 导出+drill 参数化重问；BiChart 单色纪律/TOP 收纳/双值轴；format.ts 万亿压缩+省码翻名(与后端 viewspec::province_cn 镜像)"
+ ],
+ "debt": [
+  "巨型文件+知识硬编码：meta.rs 1303 行混 7 种职责(DDL/采集/种子/召回/自动发现/日志/渲染)，且 WARNS 20 条、KW_FORCE、METRICS 12 项、DIMENSIONS 9 项、value_maps 全部以 const 数组硬编码在 seed_* 函数里——与 ADAPTIVE-REFACTOR 总纲『一切知识是数据不是代码』相悖，改口径要改代码重编译；pipeline.rs 881/direct.rs 878 也逼近巨型",
+  "手工模板与注册表口径双写：direct.rs sales_breakdown 六维度 SQL(省份/业务员/分类等)与 meta.dimension 种子表达式重复维护同一口径，改一处漏一处；时间词枚举三处独立(direct::time_window、direct::prev_window、pipeline::time_tokens)，加『上季度』要改三处",
+  "越权漏洞——会话归属未校验：chat::conv_owner 已实现但 main.rs 从未调用；api_conv_msgs 任意登录者可 GET /api/conv/{id} 读他人会话，api_ask 存消息也不校验 conv_id 归属(可写入他人会话)。PROGRESS.md M5c 声称『归属校验防越权』与代码不符",
+  "权限核心零单测面：scope.rs(403 行权限集合计算)、principal.rs、chat.rs、db.rs、embed.rs、wework.rs 单测数为 0，scope 只靠外部连库判官 tools/judge_scope.py；集成回归(regression.py 53 题)全部依赖连库+LLM，无法离线 CI",
+  "进程内状态不可扩展：auth::SESSIONS、scope::SCOPE_CACHE、wework::TOKEN 全是 OnceLock<Mutex<HashMap>>——重启丢全部会话、无法多实例部署",
+  "inject::binding_of 硬编码 8 张表绑定，注释自认『M1 硬编码，M2 迁 PG 元数据』至今未兑现；未绑定表=不注入=放行，新增权限敏感表若忘登记即 fail-open",
+  "is_safe_select 子串匹配隐患：FORBIDDEN 用 lower.contains(\"update \")——SQL 字符串字面量或注释含这些词会误拦；ensure_limit 用 contains(\"LIMIT\") 判断，别名/字面量含 limit 即跳过追加护栏",
+  "api_ask 保存 AI 消息语义错乱：save_msg(cid, \"ai\", &req.question, payload) 把用户问题存进 role='ai' 行的 question 字段；前端 routeLabel 缺 semantic-cache/compound/llm+schema-fix 映射(显示原始英文)",
+  "自进化引擎 B+/C 半闭环：correction_log/failure_log 只写不读，『同错累计≥3 升格 pitfall』的 S4 升格器未实现；review_all_pending/review_lessons 逐条串行 await LLM，量大极慢",
+  "性能小账：try_compose 每问全量拉 metric/dimension/join_edge 三表无缓存；recall_metrics/dimensions/terms 每问全表扫内存过滤；graph::sync drop 重建期间图查询有空窗",
+  "chrono_today 手写 civil_from_days 用 UTC 秒数算『今天』(服务器时区偏移下与本地日期可能差一天)，而 main.rs 已用 chrono::Local——两套日期来源不一致"
+ ],
+ "seams": [
+  "校正链插槽：pipeline::ask_single 内 schema_check→fix_group_by→correct_agg→correct_value 顺序串行、每件都是『纯 AST 函数+Option 返回+log_correction 记录』的统一形状——新校正器(默认时间范围补下界、自一致性投票、DISTINCT 去重补全)照此模式插入一行即可，corrector.rs 的 collect/last_ident 等辅助可直接复用",
+  "meta 注册表体系：metric/dimension/term/value_map/join_edge 全部幂等 upsert，sync_elements 自动汇入 element 统一向量化(search_text 变化自动清 embedding 待重建)——新指标/维度只需加种子行或让 autodiscover 注册，recall_*、try_compose、correct_agg、correct_value 全链路自动生效，零代码改动",
+  "direct 快路径四层路由front：ask_single 的 try_graph→try_compose→try_direct→try_semantic_cache 顺序清晰、各层 Option 返回未命中即下沉——新确定性能力有三个挂点：doc_binding 加单号前缀、Relation 枚举加图关系变体、try_direct 的 or_else 链加新模板",
+  "CLI 子命令面：main.rs args 分发已有 8 个子命令(meta sync/autodiscover、review-pending、review-lessons、check-sql、graph sync、retrieve、ask、scope)——新离线任务(如 S4 升格器『correction-promote』、失败日志报表)照样式加 if 分支即可，stdout 出 JSON 供脚本消费的约定已确立",
+  "ViewSpec Block 扩展：viewspec::Block 是 serde tagged enum，前端 ResultPanel.vue 按 b.type 分发——新呈现形态(地图/漏斗/双列对比)后端加变体+decision 分支、前端加 v-else-if 即成；insight 生成(compute_insight)同样是纯函数可加新模式",
+  "自进化 S4 数据已就绪：correction_log(kind/question/detail)与 failure_log(kind/sql/error)持续积累，升格器只需读日志聚合同错计数→save_lesson_candidate→review_lessons 既有复核链，闭环最后一公里管道全通",
+  "权限绑定数据化：inject::binding_of 单函数 match 即全部绑定真相，迁 meta.scope_binding 表(table/customer_col/owner_col/owner_kind)后 binding_of 改查表即可数据驱动，Binding 结构体与 build_condition 无需动",
+  "embed 可替换点：embed.rs 单 URL 常量+统一 512 维约定，换向量模型/远程服务只动一个文件；element/table_doc/sql_exemplar 三处 embedding 列的增量重建机制(NULL 待补)已支持批量 build 脚本(tools/embed_service.py build)",
+  "prompt 装配段落化：generate_sql 的 user prompt 是『指标口径→维度口径→术语→语义召回元素→表结构→pitfall→few-shot→问题』顺序拼接——新知识源(如 join_edge 路径提示、企业日历)按段插入即可，不动其他段"
+ ]
+}

@@ -91,7 +91,7 @@ async function openConv(id: number) {
   curConvId.value = id
   turns.value = []
   try {
-    const r = await (await fetch(`/api/conv/${id}`, { headers: authHeaders(false) })).json()
+    const r = await (await fetch(`/api/conv/${id}${loginQuery()}`, { headers: authHeaders(false) })).json()
     for (const m of r.msgs || []) {
       if (m.role === 'user') turns.value.push({ role: 'user', question: m.question })
       else turns.value.push({ role: 'ai', result: m.result || undefined })

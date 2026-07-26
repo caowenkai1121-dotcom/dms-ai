@@ -1,0 +1,199 @@
+{
+ "summary": "SuperSonic headless 是\"逻辑数据集\"语义层：外部只写 S2SQL（select 中文指标/维度名 from t_数据集ID）。翻译走责任链（ComponentFactory 注册的 QueryParser 列表）：SqlQueryParser 做字段→模型归属与名称换码并裁决 AggOption；MetricExpressionParser/DimExpressionParser 递归展开派生表达式；OntologyQueryParser 调 Calcite SqlBuilder 依据 JoinRelation 图（jgrapht Dijkstra 补桥接模型）生成带 JOIN 的内层本体 SQL；DefaultSemanticTranslator.mergeOntologyQuery 用 WITH 或子查询把内外层合并；再经 QueryOptimizer（方言重写 DbAdaptor.rewriteSql、补 LIMIT）出物理 SQL。权限在 server 层以 AOP 切面强制：行权限注入 WHERE、高敏感列权限拦截、维值别名换码回显。缓存为\"请求指纹→结果\"两级 Caffeine。chat 模块提供映射(HanLP 词典+向量)、多路自洽 LLM 生成、Corrector 修正链与 ChatWorkflowEngine 状态机（解析期即预翻译验证）。",
+ "mechanisms": [
+  {
+   "name": "两层SQL架构：QueryParser责任链+本体SQL合并",
+   "source_files": [
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/DefaultSemanticTranslator.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/SqlQueryParser.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/utils/ComponentFactory.java"
+   ],
+   "how_it_works": "DefaultSemanticTranslator.translate 依次执行 ComponentFactory.getQueryParsers()（每个 parser 有 accept/parse 两段协议，失败置 QueryState 短路），随后 mergeOntologyQuery 把外层用户 SQL（表名已被 SqlQueryParser.convertNameToBizName 换成 t_{dataSetId}）与内层本体 SQL 合并：数据库支持 WITH 则生成 `with t_xx as (内层SQL) 外层SQL`（已有 WITH 时用 SqlMergeWithUtils.mergeWith 合并），不支持则字符串替换为子查询 `(内层SQL) t_xx`。isSupportWith 判定 MySQL<8.0、ClickHouse<20.4 不支持 WITH（SqlGenerateUtils.isSupportWith）。最后跑 QueryOptimizer 链。",
+   "dms_status": "partial",
+   "value": "这是'准确'的根基：LLM 只面对单张宽表虚拟视图，JOIN/表达式/聚合全部由确定性代码兜底，LLM 幻觉面大幅缩小；同时天然形成'语义SQL→物理SQL'两级审计点，利于只读红线预检。",
+   "migration_sketch": "Rust 侧定义 trait QueryParser{fn accept(&self,stmt)->bool; fn parse(&mut stmt)->Result<()>}，用 Vec<Box<dyn QueryParser>> 顺序执行；合并层用 sqlparser-rs 生成 WITH CTE（PG 全版本支持 WITH，可省版本判断分支），禁用字符串替换法避免误替换。",
+   "effort": "M"
+  },
+  {
+   "name": "字段归属推导+JOIN图Dijkstra桥接+主外键ON推导",
+   "source_files": [
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/calcite/SqlBuilder.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/calcite/DataModelNode.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/pojo/JoinRelation.java"
+   ],
+   "how_it_works": "SqlQueryParser.buildOntologyQuery 三段式归属：①指标先定模型，维度优先落在已含指标的模型；②剩余字段找'单模型能覆盖全部'的模型（免 JOIN）；③再逐模型迭代兜底。SqlBuilder.probeRelatedModels 把 JoinRelation 建成 jgrapht 无向图，用 DijkstraShortestPath 找覆盖所有查询模型的路径，路径上的中间模型自动补入（雪花模型桥接表）。buildJoin 时 getMatchJoinRelation 双向匹配 left/right 并'取 join 条件数最多的关系'；若无显式 JoinRelation，getCondition 用两表 select 交集列+Identify 类型推导 ON（外键列必须对上对方主键，isForeign/isPrimary），join 类型经 getJoinSqlLiteral 归一默认 INNER。",
+   "dms_status": "missing",
+   "value": "dms-ai 目前单表/手写 JOIN；引入该机制后多模型口径（如订单+客户+门店）可自动出正确 JOIN，是'准确+智能'的最大增量点之一。",
+   "migration_sketch": "PG 元数据表存 model/join_relation(left,right,join_type,conditions jsonb)；Rust 用 petgraph 的 dijkstra 实现 probeRelatedModels；ON 条件推导按 identify(primary/foreign) 复刻。可先支持星型（一跳），雪花桥接二期。",
+   "effort": "L"
+  },
+  {
+   "name": "AggOption聚合裁决状态机（内层是否下推聚合）",
+   "source_files": [
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/SqlQueryParser.java",
+    "headless/api/src/main/java/com/tencent/supersonic/headless/api/pojo/enums/AggOption.java"
+   ],
+   "how_it_works": "SqlQueryParser.getAggOption 依据外层 S2SQL 形态决定内层本体 SQL 聚合策略：含聚合函数→AGGREGATION（内层直接聚合）；无聚合/无groupby/无子查询→NATIVE（内层出明细）；含 count/count_distinct 或有子查询/WITH/GROUP BY→OUTER（聚合留在外层，内层出明细防止双重聚合）；否则 DEFAULT。该裁决写入 OntologyQuery.aggOption 供渲染层用。",
+   "dms_status": "missing",
+   "value": "解决'外层已 count(distinct) 内层又 sum'类双重聚合错数问题——直接决定数字准不准，属于准确性硬伤防线。",
+   "migration_sketch": "dms-ai 的 SQL 改写层加一个 agg_option 判定函数（用 sqlparser-rs 检测聚合函数/子查询/groupby），当外层含 count_distinct 或嵌套聚合时，生成的视图 SQL 保持明细粒度不预聚合。纯逻辑约100行。",
+   "effort": "S"
+  },
+  {
+   "name": "派生指标/维度表达式递归展开",
+   "source_files": [
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/MetricExpressionParser.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/DimExpressionParser.java"
+   ],
+   "how_it_works": "MetricExpressionParser.buildFieldExpr 按 MetricDefineType 递归：METRIC 型指标的 expr 引用其他指标 bizName，则递归展开被引指标（visitedMetric map 防环与去重）；MEASURE 型把 measure.agg 包裹为 `AGG(expr)`；FIELD 型原样。展开后 SqlReplaceHelper.replaceSqlByExpression 把 S2SQL 中的指标 bizName 替换为最终物理表达式，并把表达式引用到的底层字段回填 queryMetric.getFields()（决定内层 select 哪些列）。DimExpressionParser 对维度 expr≠bizName 时同样替换。",
+   "dms_status": "partial",
+   "value": "支持'毛利率=毛利/收入，毛利=收入-成本'这类指标套指标的组合口径，dms-ai 指标注册表若只存单层表达式则算不了二阶派生指标。",
+   "migration_sketch": "指标表加 define_type(measure/metric/field) 与 expr；Rust 写递归展开器（HashMap 缓存已展开+环检测），展开后再交给现有 SQL 改写层做字段替换；注意展开引用的底层列要并入白名单校验集合。",
+   "effort": "M"
+  },
+  {
+   "name": "Calcite校验域+关键字转义+FilterToGroupScanRule谓词下推",
+   "source_files": [
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/calcite/SchemaBuilder.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/calcite/SemanticNode.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/calcite/FilterToGroupScanRule.java"
+   ],
+   "how_it_works": "SchemaBuilder.getScope 为每个数据集动态构造 CalciteSchema（DataModelNode.addSchemaTable 把维度注册为 VARCHAR、指标为 ANY），所有表达式经 SemanticNode.parse→scope.validateExpr 强校验，非法字段在翻译期即抛错；保留字自动按引擎加反引号（HANADB/PRESTO/TRINO 用双引号）。SemanticNode.optimize 用 HepPlanner+自定义 FilterToGroupScanRule 匹配 Filter→Project→Aggregate→Project 模式，把外层时间过滤（RuntimeOptions.minMaxTime）下推到聚合内层扫描前，减少聚合数据量；优化失败仅记日志不影响结果（SqlBuilder.optimizeParseNode try-catch）。",
+   "dms_status": "partial",
+   "value": "dms-ai 的 SchemaCorrector 只做字段白名单，缺'表达式级校验+时间谓词下推'；下推对大表聚合是数量级的提速（快），校验兜底表达式类幻觉（准确）。",
+   "migration_sketch": "校验用 sqlparser-rs 遍历表达式引用列对照注册表即可（不必引 Calcite）；谓词下推在生成 CTE 时实现：解析外层 WHERE 中分区时间列条件，克隆注入内层 SQL 的 WHERE（保守规则：仅时间列、仅 AND 顶层），失败静默跳过。",
+   "effort": "M"
+  },
+  {
+   "name": "同环比MetricRatioParser（多引擎自JOIN模板）",
+   "source_files": [
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/parser/MetricRatioParser.java"
+   ],
+   "how_it_works": "accept 检测 StructQuery 聚合器含 RATIO_ROLL(环比)/RATIO_OVER(同比)；generateRatioSql 按引擎选 H2EngineSql/MysqlEngineSql/CkEngineSql 内部类，核心是 `t0 left join t1 on 时间偏移对齐`：日环比 date_add -1 day、日同比 -7 day、周同比 to_monday(date_add 1 month)、月同比拼 '-01' 后 date_add 1 year 再 DATE_FORMAT 还原；非时间 group 列逐一 t0.g=t1.g；外层 `(cur-roll)/roll` 出比率并保留原值列；check() 禁止同环比混用且必须有时间过滤；强制 setEnableOptimize(false) 防优化器破坏结构。",
+   "dms_status": "missing",
+   "value": "同环比是经销商经营分析最高频问法（本月毛利同比？），LLM 手写窗口/自JOIN 极易错日期对齐——模板化后一次写对，准确+智能双收。",
+   "migration_sketch": "PG 版更简单：单趟 SQL 用窗口函数 lag(metric) over (partition by dims order by 时间桶) 或 CTE 自JOIN interval '1 day/7 day/1 month/1 year'；把 RATIO_ROLL/RATIO_OVER 做成 ViewSpec 的聚合算子，注意月粒度文本列需 to_date 往返。",
+   "effort": "M"
+  },
+  {
+   "name": "行/列权限AOP强制+权限提示回显",
+   "source_files": [
+    "headless/server/src/main/java/com/tencent/supersonic/headless/server/aspect/S2DataPermissionAspect.java",
+    "headless/server/src/main/java/com/tencent/supersonic/headless/server/aspect/DimValueAspect.java"
+   ],
+   "how_it_works": "@S2DataPermission 切面在 queryByReq/translate 入口执行7步：①needAuth 开关②模型管理员短路放行③checkModelVisible 可见性④authService.queryAuthorizedResources 取授权⑤checkColPermission：查询字段∩sensitiveLevel=HIGH 字段−已授权字段非空则抛 InvalidPermissionException（含'联系管理员xxx'）⑥checkRowPermission：授权行过滤表达式按 OR 拼接后 CCJSqlParserUtil.parseCondExpression 解析、SqlAddHelper.addWhere 注入到用户 SQL 的 WHERE（struct 查询则加 FilterOperatorEnum.SQL_PART 过滤器）⑦查询后 addHint 把行过滤描述写入 QueryAuthorization 随结果返回'当前结果已经过行权限过滤'。DimValueAspect 环绕同一入口：查询前把 WHERE 中维值别名/业务名→techName（=与IN分别处理），查询后结果集 techName→bizName 回显。",
+   "dms_status": "partial",
+   "value": "dms-ai 有 view_type 数据权限内核，但缺两点：高敏感列的'列级拦截+管理员提示'，以及'行权限已生效'的用户可见回显——后者对权限透明度和信任感（漂亮/权限）价值大。",
+   "migration_sketch": "axum 中做成 tower middleware/extractor：SQL 生成后、执行前统一注入行权限条件（复用现有 view_type→SQL 条件），列权限在白名单校验阶段顺带检查 sensitive_level；响应体加 authorization 字段，Vue3 结果卡片展示过滤说明。",
+   "effort": "M"
+  },
+  {
+   "name": "结果级查询缓存（请求指纹）+查询统计",
+   "source_files": [
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/cache/DefaultQueryCache.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/cache/CaffeineCacheManager.java",
+    "headless/server/src/main/java/com/tencent/supersonic/headless/server/facade/service/impl/S2SemanticLayerService.java"
+   ],
+   "how_it_works": "S2SemanticLayerService.queryByReq 流程：cacheKey=modelIds拼接+SemanticQueryReq.generateCommandMd5()（请求体指纹），命中直接返回并 setUseCache(true)；未命中走翻译+执行，结果 CompletableFuture 异步 put 进 Caffeine（CacheCommonConfig 控制开关）；同时 StatUtils.initStatInfo/statInfo2DbAsync 把每次查询的 SQL、耗时、是否命中缓存异步落库 QueryStatDO，支撑 useCnt 热度统计（HeuristicDataSetResolver 排序用到）。",
+   "dms_status": "partial",
+   "value": "dms-ai 的语义缓存是'问题→答案'层；补上'物理SQL指纹→结果集'层后，同一口径不同问法也能复用执行结果（多轮追问同数据改图表时零查询），显著提速。",
+   "migration_sketch": "Rust 用 moka 缓存：key=blake3(规范化SQL+权限上下文哈希)——务必把行权限条件纳入 key 防止越权命中；查询日志表(pg) 记 sql/耗时/cache_hit/user，为指标 useCnt 排序与慢查询观测供数。",
+   "effort": "S"
+  },
+  {
+   "name": "HanLP自定义词典映射+前后缀联想（精确召回层）",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/knowledge/KnowledgeBaseService.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/knowledge/MultiCustomDictionary.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/knowledge/SearchService.java",
+    "headless/server/src/main/java/com/tencent/supersonic/headless/server/task/DictionaryReloadTask.java"
+   ],
+   "how_it_works": "把维度值/指标名/维度名/术语写入 HanLP DoubleArrayTrie 自定义词典，词性(nature)编码为 _数据集ID_元素ID_类型（NatureHelper.convertToElementType 解码），分词即完成'词→schema元素'精确映射（HanlpDictMatchStrategy），与 EmbeddingMatchStrategy 向量召回双路并行；SearchService.prefixSearch/suffixSearch 基于 BinTrie 支持输入联想与维值补全；DictionaryReloadTask 定时从库重建词典，KnowledgeBaseService.updateSemanticKnowledge 增量更新。queryDimensionValue 优先查词典，miss 才回源 select distinct。",
+   "dms_status": "partial",
+   "value": "dms-ai 只有向量召回（EmbeddingMapper）；精确词典层对'东风本田''金昌盛'等专名零误差、零延迟命中，且免调用嵌入模型——准确与快的双保险，还顺带获得搜索框联想能力。",
+   "migration_sketch": "不必引 HanLP：PG 建 dict_word(word,element_type,element_id,dataset_id) 表 + pg_trgm/前缀索引做联想；Rust 内存加载 fst 或 aho-corasick 自动机做问题串多模式精确匹配，定时/事件重建。与向量召回结果按'精确>向量'优先级合并。",
+   "effort": "M"
+  },
+  {
+   "name": "多路自洽投票SC+few-shot动态采样",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/OnePassSCSqlGenStrategy.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/PromptHelper.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/parser/llm/ResponseHelper.java"
+   ],
+   "how_it_works": "PromptHelper.getFewShotExemplars 先向量召回 exemplar，相似度>0.989 视为'同题'强制入选；其余按相似度截尾+shuffle，为 N 次（PARSER_SELF_CONSISTENCY_NUMBER）推理各造一组不同示例，且每组保底一个最相似示例。OnePassSCSqlGenStrategy.generate 用 parallelStream 并发 N 次生成，ResponseHelper.selfConsistencyVote 对输出 SQL 字符串计数取多数票，附带票率 map；胜出 SQL 关联其所用 exemplars 便于溯源。Prompt 的 SideInfo 含 CurrentDate、术语表、'库不支持WITH'等提示。",
+   "dms_status": "missing",
+   "value": "对难问题（多条件+同环比+TopN 混合）单次生成波动大，3路投票可明显提升稳定性；历史正确问答对作为 exemplar 使系统'越用越准'。",
+   "migration_sketch": "dms-ai 已有语义缓存/记忆复核，可把复核通过的问答对存成 exemplar 表（question,schema,sql,embedding）；Rust 侧 tokio::join! 并发2-3次生成（温度>0），对 SQL 规范化（去空白/统一大小写）后投票；票率<阈值时降级走澄清或标记低置信。",
+   "effort": "M"
+  },
+  {
+   "name": "ChatWorkflowEngine状态机+解析期预翻译验证",
+   "source_files": [
+    "headless/server/src/main/java/com/tencent/supersonic/headless/server/utils/ChatWorkflowEngine.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/LLMPhysicalSqlCorrector.java"
+   ],
+   "how_it_works": "显式状态机 MAPPING→PARSING→S2SQL_CORRECTING→TRANSLATING→PHYSICAL_SQL_CORRECTING→FINISHED：每步失败带明确 errorMsg（'No semantic entities can be mapped...'）短路；关键设计是 TRANSLATING 在'解析阶段'就调 SemanticLayerService.translate 把修正后 S2SQL 翻成物理 SQL 做可行性验证（等价于 dry-run），失败在回答前暴露；最后 PHYSICAL_SQL_CORRECTING 用 LLMPhysicalSqlCorrector 对物理 SQL 做兜底修正并回写 querySQL。",
+   "dms_status": "partial",
+   "value": "dms-ai 有流水线但若缺'执行前 dry-run 翻译验证'环节，错误 SQL 会到执行期才炸；前置验证把失败转化为可解释的解析期错误，提升成功率与体验。",
+   "migration_sketch": "Rust 侧把现有流水线改为显式 enum State + loop match（易观测、易断点续跑）；生成 SQL 后先对 PG 发 PREPARE/EXPLAIN（只读预检已有，可加 EXPLAIN 验证列存在与类型），失败信息喂回修正器重试一次。",
+   "effort": "S"
+  },
+  {
+   "name": "Corrector修正链完整版细节（对照已移植简化版）",
+   "source_files": [
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/SchemaCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/GroupByCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/HavingCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/TimeCorrector.java",
+    "headless/chat/src/main/java/com/tencent/supersonic/headless/chat/corrector/WhereCorrector.java"
+   ],
+   "how_it_works": "对照 dms-ai 已移植项，完整版多出的关键细节：①SchemaCorrector.updateFieldNameByLinkingValue——用 ValueLinker 的值→字段映射反向纠正 LLM 写错的列名（值'金昌盛'出现在错误列时把列名替换为正确维度）；removeUnmappedFilterValue——删除 WHERE 中'未经值链接确认的等值条件'防值幻觉（排除日期与函数包裹）；②GroupByCorrector/AggCorrector 均先 SqlValidHelper.isComplexSQL（含子查询/UNION）则跳过修正防误伤；GroupBy 仅 QueryType.AGGREGATE 且无既有 groupby 才补，且排除已被聚合包裹的字段；③AggCorrector 仅在已有 groupby 时补聚合，defaultAgg 缺省回退 SUM；④HavingCorrector 给 HAVING 中裸指标补默认聚合；⑤TimeCorrector：无分区时间维度的数据集要'删除'日期条件（removeDateIfExist），只有时间上界时自动补下界；⑥WhereCorrector 把外部 QueryFilters 注入 WHERE。BaseSemanticCorrector.correct 统一 try-catch，单个修正器异常不断链。",
+   "dms_status": "partial",
+   "value": "这些细节都是踩坑后加的防御：isComplexSQL 跳过防止改坏嵌套SQL、值反推列名纠错、幻觉值条件删除——直接决定修正链是'越修越对'还是'越修越坏'。",
+   "migration_sketch": "逐条对 dms-ai 现有 corrector 做 gap 补丁：加 is_complex_sql 守卫、值→列反向纠正、未链接等值条件裁剪（保留日期/数值条件）、HAVING 补聚合；每条独立小函数+单测，走外科式修改。",
+   "effort": "S"
+  },
+  {
+   "name": "指标下钻维度约束校验MetricDrillDownChecker",
+   "source_files": [
+    "headless/server/src/main/java/com/tencent/supersonic/headless/server/utils/MetricDrillDownChecker.java"
+   ],
+   "how_it_works": "执行前校验：①指标配置了必要下钻维度(necessaryDimension)时，groupby/where 中缺失则抛'指标:X 缺失必要下钻维度:Y'；②groupby 中维度必须在查询指标配置的 relateDimension 下钻清单内（分区时间维度豁免），否则抛'维度:X 不在当前查询指标的下钻维度配置中'。防止语义无效组合（如 UV 类只在特定维度预计算的指标被任意维度切分出错数）。",
+   "dms_status": "missing",
+   "value": "经销商指标很多有口径限定（如某比率只按门店/月有意义），该校验把'能算但没意义/会错'的查询在执行前拦下并给出可读原因——准确性护栏。",
+   "migration_sketch": "指标注册表加 necessary_dims 与 allowed_drill_dims 两个数组字段；SQL 生成后用已有解析器提取 groupby/where 列做集合校验，错误消息直接返回给用户与修正器。约半天工作量。",
+   "effort": "S"
+  },
+  {
+   "name": "DbAdaptor方言适配+ResultLimitOptimizer兜底限流",
+   "source_files": [
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/adaptor/db/PostgresqlAdaptor.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/adaptor/db/DbAdaptorFactory.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/optimizer/ResultLimitOptimizer.java",
+    "headless/core/src/main/java/com/tencent/supersonic/headless/core/translator/optimizer/DbDialectOptimizer.java"
+   ],
+   "how_it_works": "翻译完成后 DbDialectOptimizer 取 DbAdaptorFactory.getEngineAdaptor(dbType).rewriteSql：PostgresqlAdaptor 把 MONTH()/DAY()/YEAR() 改写为 TO_CHAR(col,'MM'/'dd'/'YYYY')（jsqlparser 函数级替换并追加格式参数），并把反引号统一换双引号；getDateFormat 按 yyyymmdd/yyyy-MM-dd 两种存储格式生成周/月截断表达式（date_trunc('week',...)）。ResultLimitOptimizer 对无 LIMIT 的 SQL 追加默认 LIMIT（TranslatorConfig.TRANSLATOR_RESULT_LIMIT，默认1000）。每个 Adaptor 另提供 getColumns/classifyColumnType 做建模期字段类型→measure/time/categorical 自动分类。",
+   "dms_status": "partial",
+   "value": "dms-ai 单 PG 目标，但'LLM 爱写 MySQL 风格函数'问题相同：MONTH/反引号自动转 PG 是常见失败案例的机械修复；无 LIMIT 兜底是防大结果拖垮服务的红线之一。",
+   "migration_sketch": "在只读预检后加 PG 方言归一 pass：函数映射表(month/day/year/date_format/ifnull→to_char/coalesce)+反引号→双引号+缺 LIMIT 补默认值；classifyColumnType 逻辑可用于导入建模时自动标注字段角色。",
+   "effort": "S"
+  }
+ ],
+ "gotchas": [
+  "DataModelNode.findBaseModel 第二分支疑似真实 bug：统计完 modelDimCount 后排序却仍用 modelMetricCount（复制粘贴错误），无指标纯维度查询时基模型选择不可靠——移植时勿照抄",
+  "SqlQueryParser.getAggOption 末尾 defaultAggNullCnt>0 分支注释说返回 NATIVE 实际返回 DEFAULT，两分支等价成死代码；对照语义应以注释意图为准",
+  "mergeOntologyQuery 在数据库不支持 WITH 时用 StringUtils.replace 按表名字符串替换嵌入子查询，表名若作为子串出现在别处（列名/字符串字面量）会被误替换；PG 恒走 WITH 可规避",
+  "DefaultDimValueParser 只在整条 SQL 没有任何 WHERE 字段时才注入维度默认值（有任一过滤即跳过），并非'缺该维度就补'——语义是兜底而非合并，简化版易做错",
+  "中文别名必须加反引号（SqlQueryParser.aliasesWithBackticks），且 ORDER BY 聚合别名要替换为 select 序号（rewriteOrderBy/replaceAggAliasOrderbyField），否则部分引擎报错或排序错列",
+  "S2DataPermissionAspect 行权限表达式解析失败（JSQLParserException）仅记日志不阻断查询——权限静默失效风险；Rust 版必须 fail-closed",
+  "行权限多条表达式按 OR 合并（多角色取并集），与 dms-ai view_type 的合并规则需显式对齐，且缓存 key 若不含权限上下文会发生跨用户越权命中",
+  "GroupByCorrector 受配置 s2.corrector.additional.information 开关控制，且所有修正器遇 isComplexSQL（子查询/UNION）一律跳过——防误伤优先于修正",
+  "SemanticNode.parse 对 Calcite 保留字按引擎加不同引号（HANADB/PRESTO/TRINO 双引号，其余反引号），表达式先 validateExpr 再拼装，跳过校验会把字段错误延迟到执行期",
+  "EmbeddingMatchStrategy 相似度过滤有例外规则：检索词包含召回词时不受 threshold 限制（短词精确包含优先），简化版若一刀切阈值会漏召回",
+  "PromptHelper 把相似度>0.989 的 exemplar 视为同题强制入 few-shot；每路自洽推理用不同 shuffle 的示例组，这是投票多样性的来源，不能 N 路同 prompt",
+  "MetricRatioParser 强制 queryStatement.setEnableOptimize(false)，同环比 SQL 结构不能被优化器改写；且同比/环比不可同查、必须带时间过滤（check() 抛异常）",
+  "FilterToGroupScanRule/optimizeParseNode 全程 try-catch，优化失败静默回退原 SQL——优化必须是纯增益路径，不能因优化挂掉主链",
+  "翻译入口 buildQueryStatement 若请求已带 querySQL 则 setIsTranslated(true) 直接跳过翻译（多轮改图表场景复用上次物理SQL），移植时别漏这个快捷路径"
+ ]
+}

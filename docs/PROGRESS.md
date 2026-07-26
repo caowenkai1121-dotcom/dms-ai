@@ -1,6 +1,6 @@
 # dms-ai 迭代记录
 
-> 计划与选型：仓库外 `../REBUILD-PLAN.md`。红线：DMS 生产 MySQL 只读（连接级 READ ONLY 兜底）。
+> 计划与选型：`docs/REBUILD-PLAN.md`；整合蓝图（SuperSonic+deepagents 六期计划）：`docs/INTEGRATION-PLAN.md`。红线：DMS 生产 MySQL 只读（连接级 READ ONLY 兜底）。
 
 ## M0 骨架（2026-07-23，已验收）
 - axum 服务 :8100（/api/health）+ Vue3/antdv 前端 :5180（/api 代理）+ PG 容器 :15433。
@@ -213,6 +213,16 @@
 - `recall_dimensions` 问句命中维度名/别名→注入 prompt「维度口径卡」（禁止臆造连接键），pipeline 注入位置在指标卡后、术语前。
 - 价值场景：LLM 路径的「本月市场费用按区域」「各品类退款额」类跨域分组——指标卡定口径+维度卡定连接键，双卡夹逼。
 - 验收：cargo check 过；单测 +dim_hit 名/别名/未命中（20 轮门禁批量跑）。
+
+## M9a 蓝图第 1 期①：权限红线三连（2026-07-26，INTEGRATION-PLAN P0）
+- 前置：深度调研 workflow（6 agent 精读 SuperSonic/deepagents 源码 + dms-ai 审计）→ `docs/INTEGRATION-PLAN.md` 六期蓝图定稿，五份调研报告归档 `docs/research/`。
+- ①会话越权修复：api_conv_msgs 原**完全无鉴权**、api_ask 借他人 conv_id 可泄上一问/写入消息——接线 chat::conv_owner 归属校验，非属主 403；ai 行 question 改存 ""（原存用户问题，role 语义错乱；前端回放走 result 不受影响）。
+- ②scope_binding 数据化 + fail-closed：meta.scope_binding 表（**scoped/global/via 三态**）+ 内置种子 seed_rules 灌表 + 启动 load_rules 进程注册表（无 PG 回退内置种子）；受限用户 SQL 涉及**未登记表一律拒绝**（原 8 表硬编码之外全放行 = 最大权限暗坑，蓝图 P0 首位）。
+  - Java @DataScope 复核 15 个 mapper：新增 scoped 3 表（t_invoice_new_apply_header/t_device_inspection_header manager_code=Codes/t_long_promotion_person）；global 15 表（Java 无 @DataScope，1:1 全量可见：goods/employee/dict/仓库/winc 报表/市场费用等）。
+  - **via 模式**堵明细独查泄漏：t_sales_order_detail/logistics、t_after_sales_order_detail 独查时 `EXISTS(SELECT 1 FROM 头表 __ds_h WHERE 键相等 AND 头表权限条件)`；头表同 SELECT 在场则跳过（防双重注入拖慢）；CTE 名入豁免集不误拦。
+- ③承接上会话被重启打断的引擎 C WIP：失败复盘 review_failure（exec-error→fast LLM 复盘→候选教训）/review_lessons 复核 + zero-rows/exec-error 落 failure_log。
+- 顺带修 2 个只验过 cargo check 的历史坏单测：viewspec「订单数」被 Semantic::Order 抢先判定永不算指标列（Count 前移，M6z 分组柱/双序列因此失效）；direct::strip_annotations 不剥 ASCII 中文括注（`t_sales_order_detail(JOIN ...)` 基表名带尾巴 → 组合器恒 None，M8d 两测挂）。
+- 验收：单测 **89/89 全绿**（+7 inject 新测：fail-closed 拒绝/超管放行/via EXISTS 三断言/头表在场跳过/CTE 豁免/物流 via）。
 
 ## M8d S3② join 边注册表 + 跨基表组合（2026-07-24，组合器 v2）
 - `meta.join_edge`（SuperSonic JoinPath 思想）：表间可连接边+**基数标注**（1:N 扇出/N:1 收敛），种子 5 边全部来自已坐实模板连接键（order↔detail/order→customer/order→employee/detail→goods/goods→category）。
