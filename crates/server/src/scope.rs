@@ -58,6 +58,100 @@ impl BaseView {
     }
 }
 
+/// 基础档裁决（纯函数，可离线单测）：max(view_type) → 该走哪条路。
+/// 无 type=1 行 / ALL → Unrestricted（Java L281-292 else 分支）；未知值 → Err（fail-closed）。
+#[derive(Debug, PartialEq)]
+enum BaseDecision {
+    /// 整体短路不限制
+    Unrestricted,
+    /// 直接给定 id 集合（本人 / 结算客户哨兵）
+    Ids(Vec<i64>),
+    /// 需查部门树（bool = 是否含子部门）
+    Departments { with_children: bool },
+}
+
+fn decide_base(base_rows: &[i32]) -> anyhow::Result<BaseDecision> {
+    let Some(&max_v) = base_rows.iter().max() else {
+        return Ok(BaseDecision::Unrestricted);
+    };
+    let view = BaseView::from_value(max_v)
+        .ok_or_else(|| anyhow::anyhow!("角色数据权限配置错误 view_type={max_v}"))?;
+    Ok(match view {
+        BaseView::All => BaseDecision::Unrestricted,
+        BaseView::Me => BaseDecision::Ids(vec![]), // 占位：调用方填本人 id
+        BaseView::SettleCustomer => BaseDecision::Ids(vec![SENTINEL]),
+        BaseView::Department => BaseDecision::Departments { with_children: false },
+        BaseView::DepartmentAndSub => BaseDecision::Departments { with_children: true },
+    })
+}
+
+/// 员工 id 合并（纯函数）：哨兵段跳过并落旗，全空且有旗 → [-1]（Java L382-410）
+fn merge_employee_ids(base_ids: &[i64], sub_ids: &[i64]) -> Vec<i64> {
+    let mut out: Vec<i64> = vec![];
+    let mut perm_flag = true;
+    if base_ids.contains(&SENTINEL) {
+        perm_flag = false;
+    } else {
+        out.extend(base_ids);
+    }
+    if !sub_ids.is_empty() {
+        if sub_ids.contains(&SENTINEL) {
+            perm_flag = false;
+        } else {
+            out.extend(sub_ids);
+        }
+    }
+    if out.is_empty() && !perm_flag {
+        out.push(SENTINEL);
+    }
+    dedup_i64(out)
+}
+
+/// 客户编码合并（纯函数）：段为空即落旗（该维度本应有值却查空 = 拒绝），
+/// 全空且有旗 → ["-1"]；空串剔除（Java L568-621）。
+/// segs = (该段编码集, 该段是否"必须有值"即落旗段)
+fn merge_customer_codes(segs: &[(Vec<String>, bool)]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let mut flag = true;
+    for (codes, is_flagging) in segs {
+        if *is_flagging && codes.is_empty() {
+            flag = false;
+            continue;
+        }
+        out.extend(codes.iter().cloned());
+    }
+    out.retain(|c| !c.trim().is_empty());
+    out = dedup_str(out);
+    if out.is_empty() && !flag {
+        out.push("-1".into());
+    }
+    out
+}
+
+/// 部门树展开（纯函数）：给定全部 (department_id, parent_id) 边，从 roots 递归取自身+子孙，含环保护
+fn expand_department_tree(all: &[(i64, Option<i64>)], roots: &[i64]) -> Vec<i64> {
+    let mut result: Vec<i64> = vec![];
+    let mut seen: HashSet<i64> = HashSet::new();
+    for &root in roots {
+        if !seen.insert(root) {
+            continue;
+        }
+        result.push(root);
+        let mut frontier = vec![root];
+        while !frontier.is_empty() {
+            let next: Vec<i64> = all
+                .iter()
+                .filter(|(_, pid)| pid.map(|x| frontier.contains(&x)).unwrap_or(false))
+                .map(|(id, _)| *id)
+                .filter(|id| seen.insert(*id))
+                .collect();
+            result.extend(&next);
+            frontier = next;
+        }
+    }
+    result
+}
+
 /// 进程内 scope 缓存：key=(登录名,角色)，当日过期（对齐 Java Redis 当日缓存策略）。
 /// 权限集合计算含多次连库查询（部门/下属/客户集合），限权用户单次 ~10s；命中缓存后亚秒。
 type CacheMap = HashMap<(String, String), (ScopeSets, u64)>;
@@ -109,25 +203,19 @@ pub async fn compute_scope(mysql: &MySqlPool, p: &Principal) -> anyhow::Result<S
 
     // ── 基础档：取最大 view_type（Java L428-429 排序取最后）──
     // 无 type=1 行 或 ALL → defaultEmployeeIds 为空 → 整体短路不限制（Java L281-292 / L394-395 / L580-581）
-    let base_ids: Vec<i64> = match base_rows.iter().max() {
-        None => return Ok(ScopeSets::default()),
-        Some(&max_v) => {
-            let view = BaseView::from_value(max_v)
-                .ok_or_else(|| anyhow::anyhow!("角色数据权限配置错误 view_type={max_v}"))?;
-            match view {
-                BaseView::All => return Ok(ScopeSets::default()),
-                BaseView::Me => vec![p.employee_id],
-                BaseView::SettleCustomer => vec![SENTINEL],
-                BaseView::Department => {
-                    let depts = user_departments(mysql, p).await?;
-                    department_employee_ids(mysql, &depts).await?
-                }
-                BaseView::DepartmentAndSub => {
-                    let depts = user_departments(mysql, p).await?;
-                    let nested = self_and_children_departments(mysql, &depts).await?;
-                    department_employee_ids(mysql, &nested).await?
-                }
-            }
+    let base_ids: Vec<i64> = match decide_base(&base_rows)? {
+        BaseDecision::Unrestricted => return Ok(ScopeSets::default()),
+        // Me 走占位空集分支：由此处填本人 id（纯函数不碰 principal）
+        BaseDecision::Ids(ids) if ids.is_empty() => vec![p.employee_id],
+        BaseDecision::Ids(ids) => ids,
+        BaseDecision::Departments { with_children } => {
+            let depts = user_departments(mysql, p).await?;
+            let scope_depts = if with_children {
+                self_and_children_departments(mysql, &depts).await?
+            } else {
+                depts
+            };
+            department_employee_ids(mysql, &scope_depts).await?
         }
     };
 
@@ -142,24 +230,7 @@ pub async fn compute_scope(mysql: &MySqlPool, p: &Principal) -> anyhow::Result<S
     };
 
     // ── employee_ids 合并（Java getDefaultUserListWithRoleDataScope L382-410）──
-    let mut employee_ids: Vec<i64> = vec![];
-    let mut perm_flag = true;
-    if base_ids.contains(&SENTINEL) {
-        perm_flag = false;
-    } else {
-        employee_ids.extend(&base_ids);
-    }
-    if !sub_ids.is_empty() {
-        if sub_ids.contains(&SENTINEL) {
-            perm_flag = false;
-        } else {
-            employee_ids.extend(&sub_ids);
-        }
-    }
-    if employee_ids.is_empty() && !perm_flag {
-        employee_ids.push(SENTINEL);
-    }
-    employee_ids = dedup_i64(employee_ids);
+    let employee_ids = merge_employee_ids(&base_ids, &sub_ids);
 
     // ── employee_codes：基础+下属的 login_name（Java L528-565，-1 语义取净化版）──
     let mut employee_codes: Vec<String> = vec![];
@@ -182,34 +253,29 @@ pub async fn compute_scope(mysql: &MySqlPool, p: &Principal) -> anyhow::Result<S
     employee_codes = dedup_str(employee_codes);
 
     // ── customer_codes（Java getCustomerCodesByCurrentUser L568-621）──
-    let mut customer_codes: Vec<String> = vec![];
-    let mut cust_flag = true;
-    // 1. 基础客户：area_manager_id IN 基础ids（含哨兵时 IN(-1) 自然为空，与 Java 一致）
-    customer_codes.extend(customers_by_area_manager(mysql, &base_ids).await?);
-    // 2. 公用客户（字典 payment_customer_for_inside + payment_customer_for_all）
-    customer_codes.extend(common_customer_codes(mysql).await?);
+    // 段序同 Java；bool=该段"必须有值否则落旗"（落旗段查空 → 最终 ["-1"] 拒绝）
+    let mut segs: Vec<(Vec<String>, bool)> = vec![
+        // 1. 基础客户：area_manager_id IN 基础ids（含哨兵时 IN(-1) 自然为空，与 Java 一致）
+        (customers_by_area_manager(mysql, &base_ids).await?, false),
+        // 2. 公用客户（字典 payment_customer_for_inside + payment_customer_for_all）
+        (common_customer_codes(mysql).await?, false),
+    ];
     // 3. 定制 102 客户分组
     if custom_rows.contains(&102) {
-        let g = group_customer_codes(mysql, &[p.employee_id]).await?;
-        if g.is_empty() { cust_flag = false; } else { customer_codes.extend(g); }
+        segs.push((group_customer_codes(mysql, &[p.employee_id]).await?, true));
     }
     // 4. 定制 103 客户团队（contact_name = 姓名）
     if custom_rows.contains(&103) {
-        let m = manager_customer_codes(mysql, &[p.actual_name.clone()]).await?;
-        if m.is_empty() { cust_flag = false; } else { customer_codes.extend(m); }
+        segs.push((manager_customer_codes(mysql, &[p.actual_name.clone()]).await?, true));
     }
     // 5. 下属为团队成员/分组的客户（Java addSubordinateToCustomerManager L337-359）
     if has_sub && !sub_ids.contains(&SENTINEL) && !sub_ids.is_empty() {
         let names = actual_names_by_ids(mysql, &sub_ids).await?;
         let mut sc = manager_customer_codes(mysql, &names).await?;
         sc.extend(group_customer_codes(mysql, &sub_ids).await?);
-        if sc.is_empty() { cust_flag = false; } else { customer_codes.extend(sc); }
+        segs.push((sc, true));
     }
-    customer_codes.retain(|c| !c.trim().is_empty());
-    customer_codes = dedup_str(customer_codes);
-    if customer_codes.is_empty() && !cust_flag {
-        customer_codes.push("-1".into());
-    }
+    let customer_codes = merge_customer_codes(&segs);
 
     Ok(ScopeSets { employee_ids, employee_codes, customer_codes })
 }
@@ -238,26 +304,7 @@ async fn self_and_children_departments(mysql: &MySqlPool, roots: &[i64]) -> anyh
     )
     .fetch_all(mysql)
     .await?;
-    let mut result: Vec<i64> = vec![];
-    let mut seen: HashSet<i64> = HashSet::new();
-    for &root in roots {
-        if !seen.insert(root) {
-            continue;
-        }
-        result.push(root);
-        let mut frontier = vec![root];
-        while !frontier.is_empty() {
-            let next: Vec<i64> = all
-                .iter()
-                .filter(|(_, pid)| pid.map(|x| frontier.contains(&x)).unwrap_or(false))
-                .map(|(id, _)| *id)
-                .filter(|id| seen.insert(*id))
-                .collect();
-            result.extend(&next);
-            frontier = next;
-        }
-    }
-    Ok(result)
+    Ok(expand_department_tree(&all, roots))
 }
 
 /// 部门员工：主部门 OR 任职部门（任职行须 deleted=0 且 service_status=0，Java EmployeeMapper.xml L179-191）
@@ -400,4 +447,247 @@ fn dedup_i64(v: Vec<i64>) -> Vec<i64> {
 fn dedup_str(v: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     v.into_iter().filter(|x| seen.insert(x.clone())).collect()
+}
+
+/// 权限决策纯逻辑离线单测（对拍依据：Java DefaultEmployee + tools/judge_scope.py 连库判官）。
+/// 连库判官仍是最终验收；此处锁住不依赖数据的语义，防重构静默改语义。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    // ── 基础档裁决：view_type 全值域 ──
+    #[test]
+    fn base_empty_is_unrestricted() {
+        // 无 type=1 行 → 整体短路不限制（Java L281-292）
+        assert_eq!(decide_base(&[]).unwrap(), BaseDecision::Unrestricted);
+    }
+
+    #[test]
+    fn base_all_10_is_unrestricted() {
+        assert_eq!(decide_base(&[10]).unwrap(), BaseDecision::Unrestricted);
+    }
+
+    #[test]
+    fn base_me_0_placeholder() {
+        // Me 返回空占位，由调用方填本人 id
+        assert_eq!(decide_base(&[0]).unwrap(), BaseDecision::Ids(vec![]));
+    }
+
+    #[test]
+    fn base_settle_customer_3_is_sentinel() {
+        assert_eq!(decide_base(&[3]).unwrap(), BaseDecision::Ids(vec![SENTINEL]));
+    }
+
+    #[test]
+    fn base_department_1() {
+        assert_eq!(decide_base(&[1]).unwrap(), BaseDecision::Departments { with_children: false });
+    }
+
+    #[test]
+    fn base_department_and_sub_2() {
+        assert_eq!(decide_base(&[2]).unwrap(), BaseDecision::Departments { with_children: true });
+    }
+
+    #[test]
+    fn base_takes_max_not_first() {
+        // 多行取 MAX（Java L428-429 排序取最后）：0+2 → 部门及下级
+        assert_eq!(decide_base(&[0, 2]).unwrap(), BaseDecision::Departments { with_children: true });
+        // 任一行为 10 → 不限制（10 是最大值）
+        assert_eq!(decide_base(&[0, 1, 10]).unwrap(), BaseDecision::Unrestricted);
+        // 3 与 2 并存取 3（结算客户哨兵）
+        assert_eq!(decide_base(&[2, 3]).unwrap(), BaseDecision::Ids(vec![SENTINEL]));
+    }
+
+    #[test]
+    fn base_unknown_view_type_fails_closed() {
+        // 未知枚举值绝不当"看全部"（红队教训：catch-all 不能 = 放行）
+        assert!(decide_base(&[7]).is_err());
+        assert!(decide_base(&[99]).is_err());
+        // 未知值是 MAX 时同样拒绝，不因存在合法小值而放行
+        assert!(decide_base(&[0, 42]).is_err());
+    }
+
+    // ── employee_ids 合并：哨兵 vs 空集语义相反 ──
+    #[test]
+    fn merge_ids_base_only() {
+        assert_eq!(merge_employee_ids(&[1, 2], &[]), vec![1, 2]);
+    }
+
+    #[test]
+    fn merge_ids_union_with_sub() {
+        assert_eq!(merge_employee_ids(&[1], &[2, 3]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn merge_ids_dedups() {
+        assert_eq!(merge_employee_ids(&[1, 2], &[2, 3, 3]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn merge_ids_base_sentinel_dropped_but_sub_wins() {
+        // 基础哨兵段跳过，下属段有值 → 用下属集合（拒绝旗被有值段覆盖）
+        assert_eq!(merge_employee_ids(&[SENTINEL], &[5]), vec![5]);
+    }
+
+    #[test]
+    fn merge_ids_all_sentinel_rejects() {
+        // 全部段哨兵 → [-1] 拒绝（0 行），绝非空集放行
+        assert_eq!(merge_employee_ids(&[SENTINEL], &[SENTINEL]), vec![SENTINEL]);
+        assert_eq!(merge_employee_ids(&[SENTINEL], &[]), vec![SENTINEL]);
+    }
+
+    #[test]
+    fn merge_ids_empty_base_no_sub_is_passthrough() {
+        // 都空且无哨兵 → 空集 = 该维度不注入（放行），与 [-1] 语义相反
+        assert!(merge_employee_ids(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn merge_ids_sub_sentinel_with_base_values() {
+        assert_eq!(merge_employee_ids(&[8], &[SENTINEL]), vec![8]);
+    }
+
+    // ── customer_codes 合并：落旗段查空 = 拒绝 ──
+    #[test]
+    fn merge_cust_basic_union() {
+        let out = merge_customer_codes(&[(s(&["C1"]), false), (s(&["C2"]), false)]);
+        assert_eq!(out, s(&["C1", "C2"]));
+    }
+
+    #[test]
+    fn merge_cust_dedup_and_trim_empty() {
+        let out = merge_customer_codes(&[(s(&["C1", "C1", "", "  "]), false)]);
+        assert_eq!(out, s(&["C1"]));
+    }
+
+    #[test]
+    fn merge_cust_flagging_empty_rejects() {
+        // 102/103 类段本应有值却查空 → 整体 ["-1"] 拒绝（fail-closed）
+        let out = merge_customer_codes(&[(vec![], true)]);
+        assert_eq!(out, s(&["-1"]));
+    }
+
+    #[test]
+    fn merge_cust_flagging_empty_but_other_seg_has_value() {
+        // 有其他段有值 → 用有值段，不落 -1（Java 语义：并集非空即放行该并集）
+        let out = merge_customer_codes(&[(s(&["C9"]), false), (vec![], true)]);
+        assert_eq!(out, s(&["C9"]));
+    }
+
+    #[test]
+    fn merge_cust_all_empty_no_flag_is_passthrough() {
+        // 无落旗段且全空 → 空集 = 客户维度不注入（放行），非拒绝
+        assert!(merge_customer_codes(&[(vec![], false)]).is_empty());
+        assert!(merge_customer_codes(&[]).is_empty());
+    }
+
+    #[test]
+    fn merge_cust_multi_flagging_segments() {
+        // 多个落旗段：任一空即落旗；全空 → 拒绝
+        let out = merge_customer_codes(&[(vec![], true), (vec![], true)]);
+        assert_eq!(out, s(&["-1"]));
+    }
+
+    // ── 部门树递归（含环保护/多根/去重）──
+    #[test]
+    fn dept_tree_single_root_chain() {
+        let all = vec![(2, Some(1)), (3, Some(2)), (4, Some(3))];
+        let mut got = expand_department_tree(&all, &[1]);
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn dept_tree_leaf_root_only_self() {
+        let all = vec![(2, Some(1)), (3, Some(2))];
+        assert_eq!(expand_department_tree(&all, &[3]), vec![3]);
+    }
+
+    #[test]
+    fn dept_tree_multi_root_dedup() {
+        let all = vec![(2, Some(1)), (3, Some(1)), (5, Some(4))];
+        let mut got = expand_department_tree(&all, &[1, 4, 1]);
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn dept_tree_cycle_terminates() {
+        // 脏数据成环（1→2→1）必须终止且不重复
+        let all = vec![(2, Some(1)), (1, Some(2))];
+        let mut got = expand_department_tree(&all, &[1]);
+        got.sort();
+        assert_eq!(got, vec![1, 2]);
+    }
+
+    #[test]
+    fn dept_tree_null_parent_not_matched() {
+        // parent_id 为 NULL 的行不因任何 frontier 被拉入
+        let all = vec![(9, None), (2, Some(1))];
+        assert_eq!(expand_department_tree(&all, &[1]), vec![1, 2]);
+    }
+
+    #[test]
+    fn dept_tree_unknown_root_returns_self() {
+        assert_eq!(expand_department_tree(&[], &[42]), vec![42]);
+    }
+
+    // ── ScopeSets 语义 ──
+    #[test]
+    fn unrestricted_only_when_all_empty() {
+        assert!(ScopeSets::default().is_unrestricted());
+        let s1 = ScopeSets { employee_ids: vec![SENTINEL], ..Default::default() };
+        assert!(!s1.is_unrestricted(), "哨兵不是不限制");
+        let s2 = ScopeSets { customer_codes: s(&["-1"]), ..Default::default() };
+        assert!(!s2.is_unrestricted());
+        let s3 = ScopeSets { employee_codes: s(&["zhangsan"]), ..Default::default() };
+        assert!(!s3.is_unrestricted());
+    }
+
+    // ── 端到端：决策 → 合并 → SQL 注入（跨模块语义锁）──
+    #[test]
+    fn sentinel_injects_reject_condition() {
+        // 结算客户档(3) → 哨兵 → 注入 in(-1) → 真库 0 行
+        let base = match decide_base(&[3]).unwrap() {
+            BaseDecision::Ids(ids) => ids,
+            other => panic!("{other:?}"),
+        };
+        let sets = ScopeSets {
+            employee_ids: merge_employee_ids(&base, &[]),
+            employee_codes: vec![],
+            customer_codes: merge_customer_codes(&[(vec![], true)]),
+        };
+        assert!(!sets.is_unrestricted());
+        let sql = crate::inject::inject("SELECT * FROM t_sales_order so", &sets).unwrap();
+        let n = sql.to_lowercase().replace(' ', "");
+        assert!(n.contains("so.owner_managerin(-1)"), "{sql}");
+        assert!(n.contains("so.customer_codein('-1')"), "{sql}");
+    }
+
+    #[test]
+    fn all_view_injects_nothing() {
+        // view_type=10 → 不限制 → SQL 原样（超管路径同）
+        assert_eq!(decide_base(&[10]).unwrap(), BaseDecision::Unrestricted);
+        let sql = "SELECT * FROM t_sales_order so WHERE so.deleted_flag = 0";
+        assert_eq!(crate::inject::inject(sql, &ScopeSets::default()).unwrap(), sql);
+    }
+
+    #[test]
+    fn me_view_injects_own_id_only() {
+        // 本人档(0) + 无定制 → 只注入自己
+        let base = vec![199_i64]; // 调用方填本人 id
+        let sets = ScopeSets {
+            employee_ids: merge_employee_ids(&base, &[]),
+            employee_codes: vec![],
+            customer_codes: vec![],
+        };
+        let sql = crate::inject::inject("SELECT * FROM t_sales_order so", &sets).unwrap();
+        let n = sql.to_lowercase().replace(' ', "");
+        assert!(n.contains("so.owner_managerin(199)"), "{sql}");
+        assert!(!n.contains("customer_code"), "客户集合为空不得注入该段: {sql}");
+    }
 }
