@@ -35,11 +35,13 @@
 4. seed_rules 删除连带：**知会 plan-t10**，「重置权限档案」入口归 dms_semantic::seed::run_seeds，Task 10 管理面不重复造。
 5. 生产 baseline **用户/运维执行**，agent 只交付脚本 + B 库预演证据（不主动碰服务器）。
 
-**Task 7**（4 点）：
+**Task 7**（6 点，含 plan-t7/fix-t7 补充）：
 1. ingest MySQL 入参以 T3 为准 = `&ReadOnlyMySql`（见 C5），不允许 &MySqlPool 过渡。
 2. OPT_OUT 入库致 meta.term +7 行：**对拍脚本豁免 status='opt-out' 行**（Task 6 基线不含它，Task 7 新增）。
 3. `dim_hit` 死代码**保留**（守「13 测试一字不改」，随 7 个 filter 测试搬入 recall/filter.rs）。
 4. meta.rs 删除前置 = Task 6 清场，降级路径（未清场则不删、留段标注）**可接受**。
+5. **SchemaCorrector 不进 run_chain**：它的 hint 是 LLM repair() 的自修输入（pipeline.rs:597-603），与四个确定性改写器不同构。链 = GroupBy→Agg→Caliber→Value（四校正器），spec 4.1 的「run_chain(5 校正器)」视为 Task 9（AskRun Repair 轮）终态口径。schema_check 以独立 validator 存在。
+6. **测试数口径修正**：实际 corrector.rs 33 个 + meta.rs 13 个（任务书「33 召回+13 校正」写反）；其中 collect×3 + split_top_and×1 共 4 个属 Task 2 kernel，semantic 落地 42 个，合计 46 为验收线。
 
 **Task 8**（5 点）：
 1. metric 种子 scope_filter 双写**保留 + 判官核库防漂移**（改动最小；scope_filter 是指标级口径设计位）。
