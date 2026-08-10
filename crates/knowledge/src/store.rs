@@ -1194,7 +1194,7 @@ pub async fn replace_chunks(
                WHERE d.doc_id=$1 AND (s.owner=$15 OR EXISTS (SELECT 1 FROM kb.acl a \
                   WHERE a.scope='space' AND a.target_id=s.space_id AND a.perm='write' \
                     AND ((a.grantee_kind='login' AND a.grantee=$15) OR \
-                         (a.grantee_kind='role' AND a.grantee=ANY($16::text[])))))) FOR UPDATE), \
+                         (a.grantee_kind='role' AND a.grantee=ANY($16::text[]))))) FOR UPDATE), \
              upserted AS ( \
                INSERT INTO kb.chunk(doc_id,ord,text,heading_path,folder_path,page,tokens,embedding_text,embedding_recipe,embedding,start_char_pos,end_char_pos) \
                SELECT $1,u.ord,u.txt,u.heading,l.folder_path,u.page,u.tokens, \
