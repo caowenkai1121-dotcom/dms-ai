@@ -385,6 +385,23 @@ def _pdf_pypdf(path):
     return out, len(texts), []
 
 _H_DOCX = re.compile(r'(?:Heading|标题)\s*(\d)')
+# 伪标题（业务文档常没用 Word 样式，章节靠编号/加粗）：第X章/一、/（一）/1./1.1 等开头，
+# 长句（>40 字）不像标题，排除。级别：中文序号/第X章=1，阿拉伯编号=2，整行加粗短句=3。
+_PSEUDO_HEADING_MAX = 40
+
+
+def _pseudo_heading_level(p, text):
+    import re as _re
+    if len(text) > _PSEUDO_HEADING_MAX:
+        return 0
+    if _re.match(r'^(?:第[一二三四五六七八九十百\d]+[章节条篇]|[一二三四五六七八九十]+[、.．]|[（(][一二三四五六七八九十]+[)）])', text):
+        return 1
+    if _re.match(r'^\d+(?:\.\d+)*[、.．\s]', text):
+        return 2
+    runs = [r for r in p.runs if r.text.strip()]
+    if runs and all(r.bold for r in runs):
+        return 3
+    return 0
 
 def _p_docx(path):
     # 依赖不在时轮不到这里：`parse_doc` 的能力门先拒（缺依赖 = 明确 unsupported，见那里的注释）。
@@ -402,6 +419,9 @@ def _p_docx(path):
                 continue
             if m := _H_DOCX.search(getattr(p.style, 'name', '') or ''):
                 _push(stack, int(m.group(1)), t)
+            elif (lvl := _pseudo_heading_level(p, t)):
+                # 没用 Word 样式的文档按 编号/加粗 推断章节（导图/引用定位靠这个结构）
+                _push(stack, lvl, t)
             out.append(_blk(t, None, stack))
         elif tag == 'tbl':
             rows = [' | '.join(c.text.strip() for c in r.cells) for r in Table(child, doc).rows]

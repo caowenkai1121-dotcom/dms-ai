@@ -206,6 +206,13 @@ pub async fn ask(
 /// 建议的问法放 `view.interact.drill`（前端已把它渲染成可点的按钮）。
 /// `route` 用新标签 `need-intent` —— 那样判官脚本的 route 断言有东西可钉，
 /// 而不是只能断言「返 0 行」（返 0 行与「真的没数据」分不开，正是这个 bug 最坏的一层）。
+///
+/// 【意图先分析后规划（业主裁决 2026-08-10）】fast 判定从两词扩成**三词**：
+/// `answer`（够格进 SQL 生成链）/ `clarify`（意图不明 → 意图分析 + 候选问法）/
+/// `unsupported|主题`（主题根本没接入，如「积分」→ 直接明说能问什么，**不走 SQL 试探**）。
+/// 由来是实测：「本月的积分情况」被 fast 判 answer 放行后，LLM 拿一张无关表编出
+/// 「积分兑换金额 958 客户」（比报错更坏），或产全常量试探 SQL 被闸门拒、
+/// 用户看到「SQL 安全校验未通过」的内部措辞。两个出口都是**回答**，不是报错。
 pub(crate) async fn need_intent_reply(
     llm: &dyn ChatModel,
     on_usage: &(dyn Fn(&Usage) + Send + Sync),
@@ -228,21 +235,45 @@ pub(crate) async fn need_intent_reply(
     }
 
     // ② 精简模式统一入口：**所有**确定性路由未命中、走到 LLM 兜底的问句，先过一次
-    // Fast 极短判定（answer/clarify 两词协议）。`answer` 只表示“问题已足够进入既有 SQL
-    // 生成链”，模型在这里不生成 SQL、不碰权限；后续仍由 precise 生成并经过口径、权限和
-    // 只读执行闸门。`clarify` 才反问。模型失败（None）不直接反问 —— 降级到 ③ 的本地规则，
-    // 模型抖动不能把清楚的问句误判成澄清。
+    // Fast 极短判定（answer/clarify/unsupported 三词协议）。`answer` 只表示“问题已足够进入
+    // 既有 SQL 生成链”，模型在这里不生成 SQL、不碰权限；后续仍由 precise 生成并经过口径、
+    // 权限和只读执行闸门。`clarify` 反问（意图分析 + 候选问法）；`unsupported` 是
+    // 「主题根本没接入」—— 直接明说能问什么。两者都不产 SQL。
+    // 模型失败（None）不直接反问 —— 降级到 ③ 的本地规则，模型抖动不能把清楚的问句误判成澄清。
     match ai_query_is_actionable(llm, on_usage, question).await {
-        Some(true) => {
-            tracing::info!(question, "精简模式 Fast 理解判为可执行 → 继续 SQL 生成链");
+        Some(GateVerdict::Answer) => {
+            // ②b 覆盖兜底：fast 说「能答」，但注册表三路（指标/维度/术语）一个都不认识、
+            // 问句剥掉虚词后又有实义残留、且无疑问词/关系词/单据形 —— 那它大概率在猜
+            // （「本月的积分情况」族：fast 对「情况」类问句很容易判 answer）。
+            // 不产 SQL，按意图不明反问。判据与分诊共用 `triage::registry_hit` ——
+            // 「注册表认不认识这句问句」两份实现必漂。读失败放行：反问是补救路径，
+            // 它自己挂了不该把问答一起拖死（与 ③ 的指标召回失败同一纪律）。
+            match crate::triage::registry_hit(pg, ds, question).await {
+                Ok(covered) if hold_back_uncovered(question, covered) => {
+                    tracing::info!(question, "Fast 判可执行但注册表零覆盖且无查询目标 → 意图反问（不产 SQL）");
+                    let options = clarify_options_for(llm, on_usage, question).await;
+                    return Ok(Some(intent_reply(question, t0, options)));
+                }
+                Ok(_) => {
+                    tracing::info!(question, "精简模式 Fast 理解判为可执行 → 继续 SQL 生成链");
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "覆盖兜底读注册表失败 → 本轮不拦截，照常走管线");
+                }
+            }
             return Ok(None);
         }
-        Some(false) => {
+        Some(GateVerdict::Clarify) => {
             tracing::info!(question, "精简模式 Fast 理解判为含糊 → 反问（不产 SQL）");
             // need-intent 增强：fast 在线才生成结构化候选；任何失败都降级为空数组
             // （= 纯文本反问，wire 上 `clarify_options` 整键不上线，老客户端零影响）。
             let options = clarify_options_for(llm, on_usage, question).await;
             return Ok(Some(intent_reply(question, t0, options)));
+        }
+        Some(GateVerdict::Unsupported(topic)) => {
+            tracing::info!(question, topic, "精简模式 Fast 判主题未接入 → 直接告知能问什么（不产 SQL）");
+            let options = topic_options_for(llm, on_usage, question).await;
+            return Ok(Some(no_topic_reply(question, &topic, t0, options)));
         }
         None => {}
     }
@@ -283,10 +314,6 @@ pub(crate) async fn need_intent_reply(
     //
     // 判据在**剥词之前**看：`STRIP_WORDS` 里本来就有「是多少/多少/查/统计/排行/对比」这些，
     // 剥完残留里就没有它们了，所以不能等剥完再判。
-    const ASKING: &[&str] = &[
-        "多少", "几", "哪些", "那些", "哪几", "哪家", "谁", "哪个", "什么", "怎么", "统计", "列出", "排行", "排名",
-        "最高", "最低", "最多", "最少", "趋势", "占比", "比例", "对比", "明细", "清单", "分布", "top", "TOP", "前",
-    ];
     if ASKING.iter().any(|w| question.contains(w))
         || crate::triage::analytical_question_hit(question)
     {
@@ -295,6 +322,48 @@ pub(crate) async fn need_intent_reply(
     tracing::info!(question, "意图不足 → 反问（不产 SQL）");
     // ③ 到达这里说明 fast 已经失败过一次 —— 不为候选问法再付一次超时，直接纯文本反问
     Ok(Some(intent_reply(question, t0, vec![])))
+}
+
+/// 疑问/度量词表（模块级：③ 的本地降级与 ②b 的覆盖兜底 `hold_back_uncovered` 共用 ——
+/// 「有疑问词 = 用户问得很清楚」这条判据两处必须同一份，抄第二份必漂）。
+const ASKING: &[&str] = &[
+    "多少", "几", "哪些", "那些", "哪几", "哪家", "谁", "哪个", "什么", "怎么", "统计", "列出", "排行", "排名",
+    "最高", "最低", "最多", "最少", "趋势", "占比", "比例", "对比", "明细", "清单", "分布", "top", "TOP", "前",
+];
+
+/// 已接入数据主题的**对用户口径**清单（主题粒度，不是指标粒度）。
+/// 两个消费者：fast 意图门的判据参照（`ai_query_is_actionable` 的 prompt）与
+/// 「主题未接入」回答的列举（`no_topic_reply`）—— 两处必须同一份。
+/// 与 `semantic::seed_defs` 的指标族对齐：新增指标族时把它的主题名补进来。
+const KNOWN_TOPICS: &[&str] = &[
+    "销售", "订单", "客户", "商品", "门店", "库存", "费用", "市场活动", "售后", "开票", "对账", "业务员", "仓库",
+];
+
+/// fast 判 answer 后的覆盖兜底判据（**纯函数**，IO 那半是 `triage::registry_hit`）：
+/// 注册表零覆盖 + 剥掉虚词有实义残留 + 无疑问词 + 无关系词 + 无单据/表名形 → 扣住反问。
+///
+/// 每一条逃逸都有它护着的一族（删一条就有一族被误拦成反问）：
+/// - **疑问词**（`ASKING`）：「今年审核通过的对账单有多少笔」—— 意图明确，只是指标没声明；
+/// - **关系词**（`triage::RELATION_WORDS`）：「本月的退货情况」—— 注册表别名是「退货数」，
+///   词面搭不上，但「退货」是数仓里有的事件；
+/// - **单据/表名形**：「帮我查下 HJXH-…」直查族 —— 快路径万一流单到这里，意图也是明确的。
+fn hold_back_uncovered(question: &str, covered: bool) -> bool {
+    if covered {
+        return false;
+    }
+    // `consumed` 传空：一个资产都没命中，没有任何业务词该被消化（与 ③ 同一约定）
+    if !dms_kernel::nl::text::has_residue_with(question, &[], dms_kernel::nl::lexicon::STRIP_WORDS) {
+        return false;
+    }
+    if ASKING.iter().any(|w| question.contains(w))
+        || crate::triage::analytical_question_hit(question)
+        || crate::triage::RELATION_WORDS.iter().any(|w| question.contains(w))
+        || crate::triage::doc_code_hit(question)
+        || crate::triage::table_hit(question)
+    {
+        return false;
+    }
+    true
 }
 
 /// 反问的结构化候选：fast 生成 2~4 个最可能的意图问法，失败一律空数组（纯文本反问兜底）。
@@ -306,11 +375,38 @@ async fn clarify_options_for(
     on_usage: &(dyn Fn(&Usage) + Send + Sync),
     question: &str,
 ) -> Vec<ClarifyOption> {
+    clarify_options_with(llm, on_usage, question, CLARIFY_SYSTEM).await
+}
+
+/// 「主题未接入」的候选：围绕**已接入**主题给问法 —— 与 clarify 候选共用解析与降级，
+/// 只换 system（候选必须落在能答的主题里，再围着没接入的主题生成就是二次误导）。
+async fn topic_options_for(
+    llm: &dyn ChatModel,
+    on_usage: &(dyn Fn(&Usage) + Send + Sync),
+    question: &str,
+) -> Vec<ClarifyOption> {
+    clarify_options_with(llm, on_usage, question, TOPIC_SYSTEM).await
+}
+
+const CLARIFY_SYSTEM: &str = "你是 DMS 数据问答的意图澄清助手。用户的问题缺少明确查询目标。\
+              给出 2 到 4 个用户最可能想问的完整问句，每行一个，格式：短标签|完整问句。\
+              短标签不超过 6 个汉字（如：销售表现、订单明细、基础资料）。\
+              问句必须具体、可直接执行（带指标或明细目标），不许复述原问题，不要解释、不要编号外的文字。";
+
+const TOPIC_SYSTEM: &str = "你是 DMS 数据问答的引导助手。用户问的主题还没有接入数据。\
+              从已接入的主题（销售、订单、客户、商品、门店、库存、费用、市场活动、售后）里，\
+              给出 2 到 4 个用户最可能想改问的完整问句，每行一个，格式：短标签|完整问句。\
+              短标签不超过 6 个汉字（如：销售表现、订单明细、库存现状）。\
+              问句必须具体、可直接执行（带指标或明细目标），不许再围绕用户原来那个未接入的主题，\
+              不要解释、不要编号外的文字。";
+
+async fn clarify_options_with(
+    llm: &dyn ChatModel,
+    on_usage: &(dyn Fn(&Usage) + Send + Sync),
+    question: &str,
+    system: &str,
+) -> Vec<ClarifyOption> {
     const TIMEOUT: Duration = Duration::from_secs(4);
-    let system = "你是 DMS 数据问答的意图澄清助手。用户的问题缺少明确查询目标。\
-                  给出 2 到 4 个用户最可能想问的完整问句，每行一个，格式：短标签|完整问句。\
-                  短标签不超过 6 个汉字（如：销售表现、订单明细、基础资料）。\
-                  问句必须具体、可直接执行（带指标或明细目标），不许复述原问题，不要解释、不要编号外的文字。";
     let user = format!("用户问题：{question}\n候选问法：");
     let mut req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
     req.max_tokens = Some(200);
@@ -368,13 +464,20 @@ fn parse_clarify_options(reply: &str, question: &str) -> Vec<ClarifyOption> {
     out
 }
 
+/// 意图不明时的反问（route = `need-intent`）：**意图分析是回答主体，不是报错** ——
+/// 文案只说「我不确定你要查什么 + 可以怎么问」，不出现任何内部措辞（闸门/校验/生成失败）。
 fn intent_reply(question: &str, t0: Instant, clarify_options: Vec<ClarifyOption>) -> AskResult {
     let mut view = dms_semantic::present::build(&[], &[]);
-    view.interact.drill = vec![
-        format!("{question} 的销售表现"),
-        format!("{question} 的订单明细"),
-        format!("{question} 的基础资料"),
-    ];
+    // 模板三问只给「裸实体名」族（嗨肉/某客户有限公司）：那是它实测有效的场景
+    // （`need_intent_has_its_own_route_label` 钉着）。非实体问句套「X 的销售表现」是噪音，
+    // 候选由 clarify_options（fast 生成）承担；两者都空时前端还剩自填框（ask-card 的输入行恒在）。
+    if crate::answerers::entity::entity_form_hit(question) {
+        view.interact.drill = vec![
+            format!("{question} 的销售表现"),
+            format!("{question} 的订单明细"),
+            format!("{question} 的基础资料"),
+        ];
+    }
     AskResult {
         sql: String::new(),
         columns: vec![],
@@ -388,7 +491,7 @@ fn intent_reply(question: &str, t0: Instant, clarify_options: Vec<ClarifyOption>
         comparisons: vec![],
         subs: vec![],
         caliber_note: Some(format!(
-            "你想查看「{question}」的哪一类信息：销售表现、订单明细，还是基础资料？"
+            "我没能完全确定「{question}」要查的具体数据。可以点一个最接近的问法，或补充说明想看的对象和指标。"
         )),
         truncation_note: None,
         redacted: vec![],
@@ -402,25 +505,89 @@ fn intent_reply(question: &str, t0: Instant, clarify_options: Vec<ClarifyOption>
     }
 }
 
+/// 「主题未接入」的回答（route = `no-topic`）：明说「这个主题还没有数据」+ 列能问的主题
+/// + 候选问法，**不产 SQL**。与 `need-intent` 分两个 route：判官脚本要把「问法含糊」与
+/// 「主题不存在」分开钉，前端卡标题也按 route 分开。
+fn no_topic_reply(question: &str, topic: &str, t0: Instant, clarify_options: Vec<ClarifyOption>) -> AskResult {
+    let mut view = dms_semantic::present::build(&[], &[]);
+    // 兜底候选 = 确定能答的入口题（各自钉在回归题集里：A01 / E02 / E07 / E06）；
+    // fast 在线时另有围绕已接入主题的候选（clarify_options，渲染在 ask-card 下方的 chip 区）。
+    view.interact.drill = vec![
+        "本月销售额是多少".into(),
+        "本月有多少个订单".into(),
+        "现在总库存量是多少".into(),
+        "本月活动费用是多少".into(),
+    ];
+    // 主题词是 fast 从问句里摘的（如「积分」）；摘不出来时就着原问句说，不编造。
+    let what = if topic.is_empty() { format!("「{question}」这个主题") } else { format!("「{topic}」这个主题") };
+    AskResult {
+        sql: String::new(),
+        columns: vec![],
+        rows: vec![],
+        row_count: 0,
+        truncated: false,
+        elapsed_ms: t0.elapsed().as_millis(),
+        route: NO_TOPIC.into(),
+        view,
+        supplemental: None,
+        comparisons: vec![],
+        subs: vec![],
+        caliber_note: Some(format!(
+            "{what}还没有接入数据，目前能查的是：{}。可以试试下面的问法，或换个已接入的主题。",
+            KNOWN_TOPICS.join("、"),
+        )),
+        truncation_note: None,
+        redacted: vec![],
+        scope_note: None,
+        trust: None,
+        steps: vec![],
+        clarify_options,
+        value_labels: vec![],
+        sales_context: None,
+    }
+}
+
 /// 反问时的 route 标签。**独立于 `llm`**：判官脚本要能把「缺意图」与「LLM 答错」分开钉。
 pub const NEED_INTENT: &str = "need-intent";
 
+/// 「主题未接入」的 route 标签。**独立于 `need-intent`**：「问法含糊」与「主题不存在」
+/// 是两种回答（后者永不试探 SQL），判官脚本与前端卡标题都要分开钉。
+pub const NO_TOPIC: &str = "no-topic";
+
+/// 意图门三态判定。`Unsupported` 带主题词（fast 从问句里摘的，如「积分」），
+/// 只用于回答文案 —— 它是模型产出，进 JSON 前剥控制字符、截 12 字（同 refs 纪律）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateVerdict {
+    /// 问题已足够进入既有 SQL 生成链（模型不在这里生成 SQL）
+    Answer,
+    /// 意图不明 → 反问（意图分析 + 候选问法）
+    Clarify,
+    /// 主题没接入 → 直接告知能问什么，不走 SQL 试探
+    Unsupported(String),
+}
+
 /// 精简模式的统一意图门：所有确定性路由未命中、走到 LLM 兜底的问句都过一次。
-/// `Some(true)` = 已足够查询；`Some(false)` = 确实需要补充；`None` = 模型失败/答非所问。
+/// `Some(_)` = 三态判定成立；`None` = 模型失败/答非所问（降级到本地规则）。
 async fn ai_query_is_actionable(
     llm: &dyn ChatModel,
     on_usage: &(dyn Fn(&Usage) + Send + Sync),
     question: &str,
-) -> Option<bool> {
+) -> Option<GateVerdict> {
     const TIMEOUT: Duration = Duration::from_secs(4);
-    let system = "你只判断一个 DMS 业务数据问题是否已经足够进入查询规划。\
-                  若问题包含明确指标、明细/关系目标，或给出客户、商品、型号、单据、人员等具体实体并要求资料、订单或销售上下文，输出 answer。\
-                  具体实体名称本身也代表查看该实体总览，输出 answer。\
-                  只有缺少具体对象和查询目标、仅有代词/寒暄、或对象无法辨认时输出 clarify。\
-                  不识别表，不生成 SQL，不回答数据，不补写用户问题；只输出 answer 或 clarify。";
+    let system = format!(
+        "你只判断一个 DMS 业务数据问题该如何处理。本系统已接入的数据主题只有：{}。\
+         若问题的主题明显不在上述范围内（如积分、会员等级、考勤、工资、人事），输出 unsupported|主题词。\
+         若问题包含明确指标、明细/关系目标，或给出客户、商品、型号、单据、人员等具体实体并要求资料、订单或销售上下文，输出 answer。\
+         具体实体名称本身也代表查看该实体总览，输出 answer。\
+         只有缺少具体对象和查询目标、仅有代词/寒暄、或对象无法辨认时输出 clarify。\
+         拿不准主题是否已接入时输出 answer，不许猜 unsupported（后面还有一道注册表覆盖检查接住它）。\
+         不识别表，不生成 SQL，不回答数据，不补写用户问题；只输出 answer、clarify 或 unsupported|主题词。",
+        KNOWN_TOPICS.join("、")
+    );
     let user = format!("问题：{question}\n判定：");
-    let mut req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.0));
-    req.max_tokens = Some(8);
+    let mut req = ChatRequest::text(ModelTier::Fast, &system, &user, Some(0.0));
+    // 「unsupported|主题词」比单词回复长，预算给到 24（answer/clarify 时代是 8）
+    req.max_tokens = Some(24);
     let reply = match tokio::time::timeout(TIMEOUT, llm.chat(req)).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(e)) => {
@@ -433,20 +600,30 @@ async fn ai_query_is_actionable(
         }
     };
     on_usage(&reply.usage);
-    parse_actionable(reply.content.as_deref()?)
+    parse_gate_verdict(reply.content.as_deref()?)
 }
 
-fn parse_actionable(reply: &str) -> Option<bool> {
-    let word = reply
+/// 三词协议解析（**纯函数**）：只认首行、只认 `answer` / `clarify` / `unsupported[|主题]`。
+/// 答非所问（解释/多词/别的词）一律 `None` → 降级到本地规则，模型抖动不能误判清楚的问句。
+fn parse_gate_verdict(reply: &str) -> Option<GateVerdict> {
+    let line = reply
         .trim()
-        .trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c.is_whitespace())
-        .to_ascii_lowercase();
-    if word == "answer" {
-        Some(true)
-    } else if word == "clarify" {
-        Some(false)
-    } else {
-        None
+        .trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c.is_whitespace());
+    // 只取首行：协议是单词回复，多行输出说明模型开始解释 —— 解释不是协议
+    let line = line.lines().next().unwrap_or("").trim();
+    let (head, topic) = match line.split_once('|').or_else(|| line.split_once('｜')) {
+        Some((h, t)) => (h.trim(), t.trim()),
+        None => (line, ""),
+    };
+    match head.to_ascii_lowercase().as_str() {
+        "answer" if topic.is_empty() => Some(GateVerdict::Answer),
+        "clarify" if topic.is_empty() => Some(GateVerdict::Clarify),
+        "unsupported" => {
+            let topic: String = topic.chars().filter(|c| !c.is_control()).take(12).collect();
+            let topic = topic.trim_matches('"').trim_matches('"').trim_matches('「').trim_matches('」').trim_matches('。').to_string();
+            Some(GateVerdict::Unsupported(topic))
+        }
+        _ => None,
     }
 }
 
@@ -1058,9 +1235,10 @@ mod tests {
     #[test]
     fn need_intent_has_its_own_route_label() {
         assert_eq!(NEED_INTENT, "need-intent");
-        for r in ["llm", "llm+repair", "direct-agg", "direct-doc", "semantic-cache", "graph", "compound"] {
+        for r in ["llm", "llm+repair", "direct-agg", "direct-doc", "semantic-cache", "graph", "compound", "no-topic"] {
             assert_ne!(NEED_INTENT, r, "反问的 route 与 {r} 撞了 —— 两种失败就分不开了");
         }
+        // 裸实体名族：模板三问（销售表现/订单明细/基础资料）保留
         let reply = intent_reply("南京某客户有限公司", Instant::now(), vec![]);
         assert_eq!(
             reply.view.interact.drill,
@@ -1070,16 +1248,82 @@ mod tests {
                 "南京某客户有限公司 的基础资料".to_string(),
             ]
         );
-        assert!(reply.caliber_note.unwrap().contains("哪一类信息"));
+        let note = reply.caliber_note.unwrap();
+        assert!(note.contains("没能完全确定"), "意图分析文案必须是引导不是报错：{note}");
+        assert!(!note.contains("校验") && !note.contains("失败"), "文案不许出现内部措辞：{note}");
+        // 非实体问句（「上个月呢」族）：模板三问是噪音，drill 为空（候选由 clarify_options 承担）
+        let vague = intent_reply("上个月呢", Instant::now(), vec![]);
+        assert!(vague.view.interact.drill.is_empty(), "{:?}", vague.view.interact.drill);
     }
 
+    /// 「主题未接入」的回答：route 独立、文案明说「还没有接入数据」+ 列能问的主题、
+    /// drill 给确定能答的入口题；sql 恒空（**不走 SQL 试探**是这条 route 的存在理由）。
     #[test]
-    fn actionable_parser_only_accepts_the_two_protocol_words() {
-        assert_eq!(parse_actionable("answer"), Some(true));
-        assert_eq!(parse_actionable("`ANSWER`"), Some(true));
-        assert_eq!(parse_actionable("clarify"), Some(false));
-        assert_eq!(parse_actionable("answer because"), None);
-        assert_eq!(parse_actionable("可以查询"), None);
+    fn no_topic_reply_states_what_is_connected_and_never_probes_sql() {
+        assert_eq!(NO_TOPIC, "no-topic");
+        for r in ["llm", "llm+repair", "direct-agg", "need-intent", "compound"] {
+            assert_ne!(NO_TOPIC, r, "no-topic 的 route 与 {r} 撞了");
+        }
+        let r = no_topic_reply("本月的积分情况", "积分", Instant::now(), vec![]);
+        assert_eq!(r.route, NO_TOPIC);
+        assert!(r.sql.is_empty() && r.rows.is_empty(), "no-topic 不许带任何 SQL/数据");
+        let note = r.caliber_note.unwrap();
+        assert!(note.contains("积分"), "必须点名是哪个主题：{note}");
+        assert!(note.contains("还没有接入数据"), "{note}");
+        assert!(note.contains("销售") && note.contains("库存"), "必须列能问的主题：{note}");
+        assert_eq!(r.view.interact.drill.len(), 4, "兜底入口题不许丢：{:?}", r.view.interact.drill);
+        // 主题词缺席时就着原问句说，不编造
+        let r2 = no_topic_reply("本月的积分情况", "", Instant::now(), vec![]);
+        assert!(r2.caliber_note.unwrap().contains("本月的积分情况"));
+    }
+
+    /// 三词协议解析：answer / clarify / unsupported[|主题]，其余一律 None（降级本地规则）。
+    #[test]
+    fn gate_verdict_parser_only_accepts_the_protocol_words() {
+        assert_eq!(parse_gate_verdict("answer"), Some(GateVerdict::Answer));
+        assert_eq!(parse_gate_verdict("`ANSWER`"), Some(GateVerdict::Answer));
+        assert_eq!(parse_gate_verdict("clarify"), Some(GateVerdict::Clarify));
+        assert_eq!(
+            parse_gate_verdict("unsupported|积分"),
+            Some(GateVerdict::Unsupported("积分".into()))
+        );
+        // 全角竖线、主题带引号、只回单词（主题缺席 = 空串，不编造）
+        assert_eq!(
+            parse_gate_verdict("unsupported｜「会员等级」"),
+            Some(GateVerdict::Unsupported("会员等级".into()))
+        );
+        assert_eq!(parse_gate_verdict("unsupported"), Some(GateVerdict::Unsupported(String::new())));
+        // 答非所问一律 None
+        assert_eq!(parse_gate_verdict("answer because"), None);
+        assert_eq!(parse_gate_verdict("可以查询"), None);
+        // 多行输出只取首行（解释不是协议，但首行的判定词仍然有效 —— 与「只输出一个词」的协议对齐）
+        assert_eq!(
+            parse_gate_verdict("unsupported|积分\n因为积分是会员体系"),
+            Some(GateVerdict::Unsupported("积分".into()))
+        );
+        assert_eq!(parse_gate_verdict("answer\n因为问题已经足够明确"), Some(GateVerdict::Answer));
+    }
+
+    /// 覆盖兜底判据的两侧（纯函数）：每条逃逸护一族真实问句，删一条就有一族被误拦。
+    #[test]
+    fn hold_back_only_uncovered_targetless_questions() {
+        // 拦截：注册表零覆盖 + 有残留 + 无疑问词/关系词/单据形（「积分」族）
+        assert!(hold_back_uncovered("本月的积分情况", false));
+        assert!(hold_back_uncovered("积分", false));
+        // 逃逸①：注册表有覆盖（指标/维度/术语命中）→ 放行
+        assert!(!hold_back_uncovered("本月的积分情况", true));
+        assert!(!hold_back_uncovered("本月活动费用", true), "指标名逐字命中 → covered=true 放行");
+        // 反向（防恒真）：同一问句零覆盖时确实会被扣住 —— 这就是「积分」族的拦截形态
+        assert!(hold_back_uncovered("本月活动费用", false), "零覆盖 + 无疑问词 → 扣住（保守侧）");
+        // 逃逸②：无疑义残留（纯时间词）→ 放行
+        assert!(!hold_back_uncovered("本月", false));
+        // 逃逸③：疑问词（意图明确，只是指标没声明）→ 放行
+        assert!(!hold_back_uncovered("今年审核通过的对账单有多少笔", false));
+        // 逃逸④：关系词（「退货」是数仓里有的事件，词表别名搭不上字面条）→ 放行
+        assert!(!hold_back_uncovered("本月的退货情况", false));
+        // 逃逸⑤：单据/表名形 → 放行
+        assert!(!hold_back_uncovered("帮我查下 HJXH-DXO2026072300384", false));
+        assert!(!hold_back_uncovered("t_sales_order 现在是什么结构", false));
     }
 
     /// 反问候选的解析判据：剥序号、认全/半角竖线、滤垃圾行、去重、去掉与原问句相同的项；
@@ -1200,11 +1444,22 @@ mod tests {
             destructive < fast && fast < recall && recall < asking,
             "顺序必须是 红线词 → Fast 判定 → 指标召回 → 疑问词降级：{body}"
         );
-        // Fast 三态分支齐全：answer 放行 / clarify 反问 / None 才走本地降级
+        // Fast 三态分支齐全：answer 放行 / clarify 反问 / unsupported 主题未接入 / None 才走本地降级
         assert!(
-            body.contains("Some(true)") && body.contains("Some(false)") && body.contains("None => {}"),
-            "Fast 三态分支不完整：{body}"
+            body.contains("Some(GateVerdict::Answer)")
+                && body.contains("Some(GateVerdict::Clarify)")
+                && body.contains("Some(GateVerdict::Unsupported")
+                && body.contains("None => {}"),
+            "Fast 四态分支不完整：{body}"
         );
+        // 🔴 ②b 覆盖兜底的接线：answer 分支里必须先过 `registry_hit` + `hold_back_uncovered`
+        // 才放行（`return Ok(None)`）—— 删掉这道，「积分」族又回到「fast 说能答就去猜 SQL」。
+        let answer_arm = body.find("Some(GateVerdict::Answer)").unwrap();
+        let answer_body = &body[answer_arm..];
+        let pass_through = answer_body.find("return Ok(None)").expect("answer 分支缺放行");
+        let cover = answer_body.find("crate::triage::registry_hit(pg, ds, question)").expect("缺覆盖兜底调用");
+        let hold = answer_body.find("hold_back_uncovered(question, covered)").expect("缺覆盖兜底判据");
+        assert!(cover < hold && hold < pass_through, "覆盖兜底必须在放行之前：{answer_body}");
     }
 
     /// 🔴 呈现中文化的**接线**判据：`ask()` 的 `one` 闭包必须在 `ask_single` 之后过
@@ -1247,19 +1502,56 @@ mod tests {
         let answer = Fake::new(Some("answer"));
         assert_eq!(
             ai_query_is_actionable(&answer, &|_| {}, "长才保温柜裸机 DHT150-6").await,
-            Some(true)
+            Some(GateVerdict::Answer)
         );
         assert_eq!(answer.calls(), 1);
         let prompt = answer.prompt();
         assert!(prompt.contains("客户、商品、型号、单据、人员"), "提示词必须覆盖业务实体：{prompt}");
         assert!(prompt.contains("具体实体名称本身也代表查看该实体总览"), "裸实体必须由 Fast 模型判为可查询：{prompt}");
         assert!(!prompt.to_ascii_lowercase().contains("select "), "理解层不许诱导生成 SQL：{prompt}");
+        // 三词协议：主题清单进 prompt（判据参照）+ unsupported 的用法与「拿不准答 answer」的方向约束
+        assert!(prompt.contains("已接入的数据主题只有"), "主题清单必须进 prompt：{prompt}");
+        assert!(prompt.contains("unsupported|主题词"), "{prompt}");
+        assert!(prompt.contains("拿不准主题是否已接入时输出 answer"), "unsupported 误判方向必须写死：{prompt}");
 
         let clarify = Fake::new(Some("clarify"));
-        assert_eq!(ai_query_is_actionable(&clarify, &|_| {}, "这个呢").await, Some(false));
+        assert_eq!(ai_query_is_actionable(&clarify, &|_| {}, "这个呢").await, Some(GateVerdict::Clarify));
+
+        let unsupported = Fake::new(Some("unsupported|积分"));
+        assert_eq!(
+            ai_query_is_actionable(&unsupported, &|_| {}, "本月的积分情况").await,
+            Some(GateVerdict::Unsupported("积分".into()))
+        );
 
         let down = Fake::new(None);
         assert_eq!(ai_query_is_actionable(&down, &|_| {}, "某个陌生词").await, None);
+    }
+
+    /// 🔴 fast 判 unsupported → 「主题未接入」回答：route = no-topic、文案点名主题、
+    /// 候选围绕**已接入**主题生成（用第二包 system）；候选生成失败 → drill 兜底入口题仍在。
+    #[tokio::test]
+    async fn unsupported_topic_reply_never_probes_sql() {
+        let pg = lazy_pg();
+        // ① 判 unsupported + 候选正常 → no-topic + 结构化候选
+        let ok = Seq::of(&[Some("unsupported|积分"), Some("销售表现|本月销售额是多少\n库存现状|现在总库存量是多少")]);
+        let r = need_intent_reply(&ok, &|_| {}, &pg, "dms", "本月的积分情况", Instant::now())
+            .await
+            .unwrap()
+            .expect("判 unsupported 必须直接回答");
+        assert_eq!(r.route, NO_TOPIC);
+        assert!(r.sql.is_empty(), "no-topic 不许带 SQL（不走试探）");
+        assert_eq!(r.clarify_options.len(), 2, "{:?}", r.clarify_options);
+        let note = r.caliber_note.unwrap();
+        assert!(note.contains("积分") && note.contains("还没有接入数据"), "{note}");
+        // ② 判 unsupported + 候选生成失败 → drill 兜底入口题仍在，回答照常成立
+        let down = Seq::of(&[Some("unsupported|积分"), None]);
+        let r = need_intent_reply(&down, &|_| {}, &pg, "dms", "本月的积分情况", Instant::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.route, NO_TOPIC);
+        assert!(r.clarify_options.is_empty());
+        assert_eq!(r.view.interact.drill.len(), 4, "兜底入口题不许丢");
     }
 
     /// 🔴 改写的四条降级路：没有上一轮 / 不是追问 → **一次 LLM 都不调**；

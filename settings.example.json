@@ -16,6 +16,7 @@
   "kb_root": "data/kb",
   "kb_max_mb": 20,
   "kb_rrf_weights": { "metadata": 0.2, "relation": 0.25, "kg": 0.3, "ext_kb": 0.2 },
+  "kb_manager_grants": { "roles": [], "logins": [] },
   "llm_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "llm_api_key": "sk-***",
   "llm_model_fast": "qwen3.7-flash",

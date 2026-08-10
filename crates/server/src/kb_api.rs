@@ -170,11 +170,11 @@ async fn viewer(st: &AppState, headers: &HeaderMap, q: &KbQuery) -> Result<Viewe
 }
 
 /// 上传必须在读取 multipart 之前完成认证，因此该入口不接受 body/query 身份回退。
+/// 上传属管理面：过 `kb_manager` 闸（缺省仅管理员）。
 async fn session_viewer(st: &AppState, headers: &HeaderMap) -> Result<Viewer, ApiErr> {
     let none = None::<String>;
-    let (login, role) = crate::resolve_identity(st, headers, &none, &none)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺有效会话 token"))?;
-    load_viewer(st, login, role).await
+    let p = manager_principal(st, headers, &none, &none).await?;
+    Ok(Viewer::new(p.login_name, vec![p.role_code]))
 }
 
 async fn load_viewer(
@@ -185,6 +185,50 @@ async fn load_viewer(
     let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
         .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
+    Ok(Viewer::new(p.login_name, vec![p.role_code]))
+}
+
+/// 【KB 管理闸】管理面授权判定（纯函数，单测钉全分支）：
+/// `administrator_flag` 恒真（与 `admin_only` 同一口径，管理员永远能管）；
+/// 否则 login ∈ `grants.logins` 或 role ∈ `grants.roles`（或关系，精确字符串比对）；
+/// 缺省/None（含空名单）= 仅管理员。配置形态见 `db::Settings::kb_manager_grants`。
+fn kb_manager_allowed(
+    p: &crate::dms_policy_core::Principal,
+    grants: Option<&crate::db::KbManagerGrants>,
+) -> bool {
+    if p.administrator_flag {
+        return true;
+    }
+    let Some(g) = grants else { return false };
+    g.logins.iter().any(|login| login == &p.login_name)
+        || g.roles.iter().any(|role| role == &p.role_code)
+}
+
+/// 管理面统一闸：认证（`resolve_identity` 唯一收口，与 `viewer` 同一条）→ 现查 Principal →
+/// `kb_manager_allowed`。不过 = 403 统一文案「知识库管理未对你开放」——不区分「没配置」
+/// 与「配置了但没你」，免得从响应差异透出授权清单的存在性。
+/// 🔴 检索面（ask/search/chunk/download_doc）**不走这里**：普通用户问 KB 问题用的是检索面。
+async fn manager_principal(
+    st: &AppState,
+    headers: &HeaderMap,
+    login_name: &Option<String>,
+    role_code: &Option<String>,
+) -> Result<crate::dms_policy_core::Principal, ApiErr> {
+    let (login, role) = crate::resolve_identity(st, headers, login_name, role_code)
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
+    let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
+        .await
+        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
+    if !kb_manager_allowed(&p, st.cfg().kb_manager_grants.as_ref()) {
+        return Err(err(StatusCode::FORBIDDEN, "知识库管理未对你开放"));
+    }
+    Ok(p)
+}
+
+/// 管理面端点的 Viewer 入口：过闸 + 换算成 knowledge 的 `Viewer`（与 `load_viewer` 同一条换算，
+/// 只是 Principal 已经查过一遍，不重复打库）。
+async fn manager_viewer(st: &AppState, headers: &HeaderMap, q: &KbQuery) -> Result<Viewer, ApiErr> {
+    let p = manager_principal(st, headers, &q.login_name, &q.role_code).await?;
     Ok(Viewer::new(p.login_name, vec![p.role_code]))
 }
 
@@ -316,14 +360,17 @@ pub async fn spaces(
     headers: HeaderMap,
     Query(q): Query<KbQuery>,
 ) -> Result<ApiOk, ApiErr> {
-    let v = viewer(&st, &headers, &q).await?;
-    let is_admin = crate::admin_api::admin_only(&st, &headers, (&q.login_name, &q.role_code))
-        .await
-        .is_ok();
+    // 空间清单只服务管理面（检索面不需要它），统一过 kb_manager 闸。
+    // `kb_manager: true` 透出给前端做入口显隐 —— 能拿到这份响应的就是已过闸的人；
+    // 未过闸者在上面已经拿到 403，前端据 r.ok 判定，隐藏只是体验，闸在这里。
+    let p = manager_principal(&st, &headers, &q.login_name, &q.role_code).await?;
+    let is_admin = p.administrator_flag;
+    let v = Viewer::new(p.login_name, vec![p.role_code]);
     store::ensure_space(&st.owned, &v.login, &v.login).await.map_err(kb_err)?;
     let rows = store::list_spaces(&st.owned, &v.login, &v.roles).await.map_err(kb_err)?;
     Ok(Json(serde_json::json!({
         "is_admin": is_admin,
+        "kb_manager": true,
         "spaces": rows.into_iter().map(|s| serde_json::json!({
             "space_id": s.space_id, "name": s.name, "owner": s.owner,
             "visibility": s.visibility, "writable": s.writable, "doc_count": s.doc_count,
@@ -343,7 +390,7 @@ pub async fn create_space(
         folder_id: None,
         preset: None,
     };
-    let p = crate::admin_api::admin_only(&st, &headers, (&q.login_name, &q.role_code)).await?;
+    let p = manager_principal(&st, &headers, &q.login_name, &q.role_code).await?;
     let name = req.name.trim();
     if name.is_empty() || name.chars().count() > 60 {
         return Err(err(StatusCode::BAD_REQUEST, "知识空间名称不能为空且不超过 60 字"));
@@ -377,7 +424,7 @@ pub async fn reprocess(
         login_name: req.login_name, role_code: req.role_code, space_id: None, folder_id: None,
         preset: None,
     };
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
     if !acl::space_writable(&st.owned, &v, &row.space_id).await.map_err(kb_err)? {
         return Err(err(StatusCode::FORBIDDEN, format!("无权重处理空间 {} 的文档", row.space_id)));
@@ -433,7 +480,7 @@ pub async fn set_doc_state(
         login_name: req.login_name, role_code: req.role_code, space_id: None, folder_id: None,
         preset: None,
     };
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     let row = store::get_doc(&st.owned, &id)
         .await
         .map_err(kb_err)?
@@ -460,7 +507,7 @@ pub async fn update_doc_metadata(
         space_id: None, folder_id: None,
         preset: None,
     };
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     let meta = validate_doc_metadata(&req).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     store::update_doc_metadata_and_links(
         &st.owned,
@@ -491,8 +538,8 @@ pub async fn update_doc_metadata(
 //   .route("/api/kb/space/{id}/export", get(kb_api::export_space))
 //   .route("/api/kb/doc/{id}/description", post(kb_api::generate_description))
 //
-// 权限判据全部沿用既有口径：读 = `acl::space_readable`，写 = `acl::space_writable`，
-// 且写语句内联复核（fail-closed），本块不引入第二套判据。
+// 权限判据：先过 `kb_manager` 管理闸（本块三个 handler 均属管理面），空间级仍沿用既有口径——
+// 读 = `acl::space_readable`，写 = `acl::space_writable`，且写语句内联复核（fail-closed）。
 //
 // 接线前整块属未达代码：`allow` 挂子模块（`artifact_api`/`trace_api` 同一模子）。
 mod ops_pack {
@@ -523,7 +570,7 @@ mod ops_pack {
         Json(req): Json<IngestUrlReq>,
     ) -> Result<ApiOk, ApiErr> {
         // 先认证再占上传槽（与 `upload` 同序）：未认证请求不能耗尽 4 个许可。
-        let v = viewer(&st, &headers, &req.q).await?;
+        let v = manager_viewer(&st, &headers, &req.q).await?;
         let _permit = UPLOAD_GATE.try_acquire().map_err(|_| {
             err(StatusCode::TOO_MANY_REQUESTS, "上传并发已满（同时最多 4 个），请稍后重试")
         })?;
@@ -859,7 +906,7 @@ mod ops_pack {
             login_name: q.login_name, role_code: q.role_code,
             space_id: None, folder_id: None, preset: None,
         };
-        let v = viewer(&st, &headers, &kq).await?;
+        let v = manager_viewer(&st, &headers, &kq).await?;
         if !acl::space_readable(&st.owned, &v, &id).await.map_err(kb_err)? {
             return Err(err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {id}")));
         }
@@ -927,7 +974,7 @@ mod ops_pack {
             login_name: req.login_name, role_code: req.role_code,
             space_id: None, folder_id: None, preset: None,
         };
-        let v = viewer(&st, &headers, &kq).await?;
+        let v = manager_viewer(&st, &headers, &kq).await?;
         let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
         if !acl::space_writable(&st.owned, &v, &row.space_id).await.map_err(kb_err)? {
             return Err(err(StatusCode::FORBIDDEN, format!("无权修改空间 {} 的文档", row.space_id)));
@@ -1152,7 +1199,7 @@ pub async fn space_grants(
     Path(id): Path<String>,
     Query(q): Query<KbQuery>,
 ) -> Result<ApiOk, ApiErr> {
-    crate::admin_api::admin_only(&st, &headers, (&q.login_name, &q.role_code)).await?;
+    manager_principal(&st, &headers, &q.login_name, &q.role_code).await?;
     ensure_space_exists(&st, &id).await?;
     let roles = dms_role_options(&st).await?;
     let role_names: HashMap<&str, &str> = roles
@@ -1181,7 +1228,7 @@ pub async fn grant_space(
     Path(id): Path<String>,
     Json(req): Json<SpaceGrantReq>,
 ) -> Result<(StatusCode, ApiOk), ApiErr> {
-    crate::admin_api::admin_only(&st, &headers, (&req.login_name, &req.role_code)).await?;
+    manager_principal(&st, &headers, &req.login_name, &req.role_code).await?;
     ensure_space_exists(&st, &id).await?;
 
     if !req.role_codes.is_empty() {
@@ -1273,7 +1320,7 @@ pub async fn revoke_space(
     Path(id): Path<String>,
     Query(req): Query<SpaceGrantReq>,
 ) -> Result<ApiOk, ApiErr> {
-    crate::admin_api::admin_only(&st, &headers, (&req.login_name, &req.role_code)).await?;
+    manager_principal(&st, &headers, &req.login_name, &req.role_code).await?;
     ensure_space_exists(&st, &id).await?;
     let entry = space_acl_entry(&id, &req)?;
     // 撤权不要求对象仍存在于 DMS；否则角色被删除后会留下永远无法清理的历史 ACL。
@@ -1509,7 +1556,7 @@ pub async fn docs(
     headers: HeaderMap,
     Query(q): Query<KbQuery>,
 ) -> Result<ApiOk, ApiErr> {
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     let space_id = space_of(&v, &q);
     if !acl::space_readable(&st.owned, &v, &space_id).await.map_err(kb_err)? {
         return Err(err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {space_id}")));
@@ -1545,7 +1592,7 @@ pub async fn folders(
     headers: HeaderMap,
     Query(q): Query<KbQuery>,
 ) -> Result<ApiOk, ApiErr> {
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     let space_id = space_of(&v, &q);
     if !acl::space_readable(&st.owned, &v, &space_id).await.map_err(kb_err)? {
         return Err(err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {space_id}")));
@@ -1567,7 +1614,7 @@ pub async fn create_folder(
         space_id: req.space_id, folder_id: None,
         preset: None,
     };
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     let space_id = space_of(&v, &q);
     if space_id == v.login {
         store::ensure_space(&st.owned, &space_id, &v.login).await.map_err(kb_err)?;
@@ -1594,7 +1641,7 @@ pub async fn update_folder(
         space_id: req.space_id, folder_id: None,
         preset: None,
     };
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     let row = store::move_folder(
         &st.owned,
         &v,
@@ -1614,7 +1661,7 @@ pub async fn delete_folder(
     Path(id): Path<String>,
     Query(q): Query<KbQuery>,
 ) -> Result<ApiOk, ApiErr> {
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     store::delete_folder(&st.owned, &v, &id, q.space_id.as_deref())
         .await
         .map_err(kb_err)?;
@@ -1632,7 +1679,7 @@ pub async fn move_doc(
         space_id: None, folder_id: None,
         preset: None,
     };
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
     if !acl::space_writable(&st.owned, &v, &row.space_id).await.map_err(kb_err)? {
         return Err(err(StatusCode::FORBIDDEN, format!("无权修改空间 {} 的文档", row.space_id)));
@@ -1650,7 +1697,7 @@ pub async fn doc(
     Path(id): Path<String>,
     Query(q): Query<KbQuery>,
 ) -> Result<ApiOk, ApiErr> {
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
     let related = store::related_docs(&st.owned, &v, &id).await.map_err(kb_err)?;
     let mut body = doc_json(&row);
@@ -1737,7 +1784,7 @@ pub async fn delete(
     Path(id): Path<String>,
     Query(q): Query<KbQuery>,
 ) -> Result<ApiOk, ApiErr> {
-    let v = viewer(&st, &headers, &q).await?;
+    let v = manager_viewer(&st, &headers, &q).await?;
     // 先判可见（不可见即 403，不泄露他人文档存在性），再判可写——只读授权者不许删别人的文档
     let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
     if !acl::space_writable(&st.owned, &v, &row.space_id).await.map_err(kb_err)? {
@@ -2229,6 +2276,77 @@ async fn sync_source_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn principal(login: &str, role: &str, admin: bool) -> crate::dms_policy_core::Principal {
+        crate::dms_policy_core::Principal {
+            employee_id: 1,
+            login_name: login.into(),
+            actual_name: login.into(),
+            administrator_flag: admin,
+            department_id: None,
+            role_id: 0,
+            role_code: role.into(),
+        }
+    }
+
+    /// 【KB 管理闸】全分支：管理员恒真 / None 与空名单仅管理员 / login 命中 / role 命中 /
+    /// 都不命中为假 / 相似串不算（精确比对，无大小写折叠与通配）。
+    #[test]
+    fn kb_manager_allowed_pins_every_branch() {
+        use crate::db::KbManagerGrants;
+        let grants = KbManagerGrants {
+            roles: vec!["kb_admin".into()],
+            logins: vec!["zhangsan".into()],
+        };
+        // 管理员恒真：有没有配置、在不在名单都真
+        assert!(kb_manager_allowed(&principal("lisi", "sales", true), None));
+        assert!(kb_manager_allowed(&principal("lisi", "sales", true), Some(&grants)));
+        // 缺省 None 与空名单 = 仅管理员（即使在名单语义上也轮不到非管理员）
+        assert!(!kb_manager_allowed(&principal("zhangsan", "kb_admin", false), None));
+        assert!(!kb_manager_allowed(
+            &principal("zhangsan", "kb_admin", false),
+            Some(&KbManagerGrants::default())
+        ));
+        // login 命中 / role 命中（或关系，各命中一边即真）
+        assert!(kb_manager_allowed(&principal("zhangsan", "sales", false), Some(&grants)));
+        assert!(kb_manager_allowed(&principal("lisi", "kb_admin", false), Some(&grants)));
+        // 都不命中 = 假；相似但不等的串不算
+        assert!(!kb_manager_allowed(&principal("lisi", "sales", false), Some(&grants)));
+        assert!(!kb_manager_allowed(&principal("Zhangsan", "sales", false), Some(&grants)));
+    }
+
+    /// 闸的覆盖清单（源码断言，端点增删时这里必须跟着想一遍）：
+    /// 管理面写端点（上传/删除/移动/目录/授权/重处理/描述/ingest-url）与空间管理读端点
+    /// 必须过 manager 闸；检索面（ask/search/chunk/download）**不许**过——
+    /// 普通用户问 KB 问题走检索面，误伤就是把「问答」也收进管理授权。
+    #[test]
+    fn manager_gate_covers_management_surface_only() {
+        let src = include_str!("kb_api.rs");
+        let body_of = |name: &str| -> String {
+            let needle = format!("pub async fn {name}(");
+            let body = src.split(&needle).nth(1).unwrap_or_else(|| panic!("端点 {name} 不存在"));
+            body.split("\n}\n").next().unwrap().to_string()
+        };
+        for name in [
+            "upload", "create_space", "reprocess", "set_doc_state", "update_doc_metadata",
+            "ingest_url", "export_space", "generate_description", "space_grants", "grant_space",
+            "revoke_space", "docs", "folders", "create_folder", "update_folder", "delete_folder",
+            "move_doc", "doc", "delete", "spaces",
+        ] {
+            let body = body_of(name);
+            assert!(
+                body.contains("manager_principal") || body.contains("manager_viewer") || body.contains("session_viewer"),
+                "管理面端点 {name} 没过 kb_manager 闸"
+            );
+        }
+        for name in ["ask", "search", "chunk", "download_doc"] {
+            let body = body_of(name);
+            assert!(
+                !body.contains("manager_principal") && !body.contains("manager_viewer") && !body.contains("session_viewer"),
+                "检索面端点 {name} 不许过管理闸"
+            );
+        }
+    }
 
     /// KB 落账只在 knowledge 层（`/api/kb/ask`、`/api/ask` 分诊分支、kb_eval、MCP
     /// 四个调用点一处埋点）：server 端点再写一份就是双写（Y2）

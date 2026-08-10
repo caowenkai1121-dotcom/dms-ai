@@ -126,10 +126,7 @@ pub fn analytical_question_hit(question: &str) -> bool {
         "最多", "最少", "排行", "排名", "趋势", "占比", "比例", "对比", "明细", "清单",
         "分布", "汇总", "合计", "top", "TOP", "前十", "前20", "前二十",
     ];
-    const RELATIONS: &[&str] = &[
-        "下单", "购买", "买过", "卖出", "卖给", "成交", "关联", "发生", "新增", "流失",
-        "发货", "退货", "申请", "审核", "驳回",
-    ];
+    const RELATIONS: &[&str] = RELATION_WORDS;
     const TIME_SCOPED: &[&str] = &[
         "销售额", "销量", "销售量", "毛利", "成本", "收入", "订单", "单据", "发货",
         "退款", "售后", "开票", "对账", "库存",
@@ -148,13 +145,24 @@ pub fn kb_hit(question: &str) -> bool {
     KB_WORDS.iter().any(|w| q.contains(w))
 }
 
+/// 业务关系/事件词表（下单/退货/审核…）。两个消费者：`analytical_question_hit`（完整问句判据）
+/// 与 `ask::need_intent_reply` 的覆盖兜底（「本月的退货情况」族：注册表词表不认识「退货」，
+/// 但它说的是数仓里有的事件 —— 没有这张表，那句就会被误拦成反问）。
+pub(crate) const RELATION_WORDS: &[&str] = &[
+    "下单", "购买", "买过", "卖出", "卖给", "成交", "关联", "发生", "新增", "流失",
+    "发货", "退货", "申请", "审核", "驳回",
+];
+
 /// 注册表命中（指标名/维度名/术语，含各自的别名与 MapFilter 净化）。
 /// 三个函数是**召回链已有的那三个**，判据与 `generate_sql` 里喂 prompt 的完全同源——
 /// 在这里复述一份「什么算指标名」必然与召回漂开。`||` 短路：命中就不查后面的。
 ///
+/// `pub(crate)` 的第二个消费者是 `ask::need_intent_reply` 的覆盖兜底（fast 判 answer 之后、
+/// 放行 SQL 生成之前）——「注册表认不认识这句问句」两处必须用同一份判据，抄第二份必漂。
+///
 /// ponytail: 表名命中只看问句里的 `t_xxx` 字面（`table_hit`），没查 `meta.kw_force`——
 /// 那要多一条 SQL，而问数问句里出现真表名的比例极低（真出现时 trgm 召回照样能找到表）。
-async fn registry_hit(pg: &PgPool, ds: &str, q: &str) -> anyhow::Result<bool> {
+pub(crate) async fn registry_hit(pg: &PgPool, ds: &str, q: &str) -> anyhow::Result<bool> {
     // 三条召回都只吃 `(ds, question)`：`tables`/`limit`/`embed` 本组不读（形状见 `RecallCtx`）
     let cx = RecallCtx { question: q, tables: &[], limit: 0, ds, embed: None, embed_slices: &[] };
     Ok(!recall::recall_metric_hits(pg, &cx).await?.is_empty()
@@ -181,7 +189,8 @@ fn time_hit(q: &str) -> bool {
 
 /// 表名命中：DMS 业务表一律 `t_` 前缀 + 小写字母（`t_sales_order`）。
 /// 要求 `t_` 后跟至少 3 个小写字母，免得「t_」这两个字符本身成为触发器。
-fn table_hit(q: &str) -> bool {
+/// `pub(crate)` 的第二个消费者：`ask::hold_back_uncovered`（单据/表名形 = 意图明确，不拦）。
+pub(crate) fn table_hit(q: &str) -> bool {
     let low = q.to_lowercase();
     low.match_indices("t_").any(|(i, _)| {
         low[i + 2..].chars().take(3).filter(|c| c.is_ascii_lowercase()).count() == 3
@@ -192,7 +201,8 @@ fn table_hit(q: &str) -> bool {
 /// **只判形不判前缀**——判前缀要复述 `fastpath::doc_binding` 的映射表，那是第二份真相源；
 /// 判错的代价也不对称：这里判宽只是多走一次问数（快路径自己会不命中并回落）。
 /// 纯数字串（"20250101"）刻意不算：那是日期，由 `time_hit` 管。
-fn doc_code_hit(q: &str) -> bool {
+/// `pub(crate)` 的第二个消费者：`ask::hold_back_uncovered`（同上）。
+pub(crate) fn doc_code_hit(q: &str) -> bool {
     q.contains("单号")
         || q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).any(|t| {
             t.len() >= 6

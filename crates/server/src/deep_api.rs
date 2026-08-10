@@ -3072,7 +3072,8 @@ fn should_run_model_sections(
     plan: dms_agent::AnalysisPlan,
     primary: &dms_agent::AskResult,
 ) -> bool {
-    plan.allow_model_sections && primary.route != "need-intent"
+    // need-intent（反问）与 no-topic（主题未接入）都不是取数结果：不为它们起模型板块
+    plan.allow_model_sections && primary.route != "need-intent" && primary.route != "no-topic"
 }
 
 fn planning_catalog(
@@ -4548,6 +4549,9 @@ mod tests {
             dws_sales_metric: false,
             allow_model_sections: true,
         };
+        assert!(!should_run_model_sections(plan, &result));
+        // no-topic（主题未接入）与反问同理：不起模型板块
+        result.route = "no-topic".into();
         assert!(!should_run_model_sections(plan, &result));
         result.route = "direct-agg".into();
         assert!(should_run_model_sections(plan, &result));

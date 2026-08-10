@@ -47,8 +47,16 @@ interface Result {
   truncation_note?: string
   /** 行级权限**生效了**的回显（后端 `skip_serializing_if`，故可选）。
    *  不渲染它 = 受限用户看到子集却以为是全量，拿着被过滤的数下结论 ——
-   *  那件事不报错、也没有任何判据抓得到，属正确性而非产品面。 */
+   *  那件事不报错、也没有任何判据抓得到，属正确性而非产品面。
+   *  【结果卡降噪】它是「判断/校验类信息」：渲染在底部「核查详情」折叠条里（默认收起），不占首屏。 */
   scope_note?: string
+  /** 可信核查凭证（`agent::ctx::attach_trust`）：级别/来源/权限边界/执行方式/指纹/checks 清单。
+   *  全是判断/校验类信息 —— 裁决（2026-08-10 结果卡降噪）：收进「核查详情」折叠条，
+   *  数据一项不丢，只是默认收起。后端 `skip_serializing_if`，老服务端不带这个键也不崩。 */
+  trust?: {
+    level: 'verified' | 'high' | 'review'; trace_id: string; source: string; route: string
+    access: string; execution: string; fingerprint: string; checks: string[]
+  }
   /** 销售单指标 KPI 的同窗补充（裁决：销售额/销量/毛利额等答案顺带成本/收入/毛利）。
    *  与主查询同一时间窗、同一权限闸门；后端 `skip_serializing_if` —— 补充查询失败/为空
    *  时整键不上线（本组件就不渲染），主回答一个字符不变。恒单行五值，列名＝合同中文别名。 */
@@ -144,6 +152,22 @@ const displaySql = computed(() => {
   const sql = (props.result.sql ?? '').trim()
   return sql && !sql.startsWith('实体候选匹配：') ? sql : ''
 })
+
+/** 反问/主题未接入两族 route：回答主体是引导文案（caliber_note），不是取数结果。 */
+const isAskRoute = computed(() => props.result.route === 'need-intent' || props.result.route === 'no-topic')
+
+/** 【结果卡降噪（裁决 2026-08-10）】判断/校验类信息默认折叠进「核查详情」：
+ *  口径复核明细（caliber_note 原文）、权限注入回显（scope_note）、可信凭证（trust）。
+ *  数据一项不丢，只是默认收起；首屏只留答案 + 必要提示（截断/推导口径/脱敏）。
+ *  caliber-warn 那句一句话警告仍留首屏 —— 「数字不可信」这件事本身不能折叠。 */
+const auditTrust = computed(() => props.result.trust)
+const auditCaliberNote = computed(() => (isAskRoute.value ? '' : (props.result.caliber_note ?? '')))
+const hasAudit = computed(() => !!(auditCaliberNote.value || props.result.scope_note || auditTrust.value))
+const TRUST_LEVEL_LABEL: Record<string, string> = {
+  verified: '已验证（确定性路径）',
+  high: '较高（模型 SQL 已过全闸门）',
+  review: '需复核（有明确风险标注）',
+}
 const insightCards = computed<InsightCard[]>(() => {
   if (isEntityCandidate.value) return []
   if (!insightText.value) return []
@@ -398,10 +422,11 @@ function supplementalIsMetric(ci: number): boolean {
     <!-- 口径 / 截断标注在**每个结果自己**这一层渲染（含复合的每个子问）：
          放在数字之前，否则「照返 + 标注」等于没标注。 -->
     <!-- 【S3】need-intent 选择卡（datanote AskUserTool 对应物）：反问是**澄清**不是报错，
-         不用 error 红。选项 = 后端给的完整问法（view.interact.drill），点击原样发送 —
+         不用 error 红。no-topic（主题未接入）同形 —— 它也是引导回答，不是取数结果。
+         选项 = 后端给的完整问法（view.interact.drill），点击原样发送 —
          挂起/续跑由会话追问机制天然承担（rewrite_followup + 日期继承），无需状态机。 -->
-    <div v-if="result.route === 'need-intent'" class="ask-card">
-      <div class="ask-hd">🤔 先问清再查</div>
+    <div v-if="isAskRoute" class="ask-card">
+      <div class="ask-hd">{{ result.route === 'no-topic' ? '📭 这个主题还没接入数据' : '🤔 先问清再查' }}</div>
       <div class="ask-q">{{ result.caliber_note }}</div>
       <div class="ask-opts">
         <button v-for="d in intentOptions" :key="d" type="button" class="ask-opt" @click.stop="emit('pick', d)">{{ d }}</button>
@@ -460,9 +485,9 @@ function supplementalIsMetric(ci: number): boolean {
       敏感列已按数据策略<b>整列脱敏</b>：{{ redacted.join('、') }}
     </div>
 
-    <!-- need-intent（反问）与 entity-card（总览卡）不是取数结果，不出「未找到数据」——
+    <!-- need-intent/no-topic（反问与主题未接入）与 entity-card（总览卡）不是取数结果，不出「未找到数据」——
          实测（tp/b39c9a32）：反问气泡下叠这句，读的人以为「这个客户没数据」 -->
-    <div v-if="result.row_count === 0 && result.route !== 'need-intent' && result.route !== 'entity-card' && result.route !== 'business-lookup'" class="empty-hint">
+    <div v-if="result.row_count === 0 && !isAskRoute && result.route !== 'entity-card' && result.route !== 'business-lookup'" class="empty-hint">
       未找到数据。可能：① 该口径本期无记录　② 数据权限范围内无此数据　③ 换个说法试试
     </div>
 
@@ -679,6 +704,32 @@ function supplementalIsMetric(ci: number): boolean {
       <pre>{{ displaySql }}</pre>
     </details>
 
+    <!-- 【结果卡降噪】判断/校验类信息的默认收起位：口径复核明细、权限注入回显、
+         可信凭证（级别/来源/权限边界/执行方式/指纹/checks 清单）。数据全在，只是默认折叠。 -->
+    <details v-if="hasAudit" class="audit-details">
+      <summary>核查详情</summary>
+      <div class="audit-body">
+        <div v-if="auditCaliberNote" class="audit-item">
+          <span class="audit-k">口径复核</span>
+          <p>{{ auditCaliberNote }}</p>
+        </div>
+        <div v-if="result.scope_note" class="audit-item">
+          <span class="audit-k">数据权限</span>
+          <p>{{ result.scope_note }}</p>
+        </div>
+        <div v-if="auditTrust" class="audit-item">
+          <span class="audit-k">可信凭证</span>
+          <p>
+            级别 {{ TRUST_LEVEL_LABEL[auditTrust.level] ?? auditTrust.level }} · 来源 {{ auditTrust.source }}
+            · {{ auditTrust.access }} · {{ auditTrust.execution }} · 指纹 {{ auditTrust.fingerprint }}
+          </p>
+          <ul class="audit-checks">
+            <li v-for="(c, ci) in auditTrust.checks" :key="ci">{{ c }}</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+
     <section v-if="insightCards.length" class="result-section insight-section">
       <div class="section-head">
         <div>
@@ -861,6 +912,24 @@ function supplementalIsMetric(ci: number): boolean {
   color: var(--text-regular); font: 11.5px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
   white-space: pre; tab-size: 2;
 }
+
+/* 「核查详情」折叠条（结果卡降噪）：小字弱化，判断/校验类信息的默认收起位 */
+.audit-details {
+  margin-top: 12px; border: 1px dashed var(--border); border-radius: 7px;
+  background: transparent; overflow: hidden;
+}
+.audit-details summary {
+  padding: 7px 12px; color: var(--text-faint); font-size: 11px; font-weight: 600;
+  cursor: pointer; user-select: none;
+}
+.audit-details[open] summary { border-bottom: 1px dashed var(--border); color: var(--text-muted); }
+.audit-body { padding: 10px 13px; color: var(--text-muted); font-size: 11.5px; line-height: 1.7; }
+.audit-item { margin-bottom: 8px; }
+.audit-item:last-child { margin-bottom: 0; }
+.audit-item p { margin: 2px 0 0; overflow-wrap: anywhere; }
+.audit-k { color: var(--text-faint); font-size: 10.5px; font-weight: 700; }
+.audit-checks { margin: 4px 0 0; padding-left: 16px; }
+.audit-checks li { margin: 1px 0; }
 
 .insight-section { margin-top: 24px; padding-top: 2px; }
 .analysis-basis { color: var(--text-muted); font-size: 11px; }

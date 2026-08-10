@@ -179,7 +179,7 @@ interface DeepPage {
 
 const routeLabel: Record<string, string> = {
   'direct-doc': '业务单据', 'direct-agg': '快速聚合', 'direct-derive': '推导口径', graph: '图关系',
-  'entity-card': '实体总览', 'business-lookup': '业务库点查', 'semantic-cache': '语义缓存', 'need-intent': '需要澄清',
+  'entity-card': '实体总览', 'business-lookup': '业务库点查', 'semantic-cache': '语义缓存', 'need-intent': '需要澄清', 'no-topic': '主题未接入',
   llm: 'AI 生成', 'llm+repair': 'AI 生成·自修', knowledge: '知识库',
 }
 const QUICK_FALLBACK = ['本月销售额是多少', '本月销售额按省区', '本月销售额按战区', '买过烤肠的客户有哪些', '查一下昨天的订单明细']
@@ -1024,6 +1024,18 @@ const theme = ref(localStorage.getItem('theme') || 'light')
 // 知识库管理面（上传/列表/删除）。此前前端**没有任何上传入口** ——
 // 后端 `/api/kb/upload` 早通了、`kb_eval.py` 也在用，但用户在界面上传不了文件。
 const kbOpen = ref(false)
+// 【KB 管理闸】管理入口显隐的唯一依据：服务端确认（与管理员判定同源 —— `confirmAdminAccess`
+// 探 `/api/admin/llm-config`，这里探 `/api/kb/spaces`）。该端点已过管理闸：200 且 `kb_manager:true`
+// = 管理人；403 = 非授权（未配置授权时仅管理员能过）。隐藏只是体验，安全闸在服务端。
+const kbManager = ref(false)
+async function confirmKbManager(): Promise<void> {
+  kbManager.value = false
+  if (!sessionValidated.value || !sessionToken.value) return
+  try {
+    const r = await fetch('/api/kb/spaces', { headers: authHeaders(false) })
+    kbManager.value = r.ok && (await r.json()).kb_manager === true
+  } catch { kbManager.value = false }
+}
 const knowledgeSpaceId = ref(localStorage.getItem('dms-kb-space') || '')
 const knowledgeSpaceName = ref(localStorage.getItem('dms-kb-space-name') || '')
 function rememberKnowledgeSpace(value: { space_id: string; name: string }) {
@@ -1225,6 +1237,7 @@ function rememberSession(token: string, login: string) {
   // 预览 HTML 是按旧身份取回的授权快照。登录、续签或切换角色后必须丢弃。
   closePreview()
   adminConfirmed.value = false
+  kbManager.value = false
   sessionToken.value = token
   loginName.value = login
   sessionValidated.value = true
@@ -1237,12 +1250,13 @@ function clearSession() {
   sessionToken.value = ''; loginName.value = ''; roleCode.value = ''; loginRoles.value = []
   sessionValidated.value = false
   adminConfirmed.value = false
+  kbManager.value = false
   digests.value = []; weeklyOpen.value = false
   sessionStorage.removeItem('dms-session'); sessionStorage.removeItem('dms-login')
   if (view.value === 'settings' || location.hash === '#/settings') goChat()
 }
 async function afterLogin() {
-  await Promise.all([loadConvs(), loadSuggest(), confirmAdminAccess()])
+  await Promise.all([loadConvs(), loadSuggest(), confirmAdminAccess(), confirmKbManager()])
   await loadDigests()
 }
 async function validateSession(): Promise<boolean> {
@@ -1277,6 +1291,8 @@ async function handleSessionExpired() {
 }
 
 async function openKnowledge() {
+  // 管理入口只对有授权的人开放（服务端还有真闸，这里只是显隐）
+  if (!kbManager.value) return
   kbOpen.value = true
 }
 async function passwordLogin() {
@@ -2242,7 +2258,7 @@ function exportSupplementalCsv(t: Turn) {
         <div class="sec-t">会话 <button class="btn-sm" @click="newSession">+ 新建</button></div>
       </div>
       <div class="sec">
-        <div class="sec-t">知识库 <button class="btn-sm" @click="openKnowledge">📁 上传/管理</button></div>
+        <div class="sec-t">知识库 <button v-if="kbManager" class="btn-sm" @click="openKnowledge">📁 上传/管理</button></div>
       </div>
       <!-- 今日经营日报：服务端 feed=daily 只返回当天生成的一份。 -->
       <div class="sec" v-if="hasAdminAccess() && digests.length">
@@ -2325,7 +2341,7 @@ function exportSupplementalCsv(t: Turn) {
         <div class="brand">数据智能<span class="sub">DMS · 自然语言取数</span></div>
         <div class="sp"></div>
         <span v-if="sessionToken" class="dms-user">已登录 <b>{{ loginName || '认证中…' }}</b><template v-if="roleCode"> · {{ roleCode }}</template></span>
-        <button class="btn-sm mobile-kb" title="企业知识库" @click="openKnowledge">知识库</button>
+        <button v-if="kbManager" class="btn-sm mobile-kb" title="企业知识库" @click="openKnowledge">知识库</button>
         <button v-if="sessionToken" class="btn-sm" title="今日/累计提问与路由分布" @click="usageOpen = true">📈 使用统计</button>
         <button v-if="sessionToken" class="btn-sm" title="提示词包：注入深度报告规划提示词，admin 可写" @click="skillsOpen = true">🧩 提示词包</button>
         <button v-if="sessionToken" class="btn-sm" title="表关系图谱：节点=表、边=关系，admin 可接受/拒绝推断边" @click="datamapOpen = true">🗺 数据地图</button>
@@ -2752,7 +2768,7 @@ function exportSupplementalCsv(t: Turn) {
                    将来若给容器补上标注，这两行就是它的落点），
                    条件带 `subs?.length` 是为了不让单结果显示两遍。 -->
               <template v-if="t.result.subs?.length">
-                <div v-if="t.result.caliber_note" class="caliber-warn">当前结果未通过业务口径复核，请调整问法后重试。</div>
+                <div v-if="t.result.caliber_note" class="caliber-warn">{{ t.result.caliber_note }}</div>
                 <div v-if="t.result.truncation_note" class="trunc-note">数据量较大，当前仅展示已返回的数据；可缩小查询范围获取更完整结果。</div>
               </template>
 

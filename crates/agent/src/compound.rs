@@ -36,10 +36,21 @@ const MAX_SUBS: usize = 3;
 /// 少于两条不算复合：拆成一条等于白花一次 LLM 又丢了原问句的措辞
 const MIN_SUBS: usize = 2;
 
-/// 复合问题识别（deepagents planning 门控）：明确「分别/对比」+ 需多维度/口径拆解
+/// 复合问题识别（deepagents planning 门控）：明确「分别/对比」+ 需多维度/口径拆解；
+/// 或「A 情况，其中最 X 的 B」族（「其中」+ 极值词 = 总体与极值个体两问，见函数体注释）。
 pub fn is_compound(q: &str) -> bool {
-    q.contains("分别") || (q.contains("对比") && q.matches('和').count() + q.matches('与').count() >= 1)
+    q.contains("分别")
+        || (q.contains("对比") && q.matches('和').count() + q.matches('与').count() >= 1)
+        // 【其中族】「本月的活动费用情况，其中最高的客户信息」：没有「分别/对比」，
+        // 但「其中」+ 极值词的语义恒为「总体情况 + 极值个体」两问。实测不拆的后果：
+        // LLM 单问只答了极值那一半（LIMIT 1），总体的「费用情况」整半句静默丢掉。
+        // 边界：光有「其中」不拆（「其中已审核的明细」是单问的过滤，拆了就错）。
+        || (q.contains("其中") && SUPERLATIVE.iter().any(|w| q.contains(w)))
 }
+
+/// 「其中族」的极值词（`is_compound` 的第三支判据）。只收四个最明确的：
+/// 「最大/最小」歧义面大（最大客户 vs 最大程度），不收。
+const SUPERLATIVE: &[&str] = &["最高", "最低", "最多", "最少"];
 
 /// 复合问答的编排。`ask_one` = 单问链路（`ask.rs` 传 `|q| ask_single(...)`：
 /// 参数收所有权，`async move` 里再借，故闭包是 `Fn` 可反复调用）。
@@ -114,7 +125,7 @@ fn missing_note(failed: &[String], ok: usize) -> Option<String> {
 
 /// 拆解复合问题为独立子问题（fast 模型，deepagents write_todos 思想）
 async fn split_questions(llm: &dyn ChatModel, question: &str) -> Vec<String> {
-    let system = "把用户的复合问题拆成 2-3 个可独立查询的子问题，每个子问题自包含（含时间/维度）。只输出 JSON 字符串数组，如 [\"各省销售额\",\"各商品分类销量\"]，不要解释。";
+    let system = "把用户的复合问题拆成 2-3 个可独立查询的子问题，每个子问题自包含（含时间/维度）。「其中/它/那个」等指代词必须展开成前半句的完整对象与口径。只输出 JSON 字符串数组，如 [\"各省销售额\",\"各商品分类销量\"]，不要解释。";
     // 温度 0.1 = 搬运前 `LlmClient::chat` 写死的那个值（`server/src/llm.rs:53`）
     let req = ChatRequest::text(ModelTier::Fast, system, question, Some(0.1));
     match llm.chat(req).await.ok().and_then(|r| r.content) {
@@ -246,6 +257,12 @@ mod tests {
         assert!(!is_compound("按省份看销售额"));
         // 「对比」没有并列连词 → 不拆（"对比一下"拆不出两条独立子问）
         assert!(!is_compound("对比一下最近的走势"));
+        // 【其中族】「其中」+ 极值词 → 拆（总体 + 极值个体两问）
+        assert!(is_compound("本月的活动费用情况，其中最高的客户信息"));
+        assert!(is_compound("本月销售额情况，其中最少的是哪个省"));
+        // 判宽边界：光有「其中」无极值词 → 不拆（「其中已审核的」是单问的过滤条件）
+        assert!(!is_compound("本月订单，其中已审核的明细"));
+        assert!(!is_compound("各省中最高的那个客户"), "无「其中」字面 → 不拆（单问排行接得住）");
     }
 
     /// 拆解回复的解析：硬上限 3 条、剔空串、抽不出数组就不拆

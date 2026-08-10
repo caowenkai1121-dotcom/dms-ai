@@ -220,6 +220,27 @@ pub struct Settings {
     /// 端口收窄（docker 映射改 `127.0.0.1:8100:8100`）是另一道独立防线，两道都该做。
     #[serde(default)]
     pub insecure_login_fallback: bool,
+    /// 【KB 管理授权】知识库**管理面**（上传/删除/移动/目录/授权/重处理/AI 描述/ingest-url
+    /// 与空间管理读端点）对哪些角色/人员开放。**缺省/None = 仅管理员**
+    /// （`administrator_flag` 恒真，与 `admin_only` 同一口径）——不配就是引入前的行为；
+    /// 配了空名单等价于不配。判定在 `kb_api::kb_manager_allowed`（纯函数，单测钉全分支）。
+    /// 检索面（ask/search/chunk/下载预览）**不过这道闸**：普通用户照样能问 KB 问题。
+    #[serde(default)]
+    pub kb_manager_grants: Option<KbManagerGrants>,
+}
+
+/// 【KB 管理授权】见 `Settings::kb_manager_grants`。两个名单是**或**的关系；
+/// 匹配是精确字符串比对（无通配、无大小写折叠），角色码即 DMS `t_role.role_code`。
+/// `deny_unknown_fields` 与顶层同一条纪律（二·AS3）：嵌套键名打错也必须启动失败。
+#[derive(Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct KbManagerGrants {
+    /// 按 DMS 角色码整组开放（如 "kb_admin"）
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// 按 DMS 登录名逐人开放
+    #[serde(default)]
+    pub logins: Vec<String>,
 }
 
 /// 1 = 关（见 `sc_samples` 的文档）
@@ -1238,6 +1259,29 @@ mod tests {
             serde_json::from_str::<Settings>(raw).unwrap().xcx_auth_base.is_none(),
             "示例配置把小程序校验地址配上了 —— 照抄的人在没想清楚前就开了对外端点"
         );
+    }
+
+    /// 【KB 管理授权】三层判据（同 `xcx_auth_base_defaults_to_closed` 的结构）：
+    /// 缺省 None = 仅管理员 / 显式配置真的读进来 / 示例配置显式给出且为空名单（照抄 = 仅管理员）。
+    #[test]
+    fn kb_manager_grants_default_to_admin_only() {
+        // ① 不写这个键 = None = 管理面仅管理员（None 分支由 `kb_api::kb_manager_allowed` 的单测钉住）
+        let s: Settings = serde_json::from_str(MIN).unwrap();
+        assert!(s.kb_manager_grants.is_none(), "KB 管理授权默认必须是 None（仅管理员）");
+        // ② 显式写值要真的读进来（否则「永远 None」也让 ① 绿，授权永远开不出去）
+        let on = MIN.replace('{', r#"{"kb_manager_grants":{"roles":["kb_admin"],"logins":["zhangsan"]},"#);
+        let g = serde_json::from_str::<Settings>(&on).unwrap().kb_manager_grants.unwrap();
+        assert_eq!(g.roles, vec!["kb_admin"]);
+        assert_eq!(g.logins, vec!["zhangsan"]);
+        // 嵌套键名打错同样硬失败（deny_unknown_fields 不止守顶层）
+        let typo = MIN.replace('{', r#"{"kb_manager_grants":{"role":["kb_admin"]},"#);
+        assert!(serde_json::from_str::<Settings>(&typo).is_err(), "嵌套键名打错必须硬失败");
+        // ③ 示例配置必须显式带这个键且是空名单：照抄示例的人拿到的是「仅管理员」那一档。
+        //    只断言解析值的话示例里删掉这行照样绿，所以断言原文含键名。
+        let raw = include_str!("../../../settings.example.json");
+        assert!(raw.contains("\"kb_manager_grants\""), "示例缺这个键 = 运维不知道管理入口能按角色/人开放");
+        let g = serde_json::from_str::<Settings>(raw).unwrap().kb_manager_grants.unwrap();
+        assert!(g.roles.is_empty() && g.logins.is_empty(), "示例里的授权名单必须为空（照抄 = 仅管理员）");
     }
 
     /// 🔴 `docker run` 的端口发布面必须收在回环。

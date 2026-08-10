@@ -99,7 +99,9 @@ const folderEditParentId = ref('')
 const folderDialogErr = ref('')
 const folderDeletingId = ref('')
 const docMovingId = ref('')
-const isAdmin = ref(false)
+// 【KB 管理闸】管理操作区（共享权限/新建空间等）的显隐依据：服务端 `/api/kb/spaces` 过闸才返
+// `kb_manager:true`（配置授权的角色/人员 + 管理员）。隐藏只是体验，安全闸在服务端各管理端点。
+const kbManager = ref(false)
 const spacesErr = ref('')
 const listErr = ref('')
 const actionErr = ref('')
@@ -879,7 +881,7 @@ async function loadSpaces(preferred?: string) {
     if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`)
     if (requestId !== spacesRequestId) return
     spaces.value = data.spaces ?? []
-    isAdmin.value = !!data.is_admin
+    kbManager.value = data.kb_manager === true
     const next = preferred && spaces.value.some((space) => space.space_id === preferred)
       ? preferred
       : spaces.value.some((space) => space.space_id === spaceId.value)
@@ -942,7 +944,7 @@ async function loadSpaces(preferred?: string) {
     uploadRequestId++
     spacesErr.value = errorText(e)
     spaces.value = []
-    isAdmin.value = false
+    kbManager.value = false
     spaceId.value = ''
     docs.value = []
     folders.value = []
@@ -1685,7 +1687,7 @@ void loadSpaces(props.initialSpace)
               {{ space.name }}{{ space.writable ? '' : '（只读）' }}
             </option>
           </select>
-          <div v-if="isAdmin" class="space-actions">
+          <div v-if="kbManager" class="space-actions">
             <button v-if="currentSpace" class="secondary-btn" type="button" @click="openGrants">共享权限</button>
             <button class="secondary-btn" type="button" @click="createOpen = true">新建空间</button>
           </div>
