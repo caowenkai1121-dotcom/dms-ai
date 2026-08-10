@@ -28,7 +28,7 @@ use crate::AppState;
 use dms_semantic::registry::datasource as ds_reg;
 use dms_connector::SqlSource;
 use dms_connector::registry::DsSpec;
-use dms_policy::principal;
+use crate::dms_policy::principal;
 use axum::{extract::{Path, Query, State}, http::{HeaderMap, StatusCode}, Json};
 use dms_kernel::DsId;
 use dms_knowledge::acl::{self, AclEntry, AclScope, Grantee, Perm};

@@ -12,7 +12,7 @@
 use crate::AppState;
 // 数据源注册表已迁 dms-semantic（`server/src/meta.rs` 已删）。
 use dms_semantic::registry::datasource as ds_reg;
-use dms_policy::principal;
+use crate::dms_policy::principal;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;

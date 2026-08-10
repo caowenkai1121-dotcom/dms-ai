@@ -292,6 +292,90 @@ fn parse_entity(question: &str) -> Option<ParsedEntity> {
     Some(ParsedEntity { kind, field, value: value.to_string() })
 }
 
+/// 组织/公司形态证据：DMS 客户名带渠道前缀（customer_class 04=线下客户 的「线下-」命名约定），
+/// 或以公司类后缀收尾。命中即不可能是自然人姓名 —— 员工目录里的同名行是客户的登录账号
+/// （实测 t_employee 里 actual_name 含「有限公司」的有 1022 行），不是员工本人。
+fn looks_like_company(value: &str) -> bool {
+    const CHANNEL_PREFIXES: &[&str] = &["线下-", "线上-"];
+    const ORG_SUFFIXES: &[&str] = &[
+        "有限责任公司", "股份有限公司", "有限公司", "公司", "集团", "工厂", "厂",
+        "合作社", "经营部", "商行", "超市", "中心", "门市部", "经销部", "批发部",
+    ];
+    let v = value.trim();
+    CHANNEL_PREFIXES.iter().any(|p| v.starts_with(p))
+        || ORG_SUFFIXES.iter().any(|s| v.ends_with(s))
+}
+
+/// 商品形态证据：名称内嵌「数字+字母」混编的型号段（0400G00、DHT150-6），
+/// 或「数字+度量/包装单位」的数量规格（450克、20袋、1箱）。客户/员工/制度名都没有
+/// 这种结构；判据只认形态不认词，与具体商品无关。
+fn looks_like_goods_spec(value: &str) -> bool {
+    // ① 型号段：连续 ASCII（含连字符）同时含数字与字母，长度 ≥ 4 —— 短规格（400g）让给单位判据。
+    let mut len = 0usize;
+    let mut digit = false;
+    let mut alpha = false;
+    let mut model = false;
+    for b in value.bytes().chain(std::iter::once(b' ')) {
+        if b.is_ascii_alphanumeric() || b == b'-' {
+            len += 1;
+            digit |= b.is_ascii_digit();
+            alpha |= b.is_ascii_alphabetic();
+        } else {
+            model |= len >= 4 && digit && alpha;
+            len = 0;
+            digit = false;
+            alpha = false;
+        }
+    }
+    if model {
+        return true;
+    }
+    // ② 数量规格：数字紧跟中文度量/包装单位（400克 / 500毫升 / 20袋 / 1箱）。
+    const UNITS: &[&str] = &[
+        "毫升", "公斤", "克", "袋", "瓶", "盒", "箱", "包", "件", "罐", "杯", "支", "斤", "升",
+    ];
+    UNITS.iter().any(|unit| {
+        value
+            .match_indices(unit)
+            .any(|(i, _)| value[..i].chars().last().is_some_and(|c| c.is_ascii_digit()))
+    })
+}
+
+/// 裸实体名的形态证据（公司形态 || 商品规格形态）。triage 用它把这类裸名称钉死在 Data 路，
+/// 不再交给 fast-LLM 二分类抛硬币 —— 实测同一句「线下-揭阳市和利食品有限公司」17 秒内
+/// 被判成 knowledge 两次、entity-card 一次（query_log 2026-08-10 01:18）。
+pub(crate) fn entity_form_hit(question: &str) -> bool {
+    let Some(parsed) = parse_entity(question) else { return false };
+    looks_like_company(&parsed.value) || looks_like_goods_spec(&parsed.value)
+}
+
+/// auto 模式（无「客户/商品/员工」显式前缀）的类型收窄：公司形态证据只留组织类实体。
+/// 显式前缀是用户的明确指示，形态证据无权覆盖。
+fn narrow_kinds(kinds: Vec<Kind>, parsed: &ParsedEntity) -> Vec<Kind> {
+    if parsed.kind.is_none() && looks_like_company(&parsed.value) {
+        kinds
+            .into_iter()
+            .filter(|k| matches!(k, Kind::Customer | Kind::Shop))
+            .collect()
+    } else {
+        kinds
+    }
+}
+
+/// 并列候选的类型优先级：经营对象（客户/商品）排在目录对象（员工）之前。
+/// 之前按 label 的 UTF-8 字节序排，「员工」(U+5458) 永远压在「客户」(U+5BA2) 头上 ——
+/// 实测「线下-云南食左食右食品有限公司」候选卡首行是「员工 / 3832」。
+fn kind_priority(kind: Kind) -> u8 {
+    match kind {
+        Kind::Customer => 0,
+        Kind::Goods => 1,
+        Kind::Brand => 2,
+        Kind::Shop => 3,
+        Kind::Category => 4,
+        Kind::Employee => 5,
+    }
+}
+
 /// 裸型号窄判据：「字母 + 数字 + 连字符」的纯 ASCII 码（DHT150-6）。
 /// 三类字符缺一不可：纯数字日期段（2026-08）、纯字母连字符词（ABC-DEF）都不算型号。
 fn looks_like_goods_model(value: &str) -> bool {
@@ -537,7 +621,7 @@ async fn resolve_entity(
     if parsed.kind == Some(Kind::Employee) && !can_view_employee(cx) {
         return Ok(Some(employee_denied(cx)));
     }
-    let kinds = candidate_kinds(cx, parsed.kind);
+    let kinds = narrow_kinds(candidate_kinds(cx, parsed.kind), parsed);
     let exact = collect_candidates(cx, &kinds, parsed, true).await?;
     if exact.len() == 1 {
         return render_candidate(cx, &exact[0]).await;
@@ -585,9 +669,8 @@ async fn collect_candidates(
         }
     }
     candidates.sort_by(|a, b| {
-        a.kind
-            .label()
-            .cmp(b.kind.label())
+        kind_priority(a.kind)
+            .cmp(&kind_priority(b.kind))
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.code.cmp(&b.code))
     });
@@ -1419,6 +1502,76 @@ mod tests {
         assert!(!looks_like_goods_model("2026-08"), "日期段不是型号");
         assert!(!looks_like_goods_model("ABC-DEF"), "纯字母连字符词不是型号");
         assert!(!looks_like_goods_model("线下-浏阳品元商贸有限公司"), "中文客户名不是型号");
+    }
+
+    /// 公司形态证据：渠道前缀（线下-/线上-）与公司类后缀命中即组织名，不可能是自然人。
+    /// 反例同样钉住：人名、商品名、品类词都没有公司形态。
+    #[test]
+    fn company_form_evidence_marks_organizations_not_people() {
+        for company in [
+            "线下-云南食左食右食品有限公司",
+            "线下-浏阳品元商贸有限公司",
+            "南京苏宇食品有限公司",
+            "线上-某旗舰店超市",
+            "某养殖合作社",
+        ] {
+            assert!(looks_like_company(company), "{company} 应有公司形态证据");
+        }
+        for not in ["张三", "厚椰乳蛋挞液0400G00", "嗨肉", "可颂香肠卷", "烘焙类"] {
+            assert!(!looks_like_company(not), "{not} 不该有公司形态证据");
+        }
+    }
+
+    /// auto 模式下公司形态把员工/商品/品牌出局，只留组织类（客户/门店）——
+    /// 员工表里躺着大量客户登录账号行（actual_name = 客户公司全名），不拦则客户被判成员工。
+    /// 显式「员工」前缀是用户明确指示，形态证据无权覆盖。
+    #[test]
+    fn company_form_excludes_employee_in_auto_mode_only() {
+        let all = vec![Kind::Customer, Kind::Goods, Kind::Brand, Kind::Shop, Kind::Employee];
+        let company = parse_entity("线下-云南食左食右食品有限公司").unwrap();
+        assert_eq!(narrow_kinds(all.clone(), &company), vec![Kind::Customer, Kind::Shop]);
+        // 显式员工前缀：形态证据不生效
+        let explicit = parse_entity("员工 线下-云南食左食右食品有限公司").unwrap();
+        assert_eq!(narrow_kinds(vec![Kind::Employee], &explicit), vec![Kind::Employee]);
+        // 人名不收窄：员工与客户继续并列候选
+        let person = parse_entity("张三").unwrap();
+        assert_eq!(narrow_kinds(all, &person).len(), 5);
+    }
+
+    /// 并列候选排序用显式类型优先级，不再是 label 的 UTF-8 字节序
+    /// （字节序下「员工」U+5458 永远压在「客户」U+5BA2 头上 —— case2 的直接推手）。
+    #[test]
+    fn ambiguous_candidates_rank_customer_above_employee() {
+        assert!(kind_priority(Kind::Customer) < kind_priority(Kind::Goods));
+        assert!(kind_priority(Kind::Shop) < kind_priority(Kind::Employee));
+        assert!(kind_priority(Kind::Employee) > kind_priority(Kind::Category));
+        let src = include_str!("entity.rs");
+        let body = src
+            .split("async fn collect_candidates")
+            .nth(1)
+            .expect("collect_candidates missing")
+            .split("async fn candidates_for")
+            .next()
+            .unwrap();
+        assert!(body.contains("kind_priority"), "候选排序必须走显式类型优先级：{body}");
+        assert!(!body.contains("label()"), "候选排序不得再按 label 字节序：{body}");
+    }
+
+    /// 商品形态证据：型号段（0400G00 / DHT150-6）与数量规格（450克 / 20袋）。
+    /// `entity_form_hit` 是 triage 的确定性闸门：这两个真实 case 必须钉死在 Data 路。
+    #[test]
+    fn goods_spec_evidence_pins_bare_goods_names() {
+        for goods in ["厚椰乳蛋挞液0400G00", "DHT150-6", "可颂香肠卷450g*20袋", "鲜肉肠400克"] {
+            assert!(looks_like_goods_spec(goods), "{goods} 应有商品规格证据");
+        }
+        for not in ["高温补贴政策", "报销流程", "张三", "线下-云南食左食右食品有限公司"] {
+            assert!(!looks_like_goods_spec(not), "{not} 不该有商品规格证据");
+        }
+        assert!(entity_form_hit("厚椰乳蛋挞液0400G00"), "裸商品名必须钉死 Data");
+        assert!(entity_form_hit("线下-云南食左食右食品有限公司"), "裸客户名必须钉死 Data");
+        // 无形态证据的裸词维持原判（LLM 分诊），不抢知识库
+        assert!(!entity_form_hit("高温补贴政策"));
+        assert!(!entity_form_hit("报销流程怎么办"), "制度类问法不归实体闸门");
     }
 
     /// 型号解析必须打商品主档的名称字段（实测：DHT150-6 只在 goods_name 尾部；

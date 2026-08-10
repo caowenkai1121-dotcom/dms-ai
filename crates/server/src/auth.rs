@@ -445,7 +445,36 @@ fn parse_dms_login_info(v: &serde_json::Value) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+        /// 身份加载收口守卫：server 任何文件不许直接调 policy 的 load_principal ——
+    /// SSO/企微会话的角色带 `__dms_federated_role__:` 前缀，只有本文件的 `load_principal`
+    /// 会剥（深度报告/知识库曾因直调 policy 版而全线 403）。
     #[test]
+    fn principal_loading_only_through_auth_module() {
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+            .expect("src 目录")
+        {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if name == "auth.rs" {
+                continue; // 本文件是收口本体
+            }
+            let body = std::fs::read_to_string(&path).expect("读源码");
+            // 测试模块里的判据文本/注释里的契约说明不算调用
+            let code = body.split("#[cfg(test)]").next().unwrap_or("");
+            for bad in ["dms_policy::principal::load_principal(", "use dms_policy::principal;"] {
+                if code.contains(bad) {
+                    offenders.push(format!("{}: {}", name, bad));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "身份加载绕过 auth 收口: {offenders:?}");
+    }
+
+#[test]
     fn issue_resolve_roundtrip() {
         let tok = issue("admin".into(), Some("city_manager".into())).unwrap();
         let (ln, rc) = resolve(&tok).unwrap();

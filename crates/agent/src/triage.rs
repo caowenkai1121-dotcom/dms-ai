@@ -67,6 +67,12 @@ pub async fn triage(
         return i;
     }
     let kb = kb_hit(question);
+    // 裸实体名（公司后缀/渠道前缀/型号规格）是确定性 Data：规则与注册表都不认识客户/商品名，
+    // 以前落给 fast-LLM 二分类抛硬币 —— 实测同一句客户名 17 秒内 knowledge×2 / entity-card×1
+    // （query_log 2026-08-10 01:18）。`!kb` 前提：名字里撞了制度类词（「标准」「合同」）时维持原判。
+    if !kb && crate::answerers::entity::entity_form_hit(question) {
+        return Intent::Data;
+    }
     // ② 规则。kb 侧没命中且纯信号已判 Data → 连注册表都不查：存量问数链路（多数带时间词或
     //    指标名）不该为分诊多付三条查询。kb 命中时必须查库，否则拿不到「两侧都命中 → Data」。
     if !kb && rule_intent(question, false, false).is_some() {
@@ -233,6 +239,32 @@ mod tests {
     #[test]
     fn registry_hit_routes_to_data() {
         assert_eq!(rule_intent("销售额", true, false), Some(Intent::Data));
+    }
+
+    /// 裸实体名（公司/商品形态）必须被确定性闸门钉死在 Data，**在 LLM 二分类之前** ——
+    /// 实测同一句「线下-揭阳市和利食品有限公司」17 秒内 knowledge×2 / entity-card×1
+    /// （query_log 2026-08-10 01:18），抛硬币的路由不允许存在。
+    /// 闸门带 `!kb` 前提：名字里撞了制度类词（「标准」「合同」）时维持原判，不抢知识库。
+    #[test]
+    fn bare_entity_forms_never_reach_the_llm_coin_flip() {
+        let src = include_str!("triage.rs");
+        let body = src
+            .split("pub async fn triage")
+            .nth(1)
+            .expect("triage missing")
+            .split("/// 规则判据")
+            .next()
+            .unwrap();
+        let gate = body.find("entity_form_hit").expect("triage 缺裸实体名闸门");
+        let llm = body.find("llm_intent").expect("triage 缺 LLM 兜底");
+        assert!(gate < llm, "裸实体名闸门必须在 LLM 二分类之前：{body}");
+        assert!(
+            body.contains("!kb && crate::answerers::entity::entity_form_hit"),
+            "闸门不得抢知识库词：{body}"
+        );
+        // 两个真实 case 的行为级断言在 entity 侧（`goods_spec_evidence_pins_bare_goods_names`），
+        // 这里钉调用方向：问句原样进闸门，不是改写后的什么中间形态。
+        assert!(body.contains("entity_form_hit(question)"), "闸门必须吃原始问句：{body}");
     }
 
     /// 时间词是问数最强的信号：注册表一条都没命中也算 Data

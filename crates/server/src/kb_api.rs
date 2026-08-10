@@ -182,7 +182,7 @@ async fn load_viewer(
     login: String,
     role: Option<String>,
 ) -> Result<Viewer, ApiErr> {
-    let p = dms_policy::principal::load_principal(&st.auth_mysql, &login, role.as_deref())
+    let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
         .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
     Ok(Viewer::new(p.login_name, vec![p.role_code]))

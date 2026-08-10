@@ -76,7 +76,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 
-use dms_policy::principal;
+use crate::dms_policy::principal;
 use dms_semantic::registry::datasource as ds_reg;
 use dms_semantic::registry::model::{load_join_edges, JoinEdge};
 

@@ -48,7 +48,7 @@ pub async fn chat(
         .and_then(|value| value.strip_prefix("Bearer "))
         .and_then(crate::auth::resolve)
         .ok_or_else(|| api_err(StatusCode::UNAUTHORIZED, "未认证：请先登录"))?;
-    dms_policy::principal::load_principal(&st.auth_mysql, &login, role.as_deref())
+    crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
         .map_err(|_| api_err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
     if req.prompt.len() > 20_000 {

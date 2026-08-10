@@ -152,7 +152,7 @@ pub async fn usage_summary(
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     let (login, role) = crate::resolve_identity(&st, &headers, &q.login_name, &q.role_code)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
-    let p = dms_policy::principal::load_principal(&st.auth_mysql, &login, role.as_deref())
+    let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
         .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
     let mut body = usage_block(&st, Some(&p.login_name)).await?;
@@ -302,7 +302,7 @@ pub async fn sample_questions(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "space_id 必填（≤64 字符）"))?;
     let (login, role) = crate::resolve_identity(&st, &headers, &q.login_name, &q.role_code)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
-    let p = dms_policy::principal::load_principal(&st.auth_mysql, &login, role.as_deref())
+    let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
         .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
     let v = Viewer::new(p.login_name.clone(), vec![p.role_code.clone()]);

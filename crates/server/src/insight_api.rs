@@ -31,7 +31,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 
 use crate::AppState;
-use dms_policy::principal;
+use crate::dms_policy::principal;
 
 type ApiErr = (StatusCode, Json<serde_json::Value>);
 

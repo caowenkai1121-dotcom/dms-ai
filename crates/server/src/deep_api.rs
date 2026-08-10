@@ -3560,7 +3560,7 @@ async fn compose_inner(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
     // 身份权限来自 DMS，聊天归属来自自有 PG；两项互不依赖，先并行完成再统一放行。
     let (principal, conv_access) = tokio::join!(
-        dms_policy::principal::load_principal(&st.auth_mysql, &login_name, role_code.as_deref()),
+        crate::auth::load_principal(&st.auth_mysql, &login_name, role_code.as_deref()),
         async {
             let Some(cid) = req.conv_id else { return Ok(()) };
             match crate::chat::conv_owner(st.owned.pool(), cid).await {

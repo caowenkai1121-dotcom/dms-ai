@@ -1830,3 +1830,22 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
   （判官 CLI 被「超时 [dms-auth] 2.0s」打死，每次失败题不同 = 抖动指纹）。抬到 8s
   （只抬天花板不改正常耗时；生产点查 2s·50 行红线不动），钉测守「身份通道永不比点查红线更紧」。
 - 验证：workspace 21 测试目标全绿零警告；判官全量回归 76/76 通过 0 失败（修复后复跑确认）。
+
+## 八期（AX96，2026-08-10，小程序接入 + 服务器部署）
+- **部署上线**（117.72.32.186，京东云 Ubuntu24 + docker29）：源码 git archive 上传 →
+  服务端 docker 构建（crates 直连卡死改 rsproxy 镜像；rust 镜像 CARGO_HOME=/usr/local/cargo 的坑）
+  → PG（age/vector/pg_trgm）+ embed/解析（host venv + systemd 常驻，全格式解析档实测全绿）
+  + web（nginx 容器）。Linux host-gateway ≠ 回环：PG/8100 改绑 docker 网桥 172.17.0.1（公网够不着）。
+  宿主 nginx 兜底 server 切到新系统（旧 dms-copilot 配置备份留档）；注册表快照导入 +1283 行、
+  向量自愈回填 491 行。实测：本月销售额 direct-agg/verified、按门店 direct-derive/200 行。
+- **前端修复**：`crypto.randomUUID` 仅安全上下文可用（http://IP 部署没有它）——
+  `format.ts` 新增 `uuid()`（getRandomValues 降级 + Math.random 兜底），App.vue 5 处切换。
+- **小程序接入**（xh-xcx uni-app）：底部 tabBar 新增「AI」tab（首页/分类/AI/购物/我的，
+  图标 static/3-*.png 按既有编号规律生成）+ `pages/ai-chat/ai-chat.vue` 问答页
+  （气泡流/结果表格横滚/SQL 折叠/推导口径提示条/语音输入仅微信小程序端/notLogin 引导）。
+  后端 `xcx_api.rs`：`POST /api/xcx/ask` + `GET /api/xcx/me`——`x-access-token` 经
+  `{xcx_auth_base}/login/getLoginInfo` server-to-server 校验（60s 进程缓存、5s 超时、
+  白名单只认 code=0），解析出 login_name/role 后进同一条 ask 主管道（多轮 conv_id 语义不变）；
+  token 失效映 `{code:30007}`（小程序拦截器自动弹登录）；`xcx_auth_base` 未配置 = 404 fail-closed。
+  实测：无 token/假 token 均正确 401+30007。
+- 验证：server 485 测试全绿零警告。
