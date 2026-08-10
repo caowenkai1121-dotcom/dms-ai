@@ -398,6 +398,7 @@ fn intent_reply(question: &str, t0: Instant, clarify_options: Vec<ClarifyOption>
         steps: vec![],
         clarify_options,
         value_labels: vec![],
+        sales_context: None,
     }
 }
 
@@ -596,6 +597,7 @@ fn production_lookup_only_reply(cx: &AskCtx<'_>, ms: u128) -> AskResult {
         steps: vec![Step { stage: "business-lookup", kind: "miss", ms }],
         clarify_options: vec![],
         value_labels: vec![],
+        sales_context: None,
     }
 }
 

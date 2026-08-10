@@ -143,6 +143,12 @@ pub struct AskResult {
     /// （前端 tooltip / 对数用）。空 = 本轮没有翻译，整键不上线。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub value_labels: Vec<ValueLabel>,
+    /// 销售类单指标 KPI 的**同窗补充**（裁决：销售额/销量/毛利额等单值答案
+    /// 顺带成本/收入/毛利额/毛利率）。与主查询同一时间窗、同一权限闸门；
+    /// 取数失败/为空 = `None` 整键不上线，主回答一个字符不变（含 `sql` 展示串——
+    /// 金标把它逐字钉死）。只有 sales_fact 标量命中会填它。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sales_context: Option<SalesContextResult>,
 }
 
 /// 反问候选（need-intent）：`label` 是短标签（≤6 字预期），`question` 是可直接重发的完整问句。
@@ -168,6 +174,15 @@ pub struct SupplementalResult {
     pub row_count: usize,
     pub truncated: bool,
     pub view: dms_kernel::present::ViewSpec,
+}
+
+/// 销售单指标 KPI 的同窗补充：恒单行五值（销售额/不含税成本/不含税收入/毛利额/毛利率），
+/// 列名即合同中文别名（无需 present_cn 翻译，locale 出口对它本就零改动）。
+/// 不带 view/row_count：前端按固定四格小卡渲染，形状刻意比 `SupplementalResult` 窄。
+#[derive(Serialize)]
+pub struct SalesContextResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -244,6 +259,7 @@ impl AskResult {
             steps: vec![],
             clarify_options: vec![],
             value_labels: vec![],
+            sales_context: None,
         }
     }
 }
@@ -288,6 +304,7 @@ pub fn table_answer(
         steps: vec![],
         clarify_options: vec![],
         value_labels: vec![],
+        sales_context: None,
     }
 }
 
@@ -808,6 +825,7 @@ mod tests {
             steps: vec![],
             clarify_options: vec![],
             value_labels: vec![],
+            sales_context: None,
         };
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("caliber_note").is_none(), "{j}");
@@ -821,6 +839,20 @@ mod tests {
         // 呈现中文化与反问候选同理：空 = 整键不上线
         assert!(j.get("clarify_options").is_none(), "空 clarify_options 不许上线：{j}");
         assert!(j.get("value_labels").is_none(), "空 value_labels 不许上线：{j}");
+        // 销售同窗补充同理：None = 整键不上线（非销售 KPI 答案形状一字不变）
+        assert!(j.get("sales_context").is_none(), "无同窗补充时 sales_context 不许上线：{j}");
+        // 命中时形状 = {columns, rows}（单行五值，列序＝合同 CONTEXT_METRICS）
+        r.sales_context = Some(SalesContextResult {
+            columns: vec!["销售额".into(), "不含税成本".into(), "不含税收入".into(), "毛利额".into(), "毛利率".into()],
+            rows: vec![vec![serde_json::json!("100.00"), serde_json::json!("80.00"),
+                            serde_json::json!("90.00"), serde_json::json!("10.00"), serde_json::json!("0.1111")]],
+        });
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["sales_context"]["columns"][1], "不含税成本", "{j}");
+        assert_eq!(j["sales_context"]["rows"][0][4], serde_json::json!("0.1111"), "{j}");
+        assert!(j["sales_context"].get("view").is_none() && j["sales_context"].get("row_count").is_none(),
+                "同窗补充刻意比 supplemental 窄，不带 view/row_count：{j}");
+        r.sales_context = None;
         // 有标注时才出现，且是原文（前端按它显示「数字不可信」的提示）
         r.caliber_note = Some("口径复核未通过：下方结果不可信".into());
         assert_eq!(
@@ -874,6 +906,7 @@ mod tests {
             steps: vec![],
             clarify_options: vec![ClarifyOption { label: "销售表现".into(), question: "本月销售额是多少".into() }],
             value_labels: vec![ValueLabel { column: "状态".into(), code: "100".into(), label: "待审核".into() }],
+            sales_context: None,
         };
         let j = serde_json::to_value(&r).unwrap();
         assert_eq!(j["clarify_options"], serde_json::json!([{"label": "销售表现", "question": "本月销售额是多少"}]));

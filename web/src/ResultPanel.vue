@@ -49,6 +49,10 @@ interface Result {
    *  不渲染它 = 受限用户看到子集却以为是全量，拿着被过滤的数下结论 ——
    *  那件事不报错、也没有任何判据抓得到，属正确性而非产品面。 */
   scope_note?: string
+  /** 销售单指标 KPI 的同窗补充（裁决：销售额/销量/毛利额等答案顺带成本/收入/毛利）。
+   *  与主查询同一时间窗、同一权限闸门；后端 `skip_serializing_if` —— 补充查询失败/为空
+   *  时整键不上线（本组件就不渲染），主回答一个字符不变。恒单行五值，列名＝合同中文别名。 */
+  sales_context?: { columns: string[]; rows: unknown[][] }
 }
 
 const props = defineProps<{ result: Result }>()
@@ -78,6 +82,31 @@ const hasSupplemental = computed(() => {
   )
 })
 const drillOptions = computed(() => props.result.view?.interact?.drill ?? [])
+
+/** 同窗补充小卡：固定四格（成本/收入/毛利/毛利率），按列名定位 ——
+ *  缺列/空行/空值那一格不显示；全缺 = 整条不渲染（后端失败降级语义的前端一半）。
+ *  毛利率是 ratio 原值，按 percent 语义 ×100 后 2 位小数；金额走 fmt 的 money（已是 2 位）。 */
+const SALES_CONTEXT_CELLS: Array<{ column: string; label: string; percent?: boolean }> = [
+  { column: '不含税成本', label: '成本' },
+  { column: '不含税收入', label: '收入' },
+  { column: '毛利额', label: '毛利' },
+  { column: '毛利率', label: '毛利率', percent: true },
+]
+const salesContextItems = computed(() => {
+  const ctx = props.result.sales_context
+  const row = ctx?.rows?.[0]
+  if (!ctx || !row) return []
+  return SALES_CONTEXT_CELLS.flatMap((cell) => {
+    const ci = ctx.columns.indexOf(cell.column)
+    const raw = ci < 0 ? null : row[ci]
+    if (raw === null || raw === undefined || raw === '') return []
+    const n = toNum(raw)
+    const text = cell.percent
+      ? (n === null ? '—' : `${(n * 100).toFixed(2)}%`)
+      : (fmt(raw, 'money') || '—')
+    return [{ label: cell.label, title: cell.column, text }]
+  })
+})
 const isEntityCandidate = computed(() =>
   props.result.route === 'entity-card'
   && (props.result.sql ?? '').startsWith('实体候选匹配：')
@@ -457,6 +486,15 @@ function supplementalIsMetric(ci: number): boolean {
       </div>
     </section>
 
+    <!-- 同窗补充（销售单指标 KPI 专属）：与主卡同时间窗的成本/收入/毛利/毛利率，
+         样式对齐 KPI 卡但小一号；补充缺席时后端不上线这个键，这里整条不渲染。 -->
+    <section v-if="salesContextItems.length" class="sales-context" aria-label="同窗成本与毛利">
+      <div v-for="(item, ii) in salesContextItems" :key="`sc-${ii}`" class="sc-cell" :title="item.title">
+        <span class="sc-label">{{ item.label }}</span>
+        <span class="sc-val">{{ item.text }}</span>
+      </div>
+    </section>
+
     <section v-if="trendCharts.length" class="result-section">
       <div class="section-head">
         <div>
@@ -706,6 +744,22 @@ function supplementalIsMetric(ci: number): boolean {
 .kpi-row.solo .mc-label { font-size: 13px; }
 .kpi-row.solo .mc-val { margin-top: 12px; font-size: 40px; }
 .kpi-row.solo .mc-delta { margin-top: 10px; font-size: 13px; }
+
+/* 同窗补充小卡：对齐 metric-card 的边框/圆角/投影，但小一号（标签+数值一行，不做大数字） */
+.sales-context {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px;
+  min-width: 0; margin: 10px 0 0;
+}
+.sc-cell {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  min-width: 0; padding: 8px 12px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg-card); box-shadow: var(--shadow-sm); overflow: hidden;
+}
+.sc-label { flex: 0 0 auto; color: var(--text-muted); font-size: 11px; line-height: 1.4; white-space: nowrap; }
+.sc-val {
+  min-width: 0; color: var(--text-primary); font-size: 14px; line-height: 1.3; font-weight: 700;
+  font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere;
+}
 
 .chart-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .chart-grid.paired { grid-template-columns: repeat(2, minmax(0, 1fr)); }

@@ -855,6 +855,7 @@ fn candidate_card(cx: &AskCtx<'_>, query: &str, candidates: Vec<Candidate>) -> A
         steps: vec![],
         clarify_options: vec![],
         value_labels: vec![],
+        sales_context: None,
     }
 }
 
@@ -1467,6 +1468,7 @@ fn build_card(
         steps: vec![],
         clarify_options: vec![],
         value_labels: vec![],
+        sales_context: None,
     }
 }
 

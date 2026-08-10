@@ -242,6 +242,7 @@ pub async fn try_compose(pg: &sqlx::PgPool, ds: &str, question: &str) -> Option<
         prev: None,
         comparisons: vec![],
         detail: None,
+        sales_context: None,
     })
 }
 
@@ -896,6 +897,7 @@ pub async fn try_compose_metric_only(
                 prev: None,
                 comparisons: vec![],
                 detail: None,
+                sales_context: None,
             });
         }
     }
@@ -1027,7 +1029,7 @@ async fn metric_only(pg: &sqlx::PgPool, ds: &str, question: &str) -> MetricOnly 
         })
         .into_iter()
         .collect();
-    MetricOnly::Hit(DirectHit { sql, route: "direct-agg".into(), prev, comparisons, detail: None })
+    MetricOnly::Hit(DirectHit { sql, route: "direct-agg".into(), prev, comparisons, detail: None, sales_context: None })
 }
 
 /// 残留守卫（纯函数）：把问句里被模板/组合器「消化掉」的词剥光后，
@@ -1402,6 +1404,7 @@ fn sales_fact_unavailable(
         prev: None,
         comparisons: vec![],
         detail: None,
+        sales_context: None,
     })
 }
 
@@ -1543,6 +1546,19 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
         .into_iter()
         .collect();
     let detail = scalar.then(|| dms_semantic::sales_fact::detail_sql(&begin, &end, &predicates, 100));
+    // 同窗补充（裁决：销售类单指标 KPI 顺带成本/收入/毛利额/毛利率）：与主查询**同一时间窗、
+    // 同一批谓词**，一条 SQL 取齐五值。仅标量命中挂它 —— 维度拆解/多指标的主结果自带这些列。
+    let sales_context = scalar.then(|| {
+        sales_fact_sql(
+            dms_semantic::sales_fact::CONTEXT_METRICS,
+            &[],
+            &begin,
+            &end,
+            &predicates,
+            None,
+            None,
+        )
+    });
 
     Some(DirectHit {
         sql,
@@ -1550,6 +1566,7 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
         prev,
         comparisons,
         detail,
+        sales_context,
     })
 }
 
@@ -1614,7 +1631,7 @@ fn relation_rows(question: &str) -> Option<DirectHit> {
             )
         }
     };
-    Some(DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail: None })
+    Some(DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail: None, sales_context: None })
 }
 
 const MARKET_COST_GROUPS: &[(&str, &[&str])] = &[
@@ -1678,6 +1695,7 @@ fn warehouse_market_cost(question: &str) -> DirectHit {
         prev: if rank { None } else { prev },
         comparisons: vec![],
         detail: (!rank).then_some(detail),
+        sales_context: None,
     }
 }
 
@@ -1691,6 +1709,7 @@ fn warehouse_invoice_unavailable() -> DirectHit {
         prev: None,
         comparisons: vec![],
         detail: None,
+        sales_context: None,
     }
 }
 
@@ -1704,6 +1723,7 @@ fn warehouse_account_bill_unavailable() -> DirectHit {
         prev: None,
         comparisons: vec![],
         detail: None,
+        sales_context: None,
     }
 }
 
@@ -1761,6 +1781,7 @@ fn balance_ranking(question: &str) -> Option<DirectHit> {
         prev: None,
         comparisons: vec![],
         detail: None,
+        sales_context: None,
     })
 }
 
@@ -1844,6 +1865,7 @@ fn stock_snapshot(question: &str) -> Option<DirectHit> {
                 ranking_limit(question)
             ),
             route: "direct-agg".into(), prev: None, comparisons: vec![], detail: None,
+            sales_context: None,
         });
     }
     if grouped_province {
@@ -1856,6 +1878,7 @@ fn stock_snapshot(question: &str) -> Option<DirectHit> {
                  ORDER BY `{label}` DESC"
             ),
             route: "direct-agg".into(), prev: None, comparisons: vec![], detail: None,
+            sales_context: None,
         });
     }
     Some(DirectHit {
@@ -1873,6 +1896,7 @@ fn stock_snapshot(question: &str) -> Option<DirectHit> {
              GROUP BY COALESCE(NULLIF(product_type,''),'未分类') \
              ORDER BY `{label}` DESC LIMIT 20"
         )),
+        sales_context: None,
     })
 }
 
@@ -1913,6 +1937,7 @@ fn sales_order_rows(question: &str) -> Option<DirectHit> {
             prev: None,
             comparisons: vec![],
             detail: None,
+            sales_context: None,
         });
     }
     Some(DirectHit {
@@ -1933,6 +1958,7 @@ fn sales_order_rows(question: &str) -> Option<DirectHit> {
         prev: None,
         comparisons: vec![],
         detail: None,
+        sales_context: None,
     })
 }
 
@@ -2002,7 +2028,7 @@ fn device_orders(question: &str) -> Option<DirectHit> {
                  total_amount AS `押金金额`, {status_sql} AS `状态` \
                  FROM t_sales_order WHERE {where_sql} ORDER BY order_time DESC LIMIT 200")
     };
-    Some(DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail: None })
+    Some(DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail: None, sales_context: None })
 }
 
 /// 默认销售额维度快路径只使用已验证的 DWS 事实合同。
@@ -2108,7 +2134,7 @@ fn warehouse_order_hit(code: &str) -> DirectHit {
          JOIN dms_ods.t_sales_order_detail d ON d.sales_order_code = o.sales_order_code",
         true,
     );
-    DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail: Some(detail) }
+    DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail: Some(detail), sales_context: None }
 }
 
 fn document_detail_sql(
@@ -2140,7 +2166,7 @@ fn sniff_doc_code(question: &str, warehouse: bool) -> Option<DirectHit> {
         source.header_projection, source.header_table, column, safe, deleted
     );
     let detail = document_detail_sql(source, &safe);
-    Some(DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail })
+    Some(DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail, sales_context: None })
 }
 
 /// `agg_template` 的剥词表 ＝ 本模板消化的**业务**词 + `kernel::nl::lexicon::STRIP_WORDS`。
@@ -2247,6 +2273,7 @@ fn agg_template(question: &str) -> Option<DirectHit> {
         prev,
         comparisons,
         detail: None,
+        sales_context: None,
     })
 }
 
@@ -2395,6 +2422,10 @@ struct DeriveShape {
     join_pairs: Vec<(Vec<String>, String, Vec<String>, String)>,
     /// 没有跨表等值对的 JOIN 个数（USING/NATURAL/CROSS 或两端表解析不出 —— 没有可证的关联键）
     unevidenced_joins: usize,
+    /// 时间桶别名（`DATE_FORMAT(stat_date,'%Y-%m') AS 月份` 这类）：时间词白名单 ∧ 表达式含
+    /// 日期函数 才落这里。闸 1 跳过它们 —— 时间桶不可能虚构指标，但没这条豁免时
+    /// 「各月/按周」类推导全被误判成「别名无出处」（实测：客户限定各月销售额被回落）。
+    time_derived: Vec<String>,
 }
 
 /// 解析 derive SQL 的静态形状。`None` = AST 解析失败（调用方按推导失败回落原卡）。
@@ -2441,6 +2472,66 @@ fn analyze_set_expr(se: &sqlparser::ast::SetExpr, shape: &mut DeriveShape) -> Ve
 /// 标识符归一：去反引号/双引号、小写。
 fn ident_norm(value: &str) -> String {
     value.trim_matches(['`', '"']).to_lowercase()
+}
+
+/// 时间桶别名词表（精确匹配 —— 「月销售额」这种指标别名不在其列）。
+const TIME_ALIAS_WORDS: &[&str] = &[
+    "年", "年份", "月", "月份", "月度", "日", "日期", "天", "周", "周次", "星期", "周几", "季度", "小时", "时间",
+];
+/// 日期/时间函数白名单（MySQL/Doris 双方言常用集）。
+const TIME_FNS: &[&str] = &[
+    "DATE_FORMAT", "DATE_TRUNC", "YEAR", "MONTH", "QUARTER", "WEEK", "WEEKOFYEAR", "DAY",
+    "DAYOFMONTH", "DAYOFWEEK", "HOUR", "MINUTE", "DATE", "LAST_DAY", "STR_TO_DATE",
+    "FROM_UNIXTIME", "UNIX_TIMESTAMP", "TO_DAYS", "DATE_ADD", "DATE_SUB", "EXTRACT",
+    "CURDATE", "CURRENT_DATE", "NOW",
+];
+
+/// 时间桶别名判定：别名是时间词 ∧ 表达式调用了日期函数。
+/// 两个条件缺一不可 —— 光有时间词会把「指标改名」放过去，光有函数会把「给日期列起别名」卡掉。
+fn is_time_bucket_alias(label: &str, expr: &sqlparser::ast::Expr) -> bool {
+    TIME_ALIAS_WORDS.contains(&label) && expr_calls_time_fn(expr)
+}
+
+/// 表达式树里是否出现日期/时间函数调用（只读遍历）。
+fn expr_calls_time_fn(e: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    match e {
+        Expr::Function(f) => {
+            let name = f.name
+                .0
+                .last()
+                .map(|p| p.value.to_uppercase())
+                .unwrap_or_default();
+            if TIME_FNS.contains(&name.as_str()) {
+                return true;
+            }
+            if let sqlparser::ast::FunctionArguments::List(l) = &f.args {
+                return l.args.iter().any(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) => expr_calls_time_fn(inner),
+                    _ => false,
+                });
+            }
+            false
+        }
+        Expr::BinaryOp { left, right, .. } => expr_calls_time_fn(left) || expr_calls_time_fn(right),
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
+            expr_calls_time_fn(expr)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            operand.as_deref().map(expr_calls_time_fn).unwrap_or(false)
+                || conditions.iter().any(expr_calls_time_fn)
+                || results.iter().any(expr_calls_time_fn)
+                || else_result.as_deref().map(expr_calls_time_fn).unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 /// 本层 FROM 的别名图：别名（小写）→ 实表集合。派生子查询先递归，
@@ -2500,6 +2591,10 @@ fn analyze_select(s: &sqlparser::ast::Select, shape: &mut DeriveShape) -> Vec<St
         }
         if is_literal_projection(expr) {
             continue; // 常数占位列不算取数别名
+        }
+        if is_time_bucket_alias(&label, expr) {
+            shape.time_derived.push(label);
+            continue; // 时间桶别名有独立豁免通道，不进闸 1 的对账清单
         }
         let mut tables: Vec<String> = vec![];
         let mut unresolved = false;
@@ -2624,23 +2719,54 @@ fn collect_eq_pairs(e: &sqlparser::ast::Expr, out: &mut Vec<(String, String, Str
 /// 列名/列注释里有出处 —— 别名 ⊆ 列注释/列名，或列注释 ⊆ 别名（「销售额」⊂「销售额(元)」）。
 /// 语料 = 候选表 schema 卡实际展示的列（与 LLM 所見逐字同源，不多查一遍库）。
 /// `Some(别名)` = 第一个无出处的别名（虚构指标/码值劫走），调用方 warn 留痕后回落。
+/// 核心销售口径词（用户裁决 2026-08-10：销售额/销量/成本/毛利/收入 允许从 ODS 度量列推导）。
+/// 刻意不扩到「开票金额/专票金额」这类——它们在数仓里没有事实列，放行就是虚构（判官 E05/E08/E15）。
+const CORE_SALES_METRIC_WORDS: &[&str] = &[
+    "销售额", "销售金额", "销量", "销售数量", "毛利额", "毛利", "成本", "收入", "营收",
+];
+
+/// 度量列判定：列名或注释含度量词元（金额/数量/单价/成本/收入/毛利 或 amount/qty/price/cost/…）。
+fn is_measure_col(col: &str, cmt: &str) -> bool {
+    let c = col.to_lowercase();
+    ["amount", "qty", "quantity", "price", "cost", "revenue", "profit"].iter().any(|w| c.contains(w))
+        || ["金额", "数量", "单价", "成本", "收入", "毛利", "价格"].iter().any(|w| cmt.contains(w))
+}
+
+/// 闸 1 · 标签语义对账。三条出路（按序）：
+/// ① 别名在取数表的列名/列注释里有出处（防虚构的基本面）；
+/// ② 别名是注册指标且其登记源表就是取数表（`meta.metric` 的同源映射 —— 运营指标回自己的表）；
+/// ③ 别名是核心销售口径词且取数表有度量列（合同覆盖外的 ODS 推导映射，结果标注未经合同验证）。
 fn derive_labels_ungrounded(
     shape: &DeriveShape,
     corpus: &[(String, Vec<(String, String)>)],
+    metrics: &[(String, String)],
 ) -> Option<String> {
     for (label, tables) in &shape.labeled {
         let grounded = tables.iter().any(|table| {
-            corpus
-                .iter()
-                .find(|(name, _)| name == table)
-                .is_some_and(|(_, cols)| {
-                    cols.iter().any(|(col, cmt)| {
-                        let cmt = cmt.trim();
-                        col.contains(label.as_str())
-                            || (!cmt.is_empty()
-                                && (cmt.contains(label.as_str()) || label.contains(cmt)))
-                    })
-                })
+            let cols_of = || {
+                corpus
+                    .iter()
+                    .find(|(name, _)| name == table)
+                    .map(|(_, cols)| cols.iter().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            };
+            // ① 列名/列注释出处
+            let by_comment = cols_of().iter().any(|(col, cmt)| {
+                let cmt = cmt.trim();
+                col.contains(label.as_str())
+                    || (!cmt.is_empty() && (cmt.contains(label.as_str()) || label.contains(cmt)))
+            });
+            // ② 注册指标同源：源表可能带库名/UNION ALL，按裸表名判
+            let by_metric = metrics.iter().any(|(name, source)| {
+                name == label
+                    && source
+                        .split(|c: char| c.is_whitespace() || c == '/')
+                        .any(|seg| seg.rsplit('.').next() == Some(table.as_str()))
+            });
+            // ③ 核心销售口径词 + 该表有度量列
+            let by_core = CORE_SALES_METRIC_WORDS.contains(&label.as_str())
+                && cols_of().iter().any(|(col, cmt)| is_measure_col(col, cmt));
+            by_comment || by_metric || by_core
         });
         if !grounded {
             return Some(label.clone());
@@ -2722,63 +2848,119 @@ async fn derive_compose(cx: &dms_agent::AskCtx<'_>, schema: &str) -> Option<Stri
 
 /// ODS 推导主流程。`Some` = 推导命中（route=direct-derive，经 `land` 过闸执行出答案）；
 /// `None` = 推导不成，调用方把原「不可计算」卡原样返回。
+/// 单轮推导的结果：命中（SQL）/ 空结果（试过的表，供剔除换轮）/ 失败（回落原卡）。
+enum DeriveTry {
+    Hit(String),
+    Empty(Vec<String>),
+    Failed,
+}
+
 async fn ods_derive(cx: &dms_agent::AskCtx<'_>) -> Option<DirectHit> {
     if !derive_eligible(cx) {
         return None;
     }
-    let tables =
+    let pool =
         dms_semantic::recall::ods_candidate_tables(cx.pg, cx.ds, cx.question, DERIVE_TOP_K).await;
-    if tables.is_empty() {
+    if pool.is_empty() {
         tracing::info!(question = %cx.question, "推导无候选 ODS 表 → 回落「不可计算」卡");
         return None;
     }
-    // 仅候选表的 schema 卡：LLM 只看得到这些表（卡头即目录合同，粒度/时间/禁用规则随卡给出）。
-    // 列语料与卡文本同一次取数 —— 闸 1 的「出处」语料就是 LLM 实际看见的列，一张都不多。
-    let mut schema = String::from(
-        "（推导口径：合同层未覆盖本问题，以下全部是 ODS 明细表，只允许用这些表推导；\
-         禁止引用任何 DWS/ADS 汇总表。结果会标注「未经合同验证」。）\n",
-    );
-    let mut usable: Vec<&str> = vec![];
-    let mut corpus: Vec<(String, Vec<(String, String)>)> = vec![];
-    for table in &tables {
-        match dms_semantic::recall::schema_card_with_columns(cx.pg, cx.ds, table).await {
-            Ok(Some(card)) => {
-                schema.push_str(&card.text);
-                corpus.push(((*table).to_string(), card.columns));
-                usable.push(table);
+    // 注册指标清单（闸 1 的通道②语料）：name + source_table，ds 作用域。
+    let metrics: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, source_table FROM meta.metric WHERE ds_id IN ($1, '*') AND status='active'",
+    )
+    .bind(cx.ds)
+    .fetch_all(cx.pg)
+    .await
+    .unwrap_or_default();
+    // 空结果换一轮：候选表「有表无数据」（实测：客户 183507 在 t_winc_sale_report 零行、
+    // 在 t_sales_order 4950 行）不等于问题答不出。每轮把试过的表剔出候选池，最多两轮
+    // （一轮直连 + 一轮换表，推导是降级路，成本到这里为止）。
+    let mut tried: Vec<String> = vec![];
+    for _ in 0..2 {
+        let remaining: Vec<&str> = pool.iter().copied().filter(|t| !tried.iter().any(|x| x == t)).collect();
+        if remaining.is_empty() {
+            break;
+        }
+        // 仅候选表的 schema 卡：LLM 只看得到这些表（卡头即目录合同，粒度/时间/禁用规则随卡给出）。
+        // 列语料与卡文本同一次取数 —— 闸 1 的「出处」语料就是 LLM 实际看见的列，一张都不多。
+        let mut schema = String::from(
+            "（推导口径：合同层未覆盖本问题，以下全部是 ODS 明细表，只允许用这些表推导；\
+             禁止引用任何 DWS/ADS 汇总表。结果会标注「未经合同验证」。）\n",
+        );
+        let mut usable: Vec<&str> = vec![];
+        let mut corpus: Vec<(String, Vec<(String, String)>)> = vec![];
+        for table in &remaining {
+            match dms_semantic::recall::schema_card_with_columns(cx.pg, cx.ds, table).await {
+                Ok(Some(card)) => {
+                    schema.push_str(&card.text);
+                    corpus.push(((**table).to_string(), card.columns));
+                    usable.push(*table);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(err = %e, table = %table, "推导候选表 schema 卡读取失败，跳过该表"),
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(err = %e, table = %table, "推导候选表 schema 卡读取失败，跳过该表"),
+        }
+        if usable.is_empty() {
+            return None;
+        }
+        match derive_attempt(cx, &schema, &corpus, &metrics, &usable).await {
+            DeriveTry::Hit(sql) => {
+                tracing::info!(question = %cx.question, tables = ?usable, "ODS 推导命中（direct-derive）");
+                return Some(DirectHit {
+                    sql,
+                    route: DERIVE_ROUTE.into(),
+                    prev: None,
+                    comparisons: vec![],
+                    detail: None,
+                    sales_context: None,
+                });
+            }
+            DeriveTry::Empty(used) => {
+                tracing::info!(question = %cx.question, tables = ?used, "推导 SQL 合法但零行，换候选表再来一轮");
+                tried.extend(used);
+            }
+            DeriveTry::Failed => return None,
         }
     }
-    if usable.is_empty() {
-        return None;
-    }
-    let raw = derive_compose(cx, &schema).await?;
+    None
+}
+
+/// 一轮推导尝试（组 SQL → 用表校验 → 双语义闸 → 闸门 → 预执行）。
+async fn derive_attempt(
+    cx: &dms_agent::AskCtx<'_>,
+    schema: &str,
+    corpus: &[(String, Vec<(String, String)>)],
+    metrics: &[(String, String)],
+    usable: &[&str],
+) -> DeriveTry {
+    let Some(raw) = derive_compose(cx, schema).await else {
+        return DeriveTry::Failed;
+    };
     // 目录限定名规范化（与组合器同一个出口）：LLM 写裸表名也补成 库.表
     let sql = dms_semantic::registry::warehouse_qualified_source(cx.ds, &raw);
-    if !derive_tables_allowed(&sql, &usable, cx.source.dialect()) {
+    if !derive_tables_allowed(&sql, usable, cx.source.dialect()) {
         tracing::warn!(question = %cx.question, sql = %sql, "推导 SQL 用表越出候选集 → 回落「不可计算」卡");
-        return None;
+        return DeriveTry::Failed;
     }
     // 两道语义闸（判官 E 系列裁决）：只作用于 direct-derive，直连合同路径不经过这里。
     let Some(shape) = analyze_derive_sql(&sql, cx.source.dialect()) else {
         tracing::warn!(question = %cx.question, sql = %sql, "推导 SQL 解析失败 → 回落「不可计算」卡");
-        return None;
+        return DeriveTry::Failed;
     };
     // 闸 1 · 标签语义对账：中文取数别名必须在取数表的列名/列注释里有出处
-    if let Some(label) = derive_labels_ungrounded(&shape, &corpus) {
+    if let Some(label) = derive_labels_ungrounded(&shape, corpus, metrics) {
         tracing::warn!(question = %cx.question, alias = %label, sql = %sql,
             "推导别名在取数表列名/列注释里无出处（虚构指标/码值劫走）→ 回落「不可计算」卡");
-        return None;
+        return DeriveTry::Failed;
     }
     // 闸 2 · JOIN 证据闸：每条跨表等值关联键都要命中合同边或高置信/人工确认的 joinable 边
     if !shape.join_pairs.is_empty() || shape.unevidenced_joins > 0 {
-        let edges = dms_semantic::recall::join_evidence_edges(cx.pg, cx.ds, &usable).await;
+        let edges = dms_semantic::recall::join_evidence_edges(cx.pg, cx.ds, usable).await;
         if let Some(join) = derive_joins_unevidenced(&shape, &edges) {
             tracing::warn!(question = %cx.question, join = %join, sql = %sql,
                 "推导 JOIN 关联键无证据 → 回落「不可计算」卡");
-            return None;
+            return DeriveTry::Failed;
         }
     }
     let candidate = dms_agent::ensure_limit(&sql, cx.source.dialect());
@@ -2789,27 +2971,27 @@ async fn ods_derive(cx: &dms_agent::AskCtx<'_>) -> Option<DirectHit> {
         Ok(scoped) => scoped,
         Err(e) => {
             tracing::warn!(err = %e, question = %cx.question, "推导 SQL 未过闸门 → 回落「不可计算」卡");
-            return None;
+            return DeriveTry::Failed;
         }
     };
     // 预执行一次（行上限/超时与直连相同）：执行失败（列漂移/超时）必须回落原卡，
     // 而不是把失败交给 `land` 跌进后面的 LLM 全目录路径。
-    // 代价是命中时同一条 SQL 在 `land` 再执行一次 —— 推导是降级路，
-    // 这笔重复执行换的是「回落语义不漂」。
+    // 零行不报错但报「空」—— 调用方换候选表再来一轮（有表无数据 ≠ 答不出）。
     match cx.source.fetch(&scoped, dms_agent::MAX_ROWS, dms_agent::EXEC_TIMEOUT).await {
-        Ok(_) => {
-            tracing::info!(question = %cx.question, tables = ?usable, "ODS 推导命中（direct-derive）");
-            Some(DirectHit {
-                sql: candidate,
-                route: DERIVE_ROUTE.into(),
-                prev: None,
-                comparisons: vec![],
-                detail: None,
-            })
+        Ok(rs) if rs.rows.is_empty() => {
+            // 试过的表 = 候选集里名字出现在 SQL 中的那些（table_names_of 会把库名限定
+            // 解析成「dms_ods」，排除失效 —— 实测）。候选名足够独特，子串匹配即可。
+            let used: Vec<String> = usable
+                .iter()
+                .filter(|t| sql.to_lowercase().contains(&t.to_lowercase()))
+                .map(|t| (*t).to_string())
+                .collect();
+            DeriveTry::Empty(used)
         }
+        Ok(_) => DeriveTry::Hit(candidate),
         Err(e) => {
             tracing::warn!(err = %e, question = %cx.question, "推导 SQL 执行失败 → 回落「不可计算」卡");
-            None
+            DeriveTry::Failed
         }
     }
 }
@@ -3419,6 +3601,53 @@ mod tests {
         assert!(!h.sql.contains("UNION ALL") && !h.sql.contains("t_sales_order_logistics"), "{}", h.sql);
         assert!(agg_template("本月销售额是多少").is_none());
         assert_eq!(h.route, "direct-agg");
+    }
+
+    /// 【同窗补充】触发真值表 + SQL 口径钉（裁决：销售类单指标 KPI 顺带成本/收入/毛利额/毛利率）。
+    /// ① sales_fact 指标族的标量问法都挂补充；② 补充与主查询同一时间窗（谓词逐字相同）、
+    /// 五值单行、无 GROUP BY；③ 主 SQL 一个字不变；④ 维度拆解/多指标/非销售标量/失败关闭卡不挂。
+    #[test]
+    fn sales_context_only_on_scalar_sales_kpi_with_the_same_window() {
+        for question in [
+            "本月销售额", "本周销售额", "本月销量", "本月毛利额", "本月毛利率",
+            "本月不含税成本", "本月不含税收入",
+        ] {
+            let hit = warehouse_sales_fact(question)
+                .unwrap_or_else(|| panic!("销售标量应命中：{question}"));
+            assert_eq!(hit.route, "direct-agg", "{question}");
+            let context = hit.sales_context.as_deref()
+                .unwrap_or_else(|| panic!("销售单指标 KPI 必须带同窗补充：{question}"));
+            // ② 同时间窗：主 SQL 的 order_date 半开谓词在补充里逐字重现（含同批谓词）
+            let window = hit.sql.split("WHERE ").nth(1).unwrap_or_default().to_string();
+            assert!(window.contains("sf.order_date >="), "{question}: {}", hit.sql);
+            assert!(context.contains(&format!("WHERE {window}")),
+                    "{question} 补充时间窗/谓词 ≠ 主查询：{context}");
+            for select in [
+                "SUM(sf.amount) AS `销售额`",
+                "SUM(sf.cost_excluding_tax) AS `不含税成本`",
+                "SUM(sf.revenue_excluding_tax) AS `不含税收入`",
+                "SUM(sf.gross_profit) AS `毛利额`",
+                "SUM(sf.gross_profit)/NULLIF(SUM(sf.revenue_excluding_tax),0) AS `毛利率`",
+            ] {
+                assert!(context.contains(select), "{question} 补充缺 {select}：{context}");
+            }
+            assert!(!context.contains("GROUP BY"), "{question} 补充必须单行五值：{context}");
+            assert!(context.contains(dms_semantic::sales_fact::TABLE), "{question}: {context}");
+            // ③ 主 SQL 一个字不变：补充走独立字段，绝不并进主 SELECT
+            assert!(!hit.sql.contains("不含税成本") || question.contains("不含税成本"),
+                    "{question} 主 SQL 被补充污染：{}", hit.sql);
+        }
+        // ④ 不触发族
+        let by_region = warehouse_sales_fact("本月销售额按省区").expect("维度拆解命中");
+        assert!(by_region.sales_context.is_none(), "维度拆解自带这些列，不挂补充：{}", by_region.sql);
+        let multi = warehouse_sales_fact("本月销售额和毛利率").expect("多指标命中");
+        assert!(multi.sql.contains("SUM(sf.gross_profit)/NULLIF"), "前提：确为多指标：{}", multi.sql);
+        assert!(multi.sales_context.is_none(), "多指标主结果已是多列，不挂补充：{}", multi.sql);
+        let stock = try_direct("现在库存量是多少").expect("非销售 direct-agg 标量");
+        assert_eq!(stock.route, "direct-agg");
+        assert!(stock.sales_context.is_none(), "补充不许挂到非销售指标：{}", stock.sql);
+        let unavailable = try_direct_for("本月销售额", false).expect("业务库失败关闭卡");
+        assert!(unavailable.sales_context.is_none(), "不可计算卡不挂补充：{}", unavailable.sql);
     }
 
     #[test]
@@ -4897,28 +5126,39 @@ mod tests {
             2,
             "两个卡臂都必须「推导失败回落原卡」：{wire}"
         );
-        // ③④ ods_derive 本体：候选校验 → 闸门 → 预执行，顺序即行为
+        // ③④ 推导本体（ods_derive 两轮壳 + derive_attempt 单轮体）：
+        //    候选校验 → 闸门 → 预执行在 derive_attempt 里，顺序即行为
         let body = src
-            .split("async fn ods_derive(")
+            .split("async fn derive_attempt(")
             .nth(1)
-            .expect("ods_derive 没了")
+            .expect("derive_attempt 没了")
             .split("\nfn customer_name_fragment(")
             .next()
-            .expect("ods_derive 函数边界没了");
+            .expect("derive_attempt 函数边界没了");
         let allow = body.find("derive_tables_allowed").expect("用表硬校验没了");
         let gate = body.find("dms_agent::gate_on").expect("推导必须过与直连同一个 gate_on");
         assert!(allow < gate, "用表硬校验必须在闸门之前：{body}");
         assert!(body.contains("dms_agent::MAX_ROWS") && body.contains("dms_agent::EXEC_TIMEOUT"),
                 "行上限/超时不许另搞一套：{body}");
-        assert!(body.contains("route: DERIVE_ROUTE.into()"), "命中必须带 direct-derive route：{body}");
-        // 预执行（fetch）必须在 Some(DirectHit) 之前 —— 执行失败要回落原卡
+        // 预执行（fetch）必须在 DeriveTry::Hit 之前 —— 执行失败/零行都不许产出命中
         let fetch = body.find("cx.source.fetch").expect("预执行没了");
-        let hit = body.find("Some(DirectHit").expect("命中构造没了");
+        let hit = body.find("DeriveTry::Hit(candidate)").expect("命中构造没了");
         assert!(fetch < hit, "必须先预执行成功才许产出推导命中：{body}");
+        let shell = src
+            .split("async fn ods_derive(")
+            .nth(1)
+            .expect("ods_derive 没了")
+            .split("async fn derive_attempt(")
+            .next()
+            .expect("ods_derive 函数边界没了");
+        assert!(shell.contains("route: DERIVE_ROUTE.into()"), "命中必须带 direct-derive route：{shell}");
+        assert!(shell.contains("DeriveTry::Empty") && shell.contains("tried.extend"),
+                "空结果必须剔除试过的表再来一轮：{shell}");
         // ⑤ 两道语义闸：用表校验 → 别名对账 → JOIN 证据 → gate_on，顺序即行为；
         //    语料必须来自 schema_card_with_columns（与卡同一次取数，不多查一遍 column_doc）
-        assert!(body.contains("schema_card_with_columns"), "语料必须与卡同源：{body}");
-        assert!(!body.contains("recall::schema_card("), "不许绕开语料单列的卡接口：{body}");
+        assert!(shell.contains("schema_card_with_columns"), "语料必须与卡同源：{shell}");
+        assert!(!body.contains("recall::schema_card(") && !shell.contains("recall::schema_card("),
+                "不许绕开语料单列的卡接口");
         let labels = body.find("derive_labels_ungrounded").expect("闸 1·别名对账没了");
         let joins = body.find("join_evidence_edges").expect("闸 2·JOIN 证据取数没了");
         assert!(allow < labels && labels < joins && joins < gate,
@@ -4965,12 +5205,38 @@ mod tests {
             "SELECT SUM(d.amount) AS `开票金额` FROM dms_ods.t_sales_order_detail d \
              WHERE d.deleted_flag = 0",
         );
-        assert_eq!(derive_labels_ungrounded(&s, &detail).as_deref(), Some("开票金额"));
+        assert_eq!(derive_labels_ungrounded(&s, &detail, &[]).as_deref(), Some("开票金额"));
+        // 即便给了注册指标清单（开票金额登记在 t_invoice_apply_header 系，不在取数表），
+        // 通道②也不许放行 —— 指标必须回自己的源表。
+        let m = vec![("开票金额".to_string(), "t_invoice_apply_header UNION ALL t_invoice_new_apply_header".to_string())];
+        assert_eq!(derive_labels_ungrounded(&s, &detail, &m).as_deref(), Some("开票金额"),
+                   "注册指标的源表不是取数表时不许放行");
         // E18：业务员 = created_by 码值（「业务员」与「创建人」互不为子串）
         let s = shape_of(
             "SELECT d.created_by AS `业务员` FROM dms_ods.t_sales_order_detail d GROUP BY d.created_by",
         );
-        assert_eq!(derive_labels_ungrounded(&s, &detail).as_deref(), Some("业务员"));
+        assert_eq!(derive_labels_ungrounded(&s, &detail, &[]).as_deref(), Some("业务员"));
+    }
+
+    /// 通道③：核心销售口径词允许映射到度量列（销售额←total_amount）；非核心词不放行
+    #[test]
+    fn derive_gate1_core_sales_word_maps_to_measure_column() {
+        let ods = corpus(&[("t_sales_order", vec![
+            ("total_amount", "订单总金额"),
+            ("order_status", "订单状态"),
+        ])]);
+        let s = shape_of(
+            "SELECT SUM(t.total_amount) AS `销售额` FROM dms_ods.t_sales_order t WHERE t.deleted_flag = 0",
+        );
+        assert!(derive_labels_ungrounded(&s, &ods, &[]).is_none(),
+                "销售额←total_amount 是合同覆盖外的合法推导映射");
+        // 非核心词（返利率）就算表里有度量列也不许捏造
+        let s = shape_of("SELECT SUM(t.total_amount) AS `返利率` FROM dms_ods.t_sales_order t");
+        assert_eq!(derive_labels_ungrounded(&s, &ods, &[]).as_deref(), Some("返利率"));
+        // 表里没有度量列时，核心词也不许放行
+        let no_measure = corpus(&[("t_region", vec![("region_name", "省区名称")])]);
+        let s = shape_of("SELECT COUNT(*) AS `销售额` FROM dms_ods.t_region");
+        assert_eq!(derive_labels_ungrounded(&s, &no_measure, &[]).as_deref(), Some("销售额"));
     }
 
     /// 闸 1 过：判官给的正例对照 —— 「销售额」⊂「销售额(元)」、store_name 注释含「门店」、
@@ -4985,19 +5251,42 @@ mod tests {
             "SELECT w.store_name AS `门店`, SUM(w.sale_amount) AS `销售额` \
              FROM dms_ods.t_winc_sale_report w GROUP BY w.store_name",
         );
-        assert!(derive_labels_ungrounded(&s, &winc).is_none(), "门店/销售额必须有出处");
+        assert!(derive_labels_ungrounded(&s, &winc, &[]).is_none(), "门店/销售额必须有出处");
         // 裸列（无限定符）单表：全归该表
         let s = shape_of("SELECT store_name AS `门店` FROM dms_ods.t_winc_sale_report GROUP BY store_name");
-        assert!(derive_labels_ungrounded(&s, &winc).is_none());
+        assert!(derive_labels_ungrounded(&s, &winc, &[]).is_none());
         // 常数占位列（'不可计算' AS 数据状态）不算取数别名：整张不可计算卡都能过闸 1
         let s = shape_of(
             "SELECT '不可计算' AS `数据状态`, '销售额' AS `指标` FROM dms_ods.t_dict_value LIMIT 1",
         );
         assert!(s.labeled.is_empty(), "字面量投影不许进对账：{:?}", s.labeled);
-        assert!(derive_labels_ungrounded(&s, &[]).is_none());
+        assert!(derive_labels_ungrounded(&s, &[], &[]).is_none());
         // ASCII 别名不需要对账（列名形态，没有「改名」空间）
         let s = shape_of("SELECT w.sale_amount AS total FROM dms_ods.t_winc_sale_report w");
         assert!(s.labeled.is_empty(), "{:?}", s.labeled);
+    }
+
+    /// 时间桶别名豁免：「月份」经 DATE_FORMAT 派生 → 不进闸 1 对账；
+    /// 但「销售额」挂在 DATE_FORMAT 上也不许蒙混（词表精确匹配守着），
+    /// 裸写「月份」不调日期函数同样不许（防只挂时间词的虚构）。
+    #[test]
+    fn derive_gate1_time_bucket_alias_exemption() {
+        let corpus = corpus(&[("t_winc_sale_report", vec![
+            ("stat_date", "统计日期"),
+            ("sale_amount", "销售额(元)"),
+        ])]);
+        let s = shape_of(
+            "SELECT DATE_FORMAT(t.stat_date,'%Y-%m') AS `月份`, SUM(t.sale_amount) AS `销售额`              FROM dms_ods.t_winc_sale_report t GROUP BY 1 ORDER BY 1",
+        );
+        assert!(s.time_derived.contains(&"月份".to_string()), "{:?}", s.time_derived);
+        assert!(!s.labeled.iter().any(|(l, _)| l == "月份"), "月份不该进闸 1 对账");
+        assert!(derive_labels_ungrounded(&s, &corpus, &[]).is_none(), "销售额有出处 + 月份豁免 → 过闸");
+        // 指标别名挂日期函数 ≠ 时间桶：词表精确匹配守着
+        let s = shape_of("SELECT DATE_FORMAT(t.stat_date,'%Y-%m') AS `销售额` FROM dms_ods.t_winc_sale_report t");
+        assert!(s.time_derived.is_empty(), "销售额不是时间词");
+        // 时间词但没调日期函数：不豁免
+        let s = shape_of("SELECT t.stat_date AS `月份` FROM dms_ods.t_winc_sale_report t");
+        assert!(s.time_derived.is_empty(), "没调日期函数的时间词不豁免");
     }
 
     /// 闸 1 归属按表别名：别名只在它**实际取数**的那张表的语料里找 —— 跨表借出处不许放行。
@@ -5012,13 +5301,13 @@ mod tests {
             "SELECT w.sku_code AS `品牌` FROM dms_ods.t_winc_sale_report w \
              JOIN dms_ods.t_goods g ON w.sku_code = g.goods_code",
         );
-        assert_eq!(derive_labels_ungrounded(&s, &both).as_deref(), Some("品牌"));
+        assert_eq!(derive_labels_ungrounded(&s, &both, &[]).as_deref(), Some("品牌"));
         // 「品牌」取自 t_goods.brand_name（品牌名称）→ 有出处，过
         let s = shape_of(
             "SELECT g.brand_name AS `品牌` FROM dms_ods.t_winc_sale_report w \
              JOIN dms_ods.t_goods g ON w.sku_code = g.goods_code",
         );
-        assert!(derive_labels_ungrounded(&s, &both).is_none());
+        assert!(derive_labels_ungrounded(&s, &both, &[]).is_none());
     }
 
     /// 闸 2 拒：E09 原型 —— `sku_code = goods_code` 的 joinable 置信度只有 0.35，

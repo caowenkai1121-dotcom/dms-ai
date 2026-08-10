@@ -16,7 +16,7 @@ use std::time::Instant;
 use dms_kernel::BoxFut;
 
 use crate::answerers::Answerer;
-use crate::ctx::{table_answer, AskCtx, AskResult, SupplementalResult};
+use crate::ctx::{table_answer, AskCtx, AskResult, SalesContextResult, SupplementalResult};
 use crate::gate::{gate_on, is_guard_err, EXEC_TIMEOUT, MAX_ROWS};
 
 /// 确定性命中：SQL（未注入）+ 路由标签 + 可选上期查询（KPI 环比）。
@@ -35,6 +35,11 @@ pub struct DirectHit {
     /// 补充明细 SQL：单据保留 Entity 头卡，聚合保留 KPI 卡，再追加图表/表格。
     /// CSV 与 AI 分析使用补充明细行，SQL 展示保留两次查询。
     pub detail: Option<String>,
+    /// 销售单指标 KPI 的同窗补充 SQL（一条五值：销售额/不含税成本/不含税收入/毛利额/毛利率，
+    /// 指标集＝`sales_fact::CONTEXT_METRICS`）。**只有 sales_fact 标量命中**（无维度、单指标）
+    /// 由装配方给出；取数/落账一切失败 = None，主回答一个字符不变（`r.sql` 不追加它——
+    /// 金标把展示 SQL 逐字钉死）。
+    pub sales_context: Option<String>,
 }
 
 /// 「谁产出 `DirectHit`」是入参：`try_compose`（异步，读注册表）与 `try_direct`（同步，手工模板）
@@ -105,7 +110,7 @@ pub async fn land(
     hit: DirectHit,
     t0: Instant,
 ) -> anyhow::Result<Option<AskResult>> {
-    let DirectHit { sql, route, prev, comparisons, detail } = hit;
+    let DirectHit { sql, route, prev, comparisons, detail, sales_context } = hit;
     let gated = match gate_on(cx.p, &sql, cx.scope, cx.ds_global, cx.source.dialect()) {
         Ok(s) => Some(s),
         Err(e) if is_guard_err(&e) => None,
@@ -171,7 +176,16 @@ pub async fn land(
     let want_detail = detail.is_some() && r.row_count > 0;
     let dsql = detail.unwrap_or_default();
     let detail_rows = async { if want_detail { fetch_detail(cx, &dsql).await } else { None } };
-    let (prev_vals, detail_rows) = tokio::join!(prevs, detail_rows);
+    // 【同窗补充】销售单指标 KPI 落定后补一条五值（销售额/成本/收入/毛利额/毛利率）。
+    // 触发判据收窄：仅 direct-agg 且主结果是**单行单值 KPI** —— 维度拆解/明细问题
+    // 自带这些列，不挂补充；补充缺席同样不塌主卡。
+    let want_context = sales_context.is_some()
+        && r.route == "direct-agg"
+        && r.row_count == 1
+        && r.columns.len() == 1;
+    let csql = sales_context.unwrap_or_default();
+    let context_rows = async { if want_context { fetch_sales_context(cx, &csql).await } else { None } };
+    let (prev_vals, detail_rows, context_rows) = tokio::join!(prevs, detail_rows, context_rows);
     for (spec, val) in prev_specs.iter().zip(prev_vals) {
         if let (Some(cur), Some(prev)) = (cur, val) {
             apply_prev(&mut r, cur, &spec.1, prev);
@@ -180,6 +194,9 @@ pub async fn land(
     if let Some(d) = detail_rows {
         let replace_primary = r.route == "direct-doc";
         attach_detail(d, replace_primary, &mut r);
+    }
+    if let Some(c) = context_rows {
+        attach_sales_context(c, &mut r);
     }
     Ok(Some(r))
 }
@@ -277,6 +294,36 @@ fn attach_detail(detail: (String, dms_connector::source::RowSet), replace_primar
     if dview.insight.is_some() {
         r.view.insight = dview.insight;
     }
+}
+
+/// 同窗补充的取数半（供 `land` 与基期/明细**并行**发起）。与主查询同一条闸门、
+/// 同一次权限注入、同一个执行超时 —— 补充不是第二条通道，是同口径的再一次取数。
+/// 一切失败（闸门拒/执行错/零行）= None：补充缺席不塌主答案（文案与 `fetch_detail` 同族）。
+async fn fetch_sales_context(cx: &AskCtx<'_>, csql: &str) -> Option<dms_connector::source::RowSet> {
+    let scoped = match gate_on(cx.p, csql, cx.scope, cx.ds_global, cx.source.dialect()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(err = %e, "销售同窗补充闸门未过 → 只给主 KPI");
+            return None;
+        }
+    };
+    let crs = match cx.source.fetch(&scoped, MAX_ROWS, EXEC_TIMEOUT).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(err = %e, sql = %scoped.wire(), "销售同窗补充取数失败 → 只给主 KPI");
+            return None;
+        }
+    };
+    if crs.rows.is_empty() {
+        return None; // 窗口内无事实行 —— 主 KPI 就是全部
+    }
+    Some(crs)
+}
+
+/// 同窗补充的落账半：只写独立 `sales_context` 字段。**不碰**主结果的 SQL 展示串与行列 ——
+/// 金标把展示 SQL 逐字钉死（含 `-- 明细` 附录），主标量行列是 API/CSV/评测的主契约。
+fn attach_sales_context(crs: dms_connector::source::RowSet, r: &mut AskResult) {
+    r.sales_context = Some(SalesContextResult { columns: crs.columns, rows: crs.rows });
 }
 
 /// KPI 环比：单指标聚合时查上期算 Δ%（闸门失败=跳过环比，与拆分前同）。
@@ -418,6 +465,57 @@ mod tests {
         assert!(body.contains("columns: drs.columns"), "补充结果缺列：{body}");
         assert!(body.contains("rows: drs.rows"), "补充结果缺行：{body}");
         assert!(body.contains("row_count: d_rows"), "补充结果缺行数：{body}");
+    }
+
+    /// 【同窗补充】接线判据（源码扫描 —— 取数要池与闸门，无库测不了）：
+    /// ① 触发收窄到「direct-agg 且单行单值 KPI」；② 一切失败 = None 不塌主答案；
+    /// ③ 落账只写 `sales_context`，主 SQL 展示串与主结果行列一个字不动（金标逐字钉死）。
+    #[test]
+    fn sales_context_is_additive_gated_and_never_touches_the_primary_answer() {
+        let src = include_str!("hits.rs");
+        // ① land() 触发门：补充 SQL 在手 + direct-agg + 单行 + 单列（维度拆解/明细不挂）。
+        //    切片止于 land 之后的 mark_derived_sql 文档，判据只落在 land 函数体上。
+        let land = src
+            .split("pub async fn land(")
+            .nth(1)
+            .expect("land 没了")
+            .split("/// direct-derive 的 SQL 头标")
+            .next()
+            .expect("land 边界没了");
+        for anchor in [
+            "sales_context.is_some()",
+            "r.route == \"direct-agg\"",
+            "r.row_count == 1",
+            "r.columns.len() == 1",
+            "attach_sales_context(c, &mut r)",
+        ] {
+            assert!(land.contains(anchor), "同窗补充触发门缺 {anchor}：{land}");
+        }
+        // ② 取数半（fetch_sales_context）两处失败路径都是 warn + None（不是 `?`），零行同样 None
+        let fetch = src
+            .split("async fn fetch_sales_context(")
+            .nth(1)
+            .expect("fetch_sales_context 没了")
+            .split("/// 同窗补充的落账半")
+            .next()
+            .expect("fetch_sales_context 边界没了");
+        assert!(fetch.contains("销售同窗补充闸门未过 → 只给主 KPI"), "{fetch}");
+        assert!(fetch.contains("销售同窗补充取数失败 → 只给主 KPI"), "{fetch}");
+        assert!(fetch.contains("crs.rows.is_empty()"), "{fetch}");
+        assert!(!fetch.contains("fetch_sales_context(cx"), "切片吃到调用点了（本判据只判函数体）");
+        // ③ 落账半：只写独立字段；不给 r.sql / r.columns / r.rows 赋值
+        let body = src
+            .split("fn attach_sales_context(")
+            .nth(1)
+            .expect("attach_sales_context 没了")
+            .split("/// KPI 环比")
+            .next()
+            .expect("attach_sales_context 边界没了");
+        assert!(body.contains("r.sales_context = Some(SalesContextResult"), "{body}");
+        assert!(body.contains("columns: crs.columns") && body.contains("rows: crs.rows"), "{body}");
+        for forbidden in ["r.sql =", "r.columns =", "r.rows =", "r.view ="] {
+            assert!(!body.contains(forbidden), "同窗补充不许改主回答 {forbidden}：{body}");
+        }
     }
 
     #[test]

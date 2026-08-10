@@ -370,6 +370,7 @@ mod tests {
             steps: vec![],
             clarify_options: vec![],
             value_labels: vec![],
+            sales_context: None,
         }
     }
 

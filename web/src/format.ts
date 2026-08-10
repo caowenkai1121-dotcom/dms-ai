@@ -64,10 +64,10 @@ export function fmt(v: unknown, semantic: Semantic = 'none'): string {
   return String(v)
 }
 
-/** 业务数值：绝对值满 1 万固定 3 位小数，否则千分位且最多 3 位小数。 */
+/** 业务数值：绝对值满 1 万按“万”展示，全端统一最多 2 位小数（2026-08-10 裁决）。 */
 export function compress(n: number): string {
   const abs = Math.abs(n)
-  if (abs >= 1e4) return `${(n / 1e4).toFixed(3)}万`
+  if (abs >= 1e4) return `${(n / 1e4).toFixed(2)}万`
   return grouping(n)
 }
 
@@ -75,7 +75,7 @@ function grouping(n: number): string {
   const value = Math.abs(n) < 0.0005 ? 0 : n
   return new Intl.NumberFormat('zh-CN', {
     minimumFractionDigits: 0,
-    maximumFractionDigits: 3,
+    maximumFractionDigits: 2,
     useGrouping: true,
   }).format(value)
 }

@@ -134,6 +134,17 @@ pub const METRICS: &[Metric] = &[
     Metric::GrossMargin,
 ];
 
+/// 同窗补充五值（裁决：销售类单指标 KPI 的答案顺带成本/收入/毛利）。
+/// 顺序即 SELECT 列序；毛利率仍走「先汇总分子分母再相除」口径，不改用 amount。
+/// 只用于无维度单指标命中后的补充查询；维度拆解/明细自带这些列，不走它。
+pub const CONTEXT_METRICS: &[Metric] = &[
+    Metric::SalesAmount,
+    Metric::CostExcludingTax,
+    Metric::RevenueExcludingTax,
+    Metric::GrossProfit,
+    Metric::GrossMargin,
+];
+
 impl Metric {
     pub const fn code(self) -> &'static str {
         match self {
@@ -753,5 +764,28 @@ mod tests {
         assert_ne!(july.1, "DATE_ADD(CURDATE(), INTERVAL 1 DAY)");
         let explicit_year = question_time_bounds("2025年销售额").expect("显式年份窗口");
         assert_ne!(explicit_year.1, "DATE_ADD(CURDATE(), INTERVAL 1 DAY)");
+    }
+
+    /// 同窗补充五值的合同钉：指标集与列序固定，一条 SQL 同时间窗取齐；
+    /// 毛利率仍是「汇总分子分母再相除」，无维度、无 GROUP BY（单行五值）。
+    #[test]
+    fn context_pack_is_five_metrics_one_row_same_window() {
+        assert_eq!(
+            CONTEXT_METRICS.iter().map(|metric| metric.name()).collect::<Vec<_>>(),
+            ["销售额", "不含税成本", "不含税收入", "毛利额", "毛利率"]
+        );
+        let sql = aggregate_sql_many(CONTEXT_METRICS, &[], ":begin", ":end");
+        for select in [
+            "SUM(sf.amount) AS `销售额`",
+            "SUM(sf.cost_excluding_tax) AS `不含税成本`",
+            "SUM(sf.revenue_excluding_tax) AS `不含税收入`",
+            "SUM(sf.gross_profit) AS `毛利额`",
+            "SUM(sf.gross_profit)/NULLIF(SUM(sf.revenue_excluding_tax),0) AS `毛利率`",
+        ] {
+            assert!(sql.contains(select), "同窗补充缺 {select}: {sql}");
+        }
+        assert!(sql.contains("sf.order_date >= :begin AND sf.order_date < :end"), "{sql}");
+        assert!(!sql.contains("GROUP BY"), "补充五值必须单行：{sql}");
+        assert!(!sql.contains("ORDER BY") && !sql.contains("LIMIT"), "{sql}");
     }
 }
