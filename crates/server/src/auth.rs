@@ -367,10 +367,11 @@ pub async fn load_principal(
         .fetch_all()
         .await?;
     let administrator_flag = administrator_flag.unwrap_or(0) == 1;
-    let roles: Vec<(i64, String)> = roles
-        .into_iter()
-        .filter(|(_, code)| administrator_flag || code.trim() != "admin")
-        .collect();
+    // 不再按「无标记即剥 admin 角色」过滤：DMS 原生语义是 `administrator_flag || role_code
+    // == 'admin'` 双入口同权（scope.rs::admin_shortcut 对齐 Java L93-98/L236-243），角色管理
+    // 页里「管理员」角色的数据范围本来就是「全部」。之前这道过滤比被对齐的源系统更严，
+    // 把合法 admin 角色持有者打成「无可用角色」（云帆案例，2026-08-10）。
+    let roles: Vec<(i64, String)> = roles;
     let (role_id, role_code) = match role_code {
         Some("admin") if administrator_flag && roles.is_empty() => (0, "admin".into()),
         Some(role) => roles
