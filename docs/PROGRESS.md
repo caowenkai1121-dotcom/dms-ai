@@ -1849,3 +1849,17 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
   token 失效映 `{code:30007}`（小程序拦截器自动弹登录）；`xcx_auth_base` 未配置 = 404 fail-closed。
   实测：无 token/假 token 均正确 401+30007。
 - 验证：server 485 测试全绿零警告。
+
+## AX97（2026-08-10，嵌入/小程序问题修复批）
+- **SSO 嵌入 401**：DMS 前端 token 由生产 DMS 签发，AI 后端却拿测试库地址验——
+  `dms_base_url` 双侧统一为 `https://dms.huangjiaxiaohu.com/dms-api`；AI 地址全环境走
+  `VITE_AGENT_DOMAIN`（xh-dms-fornt home/index.vue 删 DEV 写死分支）；
+  小程序 env 补 `VITE_AI_API_URL`。
+- **深度/知识库 403**：SSO 会话角色带 `__dms_federated_role__:` 前缀，只有 `auth::load_principal`
+  会剥——但 11 处端点直调 policy 版（不剥）→ 全收口（含 usage/vision，守卫测试钉死零直调）。
+- **实体识别准确度**：公司形态（线下-前缀/公司后缀）证据收窄候选类型（客户/门店）、
+  类型优先级替代 label 字节序排序（客户不再被员工表同名行压掉）、triage 加裸实体名闸
+  （形态命中必走 Data 路，不再 LLM 抛硬币）。实测：客户名→客户卡（编码 182980），
+  商品名→商品卡，不再误出订单列表。
+- **小程序结果呈现**：编码列 nowrap+数值右对齐+表头吸顶+斑马纹；≤3 列 ≤3 行渲染键值卡；
+  空结果占位；段落化答案。待 HBuilderX 构建验证。
