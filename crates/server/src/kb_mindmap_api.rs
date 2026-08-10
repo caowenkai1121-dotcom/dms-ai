@@ -7,6 +7,8 @@
 //! .route("/api/kb/mindmap/regenerate", post(kb_mindmap_api::regenerate_mindmap))
 //! .route("/api/kb/doc/{id}/markdown", get(kb_mindmap_api::doc_markdown))
 //! .route("/api/kb/doc/{id}/chunks", get(kb_mindmap_api::doc_chunks))
+//! // ③ 内容级导图：本轮新增，接线契约在此、**刻意不注册 `main.rs`**（集成时加这一行即可）：
+//! .route("/api/kb/doc/{id}/sections", get(kb_mindmap_api::doc_sections))
 //! ```
 //!
 //! ## ① 知识导图
@@ -36,6 +38,16 @@
 //!   "page", "start_char_pos", "end_char_pos" }] }`（空文档给空数组，不 404）。
 //! - 两个都过 `acl::doc_for_viewer`：**不存在与不可见统一 403**（现有 kb_api 惯例，
 //!   不泄露他人文档的存在性）。
+//!
+//! ## ③ 内容级导图（章节分桶；本轮新增，端点未注册，接线契约见上）
+//! - `GET /api/kb/doc/{id}/sections` → `{ "doc_id", "doc_name", "sections": [
+//!   { "section", "chunk_count", "first_ord", "page", "excerpt" } ] }`。
+//!   章节＝`kb.chunk.heading_path` 的**顶层段**（`" > "` 分隔，与 ingest 写入同口径）分桶；
+//!   `excerpt`＝该节首块文本的空白压缩摘录（≤160 字），`page`/`first_ord` 同取首块；
+//!   桶序＝首块出现顺序（即 `ord` 序，确定性，不依赖 LLM）。空文档/无章节结构给
+//!   `sections: []` 或单个「未分节」桶，不 404。
+//! - 权限＝文档读：`doc_for_viewer` 闸 + 语句内联空间级读谓词双保险（与 `kb_api`
+//!   摘录 SQL 同一模子：撤权若发生在两步之间，内联谓词让结果一行都返不出）。
 //!
 //! 身份解析与错误形状（`{"error": msg}`、400/403/404 映射）与 `kb_api` 逐字同口径——
 //! 那几个 helper 是 kb_api 的私有函数，本文件按 `mcp_api`/`ds_api` 的既有做法各写一份
@@ -458,6 +470,217 @@ pub async fn doc_chunks(
         })).collect::<Vec<_>>()
     })))
 }
+
+// ════════════════════════ ③ 内容级导图（章节分桶）════════════════════════
+//
+// 接线契约（本轮**不注册 `main.rs`**，集成时加一行）：
+//   .route("/api/kb/doc/{id}/sections", get(kb_mindmap_api::doc_sections))
+// 用途：导图文档节点展开到章节级（顶层 heading 分桶 + 块数徽标），点章节出摘要卡（首块摘录）。
+// 接线前整块属未达代码：与 `kb_api::ops_pack` 同一模子（子模块 + glob re-export，
+// 接线方写 `kb_mindmap_api::doc_sections` 即可）；已在 main.rs 接线。
+mod content_pack {
+    use super::*;
+
+    /// 摘要卡摘录上限（字符）：只给苗头，全文走 `/chunks` 或 `/markdown`
+    const SECTION_EXCERPT_CHARS: usize = 160;
+    /// 单文档顶层章节数上限（导图节点有界闸；超出截断，不报错）
+    const MAX_SECTIONS: usize = 100;
+    /// 空 heading_path（扫描件/图片 OCR 等无标题结构）的桶名
+    const NO_SECTION: &str = "未分节";
+
+    /// 章节 SQL。调用方已过 `doc_for_viewer`，这里仍内联一次空间级读谓词——撤权若发生在
+    /// 两步之间，本语句一行都返不出（同 `kb_api` 描述摘录 SQL 的两步内联理由）。
+    const SECTIONS_SQL: &str =
+        "SELECT c.ord,c.heading_path,c.page,c.text FROM kb.chunk c JOIN kb.doc d ON d.doc_id = c.doc_id
+         WHERE c.doc_id = $1
+           AND EXISTS (SELECT 1 FROM kb.space s WHERE s.space_id = d.space_id
+             AND (s.owner = $2 OR EXISTS (SELECT 1 FROM kb.acl a
+               WHERE a.scope = 'space' AND a.target_id = s.space_id
+                 AND a.perm IN ('read','write')
+                 AND ((a.grantee_kind = 'login' AND a.grantee = $2)
+                   OR (a.grantee_kind = 'role' AND a.grantee = ANY($3::text[]))))))
+         ORDER BY c.ord";
+
+    /// 顶层章节段：`"A > B > C"` → `"A"`；空路径归「未分节」桶
+    fn top_section(heading_path: &str) -> &str {
+        let top = heading_path.split(" > ").next().unwrap_or("").trim();
+        if top.is_empty() { NO_SECTION } else { top }
+    }
+
+    /// 首块摘录：压缩一切空白串为单个空格（块文本里的换行/缩进对摘要卡只是噪音），
+    /// 封顶 `SECTION_EXCERPT_CHARS` 字符。
+    fn clip_excerpt(text: &str) -> String {
+        let mut out = String::new();
+        let mut pending_space = false;
+        for c in text.trim().chars() {
+            if c.is_whitespace() {
+                pending_space = true;
+                continue;
+            }
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(c);
+            if out.chars().count() >= SECTION_EXCERPT_CHARS {
+                break;
+            }
+        }
+        out
+    }
+
+    /// 一节的内容级投影：标题 + 块数徽标 + 首块定位（ord/页码）+ 首块摘录
+    struct SectionBucket {
+        section: String,
+        chunk_count: usize,
+        first_ord: i32,
+        page: Option<i32>,
+        excerpt: String,
+    }
+
+    /// 顶层 heading 分桶（纯函数，单测钉住）：输入必须按 `ord` 序（SQL 保证），
+    /// 桶序＝首块出现顺序；同名顶层段跨位置合并（`A > x`、`B > y`、再有 `A > z` 仍归一桶，
+    /// 摘录与定位始终取该节的**第一块**）。
+    fn bucket_sections(chunks: &[PreviewChunk]) -> Vec<SectionBucket> {
+        let mut out: Vec<SectionBucket> = Vec::new();
+        for c in chunks {
+            let top = top_section(&c.heading_path);
+            match out.iter_mut().find(|b| b.section == top) {
+                Some(b) => b.chunk_count += 1,
+                None => out.push(SectionBucket {
+                    section: top.to_string(),
+                    chunk_count: 1,
+                    first_ord: c.ord,
+                    page: c.page,
+                    excerpt: clip_excerpt(&c.text),
+                }),
+            }
+        }
+        out.truncate(MAX_SECTIONS);
+        out
+    }
+
+    /// `GET /api/kb/doc/{id}/sections` → `{doc_id, doc_name, sections:[...]}`。
+    /// 空文档给空数组（与 `doc_chunks` 同口径）；不存在与不可见统一 403。
+    pub async fn doc_sections(
+        State(st): State<Arc<AppState>>,
+        headers: HeaderMap,
+        Path(id): Path<String>,
+        Query(q): Query<MindmapQuery>,
+    ) -> Result<ApiOk, ApiErr> {
+        let v = viewer(&st, &headers, &q.login_name, &q.role_code).await?;
+        // 先过可见性闸再取块（与 doc_markdown/doc_chunks 同序，守卫测试钉住）
+        let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
+        let rows: Vec<(i32, String, Option<i32>, String)> = st
+            .owned
+            .fixed(SECTIONS_SQL)
+            .bind(&id)
+            .bind(&v.login)
+            .bind(&v.roles)
+            .fetch_all()
+            .await
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用，请稍后重试"))?;
+        let chunks: Vec<PreviewChunk> = rows
+            .into_iter()
+            .map(|(ord, heading_path, page, text)| PreviewChunk {
+                ord,
+                text,
+                heading_path,
+                page,
+                start_char_pos: None,
+                end_char_pos: None,
+            })
+            .collect();
+        let sections = bucket_sections(&chunks);
+        Ok(Json(serde_json::json!({
+            "doc_id": row.doc_id,
+            "doc_name": row.name,
+            "sections": sections.iter().map(|s| serde_json::json!({
+                "section": s.section,
+                "chunk_count": s.chunk_count,
+                "first_ord": s.first_ord,
+                "page": s.page,
+                "excerpt": s.excerpt,
+            })).collect::<Vec<_>>(),
+        })))
+    }
+
+    #[cfg(test)]
+    mod content_tests {
+        use super::*;
+
+        fn hchunk(ord: i32, heading_path: &str, text: &str, page: Option<i32>) -> PreviewChunk {
+            PreviewChunk {
+                ord,
+                text: text.into(),
+                heading_path: heading_path.into(),
+                page,
+                start_char_pos: None,
+                end_char_pos: None,
+            }
+        }
+
+        /// 章节分桶：顶层段归组、桶序＝首块出现序、同名顶层跨位置合并、计数与定位取首块
+        #[test]
+        fn sections_bucket_by_top_heading_in_first_seen_order() {
+            let chunks = vec![
+                hchunk(0, "总则 > 目的", "总则首块。", Some(1)),
+                hchunk(1, "总则 > 适用范围", "总则第二块。", Some(1)),
+                hchunk(2, "报销流程 > 申请", "报销首块。", Some(3)),
+                hchunk(3, "总则 > 附则", "总则第三块（跨位置仍归总则）。", Some(9)),
+            ];
+            let secs = bucket_sections(&chunks);
+            assert_eq!(secs.len(), 2);
+            assert_eq!(secs[0].section, "总则");
+            assert_eq!(secs[0].chunk_count, 3);
+            assert_eq!(secs[0].first_ord, 0);
+            assert_eq!(secs[0].page, Some(1));
+            assert_eq!(secs[0].excerpt, "总则首块。", "摘录必须取自该节首块");
+            assert_eq!(secs[1].section, "报销流程");
+            assert_eq!(secs[1].chunk_count, 1);
+            assert!(bucket_sections(&[]).is_empty());
+        }
+
+        /// 空 heading（扫描件/OCR）归「未分节」；摘录压缩空白且按字符封顶
+        #[test]
+        fn sections_fallback_and_excerpt_clipping() {
+            let long = format!("{}　\n\n  {}", "甲".repeat(200), "乙".repeat(50));
+            let chunks = vec![hchunk(0, "", &long, None), hchunk(1, "  ", "第二块", None)];
+            let secs = bucket_sections(&chunks);
+            assert_eq!(secs.len(), 1);
+            assert_eq!(secs[0].section, NO_SECTION);
+            assert_eq!(secs[0].chunk_count, 2);
+            assert_eq!(secs[0].excerpt.chars().count(), SECTION_EXCERPT_CHARS);
+            assert!(!secs[0].excerpt.contains(char::is_whitespace), "摘录不许带空白: {}", secs[0].excerpt);
+        }
+
+        /// 有界闸：顶层节数封顶 `MAX_SECTIONS`（截断不报错）
+        #[test]
+        fn sections_are_capped() {
+            let chunks: Vec<PreviewChunk> = (0..(MAX_SECTIONS + 20))
+                .map(|i| hchunk(i as i32, &format!("第{i}章"), "文", None))
+                .collect();
+            assert_eq!(bucket_sections(&chunks).len(), MAX_SECTIONS);
+        }
+
+        /// 端点顺序闸（源码级）：doc_sections 必须先过 `doc_for_viewer` 再执行章节 SQL
+        #[test]
+        fn sections_endpoint_gates_visibility_before_query() {
+            let src = include_str!("kb_mindmap_api.rs");
+            let body = src.split("pub async fn doc_sections").nth(1).unwrap();
+            // handler 在子模块内（缩进 4），函数体到第一个 4 空格缩进的 `}` 为止
+            let body = body.split("\n    }\n").next().unwrap();
+            let gate = body.find("doc_for_viewer").unwrap();
+            let query = body.find("SECTIONS_SQL").unwrap();
+            assert!(gate < query, "doc_sections 必须先过可见性再取块: {body}");
+        }
+    }
+}
+
+// 与 `kb_api::ops_pack` 同一模子：glob re-export 让接线方写 `kb_mindmap_api::doc_sections` 即可；
+// 接线（main.rs 注册路由）后这行 re-export 即被真正使用，`unused_imports` 的 allow 一并删掉。
+#[allow(unused_imports)]
+pub(crate) use content_pack::*;
 
 #[cfg(test)]
 mod tests {

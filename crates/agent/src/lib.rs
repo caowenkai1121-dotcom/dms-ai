@@ -28,6 +28,7 @@ pub mod gate;
 pub mod gather;
 pub mod guard;
 pub mod insight;
+pub mod localize;
 pub mod prompt;
 pub mod review;
 pub mod run;
@@ -42,8 +43,8 @@ pub use analysis::{AnalysisKind, AnalysisPlan, AnalysisShape, ReportSpec};
 pub use ask::{ask, is_followup, AskDeps, DetectFn, HitFn};
 pub use compound::{is_compound, try_compound};
 pub use ctx::{
-    table_answer, truncation_note, AskCtx, AskResult, Step, SubResult, SupplementalResult,
-    TrustEnvelope,
+    table_answer, truncation_note, AskCtx, AskResult, ClarifyOption, Step, SubResult, SupplementalResult,
+    TrustEnvelope, ValueLabel,
 };
 // 问答参数常量与三段闸门：server 的 `exec-sql` 判官子命令与服务走同一条管道、同一组参数。
 pub use gate::{ensure_limit, gate, gate_on, is_guard_err, EXEC_TIMEOUT, GUARD, MAX_ROWS};

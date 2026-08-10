@@ -65,6 +65,9 @@ interface AskResult {
   truncation_note?: string
   /** 被敏感列防线整列置空的列名（`RowSet.redacted`）；渲染在 ResultPanel */
   redacted?: string[]
+  /** 意图不明时后端给的候选问法（chip 与「换个维度看」同款，点击 = 把 question 原样发出）。
+   *  字段缺席 = 现状不变（老服务端不带这个键也不崩）。 */
+  clarify_options?: { label: string; question: string }[]
   scope_note?: string
   trust?: {
     level: 'verified' | 'high' | 'review'; trace_id: string; source: string; route: string
@@ -2065,6 +2068,12 @@ function dataOnlyResult(result: AskResult): AskResult {
   if (!result.view?.insight) return result
   return { ...result, view: { ...result.view, insight: undefined } }
 }
+/** 【意图澄清】clarify_options 只过干净项：空 label/question 的脏数据不进 UI。 */
+function clarifyOptionsOf(result?: AskResult): { label: string; question: string }[] {
+  if (!result || !Array.isArray(result.clarify_options)) return []
+  return result.clarify_options.filter((o) =>
+    o && typeof o.label === 'string' && typeof o.question === 'string' && o.label.trim() && o.question.trim())
+}
 function compoundAnalysis(result: AskResult): string {
   const summary = userFacingMarkdown(result.view?.insight ?? '')
   if (summary) return summary
@@ -2594,7 +2603,7 @@ function exportSupplementalCsv(t: Turn) {
               </a>
               <p v-if="t.promoted.note" class="promote-note">{{ t.promoted.note }}</p>
             </div>
-            <div v-else-if="t.result" class="bubble ai" :class="{ 'knowledge-bubble': t.result.kind === 'text' }">
+            <div v-else-if="t.result" class="bubble ai" :class="{ 'knowledge-bubble': t.result.kind === 'text', 'result-bubble': t.result.kind !== 'text' && t.mode !== 'deep' }">
               <div class="res-meta">
                 <!-- 知识库只展示面向业务的回答与关联资料概览，不暴露内部引用编号/调试计数。 -->
                 <span v-if="t.result.kind === 'text'">已关联资料</span>
@@ -2795,6 +2804,13 @@ function exportSupplementalCsv(t: Turn) {
                 <div v-else-if="t.analysis.error" class="ai-err">{{ t.analysis.error }}</div>
                 <KbAnswer v-else-if="t.analysis.insight" :result="{ markdown: userFacingMarkdown(t.analysis.insight) }" />
                 <div v-else class="ai-hint">本次没有可展示的分析结论</div>
+              </div>
+
+              <!-- 【意图澄清】后端 clarify_options：意图不明时的候选问法，chip 同「换个维度看」，
+                   点击 = 把该 question 直接发出（沿用会话追问机制）。字段缺席 = 现状不变。 -->
+              <div v-if="clarifyOptionsOf(t.result).length" class="clarify-opts">
+                <span class="clarify-t">你可以这样问：</span>
+                <span v-for="c in clarifyOptionsOf(t.result)" :key="c.question" class="pill" @click="send(c.question, { targetConvId: t.convId })">{{ c.label }}</span>
               </div>
             </div>
           </div>
@@ -3128,6 +3144,8 @@ function exportSupplementalCsv(t: Turn) {
 .bubble { max-width: 82%; padding: 12px 16px; font-size: 14px; line-height: 1.65; word-break: break-word; }
 .bubble.user { margin-left: auto; width: fit-content; background: var(--primary); color: #fff; white-space: pre-wrap; border-radius: 12px 12px 4px 12px; }
 .bubble.ai { margin-right: auto; width: fit-content; max-width: min(100%, 1120px); background: var(--bg-card); border: 1px solid var(--border); box-shadow: var(--shadow-sm); border-radius: 12px 12px 12px 4px; }
+/* 精简模式取数结果：fit-content 会把单行 KPI/少行表格挤成一小条，结果卡撑满聊天区宽（深度模式布局不动） */
+.bubble.ai.result-bubble { width: min(100%, 1120px); }
 .bubble.err { margin-right: auto; background: var(--error-bg); border: 1px solid var(--error-ring); color: var(--error-text); border-radius: 12px; }
 .thinking { display: inline-flex; align-items: center; gap: 10px; background: var(--bg-card); border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; font-size: 13px; color: var(--text-regular); box-shadow: var(--shadow-sm); width: fit-content; }
 .thinking .elapsed { color: var(--primary); font-variant-numeric: tabular-nums; }
@@ -3275,6 +3293,9 @@ function exportSupplementalCsv(t: Turn) {
 .drill-t { font-size: 12px; color: var(--text-muted); }
 .pill { font-size: 12px; padding: 4px 12px; border: 1px solid var(--border); border-radius: var(--radius-full); background: var(--bg-card); color: var(--text-muted); cursor: pointer; white-space: nowrap; transition: .12s; }
 .pill:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
+/* 【意图澄清】clarify_options chip 排：与 .drill 同形态（上边框分隔的操作行） */
+.clarify-opts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--divider); font-size: 12px; }
+.clarify-t { color: var(--text-muted); }
 /* 快捷 pill */
 .quick { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 16px; border-top: 1px solid var(--divider); background: var(--bg-card); }
 /* 能力切换 chip（知识库/问数/自动） */

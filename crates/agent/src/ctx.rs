@@ -135,6 +135,30 @@ pub struct AskResult {
     /// 不看 `steps` 末位的表标签（llm 路径命中时 route 会是 `llm+repair` 等）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<Step>,
+    /// 意图反问的结构化候选（need-intent 增强）：fast LLM 给的 2~4 个最可能问法。
+    /// 空 = 降级为纯文本反问（与引入前逐字等价），整键不上线 —— 老客户端零影响。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub clarify_options: Vec<ClarifyOption>,
+    /// 码值翻译留痕（`present_cn`）：单元格显示中文名，原始码在这里保留
+    /// （前端 tooltip / 对数用）。空 = 本轮没有翻译，整键不上线。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub value_labels: Vec<ValueLabel>,
+}
+
+/// 反问候选（need-intent）：`label` 是短标签（≤6 字预期），`question` 是可直接重发的完整问句。
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ClarifyOption {
+    pub label: String,
+    pub question: String,
+}
+
+/// 码值翻译留痕：`column` 列里原始码 `code` 显示成了 `label`。
+/// `column` 与翻译后的 `columns` 逐字一致（前端按名定位列）。
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ValueLabel {
+    pub column: String,
+    pub code: String,
+    pub label: String,
 }
 
 #[derive(Serialize)]
@@ -218,6 +242,8 @@ impl AskResult {
             trust: None,
             // 复合容器没走 Router（子问句各自的 steps 在各自 `result` 里）
             steps: vec![],
+            clarify_options: vec![],
+            value_labels: vec![],
         }
     }
 }
@@ -260,6 +286,8 @@ pub fn table_answer(
         trust: None,
         // 由 `ask_single` 的分派循环在命中后补上（这里不知道前面几个成员出过手）
         steps: vec![],
+        clarify_options: vec![],
+        value_labels: vec![],
     }
 }
 
@@ -778,6 +806,8 @@ mod tests {
             scope_note: None,
             trust: None,
             steps: vec![],
+            clarify_options: vec![],
+            value_labels: vec![],
         };
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("caliber_note").is_none(), "{j}");
@@ -788,6 +818,9 @@ mod tests {
         assert!(j.get("redacted").is_none(), "空 redacted 不许出现在 JSON 里：{j}");
         assert!(j.get("trust").is_none(), "未补凭证时 trust 不许占老 JSON 形状：{j}");
         assert!(j.get("supplemental").is_none(), "无补充结果时不许改变老 JSON 形状：{j}");
+        // 呈现中文化与反问候选同理：空 = 整键不上线
+        assert!(j.get("clarify_options").is_none(), "空 clarify_options 不许上线：{j}");
+        assert!(j.get("value_labels").is_none(), "空 value_labels 不许上线：{j}");
         // 有标注时才出现，且是原文（前端按它显示「数字不可信」的提示）
         r.caliber_note = Some("口径复核未通过：下方结果不可信".into());
         assert_eq!(
@@ -815,6 +848,40 @@ mod tests {
     fn fingerprint_normalizes_whitespace_but_not_token_boundaries() {
         assert_eq!(sql_fingerprint("SELECT   1\nFROM t"), sql_fingerprint("SELECT 1 FROM t"));
         assert_ne!(sql_fingerprint("SELECT ab c"), sql_fingerprint("SELECT a bc"));
+    }
+
+    /// 🔴 新字段的 wire 形态：非空才出现，且是 `{label, question}` / `{column, code, label}`。
+    /// 两个判官脚本与老前端不认识这两个键 —— 它们必须只在真有内容时才上线。
+    #[test]
+    fn clarify_options_and_value_labels_on_wire_only_when_present() {
+        let mut r = AskResult {
+            sql: "SELECT 1".into(),
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            truncated: false,
+            elapsed_ms: 1,
+            route: "need-intent".into(),
+            view: dms_semantic::present::build(&[], &[]),
+            supplemental: None,
+            comparisons: vec![],
+            subs: vec![],
+            caliber_note: None,
+            truncation_note: None,
+            redacted: vec![],
+            scope_note: None,
+            trust: None,
+            steps: vec![],
+            clarify_options: vec![ClarifyOption { label: "销售表现".into(), question: "本月销售额是多少".into() }],
+            value_labels: vec![ValueLabel { column: "状态".into(), code: "100".into(), label: "待审核".into() }],
+        };
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["clarify_options"], serde_json::json!([{"label": "销售表现", "question": "本月销售额是多少"}]));
+        assert_eq!(j["value_labels"], serde_json::json!([{"column": "状态", "code": "100", "label": "待审核"}]));
+        r.clarify_options = vec![];
+        r.value_labels = vec![];
+        let j = serde_json::to_value(&r).unwrap();
+        assert!(j.get("clarify_options").is_none() && j.get("value_labels").is_none(), "{j}");
     }
 
     /// direct-derive 的凭证判级：恒 review（未经合同验证），绝不进 verified/high ——

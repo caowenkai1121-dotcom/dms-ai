@@ -1354,6 +1354,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/kb/doc/{id}/chunks", get(kb_mindmap_api::doc_chunks))
         .route("/api/kb/mindmap", get(kb_mindmap_api::mindmap))
         .route("/api/kb/mindmap/regenerate", post(kb_mindmap_api::regenerate_mindmap))
+        .route("/api/kb/doc/{id}/sections", get(kb_mindmap_api::doc_sections))
         .route("/api/kb/eval/runs", get(kb_eval_api::list_runs).post(kb_eval_api::create_run))
         .route("/api/kb/eval/runs/{id}", get(kb_eval_api::get_run))
         .route("/api/kb/graph/build", post(kg_api::build))

@@ -51,6 +51,8 @@ const UPLOAD_ACCEPT = [
 ].join(',')
 // 单文件上限 20MB：与服务端 `kb_max_mb` 默认值同口径（服务端配置可调，前端按产品口径预校验）
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+// 扩展名集合（与 UPLOAD_ACCEPT 同一份清单）：文件夹选择器不认 accept，前端按它逐个预过滤
+const UPLOAD_EXTS = new Set(UPLOAD_ACCEPT.split(',').map((ext) => ext.trim().toLowerCase()))
 interface Grant {
   grantee_kind: 'login' | 'role'; grantee: string; grantee_name?: string | null
   perm: 'read' | 'write'
@@ -119,6 +121,7 @@ const openedHit = ref<Record<number, string>>({})
 const openingHit = ref<Record<number, boolean>>({})
 const hitErr = ref<Record<number, string>>({})
 const fileEl = ref<HTMLInputElement>()
+const dirEl = ref<HTMLInputElement>()
 const previewDoc = ref<Doc | null>(null)
 const confirmDoc = ref<Doc | null>(null)
 const deletingId = ref('')
@@ -1323,6 +1326,72 @@ function onDrop(e: DragEvent) {
 function openFilePicker() {
   if (!busy.value) fileEl.value?.click()
 }
+function openDirPicker() {
+  if (!busy.value) dirEl.value?.click()
+}
+// 上传文件夹：webkitdirectory 一次给出整棵目录树；文件夹名建成同名 KB 文件夹
+// （上传契约只认 folder_id，所以先复用/创建目录拿到 id，再走既有批量上传队列 send()）。
+function onPickDir(e: Event) {
+  const el = e.target as HTMLInputElement
+  const files = Array.from(el.files ?? [])
+  el.value = ''
+  void sendDirectory(files)
+}
+async function sendDirectory(files: File[]) {
+  if (!files.length || busy.value || !spaceId.value) return
+  const requestSpace = spaceId.value
+  const requestEpoch = contextEpoch
+  // webkitRelativePath 形如「根文件夹/子目录/文件」；KB 文件夹名 = 第一段（嵌套子目录不建层级，全部进该文件夹）
+  const rootName = String(files[0]?.webkitRelativePath || '').split('/')[0]?.trim()
+  const parentId = uploadFolderId.value || null
+  const parentLabel = uploadFolder.value ? folderLabel(uploadFolder.value) : ''
+  const destination = rootName ? [parentLabel, rootName].filter(Boolean).join(' / ') : '根目录 / 未分类'
+  // 逐个预过滤不支持的扩展名（失败行进队列、逐个提示）；超 20MB / 空文件由 send() 预校验同口径处理
+  const accepted: File[] = []
+  for (const file of files) {
+    const dot = file.name.lastIndexOf('.')
+    const ext = dot > 0 ? file.name.slice(dot).toLowerCase() : ''
+    if (!ext || !UPLOAD_EXTS.has(ext)) {
+      uploads.value.unshift({
+        id: ++uploadId, name: file.webkitRelativePath || file.name,
+        state: 'fail', msg: '不支持的文件类型，未上传', destination,
+      })
+      continue
+    }
+    accepted.push(file)
+  }
+  if (!accepted.length || !rootName) {
+    if (accepted.length) void send(accepted)
+    return
+  }
+  // 复用同名同级目录；没有再调既有 POST /api/kb/folders（与「新建文件夹」对话框同一条契约）
+  let folderId = folders.value.find((folder) => folder.name === rootName && (folder.parent_id || null) === parentId)?.folder_id ?? ''
+  if (!folderId) {
+    try {
+      const response = await fetch('/api/kb/folders', {
+        method: 'POST', headers: { ...headers(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ space_id: requestSpace, name: rootName, parent_id: parentId }),
+      })
+      const data = await responseJson(response)
+      if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`)
+      folderId = String(data.folder_id ?? data.id ?? '')
+      if (!contextIsCurrent(requestEpoch, requestSpace)) return
+      await loadKnowledgeAssets(requestSpace, requestEpoch)
+    } catch (e) {
+      // 本地目录列表可能过期（服务端已有同名目录）：刷新后按名再认一次，认不到才报错
+      if (!contextIsCurrent(requestEpoch, requestSpace)) return
+      await loadKnowledgeAssets(requestSpace, requestEpoch)
+      folderId = folders.value.find((folder) => folder.name === rootName && (folder.parent_id || null) === parentId)?.folder_id ?? ''
+      if (!folderId) {
+        actionErr.value = `创建文件夹“${rootName}”失败：${errorText(e)}。文件未上传，请重试或改用「选择文件」。`
+        return
+      }
+    }
+  }
+  if (!folderId || !contextIsCurrent(requestEpoch, requestSpace)) return
+  uploadFolderId.value = folderId
+  void send(accepted)
+}
 // 从 URL 添加入库（Y12）：服务端抓取 HTML/PDF → 与文件上传同一条 ingest 链。
 // 反馈复用上传队列行；目标目录沿用「上传到」选择。权威校验（SSRF/大小/类型）全在服务端。
 async function ingestUrl() {
@@ -1743,6 +1812,11 @@ void loadSpaces(props.initialSpace)
               <span>支持 PDF/Word/Excel/PPT/txt/md/csv/json/log/html 与 png/jpg/webp/gif/bmp 等图片；单文件 ≤20MB，逐个上传逐个反馈。</span>
             </div>
             <span class="primary-btn upload-action" aria-hidden="true">{{ busy ? '处理中' : '选择文件' }}</span>
+          </div>
+          <div class="dir-upload">
+            <input ref="dirEl" type="file" webkitdirectory hidden @click.stop @change="onPickDir" />
+            <button class="secondary-btn" type="button" :disabled="busy" @click="openDirPicker">📁 上传文件夹</button>
+            <span class="dir-hint">文件夹名会建成同名 KB 文件夹（嵌套子目录不建层级）；不支持的类型与超 20MB 的文件逐个跳过并在队列中提示</span>
           </div>
 
           <form class="url-ingest" @submit.prevent="ingestUrl">
@@ -2340,6 +2414,9 @@ void loadSpaces(props.initialSpace)
 .url-ingest input:focus { outline: none; border-color: var(--primary); }
 .url-ingest .secondary-btn { flex: 0 0 auto; height: 32px; }
 .url-ingest-hint { margin: 4px 0 0; color: var(--text-muted); font-size: 11px; }
+.dir-upload { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.dir-upload .secondary-btn { flex: 0 0 auto; height: 32px; }
+.dir-hint { min-width: 0; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
 .doc-desc { margin-top: 4px; color: var(--text-muted); font-size: 11px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .upload-destination label { color: var(--text-primary); font-weight: 650; }
 .upload-destination select, .folder-create-box select { height: 32px; min-width: 0; padding: 0 28px 0 8px; border: 1px solid var(--border); border-radius: 6px; outline: 0; background: var(--bg-card); color: var(--text-primary); font: inherit; font-size: 11.5px; }

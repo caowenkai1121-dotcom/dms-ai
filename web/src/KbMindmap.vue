@@ -1,11 +1,16 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
-interface MNode { name: string; children: MNode[] }
+// docId ＝文档叶子；chunkCount ＝章节节点（内容级，由 sections 端点懒加载嫁接，不是服务端树的固有层）
+interface MNode {
+  name: string; children: MNode[]
+  docId?: string; chunkCount?: number; excerpt?: string; page?: number | null
+}
 interface LayoutNode {
   key: string; name: string; depth: number; x: number; y: number
   branch: number; hasChildren: boolean; collapsed: boolean; hiddenCount: number
   docCount: number; labelW: number
+  docId: string | null; chunkCount: number; excerpt: string; page: number | null
 }
 interface LayoutEdge { x1: number; y1: number; x2: number; y2: number; branch: number }
 
@@ -23,6 +28,12 @@ const regenerating = ref(false)
 const note = ref('')
 const collapsedKeys = ref<string[]>([])
 const exporting = ref(false)
+// 内容级展开状态（只活在本会话：不按空间记忆——章节数据是懒加载的，展开即拉取）
+const expandedDocs = ref<string[]>([])
+const docSections = ref<Record<string, MNode[]>>({})
+const loadingDoc = ref('')
+interface SectionCard { docId: string; docName: string; name: string; chunkCount: number; excerpt: string; page: number | null }
+const activeSection = ref<SectionCard | null>(null)
 let mindmapEpoch = 0
 
 // 折叠状态记忆：按空间存 localStorage（键是名称路径，跨会话稳定；导图重生成后的失效键无害，
@@ -64,7 +75,10 @@ function normalizeNode(raw: unknown): MNode | null {
   const rawChildren = Array.isArray(item.children) ? item.children
     : Array.isArray(item.nodes) ? item.nodes
       : Array.isArray(item.items) ? item.items : []
-  return { name, children: rawChildren.map(normalizeNode).filter((n): n is MNode => n != null) }
+  const node: MNode = { name, children: rawChildren.map(normalizeNode).filter((n): n is MNode => n != null) }
+  // 文档叶子带 doc_id（导图端点契约）：内容级展开靠它懒加载章节
+  if (typeof item.doc_id === 'string' && item.doc_id) node.docId = item.doc_id
+  return node
 }
 
 function normalizeTree(data: unknown): MNode | null {
@@ -83,10 +97,10 @@ function countDescendants(node: MNode): number {
   return node.children.reduce((sum, child) => sum + 1 + countDescendants(child), 0)
 }
 
-// 文档数徽标的口径：叶子 = 文档，分支的文档数 = 叶子后代数（数据导图树里本来就有，直接透出）
-function countLeaves(node: MNode): number {
-  if (!node.children.length) return 1
-  return node.children.reduce((sum, child) => sum + countLeaves(child), 0)
+// 文档数徽标的口径：只数文档叶子（章节节点是内容级，不计入文档数）
+function countDocs(node: MNode): number {
+  if (node.docId) return 1
+  return node.children.reduce((sum, child) => sum + countDocs(child), 0)
 }
 
 // 徽标宽度按位数分档（1 位/2 位/3+ 位）
@@ -94,8 +108,21 @@ function badgeWidth(count: number): number {
   return count < 10 ? 16 : count < 100 ? 22 : 30
 }
 
-const layout = computed(() => {
+// 展示树＝服务端骨架 + 已展开文档下嫁接的章节节点（原树保持纯净，重生成/换空间直接丢嫁接层）
+const displayRoot = computed<MNode | null>(() => {
   const tree = root.value
+  if (!tree) return null
+  const graft = (node: MNode): MNode => {
+    if (node.docId && expandedDocs.value.includes(node.docId)) {
+      return { ...node, children: docSections.value[node.docId] ?? [] }
+    }
+    return { ...node, children: node.children.map(graft) }
+  }
+  return graft(tree)
+})
+
+const layout = computed(() => {
+  const tree = displayRoot.value
   if (!tree) return { nodes: [] as LayoutNode[], edges: [] as LayoutEdge[], width: 0, height: 0 }
   const collapsed = new Set(collapsedKeys.value)
   // 列宽按全量展开量：折叠分支再展开时列不跳动
@@ -129,8 +156,12 @@ const layout = computed(() => {
       hasChildren: node.children.length > 0,
       collapsed: isCollapsed,
       hiddenCount: isCollapsed ? countDescendants(node) : 0,
-      docCount: node.children.length ? countLeaves(node) : 0,
+      docCount: node.docId || node.chunkCount ? 0 : countDocs(node),
       labelW: labelWidth(node.name),
+      docId: node.docId ?? null,
+      chunkCount: node.chunkCount ?? 0,
+      excerpt: node.excerpt ?? '',
+      page: node.page ?? null,
     })
     return y
   }
@@ -154,6 +185,85 @@ function toggle(key: string) {
   saveCollapsed()
 }
 
+// ==================== 内容级：文档 → 章节 ====================
+// 章节数据走 `/api/kb/doc/{id}/sections`（契约见 kb_mindmap_api.rs ③，端点未注册时
+// 优雅降级为「只到文档」并提示，不炸导图）。
+
+function normalizeSections(input: unknown): MNode[] {
+  const list = Array.isArray((input as Record<string, unknown>)?.sections)
+    ? (input as Record<string, unknown>).sections as unknown[]
+    : []
+  const out: MNode[] = []
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') continue
+    const item = raw as Record<string, unknown>
+    const name = String(item.section ?? item.name ?? '').trim()
+    if (!name) continue
+    out.push({
+      name,
+      children: [],
+      chunkCount: Number(item.chunk_count) || 0,
+      excerpt: String(item.excerpt ?? ''),
+      page: typeof item.page === 'number' ? item.page : null,
+    })
+  }
+  return out
+}
+
+async function toggleDoc(node: LayoutNode) {
+  const docId = node.docId
+  if (!docId) return
+  if (expandedDocs.value.includes(docId)) {
+    expandedDocs.value = expandedDocs.value.filter((d) => d !== docId)
+    if (activeSection.value?.docId === docId) activeSection.value = null
+    return
+  }
+  if (!docSections.value[docId]) {
+    if (loadingDoc.value) return
+    loadingDoc.value = docId
+    note.value = ''
+    try {
+      const response = await fetch(`/api/kb/doc/${encodeURIComponent(docId)}/sections`, { headers: headers() })
+      if (response.status === 401) emit('auth-expired')
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const data = await response.json().catch(() => ({}))
+      docSections.value = { ...docSections.value, [docId]: normalizeSections(data) }
+    } catch {
+      note.value = '章节展开接口尚未上线，当前导图只能展开到文档。'
+      loadingDoc.value = ''
+      return
+    }
+    loadingDoc.value = ''
+  }
+  if (!docSections.value[docId]?.length) {
+    note.value = `《${node.name}》没有可展开的章节结构。`
+    return
+  }
+  expandedDocs.value = [...expandedDocs.value, docId]
+}
+
+function openSection(node: LayoutNode, doc: LayoutNode | undefined) {
+  activeSection.value = {
+    docId: doc?.docId ?? '',
+    docName: doc?.name ?? '',
+    name: node.name,
+    chunkCount: node.chunkCount,
+    excerpt: node.excerpt,
+    page: node.page,
+  }
+}
+
+// 节点点击路由：章节→摘要卡；文档→展开/收起章节；分支/根→折叠记忆（原有行为）
+function onNodeClick(node: LayoutNode) {
+  if (node.chunkCount) {
+    const parent = layout.value.nodes.find((n) => n.key === node.key.slice(0, node.key.lastIndexOf('/')))
+    openSection(node, parent)
+    return
+  }
+  if (node.docId) { void toggleDoc(node); return }
+  if (node.hasChildren) toggle(node.key)
+}
+
 function branchColor(branch: number): string {
   return PALETTE[((branch % PALETTE.length) + PALETTE.length) % PALETTE.length]
 }
@@ -165,6 +275,11 @@ async function load() {
   note.value = ''
   collapsedKeys.value = restoreCollapsed()
   root.value = null
+  // 内容级状态随树一起失效（章节挂在 doc_id 上，换空间/重生成后旧嫁接层无意义）
+  expandedDocs.value = []
+  docSections.value = {}
+  activeSection.value = null
+  loadingDoc.value = ''
   if (!props.spaceId) {
     loading.value = false
     unavailable.value = true
@@ -316,7 +431,7 @@ void load()
     <div class="mindmap-head">
       <div>
         <h3>知识导图</h3>
-        <span>按主题层级归纳当前空间文档；点击节点圆点可折叠或展开分支（折叠状态按空间记忆）。</span>
+        <span>按主题层级归纳当前空间文档；分支圆点折叠/展开，点击文档节点展开章节，点击章节查看内容摘要（分支折叠状态按空间记忆）。</span>
       </div>
       <div class="mindmap-tools">
         <button
@@ -359,15 +474,15 @@ void load()
         />
         <g v-for="node in layout.nodes" :key="node.key" :transform="`translate(${node.x}, ${node.y})`">
           <circle
-            class="mm-dot" :class="{ collapsed: node.collapsed, leaf: !node.hasChildren }"
+            class="mm-dot" :class="{ collapsed: node.collapsed, leaf: !node.hasChildren && !node.docId, doc: !!node.docId, section: !!node.chunkCount }"
             :stroke="node.depth === 0 ? 'var(--primary)' : branchColor(node.branch)"
-            :fill="node.collapsed || !node.hasChildren ? (node.depth === 0 ? 'var(--primary)' : branchColor(node.branch)) : 'var(--bg-card)'"
-            r="4.5" role="button" :aria-label="node.collapsed ? `展开 ${node.name}` : `折叠 ${node.name}`"
-            @click="node.hasChildren && toggle(node.key)"
+            :fill="node.collapsed || (!node.hasChildren && !node.docId) ? (node.depth === 0 ? 'var(--primary)' : branchColor(node.branch)) : 'var(--bg-card)'"
+            r="4.5" role="button" :aria-label="node.chunkCount ? `查看章节 ${node.name} 摘要` : node.docId ? `展开文档 ${node.name} 的章节` : node.collapsed ? `展开 ${node.name}` : `折叠 ${node.name}`"
+            @click="onNodeClick(node)"
           />
           <text
-            class="mm-label" :class="{ root: node.depth === 0, clickable: node.hasChildren }"
-            x="11" y="4" @click="node.hasChildren && toggle(node.key)"
+            class="mm-label" :class="{ root: node.depth === 0, clickable: node.hasChildren || !!node.docId || !!node.chunkCount }"
+            x="11" y="4" @click="onNodeClick(node)"
           >{{ node.name }}</text>
           <g v-if="node.docCount" class="mm-badge" :transform="`translate(${16 + node.labelW}, 0)`">
             <rect
@@ -376,12 +491,29 @@ void load()
             />
             <text :x="badgeWidth(node.docCount) / 2" y="2.5">{{ node.docCount }}</text>
           </g>
+          <g v-if="node.chunkCount" class="mm-badge chunks" :transform="`translate(${16 + node.labelW}, 0)`">
+            <rect
+              :width="badgeWidth(node.chunkCount)" height="14" y="-8" rx="7"
+              :stroke="branchColor(node.branch)"
+            />
+            <text :x="badgeWidth(node.chunkCount) / 2" y="2.5">{{ node.chunkCount }}</text>
+          </g>
           <text
             v-if="node.hiddenCount" class="mm-count"
             :x="18 + node.labelW + (node.docCount ? badgeWidth(node.docCount) + 5 : 0)" y="4"
           >+{{ node.hiddenCount }}</text>
         </g>
       </svg>
+      <aside v-if="activeSection" class="mm-card" role="dialog" aria-label="章节摘要">
+        <header>
+          <strong :title="activeSection.name">{{ activeSection.name }}</strong>
+          <button type="button" class="mm-card-close" aria-label="关闭摘要" @click="activeSection = null">×</button>
+        </header>
+        <div class="mm-card-meta">
+          {{ activeSection.docName }} · {{ activeSection.chunkCount }} 块<template v-if="activeSection.page"> · 第 {{ activeSection.page }} 页起</template>
+        </div>
+        <p>{{ activeSection.excerpt || '（本节无摘录内容）' }}</p>
+      </aside>
     </div>
   </div>
 </template>
@@ -416,6 +548,29 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .mm-edge { fill: none; stroke-width: 1.4; opacity: .75; }
 .mm-dot { cursor: pointer; stroke-width: 1.6; }
 .mm-dot.leaf { cursor: default; }
+.mm-dot.doc { stroke-dasharray: 2.5 2; }
+.mm-dot.section { r: 3.5; }
+.mm-badge.chunks rect { stroke-dasharray: 3 2; }
+.mm-card {
+  position: absolute; top: 12px; right: 12px; z-index: 2; width: 290px; max-height: calc(100% - 24px);
+  display: flex; flex-direction: column; padding: 12px 14px; overflow: auto;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); box-shadow: var(--shadow-lg);
+}
+.mm-card header { display: flex; align-items: flex-start; gap: 8px; }
+.mm-card header strong {
+  min-width: 0; flex: 1; overflow: hidden; color: var(--text-primary); font-size: 13px;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.mm-card-close {
+  flex: none; width: 22px; height: 22px; padding: 0; border: 1px solid var(--border); border-radius: 5px;
+  background: var(--bg-card); color: var(--text-regular); cursor: pointer; font: inherit; font-size: 14px; line-height: 1;
+}
+.mm-card-close:hover { border-color: var(--primary); color: var(--primary); }
+.mm-card-meta { margin-top: 5px; color: var(--text-faint); font-size: 11px; }
+.mm-card p {
+  margin: 8px 0 0; color: var(--text-regular); font-size: 12px; line-height: 1.7;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
 .mm-label { fill: var(--text-regular); font-size: 12px; }
 .mm-label.root { fill: var(--text-primary); font-size: 13px; font-weight: 700; }
 .mm-label.clickable { cursor: pointer; }

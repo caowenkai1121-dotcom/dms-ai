@@ -34,7 +34,7 @@ use crate::answerers::cache::CacheAnswerer;
 use crate::answerers::graph::{GraphAnswerer, Relation};
 use crate::answerers::hits::{DirectHit, HitAnswerer};
 use crate::answerers::Answerer;
-use crate::ctx::{attach_trust, AskCtx, AskResult, Step};
+use crate::ctx::{attach_trust, AskCtx, AskResult, ClarifyOption, Step};
 use crate::run::{Correctors, LlmAnswerer};
 use crate::{compound, source};
 
@@ -179,7 +179,11 @@ pub async fn ask(
             conv_id: conv_id.clone(),
             on_usage: d.on_usage,
         };
-        ask_single(d, &cx).await
+        // 结果出口统一过一道呈现中文化（列名中文 + 码值翻名）：所有路由共用这一个收口，
+        // 内部全降级（词表加载不到/译不动就原样），绝不让增强把一次成功取数变成失败。
+        let mut r = ask_single(d, &cx).await?;
+        crate::localize::localize_result(&cx, &mut r).await;
+        Ok(r)
     };
     if let Some(r) = compound::try_compound(&**d.llm, &rewritten, t0, &one).await {
         return Ok(r);
@@ -219,7 +223,8 @@ pub(crate) async fn need_intent_reply(
     ];
     let lower = question.to_ascii_lowercase();
     if DESTRUCTIVE.iter().any(|w| lower.contains(w)) {
-        return Ok(Some(intent_reply(question, t0)));
+        // 破坏性请求不给候选问法（不引导、也不为它多烧一次 fast 调用）
+        return Ok(Some(intent_reply(question, t0, vec![])));
     }
 
     // ② 精简模式统一入口：**所有**确定性路由未命中、走到 LLM 兜底的问句，先过一次
@@ -234,7 +239,10 @@ pub(crate) async fn need_intent_reply(
         }
         Some(false) => {
             tracing::info!(question, "精简模式 Fast 理解判为含糊 → 反问（不产 SQL）");
-            return Ok(Some(intent_reply(question, t0)));
+            // need-intent 增强：fast 在线才生成结构化候选；任何失败都降级为空数组
+            // （= 纯文本反问，wire 上 `clarify_options` 整键不上线，老客户端零影响）。
+            let options = clarify_options_for(llm, on_usage, question).await;
+            return Ok(Some(intent_reply(question, t0, options)));
         }
         None => {}
     }
@@ -285,10 +293,82 @@ pub(crate) async fn need_intent_reply(
         return Ok(None);
     }
     tracing::info!(question, "意图不足 → 反问（不产 SQL）");
-    Ok(Some(intent_reply(question, t0)))
+    // ③ 到达这里说明 fast 已经失败过一次 —— 不为候选问法再付一次超时，直接纯文本反问
+    Ok(Some(intent_reply(question, t0, vec![])))
 }
 
-fn intent_reply(question: &str, t0: Instant) -> AskResult {
+/// 反问的结构化候选：fast 生成 2~4 个最可能的意图问法，失败一律空数组（纯文本反问兜底）。
+///
+/// 输出协议是「每行 `标签|问句`」—— 比 JSON 数组耐截断（max_tokens 砍半也不会整份解析失败），
+/// 解析器 [`parse_clarify_options`] 对序号/全角竖线/垃圾行全容忍：凑不齐 2 条就当没生成。
+async fn clarify_options_for(
+    llm: &dyn ChatModel,
+    on_usage: &(dyn Fn(&Usage) + Send + Sync),
+    question: &str,
+) -> Vec<ClarifyOption> {
+    const TIMEOUT: Duration = Duration::from_secs(4);
+    let system = "你是 DMS 数据问答的意图澄清助手。用户的问题缺少明确查询目标。\
+                  给出 2 到 4 个用户最可能想问的完整问句，每行一个，格式：短标签|完整问句。\
+                  短标签不超过 6 个汉字（如：销售表现、订单明细、基础资料）。\
+                  问句必须具体、可直接执行（带指标或明细目标），不许复述原问题，不要解释、不要编号外的文字。";
+    let user = format!("用户问题：{question}\n候选问法：");
+    let mut req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
+    req.max_tokens = Some(200);
+    let reply = match tokio::time::timeout(TIMEOUT, llm.chat(req)).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => {
+            tracing::warn!(err = %e, "反问候选 fast 调用失败 → 纯文本反问");
+            return vec![];
+        }
+        Err(_) => {
+            tracing::warn!("反问候选 fast 调用超时 → 纯文本反问");
+            return vec![];
+        }
+    };
+    on_usage(&reply.usage);
+    reply
+        .content
+        .map(|c| parse_clarify_options(&c, question))
+        .unwrap_or_default()
+}
+
+/// 解析「标签|问句」行（**纯函数**）：剥序号/项目符号、认半角全角竖线、过滤不合法行，
+/// 去重、去掉与原问句相同的项，最多 4 条；**少于 2 条 = 空**（单条不构成「选项」）。
+fn parse_clarify_options(reply: &str, question: &str) -> Vec<ClarifyOption> {
+    let mut out: Vec<ClarifyOption> = vec![];
+    for line in reply.lines() {
+        let line = line.trim();
+        // 剥行首序号/符号：「1. 」「1、」「- 」「•」等
+        let line = line
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start_matches(|c: char| matches!(c, '.' | '、' | ')' | '）' | '-' | '•' | ' '))
+            .trim();
+        let Some((label, q)) = line.split_once('|').or_else(|| line.split_once('｜')) else {
+            continue;
+        };
+        let (label, q) = (label.trim(), q.trim().trim_matches('"').trim_matches('"').trim());
+        // 标签 ≤12 字（预期 ≤6，留一倍余量）；问句 4~60 字（过长的是模型开始写解释了）
+        if label.is_empty() || label.chars().count() > 12 {
+            continue;
+        }
+        if q.chars().count() < 4 || q.chars().count() > 60 || q == question {
+            continue;
+        }
+        if out.iter().any(|o| o.question == q) {
+            continue;
+        }
+        out.push(ClarifyOption { label: label.to_string(), question: q.to_string() });
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    if out.len() < 2 {
+        return vec![];
+    }
+    out
+}
+
+fn intent_reply(question: &str, t0: Instant, clarify_options: Vec<ClarifyOption>) -> AskResult {
     let mut view = dms_semantic::present::build(&[], &[]);
     view.interact.drill = vec![
         format!("{question} 的销售表现"),
@@ -316,6 +396,8 @@ fn intent_reply(question: &str, t0: Instant) -> AskResult {
         trust: None,
         // 反问没走 Router，steps 恒空（不出现在 JSON 里）
         steps: vec![],
+        clarify_options,
+        value_labels: vec![],
     }
 }
 
@@ -512,6 +594,8 @@ fn production_lookup_only_reply(cx: &AskCtx<'_>, ms: u128) -> AskResult {
         scope_note: None,
         trust: None,
         steps: vec![Step { stage: "business-lookup", kind: "miss", ms }],
+        clarify_options: vec![],
+        value_labels: vec![],
     }
 }
 
@@ -975,7 +1059,7 @@ mod tests {
         for r in ["llm", "llm+repair", "direct-agg", "direct-doc", "semantic-cache", "graph", "compound"] {
             assert_ne!(NEED_INTENT, r, "反问的 route 与 {r} 撞了 —— 两种失败就分不开了");
         }
-        let reply = intent_reply("南京某客户有限公司", Instant::now());
+        let reply = intent_reply("南京某客户有限公司", Instant::now(), vec![]);
         assert_eq!(
             reply.view.interact.drill,
             vec![
@@ -994,6 +1078,101 @@ mod tests {
         assert_eq!(parse_actionable("clarify"), Some(false));
         assert_eq!(parse_actionable("answer because"), None);
         assert_eq!(parse_actionable("可以查询"), None);
+    }
+
+    /// 反问候选的解析判据：剥序号、认全/半角竖线、滤垃圾行、去重、去掉与原问句相同的项；
+    /// **少于 2 条 = 空**（单条不构成选项），多于 4 条截断。
+    #[test]
+    fn clarify_options_parser_tolerates_noise() {
+        let reply = "1. 销售表现|嗨肉本月销售额\n2、订单明细｜嗨肉本月的订单明细\n- 基础资料|嗨肉的基础资料";
+        let got = parse_clarify_options(reply, "嗨肉");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], ClarifyOption { label: "销售表现".into(), question: "嗨肉本月销售额".into() });
+        assert_eq!(got[1].question, "嗨肉本月的订单明细");
+        // 垃圾行/不合法行被丢掉；与原问句相同的项被去掉；重复问句只留一条
+        let noisy = "好的，我来回答\n销售表现|嗨肉\n销售表现|嗨肉本月销售额\n销售表现|嗨肉本月销售额";
+        let got = parse_clarify_options(noisy, "嗨肉");
+        assert!(got.is_empty(), "只剩一条合法问句 → 降级为空：{got:?}");
+        // 超 4 条截断；标签超长/问句超短的行不算
+        let many = "a|本月销售额是多少\nb|本月订单量是多少\nc|本月客户数是多少\nd|本月商品数是多少\ne|本月门店数是多少\n超长标签超过十二个字啊啊啊啊|本月毛利是多少\nx|太短";
+        let got = parse_clarify_options(many, "嗨肉");
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert!(!got.iter().any(|o| o.label.starts_with("超长标签")), "{got:?}");
+        // 模型回空/答非所问 → 空
+        assert!(parse_clarify_options("", "嗨肉").is_empty());
+        assert!(parse_clarify_options("我不知道怎么回答", "嗨肉").is_empty());
+    }
+
+    /// 顺序假模型：按队列逐次出回复（第一次 = 意图判定，第二次 = 候选生成），`None` = 该次调用失败。
+    struct Seq {
+        replies: std::sync::Mutex<std::collections::VecDeque<Option<&'static str>>>,
+    }
+
+    impl Seq {
+        fn of(replies: &[Option<&'static str>]) -> Self {
+            Seq { replies: std::sync::Mutex::new(replies.iter().cloned().collect()) }
+        }
+    }
+
+    impl ChatModel for Seq {
+        fn chat<'a>(&'a self, _req: ChatRequest) -> BoxFut<'a, Result<ChatReply, LlmError>> {
+            let r = self.replies.lock().unwrap().pop_front().flatten();
+            Box::pin(async move {
+                match r {
+                    Some(content) => Ok(ChatReply { content: Some(content.to_string()), usage: Default::default() }),
+                    None => Err(LlmError::Transport("模型挂了".into())),
+                }
+            })
+        }
+    }
+
+    fn lazy_pg() -> PgPool {
+        // lazy 池不发连接：Some(false) 这条路不碰 DB（PG 挂了也不许影响反问）
+        PgPool::connect_lazy("postgres://127.0.0.1:1/dms").unwrap()
+    }
+
+    /// 🔴 fast 判含糊 → 反问带结构化候选；候选生成挂了/回垃圾 → 空数组（= 纯文本反问，行为兼容）。
+    #[tokio::test]
+    async fn clarify_options_attach_when_fast_judges_clarify_and_degrade_on_failure() {
+        let pg = lazy_pg();
+        // ① 判含糊 + 候选正常 → clarify_options 上线
+        let ok = Seq::of(&[Some("clarify"), Some("销售表现|嗨肉本月销售额\n订单明细|嗨肉本月的订单明细")]);
+        let r = need_intent_reply(&ok, &|_| {}, &pg, "dms", "嗨肉", Instant::now())
+            .await
+            .unwrap()
+            .expect("判含糊必须反问");
+        assert_eq!(r.route, NEED_INTENT);
+        assert_eq!(r.clarify_options.len(), 2, "{:?}", r.clarify_options);
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["clarify_options"][0]["label"], "销售表现");
+        // ② 判含糊 + 候选生成失败 → 空数组降级，整键不上线（与引入前逐字等价）
+        let down = Seq::of(&[Some("clarify"), None]);
+        let r = need_intent_reply(&down, &|_| {}, &pg, "dms", "嗨肉", Instant::now())
+            .await
+            .unwrap()
+            .expect("判含糊必须反问");
+        assert!(r.clarify_options.is_empty());
+        assert!(serde_json::to_value(&r).unwrap().get("clarify_options").is_none());
+        // ③ 判含糊 + 候选回垃圾 → 同样空数组
+        let garbage = Seq::of(&[Some("clarify"), Some("我无法理解这个问题")]);
+        let r = need_intent_reply(&garbage, &|_| {}, &pg, "dms", "嗨肉", Instant::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.clarify_options.is_empty(), "{:?}", r.clarify_options);
+    }
+
+    /// 🔴 破坏性词的反问**一次 LLM 都不许调**（不为红线问句生成候选问法）。
+    #[tokio::test]
+    async fn destructive_intent_reply_never_calls_the_model() {
+        let pg = lazy_pg();
+        let m = Seq::of(&[]);
+        let r = need_intent_reply(&m, &|_| {}, &pg, "dms", "删除所有订单", Instant::now())
+            .await
+            .unwrap()
+            .expect("破坏性词必须反问");
+        assert!(r.clarify_options.is_empty());
+        assert!(m.replies.lock().unwrap().is_empty(), "红线问句不该消费任何回复");
     }
 
     /// 🔴 Fast 判定是精简模式的**统一入口**：所有确定性路由未命中、走到 LLM 兜底的
@@ -1024,6 +1203,27 @@ mod tests {
             body.contains("Some(true)") && body.contains("Some(false)") && body.contains("None => {}"),
             "Fast 三态分支不完整：{body}"
         );
+    }
+
+    /// 🔴 呈现中文化的**接线**判据：`ask()` 的 `one` 闭包必须在 `ask_single` 之后过
+    /// `localize_result` —— 那是七条路由（含复合子问、生产点查）共用的唯一出口。
+    /// 改名/翻译的逻辑判据全在纯函数侧（`localize.rs` / `present_cn.rs` 的单测），
+    /// 这条只钉「出口没被绕开」—— 绕开的症状是英文列名与状态码原样到前端，而单测全绿。
+    #[test]
+    fn present_localization_is_wired_at_the_single_exit() {
+        let src = include_str!("ask.rs");
+        let body = src
+            .split("let one = |q: String|")
+            .nth(1)
+            .expect("one 闭包没了")
+            .split("if let Some(r) = compound::try_compound")
+            .next()
+            .expect("one 闭包边界没了");
+        let single = body.find("ask_single(d, &cx)").expect("缺 ask_single 调用");
+        let loc = body
+            .find("localize_result(&cx")
+            .expect("缺呈现中文化收口 —— 英文列名/状态码会原样透出到前端");
+        assert!(single < loc, "localize 必须在 ask_single 之后（译的是它产出的结果）");
     }
 
     #[test]

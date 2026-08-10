@@ -695,6 +695,8 @@ fn result(
             .then(|| "已按当前 DMS 账号权限执行生产轻查询".into()),
         trust: None,
         steps: vec![],
+        clarify_options: vec![],
+        value_labels: vec![],
     }
 }
 

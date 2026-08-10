@@ -21,6 +21,7 @@ pub mod document;
 pub mod ingest;
 pub mod ops_caliber;
 pub mod present;
+pub mod present_cn;
 pub mod recall;
 pub mod registry;
 pub mod sales_fact;

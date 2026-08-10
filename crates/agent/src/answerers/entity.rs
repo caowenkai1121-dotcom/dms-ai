@@ -853,6 +853,8 @@ fn candidate_card(cx: &AskCtx<'_>, query: &str, candidates: Vec<Candidate>) -> A
         scope_note: None,
         trust: None,
         steps: vec![],
+        clarify_options: vec![],
+        value_labels: vec![],
     }
 }
 
@@ -1463,6 +1465,8 @@ fn build_card(
         scope_note: None,
         trust: None,
         steps: vec![],
+        clarify_options: vec![],
+        value_labels: vec![],
     }
 }
 

@@ -99,6 +99,11 @@ const intentOptions = computed(() => drillOptions.value.filter((q) =>
   !/^(?:输入想法|自由输入|其他|其它)(?:[（(].*[）)])?$|^other$/i.test(q.trim()),
 ))
 
+/** 单 KPI 结果（无图/无表/无补充）：宽松的大数字卡，不与表格结果挤同一套密度。 */
+const soloKpi = computed(() => kpis.value.length === 1
+  && !trendCharts.value.length && !compositionCharts.value.length
+  && !entityBlocks.value.length && !tableBlocks.value.length && !hasSupplemental.value)
+
 const hasWideTable = computed(() => props.result.columns.length > 3)
 const supplementalHasWideTable = computed(() => (supplemental.value?.columns.length ?? 0) > 3)
 
@@ -439,7 +444,7 @@ function supplementalIsMetric(ci: number): boolean {
           <h3>核心指标</h3>
         </div>
       </div>
-      <div class="kpi-row">
+      <div class="kpi-row" :class="{ solo: soloKpi }">
         <div v-for="(k, ki) in kpis" :key="ki" class="metric-card">
           <div class="mc-label">{{ k.label }}</div>
           <div class="mc-val num">{{ displayValue(k.label, k.value, k.semantic, true) }}</div>
@@ -695,6 +700,13 @@ function supplementalIsMetric(ci: number): boolean {
 .mc-delta .mc-vs { margin-left: 2px; color: var(--text-muted); font-weight: 500; }
 .mc-delta-detail { margin-top: 4px; color: var(--text-faint); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 
+/* 单 KPI 大数字卡：精简模式一句话问答的主形态，宽松密度是刻意而非空洞 */
+.kpi-row.solo { grid-template-columns: minmax(0, 1fr); }
+.kpi-row.solo .metric-card { min-height: 148px; padding: 24px 28px; }
+.kpi-row.solo .mc-label { font-size: 13px; }
+.kpi-row.solo .mc-val { margin-top: 12px; font-size: 40px; }
+.kpi-row.solo .mc-delta { margin-top: 10px; font-size: 13px; }
+
 .chart-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .chart-grid.paired { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .chart-card {
@@ -725,8 +737,8 @@ function supplementalIsMetric(ci: number): boolean {
   border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); box-shadow: none;
   overflow: auto; overscroll-behavior-inline: contain; scrollbar-gutter: stable;
 }
-.tbl-wrap table { width: 100%; border-collapse: collapse; border-radius: 0; font-size: 12.5px; }
-.tbl-wrap th, .tbl-wrap td { max-width: 320px; padding: 8px 11px; line-height: 1.45; overflow: hidden; text-overflow: ellipsis; }
+.tbl-wrap table { width: 100%; border-collapse: collapse; border-radius: 0; font-size: 13px; }
+.tbl-wrap th, .tbl-wrap td { max-width: 320px; padding: 10px 12px; line-height: 1.55; overflow: hidden; text-overflow: ellipsis; }
 .tbl-wrap th { position: sticky; top: 0; z-index: 1; background: var(--bg-main); color: var(--text-regular); font-size: 11.5px; letter-spacing: 0; text-align: left; }
 .tbl-wrap tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--bg-main) 56%, var(--bg-card)); }
 .tbl-wrap tbody tr:hover td { background: var(--primary-light); }

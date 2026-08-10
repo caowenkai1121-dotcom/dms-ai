@@ -160,6 +160,8 @@ pub async fn try_graph(pg: &PgPool, rel: &Relation, t0: Instant) -> Option<AskRe
         trust: None,
         // 由 `ask_single` 的分派循环在命中后补上
         steps: vec![],
+        clarify_options: vec![],
+        value_labels: vec![],
     })
 }
 

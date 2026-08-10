@@ -368,6 +368,8 @@ mod tests {
             scope_note: None,
             trust: None,
             steps: vec![],
+            clarify_options: vec![],
+            value_labels: vec![],
         }
     }
 

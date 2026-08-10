@@ -20,14 +20,20 @@ const fileText = ref('')
 const csvRows = ref<string[][]>([])
 const csvTruncated = ref(false)
 const fileFailed = ref(false)
+const fileErr = ref('')
+const pdfFrag = ref('')
 const markdownLoading = ref(false)
 const markdownFailed = ref(false)
 const markdownRan = ref(false)
 const markdownHtml = ref('')
+const markdownToc = ref<TocEntry[]>([])
+const markdownErr = ref('')
 const chunksLoading = ref(false)
 const chunksFailed = ref(false)
 const chunksRan = ref(false)
 const chunks = ref<ChunkRow[]>([])
+const chunksErr = ref('')
+const chunkPage = ref(0)
 const downloading = ref(false)
 let previewEpoch = 0
 
@@ -38,6 +44,16 @@ function headers(): Record<string, string> {
     throw new Error('登录会话已失效，请重新登录。')
   }
   return { Authorization: `Bearer ${token}` }
+}
+
+// 错误文案以服务端 `{"error": msg}` 为准（404「原始文件已不存在」与「暂无解析文本」是两种病，
+// 笼统的「接口暂不可用」会把用户引到错的等待上）
+async function errorText(response: Response): Promise<string> {
+  try {
+    const data = await response.json() as Record<string, unknown>
+    if (typeof data?.error === 'string' && data.error.trim()) return data.error
+  } catch { /* 非 JSON 错误体 */ }
+  return `HTTP ${response.status}`
 }
 
 function extOf(name: string): string {
@@ -133,14 +149,23 @@ function revokeFileUrl() {
 async function fetchBlob(): Promise<Blob> {
   const response = await fetch(`/api/kb/doc/${encodeURIComponent(props.docId)}/download`, { headers: headers() })
   if (response.status === 401) emit('auth-expired')
-  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  if (!response.ok) throw new Error(await errorText(response))
   return response.blob()
+}
+
+// 原件不可用（格式不可内嵌 / 原件已缺失）时，解析文本就是用户要的「预览」：
+// 自动切到 Markdown 页签；解析文本也没有时才停在原件页签展示真实错误。
+async function autoMarkdown() {
+  if (!markdownRan.value && !markdownLoading.value) await loadMarkdown()
+  if (markdownHtml.value) activeTab.value = 'markdown'
 }
 
 async function loadFile() {
   const epoch = previewEpoch
   fileLoading.value = true
   fileFailed.value = false
+  fileErr.value = ''
+  pdfFrag.value = ''
   revokeFileUrl()
   fileText.value = ''
   csvRows.value = []
@@ -150,6 +175,7 @@ async function loadFile() {
   // 不可内嵌的格式（Office 等）不浪费一次下载：直接落「下载 + Markdown 页签」提示
   if (kind === 'none') {
     fileLoading.value = false
+    void autoMarkdown()
     return
   }
   try {
@@ -168,15 +194,21 @@ async function loadFile() {
         fileText.value = kind === 'json' ? prettyJson(text) : text
       }
     }
-  } catch {
-    if (epoch === previewEpoch) fileFailed.value = true
+  } catch (e) {
+    if (epoch === previewEpoch) {
+      fileFailed.value = true
+      fileErr.value = e instanceof Error ? e.message : ''
+      void autoMarkdown()
+    }
   } finally {
     if (epoch === previewEpoch) fileLoading.value = false
   }
 }
 
 // md 原件直接复用 Markdown 页签的渲染器（同一份实现，不引入第二份）
-const fileMarkdownHtml = computed(() => (fileKind.value === 'markdown' ? renderMarkdown(fileText.value) : ''))
+const fileMarkdownHtml = computed(() => (fileKind.value === 'markdown' ? renderMarkdown(fileText.value).html : ''))
+
+interface TocEntry { id: string; level: number; text: string }
 
 function esc(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -186,8 +218,11 @@ function inlineMd(value: string): string {
     .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
     .replace(/`([^`]+)`/g, '<code>$1</code>')
 }
-function renderMarkdown(md: string): string {
+// 渲染 + 顺手收目录（对齐 Yuxi 预览形态：目录跳转）。标题锚点 id 每次渲染重编，
+// 弹窗单实例，不会与页面上其他元素撞 id。
+function renderMarkdown(md: string): { html: string; toc: TocEntry[] } {
   const out: string[] = []
+  const toc: TocEntry[] = []
   let listTag: 'ul' | 'ol' | null = null
   let inCode = false
   const code: string[] = []
@@ -204,7 +239,9 @@ function renderMarkdown(md: string): string {
     if (heading) {
       closeList()
       const level = Math.min(6, heading[1].length + 1)
-      out.push(`<h${level}>${inlineMd(heading[2])}</h${level}>`)
+      const id = `kdp-mdh-${toc.length}`
+      toc.push({ id, level, text: heading[2].replace(/[*`]/g, '').trim() })
+      out.push(`<h${level} id="${id}">${inlineMd(heading[2])}</h${level}>`)
       continue
     }
     const item = /^\s*([-*+]|\d+[.)])\s+(.*)$/.exec(line)
@@ -219,17 +256,22 @@ function renderMarkdown(md: string): string {
   }
   closeList()
   if (inCode) out.push(`<pre class="md-code">${code.join('\n')}</pre>`)
-  return out.join('')
+  return { html: out.join(''), toc }
+}
+
+function jumpToHeading(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 async function loadMarkdown() {
   const epoch = previewEpoch
   markdownLoading.value = true
   markdownFailed.value = false
+  markdownErr.value = ''
   try {
     const response = await fetch(`/api/kb/doc/${encodeURIComponent(props.docId)}/markdown`, { headers: headers() })
     if (response.status === 401) emit('auth-expired')
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    if (!response.ok) throw new Error(await errorText(response))
     const raw = await response.text()
     if (epoch !== previewEpoch) return
     let text = raw
@@ -237,10 +279,16 @@ async function loadMarkdown() {
       const data = JSON.parse(raw) as Record<string, unknown>
       text = String(data.markdown ?? data.text ?? data.content ?? '')
     } catch { /* 服务端直接回 text/plain 时按原文渲染 */ }
-    markdownHtml.value = renderMarkdown(text)
+    const rendered = renderMarkdown(text)
+    markdownHtml.value = rendered.html
+    markdownToc.value = rendered.toc
     markdownRan.value = true
-  } catch {
-    if (epoch === previewEpoch) { markdownFailed.value = true; markdownRan.value = true }
+  } catch (e) {
+    if (epoch === previewEpoch) {
+      markdownFailed.value = true
+      markdownRan.value = true
+      markdownErr.value = e instanceof Error ? e.message : ''
+    }
   } finally {
     if (epoch === previewEpoch) markdownLoading.value = false
   }
@@ -268,20 +316,42 @@ function normalizeChunks(input: unknown): ChunkRow[] {
   return rows
 }
 
+// 切片分页（对齐 Yuxi 预览形态：分页）：大文档几百块一次渲染既卡又难读，按页翻
+const CHUNK_PAGE_SIZE = 20
+const chunkPageCount = computed(() => Math.max(1, Math.ceil(chunks.value.length / CHUNK_PAGE_SIZE)))
+const pagedChunks = computed(() =>
+  chunks.value.slice(chunkPage.value * CHUNK_PAGE_SIZE, (chunkPage.value + 1) * CHUNK_PAGE_SIZE))
+function flipChunkPage(delta: number) {
+  chunkPage.value = Math.min(chunkPageCount.value - 1, Math.max(0, chunkPage.value + delta))
+}
+
+// 原文对照（对齐 Yuxi 预览形态）：PDF 原件按页锚点跳（:key 强制 iframe 重挂，查看器才会认新页码）
+function jumpToPdfPage(page?: number | null) {
+  if (!page || fileKind.value !== 'pdf' || !fileUrl.value) return
+  pdfFrag.value = `#page=${page}`
+  activeTab.value = 'file'
+}
+
 async function loadChunks() {
   const epoch = previewEpoch
   chunksLoading.value = true
   chunksFailed.value = false
+  chunksErr.value = ''
   try {
     const response = await fetch(`/api/kb/doc/${encodeURIComponent(props.docId)}/chunks`, { headers: headers() })
     if (response.status === 401) emit('auth-expired')
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    if (!response.ok) throw new Error(await errorText(response))
     const data = await response.json().catch(() => ({}))
     if (epoch !== previewEpoch) return
     chunks.value = normalizeChunks(data)
+    chunkPage.value = 0
     chunksRan.value = true
-  } catch {
-    if (epoch === previewEpoch) { chunksFailed.value = true; chunksRan.value = true }
+  } catch (e) {
+    if (epoch === previewEpoch) {
+      chunksFailed.value = true
+      chunksRan.value = true
+      chunksErr.value = e instanceof Error ? e.message : ''
+    }
   } finally {
     if (epoch === previewEpoch) chunksLoading.value = false
   }
@@ -351,12 +421,12 @@ void loadFile()
           </div>
           <div v-else-if="fileFailed" class="kdp-state">
             <strong>原件预览暂不可用</strong>
-            <span>服务端暂未提供该文档的原件内容；可切换到 Markdown 或 Chunks 页签查看解析结果。</span>
+            <span>{{ fileErr || '服务端暂未提供该文档的原件内容' }}；可切换到 Markdown 或 Chunks 页签查看解析结果。</span>
           </div>
           <div v-else-if="fileKind === 'image' && fileUrl" class="kdp-image-wrap">
             <img :src="fileUrl" :alt="docName">
           </div>
-          <iframe v-else-if="fileKind === 'pdf' && fileUrl" :src="fileUrl" title="文档原件预览"></iframe>
+          <iframe v-else-if="fileKind === 'pdf' && fileUrl" :key="pdfFrag" :src="fileUrl + pdfFrag" title="文档原件预览"></iframe>
           <div v-else-if="fileKind === 'csv' && csvRows.length" class="kdp-table-wrap">
             <table class="kdp-table">
               <thead><tr><th v-for="(h, i) in csvRows[0]" :key="i">{{ h || '（空表头）' }}</th></tr></thead>
@@ -381,10 +451,20 @@ void loadFile()
           <div v-if="markdownLoading" class="kdp-state" role="status">
             <strong>正在加载 Markdown</strong><span>解析文本较大时需要几秒钟。</span>
           </div>
-          <article v-else-if="markdownHtml" class="kdp-markdown" v-html="markdownHtml"></article>
+          <div v-else-if="markdownHtml" class="kdp-md-wrap">
+            <nav v-if="markdownToc.length >= 2" class="kdp-toc" aria-label="文档目录">
+              <div class="kdp-toc-title">目录</div>
+              <button
+                v-for="entry in markdownToc" :key="entry.id" type="button"
+                class="kdp-toc-item" :class="`lv${entry.level}`" :title="entry.text"
+                @click="jumpToHeading(entry.id)"
+              >{{ entry.text }}</button>
+            </nav>
+            <article class="kdp-markdown" v-html="markdownHtml"></article>
+          </div>
           <div v-else class="kdp-state">
             <strong>{{ markdownFailed ? 'Markdown 暂不可用' : '没有可显示的 Markdown' }}</strong>
-            <span>{{ markdownFailed ? '服务端尚未提供该文档的 Markdown 接口。' : '该文档没有解析出文本内容。' }}</span>
+            <span>{{ markdownFailed ? (markdownErr || '解析文本读取失败，请稍后重试。') : '该文档没有解析出文本内容。' }}</span>
           </div>
         </section>
 
@@ -393,19 +473,29 @@ void loadFile()
             <strong>正在加载切片</strong><span>按文档顺序读取全部文本块。</span>
           </div>
           <template v-else-if="chunks.length">
-            <div class="kdp-chunks-summary">共 {{ chunks.length }} 个切片</div>
-            <article v-for="chunk in chunks" :key="chunk.ord" class="kdp-chunk">
+            <div class="kdp-chunks-summary">
+              <span>共 {{ chunks.length }} 个切片 · 第 {{ chunkPage + 1 }} / {{ chunkPageCount }} 页</span>
+              <span v-if="chunkPageCount > 1" class="kdp-pager">
+                <button type="button" :disabled="chunkPage === 0" @click="flipChunkPage(-1)">上一页</button>
+                <button type="button" :disabled="chunkPage >= chunkPageCount - 1" @click="flipChunkPage(1)">下一页</button>
+              </span>
+            </div>
+            <article v-for="chunk in pagedChunks" :key="chunk.ord" class="kdp-chunk">
               <header>
                 <span class="kdp-chunk-ord">#{{ chunk.ord }}</span>
                 <span v-if="chunk.page" class="kdp-chunk-page">第 {{ chunk.page }} 页</span>
                 <span v-if="chunk.heading" class="kdp-chunk-heading" :title="chunk.heading">{{ chunk.heading }}</span>
+                <button
+                  v-if="chunk.page && fileKind === 'pdf' && fileUrl" type="button" class="kdp-jump"
+                  :title="`在原件中打开第 ${chunk.page} 页`" @click="jumpToPdfPage(chunk.page)"
+                >对照原件</button>
               </header>
               <p>{{ chunk.text || '（空切片）' }}</p>
             </article>
           </template>
           <div v-else class="kdp-state">
             <strong>{{ chunksFailed ? '切片列表暂不可用' : '没有切片' }}</strong>
-            <span>{{ chunksFailed ? '服务端尚未提供该文档的切片接口。' : '该文档尚未完成切片。' }}</span>
+            <span>{{ chunksFailed ? (chunksErr || '切片读取失败，请稍后重试。') : '该文档尚未完成切片。' }}</span>
           </div>
         </section>
       </div>
@@ -489,6 +579,32 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .kdp-state span { max-width: 460px; line-height: 1.6; }
 .kdp-state .primary-btn { margin-top: 6px; }
 .kdp-markdown { padding: 18px 22px 28px; color: var(--text-regular); font-size: 13px; line-height: 1.75; overflow-wrap: anywhere; }
+.kdp-md-wrap { flex: 1; min-height: 0; display: flex; overflow: auto; }
+.kdp-md-wrap .kdp-markdown { flex: 1; min-width: 0; }
+.kdp-toc {
+  flex: 0 0 190px; position: sticky; top: 0; align-self: flex-start; max-height: 100%; overflow: auto;
+  padding: 14px 10px 14px 14px; border-right: 1px solid var(--divider);
+}
+.kdp-toc-title { margin-bottom: 6px; color: var(--text-faint); font-size: 11px; }
+.kdp-toc-item {
+  display: block; width: 100%; padding: 3px 6px; overflow: hidden; border: 0; border-radius: 4px;
+  background: transparent; color: var(--text-muted); cursor: pointer; font: inherit; font-size: 11.5px;
+  text-align: left; text-overflow: ellipsis; white-space: nowrap;
+}
+.kdp-toc-item:hover { background: var(--primary-light); color: var(--primary); }
+.kdp-toc-item.lv3 { padding-left: 16px; }
+.kdp-toc-item.lv4, .kdp-toc-item.lv5, .kdp-toc-item.lv6 { padding-left: 26px; }
+.kdp-pager { margin-left: auto; display: flex; gap: 6px; }
+.kdp-pager button {
+  height: 22px; padding: 0 9px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg-card); color: var(--text-regular); cursor: pointer; font: inherit; font-size: 11px;
+}
+.kdp-pager button:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+.kdp-jump {
+  flex: none; margin-left: auto; height: 20px; padding: 0 8px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg-card); color: var(--text-muted); cursor: pointer; font: inherit; font-size: 10.5px;
+}
+.kdp-jump:hover { border-color: var(--primary); color: var(--primary); }
 .kdp-markdown :deep(h2), .kdp-markdown :deep(h3), .kdp-markdown :deep(h4),
 .kdp-markdown :deep(h5), .kdp-markdown :deep(h6) {
   margin: 16px 0 8px; color: var(--text-primary); line-height: 1.4;
@@ -510,7 +626,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   font: 12px/1.65 var(--font-mono);
 }
 .kdp-chunks-summary {
-  position: sticky; top: 0; z-index: 1; padding: 8px 14px;
+  position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 8px; padding: 8px 14px;
   border-bottom: 1px solid var(--divider); background: var(--bg-main);
   color: var(--text-muted); font-size: 11.5px;
 }
