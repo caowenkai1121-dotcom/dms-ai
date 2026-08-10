@@ -2,6 +2,20 @@
 
 export type Semantic = 'money' | 'count' | 'percent' | 'geo' | 'customer' | 'goods' | 'order' | 'none'
 
+// crypto.randomUUID 只在安全上下文（HTTPS / localhost）存在；http://IP 部署时它是 undefined，
+// 会话 turnKey / rid 全靠它 —— 必须有降级（getRandomValues 在非安全上下文可用，Math.random 兜底）。
+export function uuid(): string {
+  const c = globalThis.crypto
+  if (c?.randomUUID) return c.randomUUID()
+  const buf = new Uint8Array(16)
+  if (c?.getRandomValues) c.getRandomValues(buf)
+  else for (let i = 0; i < 16; i++) buf[i] = Math.floor(Math.random() * 256)
+  buf[6] = (buf[6] & 0x0f) | 0x40
+  buf[8] = (buf[8] & 0x3f) | 0x80
+  const hex = Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
 export function toNum(v: unknown): number | null {
   if (typeof v === 'number') return v
   if (typeof v === 'string') {

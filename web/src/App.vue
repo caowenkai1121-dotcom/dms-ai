@@ -9,7 +9,7 @@ import SkillsPanel from './SkillsPanel.vue'
 import DataMapPanel from './DataMapPanel.vue'
 import SqlAuditPanel from './SqlAuditPanel.vue'
 import TracePanel from './TracePanel.vue'
-import { fmt, semanticForLabel, toNum, type Semantic } from './format'
+import { fmt, semanticForLabel, toNum, uuid, type Semantic } from './format'
 import { ANALYSIS_URL } from './api'
 
 const BiChart = defineAsyncComponent(() => import('./BiChart.vue'))
@@ -1050,7 +1050,7 @@ function enqueueAsk(text: string, refs: string[]) {
   const convId = curConvId.value
   if (convId == null) return
   const queue = queueByConv.get(convId) ?? []
-  queue.push({ id: crypto.randomUUID(), text, refs })
+  queue.push({ id: uuid(), text, refs })
   queueByConv.set(convId, queue)
 }
 function cancelQueued(id: string) {
@@ -1705,7 +1705,7 @@ function pushError(msg: string, targetConvId?: number) {
   const convId = targetConvId ?? curConvId.value ?? undefined
   const target = convId == null ? draftTurns.value : turnsByConv.get(convId)
   if (!target) { showToast(msg); return }
-  target.push({ role: 'ai', turnKey: crypto.randomUUID(), convId, error: msg })
+  target.push({ role: 'ai', turnKey: uuid(), convId, error: msg })
   if (convId == null ? curConvId.value == null : curConvId.value === convId) scrollDown()
 }
 
@@ -1750,9 +1750,9 @@ async function send(q?: string, options: SendOptions = {}) {
   // 必须从 reactive Map 重新 get：首次创建时直接继续写入原始 []，Vue 不会追踪后续 push/字段更新。
   if (!turnsByConv.has(convId)) turnsByConv.set(convId, [])
   const convTurns = turnsByConv.get(convId)!
-  convTurns.push({ role: 'user', turnKey: crypto.randomUUID(), convId, question: displayText })
+  convTurns.push({ role: 'user', turnKey: uuid(), convId, question: displayText })
   convTurns.push({
-    role: 'ai', turnKey: crypto.randomUUID(), convId, question: text,
+    role: 'ai', turnKey: uuid(), convId, question: text,
     loading: true, elapsed: 0, mode: isDeep ? 'deep' : 'lite',
     retryQuestion: text,
     retryOptions: {
@@ -1769,7 +1769,7 @@ async function send(q?: string, options: SendOptions = {}) {
     scrollDown()
   }
   // 【思维过程】深度模式：带 rid 轮询服务端阶段清单（Codex 式：等的时候知道在做什么）
-  const rid = isDeep ? crypto.randomUUID() : ''
+  const rid = isDeep ? uuid() : ''
   const progressStop = rid ? startProgress(rid, aiTurn) : () => {}
   // 【D4】rid 留在轮上：出错后凭它查服务端账本可否断点续跑
   aiTurn.rid = rid || undefined

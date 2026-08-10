@@ -1137,7 +1137,9 @@ def handle_post(path, body):
     texts = body.get('texts', [])
     return {'embeddings': embed(texts, is_query=bool(body.get('query', True))) if texts else []}
 
-def serve(port=8077):
+def serve(port=8077, host='127.0.0.1'):
+    # host 显式可选（默认回环不松）：Linux 服务器部署时容器要经 docker 网桥（172.17.0.1）
+    # 访问本服务 —— 绑网桥地址即可，0.0.0.0 会把解析/向量面暴露给公网。
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     embedder()
     # 启动就把「哪些扩展名不可用 + 为什么」打全：这条日志是运维唯一会看的地方，
@@ -1186,7 +1188,7 @@ def serve(port=8077):
     # 同一件事 `docker/parser/parse_service.py:142` 早就修了，宿主这份漏了 —— 一份实现两个入口，
     # 只修一个入口等于没修。判据：`_selftest_serve_unblocked`（换回 HTTPServer 立刻红）。
     # 模型推理仍然串行（`_EMBED_LOCK`），并发的只有 IO 与解析。
-    ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
+    ThreadingHTTPServer((host, port), H).serve_forever()
 
 def selftest():
     """parse+chunk 自检：只用标准库（md/csv/json/html 四类），不依赖任何解析库与模型。
@@ -1528,6 +1530,7 @@ if __name__ == '__main__':
     ap.add_argument('mode', nargs='?', default='serve',
                     choices=('build', 'revec', 'serve', 'selftest'))
     ap.add_argument('port', nargs='?', type=int, default=8077, help='serve 端口（默认 8077）')
+    ap.add_argument('host', nargs='?', default='127.0.0.1', help='serve 绑定地址（默认回环；容器跨网桥访问时给 172.17.0.1）')
     ap.add_argument('--ds', default='dms',
                     help='build 只处理该 ds_id 的注册表行（对应 Rust 侧 meta::DS_PRED，默认 dms）')
     ap.add_argument('--revec', action='store_true',
@@ -1540,4 +1543,4 @@ if __name__ == '__main__':
     elif a.mode == 'selftest':
         selftest()
     else:
-        serve(a.port)
+        serve(a.port, a.host)
