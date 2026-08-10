@@ -32,6 +32,8 @@ mod trace_api;
 mod usage_api;
 mod vision_api;
 mod wework;
+// 【小程序接入】路由已接线（契约见 xcx_api.rs 文件头）。
+mod xcx_api;
 
 // Server 内所有 HTTP 身份加载都从 `auth::load_principal` 收口。它保持 policy 的字段与
 // scope 契约不变，只区分独立密码会话和已由 DMS/企微认证的会话是否复查密码过期。
@@ -1396,6 +1398,9 @@ async fn main() -> anyhow::Result<()> {
         // 【K6-A】对外 MCP（JSON-RPC 2.0）。**刻意不挂会话鉴权**：它自带 X-API-Key
         //（`mcp_keys` 为空时恒 404 = 默认关）。套会话中间件会让所有 MCP 调用 401。
         .route("/api/mcp", post(mcp_api::mcp))
+        // 【小程序接入】x-access-token 桥接校验 + 问答（契约见 xcx_api.rs 文件头）
+        .route("/api/xcx/ask", post(xcx_api::ask))
+        .route("/api/xcx/me", get(xcx_api::me))
         .with_state(state);
 
     // 🔴 认证回退开着必须**每次启动都吼一声**：它等于「任何能到达端口的人可冒充任何 login_name」。

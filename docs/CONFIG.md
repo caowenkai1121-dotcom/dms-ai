@@ -178,6 +178,30 @@ Authorization: Bearer <api-key>
 - `Bearer` 是双义头：先按会话 token 解（本服务颁发的 UUID），解不开再按 API key 查 ——
   老客户端的 `Bearer <会话 token>` 行为一字不变。
 
+## 小程序接入（`xcx_auth_base`）
+
+商城小程序（uni-app）用户就是 DMS 员工。小程序登录后持有商城/DMS 后端签发的
+`x-access-token`，本服务**不自己验签**，而是 server-to-server 回调签发方：
+
+```
+GET {xcx_auth_base}/login/getLoginInfo
+x-access-token: <token>
+→ {"code":0,"data":{...},"msg":""}        # code=30007/30012 = token 失效
+```
+
+| 键 | 形状 | 不填的后果 |
+|---|---|---|
+| `xcx_auth_base` | `"https://dms.huangjiaxiaohu.com/dms-api"`（生产值） | **`/api/xcx/*` 恒 404，功能关闭** —— 与 `mcp_keys` 同一条「对外默认关」纪律 |
+
+- 端点：`POST /api/xcx/ask`（问答，与 `/api/ask` 同一条管道）与 `GET /api/xcx/me`（登录态探活）。
+- 响应协议：`{"code":0,"data":...,"msg":""}`；token 失效回 HTTP 401 + `{"code":30007,"msg":"token 失效"}`
+  （小程序拦截器按 30007 弹登录框）；校验服务不可用回 502 + `code:500`。
+- **数据权限等于该员工 Web 登录后的权限**：token 只换成 login/role，随后过 `load_principal`
+  （员工禁用 / 多角色未选照样被拒），没有「小程序就是超管」的旁路。
+- 进程内缓存：token → 身份 60s TTL、上限 1000 条（满员淘汰最旧），重复问不重复打外部；
+  代价是 token 失效/切角色最多滞后 60s 生效。
+- 这只是一个 URL、不是凭据：不参与 `enc:v1` 加密，但同样不进任何 API 响应。
+
 ## 其它
 
 | 键 | 默认 | 说明 |

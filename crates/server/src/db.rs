@@ -174,6 +174,17 @@ pub struct Settings {
     ///（`mcp_api` 记日志只写前 4 位+长度）。
     #[serde(default)]
     pub mcp_keys: std::collections::HashMap<String, String>,
+    /// 【小程序接入】商城/DMS 后端的 token 校验基地址（server-to-server）。
+    /// 校验通道：`GET {xcx_auth_base}/login/getLoginInfo`，请求头 `x-access-token: <token>`。
+    ///
+    /// **缺省 None = 小程序端点整体关闭（`/api/xcx/*` 恒 404，fail-closed）**，
+    /// 与 `mcp_keys` 默认关同一条纪律：没配校验地址就没法验 token，此时绝不能放任何人进来。
+    /// 空白串（`""`/`"  "`）在 `xcx_api` 侧同样按未配置处理（防「配了等于没配」）。
+    ///
+    /// 生产值：`https://dms.huangjiaxiaohu.com/dms-api`（公网可达）。
+    /// 这只是一个 URL、不是凭据：不加密、可进日志，但也**不进任何 API 响应**。
+    #[serde(default)]
+    pub xcx_auth_base: Option<String>,
     /// 【SC】自一致采样数：LLM 路径整条跑几次、按**结果指纹**投票取多数派。
     ///
     /// **默认 1 = 与本项引入前逐字等价**（不多一次 LLM 调用、不多一次取数）。
@@ -1205,6 +1216,27 @@ mod tests {
         assert!(
             !serde_json::from_str::<Settings>(raw).unwrap().insecure_login_fallback,
             "示例配置把认证回退设成了开 —— 照抄的人默认无认证"
+        );
+    }
+
+    /// 【小程序接入】`xcx_auth_base` 三层判据（同 `login_fallback_defaults_to_closed` 的结构）：
+    /// 缺省 None（fail-closed）/ 显式配置真的读进来 / 示例配置显式给出且为关。
+    #[test]
+    fn xcx_auth_base_defaults_to_closed() {
+        // ① 不写这个键 = None = `/api/xcx/*` 恒 404（`xcx_api::require_base` 的唯一出口）
+        let s: Settings = serde_json::from_str(MIN).unwrap();
+        assert!(s.xcx_auth_base.is_none(), "小程序校验地址默认必须是 None（功能关）");
+        // ② 显式写值要真的读进来（否则「永远 None」也让 ① 绿，功能永远开不起来）
+        let on = MIN.replace("{", r#"{"xcx_auth_base":"https://dms.huangjiaxiaohu.com/dms-api","#);
+        let s: Settings = serde_json::from_str(&on).unwrap();
+        assert_eq!(s.xcx_auth_base.as_deref(), Some("https://dms.huangjiaxiaohu.com/dms-api"));
+        // ③ 示例配置必须**显式**带这个键且为 null（关）：照抄示例的人拿到的是关的那一档，
+        //    只断言解析值的话示例里删掉这行照样绿。
+        let raw = include_str!("../../../settings.example.json");
+        assert!(raw.contains("\"xcx_auth_base\""), "示例缺这个键 = 运维不知道小程序接入怎么开");
+        assert!(
+            serde_json::from_str::<Settings>(raw).unwrap().xcx_auth_base.is_none(),
+            "示例配置把小程序校验地址配上了 —— 照抄的人在没想清楚前就开了对外端点"
         );
     }
 

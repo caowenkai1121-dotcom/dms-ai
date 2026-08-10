@@ -77,12 +77,14 @@ foreach ($c in 'semantic', 'knowledge') {
 # 实测后果：`mcp_api.rs` 里一句纯注释「英文串先小写化再匹配（sqlx/reqwest 的原文）」
 # 把整条门禁判红，而 `grep -n reqwest crates/server/src/*.rs` 显示真实用点只有
 # auth.rs / llm.rs / wework.rs 三个白名单文件 —— mcp_api.rs 一次都没用过 reqwest。
+# （其后 xcx_api.rs 作为小程序 token 校验的身份面文件加入白名单：server-to-server
+#  回调商城后端 getLoginInfo，与 auth/wework 同一性质 —— 对外 HTTP 只许出现在身份面。）
 # 假红的代价不是「多一条红」：它把整个门禁染红，**掩盖同一趟里的真违规**
 #（那一趟真红是 agent crate 造了连接池，被这条假红盖在下面）。
 $bad = Get-ChildItem crates/server/src -Recurse -Filter *.rs -ErrorAction SilentlyContinue |
     Select-String -Pattern 'reqwest' |
     Where-Object {
-        $_.Path -notmatch '(identity|wework|auth|llm|embed)\.rs$' -and
+        $_.Path -notmatch '(identity|wework|auth|llm|embed|xcx_api)\.rs$' -and
         $_.Line.Trim() -notmatch '^(//|\*|/\*)'
     }
 if ($bad) {

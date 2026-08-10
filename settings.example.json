@@ -40,6 +40,7 @@
   "wework_agentid": "",
   "wework_redirect_url": "https://AGENT_HOST/api/wework/login",
   "mcp_keys": {},
+  "xcx_auth_base": null,
   "insight_enabled": true,
   "insecure_login_fallback": false
 }
