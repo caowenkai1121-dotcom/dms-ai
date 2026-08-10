@@ -290,6 +290,15 @@ function formatDelta(value: number): string {
   return deltaNumber.format(Math.abs(value))
 }
 
+const ppNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 })
+/** KPI delta 文本：百分比指标的 delta 后端已按**百分点**出数（毛利率 19.30%→19.63% = +0.33pp），
+ *  其它指标是相对百分比。方向由左侧箭头表达，这里只出绝对值+单位。 */
+function deltaText(k: Kpi): string {
+  const d = k.delta
+  if (!d) return ''
+  return k.semantic === 'percent' ? `${ppNumber.format(Math.abs(d.pct))}pp` : `${formatDelta(d.pct)}%`
+}
+
 function deltaDetail(kpi: Kpi): string {
   const delta = kpi.delta
   if (!delta || typeof delta.baseline !== 'number' || !Number.isFinite(delta.baseline)) return ''
@@ -504,7 +513,7 @@ function supplementalIsMetric(ci: number): boolean {
           <div class="mc-val num">{{ displayValue(k.label, k.value, k.semantic, true) }}</div>
           <div v-if="k.delta" class="mc-delta" :class="k.delta.dir">
             <span class="delta-mark">{{ k.delta.dir === 'up' ? '↑' : k.delta.dir === 'down' ? '↓' : '—' }}</span>
-            {{ formatDelta(k.delta.pct) }}% <span class="mc-vs">{{ k.delta.label }}</span>
+            {{ deltaText(k) }} <span class="mc-vs">{{ k.delta.label }}</span>
           </div>
           <div v-if="deltaDetail(k)" class="mc-delta-detail">{{ deltaDetail(k) }}</div>
         </div>
@@ -630,7 +639,7 @@ function supplementalIsMetric(ci: number): boolean {
           <div class="mc-val num">{{ displayValue(k.label, k.value, k.semantic, true) }}</div>
           <div v-if="k.delta" class="mc-delta" :class="k.delta.dir">
             <span class="delta-mark">{{ k.delta.dir === 'up' ? '↑' : k.delta.dir === 'down' ? '↓' : '—' }}</span>
-            {{ formatDelta(k.delta.pct) }}% <span class="mc-vs">{{ k.delta.label }}</span>
+            {{ deltaText(k) }} <span class="mc-vs">{{ k.delta.label }}</span>
           </div>
           <div v-if="deltaDetail(k)" class="mc-delta-detail">{{ deltaDetail(k) }}</div>
         </div>

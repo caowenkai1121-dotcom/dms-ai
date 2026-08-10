@@ -10,6 +10,9 @@ dms-connector = { path = "../connector" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# chrono 已在 workspace（sqlx 传递依赖同树）：趋势 insight 判「本月至今」不足月要用本地日期，
+# 对齐 SQL 侧 CURDATE() 的本地日口径。零新增第三方依赖。
+chrono = { workspace = true }
 # sqlparser 已在 workspace（kernel 唯一使用方）；datamap_usage 的 AST 只读遍历直接复用同一
 # 版本实例（dms_kernel::by_name 的方言对象），不是新增第三方 crate。
 sqlparser = { workspace = true }

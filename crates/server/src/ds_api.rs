@@ -28,6 +28,28 @@ fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
     (code, Json(serde_json::json!({ "error": msg.to_string() })))
 }
 
+/// 内部错误的统一出口（安全审查②）：响应只带固定文案 —— anyhow/sqlx/ConnectorError 原文
+/// 可能含关系名、约束名与连接细节，回前端等于泄露内部结构。真因一律 `tracing::warn!`
+/// 留服务端（照 `kb_api::kb_err` 的收敛模子）。响应形状不变：`{"error": 固定文案}` + 原状态码。
+fn internal_err(context: &'static str, e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(error = %e, "{context}");
+    err(StatusCode::INTERNAL_SERVER_ERROR, "服务暂时不可用，请稍后重试")
+}
+
+/// 422 版（连通性测试 / schema 采集：管理员触发的动作失败归 422 而非 500）。
+/// 诊断细节留在服务端日志，不回前端（连接细节同样是内部结构）。
+fn unprocessable_err(context: &'static str, e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(error = %e, "{context}");
+    err(StatusCode::UNPROCESSABLE_ENTITY, "操作失败，请检查数据源配置后重试")
+}
+
+/// 身份核验失败（同 `api_ask` 的 403 文案）：load_principal 的 anyhow 可能携带身份库
+/// 错误原文（连接细节），不外回；业务分类（多角色未选等）由 warn 留痕。
+fn identity_err(login: &str, e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(login = %login, error = %e, "身份核验被 load_principal 拒");
+    err(StatusCode::FORBIDDEN, "当前账号或角色不可用")
+}
+
 #[derive(serde::Deserialize, Default)]
 pub struct DsQuery {
     login_name: Option<String>,
@@ -57,7 +79,7 @@ async fn caller(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
     principal::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
-        .map_err(|e| err(StatusCode::FORBIDDEN, e))
+        .map_err(|e| identity_err(&login, e))
 }
 
 async fn admin(
@@ -93,10 +115,10 @@ pub async fn list(
     let pg = st.owned.pool();
     let visible = ds_reg::visible_datasources(pg, &p.login_name, &[p.role_code.clone()])
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("数据源可见性判定失败", e))?;
     let rows = ds_reg::list_datasources(pg)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("数据源列表读取失败", e))?;
     let ds: Vec<serde_json::Value> =
         rows.iter().filter(|r| visible.contains(&r.ds_id)).map(ds_json).collect();
     Ok(Json(serde_json::json!({ "datasources": ds })))
@@ -126,7 +148,7 @@ pub async fn upsert(
     let row = validate(&req).map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
     ds_reg::upsert_datasource(st.owned.pool(), &row)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("数据源登记失败", e))?;
     Ok(Json(ds_json(&row)))
 }
 
@@ -145,7 +167,7 @@ pub async fn remove(
     ensure_row(pg, &id).await?;
     ds_reg::delete_datasource(pg, &id)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("数据源注销失败", e))?;
     st.sources.close(&DsId::new(&id)).await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -168,12 +190,13 @@ pub async fn probe(
         max_conn: 2,
         schema: dms_knowledge::tabular::upload_schema_of_ds(&row.ds_id),
     };
-    // ConnectorError 的文案只带源标识与 dsn_ref 键名（连不上时也不带明文 DSN），可直接回
+    // 安全审查②：错误原文不再回前端（连接细节属内部结构）—— 响应固定文案，
+    // 诊断细节（ConnectorError 带源标识与 dsn_ref 键名）留在服务端 warn 日志。
     let version = st
         .sources
         .probe(&spec)
         .await
-        .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+        .map_err(|e| unprocessable_err("数据源连通性测试失败", e))?;
     Ok(Json(serde_json::json!({ "ok": true, "version": version })))
 }
 
@@ -202,16 +225,16 @@ pub async fn sync(
         .mysql
         .probe_schema_with_warehouse_catalog(&assets)
         .await
-        .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+        .map_err(|e| unprocessable_err("schema 探测失败", e))?;
     let warehouse_comments = st.mysql.enrich_dms_snapshot(&mut snap).await.unwrap_or(0);
     let (tables, columns) =
         // `true`＝过滤备份表：DMS 是别人建的库，里头确有 bak_*/日期后缀的垃圾表
         dms_semantic::ingest::schema_sync::sync_schema(pg, ds_reg::DMS_DS_ID, &snap, true)
             .await
-            .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            .map_err(|e| unprocessable_err("schema 采集入库失败", e))?;
     dms_semantic::warehouse_catalog::seed(pg, ds_reg::DMS_DS_ID)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("warehouse 目录播种失败", e))?;
     Ok(Json(serde_json::json!({
         "ds_id": id,
         "tables": tables,
@@ -228,7 +251,7 @@ pub async fn sync(
 async fn ensure_row(pg: &sqlx::PgPool, id: &str) -> Result<ds_reg::DsSpecRow, ApiErr> {
     ds_reg::get_datasource(pg, id)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(|e| internal_err("数据源登记读取失败", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("数据源 {id} 未登记")))
 }
 
@@ -371,5 +394,36 @@ mod tests {
     fn upsert_body_reads_identity() {
         let r = req(r#"{"ds_id":"crm_pg","kind":"postgres","dsn_ref":"crm_url","login_name":"lisi"}"#);
         assert_eq!(r.q.login_name.as_deref(), Some("lisi"));
+    }
+
+    // ── 安全审查②：内部错误只回固定文案 ──
+
+    /// 固定文案 + 原状态码 + 响应形状不变；原文只进 warn 不进响应体
+    #[test]
+    fn internal_err_has_fixed_message_and_keeps_shape() {
+        let raw = "查询失败 [crm_pg] connection refused (10.0.0.8:5432)";
+        let (code, Json(body)) = internal_err("测试上下文", raw);
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, serde_json::json!({ "error": "服务暂时不可用，请稍后重试" }));
+        let (code, Json(body)) = unprocessable_err("连通性测试失败", raw);
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!body.to_string().contains("10.0.0.8"), "连接细节不许外泄：{body}");
+        let (code, Json(body)) = identity_err("zhangsan", raw);
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(body, serde_json::json!({ "error": "当前账号或角色不可用" }));
+    }
+
+    /// 源码闸：`err(状态码, e)` 直回原文的写法不许回来
+    #[test]
+    fn raw_causes_never_reach_the_client() {
+        let src = include_str!("ds_api.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or("");
+        for bad in [
+            "err(StatusCode::INTERNAL_SERVER_ERROR, e)",
+            "err(StatusCode::UNPROCESSABLE_ENTITY, e)",
+            "err(StatusCode::FORBIDDEN, e)",
+        ] {
+            assert!(!code.contains(bad), "错误原文泄露回来了：{bad}");
+        }
     }
 }

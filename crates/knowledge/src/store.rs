@@ -1157,6 +1157,164 @@ pub async fn append_notice(
     Ok(())
 }
 
+// ==================== 分块收口（KB 审查②）：标题-only / 过短块并入下一正文块 ====================
+
+/// 「标题-only / 过短」块的字符下限：正文不足 50 字（实测一轮 KB 审查 74 块里 25 块只有标题
+/// 没正文）或正文==叶子标题的块不独立成块。标题信号不丢：embedding_text 的「章节」行本就带
+/// 完整 heading_path（`chunk_embedding_text` 配方 v1）。
+const TITLE_ONLY_MAX_CHARS: usize = 50;
+/// 合并后块的字符合顶：bge 512 token 窗口 × 1.6 字符/token（embed_service.py `MAX_TOKENS` 口径）。
+/// 超过就不并 —— 并出一个超窗块会被 fastembed 静默截断，比标题块单独留着更坏。
+const MERGED_MAX_CHARS: usize = 480 * 8 / 5; // 768
+
+/// 与 `ingest::est_tokens` / `embed_service.py::est_tokens` 同口径：ceil(chars/1.6) 的整数写法。
+fn est_tokens(chars: usize) -> i32 {
+    ((chars * 5 + 7) / 8) as i32
+}
+
+fn leaf_heading(heading_path: &str) -> &str {
+    heading_path.rsplit(" > ").next().map(str::trim).unwrap_or("")
+}
+
+/// 标题-only 判定：正文==叶子标题（标题块自成一个分块组时的形态），或正文不足 50 字。
+fn is_title_only(c: &Chunk) -> bool {
+    let t = c.text.trim();
+    let leaf = leaf_heading(&c.heading_path);
+    (!leaf.is_empty() && t == leaf) || t.chars().count() < TITLE_ONLY_MAX_CHARS
+}
+
+/// 收口合并的产物：`sources[i]` = 输出第 i 块由哪些输入块（下标，保序）合并而成 ——
+/// 影子构建的向量重挂靠它区分「没动过的块」与「合并块」。
+struct MergedChunks {
+    chunks: Vec<Chunk>,
+    spans: Vec<Option<CharSpan>>,
+    sources: Vec<Vec<usize>>,
+}
+
+/// 与 `ingest::one_page` 同一条纪律：贡献页集合去重后只剩一个真实页才显示；跨页宁可 None。
+fn merged_page(pages: impl Iterator<Item = Option<i32>>) -> Option<i32> {
+    let mut real = pages.flatten();
+    let first = real.next()?;
+    if real.all(|p| p == first) { Some(first) } else { None }
+}
+
+/// 把 srcs 指向的输入块按序拼成一块（文本以 `\n` 连接）：span 取全体联集（任一缺失即 None，
+/// 错位的偏移比没有更糟 —— CharSpan 契约），page 取贡献页唯一值，tokens 按合并后文本重估，
+/// heading_path 取最后一个**正文块**的（尾随标题并入时不许反过来盖住正文的章节归属）。
+fn combine_chunks(chunks: &[Chunk], spans: &[Option<CharSpan>], srcs: &[usize]) -> (Chunk, Option<CharSpan>) {
+    let text = srcs
+        .iter()
+        .map(|&i| chunks[i].text.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let span = if srcs.iter().all(|&i| spans[i].is_some()) {
+        let mut it = srcs.iter().map(|&i| spans[i].unwrap());
+        let first = it.next().expect("srcs 非空");
+        Some(it.fold(first, |a, b| CharSpan { start: a.start.min(b.start), end: a.end.max(b.end) }))
+    } else {
+        None
+    };
+    let heading_path = srcs
+        .iter()
+        .rev()
+        .find(|&&i| !is_title_only(&chunks[i]))
+        .map(|&i| chunks[i].heading_path.clone())
+        .unwrap_or_else(|| chunks[*srcs.last().expect("srcs 非空")].heading_path.clone());
+    let page = merged_page(srcs.iter().map(|&i| chunks[i].page));
+    let tokens = est_tokens(text.chars().count());
+    (Chunk { text, heading_path, page, tokens }, span)
+}
+
+/// 分块收口：「text==叶子标题 或不足 50 字」的块并入**下一正文块**（接在它正文前面）；
+/// 尾随无处可并的并回上一块；全是标题块的退化文档原样保留（并掉就没有正文了）。
+/// 并块以不破 `MERGED_MAX_CHARS` 为限，装不下的块原样落下 —— 合并不是丢弃的理由。
+/// 两条入库写路径（`insert_chunks` / `replace_chunks`）都从这里过，各 preset 分块链统一受益。
+fn merge_title_only_chunks(chunks: &[Chunk], spans: &[Option<CharSpan>]) -> MergedChunks {
+    debug_assert_eq!(chunks.len(), spans.len());
+    let mut out = MergedChunks {
+        chunks: Vec::with_capacity(chunks.len()),
+        spans: Vec::with_capacity(chunks.len()),
+        sources: Vec::with_capacity(chunks.len()),
+    };
+    let push = |out: &mut MergedChunks, srcs: &[usize]| {
+        let (c, sp) = combine_chunks(chunks, spans, srcs);
+        out.chunks.push(c);
+        out.spans.push(sp);
+        out.sources.push(srcs.to_vec());
+    };
+    let mut pend: Vec<usize> = Vec::new(); // 待并入的标题-only 块（保持原序）
+    for (i, c) in chunks.iter().enumerate() {
+        if is_title_only(c) {
+            pend.push(i);
+            continue;
+        }
+        // 正文块：能装下的积压标题块并到它前面；装不下的原样先落（不留空窗）
+        let mut budget = MERGED_MAX_CHARS.saturating_sub(c.text.trim().chars().count());
+        let mut srcs: Vec<usize> = Vec::with_capacity(pend.len() + 1);
+        for &p in &pend {
+            let n = chunks[p].text.trim().chars().count() + 1; // +1 = 拼接的 \n
+            if n <= budget {
+                srcs.push(p);
+                budget -= n;
+            } else {
+                push(&mut out, &[p]);
+            }
+        }
+        srcs.push(i);
+        push(&mut out, &srcs);
+        pend.clear();
+    }
+    // 尾随标题块：并回上一块（装不下则原样落）
+    if !pend.is_empty() {
+        let mut absorbed = 0usize;
+        if let Some(last) = out.chunks.last() {
+            let mut budget = MERGED_MAX_CHARS.saturating_sub(last.text.chars().count());
+            let mut srcs = out.sources.last().expect("chunks 与 sources 平行").clone();
+            for &p in &pend {
+                let n = chunks[p].text.trim().chars().count() + 1;
+                if n > budget {
+                    break;
+                }
+                srcs.push(p);
+                budget -= n;
+                absorbed += 1;
+            }
+            if absorbed > 0 {
+                out.chunks.pop();
+                out.spans.pop();
+                out.sources.pop();
+                push(&mut out, &srcs);
+            }
+        }
+        for &p in &pend[absorbed..] {
+            push(&mut out, &[p]);
+        }
+    }
+    out
+}
+
+/// 影子构建的向量随合并重挂：合并块的预计算向量是按旧文本算的，贴到新文本上是错向量 ——
+/// expected 置空串（恒不等于 SQL 侧重算的 `kb.chunk_embedding_text`）→ 该块落 NULL →
+/// 文档按 `missing` 停 `chunked`，由 A9/embed_fill（或 `embed_service.py revec`）补算；
+/// 单源块（没动过）的向量原样保留。
+fn remap_shadow_embeddings(
+    sources: &[Vec<usize>],
+    embedding_texts: &[String],
+    embeddings: &[Option<String>],
+) -> (Vec<String>, Vec<Option<String>>) {
+    sources
+        .iter()
+        .map(|s| {
+            if s.len() == 1 {
+                (embedding_texts[s[0]].clone(), embeddings[s[0]].clone())
+            } else {
+                (String::new(), None)
+            }
+        })
+        .collect()
+}
+
 /// 重处理前清空旧块与状态。数据修改 CTE 保证两步同一条语句完成，避免半清理。
 /// 影子解析完成后一次性替换正文索引与文档状态。任何错误都会让旧 chunks 原样保留。
 /// `spans` 与 `chunks` 等长平行（B3 字符偏移），语义同 `insert_chunks`。
@@ -1181,6 +1339,14 @@ pub async fn replace_chunks(
     {
         return Err(KbError::BadInput("影子索引的切片与向量数量不一致".into()));
     }
+    // 分块收口：标题-only/过短块并入下一正文块（KB 审查②，见 `merge_title_only_chunks`）。
+    let merged = merge_title_only_chunks(chunks, spans);
+    let (embedding_texts, embeddings) =
+        remap_shadow_embeddings(&merged.sources, embedding_texts, embeddings);
+    let chunks = &merged.chunks;
+    let spans = &merged.spans;
+    let embedding_texts = &embedding_texts;
+    let embeddings = &embeddings;
     let ord: Vec<i32> = (0..chunks.len() as i32).collect();
     let text: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
     let heading: Vec<&str> = chunks.iter().map(|c| c.heading_path.as_str()).collect();
@@ -1315,6 +1481,10 @@ pub async fn insert_chunks(
     if chunks.len() != spans.len() {
         return Err(KbError::BadInput("切片与字符偏移数量不一致".into()));
     }
+    // 分块收口：标题-only/过短块并入下一正文块（KB 审查②，见 `merge_title_only_chunks`）。
+    let merged = merge_title_only_chunks(chunks, spans);
+    let chunks = &merged.chunks;
+    let spans = &merged.spans;
     let ord: Vec<i32> = (0..chunks.len() as i32).collect();
     let text: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
     let heading: Vec<&str> = chunks.iter().map(|c| c.heading_path.as_str()).collect();
@@ -2087,5 +2257,128 @@ mod tests {
         assert!(body.contains("find_by_sha"));
         // 无权限且无人抢占时仍然 fail-closed
         assert!(body.contains("KbError::Forbidden"));
+    }
+
+    // ==================== KB 审查②：标题-only / 过短块的收口合并 ====================
+
+    fn plain_chunk(text: &str, heading: &str, page: Option<i32>) -> Chunk {
+        Chunk {
+            text: text.into(),
+            heading_path: heading.into(),
+            page,
+            tokens: est_tokens(text.chars().count()),
+        }
+    }
+
+    /// 正文块（≥50 字、不等于叶子标题）的便捷构造
+    fn content_chunk(text: &str, heading: &str) -> Chunk {
+        let c = plain_chunk(text, heading, None);
+        debug_assert!(!is_title_only(&c), "夹具必须是正文块：{text}");
+        c
+    }
+
+    /// 标题块并入**下一**正文块：文本接在正文前、章节归属取正文块、span 取联集。
+    #[test]
+    fn title_only_chunk_merges_into_the_next_content_chunk() {
+        let chunks = vec![
+            plain_chunk("第三章 报销流程", "制度 > 第三章 报销流程", None),
+            content_chunk(&"发".repeat(120), "制度 > 第三章 报销流程 > 3.1 适用范围"),
+            content_chunk(&"票".repeat(120), "制度 > 第三章 报销流程 > 3.1 适用范围"),
+        ];
+        let spans = vec![Some(CharSpan { start: 10, end: 17 }), Some(CharSpan { start: 18, end: 138 }), None];
+        let m = merge_title_only_chunks(&chunks, &spans);
+        assert_eq!(m.chunks.len(), 2);
+        assert_eq!(m.chunks[0].text, format!("第三章 报销流程\n{}", "发".repeat(120)));
+        assert_eq!(m.chunks[0].heading_path, "制度 > 第三章 报销流程 > 3.1 适用范围");
+        assert_eq!(m.chunks[0].tokens, est_tokens(m.chunks[0].text.chars().count()));
+        assert_eq!(m.spans[0], Some(CharSpan { start: 10, end: 138 }), "span 取联集");
+        assert_eq!(m.spans[1], None, "任一输入缺偏移即 None（错位的偏移比没有更糟）");
+        assert_eq!(m.sources, vec![vec![0, 1], vec![2]]);
+    }
+
+    /// 「不足 50 字」同样并入；50 字整是正文块；页码取贡献页唯一值（跨页 None）。
+    #[test]
+    fn short_chunk_merges_and_page_keeps_the_only_real_page() {
+        let chunks = vec![
+            plain_chunk(&"短".repeat(49), "H", None),
+            plain_chunk(&"正".repeat(60), "H", Some(3)),
+            plain_chunk(&"足".repeat(50), "H", Some(3)),
+        ];
+        let spans = vec![None, None, None];
+        let m = merge_title_only_chunks(&chunks, &spans);
+        assert_eq!(m.chunks.len(), 2, "49 字并入下一块，50 字整独立成块");
+        assert!(m.chunks[0].text.starts_with(&"短".repeat(49)));
+        assert_eq!(m.chunks[0].page, Some(3));
+        assert_eq!(m.chunks[1].text, "足".repeat(50));
+        // 跨页：并进来的块与本块页不同 → None（「不知道」比「说错」好）
+        let chunks = vec![
+            plain_chunk("小标题", "H > 小标题", Some(2)),
+            plain_chunk(&"正".repeat(60), "H > 小标题", Some(3)),
+        ];
+        let m = merge_title_only_chunks(&chunks, &[None, None]);
+        assert_eq!(m.chunks[0].page, None);
+    }
+
+    /// 尾随标题块并回上一块；全是标题块的退化文档原样保留（并掉就没有正文了）。
+    #[test]
+    fn trailing_titles_merge_backwards_and_all_titles_are_kept() {
+        let chunks = vec![
+            content_chunk(&"正".repeat(100), "H > 一"),
+            plain_chunk("附录", "H > 附录", None),
+        ];
+        let m = merge_title_only_chunks(&chunks, &[None, None]);
+        assert_eq!(m.chunks.len(), 1);
+        assert_eq!(m.chunks[0].text, format!("{}\n附录", "正".repeat(100)));
+        assert_eq!(m.chunks[0].heading_path, "H > 一", "章节归属不许被尾随标题盖住");
+
+        let all_titles = vec![
+            plain_chunk("第一章", "第一章", None),
+            plain_chunk("第二章", "第二章", None),
+        ];
+        let m = merge_title_only_chunks(&all_titles, &[None, None]);
+        assert_eq!(m.chunks.len(), 2, "全是标题块时一个都不许丢");
+    }
+
+    /// 合并以不破 512 token 窗口（768 字符）为限：装不下的标题块原样落下，不硬并。
+    #[test]
+    fn merge_never_exceeds_the_embedding_window() {
+        let chunks = vec![
+            plain_chunk("小标题", "H > 小标题", None),
+            plain_chunk(&"满".repeat(MERGED_MAX_CHARS), "H > 正文", None),
+        ];
+        let m = merge_title_only_chunks(&chunks, &[None, None]);
+        assert_eq!(m.chunks.len(), 2, "并了就会超窗 → 不并");
+        assert_eq!(m.chunks[0].text, "小标题");
+        let chunks = vec![
+            plain_chunk("小标题", "H > 小标题", None),
+            plain_chunk(&"余".repeat(MERGED_MAX_CHARS - 20), "H > 正文", None),
+        ];
+        let m = merge_title_only_chunks(&chunks, &[None, None]);
+        assert_eq!(m.chunks.len(), 1, "装得下就并（6 + 1 + 748 ≤ 768）");
+    }
+
+    /// 影子构建的向量重挂：单源块保留原向量，合并块落 (空串哨兵, None) 走补算。
+    #[test]
+    fn shadow_embeddings_remap_invalidates_only_merged_chunks() {
+        let sources = vec![vec![0usize, 1], vec![2]];
+        let texts = vec!["t0".to_string(), "t1".to_string(), "t2".to_string()];
+        let vecs = vec![Some("v0".to_string()), Some("v1".to_string()), None];
+        let (t, v) = remap_shadow_embeddings(&sources, &texts, &vecs);
+        assert_eq!(t, vec![String::new(), "t2".to_string()], "合并块的 expected 置空串（CAS 恒失配 → NULL）");
+        assert_eq!(v, vec![None, None], "合并块不许贴旧向量；单源块原样（含本就 None 的）");
+    }
+
+    /// 两条入库写路径都必须过收口（结构性锁：绕过收口 = 标题-only 块回流）。
+    #[test]
+    fn both_chunk_write_paths_pass_through_the_merge() {
+        let src = include_str!("store.rs");
+        for f in ["pub async fn insert_chunks", "pub async fn replace_chunks"] {
+            let body = src.split(f).nth(1).unwrap();
+            let body = body.split("pub async fn ").next().unwrap();
+            assert!(body.contains("merge_title_only_chunks"), "{f} 没过标题-only 收口");
+        }
+        let replace = src.split("pub async fn replace_chunks").nth(1).unwrap();
+        let replace = replace.split("pub async fn ").next().unwrap();
+        assert!(replace.contains("remap_shadow_embeddings"), "影子构建不许把旧文本的向量贴到合并块上");
     }
 }

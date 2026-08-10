@@ -744,9 +744,21 @@ impl Round<'_> {
                 if rs.rows.is_empty() {
                     // 0 行也记录（攒数据找「中文名直写/口径过严」模式，不触发复盘——0 行常常是正确答案）
                     exemplar::log_failure_traced(cx.pg, "zero-rows", cx.question, scoped.wire(), "", &cx.trace_id).await;
-                } else if worth_learning(st, &rs) {
-                    // few-shot 回写：跑通且有结果的问答沉淀为语料（status=pending 待复核）
-                    self.save_exemplar(&st.candidate, &st.snapshot).await;
+                } else {
+                    // 【判官实测·问题 1②】合同绕开降级（LLM 路径出口）：问句点的是已验证合同的
+                    // 指标，最终 SQL 却引了同主题的 ODS 原始表、没引合同表 → 附口径说明。
+                    // 🔴 必须在 `worth_learning` 之前落 note：绕开合同的 SQL 不许沉淀成 few-shot
+                    // （note 非空 ⇒ worth_learning 否决），trust 也经 `attach_trust` 既有机制降 review。
+                    if let Some(note) = contract_overlap_note(cx, scoped.wire()) {
+                        st.note = Some(match st.note.take() {
+                            Some(old) => format!("{old}\n{note}"),
+                            None => note,
+                        });
+                    }
+                    if worth_learning(st, &rs) {
+                        // few-shot 回写：跑通且有结果的问答沉淀为语料（status=pending 待复核）
+                        self.save_exemplar(&st.candidate, &st.snapshot).await;
+                    }
                 }
                 // 【S4】经验蒸馏（datanote learn 的精简版）：回炉**成功**（route=llm+repair 且有行）
                 // → 沉淀一条 review 经验。零 LLM：修正版 SQL 本身就是教材，再花一次模型调用
@@ -914,6 +926,97 @@ fn worth_learning(st: &State, rs: &dms_connector::source::RowSet) -> bool {
     let all_null = rs.rows.len() == 1
         && rs.rows[0].iter().all(|c| matches!(c, serde_json::Value::Null));
     !all_null
+}
+
+// ─────────────────────── 【判官实测·问题 1②】LLM 出口的合同绕开降级 ───────────────────────
+
+/// 销售合同指标匹配：**镜像** `server/src/direct.rs` 的 `warehouse_sales_metrics`
+/// （词表源头是同一份合同 `sales_fact::METRICS` 的 name/aliases + 三个额外问法词；
+/// direct.rs 另一路在改、agent 不许反向引 server，故守一份镜像，漂移由单测锁）。
+/// 判据逐条对齐：每指标取最长命中词 → 按词长排序去重（被已选词真包含的让位）→ 按问句位置排序。
+/// 两个消费者：本文件 `contract_bypass_note`（LLM 出口降级）与
+/// `ask.rs` 的「维度成员值优先」门（direct-doc 外包）。
+pub(crate) fn sales_contract_metrics(
+    question: &str,
+) -> Vec<(dms_semantic::sales_fact::Metric, &'static str)> {
+    let mut candidates = dms_semantic::sales_fact::METRICS
+        .iter()
+        .copied()
+        .filter_map(|m| {
+            std::iter::once(m.name())
+                .chain(m.aliases().iter().copied())
+                .chain(sales_metric_extra_words(m).iter().copied())
+                .filter(|w| question.contains(w))
+                .max_by_key(|w| w.chars().count())
+                .map(|w| (m, w))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, w)| std::cmp::Reverse(w.chars().count()));
+    let mut selected: Vec<(dms_semantic::sales_fact::Metric, &'static str)> = vec![];
+    for candidate in candidates {
+        if selected.iter().any(|(_, word)| word.contains(candidate.1)) {
+            continue;
+        }
+        selected.push(candidate);
+    }
+    selected.sort_by_key(|(_, w)| question.find(*w).unwrap_or(usize::MAX));
+    selected
+}
+
+/// 额外问法词：与 `direct.rs` 的 `sales_fact_metric_extra_words` 逐字同源（镜像关系见上）。
+/// `pub(crate)` 的第二消费者：`ask.rs` 的值词残留提取（剥词表必须与命中判据同一份）。
+pub(crate) fn sales_metric_extra_words(
+    metric: dms_semantic::sales_fact::Metric,
+) -> &'static [&'static str] {
+    use dms_semantic::sales_fact::Metric;
+    match metric {
+        Metric::SalesAmount => &["销售金额"],
+        Metric::RevenueExcludingTax => &["收入"],
+        Metric::GrossProfit => &["毛利"],
+        _ => &[],
+    }
+}
+
+/// 与已验证销售合同（`sales_fact` DWS 日事实）**主题重叠**的 ODS 表：同一批线下销售业务的
+/// 原始层。LLM 兜底路径引了它们、又没引合同表 = 绕开合同口径（2.29 亿 vs 2.03 亿那一案）。
+/// `t_sales_order_logistics` 是物流批次，刻意不在列 —— 匹配按**最后一段表名精确等值**，不做前缀。
+const CONTRACT_OVERLAP_TABLES: &[&str] = &["t_sales_order", "t_sales_order_detail", "t_winc_sale_report"];
+
+/// 合同绕开判据（**纯函数**，故有单测）。三要件缺一不可：
+/// ① 问句点了合同指标（`sales_contract_metrics` 非空 —— 订单数/库存/售后不是合同指标，
+///    那些问题走 ODS 是正当口径，不许标注）；
+/// ② 最终 SQL 引了主题重叠的 ODS 表（大小写不敏感、按最后一段表名精确等值）；
+/// ③ 最终 SQL 没引合同事实表（引了 —— 哪怕混用 —— 都不算绕开）。
+/// 产出 = 给用户看的口径说明，落到 `st.note`：trust 经 `ctx::attach_trust` 既有机制
+/// 降 review（caliber_note 非空 = risk），同时 `worth_learning` 否决语料沉淀。
+fn contract_bypass_note(question: &str, tables: &[String]) -> Option<String> {
+    if sales_contract_metrics(question).is_empty() {
+        return None;
+    }
+    let hit = |name: &str| tables.iter().any(|t| t.eq_ignore_ascii_case(name));
+    if hit(dms_semantic::sales_fact::TABLE_NAME) {
+        return None;
+    }
+    let overlap: Vec<&str> =
+        CONTRACT_OVERLAP_TABLES.iter().copied().filter(|t| hit(t)).collect();
+    if overlap.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "本答案由 LLM 路径从 ODS 原始表（{}）计算，未使用已验证的销售合同口径（{}）：\
+         有效单过滤、时间列与退换货冲减可能不同，数字与合同口径可能有差，仅供排查参考。",
+        overlap.join("、"),
+        dms_semantic::sales_fact::TABLE
+    ))
+}
+
+/// IO 半：AST 取最终 SQL 引用的表（解析失败 = None 不标注 —— 那条路已有自己的失败处置，
+/// 降级标注绝不反过来把一次成功取数标成可疑）。与 derive 的用表硬校验同一解析入口，
+/// 不另抄一份表名提取（两份实现必漂）。
+fn contract_overlap_note(cx: &AskCtx<'_>, sql: &str) -> Option<String> {
+    let refs = dms_kernel::sql::ast::table_refs_of(sql, cx.source.dialect()).ok()?;
+    let tables: Vec<String> = refs.iter().filter_map(|parts| parts.last().cloned()).collect();
+    contract_bypass_note(cx.question, &tables)
 }
 
 /// SchemaCorrector（移植 SuperSonic）：执行前字段白名单校验，幻觉列携真实列清单自修一次。
@@ -1576,5 +1679,97 @@ mod steer_tests {
         // 切面自证：切出来的必须是 run_once 的生产段（含尝试循环），不是判据自己
         assert!(body.contains("while attempt < MAX_ATTEMPTS") && !body.contains("assert!"),
             "run_once 段切歪了：{body}");
+    }
+}
+
+#[cfg(test)]
+mod contract_bypass_tests {
+    use super::*;
+
+    /// 🔴 镜像漂移锁：`sales_contract_metrics` 与合同的 name/aliases + 三个额外问法词同源。
+    /// direct.rs 那份匹配器另一路在改 —— 两边词表源头都是 `sales_fact::METRICS`，
+    /// 谁改了合同词表，这里当场红（而不是静默漂成两种「什么算销售指标」）。
+    #[test]
+    fn contract_metric_matcher_mirrors_the_sales_contract() {
+        use dms_semantic::sales_fact::Metric;
+        // 每个合同指标的正式名都必须命中
+        for m in dms_semantic::sales_fact::METRICS {
+            assert!(
+                sales_contract_metrics(m.name()).iter().any(|(hit, _)| hit == m),
+                "合同指标名未命中：{}",
+                m.name()
+            );
+        }
+        // 三个额外问法词（与 direct.rs `sales_fact_metric_extra_words` 逐字同源）
+        assert!(sales_contract_metrics("上月销售金额").iter().any(|(m, _)| *m == Metric::SalesAmount));
+        assert!(sales_contract_metrics("上月收入").iter().any(|(m, _)| *m == Metric::RevenueExcludingTax));
+        assert!(sales_contract_metrics("上月毛利").iter().any(|(m, _)| *m == Metric::GrossProfit));
+        // 别名抽查（判官案同族问法）
+        assert!(sales_contract_metrics("上月营业额").iter().any(|(m, _)| *m == Metric::SalesAmount));
+        assert!(sales_contract_metrics("上月销量").iter().any(|(m, _)| *m == Metric::SalesQuantity));
+        // 反向（防恒真）：订单数/库存/售后都不是合同指标，一个都不许命中
+        for q in ["上月有多少订单", "现在库存量是多少", "上月退货金额"] {
+            assert!(sales_contract_metrics(q).is_empty(), "非合同指标被误命中：{q}");
+        }
+        // 多指标按问句位置排序（「销售额和毛利」两个都中、顺序不变）
+        let hits = sales_contract_metrics("上月销售额和毛利");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits[0].0 == Metric::SalesAmount && hits[1].0 == Metric::GrossProfit, "{hits:?}");
+    }
+
+    /// 🔴 判官原案（问题 1②）：「上个月消售额多少」落 LLM 全目录路径打了 ODS 订单表
+    /// （2.29 亿），正确问法走 verified 合同（2.03 亿）—— 同题两答案且 trust=high 无提示。
+    /// 降级三要件：点了合同指标 + 引了主题重叠的 ODS 表 + 没引合同表，缺一不可。
+    #[test]
+    fn ods_overlap_with_contract_metric_gets_a_caliber_note() {
+        // 判官原案（run 看到的是 ask 入口归一后的问句 —— 这里显式走同一入口）
+        let q = crate::triage::normalize_typos("上个月消售额多少");
+        let note = contract_bypass_note(&q, &["t_sales_order".into()]).expect("绕开合同必须标注");
+        assert!(note.contains("合同口径") && note.contains("t_sales_order"), "{note}");
+        // 表名大小写不敏感；明细表与经销商上报表同样算主题重叠
+        assert!(contract_bypass_note("上月销售额", &["T_SALES_ORDER_DETAIL".into()]).is_some());
+        assert!(contract_bypass_note("上月销售额", &["t_winc_sale_report".into()]).is_some());
+        // 三要件各缺一支都不许标注：
+        assert!(
+            contract_bypass_note(
+                "上月销售额",
+                &["dws_off_offline_sale_dfn".into(), "t_sales_order".into()]
+            )
+            .is_none(),
+            "引了合同表就不算绕开（哪怕混用）"
+        );
+        assert!(
+            contract_bypass_note("上月有多少订单", &["t_sales_order".into()]).is_none(),
+            "订单数不是合同指标 —— 走 ODS 是正当口径"
+        );
+        assert!(
+            contract_bypass_note("上月销售额", &["t_activity_main".into()]).is_none(),
+            "不在重叠集的表不归这条管"
+        );
+        // 精确匹配最后一段表名：物流批次表不许被 t_sales_order 前缀吞掉
+        assert!(contract_bypass_note("上月销售额", &["t_sales_order_logistics".into()]).is_none());
+    }
+
+    /// 接线判据（源码扫描 —— execute 要走库，无库测不了。锚点 `concat!` 拼，自匹配家族）：
+    /// 绕开标注必须在 `worth_learning` **之前**落 —— 顺序反了，绕开合同的 SQL 就会被
+    /// 沉淀成 few-shot 教给下一次问答（note 非空 ⇒ worth_learning 否决是既有机制）。
+    #[test]
+    fn bypass_note_is_set_before_exemplar_learning() {
+        let src = include_str!("run.rs");
+        let body = src
+            .split(concat!("async fn ", "execute("))
+            .nth(1)
+            .expect("execute 没了 —— 顺手把这条判据一起改")
+            .split(concat!("async fn ", "repair_round("))
+            .next()
+            .expect("execute 边界没了");
+        let note = body
+            .find(concat!("contract_overlap_", "note(cx, scoped.wire())"))
+            .expect("合同绕开降级没接线");
+        let learn = body.find("worth_learning(st, &rs)").expect("语料沉淀判据没了");
+        assert!(note < learn, "绕开标注必须在 worth_learning 之前：{body}");
+        // 空结果那一支不该有标注（没有数字可怀疑；出界空结果另有 no-topic 出口）
+        let zero = body.find("zero-rows").expect("零行留痕没了");
+        assert!(zero < note, "零行分支必须先于标注分支（空结果不打绕开标注）：{body}");
     }
 }

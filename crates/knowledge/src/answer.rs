@@ -20,9 +20,22 @@ use dms_kernel::{Answer, ChatModel, ChatRequest, Citation, ModelTier};
 /// 单块进 prompt 的上限（字符数，中文一字一符）
 const BLOCK_CHARS: usize = 1200;
 
-/// 「没有」的唯一文案。两条路都落它：检索零命中（**不调 LLM**），
-/// 以及模型一句带角标的话都没给出（无引用即无结论，不许把它的自由发挥当答案）。
+/// 「没有」的基干文案。两条路都落它：检索零命中（**不调 LLM**，此时经 `no_hit_text`
+/// 带上检索范围与建议），以及模型一句带角标的话都没给出（无引用即无结论，
+/// 不许把它的自由发挥当答案 —— 那条路有命中但给不出结论，不是「空结果」，保持基干文案）。
 const NO_HIT: &str = "知识库里没有相关内容。";
+
+/// 空结果兜底文案（KB 审查⑥）：说清检索范围（哪个空间、几篇文档）并给下一步建议，
+/// 不再是一句孤零零的「没有」。`searched_docs = None` = 本次没真正检索
+/// （归一化后为空的问题），不带范围，保持基干文案。
+fn no_hit_text(space: Option<&str>, searched_docs: Option<usize>) -> String {
+    let Some(n) = searched_docs else { return NO_HIT.to_string() };
+    let scope = match space {
+        Some(s) => format!("空间「{s}」"),
+        None => "全部可见空间".to_string(),
+    };
+    format!("{NO_HIT}已检索{scope}的 {n} 篇文档，可换关键词再试，或联系管理员补充资料。")
+}
 
 /// 系统段。第二句是 I5 不变量的措辞落点，改它等于改防线。
 const SYSTEM: &str = "你是企业知识库问答助手。只依据 <untrusted_document> 标签里的资料回答问题。\
@@ -101,14 +114,20 @@ async fn run(
     weights: &retrieve::RrfWeights,
     t0: std::time::Instant,
 ) -> (Result<Answer, KbError>, qa_log::Obs) {
-    match retrieve::search_with_status(store, embed, v, space, q, weights).await {
-        Ok((hits, vec_down)) => respond(llm, &hits, q, t0, vec_down).await,
+    match retrieve::search_report(store, embed, v, space, q, weights).await {
+        Ok(report) => {
+            // 空结果兜底文案的范围（KB 审查⑥）：归一化后为空的问题其实没检索过，不带范围
+            let searched =
+                (!report.normalized_query.is_empty()).then_some(report.stats.visible_docs);
+            respond(llm, &report.hits, q, t0, report.vector_degraded, space, searched).await
+        }
         Err(e) => (Err(e), qa_log::Obs::default()),
     }
 }
 
 /// 检索之后的纯编排（IO 只剩 LLM 一次）——无命中路径不调 LLM 就锁在这里。
 /// `vec_down` = 向量路缺席（`retrieve::search_with_status` 的第二项），仅写服务端诊断。
+/// `space` + `searched_docs`（Some = 真检索过的可见文档数）只进空结果兜底文案。
 /// 观测产出随结果一起回：无命中全 0（没调 LLM）；打过一发就记 1 发 + 供应商回的用量。
 async fn respond(
     llm: &dyn ChatModel,
@@ -116,13 +135,18 @@ async fn respond(
     question: &str,
     t0: std::time::Instant,
     vec_down: bool,
+    space: Option<&str>,
+    searched_docs: Option<usize>,
 ) -> (Result<Answer, KbError>, qa_log::Obs) {
     let ms = |t: std::time::Instant| t.elapsed().as_millis();
     if vec_down {
         tracing::warn!("知识库向量召回降级；仅记录服务端诊断，不向业务答案泄露检索实现");
     }
     if hits.is_empty() {
-        return (Ok(Answer::text(NO_HIT.to_string(), vec![], ms(t0))), qa_log::Obs::default());
+        return (
+            Ok(Answer::text(no_hit_text(space, searched_docs), vec![], ms(t0))),
+            qa_log::Obs::default(),
+        );
     }
     let req = ChatRequest::text(ModelTier::Precise, SYSTEM, &user_prompt(hits, question), Some(0.1));
     let reply = match llm.chat(req).await {
@@ -1027,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn no_hit_never_calls_llm() {
         let f = Fake::new("我猜报销上限是 5000 元。");
-        let (a, obs) = respond(&f, &[], "报销上限", std::time::Instant::now(), false).await;
+        let (a, obs) = respond(&f, &[], "报销上限", std::time::Instant::now(), false, None, None).await;
         let a = a.unwrap();
         assert_eq!(f.calls.load(Ordering::Relaxed), 0, "无命中不许调 LLM");
         assert_eq!(obs.llm_calls, 0, "没调用就是 0 发 —— 落账靠它认出「这发没烧钱」");
@@ -1035,11 +1059,37 @@ mod tests {
         assert_eq!(a.route, "knowledge");
     }
 
+    /// 空结果兜底文案带范围与建议（KB 审查⑥）；没真正检索（None）时保持基干文案。
+    #[test]
+    fn no_hit_message_carries_scope_and_suggestion() {
+        assert_eq!(
+            no_hit_text(Some("财务共享"), Some(3)),
+            "知识库里没有相关内容。已检索空间「财务共享」的 3 篇文档，可换关键词再试，或联系管理员补充资料。"
+        );
+        assert_eq!(
+            no_hit_text(None, Some(0)),
+            "知识库里没有相关内容。已检索全部可见空间的 0 篇文档，可换关键词再试，或联系管理员补充资料。"
+        );
+        assert_eq!(no_hit_text(Some("财务共享"), None), NO_HIT);
+    }
+
+    /// 经 `respond` 全链：无命中 → 文案带空间与篇数，且一次 LLM 都不调。
+    #[tokio::test]
+    async fn no_hit_answer_includes_the_searched_scope() {
+        let f = Fake::new("不该被调用");
+        let (a, _) =
+            respond(&f, &[], "q", std::time::Instant::now(), false, Some("sp1"), Some(7)).await;
+        let (md, n) = text_of(&a.unwrap());
+        assert!(md.contains("已检索空间「sp1」的 7 篇文档"), "{md}");
+        assert_eq!(n, 0);
+        assert_eq!(f.calls.load(Ordering::Relaxed), 0, "无命中不许调 LLM");
+    }
+
     /// 有命中且调了 LLM：观测记 1 发 + 供应商回的用量（落账的 token 口径）
     #[tokio::test]
     async fn cited_reply_reports_one_llm_call_with_usage() {
         let f = Fake::new("报销上限 800 元[^1]。");
-        let (a, obs) = respond(&f, &[hit("报销上限 800 元")], "上限", std::time::Instant::now(), false).await;
+        let (a, obs) = respond(&f, &[hit("报销上限 800 元")], "上限", std::time::Instant::now(), false, None, None).await;
         a.unwrap();
         assert_eq!(f.calls.load(Ordering::Relaxed), 1);
         assert_eq!(obs.llm_calls, 1, "打过一发就是 1 发");
@@ -1050,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn ungrounded_reply_answers_no_hit_without_citations() {
         let f = Fake::new("根据我的经验，报销上限是 5000 元。");
-        let a = respond(&f, &[hit("报销上限 800 元")], "上限", std::time::Instant::now(), false)
+        let a = respond(&f, &[hit("报销上限 800 元")], "上限", std::time::Instant::now(), false, None, None)
             .await.0.unwrap();
         assert_eq!(f.calls.load(Ordering::Relaxed), 1);
         assert_eq!(text_of(&a), (NO_HIT.to_string(), 0));
@@ -1059,7 +1109,7 @@ mod tests {
     #[tokio::test]
     async fn structure_only_reply_answers_no_hit_without_citations() {
         let f = Fake::new("## 直接结论\n\n| 项目 | 标准 |\n| --- | --- |");
-        let a = respond(&f, &[hit("报销上限 800 元")], "上限", std::time::Instant::now(), false)
+        let a = respond(&f, &[hit("报销上限 800 元")], "上限", std::time::Instant::now(), false, None, None)
             .await.0.unwrap();
         assert_eq!(text_of(&a), (NO_HIT.to_string(), 0));
     }
@@ -1067,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn cited_reply_passes_through() {
         let f = Fake::new("报销上限 800 元[^1]。这是我编的。");
-        let a = respond(&f, &[hit("报销上限 800 元")], "上限", std::time::Instant::now(), false)
+        let a = respond(&f, &[hit("报销上限 800 元")], "上限", std::time::Instant::now(), false, None, None)
             .await.0.unwrap();
         assert_eq!(text_of(&a).0, "报销上限 800 元[^1]。");
     }
@@ -1124,6 +1174,8 @@ mod tests {
             "报销和交通补贴上限",
             std::time::Instant::now(),
             false,
+            None,
+            None,
         )
         .await.0.unwrap();
         let (md, n) = text_of(&a);
@@ -1146,6 +1198,8 @@ mod tests {
             "外部培训费现在按哪个标准",
             std::time::Instant::now(),
             false,
+            None,
+            None,
         )
         .await.0.unwrap();
         let (md, n) = text_of(&a);
@@ -1332,7 +1386,7 @@ mod tests {
             })
             .collect();
         let f = Fake::new("甲[^1]。乙[^3]。丙没有来源。");
-        let a = respond(&f, &hits, "q", std::time::Instant::now(), false).await.0.unwrap();
+        let a = respond(&f, &hits, "q", std::time::Instant::now(), false, None, None).await.0.unwrap();
         let (md, n) = text_of(&a);
         assert_eq!(n, 2, "正文只剩两处引用，不许列 6 条：{md}");
         assert_eq!(md, "甲[^1]。乙[^2]。", "筛完必须重编号，否则 [^3] 指到 citations[2]");
@@ -1353,7 +1407,7 @@ mod tests {
     async fn every_footnote_used_keeps_every_citation() {
         let hits: Vec<Hit> = (0..6).map(|_| hit("正文")).collect();
         let f = Fake::new("甲[^1]乙[^2]丙[^3]丁[^4]戊[^5]己[^6]。");
-        let a = respond(&f, &hits, "q", std::time::Instant::now(), false).await.0.unwrap();
+        let a = respond(&f, &hits, "q", std::time::Instant::now(), false, None, None).await.0.unwrap();
         assert_eq!(text_of(&a), ("甲[^1]乙[^2]丙[^3]丁[^4]戊[^5]己[^6]。".to_string(), 6));
         // 越界角标（模型编的来源）不进 citations，也不得在前端伪装成可点击来源。
         assert_eq!(compact_refs("甲[^1]。乙[^9]。", 6), ("甲[^1]。乙。".into(), vec![1]));
@@ -1367,16 +1421,16 @@ mod tests {
         let f = Fake::new("报销上限 800 元[^1]。");
         let hits = [hit("报销上限 800 元")];
         let t = std::time::Instant::now();
-        assert_eq!(text_of(&respond(&f, &hits, "上限", t, false).await.0.unwrap()).0, "报销上限 800 元[^1]。");
-        let down = text_of(&respond(&f, &hits, "上限", t, true).await.0.unwrap()).0;
+        assert_eq!(text_of(&respond(&f, &hits, "上限", t, false, None, None).await.0.unwrap()).0, "报销上限 800 元[^1]。");
+        let down = text_of(&respond(&f, &hits, "上限", t, true, None, None).await.0.unwrap()).0;
         assert_eq!(down, "报销上限 800 元[^1]。", "{down}");
         assert_eq!(
-            text_of(&respond(&f, &[], "上限", t, true).await.0.unwrap()),
+            text_of(&respond(&f, &[], "上限", t, true, None, None).await.0.unwrap()),
             (NO_HIT.to_string(), 0)
         );
         let g = Fake::new("我猜是 5000 元。");
         assert_eq!(
-            text_of(&respond(&g, &hits, "上限", t, true).await.0.unwrap()),
+            text_of(&respond(&g, &hits, "上限", t, true, None, None).await.0.unwrap()),
             (NO_HIT.to_string(), 0)
         );
     }

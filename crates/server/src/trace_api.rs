@@ -19,6 +19,7 @@
 //! { "conv_id": 123,
 //!   "rounds": [ { "msg_id": 456, "question": "本月销售额", "at": "2026-08-08T10:00:01+00:00",
 //!     "status": "succeeded", "route": "llm+repair", "elapsed_ms": 1234,
+//!     "payload_truncated": false,
 //!     "events": [
 //!       {"kind":"question","at":"…","text":"本月销售额"},
 //!       {"kind":"route","stage":"semantic-cache","result":"miss","ms":3},
@@ -35,6 +36,22 @@
 //!   可归属耗时（轮内自修没有独立计时，它含在 answer 的 ms 里）。
 //! - **降级**：payload 无 `steps`（本字段上线前的老消息 / 知识库文本答）→ 一轮只剩
 //!   「问题→回答」两节点，路由链一节都不编。
+//!
+//! ### 【性能④】列表态的 payload 投影 + 截断标记
+//! 事件组装只需要 `route/steps/elapsed_ms/sql/row_count/artifact` 六个键，而 ai 行的全量
+//! payload 带着整份结果行（`AskResult.rows`，单条几十 KB 起）—— 逐行全拉是这个端点唯一的
+//! 体量来源。`MSGS_SQL` 因此在**库侧**只投出这六键（`jsonb_build_object`；缺键投成 JSON null，
+//! 与「键缺席」在 `assemble` 里走同一条 `and_then` 降级链，事件输出与全量版**逐字相同**），
+//! 并按 3KB 阈值给每轮带回 `payload_truncated` 标记。要全文的按 `msg_id` 走下面的单条端点。
+//! 🔴 投影形状 = `assemble` 的读取面：`assemble` 哪天多读一个键，`MSGS_SQL` 必须一起加。
+//!
+//! ### `GET /api/chat/msg/{msg_id}/payload?login_name=&role_code=`
+//! 单条消息的**全量** payload（列表态只带六键投影，原文走这里）。集成接线：
+//! `.route("/api/chat/msg/{msg_id}/payload", get(trace_api::msg_payload))`
+//! 本次只交付 handler 与契约，**`main.rs` 不注册**（纪律：不改 main.rs）——注册后把
+//! handler 上的 `#[allow(dead_code)]` 一行删掉。
+//! 身份与属主闸门同 `conv_trace`（401/403/500 同一判据同一文案）；msg 不存在 404。
+//! 响应：`{ "msg_id": 456, "conv_id": 123, "payload": {…} }`（user 行 payload 为 null）。
 //!
 //! 两个事实源（不多不少）：
 //! - `chat.msg`（按 id 升序配 user→ai 成轮）：payload 的 `steps/route/elapsed_ms/sql`。
@@ -64,8 +81,39 @@ fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
 
 /// 会话全部消息（id 升序 = 落库序）。与 `chat::conv_msgs` 同表同序，多取 id/created_at：
 /// 配对成轮与跨源对时都要。
+///
+/// 【性能④】payload **库侧投影**成事件组装要的六键（详见文件头「列表态的 payload 投影」）：
+/// 全量 payload 带整份结果行（`AskResult.rows`），逐行全拉曾把这个端点顶到秒级。
+/// `r` = `result_of` 的 SQL 版（`result` 键是对象才剥一层，与 Rust 侧逐字同义）；
+/// 内层保留 `payload` 本体只为取 `artifact`（它挂在包裹层，不在 `result` 里）。
+/// `payload_truncated` = 原 payload 超 3KB 的标记（全文走 `/api/chat/msg/{id}/payload`）。
 const MSGS_SQL: &str =
-    "SELECT id, role, question, payload, created_at FROM chat.msg WHERE conv_id = $1 ORDER BY id";
+    "SELECT id, role, question, created_at, payload_truncated, payload FROM (
+       SELECT id, role, question, created_at,
+              COALESCE(octet_length(payload::text) > 3072, false) AS payload_truncated,
+              jsonb_build_object(
+                'route',      r->'route',
+                'elapsed_ms', r->'elapsed_ms',
+                'steps',      r->'steps',
+                'sql',        r->'sql',
+                'row_count',  r->'row_count',
+                'artifact',   payload->'artifact'
+              ) AS payload
+       FROM (
+         SELECT id, role, question, created_at, payload,
+                CASE WHEN jsonb_typeof(payload->'result') = 'object' THEN payload->'result' ELSE payload END AS r
+         FROM chat.msg
+         WHERE conv_id = $1
+       ) m
+     ) t
+     ORDER BY id";
+
+/// 单条消息的会话归属（属主闸门的入参）。payload **不许**在这条里一起取 ——
+/// 「任何取数都在闸门之后」（见 `conv_trace` 头注），全文在闸门通过后由 `MSG_PAYLOAD_SQL` 取。
+const MSG_CONV_SQL: &str = "SELECT conv_id FROM chat.msg WHERE id = $1";
+
+/// 单条消息的全量 payload（`msg_payload` 专用，只在属主闸门通过后执行）。
+const MSG_PAYLOAD_SQL: &str = "SELECT payload FROM chat.msg WHERE id = $1";
 
 /// 同会话的**失败**尝试（成功轮的事实 chat.msg 已有，不重复取）。
 /// 老行（status 列上线前）为空串：error 非空折成 'failed'；error 也空的是老成功行，不取。
@@ -85,9 +133,11 @@ pub struct MsgRow {
     pub role: String,
     /// user 行的问句原文（ai 行恒空串，见 `chat::save_msg` 调用点）
     pub question: String,
-    /// ai 行的结果载荷（`AskResult` / `Answer` / 深度模式包裹）
+    /// ai 行的结果载荷（**列表态为六键投影**，见 `MSGS_SQL` 头注；全文走 `msg_payload`）
     pub payload: Option<Value>,
     pub at: DateTime<Utc>,
+    /// 原 payload 是否超列表态阈值（3KB）：true = 完整 payload 可按 `id` 单条取
+    pub payload_truncated: bool,
 }
 
 /// `meta.query_log` 失败行（`FAILED_SQL` 的列序）
@@ -115,6 +165,9 @@ pub struct Round {
     pub route: String,
     /// 整轮耗时（payload / query_log 原样透出；无则 null）
     pub elapsed_ms: Option<i64>,
+    /// ai 行原 payload 是否超列表态阈值（3KB）：true = 完整 payload 按 `msg_id` 单条取
+    ///（`GET /api/chat/msg/{msg_id}/payload`）；无 ai 行的轮（interrupted/失败）恒 false
+    pub payload_truncated: bool,
     pub events: Vec<Event>,
 }
 
@@ -167,6 +220,43 @@ pub async fn conv_trace(
     Ok(Json(serde_json::json!({ "conv_id": id, "rounds": rounds })))
 }
 
+/// `GET /api/chat/msg/{msg_id}/payload` —— 单条消息的**全量** payload（只读）。
+/// 列表态（`conv_trace`）只带六键投影 + 截断标记，原文走这里；契约见文件头。
+pub async fn msg_payload(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(msg_id): Path<i64>,
+    Query(q): Query<TraceQuery>,
+) -> Result<Json<Value>, ApiErr> {
+    let (login, _) = crate::resolve_identity(&st, &headers, &q.login_name, &q.role_code)
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
+    // 先取会话归属（属主闸门的入参）；payload 在闸门通过后才取 —— 「任何取数都在闸门之后」
+    let conv_id: i64 = sqlx::query(MSG_CONV_SQL)
+        .bind(msg_id)
+        .fetch_optional(st.owned.pool())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "消息不存在"))?
+        .get("conv_id");
+    // 🔴 属主闸门（fail-closed 内联，与 `conv_trace` 同一判据同一文案）：
+    // 非属主 403；闸门自身读失败 500 拒 —— 拿不准属主时一律不放行。
+    match crate::chat::conv_owner(st.owned.pool(), conv_id).await {
+        Ok(Some(owner)) if owner == login => {}
+        Ok(_) => return Err(err(StatusCode::FORBIDDEN, "无权访问该会话")),
+        Err(_) => return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "会话状态读取失败，请稍后重试",
+        )),
+    }
+    let payload: Option<Value> = sqlx::query(MSG_PAYLOAD_SQL)
+        .bind(msg_id)
+        .fetch_optional(st.owned.pool())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .and_then(|r| r.get("payload"));
+    Ok(Json(serde_json::json!({ "msg_id": msg_id, "conv_id": conv_id, "payload": payload })))
+}
+
 /// 会话消息（同 `chat::conv_msgs` 的读法：静态 SQL + `Row::get`）
 async fn fetch_msgs(st: &AppState, conv_id: i64) -> Result<Vec<MsgRow>, ApiErr> {
     let rows = sqlx::query(MSGS_SQL)
@@ -182,6 +272,7 @@ async fn fetch_msgs(st: &AppState, conv_id: i64) -> Result<Vec<MsgRow>, ApiErr> 
             question: r.get("question"),
             payload: r.get("payload"),
             at: r.get("created_at"),
+            payload_truncated: r.get("payload_truncated"),
         })
         .collect())
 }
@@ -330,6 +421,7 @@ fn answered_round(user: Option<&MsgRow>, ai: &MsgRow) -> Round {
         status: "succeeded".into(),
         route,
         elapsed_ms: elapsed,
+        payload_truncated: ai.payload_truncated,
         events,
     }
 }
@@ -343,6 +435,7 @@ fn interrupted_round(u: &MsgRow) -> Round {
         status: "interrupted".into(),
         route: String::new(),
         elapsed_ms: None,
+        payload_truncated: false, // 没有 ai 行就没有 payload 可言
         events: vec![Event::Question {
             at: u.at.to_rfc3339(),
             text: u.question.clone(),
@@ -360,6 +453,7 @@ fn failed_round(f: &FailedRow) -> Round {
         status: f.status.clone(),
         route: f.route.clone(),
         elapsed_ms: Some(f.elapsed_ms),
+        payload_truncated: false, // 失败轮不落 chat.msg，没有 payload 可言
         events: vec![
             Event::Question {
                 at: f.at.to_rfc3339(),
@@ -400,16 +494,23 @@ mod tests {
             question: q.into(),
             payload: None,
             at: at(secs),
+            payload_truncated: false,
         }
     }
 
     fn ai_msg(id: i64, payload: Option<Value>, secs: i64) -> MsgRow {
+        ai_msg_t(id, payload, secs, false)
+    }
+
+    /// 带截断标记的 ai 行（【性能④】：原 payload 超 3KB 时列表态只带六键投影）
+    fn ai_msg_t(id: i64, payload: Option<Value>, secs: i64, payload_truncated: bool) -> MsgRow {
         MsgRow {
             id,
             role: "ai".into(),
             question: String::new(),
             payload,
             at: at(secs),
+            payload_truncated,
         }
     }
 
@@ -604,7 +705,7 @@ mod tests {
     /// 只读锚点：两条 SQL 都是单句 SELECT —— 本端点不下推任何写（任务纪律①）
     #[test]
     fn sqls_are_read_only_selects() {
-        for sql in [MSGS_SQL, FAILED_SQL] {
+        for sql in [MSGS_SQL, FAILED_SQL, MSG_CONV_SQL, MSG_PAYLOAD_SQL] {
             assert!(sql.trim_start().starts_with("SELECT"), "{sql}");
             assert!(!sql.contains(';'), "多句拼接 = 下推通道: {sql}");
             for kw in ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "GRANT", "TRUNCATE"] {
@@ -616,6 +717,12 @@ mod tests {
         assert!(FAILED_SQL.contains("(status = '' AND error <> '')"), "老行折算: {FAILED_SQL}");
         assert!(FAILED_SQL.contains("conv_id = $1"), "会话过滤必须内联在 SQL 里: {FAILED_SQL}");
         assert!(MSGS_SQL.contains("WHERE conv_id = $1"), "{MSGS_SQL}");
+        // 【性能④】列表态必须是库侧投影 + 3KB 截断标记：全量 payload（含整份结果行）
+        // 逐行全拉曾把这个端点顶到秒级；`result` 剥层与 Rust 侧 `result_of` 逐字同义
+        assert!(MSGS_SQL.contains("jsonb_build_object"), "库侧投影没了: {MSGS_SQL}");
+        assert!(MSGS_SQL.contains("3072"), "3KB 截断标记没了: {MSGS_SQL}");
+        assert!(MSGS_SQL.contains("jsonb_typeof(payload->'result') = 'object'"), "剥层判据: {MSGS_SQL}");
+        assert!(MSG_PAYLOAD_SQL.contains("WHERE id = $1"), "单条全文必须按主键取: {MSG_PAYLOAD_SQL}");
     }
 
     /// 端点契约锚点：文件头写清路径、响应键与集成接线行（父代理按它注册路由）
@@ -629,5 +736,50 @@ mod tests {
         for h in ["pub async fn conv_trace", "pub fn assemble"] {
             assert!(src.contains(h), "{h}");
         }
+    }
+
+    /// 【性能④】截断标记随轮透出：ai 行超阈值 → 该轮 true 且事件一字不受标记影响；
+    /// interrupted / 失败轮（没有 ai 行）恒 false。
+    #[test]
+    fn payload_truncated_marker_follows_the_ai_row() {
+        let payload = serde_json::json!({"route": "llm", "elapsed_ms": 5});
+        let rounds = assemble(&[user_msg(1, "q", 10), ai_msg_t(2, Some(payload), 20, true)], &[]);
+        assert!(rounds[0].payload_truncated, "ai 行超阈值必须带出标记");
+        assert_eq!(kinds(&rounds[0]), ["question", "answer"], "标记只换传输形态，不换事件");
+        assert!(!assemble(&[user_msg(1, "q", 10)], &[])[0].payload_truncated, "interrupted 轮恒 false");
+        let failed = [FailedRow {
+            question: "q".into(), route: String::new(), elapsed_ms: 1,
+            status: "failed".into(), error: "e".into(), at: at(5),
+        }];
+        assert!(!assemble(&[], &failed)[0].payload_truncated, "失败轮恒 false");
+    }
+
+    /// 【性能④】单条全文端点：契约写在文件头；闸门顺序 = 身份 → 取 conv_id → 属主闸门 →
+    /// 取 payload（payload 在闸门通过后才离开库 —— 与 `conv_trace` 同一条 fail-closed 纪律）；
+    /// 且本次**不注册 main.rs**（handler 暂挂 `#[allow(dead_code)]`，注册时删）。
+    #[test]
+    fn msg_payload_endpoint_contract_and_gate_order() {
+        let src = include_str!("trace_api.rs");
+        let head = src.split("\nuse ").next().unwrap();
+        assert!(head.contains("GET /api/chat/msg/{msg_id}/payload"), "契约路径: {head}");
+        assert!(head.contains(r#".route("/api/chat/msg/{msg_id}/payload", get(trace_api::msg_payload))"#), "接线行: {head}");
+        let body = src
+            .split("pub async fn msg_payload")
+            .nth(1)
+            .expect("handler 没了")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let auth = body.find("crate::resolve_identity").expect("身份解析不在了");
+        let conv = body.find("MSG_CONV_SQL").expect("conv_id 读取不在了");
+        let gate = body.find("crate::chat::conv_owner").expect("属主闸门不在了");
+        let pay = body.find("MSG_PAYLOAD_SQL").expect("payload 读取不在了");
+        assert!(
+            auth < conv && conv < gate && gate < pay,
+            "顺序必须是 身份 → conv_id → 属主闸门 → payload: {body}"
+        );
+        assert!(body.contains("消息不存在"), "404 分支: {body}");
+        assert!(body.contains("无权访问该会话"), "403 分支: {body}");
+        assert!(body.contains("会话状态读取失败"), "闸门读失败的 500 分支: {body}");
     }
 }

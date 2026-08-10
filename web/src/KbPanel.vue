@@ -2732,6 +2732,18 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .create-box input:focus { border-color: var(--primary); box-shadow: var(--ring); }
 .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+/* 文档表中间档：面板内容宽 < 文档表网格最小宽（≈800px）时操作列被裁 —— 820 之上先切卡片堆叠 */
+@media (max-width: 1130px) {
+  .doc-table-head { display: none; }
+  .doc-table { border: 0; overflow: visible; }
+  .doc-row {
+    grid-template-columns: 1fr 1fr; gap: 8px 14px; margin-bottom: 8px; padding: 12px;
+    border: 1px solid var(--border); min-height: 0;
+  }
+  .doc-row:first-of-type { border-top: 1px solid var(--border); }
+  .doc-name-cell, .doc-status-cell { grid-column: 1 / -1; }
+  .doc-row > span::before { content: attr(data-label) ' · '; color: var(--text-faint); }
+}
 @media (max-width: 820px) {
   .kbp-mask { padding: 0; }
   .kbp { width: 100%; height: 100%; border: 0; border-radius: 0; }
@@ -2753,15 +2765,6 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .library-head { align-items: stretch; flex-direction: column; gap: 10px; }
   .library-tools { width: 100%; margin-left: 0; }
   .search-box { width: 100%; }
-  .doc-table-head { display: none; }
-  .doc-table { border: 0; overflow: visible; }
-  .doc-row {
-    grid-template-columns: 1fr 1fr; gap: 8px 14px; margin-bottom: 8px; padding: 12px;
-    border: 1px solid var(--border); min-height: 0;
-  }
-  .doc-row:first-of-type { border-top: 1px solid var(--border); }
-  .doc-name-cell, .doc-status-cell { grid-column: 1 / -1; }
-  .doc-row > span::before { content: attr(data-label) ' · '; color: var(--text-faint); }
   .filter-bar { overflow-x: auto; }
   .retrieval-input-row { flex-direction: column; }
   .retrieval-input-row .primary-btn { height: 36px; }

@@ -36,9 +36,14 @@
 //!   （前端自己拆），外加一个 `conv_id` —— 客户端拿着它追问，服务端才串得起多轮。
 //! - token 失效：HTTP 401 + `{"code":30007, "data":null, "msg":"token 失效"}` ——
 //!   拦截器按 30007 弹登录框。token 空白、上游 401/403、上游 code 非 0 全归一到这一种
-//!   （对小程序来说「该重新登录了」只有这一种安全姿态）。
+//!   （对小程序来说「该重新登录了」只有这一种安全姿态）。上游明确判失效的 token 进
+//!   60s 负缓存：坏 token 重放打在缓存上，不逐次穿透上游。
+//! - 限流：HTTP 429 + `{"code":429,...}` —— 同一 IP 每分钟 20 次（per-IP 固定窗口，
+//!   `auth::ip_rate_allow`），ask/me 共用前段一道闸。
+//! - 入参限长：question / prev_question ≤ 500 字、prev_sql ≤ 2000 字，超出 400
+//!  （与 web 端输入框 maxlength 同口径；超限拒收，不静默截断）。
 //! - 校验服务本身不可用（超时/网络/上游 5xx）：HTTP 502 + `{"code":500,...}` ——
-//!   重试可能好，**不该**骗用户重新登录。
+//!   重试可能好，**不该**骗用户重新登录。瞬时故障不进缓存（下一次重试必须真能打到上游）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -66,10 +71,18 @@ const LOGIN_INFO_PATH: &str = "/login/getLoginInfo";
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// 进程内身份缓存 TTL：60s。这是「每问一句都打一次外部校验」与「权限实时性」的取舍：
 /// token 失效/切角色最多滞后 60s 生效，60s 内同一个 token 重复问不重复打外部。
+/// 同 TTL 兼作**负缓存**：上游明确判失效的 token 也记 60s，坏 token 重放打在缓存上，
+/// 不再逐次穿透上游（拿我们当对上游的放大器）。
 const CACHE_TTL: Duration = Duration::from_secs(60);
 /// 缓存容量上限：1000 条（一条不过几百字节）。满了淘汰过期点最早的那条。
 /// 不设上限 = 常驻内存随登录态数量单调涨。
 const CACHE_CAP: usize = 1000;
+
+/// 入参限长（与 web 端口径对齐：web 输入框 maxlength=500；上一轮 SQL 给到 2000）。
+/// 无上限字符串是慢查询 / 会话存储 / LLM prompt 三处共同的成本放大面 —— 超限 400 拒收
+/// 而不是截断（静默截断会把「问题没问全」藏成「答非所问」）。
+const MAX_QUESTION_CHARS: usize = 500;
+const MAX_PREV_SQL_CHARS: usize = 2000;
 
 /// 小程序协议码：成功
 const CODE_OK: i64 = 0;
@@ -157,12 +170,21 @@ enum AuthFail {
 
 // ---------------------------------------------------------------- 进程内缓存
 
+/// 缓存判定：有效身份 / 上游明确判失效（负缓存）。
+/// 瞬时故障（Unavailable）**绝不进缓存** —— 把「上游抖了一下」存成「这 token 不行」会误伤。
+#[derive(Clone, Debug, PartialEq)]
+enum CacheVerdict {
+    Valid(XcxIdentity),
+    /// 上游明确判失效（401/403 或业务码非 0）：60s 负缓存，重放不再穿透上游
+    Invalid,
+}
+
 struct CacheEntry {
-    identity: XcxIdentity,
+    verdict: CacheVerdict,
     expires_at: Instant,
 }
 
-/// token → (身份, 过期点)。`Mutex<HashMap>` 就够：临界区只做 map 操作，**锁不跨 await**
+/// token → (判定, 过期点)。`Mutex<HashMap>` 就够：临界区只做 map 操作，**锁不跨 await**
 ///（`validate_xcx_token` 里拿锁/放锁都在同步段 —— 跨了就是全进程的问答在等一把身份锁）。
 /// 过期条目不主动清扫：靠「读时判过期 + 满员插入时淘汰最旧」两件事兜住增长。
 struct TokenCache {
@@ -170,13 +192,13 @@ struct TokenCache {
 }
 
 impl TokenCache {
-    /// 命中且未过期才给身份；过期按 miss（留着不删，下次 put 同 key 自然覆盖）。
-    fn get(&self, token: &str, now: Instant) -> Option<XcxIdentity> {
+    /// 命中且未过期才给判定；过期按 miss（留着不删，下次 put 同 key 自然覆盖）。
+    fn get(&self, token: &str, now: Instant) -> Option<CacheVerdict> {
         let e = self.map.get(token)?;
-        (e.expires_at > now).then(|| e.identity.clone())
+        (e.expires_at > now).then(|| e.verdict.clone())
     }
 
-    fn put(&mut self, token: String, identity: XcxIdentity, now: Instant) {
+    fn put(&mut self, token: String, verdict: CacheVerdict, now: Instant) {
         // 满员且是新 key：淘汰过期点最早（最旧）的一条。O(n) 只在满员插入时付一次，
         // 1000 条量级无感 —— 为一个 1000 条的缓存引一套堆结构是过度设计。
         if self.map.len() >= CACHE_CAP && !self.map.contains_key(&token) {
@@ -192,16 +214,17 @@ impl TokenCache {
         self.map.insert(
             token,
             CacheEntry {
-                identity,
+                verdict,
                 expires_at: now + CACHE_TTL,
             },
         );
     }
 }
 
-/// 进程级单例。token 本身当 key —— 缓存命中即视为登录态有效，这是 TTL 内的事；
-/// 注意缓存**不随 `xcx_auth_base` 运行时切换失效**：base 换地址后旧身份最多再活 60s，
-/// 对「换校验后端」这种运维动作这是可接受的滞后（已在文件头协议里声明 TTL 语义）。
+/// 进程级单例。token 本身当 key —— 命中 Valid 即视为登录态有效（TTL 内的事）；
+/// 命中 Invalid 即视为已失效（负缓存）。注意缓存**不随 `xcx_auth_base` 运行时切换失效**：
+/// base 换地址后旧判定最多再活 60s，对「换校验后端」这种运维动作这是可接受的滞后
+///（已在文件头协议里声明 TTL 语义）。
 static TOKEN_CACHE: LazyLock<Mutex<TokenCache>> =
     LazyLock::new(|| Mutex::new(TokenCache { map: HashMap::new() }));
 
@@ -224,19 +247,36 @@ fn normalize_base(raw: Option<String>) -> Option<String> {
 // ---------------------------------------------------------------- token 校验
 
 /// token → 身份：缓存命中（未过期）直接返，不打外部；miss/过期才调 getLoginInfo 并回填缓存。
+/// 上游**明确判失效**的 token 同样回填（负缓存）：同一个坏 token 的重复重放打在缓存上，
+/// 不再逐次穿透上游。瞬时故障（Unavailable）不缓存 —— 下一次重试必须真能打到上游。
 /// 失败出路就 `AuthFail` 两种，HTTP/协议码分叉收在 `require_identity`。
 async fn validate_xcx_token(base: &str, token: &str) -> Result<XcxIdentity, AuthFail> {
     let now = Instant::now();
     if let Some(hit) = TOKEN_CACHE.lock().expect("xcx 缓存锁中毒").get(token, now) {
-        return Ok(hit);
+        return match hit {
+            CacheVerdict::Valid(id) => Ok(id),
+            // 负缓存命中：与上游亲判同形（调用方无感），只是不再打外部
+            CacheVerdict::Invalid => Err(AuthFail::TokenInvalid),
+        };
     }
     // 锁已在上一句结尾放掉 —— await 期间不持锁（TokenCache 注释那条红线）
-    let id = fetch_identity(base, token).await?;
-    TOKEN_CACHE
-        .lock()
-        .expect("xcx 缓存锁中毒")
-        .put(token.to_string(), id.clone(), Instant::now());
-    Ok(id)
+    match fetch_identity(base, token).await {
+        Ok(id) => {
+            TOKEN_CACHE
+                .lock()
+                .expect("xcx 缓存锁中毒")
+                .put(token.to_string(), CacheVerdict::Valid(id.clone()), Instant::now());
+            Ok(id)
+        }
+        Err(AuthFail::TokenInvalid) => {
+            TOKEN_CACHE
+                .lock()
+                .expect("xcx 缓存锁中毒")
+                .put(token.to_string(), CacheVerdict::Invalid, Instant::now());
+            Err(AuthFail::TokenInvalid)
+        }
+        Err(AuthFail::Unavailable) => Err(AuthFail::Unavailable),
+    }
 }
 
 /// 实际打外部那一次：GET {base}/login/getLoginInfo。
@@ -302,9 +342,34 @@ fn invalid_token_err() -> ApiErr {
     fail(StatusCode::UNAUTHORIZED, CODE_TOKEN_INVALID, "token 失效")
 }
 
-/// 两个端点共用的前段：功能开关 → 取 token → 校验（含缓存）。
-/// 404（未配置）/ 401（token 空白或失效）/ 502（校验服务不可用）全部收在这里。
+/// ⑤ 入参限长判据（纯函数，handler 只负责把 Err 映射成 400）：
+/// question / prev_question ≤ 500 字、prev_sql ≤ 2000 字（按字符计，不按字节切 CJK）。
+fn lengths_ok(question: &str, prev_question: Option<&str>, prev_sql: Option<&str>) -> Result<(), &'static str> {
+    if question.chars().count() > MAX_QUESTION_CHARS {
+        return Err("question 超长（最多 500 字）");
+    }
+    if prev_question.is_some_and(|q| q.chars().count() > MAX_QUESTION_CHARS) {
+        return Err("prev_question 超长（最多 500 字）");
+    }
+    if prev_sql.is_some_and(|s| s.chars().count() > MAX_PREV_SQL_CHARS) {
+        return Err("prev_sql 超长（最多 2000 字）");
+    }
+    Ok(())
+}
+
+/// 两个端点共用的前段：per-IP 限流 → 功能开关 → 取 token → 校验（含缓存）。
+/// 429（限流）/ 404（未配置）/ 401（token 空白或失效）/ 502（校验服务不可用）全部收在这里。
 async fn require_identity(st: &AppState, headers: &HeaderMap) -> Result<XcxIdentity, ApiErr> {
+    // ① per-IP 限流：这两个端点原本零限流 —— 坏 token 每次实打上游（穿透放大），
+    // 好 token 也能拿来刷问答预算。同一 IP 20 次/分钟，超出 429（与 login/sso 同模子，
+    // 契约见 `auth::ip_rate_allow` 文档）。放在最前：这是最便宜的一道闸。
+    if !crate::auth::ip_rate_allow(&crate::auth::client_ip(headers)) {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            429,
+            "请求过于频繁，请稍后重试",
+        ));
+    }
     let base = normalize_base(st.cfg().xcx_auth_base.clone())
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, 404, "小程序接入未启用"))?;
     let token = headers
@@ -347,6 +412,14 @@ pub async fn ask(
     let question = req.question.trim();
     if question.is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, 400, "question 不能为空"));
+    }
+    // ⑤ 限长（与 web 端口径对齐）：超限 400 拒收，不静默截断
+    if let Err(msg) = lengths_ok(
+        question,
+        req.prev_question.as_deref().map(str::trim),
+        req.prev_sql.as_deref(),
+    ) {
+        return Err(fail(StatusCode::BAD_REQUEST, 400, msg));
     }
     // 身份 → Principal：员工禁用 / 多角色未选在这里被拒（与 Web 登录同一判据，零旁路）
     let p = principal::load_principal(&st.auth_mysql, &id.login_name, id.role_code.as_deref())
@@ -566,17 +639,33 @@ mod tests {
     fn cache_hit_miss_and_expiry() {
         let mut c = TokenCache { map: HashMap::new() };
         let t0 = Instant::now();
-        c.put("tok1".to_string(), id("zhangsan"), t0);
+        c.put("tok1".to_string(), CacheVerdict::Valid(id("zhangsan")), t0);
         // TTL 内命中
-        assert_eq!(c.get("tok1", t0 + Duration::from_secs(59)), Some(id("zhangsan")));
+        assert_eq!(
+            c.get("tok1", t0 + Duration::from_secs(59)),
+            Some(CacheVerdict::Valid(id("zhangsan")))
+        );
         // 恰好到点即过期（边界用 > 判定，等于 expires_at 的那一拍按 miss）
         assert_eq!(c.get("tok1", t0 + CACHE_TTL), None);
         assert_eq!(c.get("tok1", t0 + Duration::from_secs(61)), None);
         // 没见过的 key
         assert_eq!(c.get("nope", t0), None);
         // 过期后重放同 key：新身份覆盖旧条目
-        c.put("tok1".to_string(), id("lisi"), t0 + Duration::from_secs(120));
-        assert_eq!(c.get("tok1", t0 + Duration::from_secs(121)), Some(id("lisi")));
+        c.put("tok1".to_string(), CacheVerdict::Valid(id("lisi")), t0 + Duration::from_secs(120));
+        assert_eq!(
+            c.get("tok1", t0 + Duration::from_secs(121)),
+            Some(CacheVerdict::Valid(id("lisi")))
+        );
+    }
+
+    /// 负缓存条目同样受 TTL 约束：60s 内命中 Invalid，过期后按 miss（重打上游）
+    #[test]
+    fn cache_negative_verdict_expires_too() {
+        let mut c = TokenCache { map: HashMap::new() };
+        let t0 = Instant::now();
+        c.put("bad".to_string(), CacheVerdict::Invalid, t0);
+        assert_eq!(c.get("bad", t0 + Duration::from_secs(59)), Some(CacheVerdict::Invalid));
+        assert_eq!(c.get("bad", t0 + CACHE_TTL), None, "负缓存不是终身黑名单");
     }
 
     #[test]
@@ -585,21 +674,21 @@ mod tests {
         let t0 = Instant::now();
         // 逐秒插入 CAP 条：tok0 最旧（过期点最早）
         for i in 0..CACHE_CAP {
-            c.put(format!("tok{i}"), id("u"), t0 + Duration::from_secs(i as u64));
+            c.put(format!("tok{i}"), CacheVerdict::Valid(id("u")), t0 + Duration::from_secs(i as u64));
         }
         assert_eq!(c.map.len(), CACHE_CAP);
         // 满员插新 key → 最旧的 tok0 被淘汰，其余还在
-        c.put("tok-new".to_string(), id("v"), t0 + Duration::from_secs(CACHE_CAP as u64));
+        c.put("tok-new".to_string(), CacheVerdict::Valid(id("v")), t0 + Duration::from_secs(CACHE_CAP as u64));
         assert_eq!(c.map.len(), CACHE_CAP, "淘汰后容量不许涨");
         assert_eq!(c.get("tok0", t0), None, "最旧的没被淘汰");
         assert!(c.get("tok1", t0 + Duration::from_secs(2)).is_some(), "次旧的不该被误伤");
         assert!(c.get("tok-new", t0 + Duration::from_secs(CACHE_CAP as u64)).is_some());
         // 满员时**更新已存在的 key** 不触发淘汰（容量不变、内容刷新）
-        c.put("tok1".to_string(), id("u2"), t0 + Duration::from_secs(CACHE_CAP as u64));
+        c.put("tok1".to_string(), CacheVerdict::Valid(id("u2")), t0 + Duration::from_secs(CACHE_CAP as u64));
         assert_eq!(c.map.len(), CACHE_CAP);
         assert_eq!(
             c.get("tok1", t0 + Duration::from_secs(CACHE_CAP as u64)),
-            Some(id("u2"))
+            Some(CacheVerdict::Valid(id("u2")))
         );
     }
 
@@ -730,5 +819,49 @@ mod tests {
         let (base, _, _) = stub_server("200 OK", r#"{"code":30007,"data":null,"msg":"x"}"#);
         let tok = format!("tok-bad-{}", uuid::Uuid::new_v4());
         assert_eq!(validate_xcx_token(&base, &tok).await, Err(AuthFail::TokenInvalid));
+    }
+
+    /// ① 负缓存：上游明确判失效的 token，60s 内重放不再穿透上游（ hits 恒 1 ）
+    #[tokio::test]
+    async fn validate_negative_caches_upstream_invalid() {
+        let (base, hits, _rx) = stub_server("200 OK", r#"{"code":30007,"data":null,"msg":"x"}"#);
+        let tok = format!("tok-neg-{}", uuid::Uuid::new_v4());
+        assert_eq!(validate_xcx_token(&base, &tok).await, Err(AuthFail::TokenInvalid));
+        assert_eq!(validate_xcx_token(&base, &tok).await, Err(AuthFail::TokenInvalid));
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "失效判定 TTL 内重放不许再打上游");
+    }
+
+    /// 瞬时故障（上游 5xx）**不进**负缓存：下一次重试必须真能打到上游
+    #[tokio::test]
+    async fn validate_never_caches_unavailable() {
+        let (base, hits, _rx) = stub_server("500 Internal Server Error", r#"{"code":500}"#);
+        let tok = format!("tok-flaky-{}", uuid::Uuid::new_v4());
+        assert_eq!(validate_xcx_token(&base, &tok).await, Err(AuthFail::Unavailable));
+        assert_eq!(validate_xcx_token(&base, &tok).await, Err(AuthFail::Unavailable));
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "瞬时故障不许缓存（误存 = 把抖动判成失效）");
+    }
+
+    // ---------- ⑤ 入参限长（与 web 端口径对齐） ----------
+
+    #[test]
+    fn lengths_are_capped_by_chars() {
+        let q500 = "问".repeat(500);
+        let q501 = "问".repeat(501);
+        let s2000 = "s".repeat(2000);
+        let s2001 = "s".repeat(2001);
+        assert!(lengths_ok(&q500, None, None).is_ok(), "500 字放行（边界）");
+        assert!(lengths_ok(&q501, None, None).unwrap_err().contains("question 超长"));
+        assert!(lengths_ok("短", Some(&q500), None).is_ok());
+        assert!(lengths_ok("短", Some(&q501), None).unwrap_err().contains("prev_question 超长"));
+        assert!(lengths_ok("短", None, Some(&s2000)).is_ok(), "2000 字 SQL 放行（边界）");
+        assert!(lengths_ok("短", None, Some(&s2001)).unwrap_err().contains("prev_sql 超长"));
+        assert!(lengths_ok("短", None, None).is_ok(), "可选项缺省不拦");
+    }
+
+    /// 限流/限长常量是外部口径：有人改数值这条会红，逼他读常量上的注释再想一遍
+    #[test]
+    fn security_tuning_constants_are_pinned() {
+        assert_eq!(MAX_QUESTION_CHARS, 500, "与 web 输入框 maxlength 同口径");
+        assert_eq!(MAX_PREV_SQL_CHARS, 2000);
     }
 }

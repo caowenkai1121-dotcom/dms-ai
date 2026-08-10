@@ -491,6 +491,7 @@ name = "dms-semantic"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dms-connector",
  "dms-kernel",
  "serde",

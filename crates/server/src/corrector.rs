@@ -132,15 +132,24 @@ pub async fn schema_check(pg: &PgPool, ds: &str, sql: &str) -> anyhow::Result<Op
     }
     // 涉及的真实表 → 从 meta.column_doc 取真实列集合（只对 meta 已知表校验）
     // 【K6-D】ds 限定：列白名单是**每个源自己的**，拿 DMS 的列清单校别的库会把真列判成幻觉列
+    // 【性能③】一次 `= ANY($1)` 取回全部涉及表（原来按表循环是 N+1 次往返），内存按表分组。
+    // 谓词仍是 `lower(table_name)` 与逐表版逐字相同：行能返回 ⇔ 分组键等于某个 `real_tables`
+    // 元素本身，所以按 `t` 查回分组与逐表版**逐个等价**（含「t 带大写则查不到」这个边角）。
     let q = format!(
-        "SELECT lower(column_name) FROM meta.column_doc WHERE lower(table_name) = $1{ds_pred}",
+        "SELECT lower(table_name), lower(column_name) FROM meta.column_doc WHERE lower(table_name) = ANY($1){ds_pred}",
         ds_pred = dms_semantic::registry::ds_pred(2)
     );
+    let tables: Vec<String> = real_tables.iter().cloned().collect();
+    let rows: Vec<(String, String)> =
+        sqlx::query_as(&q).bind(&tables).bind(ds).fetch_all(pg).await?;
+    let mut grouped: HashMap<String, HashSet<String>> = HashMap::new();
+    for (t, c) in rows {
+        grouped.entry(t).or_insert_with(HashSet::new).insert(c);
+    }
     let mut table_cols: HashMap<String, HashSet<String>> = HashMap::new();
     for t in &real_tables {
-        let rows: Vec<(String,)> = sqlx::query_as(&q).bind(t).bind(ds).fetch_all(pg).await?;
-        if !rows.is_empty() {
-            table_cols.insert(t.clone(), rows.into_iter().map(|(c,)| c).collect());
+        if let Some(cols) = grouped.get(t) {
+            table_cols.insert(t.clone(), cols.clone());
         }
     }
     if table_cols.is_empty() {
@@ -322,19 +331,21 @@ pub async fn correct_value(pg: &PgPool, ds: &str, sql: &str) -> anyhow::Result<O
         return Ok(None);
     }
     // 【K6-D】ds 限定：码表是每个源自己的（DMS 的 invoice_status=2 换到别的库就是错值）
+    // 【性能③】一次 `= ANY($1)` 取回全部涉及表（原来按表循环是 N+1 次往返），内存按表分组。
+    // 分组键用 `lower(table_name)`：逐表版的谓词是 `lower(table_name) = t`，行能返回 ⇔
+    // 分组键与 `t` 逐字相等 —— 所以码表的 (表,列) 键与逐表版**逐个等价**，大小写边角同形。
     let q = format!(
-        "SELECT column_name, name, code, match_kind FROM meta.value_map WHERE lower(table_name) = $1{ds_pred}",
+        "SELECT lower(table_name), column_name, name, code, match_kind FROM meta.value_map WHERE lower(table_name) = ANY($1){ds_pred}",
         ds_pred = dms_semantic::registry::ds_pred(2)
     );
+    let tables_vec: Vec<String> = tables.iter().cloned().collect();
+    let rows: Vec<(String, String, String, String, String)> =
+        sqlx::query_as(&q).bind(&tables_vec).bind(ds).fetch_all(pg).await?;
     let mut maps: ValueMaps = HashMap::new();
-    for t in &tables {
-        let rows: Vec<(String, String, String, String)> =
-            sqlx::query_as(&q).bind(t).bind(ds).fetch_all(pg).await?;
-        for (col, name, code, kind) in rows {
-            maps.entry((t.clone(), col.to_lowercase()))
-                .or_insert_with(Vec::new)
-                .push((name, code, kind));
-        }
+    for (t, col, name, code, kind) in rows {
+        maps.entry((t, col.to_lowercase()))
+            .or_insert_with(Vec::new)
+            .push((name, code, kind));
     }
     Ok(link_values_with(sql, &amap, &maps))
 }
@@ -1104,6 +1115,31 @@ mod tests {
 
     fn norm(s: &str) -> String {
         s.to_lowercase().replace(' ', "")
+    }
+
+    /// 🔴【性能③】两处按表取数必须是**一次 `= ANY($1)`**，逐表循环（N+1）不许回来。
+    /// 无库单测覆盖不到这段 IO，照本仓既有形态（`gather.rs` 的接线判据）用源码守。
+    /// 同时钉住【K6-D】：ds 限定不许在改造中丢掉（拿 DMS 的列/码校别的库就是错判）。
+    #[test]
+    fn schema_and_value_lookups_are_single_any_queries() {
+        let src = include_str!("corrector.rs");
+        let body = |marker: &str, tail: &str| {
+            let s = src.split(marker).nth(1).expect("函数改名了 —— 顺手把这条判据一起改");
+            let b = s.split("\n///").next().unwrap();
+            assert!(b.contains(tail), "切段没切住：{b}");
+            b
+        };
+        // schema_check：column_doc 一次 ANY 取回 + 内存分组
+        //（断言用 contains 不用条数：函数体内的注释里也出现了同一字面量，数条数会恒红）
+        let sc = body("pub async fn schema_check", "Ok(Some(hint))");
+        assert!(sc.contains("= ANY($1)"), "列清单必须一次 ANY 取回：{sc}");
+        assert!(!sc.contains(".bind(t)"), "逐表循环的 bind 回来了：{sc}");
+        assert!(sc.contains("ds_pred(2)"), "K6-D 的 ds 限定丢了：{sc}");
+        // correct_value：value_map 一次 ANY 取回 + 内存分组
+        let cv = body("pub async fn correct_value", "link_values_with");
+        assert!(cv.contains("= ANY($1)"), "码表必须一次 ANY 取回：{cv}");
+        assert!(!cv.contains(".bind(t)"), "逐表循环的 bind 回来了：{cv}");
+        assert!(cv.contains("ds_pred(2)"), "K6-D 的 ds 限定丢了：{cv}");
     }
 
     /// 【A21】复合表达式抽全部聚合：客单价两条规则都抽到；

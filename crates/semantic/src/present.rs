@@ -123,10 +123,23 @@ pub fn patch_kpi_delta(view: &mut ViewSpec, cur: f64, prev: f64, label: String) 
             if prev.abs() < f64::EPSILON {
                 return; // 上期为 0，环比无意义
             }
-            let pct = (cur - prev) / prev * 100.0;
-            let dir = if pct > 0.05 { "up" } else if pct < -0.05 { "down" } else { "flat" };
+            // 🔴 百分比指标的 delta 必须用**百分点**，不是相对百分比：
+            // 毛利率 19.30%→19.63% 按相对算是「+1.7%」（实测判官抓获），正确说法是 +0.33pp。
+            // 毛利率族是小数比值口径（前端 isGrossMarginLabel 显示时 ×100），pp 要 ×100；
+            // 其它百分比列按既有约定已是 0-100 数值，pp 直接相减。
+            let (pct, flat_eps, factor) = if matches!(items[0].semantic, Semantic::Percent) {
+                let points = if is_ratio_percent_label(&items[0].label) {
+                    (cur - prev) * 100.0
+                } else {
+                    cur - prev
+                };
+                (points, 0.005, 100.0) // pp 保留两位小数（0.33pp），flat 阈值 0.005pp
+            } else {
+                ((cur - prev) / prev * 100.0, 0.05, 10.0)
+            };
+            let dir = if pct > flat_eps { "up" } else if pct < -flat_eps { "down" } else { "flat" };
             let delta = Delta {
-                pct: (pct * 10.0).round() / 10.0,
+                pct: (pct * factor).round() / factor,
                 dir,
                 label,
                 baseline: prev,
@@ -135,6 +148,13 @@ pub fn patch_kpi_delta(view: &mut ViewSpec, cur: f64, prev: f64, label: String) 
             if items[0].delta.is_none() { items[0].delta = Some(delta); }
         }
     }
+}
+
+/// 毛利率族标签 = 小数比值口径（与前端 `isGrossMarginLabel`/`isGrossMarginValueLabel` 同源，
+/// 两处都是去掉空白后全等匹配；显示侧 ×100，所以 delta 也要 ×100 才是百分点）。
+fn is_ratio_percent_label(label: &str) -> bool {
+    let normalized: String = label.chars().filter(|c| !c.is_whitespace()).collect();
+    normalized == "毛利率" || normalized == "销售毛利率"
 }
 
 /// 组装 ViewSpec：推断下钻维度 + 结论洞察（has_metric 从列 role 判定）
@@ -147,6 +167,38 @@ fn mk(specs: Vec<ColumnSpec>, blocks: Vec<Block>, rows: &[Vec<Value>]) -> ViewSp
 
 /// 结论洞察（移植 SuperSonic textSummary）：排行占比+CR3集中度 / 趋势涨跌，确定性 0-LLM。
 fn compute_insight(specs: &[ColumnSpec], rows: &[Vec<Value>]) -> Option<String> {
+    compute_insight_on(specs, rows, chrono::Local::now().date_naive())
+}
+
+/// 全局行上限（= `dms_agent::MAX_ROWS`；agent→semantic 单向依赖，这里只能复刻数值）。
+/// 判据与 `agent::ctx` 的截断提示同源：行数顶到上限即「可能被截断」。
+const ROW_CAP: usize = 200;
+
+/// 月份标签（`YYYY-MM`，月度维度的出数形态）是不是「本月至今」的不足月：
+/// 等于当前年月、且今天还不是月末最后一天（月末当天全月已齐，端点可用）。
+/// 日粒度标签（`YYYY-MM-DD`）与任何非法形态一律不算。
+fn is_partial_current_month(label: &str, today: chrono::NaiveDate) -> bool {
+    use chrono::Datelike;
+    let b = label.as_bytes();
+    if b.len() != 7 || b[4] != b'-' || !b[..4].iter().chain(b[5..].iter()).all(u8::is_ascii_digit) {
+        return false;
+    }
+    let (Ok(y), Ok(m)) = (label[..4].parse::<i32>(), label[5..].parse::<u32>()) else {
+        return false;
+    };
+    if !(1..=12).contains(&m) || (y, m) != (today.year(), today.month()) {
+        return false;
+    }
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    let Some(next_month) = chrono::NaiveDate::from_ymd_opt(ny, nm, 1) else {
+        return false;
+    };
+    today.day() < (next_month - chrono::Duration::days(1)).day()
+}
+
+/// `today` 参数化：不足月判定要「今天」，测试用固定日期打判据
+/// （生产路径恒为本地今天，与 SQL 侧 CURDATE() 同口径）。
+fn compute_insight_on(specs: &[ColumnSpec], rows: &[Vec<Value>], today: chrono::NaiveDate) -> Option<String> {
     // 🔴 **单行全 NULL 要说话**。`SUM` over 0 行给的是一行 NULL，不是 0 行 ——
     // 于是它既不走「无结果」提示、也没有洞察，前端渲染成**一个空格子**，
     // 用户分不清「这段时间没数据」和「系统坏了」。实测现场：数据从 2025-09-29 起，
@@ -194,6 +246,15 @@ fn compute_insight(specs: &[ColumnSpec], rows: &[Vec<Value>]) -> Option<String> 
                 vals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let top = &vals[0];
                 let cr3: f64 = vals.iter().take(3).map(|(_, v)| v).sum();
+                // 🔴 行数顶到全局行上限 = 结果可能被截断：分母只是截断子集的小计，
+                // 拿它算「占 XX%」就是把子集份额冒充全量份额（实测 TOP200 截断下「占 35.6%」）。
+                // 本函数是纯函数、拿不到全量合计（一次 SUM 要改管线签名），按裁决**不显示占比**。
+                if rows.len() >= ROW_CAP {
+                    return Some(format!(
+                        "榜首「{}」{}；前三合计 {}（结果已截断为前 {} 项，占比缺全量分母从略）",
+                        top.0, unit(top.1), unit(cr3), vals.len()
+                    ));
+                }
                 return Some(format!(
                     "榜首「{}」{}，占 {:.1}%；前三合计占 {:.1}%（共 {} 项）",
                     top.0, unit(top.1), top.1 / total * 100.0, cr3 / total * 100.0, vals.len()
@@ -202,17 +263,32 @@ fn compute_insight(specs: &[ColumnSpec], rows: &[Vec<Value>]) -> Option<String> 
         }
     }
     // 趋势（时间+单指标，≥2 行）：首末对比涨跌
-    if let Some(_ti) = time_i {
+    if let Some(ti) = time_i {
         if rows.len() >= 2 {
-            let first = cell_f64(&rows[0][mi])?;
-            let last = cell_f64(&rows[rows.len() - 1][mi])?;
-            if first.abs() > f64::EPSILON {
-                let pct = (last - first) / first * 100.0;
-                let dir = if pct >= 0.0 { "增长" } else { "下降" };
-                return Some(format!(
-                    "从 {} 到 {}，整体{} {:.1}%",
-                    unit(first), unit(last), dir, pct.abs()
-                ));
+            // 🔴 末段是「本月至今」的不足月时，拿它当端点必出假涨跌 —— 实测「最近三个月
+            // 销售额趋势」拿 5 月全月对 8 月 10 天得出「下降 38%」（实际连续大涨）。
+            // 不足月末段**排除出端点比较**；只剩一个完整端点时宁可不出趋势洞察，不比。
+            let partial_tail = rows
+                .last()
+                .and_then(|row| row.get(ti))
+                .is_some_and(|cell| is_partial_current_month(&val_str(cell), today));
+            let end = if partial_tail { rows.len() - 1 } else { rows.len() };
+            if end >= 2 {
+                let first = cell_f64(&rows[0][mi])?;
+                let last = cell_f64(&rows[end - 1][mi])?;
+                if first.abs() > f64::EPSILON {
+                    let pct = (last - first) / first * 100.0;
+                    let dir = if pct >= 0.0 { "增长" } else { "下降" };
+                    let note = if partial_tail { "（末月为本月至今，未纳入端点比较）" } else { "" };
+                    return Some(format!(
+                        "从 {} 到 {}，整体{} {:.1}%{}",
+                        unit(first),
+                        unit(last),
+                        dir,
+                        pct.abs(),
+                        note
+                    ));
+                }
             }
         }
     }
@@ -606,6 +682,113 @@ mod tests {
         patch_kpi_delta(&mut v2, 120.0, 0.0, "较上月".into());
         if let Block::Kpis { items } = &v2.blocks[0] {
             assert!(items[0].delta.is_none());
+        }
+    }
+
+    /// ③ 不足月末段必须排除出端点比较：实测「最近三个月销售额趋势」拿 5 月全月对
+    /// 8 月 10 天得出「下降 38%」（实际连续大涨）。修后端点取到上一个完整月，并标注末月未纳入。
+    #[test]
+    fn trend_insight_excludes_partial_current_month() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let rows = vec![
+            vec![json!("2026-05"), json!("100")],
+            vec![json!("2026-06"), json!("200")],
+            vec![json!("2026-07"), json!("400")],
+            vec![json!("2026-08"), json!("150")], // 本月至今 10 天 —— 当端点就是「下降 62.5%」的假数
+        ];
+        let v = build(&cols(&["月份", "销售额"]), &rows);
+        let s = compute_insight_on(&v.columns, &rows, today).unwrap();
+        assert!(s.contains("整体增长 300.0%"), "端点必须是 05→07（100→400）：{s}");
+        assert!(s.contains("本月至今"), "必须标注末月未纳入：{s}");
+        assert!(!s.contains("下降"), "{s}");
+
+        // 月末当天：全月已齐，端点可用（不标注）
+        let month_end = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+        let s2 = compute_insight_on(&v.columns, &rows, month_end).unwrap();
+        assert!(s2.contains("整体增长 50.0%"), "月末当天 08 月是完整月：{s2}");
+        assert!(!s2.contains("本月至今"), "{s2}");
+
+        // 末段是已过去的完整月：正常比较，一个字不多
+        let rows_done = vec![
+            vec![json!("2026-05"), json!("100")],
+            vec![json!("2026-06"), json!("200")],
+            vec![json!("2026-07"), json!("400")],
+        ];
+        let v3 = build(&cols(&["月份", "销售额"]), &rows_done);
+        let s3 = compute_insight_on(&v3.columns, &rows_done, today).unwrap();
+        assert_eq!(s3, "从 ¥100 到 ¥400，整体增长 300.0%");
+
+        // 不足月排除后只剩一个完整端点：宁可不出趋势洞察，也不拿不足月比
+        let rows_two = vec![
+            vec![json!("2026-07"), json!("400")],
+            vec![json!("2026-08"), json!("150")],
+        ];
+        let v4 = build(&cols(&["月份", "销售额"]), &rows_two);
+        assert!(compute_insight_on(&v4.columns, &rows_two, today).is_none());
+
+        // 不足月判定本体：日粒度/非法标签/往年同月都不算
+        assert!(is_partial_current_month("2026-08", today));
+        assert!(!is_partial_current_month("2026-08-10", today), "日粒度没有「不足月」一说");
+        assert!(!is_partial_current_month("2025-08", today), "去年同月是完整月");
+        assert!(!is_partial_current_month("2026-8", today));
+        assert!(!is_partial_current_month("2026-13", today));
+        assert!(is_partial_current_month("2026-08", chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()));
+        assert!(!is_partial_current_month("2026-08", month_end));
+        // 跨年末月（12 月 → 次年 1 月的月末推算）
+        assert!(is_partial_current_month("2026-12", chrono::NaiveDate::from_ymd_opt(2026, 12, 15).unwrap()));
+    }
+
+    /// ④ 行数顶到全局上限（200）= 可能被截断：占比分母是截断子集小计，按裁决不显示占比。
+    #[test]
+    fn ranking_insight_suppresses_share_when_truncated() {
+        let big: Vec<Vec<Value>> = (0..200)
+            .map(|i| vec![json!(format!("客户{i:03}")), json!((1000 - i).to_string())])
+            .collect();
+        let v = build(&cols(&["客户", "销售额"]), &big);
+        let s = v.insight.as_deref().unwrap_or("");
+        assert!(s.contains("榜首"), "{s}");
+        assert!(!s.contains('%'), "截断时不许出现任何百分比（分母是子集小计）：{s}");
+        assert!(s.contains("截断"), "必须明说为什么没占比：{s}");
+        // 未触上限：占比照出，一个字不改
+        let small: Vec<Vec<Value>> = (0..100)
+            .map(|i| vec![json!(format!("客户{i:03}")), json!((1000 - i).to_string())])
+            .collect();
+        let v2 = build(&cols(&["客户", "销售额"]), &small);
+        let s2 = v2.insight.as_deref().unwrap_or("");
+        assert!(s2.contains('%'), "未截断必须保留占比：{s2}");
+        assert!(s2.contains("共 100 项"), "{s2}");
+    }
+
+    /// ⑤ 百分比指标的 KPI delta 用百分点：毛利率 19.30%→19.63% 是 +0.33pp，不是「+1.7%」。
+    #[test]
+    fn percent_kpi_delta_uses_percentage_points() {
+        let mut v = build(&cols(&["毛利率"]), &[vec![json!("0.1963")]]);
+        patch_kpi_delta(&mut v, 0.1963, 0.1930, "较上月".into());
+        if let Block::Kpis { items } = &v.blocks[0] {
+            assert_eq!(items[0].semantic, Semantic::Percent, "前提：毛利率是百分比语义");
+            let d = items[0].delta.as_ref().unwrap();
+            assert_eq!(d.pct, 0.33, "delta 必须是百分点");
+            assert_eq!(d.dir, "up");
+            assert!((d.baseline - 0.1930).abs() < 1e-9, "{}", d.baseline);
+            assert!((d.change - 0.0033).abs() < 1e-9, "{}", d.change);
+        } else {
+            panic!("no kpi");
+        }
+        // 0-100 口径的百分比列（非比值）：pp 直接相减
+        let mut v2 = build(&cols(&["占比"]), &[vec![json!("36.9")]]);
+        patch_kpi_delta(&mut v2, 36.9, 35.6, "较上月".into());
+        if let Block::Kpis { items } = &v2.blocks[0] {
+            assert_eq!(items[0].delta.as_ref().unwrap().pct, 1.3);
+        } else {
+            panic!("no kpi");
+        }
+        // 金额照旧是相对百分比（回归锁，不许被百分点那支拐走）
+        let mut v3 = build(&cols(&["销售额"]), &[vec![json!("120")]]);
+        patch_kpi_delta(&mut v3, 120.0, 100.0, "较上月".into());
+        if let Block::Kpis { items } = &v3.blocks[0] {
+            assert_eq!(items[0].delta.as_ref().unwrap().pct, 20.0);
+        } else {
+            panic!("no kpi");
         }
     }
 

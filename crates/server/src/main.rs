@@ -1338,6 +1338,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/skills/{id}", put(skills_api::update).delete(skills_api::remove))
         .route("/api/skills/{id}/toggle", post(skills_api::toggle))
         .route("/api/chat/conv/{id}/trace", get(trace_api::conv_trace))
+        .route("/api/chat/msg/{msg_id}/payload", get(trace_api::msg_payload))
         .route("/api/chat/conv/{id}/branch", post(api_conv_branch))
         // 【Y5】运行中插话（steer 并入当前问题上下文重走一次组装，仅一次防循环）
         .route("/api/chat/conv/{id}/steer", post(chat::api_conv_steer))
@@ -1447,9 +1448,13 @@ fn sso_role(
 /// SSO 换签：验真 DMS token → 颁自有会话 token
 async fn api_sso(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SsoReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
+    if !auth::ip_rate_allow(&auth::client_ip(&headers)) {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后再试".into()));
+    }
     if st.dms_base_url.trim().is_empty() {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1610,9 +1615,14 @@ struct LoginReq {
 /// 本端没有 DMS 强制修改密码页，因此仅此密码入口拒绝过期密码；SSO/企微不应用该限制。
 async fn api_login(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, msg: &str| (code, Json(serde_json::json!({ "error": msg })));
+    // per-IP 令牌桶（密码喷洒防护：按账号计数挡不住遍历账号的弱口令探测）
+    if !auth::ip_rate_allow(&auth::client_ip(&headers)) {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后再试"));
+    }
     if auth::normalized_login(&req.login_name).is_none() || req.password.is_empty() || req.password.len() > 256 {
         return Err(err(StatusCode::BAD_REQUEST, "请输入账号和密码"));
     }

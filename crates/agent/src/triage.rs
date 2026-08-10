@@ -14,12 +14,49 @@
 //!
 //! 搬运源 `server/src/triage.rs` 全文（判据、文案、测试断言逐字保留）。
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use sqlx::PgPool;
 
 use dms_kernel::{ChatModel, ChatRequest, ModelTier};
 use dms_semantic::recall::{self, RecallCtx};
+
+/// 【判官实测 2026-08-10·问题 1①】常见错别字归一表（**词表驱动**，加词改表不改逻辑）。
+/// 实测现场：「上个月消售额多少」（消售=错别字）→ 规则判据与注册表召回同时失明
+/// （「消售额」不是任何指标名/别名），落 LLM 全目录路径打了 ODS 订单表 = 2.29 亿；
+/// 而正确问法「上个月销售额多少」走 verified 合同 = 2.03 亿 —— **同题两个答案**，
+/// 且两边 trust=high、一个字提示都没有。归一做在分诊/问答的最前面：下游所有判据
+/// （规则、注册表召回、语义缓存键、LLM prompt）见到的都是归一后的问句，
+/// 错别字问法与正确问法走同一条路。
+///
+/// 🔴 收词纪律：只收「错形在任何合法业务文本里都不可能成立」的成对词（消售/销受/售销/定单/裤存/对帐）。
+/// 单字条目一律不收 —— 「报销」「撤销」里的「销」一个字都不许动；词形不够歧义安全的词也不收
+/// （判宽的代价是把正经词改坏，那比不识别更坏）。
+const TYPO_PAIRS: &[(&str, &str)] = &[
+    ("消售", "销售"),
+    ("销受", "销售"),
+    ("售销", "销售"),
+    ("定单", "订单"),
+    ("裤存", "库存"),
+    ("对帐", "对账"),
+];
+
+/// 错别字归一（纯函数）：命中词表才改写，逐对全量替换（词表内各对互不重叠，顺序无关）。
+/// 无命中返回 `Cow::Borrowed`（干净问句零分配）。幂等：归一结果再归一一次逐字不变。
+///
+/// 两个调用点：`triage()` 入口（归一只影响分诊判定，路由出去的原问句不动）与
+/// `ask()` 的多轮改写之后（真正送去选源/召回/生成的那份）。
+pub fn normalize_typos(q: &str) -> Cow<'_, str> {
+    if !TYPO_PAIRS.iter().any(|(wrong, _)| q.contains(wrong)) {
+        return Cow::Borrowed(q);
+    }
+    let mut s = q.to_string();
+    for (wrong, right) in TYPO_PAIRS {
+        s = s.replace(wrong, right);
+    }
+    Cow::Owned(s)
+}
 
 /// 时间词集合（护栏：命中缓存的问题时间词必须与本问全等，"上月"≠"本月"）。
 /// 搬运源 `server/src/pipeline.rs:953`，逻辑一字未改。
@@ -62,6 +99,11 @@ pub async fn triage(
     question: &str,
     forced: Option<&str>,
 ) -> Intent {
+    // 【判官实测·问题 1①】错别字归一先于一切判据（含 forced 判读）：「消售」这类错形会让
+    // 规则判据与注册表召回同时失明。归一只影响分诊**判定** —— 路由出去的原问句不动，
+    // 送去分析的那份由 `ask()` 入口再归一一次。
+    let normalized = normalize_typos(question);
+    let question = normalized.as_ref();
     // ① 前端 chip 显式指定：一次 IO 都不许发生（`auto` / 未知值解析成 None，继续往下）
     if let Some(i) = forced.and_then(parse_intent) {
         return i;
@@ -382,5 +424,58 @@ mod tests {
         }
         // 不在表里、又没有数字前缀 → 不算时间词（判宽会把制度类问句抢成问数）
         assert!(!time_hit("年假规定"));
+    }
+
+    /// 🔴 【判官实测·问题 1①】错别字归一表：词表驱动、幂等、不误伤正经词。
+    /// 判官原案：「上个月消售额多少」归一后必须与「上个月销售额多少」走同一条路 ——
+    /// 同题两答案（2.29 亿 vs 2.03 亿）不允许再现。
+    #[test]
+    fn typo_normalization_is_table_driven_and_safe() {
+        // 判官原案：归一后与正确问法逐字相同
+        assert_eq!(normalize_typos("上个月消售额多少"), "上个月销售额多少");
+        // 词表每一对都真的生效（表驱动：加词不改逻辑）
+        for (wrong, right) in TYPO_PAIRS {
+            assert_eq!(normalize_typos(wrong), *right, "词表对 {wrong}→{right} 没生效");
+            assert!(
+                normalize_typos(&format!("本月{wrong}是多少")) == format!("本月{right}是多少"),
+                "语境中的 {wrong} 没被归一"
+            );
+        }
+        // 幂等：归一结果再归一逐字不变
+        let once = normalize_typos("上个月消售额多少").into_owned();
+        assert_eq!(normalize_typos(&once), once.as_str());
+        // 干净问句零改写（Borrowed：一个字符都不动，也不分配）
+        assert!(matches!(normalize_typos("本月销售额是多少"), Cow::Borrowed(_)));
+        // 🔴 不误伤：含「销」的正经词一个字母都不许动（单字条目永不许进表）
+        for legit in ["报销制度是什么", "撤销订单流程", "本月销售额是多少", "对账单有几笔"] {
+            assert!(matches!(normalize_typos(legit), Cow::Borrowed(_)), "正经词被误改：{legit}");
+        }
+        // 归一后的问句必须被完整问句判据识别（判官案的路由层症状：规则判据失明）
+        assert!(analytical_question_hit(&normalize_typos("上个月消售额多少")));
+        assert!(analytical_question_hit(&normalize_typos("昨天定单有多少")));
+    }
+
+    /// 🔴 归一的**位置**判据（源码扫描）：必须在分诊的一切判据之前 —— 在 kb/规则之后
+    /// 归一等于没归一（判据读的还是错形）。锚点 `concat!` 拼（自匹配家族，本仓惯例）。
+    #[test]
+    fn typo_normalization_precedes_every_triage_rule() {
+        let src = include_str!("triage.rs");
+        let body = src
+            .split("pub async fn triage")
+            .nth(1)
+            .expect("triage 没了")
+            .split("/// 规则判据")
+            .next()
+            .unwrap();
+        let norm = body
+            .find(concat!("normalize_", "typos(question)"))
+            .expect("triage 入口没做错别字归一");
+        let kb = body.find("kb_hit(question)").expect("kb 判据没了");
+        let entity = body.find("entity_form_hit(question)").expect("实体闸门没了");
+        let registry = body.find("registry_hit(pg, ds, question)").expect("注册表召回没了");
+        assert!(norm < kb && norm < entity && norm < registry, "归一必须在一切判据之前：{body}");
+        // 归一也先于 forced 判读（统一入口语义：分诊全程只见归一后的问句）
+        let forced = body.find("forced.and_then(parse_intent)").expect("forced 判读没了");
+        assert!(norm < forced, "{body}");
     }
 }

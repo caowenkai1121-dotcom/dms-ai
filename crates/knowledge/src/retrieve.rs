@@ -1,4 +1,4 @@
-//! 混合检索：**ACL 先行**（可见 doc 子查询内联进检索 SQL）→ 向量/全文/正文 trgm/标题/元数据各自 top
+//! 混合检索：**ACL 先行**（可见 doc 子查询内联进检索 SQL）→ 向量/精确 token/正文 trgm/标题/元数据各自 top
 //! → 目录/文档关系扩展 + 图谱召回（Yuxi B6：实体种子 → 1~2 hop 扩散 → 幂迭代 PPR，
 //! `DMS_KG_RETRIEVAL=off` 整体关闭）+ 外部只读 KB（Yuxi B9：Dify 数据集检索，
 //! `DMS_EXT_KB_*` 未配齐即关闭，关闭时零 IO）→ RRF 融合 → 同文档相邻块合并、去重 → 来源多样化截断。
@@ -9,7 +9,7 @@
 //! 两条不许退让的：
 //! 1. **绝不「查完再过滤」**：ACL 条件必须参与检索查询本身。后过滤在 HNSW 上等于自杀 ——
 //!    先取到的全局最近邻可能整批属于别人，滤完剩零条，症状是「明明上传了文档却搜不到」。
-//! 2. **embed 挂只跳这一路**：全文与 trgm 仍要出结果（`ingest` 也允许停在 `chunked`）。
+//! 2. **embed 挂只跳这一路**：精确匹配与 trgm 仍要出结果（`ingest` 也允许停在 `chunked`）。
 //!
 //! 两个阈值（`TRGM_MIN` / `VEC_MAX_DIST`）是**标定值**，都由连库实测的分数分布定的，
 //! 各自钉着一张 `*_MEASURED` 表。改它们之前先重量一遍分布，别拍脑袋调。
@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 /// 各召回路的上限
 const VEC_TOP: i64 = 20;
-const FTS_TOP: i64 = 20;
+const EXACT_TOP: i64 = 20;
 const TRGM_TOP: i64 = 10;
 const TITLE_TOP: i64 = 10;
 const METADATA_TOP: i64 = 10;
@@ -155,8 +155,9 @@ const EXACT_SCAN_DOCS: usize = 50;
 ///
 /// 🔴 原值 0.3 把 KB01 的判据块（**0.2667**）挡在门外，而 14 题里只有 3 题能让 trgm 出结果
 /// （其中一次还是同文档标题块）—— 「三路混合 + RRF」于是退化成**单路**：
-/// FTS 那一路 `plainto_tsquery('simple', …)` 对中文不分词，实测 14 题 × 23 块
-/// **322 格全部 `ts_rank_cd = 0`**（恒空）。trgm 再被挡住，RRF 就只剩向量一路可融。
+/// 当时的 FTS 那一路 `plainto_tsquery('simple', …)` 对中文不分词，实测 14 题 × 23 块
+/// **322 格全部 `ts_rank_cd = 0`**（恒空；KB 审查③已把它换成单号/型号精确匹配路）。
+/// trgm 再被挡住，RRF 就只剩向量一路可融。
 /// 降到 0.2 后 trgm 在 **9/14** 题出结果（每题 1-3 条）。
 ///
 /// 上界钉在 0.2105（KB02「发票 15 个工作日」与 KB16「通讯补贴四档」的判据块），
@@ -281,6 +282,8 @@ pub struct Hit {
 pub struct SearchStats {
     pub visible_docs: usize,
     pub vector_candidates: usize,
+    /// 精确 token 路的候选数（KB 审查③起是单号/型号 ILIKE 那一路；字段名保留是
+    /// server `kb_api` 诊断端点的既有 JSON 键，改名即破约）。
     pub fts_candidates: usize,
     pub trgm_candidates: usize,
     pub title_candidates: usize,
@@ -411,7 +414,7 @@ pub async fn search_report(
             // 🔴 静默跳过这一路是本文件最贵的一处沉默。剩下路线仍可答，但必须显式降级。
             None => {
                 tracing::warn!(
-                    "向量检索不可用（embed 服务挂或熔断中）→ 本次只剩全文/正文相似/标题/元数据路，可能漏检"
+                    "向量检索不可用（embed 服务挂或熔断中）→ 本次只剩精确匹配/正文相似/标题/元数据路，可能漏检"
                 );
                 Ok::<_, KbError>((Vec::new(), true))
             }
@@ -420,17 +423,17 @@ pub async fn search_report(
     // 第 8 路外部只读 KB（B9）也是一条独立 HTTP，与上面五路同批发出（不占额外尾延迟）；
     // 未配置时 `from_env` 为 None → 这一路恒空、零 IO，与接入前逐字节一致。
     let ext_client = ExtKbClient::from_env();
-    let (vector, fts, trgm, title, metadata, ext_kb) = tokio::join!(
+    let (vector, exact, trgm, title, metadata, ext_kb) = tokio::join!(
         vector,
-        fts_ids(store, &docs, &query),
+        exact_ids(store, &docs, &query),
         trgm_ids(store, &docs, &query),
         title_ids(store, &docs, &query),
         metadata_ids(store, &docs, &query),
         ext_kb_route(ext_client.as_ref(), &query),
     );
     let (vec_ids, vec_down) = vector?;
-    // 固定五个槽位，向量降级时也保留空 vec：诊断日志不会把 FTS 数量误记成向量数量。
-    let mut lists = vec![vec_ids, fts?, trgm?, title?, metadata?];
+    // 固定五个槽位，向量降级时也保留空 vec：诊断日志不会把精确路数量误记成向量数量。
+    let mut lists = vec![vec_ids, exact?, trgm?, title?, metadata?];
     let (direct, auxiliary) = lists.split_at_mut(4);
     keep_auxiliary_votes_on_direct_hits(direct, &mut auxiliary[0]);
     let direct_ranked = rrf_weighted(&lists, &weights.route_array()[..5]);
@@ -499,7 +502,7 @@ pub async fn search_report(
         //   ③ 各路都空（`lists` 里每条都是空）：真没有，处置是告诉用户补文档。
         // 没有这一条，「明明上传了却搜不到」只能靠猜：是 embed 挂了、是阈值挡了、还是真没有。
         // 三题诊断（wf_c921b918）把这处列为「观测最粗的一处」 —— 今天三者全归成同一行「没有相关内容」。
-        let (vec_n, fts_n, trgm_n, title_n, metadata_n) = (
+        let (vec_n, exact_n, trgm_n, title_n, metadata_n) = (
             lists.first().map_or(0, Vec::len),
             lists.get(1).map_or(0, Vec::len),
             lists.get(2).map_or(0, Vec::len),
@@ -511,14 +514,14 @@ pub async fn search_report(
         tracing::info!(
             vec_down,
             vec = vec_n,
-            fts = fts_n,
+            exact = exact_n,
             trgm = trgm_n,
             title = title_n,
             metadata = metadata_n,
             kg = kg_n,
             ext_kb = ext_kb_n,
             merged = ranked.len(),
-            "检索零命中：各路召回数（vec=向量 fts=全文 trgm=正文相似 title=标题/文件名 metadata=元数据 kg=图谱 ext_kb=外部知识库 merged=RRF 后）"
+            "检索零命中：各路召回数（vec=向量 exact=单号/型号精确 trgm=正文相似 title=标题/文件名 metadata=元数据 kg=图谱 ext_kb=外部知识库 merged=RRF 后）"
         );
         return Ok(SearchReport {
             normalized_query: query,
@@ -749,13 +752,52 @@ async fn vector_ids(
     ids(store.fixed(sql).bind(docs).bind(vlit).bind(VEC_TOP).bind(VEC_MAX_DIST)).await
 }
 
-const FTS_SQL: &str = "SELECT chunk_id FROM kb.chunk \
-                       WHERE doc_id = ANY($1::text[]) AND ts @@ plainto_tsquery('simple', $2) \
-                       ORDER BY ts_rank_cd(ts, plainto_tsquery('simple', $2)) DESC, chunk_id \
-                       LIMIT $3";
+/// 无编号精确匹配路（KB 审查③，替换原中文 FTS 路）：`plainto_tsquery('simple', …)` 对连写中文
+/// 切不出词，实测 14 题 × 23 块 322 格 `ts_rank_cd` 恒 0（见 `TRGM_MIN` 的实测注释）——
+/// 那一路从没产出过候选，名额让给「单号/型号精确包含」：从归一化问句抽 `[A-Za-z0-9-]{6,}`
+/// 的 token 做正文 ILIKE。权重与标题路同级（1.0，RRF 第二槽）；问单号时一路直达。
+/// 路内排序：命中 token 数多的块在前（多号并问时兼中者优先），同数按 chunk_id（可复现）。
+const EXACT_SQL: &str = "SELECT chunk_id FROM kb.chunk c \
+                         WHERE c.doc_id = ANY($1::text[]) AND c.text ILIKE ANY($2::text[]) \
+                         ORDER BY (SELECT count(*) FROM unnest($2::text[]) AS t(p) \
+                                   WHERE c.text ILIKE t.p) DESC, c.chunk_id \
+                         LIMIT $3";
 
-async fn fts_ids(store: &OwnedStore, docs: &[String], q: &str) -> Result<Vec<i64>, KbError> {
-    ids(store.fixed(FTS_SQL).bind(docs).bind(q).bind(FTS_TOP)).await
+/// 精确路一次参与的 token 上限（防爆闸；正常问句一两个）。
+const EXACT_MAX_TOKENS: usize = 8;
+
+/// 精确路的 token 抽取：`[A-Za-z0-9-]{6,}`（单号/型号/编号）。全仓无 regex 依赖，手写扫描。
+/// 调用方传入的是归一化问句（已小写化、按空白/标点切段）；token 字符集不含 `%`/`_`，
+/// 拼 ILIKE 模式串无需转义。去重保序，超闸截断。
+fn exact_tokens(q: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        if cur.len() >= 6 && !out.contains(cur) {
+            out.push(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+    for ch in q.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            cur.push(ch);
+        } else {
+            flush(&mut cur, &mut out);
+        }
+    }
+    flush(&mut cur, &mut out);
+    out.truncate(EXACT_MAX_TOKENS);
+    out
+}
+
+async fn exact_ids(store: &OwnedStore, docs: &[String], q: &str) -> Result<Vec<i64>, KbError> {
+    let tokens = exact_tokens(q);
+    if tokens.is_empty() {
+        return Ok(Vec::new()); // 没有 ≥6 位 ASCII token：省一次可见块全扫（纯中文问句的常态）
+    }
+    let pats: Vec<String> = tokens.iter().map(|t| format!("%{t}%")).collect();
+    ids(store.fixed(EXACT_SQL).bind(docs).bind(&pats).bind(EXACT_TOP)).await
 }
 
 /// 各召回路共用的 `Vec<(i64,)> → Vec<i64>`（`fixed()` 通道只给 `FromRow`，标量要自己拆元组）
@@ -1278,7 +1320,7 @@ fn ext_kb_hit(chunk_id: i64, ord: i32, record: &ExtKbRecord) -> Hit {
 }
 
 fn match_channels(chunk_id: i64, lists: &[Vec<i64>]) -> Vec<String> {
-    const NAMES: [&str; 8] = ["向量", "全文", "正文相似", "标题", "元数据", "结构关联", "图谱", "外部知识库"];
+    const NAMES: [&str; 8] = ["向量", "精确匹配", "正文相似", "标题", "元数据", "结构关联", "图谱", "外部知识库"];
     lists
         .iter()
         .zip(NAMES)
@@ -1720,6 +1762,41 @@ mod tests {
         assert_eq!(normalize_query("\n\t？！？"), "");
     }
 
+    // ==================== KB 审查③：无编号精确匹配路 ====================
+
+    /// token 抽取：`[A-Za-z0-9-]{6,}`（输入是归一化后的问句），去重保序、超闸截断。
+    #[test]
+    fn exact_tokens_picks_order_and_model_numbers() {
+        assert_eq!(exact_tokens("单号 so-2026-007 报了多少钱"), vec!["so-2026-007"]);
+        assert_eq!(exact_tokens("dht150-6 昨天 dht150-6"), vec!["dht150-6"], "重复 token 去重");
+        assert!(exact_tokens("报销上限是多少").is_empty(), "纯中文问句没有精确 token");
+        assert!(exact_tokens("abc_01.2xy").is_empty(), "`_` 与 `.` 是切点，各段都不到 6 位");
+        assert!(exact_tokens("abcde").is_empty(), "5 位不到门槛");
+        assert_eq!(exact_tokens("abcdef"), vec!["abcdef"], "6 位恰好够");
+        let many = (0..12).map(|i| format!("token{i:02}")).collect::<Vec<_>>().join(" ");
+        assert_eq!(exact_tokens(&many).len(), EXACT_MAX_TOKENS, "超闸截断");
+    }
+
+    /// 精确路 SQL 的契约：ACL 内联（`$1`）、正文 ILIKE 任一模式（`$2`）、命中数排序 + LIMIT。
+    #[test]
+    fn exact_route_sql_matches_tokens_against_chunk_text() {
+        assert!(EXACT_SQL.contains("c.doc_id = ANY($1::text[])"), "{EXACT_SQL}");
+        assert!(EXACT_SQL.contains("c.text ILIKE ANY($2::text[])"), "{EXACT_SQL}");
+        assert!(EXACT_SQL.contains("LIMIT $3") && EXACT_TOP == 20, "{EXACT_SQL}");
+        assert!(EXACT_SQL.contains("WHERE c.text ILIKE t.p"), "多 token 时兼中者排前：{EXACT_SQL}");
+        assert!(EXACT_SQL.contains("c.chunk_id"), "并列按 chunk_id（可复现）：{EXACT_SQL}");
+        // 权重等同标题路：占据 RRF 第二槽（恒 1.0 的字面量区），不进可调权重
+        assert_eq!(RrfWeights::default().route_array()[1], 1.0);
+    }
+
+    /// 没有 ≥6 位 ASCII token 就不发查询（`exact_ids` 的早退）：纯中文问句是常态，
+    /// 空模式扫一遍可见块是纯浪费。早退的纯逻辑输入即 `exact_tokens` 的空 Vec 判据。
+    #[test]
+    fn exact_route_skips_when_no_token() {
+        assert!(exact_tokens("报销上限是多少").is_empty());
+        assert!(!exact_tokens("so-2026-007 的审批人").is_empty());
+    }
+
     #[test]
     fn search_stats_default_is_an_explicit_zero_baseline() {
         let s = SearchStats::default();
@@ -1768,7 +1845,8 @@ mod tests {
     /// 🔴 trgm 阈值必须同时满足两头：收住实测判据块、挡住近域 nohit 的噪声。
     ///
     /// 由来：原值 0.3 把 KB01 的判据块（0.2667）挡在门外 → 14 题里只有 3 题能让 trgm 出结果，
-    /// 而中文 FTS 那一路实测 322 格全为 0（`plainto_tsquery('simple')` 不切中文），
+    /// 而彼时的中文 FTS 那一路实测 322 格全为 0（`plainto_tsquery('simple')` 不切中文；
+    /// 该路后被 KB 审查③换成单号/型号精确匹配），
     /// 于是「三路混合 + RRF」实际只有向量一路。
     #[test]
     fn trgm_threshold_matches_the_measured_distribution() {
@@ -1843,7 +1921,7 @@ mod tests {
         assert!(s.contains("$3::text IS NULL OR x.space_id = $3"));
         assert!(!s.contains("$4"), "只许用到 $1/$2/$3");
         // 所有召回路都按 doc_id 数组收口，没有任何一路是「查完再过滤」
-        for sql in [VEC_SQL, FTS_SQL, TRGM_SQL, TITLE_SQL, METADATA_SQL] {
+        for sql in [VEC_SQL, EXACT_SQL, TRGM_SQL, TITLE_SQL, METADATA_SQL] {
             assert!(sql.contains("doc_id = ANY($1::text[])"), "{sql}");
         }
         assert!(TITLE_SQL.contains("d.name") && TITLE_SQL.contains("c.heading_path"), "{TITLE_SQL}");
@@ -1987,6 +2065,9 @@ mod tests {
         assert_eq!(match_channels(7, &lists), ["向量", "标题", "元数据", "结构关联"]);
         assert_eq!(match_channels(8, &lists), ["向量", "正文相似"]);
         assert_eq!(match_channels(10, &lists), ["结构关联"]);
+        // 第二槽是精确匹配路（KB 审查③ 起，原「全文」路已替换）
+        let lists = vec![vec![], vec![42], vec![], vec![], vec![], vec![]];
+        assert_eq!(match_channels(42, &lists), ["精确匹配"]);
     }
 
     #[test]

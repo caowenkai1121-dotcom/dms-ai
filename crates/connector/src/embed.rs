@@ -37,6 +37,13 @@ pub struct EmbedClient {
     /// 超时仍在**每次请求**上单独设（`RequestBuilder::timeout` 覆盖语义与
     /// `Client::builder().timeout` 逐字相同），不同条数/模式的超时预算不变。
     http: reqwest::Client,
+    /// 问句向量的单槽 memo（问句原文 → 向量）：一轮问答里同一问句至少被取三次
+    /// （首轮 `gather` 的表召回、回炉 `gather_all_cards` 的 schema 召回与经验召回），
+    /// 而向量对（embed 服务, 文本）是确定的 —— 重复 HTTP 是纯浪费（单次几十~几百 ms）。
+    /// 单槽而不是 Map：一次问答只有一个问句，跨请求命中同文本同样安全；
+    /// **只缓存成功**（None 不缓存）：服务恢复后必须能重试，冷却/熔断语义全在 `embed`，
+    /// 本字段不加第二道。`Clone` 共享（与熔断状态同一处理）。
+    query_memo: Arc<std::sync::Mutex<Option<(String, Vec<f32>)>>>,
 }
 
 fn now() -> u64 {
@@ -53,6 +60,7 @@ impl EmbedClient {
             url: format!("{}/embed", base_url.trim_end_matches('/')),
             cooldown_until: Arc::new(AtomicU64::new(0)),
             http: reqwest::Client::builder().build().expect("embed http client"),
+            query_memo: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -90,7 +98,16 @@ impl EmbedClient {
 
     /// 单条查询向量（512 维）。历史 `embed_query` 语义：Query 模式取首行。
     pub async fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
-        self.embed(&[text.to_string()], EmbedMode::Query).await?.into_iter().next()
+        // 先撞 memo（锁只护一读后写，不跨 await）：同一问句在一轮问答里被取多次，
+        // 见 `query_memo` 字段注释。未命中才走 HTTP，命中结果回填。
+        if let Some((t, v)) = self.query_memo.lock().unwrap().as_ref() {
+            if t == text {
+                return Some(v.clone());
+            }
+        }
+        let v = self.embed(&[text.to_string()], EmbedMode::Query).await?.into_iter().next()?;
+        *self.query_memo.lock().unwrap() = Some((text.to_string(), v.clone()));
+        Some(v)
     }
 
     /// 语料批量（Passage 模式），知识库入库用。**按 `BATCH` 分批**。
@@ -216,6 +233,29 @@ mod tests {
         let c = EmbedClient::new("http://127.0.0.1:1");
         assert!(c.embed(&[], EmbedMode::Query).await.is_none());
         assert!(c.embed_passages(&[]).await.is_none());
+    }
+
+    /// 问句向量 memo：同文本第二次不再发 HTTP（一轮问答里同一问句被取多次），
+    /// 换文本照常发；**失败不缓存**（服务恢复后必须能重试，冷却语义在 `embed`）。
+    #[tokio::test]
+    async fn query_embedding_is_memoized_per_text_and_failures_are_not() {
+        let (base, seen) = stub(std::time::Duration::ZERO, |n| n).await;
+        let c = EmbedClient::new(&base);
+        let a = c.embed_query("同一个问题").await.expect("桩在线必须取向量");
+        let b = c.embed_query("同一个问题").await.expect("memo 命中");
+        assert_eq!(a, b, "memo 必须返回同一份向量");
+        assert_eq!(seen.lock().unwrap().len(), 1, "第二次必须命中 memo，不许再发 HTTP");
+        // clone 共享 memo（与熔断状态同一语义）：另一个句柄也命中
+        let c2 = c.clone();
+        let _ = c2.embed_query("同一个问题").await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "clone 必须共享同一份 memo");
+        // 单槽只记**最近**一个文本：换文本照常发（并把槽顶掉 —— 一轮问答只有一个问句）
+        let _ = c.embed_query("另一个问题").await;
+        assert_eq!(seen.lock().unwrap().len(), 2, "换文本必须照常发请求");
+        // 失败侧：服务不可达 → None，且**不进** memo（下一轮重试权不许被缓存毒掉）
+        let down = EmbedClient::new("http://127.0.0.1:1");
+        assert!(down.embed_query("q").await.is_none());
+        assert!(down.query_memo.lock().unwrap().is_none(), "None 不许进 memo");
     }
 
     // ===== 分批：桩服务记每次请求的 texts 条数 =====

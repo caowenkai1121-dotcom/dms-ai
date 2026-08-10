@@ -1213,6 +1213,7 @@ fn try_direct_for(question: &str, warehouse: bool) -> Option<DirectHit> {
             question,
             warehouse_sales_unsupported_semantic(question),
             "默认销售经营指标只允许在已验证数仓事实上查询；当前业务库不执行替代统计",
+            "请切换到已验证数仓，或先补齐独立事实合同",
         )
         .or_else(|| try_direct(question))
     }
@@ -1379,10 +1380,85 @@ fn warehouse_sales_has_unsupported_semantics(question: &str) -> bool {
     warehouse_sales_unsupported_semantic(question).is_some()
 }
 
+/// 问句尾部的「问法修饰词」——不携带口径限定、且装配器**兑现得了**才允许剥
+/// （与 `lexicon::STRIP_WORDS` 同一条纪律：剥了却不兑现 = 静默丢限定，E16 同形态）。
+///
+/// - 「怎么样/如何」是纯语气，恒可剥；
+/// - 「同比/环比（增长/下降）多少」由 KPI delta（prev/comparisons）用百分数兑现 ——
+///   只在**标量**（delta 只挂单指标 KPI）且对应比较窗口确实存在时才剥；
+///   剥了却没有 delta 可答，就是把「问同比」答成「只有总量」；
+/// - 「其中 X 占多少」：X 在合同里无可验证谓词（compound 只接「其中+极值词」，不接占比族），
+///   按裁决以 KPI+delta 形态答总量；含极值词的「其中」族归 compound，这里一个字都不剥。
+/// 判残留前由 `warehouse_sales_fact_predicated` 并进 consumed。
+fn answerable_tail_words(question: &str, scalar: bool) -> Vec<String> {
+    let mut words: Vec<String> = ["怎么样", "如何"]
+        .iter()
+        .filter(|word| question.contains(**word))
+        .map(|word| (*word).to_string())
+        .collect();
+    if !scalar {
+        return words;
+    }
+    // 「同比」由 yoy_window 兑现、「环比」由 prev_window 兑现；窗口认不得就不剥。
+    if question.contains("同比") && yoy_window(question).is_some() {
+        for word in ["同比增长多少", "同比下降多少", "同比增长", "同比下降", "同比"] {
+            if question.contains(word) {
+                words.push(word.to_string());
+            }
+        }
+    }
+    if question.contains("环比") && prev_window(question).is_some() {
+        for word in ["环比增长多少", "环比下降多少", "环比增长", "环比下降", "环比"] {
+            if question.contains(word) {
+                words.push(word.to_string());
+            }
+        }
+    }
+    if words.iter().any(|w| w.contains("同比") || w.contains("环比")) {
+        for word in ["增长多少", "下降多少", "增长", "下降"] {
+            if question.contains(word) {
+                words.push(word.to_string());
+            }
+        }
+    }
+    // 「其中 X 占多少」：占比请求。含极值词的是 compound 的地盘，不碰。
+    if let Some(pos) = question.find("其中") {
+        let tail = &question[pos..];
+        let superlative = ["最高", "最低", "最多", "最少"].iter().any(|w| tail.contains(w));
+        if tail.contains('占') && !superlative {
+            words.push(tail.to_string());
+        }
+    }
+    words
+}
+
+/// 「解析失败」卡要点名的那段：剥掉指标/维度词、通用虚词与可答尾词后剩下的实义残留。
+/// 与 `has_residue` 的剥离完全同构（同一词表、同一算法），只是返回残留文本而不是布尔。
+fn unrecognized_residue(question: &str) -> String {
+    let metrics = warehouse_sales_metrics(question);
+    let dimensions = warehouse_sales_dimensions(question);
+    let mut consumed: Vec<String> = vec![];
+    for (metric, _) in &metrics {
+        consumed.push(metric.name().to_string());
+        consumed.extend(metric.aliases().iter().map(|word| (*word).to_string()));
+        consumed.extend(sales_fact_metric_extra_words(*metric).iter().map(|word| (*word).to_string()));
+    }
+    for (dimension, _) in &dimensions {
+        consumed.push(dimension.name().to_string());
+        consumed.extend(dimension.aliases().iter().map(|word| (*word).to_string()));
+        consumed
+            .extend(sales_fact_dimension_extra_words(*dimension).iter().map(|word| (*word).to_string()));
+    }
+    let scalar = dimensions.is_empty() && metrics.len() == 1;
+    consumed.extend(answerable_tail_words(question, scalar));
+    residual_text(question, &consumed.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
 fn sales_fact_unavailable(
     question: &str,
     unsupported: Option<&'static str>,
-    reason: &'static str,
+    reason: &str,
+    advice: &str,
 ) -> Option<DirectHit> {
     let metrics = warehouse_sales_metrics(question);
     if metrics.is_empty() {
@@ -1398,7 +1474,7 @@ fn sales_fact_unavailable(
         sql: format!(
             "SELECT '不可计算' AS `数据状态`, '{names}' AS `指标`, \
                     '{requested}' AS `未确认范围`, '{reason}' AS `原因`, \
-                    '请切换到已验证数仓，或先补齐独立事实合同' AS `处理建议` \n             FROM dms_ods.t_dict_value LIMIT 1"
+                    '{advice}' AS `处理建议` \n             FROM dms_ods.t_dict_value LIMIT 1"
         ),
         route: "direct-doc".into(),
         prev: None,
@@ -1412,11 +1488,30 @@ fn warehouse_sales_semantics_unavailable(question: &str) -> Option<DirectHit> {
     if warehouse_sales_metrics(question).is_empty() {
         return None;
     }
-    let unsupported = warehouse_sales_unsupported_semantic(question).unwrap_or("未确认限定");
+    // 合同缺失：问句点名的维度/语义确实不在 sales_fact 合同里（文案与回归钉的字节不变）。
+    if let Some(unsupported) = warehouse_sales_unsupported_semantic(question) {
+        return sales_fact_unavailable(
+            question,
+            Some(unsupported),
+            "当前 sales_fact 合同没有该维度或语义；禁止关联旧订单或物流事实猜算",
+            "请切换到已验证数仓，或先补齐独立事实合同",
+        );
+    }
+    // 解析失败：指标认得出、但残余限定没消化完 —— 不是合同缺东西，卡面不许再栽给
+    // 「合同没有该维度」（修前两支共用一句文案，解析失败被误读成合同缺失）。
+    // 未确认范围保持「未确认限定」：`direct_hit` 靠这四个字识别本卡去探客户主档，一个字不许改。
+    let residue = unrecognized_residue(question);
+    let residue = if residue.is_empty() { "问句中的部分限定".to_string() } else { residue };
+    // 进 SQL 字面量前转义引号/反斜杠，并截断兜底（卡面不是日志，别把整句问句塞进去）。
+    let residue = residue.replace('\\', "\\\\").replace('\'', "''");
+    let residue: String = residue.chars().take(20).collect();
     sales_fact_unavailable(
         question,
-        Some(unsupported),
-        "当前 sales_fact 合同没有该维度或语义；禁止关联旧订单或物流事实猜算",
+        Some("未确认限定"),
+        &format!(
+            "问句含未能识别的限定「{residue}」（解析失败，非合同缺失）；禁止关联旧订单或物流事实猜算"
+        ),
+        "请换个问法重试（如去掉该限定），或先补齐同义词/维度登记",
     )
 }
 
@@ -1459,6 +1554,9 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
     let dimension_hits = warehouse_sales_dimensions(question);
     let metrics = metric_hits.iter().map(|(metric, _)| *metric).collect::<Vec<_>>();
     let dimensions = dimension_hits.iter().map(|(dimension, _)| *dimension).collect::<Vec<_>>();
+    // 标量 = 无维度单指标：只有它能挂 KPI delta（prev/comparisons 只在这时装配），
+    // 「同比/环比多少」类尾词因此只在标量下才允许剥（见 `answerable_tail_words` 的纪律）。
+    let scalar = dimensions.is_empty() && metrics.len() == 1;
 
     let mut consumed = vec![];
     for (metric, _) in &metric_hits {
@@ -1480,6 +1578,8 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
     if let Some(name) = customer {
         consumed.push(name.to_string());
     }
+    // 尾部问法修饰词（怎么样/同比增长多少/其中X占多少…）：兑现得了的才剥，判残留前并进 consumed。
+    consumed.extend(answerable_tail_words(question, scalar));
     if has_residue(question, &consumed) {
         return None;
     }
@@ -1525,8 +1625,14 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
         limit,
     );
 
-    let scalar = dimensions.is_empty() && metrics.len() == 1;
-    let prev = scalar.then(|| prev_window(question)).flatten().and_then(|(template, label)| {
+    // 问句点名「同比」时，同比就是主 delta（KPI 卡第一个比较位），环比退居 comparisons；
+    // 未点名维持原序（环比为主、同比为辅）。两种问法两个比较都会执行，只是展示位次不同。
+    let (primary, secondary) = if question.contains("同比") {
+        (yoy_window(question), prev_window(question))
+    } else {
+        (prev_window(question), yoy_window(question))
+    };
+    let prev = scalar.then(|| primary).flatten().and_then(|(template, label)| {
         let (begin, end) = dms_semantic::sales_fact::comparison_time_bounds(question, template)?;
         Some((
             sales_fact_sql(&metrics, &[], &begin, &end, &predicates, None, None),
@@ -1534,7 +1640,7 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
         ))
     });
     let comparisons = scalar
-        .then(|| yoy_window(question))
+        .then(|| secondary)
         .flatten()
         .and_then(|(template, label)| {
             let (begin, end) = dms_semantic::sales_fact::comparison_time_bounds(question, template)?;
@@ -3695,6 +3801,83 @@ mod tests {
         assert!(day.ends_with("AND DATE(order_time) = CURDATE() - INTERVAL 1 DAY"), "{day}");
     }
 
+    /// ① 尾部问法修饰词剥离：这四句实测全落过「不可计算」卡（残留守卫把
+    /// 「怎么样/同比增长多少/其中X占多少」当成未识别限定），而它们 KPI 自带 delta 或可答。
+    #[test]
+    fn tail_modifier_words_no_longer_false_positive_unavailable() {
+        // 「同比多少」：剥尾词后走标量事实，且**点名的同比占主 delta 位**（prev = 同比窗口）
+        let yoy = warehouse_sales_fact("上月销售额同比增长多少")
+            .expect("同比问法应命中标量事实，不该落不可计算卡");
+        assert!(yoy.sql.contains("SUM(sf.amount) AS `销售额`"), "{}", yoy.sql);
+        let (prev_sql, prev_label) = yoy.prev.as_ref().expect("同比问法必须有主 delta");
+        assert_eq!(prev_label, "同比", "点名的同比必须在 KPI 第一比较位：{prev_sql}");
+        assert!(prev_sql.contains("INTERVAL 1 YEAR"), "同比窗口必须是去年同期：{prev_sql}");
+        assert_eq!(yoy.comparisons.len(), 1, "环比退居 comparisons：{:?}", yoy.comparisons);
+        assert_eq!(yoy.comparisons[0].1, "较上上月");
+
+        // 「环比…怎么样」：环比本来就是主 delta 位；「怎么样」是纯语气
+        let mom = warehouse_sales_fact("本月销售额环比上月怎么样")
+            .expect("环比问法应命中标量事实");
+        assert_eq!(mom.prev.as_ref().map(|(_, l)| l.as_str()), Some("较上月"));
+        // 主查询时间窗必须是「本月」（rule_relative 里本月先于上月），不能被「环比上月」抢走
+        assert!(mom.sql.contains("sf.order_date >= DATE_FORMAT(CURDATE(),'%Y-%m-01')"), "{}", mom.sql);
+
+        // 「怎么样」：纯语气尾词
+        let tone = warehouse_sales_fact("昨天的销量怎么样").expect("语气尾词不该挡路");
+        assert!(tone.sql.contains("SUM(sf.qty) AS `销量`"), "{}", tone.sql);
+        assert!(tone.sql.contains("sf.order_date >= CURDATE() - INTERVAL 1 DAY"), "{}", tone.sql);
+
+        // 「其中 X 占多少」：X 在合同里无可验证谓词、compound 只接极值词族 ——
+        // 按裁决以 KPI+delta 形态答总量（scalar 命中，自带 prev/同比/明细/同窗补充）
+        let share = warehouse_sales_fact("上月销售额，其中直营占多少")
+            .expect("占比族按 KPI+delta 形态答总量");
+        assert!(share.sql.contains("SUM(sf.amount) AS `销售额`"), "{}", share.sql);
+        assert!(share.prev.is_some(), "总量答案自带环比 delta");
+
+        // 整条同步链（try_direct_for）同一结论：四句实测题一律不再出「不可计算」卡
+        for question in [
+            "上月销售额同比增长多少",
+            "本月销售额环比上月怎么样",
+            "昨天的销量怎么样",
+            "上月销售额，其中直营占多少",
+        ] {
+            let hit = try_direct_for(question, true)
+                .unwrap_or_else(|| panic!("整条链应接住：{question}"));
+            assert_eq!(hit.route, "direct-agg", "{question}");
+            assert!(!is_unavailable_card(&hit), "{question} 不许再误报不可计算卡：{}", hit.sql);
+        }
+
+        // 🔴 反面①：窗口兑现不了「同比」时**不许剥**（剥了 = 静默丢限定）
+        assert!(warehouse_sales_fact("上半年销售额同比增长多少").is_none(),
+                "上半年没有同比窗口，必须照旧拦下");
+        // 🔴 反面②：带维度的问句没有 KPI delta 可挂，「同比」不许剥
+        assert!(warehouse_sales_fact("上月各省区销售额同比增长多少").is_none(),
+                "维度拆解答不了同比，必须照旧拦下");
+        // 🔴 反面③：「其中+极值词」是 compound 的地盘，这里一个字都不剥
+        assert!(warehouse_sales_fact("上月销售额，其中最高的客户是哪个").is_none(),
+                "极值词族不许被占比族剥掉");
+    }
+
+    /// ① 卡面文案：「解析失败」与「合同缺失」必须说不同的话 ——
+    /// 修前两支共用「合同没有该维度」，解析失败被误读成合同缺失（判官实测误导）。
+    #[test]
+    fn unavailable_card_distinguishes_parse_failure_from_contract_gap() {
+        // 合同缺失：点名的维度不在合同里 —— 文案保持回归钉的字节
+        let gap = warehouse_sales_semantics_unavailable("本月销售额按门店")
+            .expect("门店不在合同维度里");
+        assert!(gap.sql.contains("'门店' AS `未确认范围`"), "{}", gap.sql);
+        assert!(gap.sql.contains("sales_fact 合同没有该维度或语义"), "{}", gap.sql);
+
+        // 解析失败：指标认得出、残余限定消化不掉 —— 卡面指名残留、且不栽给合同
+        let parse = warehouse_sales_semantics_unavailable("嗨肉本月销售额")
+            .expect("客户名残留是解析失败");
+        assert!(parse.sql.contains("'未确认限定' AS `未确认范围`"),
+                "「未确认限定」是 direct_hit 探客户主档的哨兵，一个字不许改：{}", parse.sql);
+        assert!(parse.sql.contains("解析失败，非合同缺失"), "{}", parse.sql);
+        assert!(parse.sql.contains("「嗨肉」"), "卡面必须指名没认出来的那段：{}", parse.sql);
+        assert!(!parse.sql.contains("合同没有该维度"), "解析失败不许栽给合同缺失：{}", parse.sql);
+    }
+
     #[test]
     fn agg_skips_dimension() {
         // 带维度词 → 回落 LLM
@@ -4683,11 +4866,12 @@ mod tests {
 
     #[test]
     fn time_recent_n_with_cn_numbers() {
-        assert!(tp("近7天销售额").contains("INTERVAL 7 DAY"));
+        // 「近 N 天」含今天 = N 个自然日：起点回推 N-1 天（修前回推 N 天 → N+1 天）
+        assert!(tp("近7天销售额").contains("INTERVAL 6 DAY"));
         assert!(tp("最近三个月销售额").contains("INTERVAL 3 MONTH"));
         assert!(tp("过去两周订单数").contains("INTERVAL 2 WEEK"));
-        assert!(tp("近十天销量").contains("INTERVAL 10 DAY"));
-        assert!(tp("最近十五天销售额").contains("INTERVAL 15 DAY"));
+        assert!(tp("近十天销量").contains("INTERVAL 9 DAY"));
+        assert!(tp("最近十五天销售额").contains("INTERVAL 14 DAY"));
     }
 
     #[test]

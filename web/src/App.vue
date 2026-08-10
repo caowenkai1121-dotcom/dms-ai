@@ -1017,6 +1017,8 @@ const turns = computed<Turn[]>({
   },
 })
 const chatEl = ref<HTMLElement>()
+// 移动端（≤820px）侧栏改为抽屉：顶栏 ☰ 拉开，遮罩/点会话收起；桌面端恒为 false 不影响布局
+const sideOpen = ref(false)
 const health = ref('检查中…')
 const healthOk = ref(false)
 const healthBusy = ref(false)
@@ -1870,7 +1872,7 @@ async function send(q?: string, options: SendOptions = {}) {
 function startProgress(rid: string, aiTurn: Turn): () => void {
   const timer = setInterval(async () => {
     try {
-      const r = await fetch(`/api/deep/progress?rid=${encodeURIComponent(rid)}`)
+      const r = await fetch(`/api/deep/progress?rid=${encodeURIComponent(rid)}`, { headers: authHeaders(false) })
       if (!r.ok) return
       const j = await r.json()
       aiTurn.progress = j.steps ?? []
@@ -1885,7 +1887,7 @@ function startProgress(rid: string, aiTurn: Turn): () => void {
 // 可续跑 = failed/interrupted/重启孤儿（running 但执行器已死）；活执行器/已完成 = 不亮。
 async function checkResumable(rid: string, t: Turn) {
   try {
-    const r = await fetch(`/api/deep/progress?rid=${encodeURIComponent(rid)}`)
+    const r = await fetch(`/api/deep/progress?rid=${encodeURIComponent(rid)}`, { headers: authHeaders(false) })
     if (!r.ok) return
     const j = await r.json()
     t.resumable = j.resumable === true
@@ -2249,7 +2251,7 @@ function exportSupplementalCsv(t: Turn) {
 <template>
   <div class="wrap" :class="{ 'has-preview': !!preview }">
     <!-- 侧栏 -->
-    <aside class="side">
+    <aside class="side" :class="{ open: sideOpen }">
       <div class="side-hd">
         <span class="logo">🐯 皇家小虎</span>
         <button class="btn-icon" @click="toggleTheme" :title="'明暗切换'">{{ theme === 'dark' ? '☀️' : '🌙' }}</button>
@@ -2263,9 +2265,9 @@ function exportSupplementalCsv(t: Turn) {
       <!-- 今日经营日报：服务端 feed=daily 只返回当天生成的一份。 -->
       <div class="sec" v-if="hasAdminAccess() && digests.length">
         <div class="sec-t">经营日报</div>
-        <div v-for="a in digests" :key="a.id" class="hist-item" @click="openPreview(a.preview_url, a.title)">
+        <button v-for="a in digests" :key="a.id" type="button" class="hist-item" @click="openPreview(a.preview_url, a.title); sideOpen = false">
           <span class="hi-title">📊 {{ a.title }}</span>
-        </div>
+        </button>
       </div>
       <div class="sec weekly-sec">
         <div class="sec-t">
@@ -2279,7 +2281,8 @@ function exportSupplementalCsv(t: Turn) {
       </div>
       <div class="hist">
         <div v-if="!convs.length" class="hist-empty">还没有会话，点「+ 新建」或直接提问</div>
-        <div v-for="c in convs" :key="c.id" class="hist-item" :class="{ active: c.id === curConvId }" @click="openConv(c.id)">
+        <div v-for="c in convs" :key="c.id" class="hist-item" :class="{ active: c.id === curConvId }" role="button" tabindex="0"
+             @click="openConv(c.id); sideOpen = false" @keydown.self.enter.prevent="openConv(c.id); sideOpen = false" @keydown.self.space.prevent="openConv(c.id); sideOpen = false">
           <span v-if="convRunning(c.id)" class="hi-run" title="该会话仍在分析"><span class="spin"></span></span>
           <span class="hi-title">{{ c.title }}</span>
           <span class="hi-time">{{ c.time }}</span>
@@ -2292,6 +2295,8 @@ function exportSupplementalCsv(t: Turn) {
         <div class="readonly">🔒 纯查询模式（无写操作）</div>
       </div>
     </aside>
+    <!-- 移动端抽屉遮罩：仅 ≤820px 抽屉态可见（桌面端 .side-mask display:none） -->
+    <div v-if="sideOpen" class="side-mask" @click="sideOpen = false"></div>
 
     <KbPanel
       v-if="kbOpen" :token="sessionToken" :login="loginName" :initial-space="knowledgeSpaceId"
@@ -2331,13 +2336,14 @@ function exportSupplementalCsv(t: Turn) {
         </header>
         <div v-if="traceLoading" class="trace-state"><span class="spin"></span>加载中…</div>
         <div v-else-if="traceError" class="trace-state trace-err">{{ traceError }}</div>
-        <TracePanel v-else :rounds="traceRounds" />
+        <TracePanel v-else :rounds="traceRounds" @preview="openPreview" />
       </div>
     </div>
 
     <!-- 主区 -->
     <div class="main">
       <div class="topbar">
+        <button type="button" class="btn-icon mobile-menu" title="会话列表与导航" @click="sideOpen = true">☰</button>
         <div class="brand">数据智能<span class="sub">DMS · 自然语言取数</span></div>
         <div class="sp"></div>
         <span v-if="sessionToken" class="dms-user">已登录 <b>{{ loginName || '认证中…' }}</b><template v-if="roleCode"> · {{ roleCode }}</template></span>
@@ -2355,7 +2361,7 @@ function exportSupplementalCsv(t: Turn) {
       <div v-if="view === 'settings' && hasAdminAccess()" class="chat set-wrap">
         <div class="set-head">
           <div class="set-title">系统设置</div>
-          <a class="set-back" @click="goChat">← 返回对话</a>
+          <button type="button" class="set-back" @click="goChat">← 返回对话</button>
         </div>
         <div v-if="llmMsg" class="set-msg">{{ llmMsg }}</div>
 
@@ -2607,15 +2613,15 @@ function exportSupplementalCsv(t: Turn) {
                 <button v-for="r in t.roles" :key="r" class="btn-sm" @click="pickRole(r, t.retryQuestion || turns[ti - 1]?.question, t.retryOptions, t.convId)">{{ r }}</button>
               </div>
               <!-- 【D4】断点续跑：服务端账本判定可续跑才显示（已完成板块零重跑） -->
-              <a v-if="t.resumable && t.rid" class="retry" :class="{ disabled: t.resuming }" @click="resumeDeep(t)">↻ 续跑（从断点继续，不重跑已完成板块）</a>
-              <a v-else-if="t.retryQuestion || turns[ti - 1]?.question" class="retry" @click="send(t.retryQuestion || turns[ti - 1]?.question, { ...t.retryOptions, targetConvId: t.convId })">↻ 重试</a>
+              <button v-if="t.resumable && t.rid" type="button" class="retry" :class="{ disabled: t.resuming }" @click="resumeDeep(t)">↻ 续跑（从断点继续，不重跑已完成板块）</button>
+              <button v-else-if="t.retryQuestion || turns[ti - 1]?.question" type="button" class="retry" @click="send(t.retryQuestion || turns[ti - 1]?.question, { ...t.retryOptions, targetConvId: t.convId })">↻ 重试</button>
             </div>
             <!-- 【D6】promote 回放：别的会话钉进来的产物引用（点击走深链拦截开预览面板） -->
             <div v-else-if="t.promoted" class="bubble ai">
               <div class="res-meta"><span>📌 引用的产物<template v-if="t.promoted.version"> · v{{ t.promoted.version }}</template></span></div>
               <a class="art-card" :href="t.promoted.url">
                 📄 <b>{{ t.promoted.title }}</b><span class="art-hint">已钉到本会话 · 点击预览/分享</span>
-                <span class="art-share" title="发分享链接" @click.prevent.stop="shareArtifact(artifactIdOf(t.promoted.url))">🔗</span>
+                <button type="button" class="art-share" title="发分享链接" @click.prevent.stop="shareArtifact(artifactIdOf(t.promoted.url))">🔗</button>
               </a>
               <p v-if="t.promoted.note" class="promote-note">{{ t.promoted.note }}</p>
             </div>
@@ -2630,17 +2636,17 @@ function exportSupplementalCsv(t: Turn) {
                    具体数字与续读参数由后端 `truncation_note` 说全（ResultPanel 渲染它）。 -->
               <span>{{ t.result.row_count }} 行{{ t.result.truncated ? ' · 已截断' : '' }}</span>
                   <!-- 深度模式不出 AI 解读钮：分析默认做（在产物页里），按钮是重复入口 -->
-                  <a v-if="t.mode !== 'deep' && t.result.row_count > 0" class="sql-toggle" style="margin-left: auto" @click="toggleAnalysis(t)">
+                  <button v-if="t.mode !== 'deep' && t.result.row_count > 0" type="button" class="sql-toggle" style="margin-left: auto" @click="toggleAnalysis(t)">
                     {{ t.analysis?.open ? '收起解读' : '🤖 AI 解读' }}
-                  </a>
-                  <a v-if="t.result.row_count > 0" class="sql-toggle" :style="t.page ? 'margin-left: auto' : ''" @click="exportCsv(t)">⬇ 导出 CSV</a>
-                  <a v-if="t.result.supplemental" class="sql-toggle" @click="exportSupplementalCsv(t)">⬇ 导出明细 CSV</a>
-                  <a v-if="turnSqls(t).length" class="sql-toggle" :style="t.result.row_count > 0 ? '' : 'margin-left: auto'" @click="t.showSql = !t.showSql">{{ t.showSql ? '隐藏' : '查看' }} SQL</a>
+                  </button>
+                  <button v-if="t.result.row_count > 0" type="button" class="sql-toggle" :style="t.page ? 'margin-left: auto' : ''" @click="exportCsv(t)">⬇ 导出 CSV</button>
+                  <button v-if="t.result.supplemental" type="button" class="sql-toggle" @click="exportSupplementalCsv(t)">⬇ 导出明细 CSV</button>
+                  <button v-if="turnSqls(t).length" type="button" class="sql-toggle" :style="t.result.row_count > 0 ? '' : 'margin-left: auto'" @click="t.showSql = !t.showSql">{{ t.showSql ? '隐藏' : '查看' }} SQL</button>
                 </template>
                 <!-- 【引用上轮】该轮问题+结论摘要进输入框上方的引用 chip 区，随下一条提问发出 -->
-                <a class="sql-toggle" title="引用该轮问答作为下一条提问的上下文" @click="quoteTurn(t)">↩ 引用</a>
+                <button type="button" class="sql-toggle" title="引用该轮问答作为下一条提问的上下文" @click="quoteTurn(t)">↩ 引用</button>
                 <!-- 【分支会话】只挂在持久会话的轮上（draft 轮没有 convId 可分支）；from_seq 是该轮的 1 基序号 -->
-                <a v-if="t.convId != null" class="sql-toggle branch-toggle" :class="{ disabled: branchBusy }" title="从该轮岔出一个新会话（复制到该轮为止的上下文）" @click="branchTurn(t, ti)">⑂ 分支</a>
+                <button v-if="t.convId != null" type="button" class="sql-toggle branch-toggle" :class="{ disabled: branchBusy }" title="从该轮岔出一个新会话（复制到该轮为止的上下文）" @click="branchTurn(t, ti)">⑂ 分支</button>
               </div>
               <div v-if="t.showSql && t.result.kind !== 'text'" class="sql-stack">
                 <details v-for="(item, qi) in turnSqls(t)" :key="qi" class="sql-item" :open="qi === 0">
@@ -2652,7 +2658,7 @@ function exportSupplementalCsv(t: Turn) {
                    点击走深链拦截 → 右侧沙箱面板；与 S2 的 .art-card 同形 -->
               <a v-if="t.artifact" class="art-card" :href="t.artifact.url">
                 📄 <b>{{ t.artifact.title }}</b><span class="art-hint">深度分析页已生成 · 点击预览/分享</span>
-                <span class="art-share" title="发分享链接" @click.prevent.stop="shareArtifact(artifactIdOf(t.artifact.url))">🔗</span>
+                <button type="button" class="art-share" title="发分享链接" @click.prevent.stop="shareArtifact(artifactIdOf(t.artifact.url))">🔗</button>
               </a>
                <!-- 【深度页聊天内嵌】问题理解 → KPI → 板块（图+表）→ 明细 → AI 分析收尾。
                     数据全在 page 载荷里，与分享页同源（同一次取数、同一份内容） -->
@@ -2826,7 +2832,7 @@ function exportSupplementalCsv(t: Turn) {
                    点击 = 把该 question 直接发出（沿用会话追问机制）。字段缺席 = 现状不变。 -->
               <div v-if="clarifyOptionsOf(t.result).length" class="clarify-opts">
                 <span class="clarify-t">你可以这样问：</span>
-                <span v-for="c in clarifyOptionsOf(t.result)" :key="c.question" class="pill" @click="send(c.question, { targetConvId: t.convId })">{{ c.label }}</span>
+                <button v-for="c in clarifyOptionsOf(t.result)" :key="c.question" type="button" class="pill" @click="send(c.question, { targetConvId: t.convId })">{{ c.label }}</button>
               </div>
             </div>
           </div>
@@ -2835,14 +2841,14 @@ function exportSupplementalCsv(t: Turn) {
 
       <!-- 能力切换 + 快捷 pill -->
       <div class="quick">
-        <span v-for="c in CAPS" :key="c.v" class="pill cap" :class="{ on: intent === c.v }"
-              :title="'问答能力：' + c.t" @click="intent = c.v">{{ c.t }}</span>
+        <button v-for="c in CAPS" :key="c.v" type="button" class="pill cap" :class="{ on: intent === c.v }"
+              :title="'问答能力：' + c.t" @click="intent = c.v">{{ c.t }}</button>
         <span v-if="intent !== 'data' && knowledgeSpaceName" class="kb-scope" :title="intent === 'auto' ? `自动分诊为知识库时仅检索 ${knowledgeSpaceName}` : `仅检索 ${knowledgeSpaceName}`">
           {{ knowledgeSpaceName }}
         </span>
         <span class="cap-sp"></span>
         <button type="button" class="pill mobile-weekly" :disabled="weeklyBusy || sending" @click="openWeeklyReport">经营周报</button>
-        <span v-for="q in quick" :key="q" class="pill" @click="send(q)">{{ q }}</span>
+        <button v-for="q in quick" :key="q" type="button" class="pill" @click="send(q)">{{ q }}</button>
       </div>
 
       <!-- 【引用上轮】chip 区 + 输入栏 +【排队追问】队列：一个外壳共用一条上边框 -->
@@ -2859,8 +2865,8 @@ function exportSupplementalCsv(t: Turn) {
       <div class="inputbar">
         <!-- 【深度模式】精简|深度：深度 = AI 深度参与并生成可点击预览的报表卡 -->
         <div class="mode-seg" :class="{ disabled: intent === 'knowledge' }" :title="intent === 'knowledge' ? '知识库模式固定使用引用式回答' : '深度模式：AI 深度参与生成与分析，自动出深度解读与报表（更慢更丰满）'">
-          <span :class="{ on: !deepMode }" @click="intent !== 'knowledge' && setMode(false)">精简</span>
-          <span :class="{ on: deepMode }" @click="intent !== 'knowledge' && setMode(true)">深度</span>
+          <button type="button" :class="{ on: !deepMode }" @click="intent !== 'knowledge' && setMode(false)">精简</button>
+          <button type="button" :class="{ on: deepMode }" @click="intent !== 'knowledge' && setMode(true)">深度</button>
         </div>
         <textarea v-model="question" :placeholder="sending ? '当前提问仍在分析，Enter 发送将排队等待…' : '用自然语言提问，Enter 发送，Shift+Enter 换行…'" @keydown="onKey" rows="1"></textarea>
         <button class="send" :disabled="!question.trim()" @click="send()">{{ sending ? '排队' : '发送' }}</button>
@@ -2948,27 +2954,27 @@ function exportSupplementalCsv(t: Turn) {
       <div class="pv-drag" @mousedown="startDrag" title="拖动调整宽度"></div>
       <div class="pv-hd">
         <span class="pv-title">{{ preview.title }}<template v-if="previewVer"> · v{{ previewVer }}</template></span>
-        <a class="pv-act" @click="toggleVersions" title="版本历史（重生成留版本，可回看老版本）">🕘 版本</a>
-        <a class="pv-act" @click="exportPreview('csv')" title="把产物页里的表格导成 CSV">⬇ CSV</a>
-        <a class="pv-act" @click="exportPreview('xlsx')" title="把产物页里的表格导成 Excel">⬇ Excel</a>
-        <a class="pv-act" @click="pvPromoteOpen = !pvPromoteOpen; pvVersionsOpen = false" title="把该产物引用到自己的另一会话">📌 引用</a>
-        <a class="pv-act" @click="shareArtifact(artifactIdOf(preview.sourceUrl))" title="发分享链接（免登录只读）">🔗 分享</a>
-        <a class="pv-act" @click="downloadPreview" title="下载">⬇ 下载</a>
-        <button class="pv-act" @click="openPreviewWindow" title="在浏览器新窗口打开">↗ 新窗口</button>
-        <button class="pv-act pv-x" @click="closePreview" title="关闭">✕</button>
+        <button type="button" class="pv-act" @click="toggleVersions" title="版本历史（重生成留版本，可回看老版本）">🕘 版本</button>
+        <button type="button" class="pv-act" @click="exportPreview('csv')" title="把产物页里的表格导成 CSV">⬇ CSV</button>
+        <button type="button" class="pv-act" @click="exportPreview('xlsx')" title="把产物页里的表格导成 Excel">⬇ Excel</button>
+        <button type="button" class="pv-act" @click="pvPromoteOpen = !pvPromoteOpen; pvVersionsOpen = false" title="把该产物引用到自己的另一会话">📌 引用</button>
+        <button type="button" class="pv-act" @click="shareArtifact(artifactIdOf(preview.sourceUrl))" title="发分享链接（免登录只读）">🔗 分享</button>
+        <button type="button" class="pv-act" @click="downloadPreview" title="下载">⬇ 下载</button>
+        <button type="button" class="pv-act" @click="openPreviewWindow" title="在浏览器新窗口打开">↗ 新窗口</button>
+        <button type="button" class="pv-act pv-x" @click="closePreview" title="关闭">✕</button>
       </div>
       <!-- 【D6】版本历史浮层：点版本回看那一版（iframe 仍是同一 CSP 沙箱页） -->
       <div v-if="pvVersionsOpen" class="pv-pop">
         <div v-if="!pvVersions" class="pv-pop-item">加载中…</div>
         <template v-else>
-          <a v-for="v in pvVersions" :key="v.version" class="pv-pop-item" :class="{ on: previewVer ? v.version === previewVer : v.latest }"
-             @click="openVersion(v.version)">v{{ v.version }}<small>{{ (v.created_at || '').slice(5, 16) }}<template v-if="v.latest"> · 最新</template></small></a>
+          <button v-for="v in pvVersions" :key="v.version" type="button" class="pv-pop-item" :class="{ on: previewVer ? v.version === previewVer : v.latest }"
+             @click="openVersion(v.version)">v{{ v.version }}<small>{{ (v.created_at || '').slice(5, 16) }}<template v-if="v.latest"> · 最新</template></small></button>
         </template>
       </div>
       <!-- 【D6】引用到会话浮层：侧栏只列自己的会话，服务端 promote 再核一次属主（fail-closed） -->
       <div v-if="pvPromoteOpen" class="pv-pop">
         <div v-if="!convs.length" class="pv-pop-item">还没有会话</div>
-        <a v-for="c in convs" :key="c.id" class="pv-pop-item" @click="promoteArtifact(c.id, c.title)">📌 {{ c.title }}</a>
+        <button v-for="c in convs" :key="c.id" type="button" class="pv-pop-item" @click="promoteArtifact(c.id, c.title)">📌 {{ c.title }}</button>
       </div>
       <div v-if="preview.loading" class="pv-state"><span class="spin"></span>正在加载预览…</div>
       <div v-else-if="preview.error" class="pv-state pv-error">{{ preview.error }}</div>
@@ -3028,7 +3034,7 @@ function exportSupplementalCsv(t: Turn) {
 .set-wrap { padding: 20px 28px 60px; }
 .set-head { max-width: 920px; margin: 4px auto 14px; display: flex; align-items: baseline; justify-content: space-between; }
 .set-title { font-size: 18px; font-weight: 650; color: var(--text-primary); }
-.set-head .set-back { font-size: 13px; color: var(--primary); cursor: pointer; }
+.set-head .set-back { padding: 0; border: 0; background: none; font-family: inherit; font-size: 13px; color: var(--primary); cursor: pointer; }
 .set-head .set-back:hover { text-decoration: underline; }
 .set-wrap > .set-msg { max-width: 920px; margin: 0 auto 12px; }
 .set-card { max-width: 920px; margin: 0 auto 16px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px 18px; box-shadow: var(--shadow-sm); }
@@ -3126,7 +3132,7 @@ function exportSupplementalCsv(t: Turn) {
 .vqr-sql summary { cursor: pointer; width: fit-content; }
 .vqr-sql pre { max-height: 180px; overflow: auto; margin: 6px 0 0; padding: 8px 10px; border: 1px solid var(--divider); border-radius: 6px; background: var(--bg-main); color: var(--text-regular); white-space: pre-wrap; font-family: var(--font-mono); }
 .vqr-ops { display: flex; align-items: flex-start; gap: 6px; flex-shrink: 0; }
-.hist-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-regular); padding: 7px 10px; border-radius: var(--radius-md); cursor: pointer; }
+.hist-item { display: flex; align-items: center; gap: 6px; width: 100%; font-family: inherit; font-size: 13px; text-align: left; border: 0; background: none; color: var(--text-regular); padding: 7px 10px; border-radius: var(--radius-md); cursor: pointer; }
 .hist-item:hover { background: var(--bg-hover); }
 .hist-item.active { background: var(--primary-light); color: var(--primary); }
 .hist-item .hi-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -3135,10 +3141,12 @@ function exportSupplementalCsv(t: Turn) {
 .hist-item .hi-time { font-size: 11px; color: var(--text-faint); flex-shrink: 0; }
 .hist-item .hi-del { opacity: 0; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 15px; line-height: 1; flex-shrink: 0; }
 .hist-item .hi-trace { opacity: 0; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 12px; line-height: 1; flex-shrink: 0; }
-.hist-item:hover .hi-trace { opacity: 1; }
+.hist-item:hover .hi-trace, .hist-item:focus-within .hi-trace { opacity: 1; }
 .hist-item .hi-trace:hover { color: var(--primary); }
-.hist-item:hover .hi-del { opacity: 1; }
+.hist-item:hover .hi-del, .hist-item:focus-within .hi-del { opacity: 1; }
 .hist-item .hi-del:hover { color: var(--error-text); }
+/* 触屏无 hover：行内删除/Trace 按钮常显，否则永远无法点 */
+@media (hover: none) { .hist-item .hi-trace, .hist-item .hi-del { opacity: 1; } }
 .side-ft { margin-top: auto; }
 .health { font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 6px; }
 .health .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
@@ -3147,7 +3155,7 @@ function exportSupplementalCsv(t: Turn) {
 .readonly { font-size: 11px; color: var(--text-faint); margin-top: 5px; }
 /* 主区 */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
-.topbar { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--divider); background: var(--bg-card); }
+.topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; padding: 12px 16px; border-bottom: 1px solid var(--divider); background: var(--bg-card); }
 .topbar .brand { font-weight: 650; font-size: 16px; color: var(--text-primary); display: flex; align-items: baseline; gap: 6px; }
 .topbar .brand .sub { font-size: 12px; color: var(--text-muted); font-weight: 400; }
 .topbar .sp { flex: 1; }
@@ -3174,7 +3182,7 @@ function exportSupplementalCsv(t: Turn) {
 .think-state b { font-size: 13px; }
 .think-state strong { color: var(--primary); font-size: 12px; font-variant-numeric: tabular-nums; }
 .think-state small { color: var(--text-muted); font-size: 11.5px; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.bubble.err .retry { display: inline-block; margin-top: 8px; font-size: 12px; color: var(--primary); cursor: pointer; }
+.bubble.err .retry { display: inline-block; margin-top: 8px; padding: 0; border: 0; background: none; font-family: inherit; font-size: 12px; color: var(--primary); cursor: pointer; }
 .bubble.err .retry:hover { text-decoration: underline; }
 /* 角色选择器（多角色账号被 fail-closed 拒时唯一的出口）：一行标题 + 每个角色一个按钮 */
 .bubble.err .role-pick { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; }
@@ -3185,7 +3193,7 @@ function exportSupplementalCsv(t: Turn) {
 .res-meta .steps { font-size: 12px; }
 .res-meta .steps summary { display: inline; cursor: pointer; color: var(--primary); }
 .res-meta .steps .step { margin-right: 10px; white-space: nowrap; }
-.res-meta .sql-toggle { margin-left: auto; cursor: pointer; color: var(--primary); }
+.res-meta .sql-toggle { margin-left: auto; padding: 0; border: 0; background: none; font: inherit; color: var(--primary); cursor: pointer; }
 /* 【分支会话】紧跟「↩ 引用」右排，不瓜分 auto 间距；busy 时只变样不挡其他轮点击（函数内互斥） */
 .res-meta .sql-toggle.branch-toggle { margin-left: 10px; }
 .res-meta .sql-toggle.branch-toggle.disabled { opacity: .5; pointer-events: none; }
@@ -3307,7 +3315,7 @@ function exportSupplementalCsv(t: Turn) {
 /* 下钻 chips */
 .drill { margin-top: 8px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .drill-t { font-size: 12px; color: var(--text-muted); }
-.pill { font-size: 12px; padding: 4px 12px; border: 1px solid var(--border); border-radius: var(--radius-full); background: var(--bg-card); color: var(--text-muted); cursor: pointer; white-space: nowrap; transition: .12s; }
+.pill { font-family: inherit; font-size: 12px; padding: 4px 12px; border: 1px solid var(--border); border-radius: var(--radius-full); background: var(--bg-card); color: var(--text-muted); cursor: pointer; white-space: nowrap; transition: .12s; }
 .pill:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
 /* 【意图澄清】clarify_options chip 排：与 .drill 同形态（上边框分隔的操作行） */
 .clarify-opts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--divider); font-size: 12px; }
@@ -3345,7 +3353,7 @@ function exportSupplementalCsv(t: Turn) {
 .inputbar textarea:focus { border-color: var(--primary); box-shadow: var(--ring); outline: none; }
 .send { flex: 0 0 auto; height: 42px; padding: 0 22px; background: var(--primary); color: #fff; border: 1px solid var(--primary); border-radius: var(--radius-md); font-size: 14px; font-weight: 600; cursor: pointer; }
 .send:disabled { opacity: .55; cursor: not-allowed; }
-.toast { position: fixed; right: 18px; bottom: 18px; z-index: 50; background: var(--text-primary); color: var(--bg-card); font-size: 13px; padding: 9px 14px; border-radius: 9px; box-shadow: var(--shadow-md, 0 4px 16px rgba(0,0,0,.18)); animation: toastIn .18s ease-out; }
+.toast { position: fixed; right: 18px; bottom: 18px; z-index: 1300; background: var(--text-primary); color: var(--bg-card); font-size: 13px; padding: 9px 14px; border-radius: 9px; box-shadow: var(--shadow-md, 0 4px 16px rgba(0,0,0,.18)); animation: toastIn .18s ease-out; }
 @keyframes toastIn { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
 .weekly-mask { position: fixed; inset: 0; z-index: 1100; display: grid; place-items: center; padding: 20px; background: rgba(17, 24, 39, .38); backdrop-filter: blur(5px); }
 .weekly-dialog { width: min(480px, 100%); overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); box-shadow: 0 24px 70px rgba(17, 24, 39, .2); }
@@ -3477,36 +3485,47 @@ function exportSupplementalCsv(t: Turn) {
 .bi-focus-table { max-height: none; height: 100%; }
 /* 【深度模式】精简|深度 segmented */
 .mode-seg { display: flex; border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; flex: 0 0 auto; height: 42px; }
-.mode-seg span { display: flex; align-items: center; padding: 0 12px; font-size: 13px; color: var(--text-muted); cursor: pointer; background: var(--bg-card); }
-.mode-seg span.on { background: var(--primary); color: #fff; font-weight: 600; }
+.mode-seg button { display: flex; align-items: center; padding: 0 12px; border: 0; font: inherit; font-size: 13px; color: var(--text-muted); cursor: pointer; background: var(--bg-card); }
+.mode-seg button.on { background: var(--primary); color: #fff; font-weight: 600; }
 .mode-seg.disabled { opacity: .48; }
-.mode-seg.disabled span { cursor: not-allowed; }
+.mode-seg.disabled button { cursor: not-allowed; }
 /* 按钮 */
 .btn-icon, .btn-sm { border: 1px solid var(--border); background: var(--bg-card); color: var(--text-regular); border-radius: var(--radius); cursor: pointer; font-size: 12px; }
 .btn-icon { width: 30px; height: 30px; padding: 0; font-size: 15px; }
 .btn-sm { height: 26px; padding: 0 10px; }
 .mobile-kb { display: none; }
 .mobile-weekly { display: none; }
+.mobile-menu { display: none; }
+.side-mask { display: none; }
 .btn-icon:hover, .btn-sm:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
-@media (max-width: 820px) { .side { display: none; } .mobile-kb, .mobile-weekly { display: inline-flex; align-items: center; } .bubble { max-width: 94%; } }
+/* 移动端侧栏：整栏 display:none 会同时丢掉会话列表/新建/主题入口 —— 改为 ☰ 拉开的抽屉 */
+@media (max-width: 820px) {
+  .mobile-menu { display: inline-flex; }
+  .side { position: fixed; top: 0; left: 0; bottom: 0; z-index: 1150; width: min(300px, 86vw); transform: translateX(-105%); transition: transform .18s ease-out; }
+  .side.open { transform: none; box-shadow: 18px 0 50px rgba(17, 24, 39, .18); }
+  .side-mask { display: block; position: fixed; inset: 0; z-index: 1140; background: rgba(17, 24, 39, .38); backdrop-filter: blur(5px); }
+  .mobile-kb, .mobile-weekly { display: inline-flex; align-items: center; }
+  .bubble { max-width: 94%; }
+}
 @media (max-width: 520px) { .weekly-mask { padding: 10px; align-items: end; } .weekly-dialog { border-radius: 8px 8px 0 0; } .weekly-head, .weekly-intro, .weekly-field, .weekly-actions { padding-inline: 18px; } .weekly-period { margin-inline: 18px; grid-template-columns: 1fr; } .weekly-period small { grid-column: 1; } }
 @media (max-width: 980px) { .dh-grid { grid-template-columns: 1fr; } .dkpi { grid-template-columns: 1fr; } .dk-comparisons { border-left: 0; border-top: 1px solid var(--divider); } }
-@media (max-width: 1360px) { .wrap.has-preview .side { display: none; } }
+/* ≤820px 预览面板是全屏 fixed 浮层，侧栏转为抽屉常驻（见上），本条只约束桌面档 */
+@media (min-width: 821px) and (max-width: 1360px) { .wrap.has-preview .side { display: none; } }
 /* 【S1】artifact 预览面板 */
 .art-card { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 10px; font-size: 13px; color: var(--text-regular); text-decoration: none; cursor: pointer; background: var(--primary-bg); }
 .art-card:hover { border-color: var(--primary); }
 .art-card .art-hint { margin-left: auto; font-size: 12px; color: var(--text-faint); }
-.art-card .art-share { margin-left: 6px; font-size: 14px; }
+.art-card .art-share { margin-left: 6px; padding: 0; border: 0; background: none; font-family: inherit; font-size: 14px; cursor: pointer; }
 .pv { position: relative; flex: 0 0 46%; min-width: 340px; max-width: 75%; border-left: 1px solid var(--border); background: var(--bg-card); display: flex; flex-direction: column; min-height: 0; }
 .pv-drag { position: absolute; left: -3px; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 2; }
 .pv-drag:hover { background: var(--primary-light); }
 .pv-hd { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--divider); }
 .pv-title { flex: 1; font-size: 13px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pv-act { font-size: 12px; color: var(--primary); cursor: pointer; border: none; background: none; text-decoration: none; white-space: nowrap; }
+.pv-act { padding: 0; font-family: inherit; font-size: 12px; color: var(--primary); cursor: pointer; border: none; background: none; text-decoration: none; white-space: nowrap; }
 .pv-act:hover { text-decoration: underline; }
 /* 【D6】版本/引用浮层：挂在预览面板头部下方，点条目即动作（回看版本 / 引用到会话） */
 .pv-pop { position: absolute; top: 38px; right: 10px; z-index: 30; min-width: 200px; max-width: 320px; max-height: 60vh; overflow-y: auto; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 10px 30px rgba(31, 45, 77, .16); padding: 6px; }
-.pv-pop-item { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 7px 10px; font-size: 12.5px; color: var(--text-primary); border-radius: 6px; cursor: pointer; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pv-pop-item { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; width: 100%; border: 0; background: none; font: inherit; text-align: left; padding: 7px 10px; font-size: 12.5px; color: var(--text-primary); border-radius: 6px; cursor: pointer; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pv-pop-item small { color: var(--text-muted); font-size: 11px; flex-shrink: 0; }
 .pv-pop-item:hover { background: var(--bg-hover, rgba(53, 103, 214, .08)); }
 .pv-pop-item.on { color: var(--primary); font-weight: 650; }

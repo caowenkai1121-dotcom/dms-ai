@@ -90,6 +90,21 @@ fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
     (code, Json(serde_json::json!({ "error": msg.to_string() })))
 }
 
+/// 内部错误的统一出口（安全审查②）：响应只带固定文案 —— anyhow/sqlx 原文含关系名、
+/// 约束名与连接细节，回前端等于泄露内部结构。真因一律 `tracing::warn!` 留服务端
+///（照 `kb_api::kb_err` 的收敛模子）。响应形状不变：`{"error": 固定文案}` + 原状态码。
+fn internal_err(context: &'static str, e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(error = %e, "{context}");
+    err(StatusCode::INTERNAL_SERVER_ERROR, "服务暂时不可用，请稍后重试")
+}
+
+/// 身份核验失败的统一出口（同 `api_ask` 的 403 文案）：`load_principal` 的 anyhow 可能
+/// 携带身份库错误原文（连接细节），不外回；业务分类（多角色未选等）由 warn 留痕。
+fn identity_err(login: &str, e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(login = %login, error = %e, "身份核验被 load_principal 拒");
+    err(StatusCode::FORBIDDEN, "当前账号或角色不可用")
+}
+
 // ─────────────────────────── 推断边注册表（meta.datamap_edge）───────────────────────────
 // 推断边的**唯一**生命周期表：pending（待人工复核）→ accepted / rejected（终态，不回迁）。
 // 🔴 本表三处共用（本模块 = 正本 / semantic::datamap 静态推断 / semantic::datamap_usage
@@ -447,7 +462,7 @@ async fn caller(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
     principal::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
-        .map_err(|e| err(StatusCode::FORBIDDEN, e))
+        .map_err(|e| identity_err(&login, e))
 }
 
 /// ds 级可见性判据的唯一实现（REST `require_ds_visible` 与 MCP `datamap_*` 工具共用）：
@@ -471,7 +486,7 @@ async fn require_ds_visible(
 ) -> Result<(), ApiErr> {
     if !ds_visible(st, p, ds)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(|e| internal_err("ds 可见性判定失败", e))?
     {
         return Err(err(StatusCode::FORBIDDEN, format!("无权访问数据源 {ds}")));
     }
@@ -537,7 +552,7 @@ pub async fn nodes(
     require_ds_visible(&st, &p, ds).await?;
     let out = load_nodes(&st, ds)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("目录节点加载失败", e))?;
     Ok(Json(serde_json::json!({ "ds": ds, "nodes": out })))
 }
 
@@ -636,7 +651,7 @@ pub async fn edges(
             .bind(ds)
             .fetch_all::<RegistryEdgeRow>()
             .await
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            .map_err(|e| internal_err("注册表边加载失败", e))?;
         for (lt, lc, rt, rc, card, note) in rows {
             out.push(serde_json::json!({
                 "source": "registry", "id": null, "kind": "join", "status": "active",
@@ -652,7 +667,7 @@ pub async fn edges(
         out.extend(
             load_inferred_edges(&st, ds, &statuses, &kinds)
                 .await
-                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?,
+                .map_err(|e| internal_err("推断边加载失败", e))?,
         );
     }
     Ok(Json(serde_json::json!({ "ds": ds, "edges": out })))
@@ -728,7 +743,7 @@ pub async fn paths(
     // 边取组合器同一加载口：路径面就是可通行面（liveness 谓词与 ds 作用域在那一处）
     let edges = load_join_edges(st.owned.pool(), ds)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("合同边加载失败", e))?;
     if !within_edge_budget(edges.len()) {
         return Err(err(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -756,7 +771,7 @@ async fn load_edge(st: &AppState, id: i64) -> Result<Option<EdgeRow>, ApiErr> {
         .bind(id)
         .fetch_optional::<EdgeRow>()
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(|e| internal_err("推断边读取失败", e))
 }
 
 /// `POST /api/datamap/edges/{id}/accept` —— 人工确认（**推断边进合同的唯一门**）
@@ -804,7 +819,7 @@ pub async fn accept(
             .bind(&note)
             .fetch_optional::<(String,)>()
             .await
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            .map_err(|e| internal_err("推断边验收落账失败", e))?;
         if written.is_none() {
             return Err(err(
                 StatusCode::CONFLICT,
@@ -824,7 +839,7 @@ pub async fn accept(
         .bind(&p.login_name)
         .execute()
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("推断边验收落账失败", e))?;
     if n == 0 {
         return Err(err(
             StatusCode::CONFLICT,
@@ -858,7 +873,7 @@ pub async fn reject(
         .bind(&p.login_name)
         .execute()
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("推断边否决落账失败", e))?;
     if n == 0 {
         return Err(err(
             StatusCode::CONFLICT,
@@ -953,7 +968,7 @@ pub async fn audit_sql(
         .bind(limit)
         .fetch_all::<AuditRow>()
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("SQL 审计读取失败", e))?;
     let out: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {
@@ -1007,7 +1022,7 @@ pub async fn relations(
     require_ds_visible(&st, &p, ds).await?;
     let cards = dms_semantic::lineage::table_relations(st.owned.pool(), ds)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("表关系卡加载失败", e))?;
     Ok(Json(cards))
 }
 
@@ -1348,6 +1363,36 @@ mod tests {
         let long = "x".repeat(65);
         for bad in ["", "a b", "a;DROP", long.as_str()] {
             assert!(!valid_ds(bad), "{bad}");
+        }
+    }
+
+    // ── 安全审查②：内部错误只回固定文案 ──
+
+    /// 固定文案 + 原状态码 + 响应形状不变；原文只进 warn 不进响应体
+    #[test]
+    fn internal_err_has_fixed_message_and_keeps_shape() {
+        let raw = "duplicate key value violates unique constraint \"join_edge_pkey\" (host=10.0.0.8:5432)";
+        let (code, Json(body)) = internal_err("测试上下文", raw);
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, serde_json::json!({ "error": "服务暂时不可用，请稍后重试" }));
+        assert!(!body.to_string().contains("join_edge_pkey"), "约束名不许外泄");
+        let (code, Json(body)) = identity_err("zhangsan", raw);
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(body, serde_json::json!({ "error": "当前账号或角色不可用" }));
+    }
+
+    /// 源码闸：内部错误一律走 internal_err/identity_err —— `err(状态码, e)` 直回原文的
+    /// 写法不许回来（sqlx/anyhow 原文含关系名/约束名/连接细节）
+    #[test]
+    fn raw_causes_never_reach_the_client() {
+        let src = include_str!("datamap_api.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or("");
+        for bad in [
+            "err(StatusCode::INTERNAL_SERVER_ERROR, e)",
+            "err(StatusCode::UNPROCESSABLE_ENTITY, e)",
+            "err(StatusCode::FORBIDDEN, e)",
+        ] {
+            assert!(!code.contains(bad), "错误原文泄露回来了：{bad}");
         }
     }
 }

@@ -113,6 +113,101 @@ pub fn record_login(login_name: &str, ok: bool) {
     }
 }
 
+// ─────────────────────── 公开端点 per-IP 限流 ───────────────────────
+// login / sso / wework / xcx 这些公开端点原来只有账号级失败计数（login_allowed），
+// 对「换账号不换 IP」的密码喷洒、以及「坏 token 逐次穿透上游校验」没有闸。这里加
+// 进程内 per-IP 固定窗口限流：同一 IP 每分钟最多 20 次，超出由调用方回 429。
+
+/// 限流窗口（秒）与窗口内配额。这是运维口径：改数值前想清楚「正常用户一分钟点几次」。
+const IP_RATE_WINDOW_SECS: u64 = 60;
+const IP_RATE_MAX_PER_WINDOW: u32 = 20;
+/// 容量帽：满员先清扫过期窗口，仍满则放行但不记账 —— 限流器自身绝不能成为 DoS 面
+///（宁可短时放宽，也不能因为一张被打满的表把正常登录一起锁在门外）。
+const IP_RATE_CAP: usize = 4096;
+
+/// per-IP 固定窗口计数器（与 login_allowed 同模子：进程内 Mutex<HashMap>，窗口过期重开）。
+/// 结构体独立出来是为了单测能建私有实例 —— 进程级单例共享会让用例互相污染。
+struct IpRateLimiter {
+    /// ip → (本窗口已计次数, 窗口起点 epoch 秒)
+    map: HashMap<String, (u32, u64)>,
+}
+
+impl IpRateLimiter {
+    /// true = 放行（并已计数）；false = 超限（调用方回 429）。`now` 注入是为了窗口判定可测。
+    fn allow(&mut self, ip: &str, now: u64) -> bool {
+        match self.map.get_mut(ip) {
+            // 窗口内：超配额拒，否则计数 +1
+            Some((n, started)) if now.saturating_sub(*started) < IP_RATE_WINDOW_SECS => {
+                if *n >= IP_RATE_MAX_PER_WINDOW {
+                    return false;
+                }
+                *n += 1;
+                true
+            }
+            // 窗口已过期：重开一扇
+            Some(entry) => {
+                *entry = (1, now);
+                true
+            }
+            None => {
+                if self.map.len() >= IP_RATE_CAP {
+                    let cutoff = now.saturating_sub(IP_RATE_WINDOW_SECS);
+                    self.map.retain(|_, (_, started)| *started > cutoff);
+                    if self.map.len() >= IP_RATE_CAP {
+                        return true; // 容量帽打满：放行不记账（见 IP_RATE_CAP 注释）
+                    }
+                }
+                self.map.insert(ip.to_string(), (1, now));
+                true
+            }
+        }
+    }
+}
+
+static IP_RATE: OnceLock<Mutex<IpRateLimiter>> = OnceLock::new();
+
+/// 公开端点 per-IP 限流：同一 IP 每分钟 20 次，超出 false（调用方回 429）。
+///
+/// ## 接线契约（编排方在 main.rs 的 api_login / api_sso / api_wework_start /
+/// api_wework_login 首段接线；本包不改 main.rs）
+///
+/// ```ignore
+/// let ip = auth::client_ip(&headers); // 各 handler 需补 `headers: HeaderMap` 提取器
+/// if !auth::ip_rate_allow(&ip) {
+///     return Err(err(StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后重试"));
+/// }
+/// ```
+/// xcx 侧已在 `xcx_api::require_identity` 接线（ask / me 两个端点共用）。
+pub fn ip_rate_allow(ip: &str) -> bool {
+    IP_RATE
+        .get_or_init(|| Mutex::new(IpRateLimiter { map: HashMap::new() }))
+        .lock()
+        .expect("ip rate lock")
+        .allow(ip, now())
+}
+
+/// 调用方 IP：反代链路（docker/web/nginx.conf 已注入）取 X-Forwarded-For 首跳 = 客户端
+/// 原始地址，其次 X-Real-IP，都没有记 "unknown"（无反代形态下同源请求聚成一个桶，
+/// 仍防得住单点喷洒）。⚠️ XFF 可被调用方伪造：伪造换来的只是「换串绕限流」，
+/// 换不来「伪造别人身份」—— 限流是削弱攻击的闸，不是身份依据。
+pub fn client_ip(headers: &axum::http::HeaderMap) -> String {
+    let raw = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+    // 截断防异常体量当 map key（IPv6 文本也就 45 字符，64 足够）
+    raw.unwrap_or("unknown").chars().take(64).collect()
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -626,5 +721,66 @@ mod tests {
         assert!(matches!(resolve_identity_dual(&keys, None, None), IdentityChannel::Absent));
         assert!(matches!(resolve_identity_dual(&keys, Some("  "), None), IdentityChannel::Absent));
         revoke(&tok);
+    }
+
+    // ─────────────── 公开端点 per-IP 限流 ───────────────
+
+    /// 窗口内 20 放 21 拒；过期重开；窗口起点在未来（时钟回拨）不 panic 且按窗内计
+    #[test]
+    fn ip_rate_limiter_counts_window_and_reopens() {
+        let mut limiter = IpRateLimiter { map: HashMap::new() };
+        let t0 = 1_000_000;
+        for i in 1..=IP_RATE_MAX_PER_WINDOW {
+            assert!(limiter.allow("1.2.3.4", t0), "第 {i} 次必须放行");
+        }
+        assert!(!limiter.allow("1.2.3.4", t0), "第 21 次必须拒");
+        assert!(!limiter.allow("1.2.3.4", t0 + 59), "窗口内持续拒");
+        assert!(limiter.allow("1.2.3.4", t0 + IP_RATE_WINDOW_SECS), "窗口过期重开");
+        assert!(limiter.allow("5.6.7.8", t0), "别的 IP 不受影响");
+        // 时钟回拨（NTP 校时）：saturating_sub 不许下溢 panic
+        assert!(limiter.allow("9.9.9.9", t0));
+        let _ = limiter.allow("9.9.9.9", t0 - 500);
+    }
+
+    /// 容量帽：满员先清扫过期窗口；仍满（全是活窗口）则放行不记账 —— 限流器不许成为 DoS 面
+    #[test]
+    fn ip_rate_limiter_cap_sweeps_expired_then_fails_open() {
+        let mut limiter = IpRateLimiter { map: HashMap::new() };
+        let t0 = 1_000_000;
+        // 灌满 CAP 条**已过期**窗口
+        for i in 0..IP_RATE_CAP {
+            limiter.map.insert(format!("old-{i}"), (IP_RATE_MAX_PER_WINDOW, t0 - IP_RATE_WINDOW_SECS - 1));
+        }
+        // 新 IP：清扫过期条目后正常入账
+        assert!(limiter.allow("new-1", t0));
+        assert_eq!(limiter.map.len(), 1, "过期窗口应被清扫，只留新条目");
+        // 灌满 CAP 条**活**窗口：新 IP 放行但不记账（fail-open，见 IP_RATE_CAP 注释）
+        for i in 0..IP_RATE_CAP {
+            limiter.map.insert(format!("hot-{i}"), (1, t0));
+        }
+        assert!(limiter.allow("new-2", t0), "容量帽打满时放行");
+        assert!(!limiter.map.contains_key("new-2"), "但不记账（不为它挤掉别人）");
+    }
+
+    /// 进程级入口可用（用 uuid IP 隔离，不污染其它用例共享的单例）
+    #[test]
+    fn ip_rate_allow_process_entrypoint() {
+        let ip = format!("rl-{}", uuid::Uuid::new_v4());
+        assert!(ip_rate_allow(&ip));
+    }
+
+    /// XFF 首跳优先、X-Real-IP 兜底、都没有记 unknown；超长截断；空白不算
+    #[test]
+    fn client_ip_prefers_forwarded_for_first_hop() {
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(client_ip(&h), "unknown");
+        h.insert("x-real-ip", "10.0.0.1".parse().unwrap());
+        assert_eq!(client_ip(&h), "10.0.0.1");
+        h.insert("x-forwarded-for", " 203.0.113.9 , 10.0.0.1".parse().unwrap());
+        assert_eq!(client_ip(&h), "203.0.113.9", "XFF 首跳 = 客户端原始地址");
+        h.insert("x-forwarded-for", "   ".parse().unwrap());
+        assert_eq!(client_ip(&h), "10.0.0.1", "XFF 全空白 → 回落 X-Real-IP");
+        h.insert("x-forwarded-for", format!("{}.", "9".repeat(100)).parse().unwrap());
+        assert_eq!(client_ip(&h).chars().count(), 64, "超长截断防异常体量 key");
     }
 }

@@ -32,7 +32,7 @@ use dms_semantic::registry::datasource as ds_reg;
 
 use crate::answerers::cache::CacheAnswerer;
 use crate::answerers::graph::{GraphAnswerer, Relation};
-use crate::answerers::hits::{DirectHit, HitAnswerer};
+use crate::answerers::hits::{land, DirectHit, HitAnswerer};
 use crate::answerers::Answerer;
 use crate::ctx::{attach_trust, AskCtx, AskResult, ClarifyOption, Step};
 use crate::run::{Correctors, LlmAnswerer};
@@ -139,6 +139,11 @@ pub async fn ask(
         }
         _ => rewritten,
     };
+    // 【判官实测·问题 1①】错别字归一：在改写与日期继承之后、选源/复合拆解/路由之前 ——
+    // 下游（注册表召回、语义缓存键、LLM prompt）全见到归一后的问句，错别字问法与正确问法
+    // 走同一条路。用户原文仍在 server 侧的聊天记录里，这里改的是送去分析的那份；
+    // 多轮改写若把上一轮的错字带下来，也在这一并被归一。
+    let rewritten = crate::triage::normalize_typos(&rewritten).into_owned();
     // 【K3-B ③】选源。判据顺序在 `source::select_source`（显式 > 单源直通 > 向量最近邻）
     let picked = source::select_source(&**d.llm, d.pg, d.embed, p, &rewritten, explicit_ds).await?;
     (d.on_ds)(&picked);
@@ -182,6 +187,11 @@ pub async fn ask(
         // 结果出口统一过一道呈现中文化（列名中文 + 码值翻名）：所有路由共用这一个收口，
         // 内部全降级（词表加载不到/译不动就原样），绝不让增强把一次成功取数变成失败。
         let mut r = ask_single(d, &cx).await?;
+        // 【判官实测·问题 3】空结果 + 出界主题无注册表覆盖 → 换 no-topic 文案
+        // （「请确认筛选条件」对「主题根本不存在」不对症）。在 localize 之前整份换掉。
+        if let Some(nt) = out_of_scope_empty_reply(&cx, &mut r).await {
+            r = nt;
+        }
         crate::localize::localize_result(&cx, &mut r).await;
         Ok(r)
     };
@@ -547,6 +557,148 @@ fn no_topic_reply(question: &str, topic: &str, t0: Instant, clarify_options: Vec
     }
 }
 
+// ─────────────────────── 【判官实测 2026-08-10·问题 3】空结果的出界主题出口 ───────────────────────
+//
+// 实测：「火星上销售额多少」→ derive 空结果，文案「请确认时间范围与筛选条件」不对症 ——
+// 主题（火星）根本不存在，不是筛选条件的问题。裁决：空结果 + 出界主题无注册表覆盖 →
+// 换 no-topic 文案（复用本文件 `no_topic_reply` 与 `KNOWN_TOPICS` 判定），
+// 让「主题不存在」与「筛选太严」两种空结果在文案上分得开。
+
+/// 出界 reroute 只圈的 route 家族：LLM 与 ODS 推导 —— 这两条路上「主题出界」才可能
+/// 被当成筛选条件硬查。合同路径（direct-agg 等）的空结果是「窗口内真没数」，
+/// present 的「请确认时间范围」文案对症，不许抢。
+const OUT_OF_SCOPE_ROUTES: &[&str] = &["direct-derive", "llm", "llm+repair", "llm+schema-fix"];
+
+/// 换文案判据（纯函数，故有单测）：空结果 + route 在圈内 + 无既有风险标注
+/// （口径复核未通过等标注不许被换文案盖掉）+ 有出界主题 + 主题无覆盖。缺一不可。
+fn no_topic_verdict(
+    route: &str,
+    row_count: usize,
+    has_note: bool,
+    topic: Option<&str>,
+    topic_covered: bool,
+) -> bool {
+    row_count == 0
+        && !has_note
+        && OUT_OF_SCOPE_ROUTES.contains(&route)
+        && topic.is_some()
+        && !topic_covered
+}
+
+/// 出界主题提取（纯函数）：剥掉命中的合同指标词 / 销售合同维度词 / 已接入主题词
+/// （`KNOWN_TOPICS`）/ 通用虚词后的残留，再剥方位词尾（「火星上」的「上」不是主题的一部分）。
+/// `None` = 没有可归咎的出界主题：
+/// - 剥光（纯指标/时间问句：「上月销售额」空结果 = 窗口内没数，present 文案对症）；
+/// - 单据/表名形（空结果 = 「没查到这张单」）；
+/// - 实体名（客户/商品 —— 空结果是「没这个客户/没卖过这个品」，不是主题未接入）。
+fn out_of_scope_topic(question: &str) -> Option<String> {
+    if crate::triage::doc_code_hit(question) || crate::triage::table_hit(question) {
+        return None;
+    }
+    let mut s = question.to_string();
+    let mut consumed: Vec<String> = vec![];
+    for (m, _) in crate::run::sales_contract_metrics(question) {
+        consumed.push(m.name().to_string());
+        consumed.extend(m.aliases().iter().map(|a| (*a).to_string()));
+        consumed.extend(crate::run::sales_metric_extra_words(m).iter().map(|a| (*a).to_string()));
+    }
+    for d in dms_semantic::sales_fact::DIMENSIONS {
+        consumed.push(d.name().to_string());
+        consumed.extend(d.aliases().iter().map(|a| (*a).to_string()));
+    }
+    consumed.extend(KNOWN_TOPICS.iter().map(|t| (*t).to_string()));
+    // 长词优先（与 kernel `has_residue_with` 同一剥法：短词先剥会把长词拆散）
+    consumed.sort_by_key(|w| std::cmp::Reverse(w.chars().count()));
+    for w in &consumed {
+        s = s.replace(w.as_str(), "");
+    }
+    for w in dms_kernel::nl::lexicon::STRIP_WORDS {
+        s = s.replace(w, "");
+    }
+    let s: String = s
+        .chars()
+        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"，。？?、,.~～!！:：;；「」『』()（）".contains(*c))
+        .collect();
+    let s = s.trim_end_matches(|c| matches!(c, '上' | '下' | '里' | '内' | '中' | '旁' | '侧')).to_string();
+    // 至少两个汉字才有「主题」可谈（单字残留当噪音，不为它换文案）
+    if s.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count() < 2 {
+        return None;
+    }
+    if crate::answerers::entity::entity_form_hit(&s) {
+        return None;
+    }
+    Some(s)
+}
+
+/// 出界主题的覆盖判定（IO 半）。任一来源命中 = 有覆盖（保留原空结果答案）：
+/// ① `KNOWN_TOPICS` 快路（双保险 —— `out_of_scope_topic` 已剥过一轮）；
+/// ② 注册表三路召回（指标/维度/术语，含别名与 trgm 近似）；
+/// ③ 名称型值域取值（商品分类名那批：「烤肠」空结果是「没卖过」，不是主题未接入）；
+/// ④ 销售合同的维度成员值探针（战区/省区：「直营」空结果是「没数据」）。
+/// 🔴 全部**失败开放**：任何一路读挂了都当成「有覆盖」—— 换文案是补救路径，
+/// 它自己挂了不许把一次原本成立的回答换成另一副面孔。
+async fn topic_covered(cx: &AskCtx<'_>, topic: &str) -> bool {
+    use dms_semantic::sales_fact::Dimension;
+    if KNOWN_TOPICS.iter().any(|t| topic.contains(t)) {
+        return true;
+    }
+    match crate::triage::registry_hit(cx.pg, cx.ds, topic).await {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(err = %e, "出界主题覆盖判定读注册表失败 → 视为有覆盖，保留原答案");
+            return true;
+        }
+    }
+    match dms_semantic::registry::lexicon::load_domain_values(cx.pg, cx.ds).await {
+        Ok(values) => {
+            if dms_semantic::registry::lexicon::longest_value_hit(
+                topic,
+                values.iter().map(|(_, _, v)| v.as_str()),
+            )
+            .is_some()
+            {
+                return true;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "出界主题覆盖判定读值域取值失败 → 视为有覆盖，保留原答案");
+            return true;
+        }
+    }
+    for dim in [Dimension::WarZone, Dimension::Region] {
+        if probe_dimension_member(cx, dim, &dimension_probe_values(dim, topic)).await.is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// 空结果 + 出界主题 → 换 no-topic 文案（`ask()` 的 `one` 闭包在 localize 之前调用）。
+/// 换的是整份答案：route = no-topic、不带走已执行的 SQL（no-topic 的语义就是
+/// 「这个主题不该有 SQL」；执行痕迹已按既有纪律落在 failure_log/correction_log）。
+/// 原答案的分步留痕（steps）带过去：「走过哪些路才到这里」是排障材料，不随换文案丢掉。
+async fn out_of_scope_empty_reply(cx: &AskCtx<'_>, r: &mut AskResult) -> Option<AskResult> {
+    let topic = out_of_scope_topic(cx.question);
+    // covered=false 先试判（保守下界）：route/行数/已有标注/主题形此时已不合格，
+    // 覆盖判定救不回来 —— 不为它付注册表与探针的 IO。
+    if !no_topic_verdict(&r.route, r.row_count, r.caliber_note.is_some(), topic.as_deref(), false) {
+        return None;
+    }
+    let Some(topic) = topic else { return None }; // 试判为真 ⇒ 主题必在，这行只是类型窄化
+    let covered = topic_covered(cx, &topic).await;
+    if !no_topic_verdict(&r.route, r.row_count, r.caliber_note.is_some(), Some(&topic), covered) {
+        return None;
+    }
+    tracing::info!(
+        question = %cx.question, topic = %topic, route = %r.route,
+        "空结果 + 出界主题无注册表覆盖 → 换 no-topic 文案"
+    );
+    let mut reply = no_topic_reply(cx.question, &topic, cx.t0, vec![]);
+    reply.steps = std::mem::take(&mut r.steps);
+    Some(reply)
+}
+
 /// 反问时的 route 标签。**独立于 `llm`**：判官脚本要能把「缺意图」与「LLM 答错」分开钉。
 pub const NEED_INTENT: &str = "need-intent";
 
@@ -778,6 +930,217 @@ fn production_lookup_only_reply(cx: &AskCtx<'_>, ms: u128) -> AskResult {
     }
 }
 
+// ─────────────────────── 【判官实测 2026-08-10·问题 2】维度成员值优先门 ───────────────────────
+//
+// 实测：「直营上月销售额」→ 谓词 `INSTR(storename,'直营')>0`（把战区值当客户名），空结果；
+// 直营其实是 war_zone 的合法值（8284 万）。值词解析的现住处在 `server/src/direct.rs`
+// （`customer_name_fragment` / `customer_filtered_sales`）—— 那个文件另一路在改、
+// agent 不许反向引 server，所以修在这里：给 Router 的 direct-doc 成员外包一层。
+//
+// 裁决（判官方向，两者都做）：过滤值**先查维度成员值**（战区/省区），命中才走维度过滤；
+// 客户名 LIKE 兜底仅当维度无命中（探针全不中 → 原样委托内层 `direct_hit`，行为逐字不变）。
+// 成员值的来源：实测注册表快照里 `meta.value_map` / `meta.value_domain` 都没有 DWS 事实表的
+// 战区/省区取值 —— 所以用**存在性探针**（与 direct.rs 探 `t_customer` 同一形态：同一道
+// gate_on、LIMIT 1、只验证存在性），事实表自己是成员值的唯一事实源，不另造会漂的静态词表。
+
+/// direct-doc 成员的外包：先过维度成员值门，再原样委托内层。
+/// 表标签 `direct-doc` 不变（ROUTER_ORDER 七位契约一位不动）。
+struct DimensionFirstHit {
+    inner: HitAnswerer,
+}
+
+impl DimensionFirstHit {
+    fn new(inner_fn: HitFn) -> Self {
+        Self { inner: HitAnswerer::new("direct-doc", Box::new(inner_fn)) }
+    }
+}
+
+impl Answerer for DimensionFirstHit {
+    fn route(&self) -> &'static str {
+        self.inner.route()
+    }
+
+    /// 与内层同一纪律（恒真：裁决 二·C，见 hits.rs）
+    fn accept(&self, cx: &AskCtx<'_>) -> bool {
+        self.inner.accept(cx)
+    }
+
+    fn answer<'a>(&'a self, cx: &'a AskCtx<'a>) -> BoxFut<'a, anyhow::Result<Option<AskResult>>> {
+        Box::pin(async move {
+            // 先查维度成员值（问题 2 的修复点）；无命中 → 原样委托内层
+            // （客户名 LIKE 兜底仍在 direct.rs 那一层，一步不动）。
+            if let Some(hit) = dimension_value_hit(cx).await {
+                // 与内层共用同一个落地口（三段闸门 → 取数 → 视图 → KPI 环比），一步不少
+                return land(cx, hit, cx.t0).await;
+            }
+            self.inner.answer(cx).await
+        })
+    }
+}
+
+/// 维度成员值命中 → 直接装配合同答案；`None` = 这扇门不接（原样委托内层）。
+async fn dimension_value_hit(cx: &AskCtx<'_>) -> Option<DirectHit> {
+    use dms_semantic::sales_fact::Dimension;
+    // 销售合同只在数仓源上成立（与 direct.rs `customer_filtered_sales` 同一前提）
+    if !cx.source.is_warehouse() {
+        return None;
+    }
+    let hits = crate::run::sales_contract_metrics(cx.question);
+    if hits.is_empty() {
+        return None;
+    }
+    let word = value_word_residue(cx.question)?;
+    // 战区先于省区：两列撞同名值时取战区（判官实测案例所在列；撞车本就罕见）
+    for dim in [Dimension::WarZone, Dimension::Region] {
+        let candidates = dimension_probe_values(dim, &word);
+        if let Some(member) = probe_dimension_member(cx, dim, &candidates).await {
+            tracing::info!(
+                question = %cx.question,
+                value = %member,
+                dimension = dim.name(),
+                "过滤值命中维度成员值 → 走维度过滤（不再错配客户名）"
+            );
+            let metrics: Vec<_> = hits.iter().map(|(m, _)| *m).collect();
+            return build_dimension_value_hit(cx.question, dim, &member, &metrics);
+        }
+    }
+    None
+}
+
+/// 候选过滤值提取（纯函数）：剥命中的合同指标词（长词优先，与 kernel `has_residue_with`
+/// 同一剥法）→ 剥通用虚词 → 滤数字/空白/标点。镜像 direct.rs `customer_name_fragment` 的
+/// 剥法，差别只在**这里不剥维度词** —— 维度词尾留给 `dimension_probe_values` 的词干处理
+/// （「直营战区」先整词试、再剥尾试「直营」）。
+/// 至少两个汉字才值得探库（与 customer_name_fragment 同一门槛）。
+/// 「直营和加盟」这类多值问句剥完是融合串，等值探针必不中 → 原样委托内层，
+/// 绝不静默只取一个值（与 direct.rs `stock_snapshot` 的多省判据同一取舍）。
+fn value_word_residue(question: &str) -> Option<String> {
+    let mut s = question.to_string();
+    let mut consumed: Vec<&'static str> = vec![];
+    for (m, _) in crate::run::sales_contract_metrics(question) {
+        consumed.push(m.name());
+        consumed.extend(m.aliases().iter().copied());
+        consumed.extend(crate::run::sales_metric_extra_words(m).iter().copied());
+    }
+    consumed.sort_by_key(|w| std::cmp::Reverse(w.chars().count()));
+    for w in consumed {
+        s = s.replace(w, "");
+    }
+    for w in dms_kernel::nl::lexicon::STRIP_WORDS {
+        s = s.replace(w, "");
+    }
+    let s: String = s
+        .chars()
+        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"，。？?、,.~～!！:：;；「」『』()（）".contains(*c))
+        .collect();
+    if s.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count() < 2 {
+        return None;
+    }
+    Some(s)
+}
+
+/// 维度名词尾：「直营战区」的「战区」是维度词不是值。长词先剥（「大战区」先于「战区」）。
+const DIMENSION_NOUN_TAILS: &[&str] = &["大战区", "战区", "省区", "区域", "渠道"];
+
+/// 成员值探针候选（纯函数）：原词 → 剥维度词尾的词干。
+/// 词干是**裸值**时才再补一个「词干+本维度惯用后缀」的候选（省区值多带「省区」后缀：
+/// 用户说「湖南」，库里是「湖南省区」）；词尾本来就是用户给的，剥完不再画蛇添足。
+/// 去重保序。
+fn dimension_probe_values(dim: dms_semantic::sales_fact::Dimension, word: &str) -> Vec<String> {
+    let stem = DIMENSION_NOUN_TAILS.iter().find_map(|t| word.strip_suffix(t)).unwrap_or(word);
+    let mut out: Vec<String> = vec![word.to_string()];
+    if stem != word {
+        out.push(stem.to_string());
+        return out;
+    }
+    let suffixed = match dim {
+        dms_semantic::sales_fact::Dimension::WarZone => format!("{stem}战区"),
+        dms_semantic::sales_fact::Dimension::Region => format!("{stem}省区"),
+        _ => String::new(),
+    };
+    if !suffixed.is_empty() && !out.contains(&suffixed) {
+        out.push(suffixed);
+    }
+    out
+}
+
+/// 维度成员值存在性探针（与 direct.rs 探 `t_customer` 同一形态：同一道 `gate_on`、
+/// LIMIT 1、只验证存在性）。**一切失败 = None**：探针自己挂了原样委托内层，
+/// 不许把一次本来能走的问答拖死。返回探中的**存储值**（「湖南」探中的是「湖南省区」，谓词按存储值写）。
+async fn probe_dimension_member(
+    cx: &AskCtx<'_>,
+    dim: dms_semantic::sales_fact::Dimension,
+    candidates: &[String],
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    // 探针用原始列（等值存在性判断不需要 COALESCE 翻名表达式）
+    let col = dim.column();
+    let list = candidates
+        .iter()
+        .map(|v| format!("'{}'", v.replace('\\', "\\\\").replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let probe = format!(
+        "SELECT {col} FROM {} {} WHERE {}.{col} IN ({list}) LIMIT 1",
+        dms_semantic::sales_fact::TABLE,
+        dms_semantic::sales_fact::ALIAS,
+        dms_semantic::sales_fact::ALIAS,
+    );
+    let scoped = crate::gate::gate_on(cx.p, &probe, cx.scope, cx.ds_global, cx.source.dialect()).ok()?;
+    let rs = cx.source.fetch(&scoped, crate::gate::MAX_ROWS, crate::gate::EXEC_TIMEOUT).await.ok()?;
+    rs.rows.first()?.first()?.as_str().map(str::to_string)
+}
+
+/// 维度值过滤的合同装配（纯函数，故有单测）：形状与 direct.rs `warehouse_sales_fact_predicated`
+/// 的标量分支逐条对应 —— 单指标带环比/同比/明细/同窗补充，多指标只装配主查询；
+/// 谓词用等值（成员值是维度域的精确取值，不是客户名那种带前缀的模糊片段）。
+fn build_dimension_value_hit(
+    question: &str,
+    dim: dms_semantic::sales_fact::Dimension,
+    member: &str,
+    metrics: &[dms_semantic::sales_fact::Metric],
+) -> Option<DirectHit> {
+    use dms_semantic::sales_fact::{self, Predicate, QueryOptions};
+    if metrics.is_empty() {
+        return None;
+    }
+    let (begin, end) = sales_fact::question_time_bounds(question)?;
+    let predicates = vec![Predicate::eq(dim, member)];
+    let with = |b: &str, e: &str, ms: &[sales_fact::Metric]| {
+        sales_fact::aggregate_sql_with_options(
+            ms,
+            &[],
+            b,
+            e,
+            QueryOptions { predicates: &predicates, sort: None, limit: None },
+        )
+    };
+    let sql = with(&begin, &end, metrics);
+    // 标量（单指标无维度）才有环比/同比/明细/同窗补充 —— 与合同装配器同一约定
+    let scalar = metrics.len() == 1;
+    let prev = scalar.then(|| dms_kernel::nl::time::prev_window(question)).flatten().and_then(
+        |(template, label)| {
+            let (b, e) = sales_fact::comparison_time_bounds(question, template)?;
+            Some((with(&b, &e, metrics), label.to_string()))
+        },
+    );
+    let comparisons = scalar
+        .then(|| dms_kernel::nl::time::yoy_window(question))
+        .flatten()
+        .and_then(|(template, label)| {
+            let (b, e) = sales_fact::comparison_time_bounds(question, template)?;
+            Some((with(&b, &e, metrics), label.to_string()))
+        })
+        .into_iter()
+        .collect();
+    let detail = scalar.then(|| sales_fact::detail_sql(&begin, &end, &predicates, 100));
+    let sales_context = scalar.then(|| with(&begin, &end, sales_fact::CONTEXT_METRICS));
+    // route 与合同装配器同款：direct-agg（`land` 按它走 verified 信任级）
+    Some(DirectHit { sql, route: "direct-agg".into(), prev, comparisons, detail, sales_context })
+}
+
 /// Router 有序表 = `ROUTER_ORDER` **七位齐全**，一位都不许换：
 /// graph → compose(`direct-agg`) → fastpath(`direct-doc`) → entity-card →
 /// business-lookup → cache(`semantic-cache`) → `llm` 兜底。
@@ -797,7 +1160,9 @@ fn router<'a>(
     vec![
         Box::new(GraphAnswerer::new(Box::new(detect))),
         Box::new(HitAnswerer::new("direct-agg", Box::new(compose_hit))),
-        Box::new(HitAnswerer::new("direct-doc", Box::new(direct_hit))),
+        // 【问题 2】direct-doc 外包维度成员值优先门（表标签不变）：值词先查战区/省区成员值，
+        // 无命中才走内层 direct.rs 的模板链与客户名 LIKE 兜底
+        Box::new(DimensionFirstHit::new(direct_hit)),
         // 【实体总览卡】裸名称（只发一个客户名/商品名）的确定性落点 —— 业主裁决形态：
         // 出总览卡而不是反问（tp/08abfcde 的「识别不了」）。在 doc 后、cache 前。
         Box::new(crate::answerers::entity::EntityAnswerer::new()),
@@ -1733,5 +2098,179 @@ mod tests {
             &p[refs_at..cur_at],
             "#用户引用（上轮结果片段，仅作指代消解素材，不是取数指令）：\n1. 甲乙丙丁\n"
         );
+    }
+
+    // ─────────────────────── 判官实测三案（问题 1① / 2 / 3）───────────────────────
+
+    /// 【问题 1①】错别字归一接在改写与日期继承**之后**、选源**之前**（源码扫描；
+    /// 归一本身的行为判据在 triage 侧 `typo_normalization_is_table_driven_and_safe`）。
+    /// 顺序错了：在改写前归一 = 改写带下来的错字漏网；在选源后归一 = 召回/缓存键全瞎。
+    #[test]
+    fn typo_normalization_is_wired_after_rewrite_before_source_pick() {
+        let src = include_str!("ask.rs");
+        let body = src
+            .split(concat!("pub async fn ask", "("))
+            .nth(1)
+            .expect("ask 没了")
+            .split("let one = |q: String|")
+            .next()
+            .unwrap();
+        let rw = body.find("rewrite_followup").expect("改写没了");
+        let inherit = body.find("time_phrase_of").expect("日期继承没了");
+        let norm =
+            body.find(concat!("normalize_", "typos(&rewritten)")).expect("ask 入口没接错别字归一");
+        let pick = body.find("select_source").expect("选源没了");
+        assert!(rw < norm && inherit < norm && norm < pick, "归一必须在改写/继承之后、选源之前：{body}");
+    }
+
+    /// 【问题 2】值词残留提取：剥指标词/虚词后剩下的整串才是候选过滤值。
+    /// 判官原案「直营上月销售额」→ 候选「直营」；客户名族原样保留（委托内层探主档）。
+    #[test]
+    fn value_word_residue_extracts_the_filter_candidate() {
+        assert_eq!(value_word_residue("直营上月销售额").as_deref(), Some("直营"));
+        assert_eq!(value_word_residue("直营战区上月销售额").as_deref(), Some("直营战区"));
+        // 客户名族：残留是名字，探针不中 → 原样委托内层（客户名 LIKE 兜底保留）
+        assert_eq!(value_word_residue("恒众餐饮本月买了多少").as_deref(), Some("恒众餐饮"));
+        // 纯指标/时间问句没有值词 → 门不接
+        assert_eq!(value_word_residue("上月销售额"), None);
+        assert_eq!(value_word_residue("昨天销量"), None);
+        // 多值问句剥完是融合串：等值探针必不中 → 委托内层，绝不静默只取一个值
+        assert_eq!(value_word_residue("直营和加盟上月销售额").as_deref(), Some("直营加盟"));
+    }
+
+    /// 【问题 2】探针候选：原词 → 剥维度词尾的词干 → 词干+本维度惯用后缀。
+    #[test]
+    fn dimension_probe_candidates_cover_noun_tails_and_suffix_forms() {
+        use dms_semantic::sales_fact::Dimension;
+        // 判官原案
+        assert_eq!(dimension_probe_values(Dimension::WarZone, "直营"), vec!["直营", "直营战区"]);
+        // 「直营战区」剥维度词尾再试（词尾长词先剥：「大战区」先于「战区」）
+        assert_eq!(dimension_probe_values(Dimension::WarZone, "直营大战区"), vec!["直营大战区", "直营"]);
+        // 省区值多带「省区」后缀：用户说「湖南」，库里是「湖南省区」
+        assert_eq!(dimension_probe_values(Dimension::Region, "湖南"), vec!["湖南", "湖南省区"]);
+        assert_eq!(dimension_probe_values(Dimension::Region, "湖南省区"), vec!["湖南省区", "湖南"]);
+    }
+
+    /// 【问题 2】维度值命中的合同装配：等值谓词落在战区列上（不是 `INSTR(storename,…)`），
+    /// 标量带环比/明细/同窗补充，route = direct-agg（verified 信任级）。
+    #[test]
+    fn dimension_value_hit_builds_the_contract_answer() {
+        use dms_semantic::sales_fact::{Dimension, Metric};
+        let hit = build_dimension_value_hit("直营上月销售额", Dimension::WarZone, "直营", &[Metric::SalesAmount])
+            .expect("标量装配必须成立");
+        assert!(hit.sql.contains("FROM sales_dw.dws_off_offline_sale_dfn sf"), "{}", hit.sql);
+        assert!(hit.sql.contains("sf.war_zone") && hit.sql.contains("= '直营'"), "谓词必须落在战区列：{}", hit.sql);
+        assert!(!hit.sql.contains("storename"), "不许再错配客户名列：{}", hit.sql);
+        assert!(hit.sql.contains("SUM(sf.amount) AS `销售额`"), "{}", hit.sql);
+        assert!(hit.sql.contains("sf.order_date >="), "时间窗必须带上：{}", hit.sql);
+        assert_eq!(hit.route, "direct-agg");
+        assert!(hit.prev.is_some(), "上月必须有环比基期");
+        assert!(hit.detail.is_some() && hit.sales_context.is_some(), "标量必须带明细与同窗补充");
+        // 多指标：只装配主查询（与合同装配器的标量约定一致）
+        let multi = build_dimension_value_hit(
+            "直营上月销售额和毛利",
+            Dimension::WarZone,
+            "直营",
+            &[Metric::SalesAmount, Metric::GrossProfit],
+        )
+        .unwrap();
+        assert!(multi.prev.is_none() && multi.detail.is_none() && multi.sales_context.is_none());
+        // 反向（防恒真）：空指标集不许装出答案
+        assert!(build_dimension_value_hit("直营上月销售额", Dimension::WarZone, "直营", &[]).is_none());
+    }
+
+    /// 【问题 2】接线判据：router 的 direct-doc 成员被优先门包住、表标签不变；
+    /// 门的 answer 里维度探针**必须先于**内层委托（顺序反了 = 客户名 LIKE 又抢了维度值）。
+    #[test]
+    fn direct_doc_is_wrapped_with_the_dimension_first_gate() {
+        // 行为半：外包成员的表标签必须仍是 direct-doc（ROUTER_ORDER 七位契约一位不动）
+        fn no_hit<'a>(_cx: &'a AskCtx<'a>) -> BoxFut<'a, Option<DirectHit>> {
+            Box::pin(async { None })
+        }
+        assert_eq!(DimensionFirstHit::new(no_hit).route(), "direct-doc");
+        // 接线半（源码扫描，锚点 `concat!` 拼 —— 自匹配家族，本仓惯例）
+        let src = include_str!("ask.rs");
+        assert!(
+            src.contains(concat!("DimensionFirstHit::", "new(direct_hit)")),
+            "router 的 direct-doc 没被维度成员值优先门包住"
+        );
+        let body = src
+            .split(concat!("impl Answerer for DimensionFirst", "Hit"))
+            .nth(1)
+            .expect("DimensionFirstHit 的 Answerer impl 没了")
+            .split(concat!("async fn dimension_value_", "hit("))
+            .next()
+            .expect("impl 边界没了");
+        let gate = body.find(concat!("dimension_value_", "hit(cx)")).expect("维度成员值门没了");
+        let inner = body.find("self.inner.answer(cx)").expect("内层委托没了");
+        assert!(gate < inner, "维度成员值必须先于客户名 LIKE 兜底（内层委托）：{body}");
+        // 落地口必须与内层同一个（三段闸门 → 取数 → 视图，一步不少）
+        assert!(body.contains("land(cx, hit, cx.t0)"), "门的命中必须走 land 落地：{body}");
+    }
+
+    /// 【问题 3】出界主题提取：判官原案 + 各逃逸族（纯函数）。
+    #[test]
+    fn out_of_scope_topic_extraction_and_escapes() {
+        // 判官原案：「火星上销售额多少」→ 主题「火星」（方位词尾不是主题的一部分）
+        assert_eq!(out_of_scope_topic("火星上销售额多少").as_deref(), Some("火星"));
+        assert_eq!(out_of_scope_topic("火星上有多少订单").as_deref(), Some("火星"), "已接入主题词必须剥掉");
+        // 逃逸族①：纯指标/时间问句 → None（present 的空窗文案对症，不许抢）
+        assert_eq!(out_of_scope_topic("上月销售额"), None);
+        // 逃逸族②：实体名 —— 空结果是「没这个客户」，不是主题未接入
+        assert_eq!(out_of_scope_topic("南京苏宇食品有限公司上月销售额"), None);
+        // 逃逸族③：单据/表名形 —— 空结果 = 没查到这张单
+        assert_eq!(out_of_scope_topic("帮我查下 HJXH-DXO2026072300384"), None);
+        assert_eq!(out_of_scope_topic("t_sales_order 现在是什么结构"), None);
+    }
+
+    /// 【问题 3】换文案判据的真值表：空结果 + route 在圈内 + 无既有标注 + 有出界主题 + 无覆盖，
+    /// 五个条件缺一不可。
+    #[test]
+    fn no_topic_verdict_truth_table() {
+        // 判官原案：derive 空结果 + 出界主题无覆盖 → 换
+        assert!(no_topic_verdict("direct-derive", 0, false, Some("火星"), false));
+        for route in ["llm", "llm+repair", "llm+schema-fix"] {
+            assert!(no_topic_verdict(route, 0, false, Some("火星"), false), "{route}");
+        }
+        // 有覆盖 → 不换（「烤肠」是分类名、「直营」是战区值 —— 它们的空结果不是主题问题）
+        assert!(!no_topic_verdict("direct-derive", 0, false, Some("烤肠"), true));
+        // 非空结果 → 不换
+        assert!(!no_topic_verdict("direct-derive", 3, false, Some("火星"), false));
+        // 合同路径 → 不换（present 的空窗文案对症）
+        assert!(!no_topic_verdict("direct-agg", 0, false, Some("火星"), false));
+        assert!(!no_topic_verdict("direct-doc", 0, false, Some("火星"), false));
+        // 已有风险标注 → 不换（不许盖掉口径复核的标注）
+        assert!(!no_topic_verdict("llm", 0, true, Some("火星"), false));
+        // 无出界主题 → 不换
+        assert!(!no_topic_verdict("llm", 0, false, None, false));
+    }
+
+    /// 【问题 3】接线判据：换上的文案就是 `no_topic_reply` 那一份（复用 KNOWN_TOPICS 判定，
+    /// 不是另抄一份文案）；接线在 `one` 闭包里 ask_single 之后、localize 之前。
+    #[test]
+    fn out_of_scope_empty_reply_reuses_the_no_topic_copy() {
+        let src = include_str!("ask.rs");
+        let one = src
+            .split("let one = |q: String|")
+            .nth(1)
+            .expect("one 闭包没了")
+            .split("if let Some(r) = compound::try_compound")
+            .next()
+            .expect("one 闭包边界没了");
+        let single = one.find("ask_single(d, &cx)").expect("ask_single 调用没了");
+        let reroute =
+            one.find(concat!("out_of_scope_empty_", "reply(&cx, &mut r)")).expect("出界出口没接线");
+        let loc = one.find("localize_result(&cx").expect("localize 收口没了");
+        assert!(single < reroute && reroute < loc, "出界出口必须在 ask_single 之后、localize 之前：{one}");
+        // 文案半：复用同一个 no_topic_reply（含 KNOWN_TOPICS 列举），分步留痕带过去
+        let body = src
+            .split(concat!("async fn out_of_scope_empty_", "reply("))
+            .nth(1)
+            .expect("out_of_scope_empty_reply 没了");
+        assert!(
+            body.contains(concat!("no_topic_", "reply(cx.question, &topic, cx.t0")),
+            "必须复用 no_topic_reply（另抄一份文案必漂）：{body}"
+        );
+        assert!(body.contains("std::mem::take(&mut r.steps)"), "分步留痕必须带过去：{body}");
     }
 }

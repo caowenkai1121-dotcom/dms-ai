@@ -288,8 +288,11 @@ fn valid_iso_date(b: &[u8]) -> Option<(u16, u8, u8)> {
 /// 规则①：近 N 天/周/月/年（含中文数字）
 fn rule_recent_n(q: &str) -> Option<String> {
     let (n, unit) = recent_n(q)?;
+    // 🔴 「近 N 天」含今天：起点只回推 N-1 天，窗口才恰好 N 个自然日
+    //（修前回推 N 天，「近7天」实测覆盖 8 个自然日）；周/月/年是滚动周期单位，不折算。
+    let back = if unit == "DAY" { n - 1 } else { n };
     Some(format!(
-        "{{}} >= DATE_SUB(CURDATE(), INTERVAL {n} {unit}) AND {{}} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
+        "{{}} >= DATE_SUB(CURDATE(), INTERVAL {back} {unit}) AND {{}} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
     ))
 }
 
@@ -690,6 +693,22 @@ mod tests {
         assert_eq!(recent_n("近2年"), Some((2, "YEAR")));
         assert_eq!(recent_n("近99天"), None, "N>60 不解析");
         assert_eq!(recent_n("最近一段时间"), None, "无单位不解析");
+    }
+
+    /// 🔴 「近 N 天」含今天 = 恰好 N 个自然日：起点只回推 N-1 天。
+    /// 修前回推 N 天 → 窗口 N+1 天（「近7天」实测覆盖 8 个自然日），
+    /// 与「含今天 7 天」的业务口径不符（CODE-REVIEW-2026-07-30 第 2 条）。
+    #[test]
+    fn recent_n_days_window_is_exactly_n_days_including_today() {
+        let p = tp("近7天销售额");
+        assert!(p.contains("INTERVAL 6 DAY"), "近7天=今天+前6天：{p}");
+        assert!(!p.contains("INTERVAL 7 DAY"), "回推 7 天就是 8 个自然日：{p}");
+        assert!(p.contains("< DATE_ADD(CURDATE(), INTERVAL 1 DAY)"), "右端不变（含今天）：{p}");
+        assert!(tp("近1天销售额").contains("INTERVAL 0 DAY"), "近1天=只含今天");
+        assert!(tp("近三十天销量").contains("INTERVAL 29 DAY"));
+        // 滚动周期单位不做天数折算：周/月/年原样
+        assert!(tp("最近三个月").contains("INTERVAL 3 MONTH"));
+        assert!(tp("过去两周").contains("INTERVAL 2 WEEK"));
     }
 
     #[test]

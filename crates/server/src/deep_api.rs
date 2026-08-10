@@ -28,6 +28,21 @@ fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
     (code, Json(serde_json::json!({ "error": msg.to_string() })))
 }
 
+/// 内部错误的统一出口（安全审查②）：响应只带固定文案 —— anyhow/sqlx 原文含关系名、
+/// 约束名与连接细节，回前端等于泄露内部结构。真因一律 `tracing::warn!` 留服务端
+///（照 `kb_api::kb_err` 的收敛模子）。响应形状不变：`{"error": 固定文案}` + 原状态码。
+fn internal_err(context: &'static str, e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(error = %e, "{context}");
+    err(StatusCode::INTERNAL_SERVER_ERROR, "服务暂时不可用，请稍后重试")
+}
+
+/// 身份核验失败（同 `api_ask` 的 403 文案）：load_principal 的 anyhow 可能携带身份库
+/// 错误原文（连接细节），不外回；业务分类（多角色未选等）由 warn 留痕。
+fn identity_err(login: &str, e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(login = %login, error = %e, "身份核验被 load_principal 拒");
+    err(StatusCode::FORBIDDEN, "当前账号或角色不可用")
+}
+
 const DETAIL_SQL_SEPARATOR: &str = ";\n\n-- 明细\n";
 const DWS_SALES_FACT: &str = dms_semantic::sales_fact::TABLE;
 type SalesMeasure = dms_semantic::sales_fact::Metric;
@@ -1987,9 +2002,12 @@ static PROGRESS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, ProgressEntry>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// 一次深度请求的进度：固定脱敏阶段 + 板块级子任务状态。
+/// 一次深度请求的进度：属主 + 固定脱敏阶段 + 板块级子任务状态。
 struct ProgressEntry {
     at: std::time::Instant,
+    /// 属主登录名（compose/resume 身份解析后登记）：`/api/deep/progress` 属主闸的依据之一
+    ///（内存级；重启后由 PG `deep_run.login_name` 接手判定）。
+    owner: Option<String>,
     steps: Vec<String>,
     sections: Vec<SectionProgress>,
 }
@@ -2049,6 +2067,7 @@ fn progress_entry<'m>(
     }
     m.entry(rid.to_string()).or_insert_with(|| ProgressEntry {
         at: std::time::Instant::now(),
+        owner: None,
         steps: vec![],
         sections: vec![],
     })
@@ -2071,43 +2090,88 @@ fn valid_progress_id(rid: &str) -> bool {
         && rid.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+/// 【安全审查③】属主登记：compose/resume 在身份解析后调用 —— 进度端点只认
+/// 「登记属主 = 调用方」。内存属主覆盖「本进程在跑/刚跑完」（含落账降级与知识分支
+/// 这两个 PG 没行的窗口）；重启后由 PG `deep_run.login_name` 接手。
+fn note_owner(rid: &str, login_name: &str) {
+    if !valid_progress_id(rid) {
+        return;
+    }
+    let mut m = PROGRESS.lock().expect("progress 锁中毒");
+    progress_entry(&mut m, rid).owner = Some(login_name.to_string());
+}
+
+/// 属主闸（纯函数，判据打在这里）：内存登记或 PG 账本任一属主与调用方一致才放行；
+/// 两者都查不到 = 属主不可证 → 拒（调用方统一 404，与「不存在」同形，不泄 rid 存在性）。
+fn progress_visible(caller: &str, mem_owner: Option<&str>, pg_owner: Option<&str>) -> bool {
+    mem_owner == Some(caller) || pg_owner == Some(caller)
+}
+
 #[derive(serde::Deserialize, Default)]
 pub struct ProgressQuery {
     rid: Option<String>,
+    /// 与其它端点同形的身份回退字段（仅 `insecure_login_fallback` 开启时生效；缺省 None）
+    login_name: Option<String>,
+    role_code: Option<String>,
+}
+
+/// 进度端点的统一拒答：404 固定文案。未认证 / 非属主 / rid 无效 / 属主查不到全部同形 ——
+/// 响应差异会泄露「rid 是否真实存在」，而 rid 可能随分享链接/日志/会话记录流出。
+fn progress_not_found() -> ApiErr {
+    err(StatusCode::NOT_FOUND, "进度不存在或已过期")
 }
 
 /// `GET /api/deep/progress?rid=` —— 阶段清单 + 板块子任务状态 + 是否已完成（完成即可停轮询）。
-/// 无身份要求（rid 是随机 uuid，枚举不出别人的 —— 它也**不含数据**，只有阶段名与板块标题）。
+/// 【安全审查③】属主闸：rid 是随机 uuid 枚举不出，但**泄露**防不住（分享链接/浏览器历史/
+/// 服务端日志都带它），而板块标题与验收断言本身就是经营信息（透出「公司在分析什么」）。
+/// 调用方必须证明自己是该 rid 的属主：内存登记（本进程在跑/刚跑完，含落账降级与知识分支
+/// 这两个 PG 没行的窗口）或 PG 账本 `deep_run.login_name`（重启后仍可判）任一命中才放行。
+/// 老前端轮询不带身份参数 → 干净 404，其 `if (!r.ok) return` 逻辑天然兼容（静默跳过这一拍）。
 /// 【D4】`state`/`resumable`：PG 里的运行态（重启后内存进度没了它还在）与「可续跑」布尔。
 /// 透出的仍是固定状态词与布尔 —— 脱敏纪律与 steps/sections 同一条，一个敏感字段不加。
 pub async fn progress(
     State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<ProgressQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiErr> {
     let rid = q.rid.unwrap_or_default();
     if !valid_progress_id(&rid) {
-        return Json(serde_json::json!({ "steps": [], "done": false, "sections": [] }));
+        return Err(progress_not_found());
     }
-    let (steps, sections) = {
+    let (login, _role) = crate::resolve_identity(&st, &headers, &q.login_name, &q.role_code)
+        .ok_or_else(progress_not_found)?;
+    let (mem_owner, steps, sections) = {
         let m = PROGRESS.lock().expect("progress 锁中毒");
-        m.get(&rid)
-            .map(|entry| (entry.steps.clone(), entry.sections.clone()))
-            .unwrap_or_default()
+        match m.get(&rid) {
+            Some(entry) => (entry.owner.clone(), entry.steps.clone(), entry.sections.clone()),
+            None => (None, vec![], vec![]),
+        }
     };
+    // PG 账本一次往返取（属主, 运行态）：表没建过/查询失败按 None 降级 —— 内存属主还在的
+    //（本进程在跑）不受 PG 抖动影响；两边都查不到则属主不可证 → 404（fail-closed）。
+    let pg_row = match deep_run_owner_state(st.owned.pool(), &rid).await {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(error = %e, "进度属主/运行态查询失败");
+            None
+        }
+    };
+    if !progress_visible(&login, mem_owner.as_deref(), pg_row.as_ref().map(|(owner, _)| owner.as_str())) {
+        return Err(progress_not_found());
+    }
     let done = steps.iter().any(|s| s == ProgressStage::Done.label())
         || steps.iter().any(|s| s == ProgressStage::Failed.label());
-    // 运行态（PG 真相）：running 且本进程执行器已死 → 视作可续跑（收割判据同一处）；
-    // 表没建过/查询失败 = 无运行态（deep 落账是可选路径，进度端点不许因此报错）。
-    let (state, resumable) = match deep_run_state(st.owned.pool(), &rid).await {
-        Ok(Some(state)) => {
+    // 运行态（PG 真相）：running 且本进程执行器已死 → 视作可续跑（收割判据同一处）
+    let (state, resumable) = match pg_row {
+        Some((_, state)) => {
             let resumable = run_resumable(&state, run_is_active(&rid));
             (Some(state), resumable)
         }
-        _ => (None, false),
+        None => (None, false),
     };
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "steps": steps, "done": done, "sections": sections, "state": state, "resumable": resumable,
-    }))
+    })))
 }
 
 /// 【板块级进度】计划板块一次性入列（全部 queued）。状态与阶段同住一把 PROGRESS 锁：
@@ -2502,14 +2566,15 @@ async fn deep_sections_load(pool: &sqlx::PgPool, rid: &str) -> anyhow::Result<Ve
         .collect())
 }
 
-/// 进度端点的运行态查询（表可能从没建过 —— Err 由调用方降级为「无运行态」，不炸进度）。
-async fn deep_run_state(pool: &sqlx::PgPool, rid: &str) -> anyhow::Result<Option<String>> {
-    let state: Option<String> =
-        sqlx::query_scalar("SELECT state FROM meta.deep_run WHERE rid=$1")
+/// 进度端点的（属主, 运行态）查询 —— 一次往返同时喂属主闸与 `state`/`resumable`
+///（表可能从没建过 —— Err 由调用方降级，不炸进度；但属主也因此不可证 → 404）。
+async fn deep_run_owner_state(pool: &sqlx::PgPool, rid: &str) -> anyhow::Result<Option<(String, String)>> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT login_name, state FROM meta.deep_run WHERE rid=$1")
             .bind(rid)
             .fetch_optional(pool)
             .await?;
-    Ok(state)
+    Ok(row)
 }
 
 // ───────────────────── 【PLAN】LLM 当分析师：报表计划由模型出 ─────────────────────
@@ -3567,11 +3632,11 @@ async fn compose_inner(
             match crate::chat::conv_owner(st.owned.pool(), cid).await {
                 Ok(Some(owner)) if owner == login_name => Ok(()),
                 Ok(_) => Err(err(StatusCode::FORBIDDEN, "无权访问该会话")),
-                Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+                Err(e) => Err(internal_err("会话状态读取失败", e)),
             }
         },
     );
-    let p = principal.map_err(|e| err(StatusCode::FORBIDDEN, e))?;
+    let p = principal.map_err(|e| identity_err(&login_name, e))?;
     conv_access?;
     // 会话追问上下文与意图分诊互不依赖；两条 PG/LLM 路径并发，避免固定串行税。
     let triage_ds = req
@@ -3593,8 +3658,10 @@ async fn compose_inner(
             req.intent.as_deref(),
         ),
     );
-    // `rid` 只登记固定脱敏阶段；未鉴权进度端点不得承载问题、实体、数据或模型文本。
+    // `rid` 只登记属主与固定脱敏阶段；进度端点不得承载问题、实体、数据或模型文本。
+    // 属主登记抢在第一个 note 前：前端发起 POST 即开始轮询，早一拍是一拍。
     let rid = req.rid.clone().unwrap_or_default();
+    note_owner(&rid, &login_name);
     if matches!(intent, crate::triage::Intent::Knowledge) {
         note(&rid, ProgressStage::Knowledge);
         let answer = dms_agent::answerers::knowledge::answer(
@@ -3609,7 +3676,9 @@ async fn compose_inner(
         .await
         .map_err(|e| {
             note(&rid, ProgressStage::Failed);
-            err(StatusCode::UNPROCESSABLE_ENTITY, e)
+            // 固定文案（同 api_ask 的知识分支）：原文只进 warn 不进响应（安全审查②）
+            tracing::warn!(error = %e, "深度模式知识检索失败");
+            err(StatusCode::UNPROCESSABLE_ENTITY, "暂时无法完成知识检索，请稍后重试")
         })?;
         let result = serde_json::to_value(&answer).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(cid) = req.conv_id {
@@ -3671,7 +3740,14 @@ async fn compose_inner(
     };
     let mut primary = primary.map_err(|e| {
         note(&rid, ProgressStage::Failed);
-        err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+        // 与 api_ask 同一口径：「无权访问数据源」是权限拒绝 → 403；其余 422 固定文案，
+        // anyhow 原文（SQL/连接细节）只进 warn 不进响应（安全审查②）。
+        tracing::warn!(error = %e, "深度模式主查询失败");
+        if e.to_string().contains("无权访问数据源") {
+            err(StatusCode::FORBIDDEN, "当前账号无权访问该数据源")
+        } else {
+            err(StatusCode::UNPROCESSABLE_ENTITY, "暂时无法完成本次问数，请调整问题后重试")
+        }
     })?;
     let (main_target, main_is_warehouse) = st.mysql.target_snapshot();
     let report_ds = report_ds_id(&primary, req.ds.as_deref(), &main_target);
@@ -4109,7 +4185,7 @@ async fn compose_inner(
             if let Some((ctx, _)) = &run_tracking {
                 let _ = deep_run_finish(&ctx.pool, &ctx.rid, "failed", None, "执行失败").await;
             }
-            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e));
+            return Err(internal_err("报告产物保存失败", e));
         }
     };
     // 【D4】运行终态落账。落账失败只留痕：报告本身已成功，不能因账本抖动 500
@@ -4192,13 +4268,15 @@ pub async fn resume(
     }
     let (login_name, role_code) = crate::resolve_identity(&st, &headers, &req.login_name, &req.role_code)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
+    // 属主登记：续跑沿用同一 rid，进度轮询的属主闸（内存一级）要在第一拍轮询前就位
+    note_owner(&rid, &login_name);
     let pool = st.owned.pool().clone();
     run_migrate(&pool)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("续跑账本初始化失败", e))?;
     let run = deep_run_load(&pool, &rid)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(|e| internal_err("续跑账本读取失败", e))?
         .ok_or_else(|| {
             err(
                 StatusCode::NOT_FOUND,
@@ -4219,7 +4297,7 @@ pub async fn resume(
         }
         deep_run_reap(&pool, &rid)
             .await
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            .map_err(|e| internal_err("中断运行收割失败", e))?;
     }
     // 并发闸 + PG 状态翻转双保险：进程内闸先占坑；PG 只许 interrupted/failed → running，
     // 两份并发续跑只有一份翻转成功（另一份 409）。
@@ -4233,13 +4311,13 @@ pub async fn resume(
     .bind(&rid)
     .fetch_optional(&pool)
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(|e| internal_err("续跑状态认领失败", e))?;
     if claimed.is_none() {
         return Err(err(StatusCode::CONFLICT, "该报告状态已变化，请刷新进度后重试"));
     } // guard 随 return drop → 并发闸释放，不泄漏
     let sections = deep_sections_load(&pool, &rid)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("续跑板块读取失败", e))?;
     if sections.is_empty() {
         let _ = deep_run_finish(&pool, &rid, "failed", None, "执行失败").await;
         return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "账本里没有可续跑的板块计划"));
@@ -4376,6 +4454,79 @@ mod tests {
         assert!(!valid_progress_id(""));
         assert!(!valid_progress_id("has spaces"));
         assert!(!valid_progress_id(&"x".repeat(65)));
+    }
+
+    /// 安全审查③：属主闸 —— 内存登记 / PG 账本任一属主与调用方一致才放行；
+    /// 两边都查不到 = 属主不可证 → 拒（fail-closed，调用方统一 404 不泄存在性）
+    #[test]
+    fn progress_owner_gate() {
+        assert!(progress_visible("alice", Some("alice"), None), "内存属主命中");
+        assert!(progress_visible("alice", None, Some("alice")), "PG 账本属主命中（重启后）");
+        assert!(progress_visible("alice", Some("alice"), Some("alice")));
+        assert!(!progress_visible("mallory", Some("alice"), None), "非属主拒（内存）");
+        assert!(!progress_visible("mallory", None, Some("alice")), "非属主拒（PG）");
+        assert!(!progress_visible("alice", None, None), "属主不可证 = 拒");
+        assert!(!progress_visible("mallory", Some(""), Some("")), "空属主谁也不许匹配");
+    }
+
+    /// 属主登记写进内存进度条目；非法 rid 静默不建档（与 note/note_sections_planned 同纪律）
+    #[test]
+    fn note_owner_registers_into_progress_entry() {
+        let rid = "owner-gate-test-rid";
+        note_owner(rid, "alice");
+        {
+            let m = PROGRESS.lock().expect("progress 锁中毒");
+            assert_eq!(m.get(rid).and_then(|e| e.owner.as_deref()), Some("alice"));
+        }
+        note_owner("bad rid", "alice");
+        let m = PROGRESS.lock().expect("progress 锁中毒");
+        assert!(m.get("bad rid").is_none());
+    }
+
+    /// 进度端点必须鉴权：handler 体内身份解析 + 属主闸 + 统一 404 出口三件套钉死
+    ///（先归一 CRLF 再切函数体：本文件是混合行尾，直接切 "\n}\n" 会切不到）
+    #[test]
+    fn progress_endpoint_requires_ownership() {
+        let src = include_str!("deep_api.rs").replace("\r\n", "\n");
+        let body = src
+            .split("pub async fn progress(")
+            .nth(1)
+            .expect("progress handler 没了")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(body.contains("resolve_identity"), "进度端点丢了身份解析：{body}");
+        assert!(body.contains("progress_visible"), "进度端点丢了属主闸：{body}");
+        assert!(body.contains("progress_not_found"), "非属主必须走统一 404（不泄存在性）：{body}");
+        assert!(body.contains("deep_run_owner_state"), "PG 属主/运行态必须一次往返：{body}");
+    }
+
+    /// 安全审查②：内部错误只回固定文案（原文含关系名/约束名/连接细节，只进 warn 不进响应体）
+    #[test]
+    fn internal_err_has_fixed_message_and_keeps_shape() {
+        let raw = "duplicate key violates \"deep_run_pkey\" (host=10.0.0.8:5432)";
+        let (code, Json(body)) = internal_err("测试上下文", raw);
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, serde_json::json!({ "error": "服务暂时不可用，请稍后重试" }));
+        assert!(!body.to_string().contains("deep_run_pkey"), "约束名不许外泄");
+        let (code, Json(body)) = identity_err("zhangsan", raw);
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(body, serde_json::json!({ "error": "当前账号或角色不可用" }));
+    }
+
+    /// 源码闸：`err(状态码, e)` 直回原文的写法不许回来
+    #[test]
+    fn raw_causes_never_reach_the_client() {
+        let src = include_str!("deep_api.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or("");
+        for bad in [
+            "err(StatusCode::INTERNAL_SERVER_ERROR, e)",
+            "err(StatusCode::UNPROCESSABLE_ENTITY, e)",
+            "err(StatusCode::FORBIDDEN, e)",
+            "err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())",
+        ] {
+            assert!(!code.contains(bad), "错误原文泄露回来了：{bad}");
+        }
     }
 
     #[test]

@@ -10,7 +10,8 @@
 //!    这条路，多角色账号在这里同样被 fail-closed 拒（要选角色）。`kb_search` 的 `Viewer` 用映射到的
 //!    login + 该 `Principal` 的角色码，**不放宽**：放宽一个字，MCP 就成了绕过 `kb.acl` 的入口。
 //! 3. **默认关**：`mcp_keys` 为空时整个端点 404（对外面默认关比默认开重要）。key 不匹配 401，
-//!    且响应与日志都不回显 key（日志只有前 4 位 + 长度，见 `mask_key`）。
+//!    比较走 `auth::api_key_login` 常量时间版（不泄露前缀时序），且响应与日志都不回显 key
+//!    （日志只记 `key_len`，一个前缀位都不给）。
 //!
 //! HTTP 状态码恒 200（JSON-RPC 的错误在 body 里），只有鉴权两种情况例外（404 / 401）——
 //! 否则 MCP 客户端会把「工具执行失败」当成传输层故障重试。
@@ -239,17 +240,6 @@ fn text_content(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }] })
 }
 
-/// 日志用的 key 脱敏。**永不打印完整 key**：短 key 连前缀都不给
-/// （8 位以下时「前 4 位」已经等于泄露一半以上）。
-fn mask_key(k: &str) -> String {
-    let n = k.chars().count();
-    if n >= 8 {
-        format!("{}…(len={n})", k.chars().take(4).collect::<String>())
-    } else {
-        format!("***(len={n})")
-    }
-}
-
 // ---------------------------------------------------------------- 鉴权
 
 /// key → login_name。两种 HTTP 例外都在这里：未配置任何 key = 功能关闭（404）、key 不匹配（401）。
@@ -260,10 +250,13 @@ fn authorize(keys: &HashMap<String, String>, headers: &HeaderMap) -> Result<Stri
         return Err(deny(StatusCode::NOT_FOUND, "未找到"));
     }
     let raw = headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok()).unwrap_or_default();
-    match keys.get(raw) {
-        Some(login) => Ok(login.clone()),
+    // 常量时间比较（复用 `auth::api_key_login`）：`HashMap::get` 的哈希早退会泄露时序，
+    // 攻击者可逐位探测 key 前缀 —— 与 REST 双通道同一条比较链，不各抄一份。
+    match crate::auth::api_key_login(keys, raw) {
+        Some(login) => Ok(login.to_string()),
         None => {
-            tracing::warn!(key = %mask_key(raw), "MCP 鉴权失败：X-API-Key 不匹配");
+            // 日志只记长度不回显任何前缀（前 4 位也是 key 的一部分）
+            tracing::warn!(key_len = raw.len(), "MCP 鉴权失败：X-API-Key 不匹配");
             Err(deny(StatusCode::UNAUTHORIZED, "X-API-Key 无效"))
         }
     }
@@ -663,17 +656,14 @@ mod tests {
         assert_eq!(opt_str(&json!({ "ds": " up_d1 " }), "ds").as_deref(), Some("up_d1"));
     }
 
-    /// 脱敏函数是「不泄露 key」这条纪律的唯一实现：任何长度都不许含完整 key
+    /// 脱敏已收敛为「日志只记 key_len」：`mask_key` 已删（前 4 位也是 key 的一部分）。
+    /// 这条守的是「别把脱敏前缀加回来」：失败日志一个前缀位都不给。
+    /// （判据只扫非测试代码：断言文本里自己也写着这个函数名，全文件扫会数到自己）
     #[test]
-    fn mask_key_never_leaks_full_key() {
-        for k in ["k-abcdef123456", "abc", "1234567", "12345678", "口令口令口令口令"] {
-            let m = mask_key(k);
-            assert!(!m.contains(k), "泄露了完整 key: {m}");
-            assert!(m.contains(&format!("len={}", k.chars().count())), "{m}");
-        }
-        assert!(mask_key("k-abcdef123456").starts_with("k-ab"));
-        // 8 位以下连前缀都不给
-        assert_eq!(mask_key("1234567"), "***(len=7)");
+    fn key_masking_helper_is_gone() {
+        let src = include_str!("mcp_api.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(!code.contains("fn mask_key"), "脱敏函数加回来 = 前缀泄露面加回来");
     }
 
     /// 鉴权的三条分支（本文件唯一的 HTTP 状态码来源）
@@ -694,6 +684,28 @@ mod tests {
         );
         // 匹配 → login_name
         assert_eq!(authorize(&keys(), &hdr("k-abcdef123456")).unwrap(), "zhangsan");
+        // 差一位 / 前缀相同都不许命中（常量时间比较的行为由 auth 侧单测钉，这里钉接线没丢）
+        assert_eq!(authorize(&keys(), &hdr("k-abcdef123457")).unwrap_err().0, StatusCode::UNAUTHORIZED);
+        assert_eq!(authorize(&keys(), &hdr("k-abcdef12345")).unwrap_err().0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// 🔴 比较链必须复用 `auth::api_key_login`（常量时间）：`HashMap::get` 的哈希早退
+    /// 泄露时序，攻击者可逐位探测前缀。失败日志只记 key_len，连脱敏前缀都不回显。
+    ///（先归一 CRLF 再切函数体：本文件是混合行尾，直接切 "\n}\n" 会把测试体也切进来）
+    #[test]
+    fn authorize_uses_constant_time_lookup_and_logs_only_length() {
+        let src = include_str!("mcp_api.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn authorize(")
+            .nth(1)
+            .expect("authorize 没了")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(body.contains("crate::auth::api_key_login"), "key 比较必须走常量时间版：{body}");
+        assert!(!body.contains("keys.get("), "API key 查找不许用 HashMap::get（哈希早退泄露时序）：{body}");
+        assert!(!body.contains("mask_key"), "失败日志不回显 key 前缀：{body}");
+        assert!(body.contains("key_len"), "失败日志只记长度：{body}");
     }
 
     /// `initialize` 的三个字段是客户端握手的硬要求（缺一个 n8n 直接报 protocol error）

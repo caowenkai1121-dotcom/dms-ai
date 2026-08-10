@@ -39,6 +39,21 @@ fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
     (code, Json(serde_json::json!({ "error": msg.to_string() })))
 }
 
+/// 内部错误的统一出口（安全审查②）：响应只带固定文案 —— anyhow/sqlx 原文可能含关系名、
+/// 约束名与连接细节，回前端等于泄露内部结构。真因一律 `tracing::warn!` 留服务端
+///（照 `kb_api::kb_err` 的收敛模子）。响应形状不变：`{"error": 固定文案}` + 原状态码。
+fn internal_err(context: &'static str, e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(error = %e, "{context}");
+    err(StatusCode::INTERNAL_SERVER_ERROR, "服务暂时不可用，请稍后重试")
+}
+
+/// 身份核验失败（同 `api_ask` 的 403 文案）：load_principal 的 anyhow 可能携带身份库
+/// 错误原文（连接细节），不外回；业务分类（多角色未选等）由 warn 留痕。
+fn identity_err(login: &str, e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(login = %login, error = %e, "身份核验被 load_principal 拒");
+    err(StatusCode::FORBIDDEN, "当前账号或角色不可用")
+}
+
 /// 请求体 = 前端手上那次 `/api/ask` 结果的四个字段 + 身份。
 /// 全部 `#[serde(default)]`（除 `question`/`sql`）：老前端补字段是渐进的，缺 `rows` 也该能出口径说明。
 #[derive(serde::Deserialize)]
@@ -83,7 +98,7 @@ pub async fn analysis(
     // 权限集合与脱敏不在这里判：能进这个 body 的行，是调用方上一次问数时已经过闸门给他的。
     principal::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
-        .map_err(|e| err(StatusCode::FORBIDDEN, e))?;
+        .map_err(|e| identity_err(&login, e))?;
     let r = dms_agent::Reading {
         question: &req.question,
         sql: &req.sql,
@@ -221,7 +236,7 @@ pub async fn report(
         .map_err(|_| err(StatusCode::BAD_REQUEST, "conv_id 必须是会话主键数字"))?;
     let owner = crate::chat::conv_owner(st.owned.pool(), cid)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("insight 服务端读写失败", e))?;
     if owner.as_deref() != Some(login.as_str()) {
         return Err(err(StatusCode::FORBIDDEN, "无权在该会话下生成报表"));
     }
@@ -245,7 +260,7 @@ pub async fn report(
     let html = crate::artifact_api::page_shell(&title, &html_body);
     let id = crate::artifact_api::save_artifact(&st, &req.conv_id, "report", &title, &html, &login)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| internal_err("insight 服务端读写失败", e))?;
     Ok(Json(serde_json::json!({
         "id": id,
         "title": title,
@@ -256,6 +271,32 @@ pub async fn report(
 
 #[cfg(test)]
 mod tests {
+    /// 安全审查②：内部错误只回固定文案（原文含关系名/约束名/连接细节，只进 warn 不进响应体）
+    #[test]
+    fn internal_err_has_fixed_message_and_keeps_shape() {
+        let raw = "duplicate key violates \"msg_pkey\" (host=10.0.0.8:5432)";
+        let (code, axum::Json(body)) = super::internal_err("测试上下文", raw);
+        assert_eq!(code, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, serde_json::json!({ "error": "服务暂时不可用，请稍后重试" }));
+        assert!(!body.to_string().contains("msg_pkey"), "约束名不许外泄");
+        let (code, axum::Json(body)) = super::identity_err("zhangsan", raw);
+        assert_eq!(code, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(body, serde_json::json!({ "error": "当前账号或角色不可用" }));
+    }
+
+    /// 源码闸：`err(状态码, e)` 直回原文的写法不许回来
+    #[test]
+    fn raw_causes_never_reach_the_client() {
+        let src = include_str!("insight_api.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or("");
+        for bad in [
+            "err(StatusCode::INTERNAL_SERVER_ERROR, e)",
+            "err(StatusCode::FORBIDDEN, e)",
+        ] {
+            assert!(!code.contains(bad), "错误原文泄露回来了：{bad}");
+        }
+    }
+
     /// 🔴 响应两个键的形状是与前端的契约：`caliber` 恒有、`insight` 可为 `null`。
     /// 断言打在 **handler 用的那个 `body()`** 上，不是在测试体里自己造一个字面量 ——
     /// 后者测的是 `serde_json`，删键也不会红（实测：改成只返 caliber 仍 139 passed）。

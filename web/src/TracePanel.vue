@@ -46,6 +46,9 @@ interface TraceRound {
   events: TraceEvent[]
 }
 const props = defineProps<{ rounds: TraceRound[] }>()
+/** 产物点击不跳新标签（/api/artifact/* 是 Bearer 鉴权页，新标签无凭据必 401）：
+ * 交给挂载方走 openPreview() 沙箱预览管线，与聊天气泡的深链拦截同款。 */
+const emit = defineEmits<{ (e: 'preview', url: string, title: string): void }>()
 
 const roundList = computed(() => props.rounds ?? [])
 
@@ -163,7 +166,7 @@ function roundTone(r: TraceRound): string {
               <template v-if="ev.sql"> · SQL {{ expanded.has(ri) ? '▾' : '▸' }}</template>
             </div>
             <div v-else-if="ev.kind === 'artifact'" class="tl-detail">
-              <a v-if="ev.preview_url" :href="ev.preview_url" target="_blank" rel="noopener" @click.stop>{{ ev.title }}</a>
+              <a v-if="ev.preview_url" :href="ev.preview_url" @click.prevent.stop="emit('preview', ev.preview_url, ev.title || '产物预览')">{{ ev.title }}</a>
               <template v-else>{{ ev.title }}</template>
             </div>
             <pre v-if="ev.kind === 'answer' && ev.sql && expanded.has(ri)" class="tl-sql">{{ ev.sql }}</pre>

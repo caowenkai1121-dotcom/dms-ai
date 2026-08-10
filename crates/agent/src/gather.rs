@@ -442,41 +442,56 @@ fn stash_context(trace_id: &str, cs: &ContextSummary) {
     }
 }
 
-/// 回炉（`repair`）的材料：schema 段 + **全量**指标/维度声明（对照 SuperSonic
-/// `AllFieldMapper` / `MapModeEnum.ALL`）。
+/// 回炉（`repair`）的材料：schema 段 + **全量**指标声明 + **按召回面过滤的**维度声明
+/// （指标侧对照 SuperSonic `AllFieldMapper` / `MapModeEnum.ALL`；维度侧见下面【性能①】）。
 ///
 /// 🔴 为什么回炉不能只给 schema（这里原来叫 `gather_schema`，只给 schema 段）：
 /// 首轮失败最大的一档就是**口径卡没命中** —— `why-not-compose` 逐题诊断 38 题时
 /// 「①指标不命中」9 题、「②装配器拒」9 题，而回炉是唯一一次补救机会。
 /// 只喂 schema 等于让模型拿着上一轮同样缺的那张牌再猜一遍，那次机会就白烧了。
-/// **全量不过 `match_word` 命中判据**，这正是要点：命中判据已经错过一次了。
+/// **指标段仍全量、不过 `match_word` 命中判据**，这正是要点：命中判据已经错过一次了。
+/// 指标只有 18 行 / 2.8KB（`meta.metric` 全是手工声明，autodiscover 不写它），全量喂得起。
 ///
-/// 实测体量（本机 pg 的 active 行，按**渲染后**的行文本量的，含 `- ` 前缀与换行）：
-/// 指标段 **18 行 / 2 772 字符 / 3 766 字节**（`meta.metric` 全是手工声明，autodiscover 不写它）；
-/// 维度段 **54 行 / 13 906 字符 / 19 956 字节** —— `meta.dimension` 有 **78** 行，
-/// 不按（名字, 表达式）归并的话是 28 558 字符 / 45 040 字节，**归并省掉一半**
-/// （`company_code` 那条 1.08KB 的 CASE 被 autodiscover 灌进了 13 张表）。
-/// 参照量：6 张表的 schema 段 ≈9KB（`t_sales_order` 80 列 2.5KB、`t_customer` 80 列 2.4KB…）——
-/// 也就是回炉提示会从 ≈9KB 长到 ≈33KB（3.6×），这个代价是**明知**的，见下面那行 ponytail。
-/// **别按「10 个维度」的印象估**：那是种子声明数（`seed_defs::DIMENSIONS`），
-/// 线上 78 行里 68 行是 autodiscover 灌的码→名 CASE。
+/// 【性能①】维度段为什么改成**按召回面过滤**（召回表 ∪ JOIN 对面表，与首轮
+/// `tables_for_rules` 同一集合语义）：实测维度段 54 行 / 13 906 字符 / 19 956 字节，
+/// 其中 **87% 是 autodiscover 灌的码→名 CASE**（`meta.dimension` 78 行里 68 行，
+/// `company_code` 那条 1.08KB 的 CASE 被灌进 13 张表），回炉每轮为这段多付 2-5s。
+/// 而来源表不在召回面里的声明救不了这次修复 —— 那些表的 schema 本来就不在材料里，
+/// 分组表达式给了也落不了地。过滤纯函数是 `dims_for_repair`（单测钉着）。
 ///
-/// ponytail: 维度那半是指标那半的 3 倍、且 87% 来自 autodiscover。若实测发现回炉质量被这段
-/// 稀释拖低，先整段砍维度（删下面那一行 `dim_lines`），**别去截断单张卡** ——
-/// 截半条 CASE 阶梯会让模型照抄一条语法不全的 CASE。
+/// ponytail: 若实测发现回炉质量被维度段稀释拖低，下一步是整段砍维度（删 `dim_lines_for`
+/// 那行），**别去截断单张卡** —— 截半条 CASE 阶梯会让模型照抄一条语法不全的 CASE。
 pub async fn gather_all_cards(cx: &AskCtx<'_>, embed: &EmbedClient) -> anyhow::Result<String> {
-    let schema = schema_section(cx, embed).await?;
-    // 读失败降级成「这一段缺席」而不是让整轮回炉失败（回炉本身就是补救路径），但**必须吼一声**：
-    // 注册表读失败曾经是静默的，一趟评测才把它照出来（裁决 二·AE）。
-    let metrics = load_metrics(cx.pg, cx.ds)
-        .await
+    // 【性能②】问句向量只算一次：schema 召回与经验召回共用（此前两处各发一次 embed HTTP，
+    // 与首轮 `gather` 那次也是同一个问句 —— 跨调用那一层由 `EmbedClient` 的问句 memo 兜）。
+    let qvec = embed.embed_query(cx.question).await.map(|v| to_pgvector(&v));
+    // 【性能②】四读并行（原来 schema → 指标 → 维度串行，回炉每轮白付两段注册表往返）。
+    // 注册表读失败降级成「这一段缺席」而不是让整轮回炉失败（回炉本身就是补救路径），
+    // 但**必须吼一声**：注册表读失败曾经是静默的，一趟评测才把它照出来（裁决 二·AE）。
+    // schema 召回失败仍整轮失败（与串行版的 `?` 相同）。
+    let (schema, metrics, dims, edges) = tokio::join!(
+        schema_section(cx, qvec.as_deref()),
+        load_metrics(cx.pg, cx.ds),
+        load_dimensions(cx.pg, cx.ds),
+        load_join_edges(cx.pg, cx.ds),
+    );
+    let (schema, recalled) = schema?;
+    let metrics = metrics
         .map_err(|e| tracing::warn!(err = %e, "回炉全量指标读失败 → 指标段缺席"))
         .unwrap_or_default();
-    let dims = load_dimensions(cx.pg, cx.ds)
-        .await
+    let dims = dims
         .map_err(|e| tracing::warn!(err = %e, "回炉全量维度读失败 → 维度段缺席"))
         .unwrap_or_default();
-    tracing::info!(metrics = metrics.len(), dims = dims.len(), "回炉喂全量口径声明");
+    // 关联图在这里只为维度过滤的「JOIN 对面表」那半服务：读失败 → 过滤面只剩召回表
+    // （过滤更狠一档，但仍是「段缺席」族的降级，不是失败）。
+    let edges = edges
+        .map_err(|e| tracing::warn!(err = %e, "回炉关联图读失败 → 维度过滤只看召回表"))
+        .unwrap_or_default();
+    let mut relevant = recalled;
+    let counterparts = join_counterparts(&edges, &relevant);
+    relevant.extend(counterparts);
+    let dims = dims_for_repair(dims, &relevant);
+    tracing::info!(metrics = metrics.len(), dims = dims.len(), "回炉喂口径声明（维度段按召回面过滤）");
     let mut material = repair_material_for(
         cx.ds,
         &metrics,
@@ -488,7 +503,6 @@ pub async fn gather_all_cards(cx: &AskCtx<'_>, embed: &EmbedClient) -> anyhow::R
     // 地方恰恰是回炉提示（首轮 prompt 的经验段在 `gather`）。贴 material 尾部：
     // 回炉提示的热区在尾部（问题 → 上一版 SQL → 错误），离错误越近越看得见的同一理由。
     // embed 缺席/读失败 = 该段缺席（与上面两段同一降级语义，各吼一声）。
-    let qvec = embed.embed_query(cx.question).await.map(|v| to_pgvector(&v));
     let mems = dms_semantic::registry::memory::recall_memories(cx.pg, cx.ds, qvec.as_deref(), 3)
         .await
         .map_err(|e| tracing::warn!(err = %e, "回炉经验召回失败 → 经验段缺席"))
@@ -507,32 +521,46 @@ pub async fn gather_all_cards(cx: &AskCtx<'_>, embed: &EmbedClient) -> anyhow::R
     Ok(material)
 }
 
-/// schema 段的召回。逐行等价于拆分前 `pipeline.rs:1091-1100`（同一组 `RecallCtx` 参数，limit 同为 6）。
-async fn schema_section(cx: &AskCtx<'_>, embed: &EmbedClient) -> anyhow::Result<String> {
-    let qvec = embed.embed_query(cx.question).await.map(|v| to_pgvector(&v));
+/// 【性能①】回炉维度段的过滤（**纯函数**，好断言）：只留来源表在召回面里的声明。
+/// 大小写不敏感（与 `join_counterparts` 的 `seen` 同口径）。保持 `load_dimensions` 的原序
+/// —— 定序与归并是 `dim_lines_for` 的事，本函数只减不增。
+fn dims_for_repair(dims: Vec<DimensionDef>, relevant: &[String]) -> Vec<DimensionDef> {
+    dims.into_iter()
+        .filter(|d| relevant.iter().any(|t| t.eq_ignore_ascii_case(d.source_table.as_str())))
+        .collect()
+}
+
+/// schema 段的召回 + 召回到的表名（回炉的维度段过滤要用这个集合）。
+/// 逐行等价于拆分前 `pipeline.rs:1091-1100`（同一组 `RecallCtx` 参数，limit 同为 6）。
+/// 【性能②】问句向量由调用方算好传入：本函数原来自己 embed 一次，与经验召回那次重复。
+async fn schema_section(cx: &AskCtx<'_>, qvec: Option<&str>) -> anyhow::Result<(String, Vec<String>)> {
     let rc = RecallCtx {
         question: cx.question,
         tables: &[],
         limit: 6,
         ds: cx.ds,
-        embed: qvec.as_deref(),
+        embed: qvec,
         embed_slices: &[],
     };
-    Ok(schema_text(&recall::retrieve(cx.pg, &rc).await?))
+    let ctxs = recall::retrieve(cx.pg, &rc).await?;
+    let tables = ctxs.iter().map(|c| c.table_name.clone()).collect();
+    Ok((schema_text(&ctxs), tables))
 }
 
-// 两个全量段的标题。**不许带反引号**：`prompt.rs` 有一条断言钉着「PG 提示里不许剩任何标识符
+// 两个口径段的标题（指标段全量、维度段按召回面过滤 —— 【性能①】）。**不许带反引号**：
+// `prompt.rs` 有一条断言钉着「PG 提示里不许剩任何标识符
 // 反引号」（留一个 LLM 就会照抄那一个），而这两段和 repair 提示一样会喂给 PG 源。
 //
 // 措辞刻意写成「**若**在此列就必须照此」而不是「不在此列就是口径错」：后者会把
 // 「本仓没声明这个指标」（毛利率之类）推成「拿一个别的已声明指标凑」——
-// 全量段的作用是补上漏召回的那张卡，不是宣布注册表已经穷尽了业务。
+// 口径段的作用是补上漏召回的那张卡，不是宣布注册表已经穷尽了业务。
 const T_ALL_METRICS: &str =
     "\n## 全部指标口径（全量声明，未按问句筛选；问句要的指标若在此列，口径与来源表必须严格照此，不许自己选表或改算法）\n";
 const T_ALL_DIMS: &str =
-    "\n## 全部维度口径（全量声明，未按问句筛选；问句要的维度若在此列，分组必须照抄这里的表达式，禁止自己臆造连接键）\n";
+    "\n## 相关维度口径（按本轮召回的相关表筛选；问句要的维度若在此列，分组必须照抄这里的表达式，禁止自己臆造连接键）\n";
 
-/// 回炉材料的拼装（**纯函数**，好断言）。段序：schema → 全量指标 → 全量维度。
+/// 回炉材料的拼装（**纯函数**，好断言）。段序：schema → 全量指标 → 过滤后的维度
+/// （过滤在 `gather_all_cards` 的 `dims_for_repair`，本函数只渲染收到的声明）。
 ///
 /// 🔴 为什么口径段在 schema **之后**（与首轮 `build_user_prompt` 正好相反）：
 /// `prompts/repair.md` 的 `{schema}` 槽在「## 可用表结构」标题**之下**，把卡片塞到它前面会
@@ -966,9 +994,64 @@ mod tests {
             "回炉的经验段掉线了 —— 经验最该出现的地方就是回炉"
         );
         // 防恒真：切出来的必须真的是那个函数体而不是整份源码
-        //（S4 补强加段后函数变长，上限跟着抬 —— 守的仍是「没切成整份源码」）
-        assert!(body.len() < 2600, "切段没切住，body {} 字符 —— 断言会因为看的是整份源码而恒真", body.len());
+        //（S4 补强、【性能①②】的过滤与并行加段后函数变长，上限跟着抬 —— 守的仍是「没切成整份源码」；
+        // 注意 `body.len()` 是**字节**数而注释全是中文，别拿字符数估）
+        assert!(body.len() < 3600, "切段没切住，body {} 字符 —— 断言会因为看的是整份源码而恒真", body.len());
         assert!(body.contains("repair_material"), "切段没切住：{body}");
+        // 【性能②】问句只许 embed 一次（schema 召回与经验召回共用同一个 qvec），
+        // 注册表两读 + 关联图必须与 schema 召回并行（原来串行，回炉每轮白付两段往返）
+        assert_eq!(body.matches("embed_query").count(), 1, "回炉重复 embed 问句了：{body}");
+        assert!(body.contains("tokio::join!"), "回炉的注册表两读不许退回串行：{body}");
+        // 【性能①】维度段必须过召回面过滤（87% 是 autodiscover 的码→名 CASE，约 20KB）
+        assert!(body.contains("dims_for_repair"), "维度段的召回面过滤掉了：{body}");
+        // schema_section 不再自己 embed（qvec 由 gather_all_cards 传入），且必须交出召回表名
+        let ss = src
+            .split("async fn schema_section")
+            .nth(1)
+            .expect("schema_section 改名了 —— 顺手把这条判据一起改")
+            .split("\n///")
+            .next()
+            .unwrap();
+        assert!(!ss.contains("embed_query"), "schema_section 自己 embed 就是第二次：{ss}");
+        assert!(ss.contains("table_name"), "召回表名没交出来 —— 维度过滤的集合从哪来：{ss}");
+    }
+
+    /// 【性能①】回炉维度段的过滤判据：只留来源表在召回面（召回表 ∪ JOIN 对面表）里的声明；
+    /// 大小写不敏感；保持输入序（定序与归并是 `dim_lines_for` 的事，过滤只减不增）；
+    /// 召回面为空 → 一行不留（那些表的 schema 不在材料里，分组表达式给了也落不了地）。
+    #[test]
+    fn repair_dims_are_filtered_to_the_recall_surface() {
+        let dims = vec![
+            dim("品牌", "t_x", "g.brand_name"),
+            dim("所属公司", "t_a", "CASE company_code WHEN '1' THEN 'x' END"),
+            dim("省份", "T_Customer", "c.province"),
+        ];
+        let relevant = vec!["t_a".to_string(), "t_customer".to_string()];
+        let kept = dims_for_repair(dims, &relevant);
+        let names: Vec<&str> = kept.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["所属公司", "省份"],
+            "t_x 不在召回面必须滤掉；T_Customer 大小写不敏感命中；顺序保持输入序：{names:?}"
+        );
+        assert!(dims_for_repair(vec![dim("品牌", "t_x", "e")], &["t_a".to_string()]).is_empty());
+        assert!(
+            dims_for_repair(vec![dim("品牌", "t_x", "e")], &[]).is_empty(),
+            "召回面为空 → 维度段整段缺席（一行不留）"
+        );
+    }
+
+    /// 召回面 = 召回表 ∪ JOIN 对面表（与首轮 `tables_for_rules` 同一集合语义）：
+    /// 对面表上的维度（「省份」在 t_customer 上）正是回炉要救的那类卡，不许被过滤误伤。
+    #[test]
+    fn repair_dim_surface_includes_join_counterparts() {
+        let edges = vec![edge("t_ord", "cust", "t_cust", "cust", "N:1")];
+        let mut relevant = vec!["t_ord".to_string()];
+        let counterparts = join_counterparts(&edges, &relevant);
+        relevant.extend(counterparts);
+        assert!(relevant.iter().any(|t| t == "t_cust"), "对面表必须进召回面");
+        let kept = dims_for_repair(vec![dim("省份", "t_cust", "c.province")], &relevant);
+        assert_eq!(kept.len(), 1, "对面表上的维度必须留住");
     }
 
     /// 🔴 **降级必须留痕**：`gather` 里每一处 `unwrap_or_default()` 都得配一条 `tracing::warn!`。

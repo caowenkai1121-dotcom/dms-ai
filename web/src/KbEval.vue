@@ -122,6 +122,10 @@ function normalizeItem(raw: Record<string, unknown>): EvalItem {
 function isRunning(status: string): boolean {
   return /running|processing|pending|queued|进行中|排队/.test(status.toLowerCase())
 }
+/** 只有明确完成才给绿色成功样式；未知状态走默认中性灰（避免误报「成功」） */
+function isCompleted(status: string): boolean {
+  return /completed|done|finished|success|完成/.test(status.toLowerCase())
+}
 
 function statusText(status: string): string {
   const s = status.toLowerCase()
@@ -334,7 +338,7 @@ void reload()
         </div>
         <article v-for="run in runs" :key="run.id" class="eval-row">
           <span class="eval-id" :title="run.id">{{ run.id }}</span>
-          <span><i class="eval-status" :class="{ running: isRunning(run.status), failed: /失败/.test(statusText(run.status)) }">{{ statusText(run.status) }}</i></span>
+          <span><i class="eval-status" :class="{ running: isRunning(run.status), failed: /失败/.test(statusText(run.status)), done: isCompleted(run.status) }">{{ statusText(run.status) }}</i></span>
           <span><b class="eval-score" :class="scoreClass(run.score)">{{ percentText(run.score) }}</b></span>
           <span>{{ run.completed ?? '-' }}/{{ run.total ?? '-' }}</span>
           <span>{{ durationText(run.durationMs) }}</span>
@@ -370,7 +374,7 @@ void reload()
         <div class="eval-summary">
           <div class="eval-card">
             <span>状态</span>
-            <i class="eval-status" :class="{ running: reportRunning }">{{ statusText(summary.status) }}</i>
+            <i class="eval-status" :class="{ running: reportRunning, done: isCompleted(summary.status) }">{{ statusText(summary.status) }}</i>
           </div>
           <div class="eval-card">
             <span>总体评分</span>
@@ -472,8 +476,9 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .eval-id { color: var(--text-regular) !important; font-family: var(--font-mono); font-size: 11px; }
 .eval-status {
   display: inline-block; padding: 1px 8px; border-radius: 999px; font-style: normal;
-  background: var(--success-bg); color: var(--success-text); font-size: 10.5px; font-weight: 650;
+  background: var(--bg-sunken); color: var(--text-muted); font-size: 10.5px; font-weight: 650;
 }
+.eval-status.done { background: var(--success-bg); color: var(--success-text); }
 .eval-status.running { background: var(--primary-light); color: var(--primary); }
 .eval-status.failed { background: var(--error-bg); color: var(--error-text); }
 .eval-score { font-weight: 700; }

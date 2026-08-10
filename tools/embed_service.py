@@ -467,16 +467,50 @@ def _sheet(name, rows):
     return {'name': name, 'header': keep[0], 'rows': keep[1:]}
 
 def _p_xlsx(path):
-    """表格只出 sheets（单元格矩阵），markdown 文本通道由 knowledge::tabular 的 sheet_blocks 出"""
+    """表格只出 sheets（单元格矩阵），markdown 文本通道由 knowledge::tabular 的 sheet_blocks 出。
+
+    🔴 read_only 模式轻信每个 sheet 顶部的 <dimension> 声明，而 WPS/ERP 导出的 xlsx 常把它
+    写小（声明 A1:A1、实际到 F 列）—— iter_rows 按声明截断，**静默丢列**（KB 审查实测形态）。
+    openpyxl ≥ 3.1 用 `ws.reset_dimensions()` 让它忽略声明、按实际单元格重算边界；
+    更老的版本没有它：声明列数与首行实长不符时降级非 read_only 重读（内存换正确性）。
+    判据钉在 `_selftest_xlsx_dims`（篡改 dimension 声明的夹具）。"""
     import openpyxl                    # 依赖门在 parse_doc，同 _p_docx
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
-        sheets = [s for ws in wb.worksheets
-                  if (s := _sheet(ws.title, ([_cell(c) for c in r]
-                                             for r in ws.iter_rows(values_only=True))))]
+        out = []
+        for ws in wb.worksheets:
+            if hasattr(ws, 'reset_dimensions'):
+                ws.reset_dimensions()  # 不信 <dimension> 声明（openpyxl ≥ 3.1）
+            elif _dims_suspect(ws):
+                # openpyxl < 3.1 的兜底：声明不可信 → 非 read_only 按实际单元格重读整本
+                return _xlsx_eager(path)      # 本 wb 由 finally 关闭
+            s = _sheet(ws.title, ([_cell(c) for c in r]
+                                  for r in ws.iter_rows(values_only=True)))
+            if s:
+                out.append(s)
     finally:
         wb.close()
-    return [], 0, sheets
+    return [], 0, out
+
+def _dims_suspect(ws):
+    """老 openpyxl（无 `reset_dimensions`）的错声明探测：read_only 下 `ws.max_column`
+    就是 <dimension> 的声明列数，与首行实长不符即不可信。"""
+    declared = ws.max_column
+    if declared is None:
+        return False
+    first = next(ws.iter_rows(values_only=True), None)
+    return first is not None and len(first) != declared
+
+def _xlsx_eager(path):
+    """非 read_only 重读整本：矩阵按实际单元格建，<dimension> 声明够不着它。"""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=False, data_only=True)
+    try:
+        return [], 0, [s for ws in wb.worksheets
+                       if (s := _sheet(ws.title, ([_cell(c) for c in r]
+                                                  for r in ws.iter_rows(values_only=True))))]
+    finally:
+        wb.close()
 
 def _p_csv(path):
     text = _read_text(path)
@@ -917,6 +951,42 @@ def _selftest_pages():
                           {'text': '乙' * 400, 'heading_path': 'H', 'page': 2}], overlap=0)
     assert [c['page'] for c in split] == [1, 2], split
 
+# `| --- | :-: |` 形分隔行：单元格只许是 `-` 与 `:`（带数字/文字的行不是分隔行）
+_MD_SEP = re.compile(r'^\s*\|?(?:\s*:?-+:?\s*\|)+\s*$')
+
+def _table_split(text):
+    """markdown 表格块的「表头切点」：返回 (每块都要重复的前缀, 数据行列表)；不是表格块返 None。
+
+    只认**块首 6 行内**的表格（sheet 渲染块恒在块首：`# 名` + 空行 + 表头行 + 分隔行）——
+    块中间的表格仍走通用分块：那种前缀里裹着散文，「每块重复前缀」会把散文复制 N 份，更糟。"""
+    lines = text.split('\n')
+    for i, l in enumerate(lines[:6]):
+        if i > 0 and _MD_SEP.match(l) and lines[i - 1].lstrip().startswith('|'):
+            return '\n'.join(lines[:i + 1]), [x for x in lines[i + 1:] if x.strip()]
+    return None
+
+def _fill_table(chunks, prefix, rows, hp, page, tc):
+    """表格块的**行感知**装箱（KB 审查实测：通用分块从表中间切开，后半表是没表头的裸数字）。
+    按 `\n` 行装箱到目标长度，**每块重复「# 标题 + 表头 + 分隔行」前缀**（markdown 表跨块的
+    标准做法）；块间不做字符重叠 —— 表格的重叠尾巴是半行裸数据，表头重复才是上下文。"""
+    budget = tc - len(prefix) - 1                            # 每块数据行的字符预算
+    hard_cap = int(MAX_TOKENS * CHARS_PER_TOKEN) - len(prefix) - 1   # 单行硬切上限（不破 512 窗口）
+    cur, cur_len = [], 0
+    for row in rows:
+        need = len(row) + 1
+        if cur and cur_len + need > budget:
+            _emit(chunks, prefix + '\n' + '\n'.join(cur), hp, page)
+            cur, cur_len = [], 0
+        if need > budget:
+            # 单行就超目标（单元格超长的病态行）：带表头硬切，仍不破 MAX_TOKENS 窗口
+            for piece in _split_long(row, max(1, min(budget, hard_cap))):
+                _emit(chunks, prefix + '\n' + piece, hp, page)
+            continue
+        cur.append(row)
+        cur_len += need
+    if cur:
+        _emit(chunks, prefix + '\n' + '\n'.join(cur), hp, page)
+
 def chunk_blocks(blocks, target_tokens=TARGET_TOKENS, overlap=OVERLAP):
     overlap = max(0, min(overlap, MAX_TOKENS // 4))
     target = max(1, min(target_tokens, MAX_TOKENS - overlap))
@@ -924,7 +994,18 @@ def chunk_blocks(blocks, target_tokens=TARGET_TOKENS, overlap=OVERLAP):
     cap = max(1, tc - oc - 1)   # 单元留出重叠余量：短标题块才能与正文合并，且 重叠+单元 不破 MAX_TOKENS
     chunks = []
     for hp, group in itertools.groupby(blocks, key=lambda b: b.get('heading_path') or ''):
-        _fill(chunks, list(group), hp, tc, oc, cap)
+        prose = []
+        for b in group:
+            t = (b.get('text') or '').strip()
+            split = _table_split(t) if t else None
+            if split is None or tc - len(split[0]) - 1 < 50:
+                # 非表格块照旧；表头本身就吃掉大半预算的宽表（如 200 列）也回通用路径
+                prose.append(b)
+                continue
+            _fill(chunks, prose, hp, tc, oc, cap)   # 先收掉表格前面的散文段
+            prose = []
+            _fill_table(chunks, split[0], split[1], hp, b.get('page'), tc)
+        _fill(chunks, prose, hp, tc, oc, cap)
     return chunks
 
 def _vlit(v):
@@ -1006,8 +1087,8 @@ def _revec_datasources(cur):
 # ============ 第五个 build 目标：知识库向量补齐（revec）============
 # 缺陷背景（已实测）：`knowledge/src/ingest.rs` 在向量服务不可用时把文档停在 `chunked` 并写
 # 「向量服务不可用，稍后可重建」——**而重建它的实现者一直不存在**。
-# 后果不是「少一路召回」而是那份文档基本永久检索不到：`knowledge/src/retrieve.rs` 三路里
-# 中文 FTS 走 `to_tsvector('simple')`（连写中文切不出词）、trgm 又被 `TRGM_MIN=0.3` 挡着。
+# 后果不是「少一路召回」而是那份文档基本永久检索不到：`knowledge/src/retrieve.rs` 里
+# 中文 FTS 实测恒 0（该路已换成单号/型号精确匹配，只保 ASCII token）、trgm 又有阈值挡着。
 # 这两句不是推测，是量过的：14 个块 × 5 道题 = 70 组，**FTS 命中恒 0**；
 # 「一线城市出差住宿费上限是多少」对答案所在块的 word_similarity 只有 0.267（<0.3，被挡）。
 # 于是向量为空 = 零命中，而 UI 上那份文档显示「已入库」。
@@ -1266,6 +1347,8 @@ def selftest():
     caps = _selftest_caps(d)
     _selftest_pages()
     _selftest_pdf_scan(d)
+    _selftest_xlsx_dims(d)
+    _selftest_table_chunks()
     _selftest_revec()
     dt = _selftest_serve_unblocked()
     print(f'selftest ok: md块={len(r["blocks"])} 分块={len(ch)} tokens={[c["tokens"] for c in ch]}'
@@ -1391,6 +1474,60 @@ def _selftest_pdf_scan(tmpdir):
         if not _have('fitz'):
             assert t['ocr'] is None, 'fitz 缺席还上报 OCR 档可用 = 上报与真解析两套口径'
         assert 'OCR' in caps['.pdf']['why'], caps['.pdf']
+
+
+def _selftest_xlsx_dims(tmpdir):
+    """xlsx 静默丢列的钉（`_p_xlsx`）：WPS/ERP 导出常把 <dimension> 写小，read_only 轻信它
+    就按声明截断。夹具 = 声明 A1:A1、实际 3 列的 xlsx，断言 3 列全回来。
+    没有 openpyxl 时跳过（与 `_selftest_pdf_scan` 的真实夹具同纪律：能力缺席 ≠ 判据消失）。"""
+    if not _have('openpyxl'):
+        print('  ⏭️  xlsx 丢列判据跳过（openpyxl 不可用）', flush=True)
+        return
+    import openpyxl
+    import zipfile
+    src = os.path.join(tmpdir, 'dims_src.xlsx')
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '台账'
+    ws.append(['单号', '金额', '备注'])
+    ws.append(['A-1', '10', '甲'])
+    ws.append(['B-2', '20', '乙'])
+    wb.save(src)
+    bad = os.path.join(tmpdir, 'dims_bad.xlsx')
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(bad, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.startswith('xl/worksheets/sheet'):
+                # WPS/ERP 导出的实测形态：声明比实际小
+                data = re.sub(rb'<dimension ref="[^"]*"/>', b'<dimension ref="A1:A1"/>', data)
+            zout.writestr(item, data)
+    r = parse_doc(bad)
+    sheet = r['sheets'][0]
+    assert sheet['header'] == ['单号', '金额', '备注'], f'静默丢列复现：{sheet}'
+    assert sheet['rows'] == [['A-1', '10', '甲'], ['B-2', '20', '乙']], sheet
+
+
+def _selftest_table_chunks():
+    """表格行感知分块的钉（`_fill_table`）：每块必须重复表头、一行不丢不重、顺序不乱；
+    同标题下的散文段仍走通用分块（互不染指）。"""
+    rows = [f'| SO-2026-{i:03d} | {100 + i} 元 |' for i in range(60)]
+    text = '# 一月台账\n\n| 单号 | 金额 |\n| --- | --- |\n' + '\n'.join(rows)
+    ch = chunk_blocks([{'text': text, 'heading_path': '一月台账', 'page': None}],
+                      target_tokens=60, overlap=0)
+    assert len(ch) > 3, ch
+    for c in ch:
+        lines = c['text'].split('\n')
+        assert lines[:4] == ['# 一月台账', '', '| 单号 | 金额 |', '| --- | --- |'], c
+        assert all(l.startswith('| SO-') for l in lines[4:]), c
+    got = [l for c in ch for l in c['text'].split('\n') if l.startswith('| SO-')]
+    assert got == rows, '数据行丢/重/乱序'
+    mix = chunk_blocks([{'text': '前文说明。' * 30, 'heading_path': 'H', 'page': None},
+                        {'text': text, 'heading_path': 'H', 'page': None}],
+                       target_tokens=60, overlap=0)
+    assert any('前文说明' in c['text'] for c in mix)
+    for c in mix:
+        if c['text'].startswith('# 一月台账'):
+            assert '前文说明' not in c['text'], c
 
 
 def _selftest_caps(tmpdir):

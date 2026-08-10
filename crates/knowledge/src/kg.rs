@@ -3,7 +3,7 @@
 //! 三段职责切分：
 //! - **本文件**：固定 JSON schema 的抽取 prompt、容错解析（json_repair 思路：剥围栏 →
 //!   定位首个 `{` 到末个 `}` → 直接解析 → 去尾逗号再解析）、实体归并
-//!   （规范名 + label → 确定性 id）、并发 4 + 指数退避重试 2 次的构建流水；
+//!   （规范名 → 确定性 id；label 多数决 + 噪声过滤，KB 审查⑤）、并发 4 + 指数退避重试 2 次的构建流水；
 //! - **Cypher 拼接唯一收口**在 `dms_connector::doc_graph`（AGE 图名 `kb_graph`）；
 //! - **构建状态表 `meta.kb_graph_build`** 在 server 侧（knowledge 不碰 `meta.*`），
 //!   本文件只经 `BuildProgress` 回报口把进度推上去。
@@ -37,6 +37,11 @@ const MAX_LABEL_CHARS: usize = 30;
 
 /// 固定 JSON schema 的抽取 prompt（Yuxi `DEFAULT_TRIPLE_EXTRACTION_PROMPT` 同构）。
 /// 不接受自定义 prompt：图谱质量依赖输出形状稳定，开放 prompt 等于开放 schema 漂移。
+///
+/// KB 审查⑤的硬约束（垃圾实体两族）：单号/日期/金额**实例值**不进图（一张单据一个节点，
+/// 图很快长满一次性叶子）；「制度」「规定」这类单独泛词不进图（没有辨识度，全是枢纽）。
+/// prompt 是第一道，`is_noise_entity` 是兜底的确定性闸 —— 模型不听话时图也不收。
+/// ⚠️ 本 prompt 与归并口径的改动**必须重建图谱才生效**（`build_space` 先清该空间旧图再全量写）。
 pub const EXTRACTION_SYSTEM: &str = "请从给定文本中抽取实体和实体关系，返回严格 JSON，不要输出任何解释。\n\
 JSON 格式：\n\
 {\n\
@@ -46,7 +51,10 @@ JSON 格式：\n\
 }\n\
 要求：\n\
 - 实体文本必须是原文中出现的片段；实体类型用简短名词（如 人物、组织、产品、制度、地点、概念）。\n\
-- 关系类型用简短动词或名词（如 隶属于、规定了、适用于）；source 与 target 必须是 entities 里的实体。\n\
+- 实体只抽有结构价值的业务对象：不抽单号/编号、日期、金额这类实例值\
+（如「PO-2024-001」「2025年3月」「5000元」），也不抽「制度」「规定」「公司」这类单独出现的泛词。\n\
+- 关系类型只许从受控词表选择：隶属于 / 规定了 / 适用于 / 负责 / 审批 / 包含 / 引用 / 相关；\
+都不合适就用「相关」。source 与 target 必须是 entities 里的实体。\n\
 - 只抽取文本明确陈述的事实，不推测；没有可抽取内容时返回 {\"entities\": [], \"relations\": []}。";
 
 /// 一次抽取的原始产物（未归并；字段已按上限截断）。
@@ -113,16 +121,59 @@ pub fn normalize_name(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-/// 确定性实体 id = hash(space:规范名:label)（Yuxi `compute_entity_id` 同款语义）。
-/// 同 (space, 规范名, label) 恒同 id → 跨 chunk/跨文档的同名实体在 MERGE 时天然归并。
+/// 确定性实体 id = hash(space:规范名)（KB 审查⑤：label 退出归并键 —— 「差旅报销制度·制度」与
+/// 「差旅报销制度·概念」两个节点各挂一半 MENTIONS，是实测抓到的实体碎裂根因）。
+/// 同 (space, 规范名) 恒同 id → 跨 chunk/跨文档的同名实体在 MERGE 时天然归并。
 ///
 /// 散列用 std 的 `DefaultHasher`（固定密钥，同二进制内稳定）—— 零新增依赖（D6）下
 /// 没有 sha2/md5 可用。id 只需在一次部署内自洽：重建本就先清空再全量，不跨版本比对。
-pub fn entity_id(space_id: &str, normalized_name: &str, label: &str) -> String {
+/// ⚠️ id 口径变了（旧 id 含 label）：**必须重建图谱才生效**，新旧 id 永不匹配。
+pub fn entity_id(space_id: &str, normalized_name: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    format!("{space_id}:{normalized_name}:{label}").hash(&mut h);
+    format!("{space_id}:{normalized_name}").hash(&mut h);
     format!("e_{:016x}", h.finish())
+}
+
+/// 泛词 stoplist（KB 审查⑤）：单独出现没有辨识度的词；组合词不受影响（「差旅报销制度」≠「制度」）。
+const GENERIC_ENTITY_NAMES: &[&str] = &[
+    "制度", "规定", "办法", "流程", "通知", "文件", "公司", "部门", "员工", "系统", "管理", "标准", "要求",
+];
+
+/// 噪声实体判定（`EXTRACTION_SYSTEM` 硬约束的确定性兜底）：
+/// - stoplist 泛词（单独出现没有结构价值，全是枢纽节点）；
+/// - 纯 ASCII 编号/单号：全 `[a-z0-9-]`、含数字、≥4 位（normalize_name 已小写化）；
+/// - 日期/纯数字/金额：剥掉数字与日期/金额修饰字后什么都不剩。
+fn is_noise_entity(name: &str) -> bool {
+    if GENERIC_ENTITY_NAMES.contains(&name) {
+        return true;
+    }
+    if name.len() >= 4
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && name.bytes().any(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    name.chars().all(|c| {
+        c.is_ascii_digit()
+            || matches!(
+                c,
+                '.' | '-' | '/' | ':' | ',' | '年' | '月' | '日' | '号' | '元' | '万' | '亿'
+                    | '角' | '分' | '块' | '¥' | '￥' | '$' | '％' | '%'
+            )
+    })
+}
+
+/// 关系 label 受控词表（KB 审查⑤）：自由文本 label 让同一语义长出几十种写法
+/// （「由发布」「发布了」「出自」），按 label 聚合的图查询随之失效。
+/// 词表外（含空）一律归「相关」。
+pub const RELATION_VOCAB: &[&str] =
+    &["隶属于", "规定了", "适用于", "负责", "审批", "包含", "引用", "相关"];
+
+/// 关系 label 归一到受控词表（`normalize_name` 先压空白小写化）。
+fn normalize_relation(label: &str) -> String {
+    let l = normalize_name(label);
+    if RELATION_VOCAB.contains(&l.as_str()) { l } else { "相关".into() }
 }
 
 /// 构建取数 SQL：当前 viewer 可见 + enabled + 已入库（chunked/embedded）+ 生效期内的
@@ -316,29 +367,29 @@ fn extraction_from_value(v: &serde_json::Value) -> Extraction {
     Extraction { entities, relations }
 }
 
-/// 抽取结果 → 图投影：实体按 (规范名, label) 归并出确定性 id；关系端点若不在
-/// entities 清单里自动补登（模型偶尔漏 entities 却给了关系，丢关系比补实体可惜）；
-/// 自环丢弃（「X 隶属于 X」是抽取噪声）；同 chunk 内重复关系去重。
+/// 抽取结果 → 图投影：实体按**规范名**归并出确定性 id（label 不进归并键，KB 审查⑤）；
+/// 关系端点若不在 entities 清单里自动补登（模型偶尔漏 entities 却给了关系，丢关系比补实体可惜）；
+/// 噪声实体（泛词/单号/日期/金额实例值）不登记，指向它的关系随之丢弃；
+/// 自环丢弃（「X 隶属于 X」是抽取噪声）；关系 label 归一到受控词表；同 chunk 内重复关系去重。
 pub fn to_chunk_graph(space_id: &str, chunk_id: i64, doc_id: &str, ex: &Extraction) -> ChunkGraph {
-    let mut entities: Vec<GraphEntity> = vec![];
-    let mut ids: HashMap<(String, String), String> = HashMap::new();
+    let mut it = Interner::default();
     for e in &ex.entities {
-        intern(&mut entities, &mut ids, space_id, &e.text, &e.label);
+        it.intern(space_id, &e.text, &e.label);
     }
     let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
     let mut relations: Vec<GraphRelation> = vec![];
     for r in &ex.relations {
         let (Some(src), Some(dst)) = (
-            intern(&mut entities, &mut ids, space_id, &r.source.text, &r.source.label),
-            intern(&mut entities, &mut ids, space_id, &r.target.text, &r.target.label),
+            it.intern(space_id, &r.source.text, &r.source.label),
+            it.intern(space_id, &r.target.text, &r.target.label),
         ) else {
             continue;
         };
         if src == dst {
             continue;
         }
-        let relation = normalize_name(&r.label);
-        if relation.is_empty() || !seen_rel.insert((src.clone(), dst.clone(), relation.clone())) {
+        let relation = normalize_relation(&r.label);
+        if !seen_rel.insert((src.clone(), dst.clone(), relation.clone())) {
             continue;
         }
         relations.push(GraphRelation { src, dst, relation });
@@ -347,35 +398,54 @@ pub fn to_chunk_graph(space_id: &str, chunk_id: i64, doc_id: &str, ex: &Extracti
         space_id: space_id.to_string(),
         doc_id: doc_id.to_string(),
         chunk_id,
-        entities,
+        entities: it.entities,
         relations,
     }
 }
 
-/// 归并登记：(规范名, label) → 确定性 id；已见过的直接复用 id（同名实体同 id）。
-fn intern(
-    entities: &mut Vec<GraphEntity>,
-    ids: &mut HashMap<(String, String), String>,
-    space_id: &str,
-    text: &str,
-    label: &str,
-) -> Option<String> {
-    let name = normalize_name(text);
-    if name.is_empty() {
-        return None;
+/// 一个 chunk 内的实体归并器：规范名 → 确定性 id（同名实体同 id）。
+/// label 不参与归并；同名实体的 label 取**本 chunk 内被提及次数最多**的那个（并列保持先到）
+/// —— 跨 chunk 的 label 收敛没有全局票箱（构建是并发写的），与所有图数据改动一样
+/// **必须重建图谱才生效**（`build_space` 先清该空间旧图再全量写）。
+#[derive(Default)]
+struct Interner {
+    entities: Vec<GraphEntity>,
+    ids: HashMap<String, usize>,
+    /// `ballots[i]` = `entities[i]` 各 label 在本 chunk 内的票数（多数决的票箱）
+    ballots: Vec<HashMap<String, usize>>,
+}
+
+impl Interner {
+    /// 归并登记：返回该实体的确定性 id；噪声实体（空名/泛词/实例值）返 None，
+    /// 指向它的关系端点由 `to_chunk_graph` 的 let-else 一并丢弃。
+    fn intern(&mut self, space_id: &str, text: &str, label: &str) -> Option<String> {
+        let name = normalize_name(text);
+        if name.is_empty() || is_noise_entity(&name) {
+            return None;
+        }
+        let label = {
+            let l = normalize_name(label);
+            if l.is_empty() { "entity".to_string() } else { l }
+        };
+        if let Some(&idx) = self.ids.get(&name) {
+            // 同名再现一票；票数严格更多才换 label（并列保持先到，确定性）
+            let n = {
+                let b = self.ballots[idx].entry(label.clone()).or_insert(0);
+                *b += 1;
+                *b
+            };
+            let cur = self.ballots[idx].get(&self.entities[idx].label).copied().unwrap_or(0);
+            if n > cur {
+                self.entities[idx].label = label;
+            }
+            return Some(self.entities[idx].id.clone());
+        }
+        let id = entity_id(space_id, &name);
+        self.ids.insert(name.clone(), self.entities.len());
+        self.ballots.push(HashMap::from([(label.clone(), 1)]));
+        self.entities.push(GraphEntity { id: id.clone(), name, label });
+        Some(id)
     }
-    let label = {
-        let l = normalize_name(label);
-        if l.is_empty() { "entity".to_string() } else { l }
-    };
-    let key = (name.clone(), label.clone());
-    if let Some(id) = ids.get(&key) {
-        return Some(id.clone());
-    }
-    let id = entity_id(space_id, &name, &label);
-    ids.insert(key, id.clone());
-    entities.push(GraphEntity { id: id.clone(), name, label });
-    Some(id)
 }
 
 /// 单次 LLM 抽取（Fast 档：批量后台任务的性价比档；形状约束在 prompt 里）。
@@ -632,16 +702,16 @@ mod tests {
         assert_eq!(ex.entities[0].label.chars().count(), MAX_LABEL_CHARS);
     }
 
-    /// Yuxi 归并语义：空白压缩 + 小写化后相同 ⇒ 同 id；space/label 不同 ⇒ 不同 id。
+    /// 归并语义：空白压缩 + 小写化后相同 ⇒ 同 id；space 不同 ⇒ 不同 id。
+    /// label 不再参与 id（KB 审查⑤：同名不同 label 曾是实体碎裂的根因）。
     #[test]
     fn entity_id_merges_and_separates() {
         assert_eq!(normalize_name("  差旅   报销 制度 "), "差旅 报销 制度");
         assert_eq!(normalize_name("ERP 系统"), "erp 系统");
-        let a = entity_id("sp1", &normalize_name("差旅  报销"), "制度");
-        let b = entity_id("sp1", &normalize_name("差旅 报销"), "制度");
+        let a = entity_id("sp1", &normalize_name("差旅  报销"));
+        let b = entity_id("sp1", &normalize_name("差旅 报销"));
         assert_eq!(a, b, "规范名相同必须同 id（归并）");
-        assert_ne!(a, entity_id("sp2", &normalize_name("差旅 报销"), "制度"), "跨空间不许归并");
-        assert_ne!(a, entity_id("sp1", &normalize_name("差旅 报销"), "概念"), "label 参与 id");
+        assert_ne!(a, entity_id("sp2", &normalize_name("差旅 报销")), "跨空间不许归并");
         assert!(a.starts_with("e_") && a.len() == 18);
     }
 
@@ -672,9 +742,99 @@ mod tests {
         assert_eq!(g.entities.len(), 3, "{:?}", g.entities);
         assert_eq!(g.entities[0].name, "erp 系统");
         assert_eq!(g.relations.len(), 1, "自环必须丢：{:?}", g.relations);
-        assert_eq!(g.relations[0].relation, "由 维护");
+        assert_eq!(g.relations[0].relation, "相关", "词表外的「由 维护」归一到受控词表");
         assert!(g.entities.iter().any(|e| e.name == "财务部"), "关系端点要补登");
         assert!(g.relations[0].src.starts_with("e_") && g.relations[0].dst.starts_with("e_"));
+    }
+
+    // ==================== KB 审查⑤：归并键去 label / 噪声过滤 / 关系受控词表 ====================
+
+    /// 同名不同 label 归并成**一个**节点，label 取本 chunk 内提及次数最多的（并列保持先到）。
+    /// ⚠️ 跨 chunk 的 label 收敛没有全局票箱 —— 图数据改动必须重建图谱才生效。
+    #[test]
+    fn same_name_merges_and_label_is_majority_within_the_chunk() {
+        let ex = Extraction {
+            entities: vec![
+                RawEntity { text: "差旅报销制度".into(), label: "制度".into() },
+                RawEntity { text: "差旅报销制度".into(), label: "概念".into() },
+                RawEntity { text: "差旅报销制度".into(), label: "概念".into() },
+            ],
+            relations: vec![],
+        };
+        let g = to_chunk_graph("sp1", 7, "doc-1", &ex);
+        assert_eq!(g.entities.len(), 1, "同名不许碎成多节点：{:?}", g.entities);
+        assert_eq!(g.entities[0].label, "概念", "多数决：概念 2 票 > 制度 1 票");
+        assert_eq!(g.entities[0].id, entity_id("sp1", "差旅报销制度"));
+        // 并列保持先到（确定性）
+        let ex = Extraction {
+            entities: vec![
+                RawEntity { text: "财务部".into(), label: "组织".into() },
+                RawEntity { text: "财务部".into(), label: "部门".into() },
+            ],
+            relations: vec![],
+        };
+        let g = to_chunk_graph("sp1", 7, "doc-1", &ex);
+        assert_eq!(g.entities.len(), 1);
+        assert_eq!(g.entities[0].label, "组织", "1:1 并列保持先到的 label");
+    }
+
+    /// 噪声实体不登记：泛词 stoplist、单号/编号、日期、金额实例值；指向它们的关系一并丢弃。
+    #[test]
+    fn noise_entities_never_enter_the_graph() {
+        for noise in [
+            "制度", "规定", "公司", "po-2024-001", "DHT150-6", "2026-08-06", "2025年3月",
+            "5000元", "1,000元", "50%",
+        ] {
+            assert!(is_noise_entity(&normalize_name(noise)), "{noise} 必须被拦");
+        }
+        for keep in ["差旅报销制度", "erp 系统", "第三章", "v2", "总经理"] {
+            assert!(!is_noise_entity(&normalize_name(keep)), "{keep} 不许误拦");
+        }
+        let ex = Extraction {
+            entities: vec![
+                RawEntity { text: "PO-2024-001".into(), label: "单号".into() },
+                RawEntity { text: "差旅报销制度".into(), label: "制度".into() },
+            ],
+            relations: vec![RawRelation {
+                source: RawEntity { text: "PO-2024-001".into(), label: "单号".into() },
+                target: RawEntity { text: "差旅报销制度".into(), label: "制度".into() },
+                label: "适用于".into(),
+            }],
+        };
+        let g = to_chunk_graph("sp1", 7, "doc-1", &ex);
+        assert_eq!(g.entities.len(), 1, "单号实例值不进图：{:?}", g.entities);
+        assert_eq!(g.entities[0].name, "差旅报销制度");
+        assert!(g.relations.is_empty(), "端点被拦的关系随之丢弃");
+    }
+
+    /// 关系 label 受控词表：词表内保留（先空白/大小写归一），词表外（含空）一律「相关」；
+    /// 归一后同一对实体的不同写法按重复关系去重。
+    #[test]
+    fn relation_labels_are_clamped_to_the_vocabulary() {
+        assert_eq!(normalize_relation(" 隶属于 "), "隶属于");
+        assert_eq!(normalize_relation("由发布"), "相关");
+        assert_eq!(normalize_relation(""), "相关");
+        let mk = |label: &str| RawRelation {
+            source: RawEntity { text: "员工公寓".into(), label: "地点".into() },
+            target: RawEntity { text: "后勤部".into(), label: "组织".into() },
+            label: label.into(),
+        };
+        let ex = Extraction { entities: vec![], relations: vec![mk("由管理"), mk("归口于")] };
+        let g = to_chunk_graph("sp1", 7, "doc-1", &ex);
+        assert_eq!(g.relations.len(), 1, "词表外 label 都归「相关」→ 同对同 label 去重");
+        assert_eq!(g.relations[0].relation, "相关");
+    }
+
+    /// 抽取 prompt 的硬约束钉（KB 审查⑤）：不抽实例值/泛词 + 关系受控词表，
+    /// 缺一条图就长垃圾（prompt 是第一道，`is_noise_entity`/`normalize_relation` 是兜底）。
+    #[test]
+    fn extraction_prompt_carries_the_hard_constraints() {
+        assert!(EXTRACTION_SYSTEM.contains("不抽单号/编号、日期、金额"), "{EXTRACTION_SYSTEM}");
+        assert!(EXTRACTION_SYSTEM.contains("泛词"), "{EXTRACTION_SYSTEM}");
+        assert!(EXTRACTION_SYSTEM.contains("受控词表"), "{EXTRACTION_SYSTEM}");
+        for l in RELATION_VOCAB {
+            assert!(EXTRACTION_SYSTEM.contains(l), "prompt 缺受控词表成员 {l}");
+        }
     }
 
     struct Fake {
