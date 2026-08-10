@@ -1,0 +1,1 @@
+SELECT COUNT(DISTINCT sales_order_code) AS `订单数` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(),'%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'), INTERVAL 1 MONTH) LIMIT 200

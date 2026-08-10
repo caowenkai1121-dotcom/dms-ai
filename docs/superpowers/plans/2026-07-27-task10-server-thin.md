@@ -18,7 +18,7 @@
   4. **health 判定收紧**：从「有任意 PG 扩展即健康」（main.rs:483 `!pg_exts.is_empty()`）改为显式校验 `vector/age/pg_trgm` 三件套齐全；监控若只看 `ok` 字段会在缺扩展时报警（这是修复目的）。
   5. **drill chips 数据源**：从写死 `DIM_POOL` 6 个（viewspec.rs:108）变为读 `meta.dimension` 注册表（当前种子 ~10 个），前端无需改（drill 数组本就动态渲染）。
   6. **省码翻名后端化**：geo 码→省名从 viewspec 内置 `province_cn`（viewspec.rs:294-307）改为 semantic/present.rs 列标注阶段完成（需 Task 7）；三端同步点：viewspec / web/src/App.vue / web/src/format.ts，本任务只动 server 侧并在 App.vue/format.ts 留冗余标注。
-  7. **配置格式 breaking**：settings.json 从平铺改分组（db/llm/wework/server），`dms_base_url` 去掉 `http://1.95.167.10/dms` 硬编码默认（db.rs:30-32），未配置时 `/api/sso` 明确报 500「未配置」而非悄悄连生产。settings.example.json 同步更新；部署机 settings.json 需手工迁移一次。
+  7. **配置格式 breaking**：settings.json 从平铺改分组（db/llm/wework/server），`dms_base_url` 去掉真实 DMS 地址的硬编码默认（db.rs:30-32），未配置时 `/api/sso` 明确报 500「未配置」而非悄悄连生产。settings.example.json 同步更新；部署机 settings.json 需手工迁移一次。
 - **零新增第三方依赖**：认证用 axum 自带 `middleware::from_fn_with_state`；AppError 手写 enum + IntoResponse，不引 thiserror；cron 不引（注册表 + wait_secs fn 指针）；中间件测试不引 tower（核心逻辑抽纯函数单测，见 Task 10.3）。
 - **TDD 节奏**：每个子任务先写/改测试再动实现；纯逻辑（认证判定、health 判定、env 覆盖、msg 构造、drill 池注入）全部抽纯函数离线单测。
 - **外科式搬家**：handler/子命令/wework/auth 逻辑一字不改地搬，只换三类东西：错误闭包 → AppError、resolve_identity → CurrentUser extractor、裸 MySqlPool → ReadOnlyMySql（后者以 Task 3 交付为准）。

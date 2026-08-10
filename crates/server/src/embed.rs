@@ -1,51 +1,22 @@
-//! embed 客户端：调本地 bge 向量服务（:8077），带熔断（服务挂时静默降级不阻塞）。
+//! embed 客户端薄包装：实现整块搬到 `dms_connector::embed`（实例式 `EmbedClient`）。
+//! 这里只留进程内单例 + 两个原签名 free fn，让 `meta.rs`/`pipeline.rs` 的调用点一行不改。
+//! （connector 侧禁全局单例；server 是装配层，全局在这一层是允许的。）
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use dms_connector::embed::EmbedClient;
+use std::sync::OnceLock;
 
-const URL: &str = "http://127.0.0.1:8077/embed";
-/// 熔断：连续失败后冷却期内不再尝试（防 embed 服务挂时每问白等）
-static COOLDOWN_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// ponytail: base_url 先写死。配置化（`config.rs` 的单一 `service_url`，embed 与文档服务同端口）由 B3 接管。
+const BASE_URL: &str = "http://127.0.0.1:8077";
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+fn client() -> &'static EmbedClient {
+    static C: OnceLock<EmbedClient> = OnceLock::new();
+    C.get_or_init(|| EmbedClient::new(BASE_URL))
 }
 
 /// 查询向量（512维）。服务不可用/熔断中返回 None，调用方降级到词典召回。
 pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
-    if now() < COOLDOWN_UNTIL.load(Ordering::Relaxed) {
-        return None;
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .ok()?;
-    let body = serde_json::json!({ "texts": [text], "query": true });
-    match client.post(URL).json(&body).send().await {
-        Ok(resp) => {
-            let v: serde_json::Value = resp.json().await.ok()?;
-            let arr = v["embeddings"][0].as_array()?;
-            Some(arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
-        }
-        Err(_) => {
-            // 熔断 300s
-            COOLDOWN_UNTIL.store(now() + 300, Ordering::Relaxed);
-            None
-        }
-    }
+    client().embed_query(text).await
 }
 
 /// f32 向量 → pgvector 字面量 '[...]'
-pub fn to_pgvector(v: &[f32]) -> String {
-    let mut s = String::from("[");
-    for (i, x) in v.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str(&format!("{x:.6}"));
-    }
-    s.push(']');
-    s
-}
+pub use dms_connector::embed::to_pgvector;

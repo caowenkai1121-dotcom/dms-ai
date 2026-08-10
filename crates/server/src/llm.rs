@@ -1,15 +1,87 @@
-//! LLM 客户端：OpenAI 兼容 HTTP（DeepSeek），无框架依赖。
+//! LLM 客户端：OpenAI 兼容 HTTP（DeepSeek/千问），无框架依赖。
 
 use serde::Serialize;
 
+/// 一次切换要换的全部字段（供应商目录里的一条）。
+/// `api_key` 只经 settings.json 进来 —— 不入库、不进日志、不进任何响应（红线同 DSN）。
 #[derive(Clone)]
-pub struct LlmClient {
+pub struct Conf {
+    /// 供应商目录名。仅用于能力路由与脱敏响应，不是凭据。
+    pub provider: String,
     pub base_url: String,
     pub api_key: String,
     pub model_fast: String,
     pub model_precise: String,
+    /// 供应商特有参数，合并进每次请求体（见 `Settings::llm_extra_body`）
+    pub extra: serde_json::Map<String, serde_json::Value>,
+    /// 视觉模型名（`None` = 该供应商没有图片识别能力 —— DeepSeek 全系。
+    /// 千问 flash 自己就是视觉模型，实测 988ms 三题全对，不需要单独的 vision 型号）。
+    pub vision: Option<String>,
+}
+
+/// 【热切换】配置住在 `RwLock` 里：每次调用现读（`POST /api/admin/llm-provider`
+/// 保存即生效，不需要重启 —— 实测诉求）。读锁一次调用一次，纳秒级，不是性能问题。
+#[derive(Clone)]
+pub struct LlmClient {
+    /// 主配置与备用视觉配置必须来自同一个快照；否则热切换并发时可能混出
+    /// “旧主模型 + 新备用模型”的不存在组合。
+    runtime: std::sync::Arc<std::sync::RwLock<RuntimeConf>>,
     http: reqwest::Client,
 }
+
+#[derive(Clone)]
+struct RuntimeConf {
+    primary: Conf,
+    fallback_vision: Option<Conf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VisionCapability {
+    pub provider: String,
+    pub model: String,
+    pub fallback: bool,
+}
+
+pub(crate) const MAX_VISION_IMAGE_URL_BYTES: usize = 16 * 1024 * 1024;
+
+/// 视觉调用只向协议层暴露固定错误类别。上游 URL、响应正文和供应商名称都不能进入错误链，
+/// 避免未来新增日志或调用方直接返回错误时泄漏配置细节。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisionError {
+    InvalidImage,
+    ImageTooLarge,
+    Unavailable,
+    Upstream,
+}
+
+impl std::fmt::Display for VisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InvalidImage => "图片仅支持 HTTPS 地址或受支持的 data:image Base64 数据",
+            Self::ImageTooLarge => "图片大小不能超过 16MB",
+            Self::Unavailable => "当前未配置可用的多模态模型",
+            Self::Upstream => "图片解析服务暂时不可用",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for VisionError {}
+
+/// `llm_extra_body` **不许**出现的键：能覆盖它们的配置项等于静默改行为。
+/// `messages` = 配置文件可做任意提示注入；`model` = fast/precise 两档形同虚设。
+/// 两个都不会报错，所以只能在构造时硬拦。
+const EXTRA_FORBIDDEN: &[&str] = &[
+    "messages",
+    "model",
+    "temperature",
+    "stream",
+    "authorization",
+    "api_key",
+    "apikey",
+    "access_token",
+    "token",
+];
 
 #[derive(Serialize)]
 struct Msg<'a> {
@@ -18,12 +90,47 @@ struct Msg<'a> {
 }
 
 impl LlmClient {
-    pub fn new(base_url: &str, api_key: &str, fast: &str, precise: &str) -> Self {
-        Self {
+        /// 带供应商特有参数的构造。**空 map 时与 `new` 逐字节等价**（判据 `empty_extra_is_byte_identical`）。
+    ///
+    /// # Panics
+    /// `extra` 含 `messages`/`model` 时 panic —— 那是启动期的配置错误，必须响亮失败。
+    /// 静默忽略它会让人以为配置生效了，静默接受它是提示注入通道。
+    #[cfg(test)]
+    pub fn with_extra(
+        base_url: &str,
+        api_key: &str,
+        fast: &str,
+        precise: &str,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        Self::with_conf(Conf {
+            provider: "custom".to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             model_fast: fast.to_string(),
             model_precise: precise.to_string(),
+            extra,
+            vision: None,
+        })
+    }
+
+    /// 整份 Conf 的构造（供应商目录的落点）。forbidden 键检查与 `with_extra` 同一处。
+    pub fn with_conf(conf: Conf) -> Self {
+        Self::with_conf_and_fallback(conf, None)
+    }
+
+    /// 启动时一次装入主供应商与备用视觉供应商。备用只在主供应商无 vision 时消费。
+    pub fn with_conf_and_fallback(conf: Conf, fallback: Option<Conf>) -> Self {
+        validate_conf(&conf, false).unwrap_or_else(|e| panic!("settings 的 LLM 配置无效: {e}"));
+        if let Some(c) = fallback.as_ref() {
+            validate_conf(c, true)
+                .unwrap_or_else(|e| panic!("settings 的备用多模态配置无效: {e}"));
+        }
+        Self {
+            runtime: std::sync::Arc::new(std::sync::RwLock::new(RuntimeConf {
+                primary: conf,
+                fallback_vision: fallback,
+            })),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(90))
                 .build()
@@ -31,55 +138,820 @@ impl LlmClient {
         }
     }
 
-    pub async fn chat(&self, model: &str, system: &str, user: &str) -> anyhow::Result<String> {
-        let body = serde_json::json!({
-            "model": model,
-            "messages": [
-                Msg { role: "system", content: system },
-                Msg { role: "user", content: user },
-            ],
-            "temperature": 0.1,
-        });
+    /// 热切换（保存即生效）：换整份 Conf。forbidden 键在这里**返回错误**而不是 panic ——
+    /// 这是运行时路径，不是启动路径，拒绝切换就是了。
+    #[cfg(test)]
+    pub fn set_conf(&self, conf: Conf) -> anyhow::Result<()> {
+        validate_conf(&conf, false)?;
+        self.runtime.write().expect("llm runtime lock").primary = conf;
+        Ok(())
+    }
+
+    /// 保存/清除备用视觉供应商。先完整校验再换锁，拒绝时旧配置原样保留。
+    #[cfg(test)]
+    pub fn set_fallback_vision(&self, conf: Option<Conf>) -> anyhow::Result<()> {
+        if let Some(c) = conf.as_ref() {
+            validate_conf(c, true)?;
+        }
+        self.runtime.write().expect("llm runtime lock").fallback_vision = conf;
+        Ok(())
+    }
+
+    /// 设置页同时改供应商形状/key/备用模型时，用一次校验后的临界区提交整份运行时快照。
+    /// 任一配置不合法时快照不动；调用期间不会出现主配置更新而备用仍是旧值。
+    pub fn set_runtime_configs(&self, primary: Conf, fallback: Option<Conf>) -> anyhow::Result<()> {
+        validate_conf(&primary, false)?;
+        if let Some(c) = fallback.as_ref() {
+            validate_conf(c, true)?;
+        }
+        *self.runtime.write().expect("llm runtime lock") = RuntimeConf {
+            primary,
+            fallback_vision: fallback,
+        };
+        Ok(())
+    }
+
+    /// 设置文件与运行时主备模型的一次提交。写锁覆盖持久化窗口，因此并发调用只能看到
+    /// 完整旧快照或完整新快照；持久化失败时在释放锁前恢复旧快照。
+    pub fn commit_runtime_configs(
+        &self,
+        primary: Conf,
+        fallback: Option<Conf>,
+        persist: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        validate_conf(&primary, false)?;
+        if let Some(c) = fallback.as_ref() {
+            validate_conf(c, true)?;
+        }
+        let mut runtime = self.runtime.write().expect("llm runtime lock");
+        let old = runtime.clone();
+        *runtime = RuntimeConf {
+            primary,
+            fallback_vision: fallback,
+        };
+        if let Err(error) = persist() {
+            *runtime = old;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 当前 Conf 的快照（调用一次的读取点：base_url/key/模型/extra 全从快照出，
+    /// 切换半途不会出现「base_url 是新的、模型是旧的」的混搭）。
+    fn conf(&self) -> Conf {
+        self.runtime.read().expect("llm runtime lock").primary.clone()
+    }
+
+    /// 当前供应商的视觉能力：`Some(模型名)` = 支持图片识别，`None` = 没有（DeepSeek）。
+    /// 调用方（图片问答/企微拍照）按它降级，而不是猜供应商名。
+    #[cfg(test)]
+    pub fn vision_model(&self) -> Option<String> {
+        self.vision_capability().map(|c| c.model)
+    }
+
+    pub fn primary_provider(&self) -> String {
+        self.runtime
+            .read()
+            .expect("llm runtime lock")
+            .primary
+            .provider
+            .clone()
+    }
+
+    pub fn fallback_vision_provider(&self) -> Option<String> {
+        self.runtime
+            .read()
+            .expect("llm runtime lock")
+            .fallback_vision
+            .as_ref()
+            .map(|c| c.provider.clone())
+    }
+
+    /// 最终视觉能力：主供应商优先；主供应商没有 vision 才看备用。
+    pub fn vision_capability(&self) -> Option<VisionCapability> {
+        self.vision_route().ok().map(|(_, c)| c)
+    }
+
+    /// 当前生效的快照（`/api/admin/llm-config` 的 effective 段；**不含 api_key** ——
+    /// key 只经 settings.json 进来，永不出现在任何响应里）。
+    pub fn public_conf(&self) -> (String, String, String, Option<String>, serde_json::Map<String, serde_json::Value>) {
+        let c = self.conf();
+        (c.base_url, c.model_fast, c.model_precise, c.vision, c.extra)
+    }
+
+    /// 【K6-B】带 token 用量的一次调用。**全仓唯一的 LLM 出口**：拆分前那个丢弃 usage 的
+    /// `chat(model, system, user)` 薄包装随 `pipeline.rs`/`triage.rs` 一起没了调用点（T9），
+    /// 留着它就是留一条「用量静默变 0」的路 —— 而那条路正好是下面 `ChatModel` 曾经踩的坑。
+    pub async fn chat_with_usage(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+    ) -> anyhow::Result<(String, dms_kernel::llm::Usage)> {
+        let c = self.conf();
+        self.chat_with_conf(&c, model, system, user).await
+    }
+
+    async fn chat_with_conf(
+        &self,
+        c: &Conf,
+        model: &str,
+        system: &str,
+        user: &str,
+    ) -> anyhow::Result<(String, dms_kernel::llm::Usage)> {
+        let body = build_body(model, system, user, &c.extra);
         let resp = self
             .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
+            .post(format!("{}/chat/completions", c.base_url))
+            .bearer_auth(&c.api_key)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!("LLM 请求失败"))?;
         let status = resp.status();
-        let v: serde_json::Value = resp.json().await?;
         if !status.is_success() {
-            anyhow::bail!("LLM {status}: {}", v.to_string().chars().take(300).collect::<String>());
+            anyhow::bail!("LLM 请求失败（HTTP {status}）");
         }
-        v["choices"][0]["message"]["content"]
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|_| anyhow::anyhow!("LLM 响应格式无效"))?;
+        let text = v["choices"][0]["message"]["content"]
             .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("LLM 响应缺 content"))
+            .map(strip_thinking)
+            .ok_or_else(|| anyhow::anyhow!("LLM 响应缺 content"))?;
+        Ok((text, read_usage(&v["usage"])))
+    }
+
+    /// OpenAI-compatible 多模态调用的统一出口。图片/OCR/企微拍照都应调用本方法，
+    /// 不能自己猜 qwen 或复制 key。`image_url` 支持 data URL 与 https URL。
+    pub async fn vision_chat(
+        &self,
+        prompt: &str,
+        image_url: &str,
+    ) -> Result<(String, dms_kernel::llm::Usage, VisionCapability), VisionError> {
+        let image_url = image_url.trim();
+        validate_vision_image(image_url)?;
+        let (c, route) = self.vision_route()?;
+        let mut body = serde_json::json!({
+            "model": route.model.clone(),
+            "messages": [
+                {"role": "system", "content": "准确识别图片中的文字、表格、对象与业务信息；不要猜测不可见内容。"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": if prompt.trim().is_empty() { "请识别并说明图片内容。" } else { prompt.trim() }},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ]}
+            ],
+            "temperature": 0.1
+        });
+        if let Some(o) = body.as_object_mut() {
+            for (k, v) in &c.extra {
+                o.insert(k.clone(), v.clone());
+            }
+        }
+        let resp = self
+            .http
+            .post(format!("{}/chat/completions", c.base_url))
+            .bearer_auth(&c.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| VisionError::Upstream)?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(VisionError::Upstream);
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|_| VisionError::Upstream)?;
+        let text = v["choices"][0]["message"]["content"]
+            .as_str()
+            .map(strip_thinking)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or(VisionError::Upstream)?;
+        Ok((text, read_usage(&v["usage"]), route))
+    }
+
+    fn vision_route(&self) -> Result<(Conf, VisionCapability), VisionError> {
+        let runtime = self.runtime.read().expect("llm runtime lock").clone();
+        let primary = runtime.primary;
+        if let Some(model) = primary.vision.clone().filter(|m| !m.trim().is_empty()) {
+            let route = VisionCapability {
+                provider: primary.provider.clone(),
+                model,
+                fallback: false,
+            };
+            return Ok((primary, route));
+        }
+        let fallback = runtime.fallback_vision.ok_or(VisionError::Unavailable)?;
+        let model = fallback
+            .vision
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .ok_or(VisionError::Unavailable)?;
+        let route = VisionCapability {
+            provider: fallback.provider.clone(),
+            model,
+            fallback: true,
+        };
+        Ok((fallback, route))
     }
 }
 
-/// 从 LLM 回复中抽出 SQL（```sql 围栏优先，其次裸文本首个 SELECT 起始段）
-pub fn extract_sql(text: &str) -> Option<String> {
-    let t = text.trim();
-    if let Some(start) = t.find("```") {
-        let after = &t[start..];
-        let inner_start = after.find('\n')?;
-        let inner = &after[inner_start + 1..];
-        let end = inner.find("```")?;
-        let sql = inner[..end].trim();
-        if !sql.is_empty() {
-            return Some(sql.to_string());
+fn validate_vision_image(image_url: &str) -> Result<(), VisionError> {
+    validate_vision_image_len(image_url.len())?;
+    if image_url.starts_with("https://") {
+        let url = reqwest::Url::parse(image_url).map_err(|_| VisionError::InvalidImage)?;
+        if url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(VisionError::InvalidImage);
+        }
+        return Ok(());
+    }
+    let (header, payload) = image_url.split_once(',').ok_or(VisionError::InvalidImage)?;
+    if !matches!(
+        header,
+        "data:image/png;base64"
+            | "data:image/jpeg;base64"
+            | "data:image/jpg;base64"
+            | "data:image/bmp;base64"
+            | "data:image/tiff;base64"
+            | "data:image/webp;base64"
+    ) || payload.is_empty()
+        || payload.len() % 4 != 0
+    {
+        return Err(VisionError::InvalidImage);
+    }
+    let padding = payload.as_bytes().iter().rev().take_while(|&&b| b == b'=').count();
+    if padding > 2
+        || !payload.as_bytes()[..payload.len() - padding]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'+' | b'/'))
+        || !valid_base64_padding_bits(payload.as_bytes(), padding)
+    {
+        return Err(VisionError::InvalidImage);
+    }
+    Ok(())
+}
+
+fn valid_base64_padding_bits(payload: &[u8], padding: usize) -> bool {
+    let value = |b: u8| -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    match padding {
+        0 => true,
+        1 => payload.len() >= 4 && value(payload[payload.len() - 2]).is_some_and(|v| v & 0b11 == 0),
+        2 => payload.len() >= 4 && value(payload[payload.len() - 3]).is_some_and(|v| v & 0b1111 == 0),
+        _ => false,
+    }
+}
+
+fn validate_vision_image_len(len: usize) -> Result<(), VisionError> {
+    if len > MAX_VISION_IMAGE_URL_BYTES {
+        Err(VisionError::ImageTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+/// 配置校验只读，供“先校验、后持久化、最后热换”使用。校验失败不碰任何锁。
+pub fn validate_conf(conf: &Conf, require_vision: bool) -> anyhow::Result<()> {
+    validate_provider_shape(conf)?;
+    if conf.api_key.trim().is_empty() {
+        anyhow::bail!("模型配置没有 key");
+    }
+    if conf.api_key.len() > 4096 || conf.api_key.chars().any(char::is_control) {
+        anyhow::bail!("模型 key 过长或含控制字符");
+    }
+    if require_vision && conf.vision.as_deref().map(str::trim).filter(|m| !m.is_empty()).is_none() {
+        anyhow::bail!("备用多模态配置没有 vision 模型");
+    }
+    Ok(())
+}
+
+/// 校验可保存但尚未启用的供应商形状；Key 可稍后填写，其他字段不能先存坏再等切换时报错。
+pub fn validate_provider_shape(conf: &Conf) -> anyhow::Result<()> {
+    if conf.extra.iter().any(|(key, value)| {
+        forbidden_extra_key(key)
+            || forbidden_extra_field(value).is_some()
+    }) {
+        anyhow::bail!("extra_body 不许含保留或敏感字段");
+    }
+    validate_base_url(&conf.base_url)?;
+    if conf.model_fast.trim().is_empty() || conf.model_precise.trim().is_empty() {
+        anyhow::bail!("供应商地址与 fast/precise 模型不能为空");
+    }
+    for value in [Some(conf.model_fast.as_str()), Some(conf.model_precise.as_str()), conf.vision.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if value.len() > 160 || value.chars().any(char::is_control) {
+            anyhow::bail!("模型名称过长或含控制字符");
         }
     }
-    let upper = t.to_uppercase();
-    let pos = upper.find("SELECT")?;
-    Some(t[pos..].trim().trim_end_matches(';').to_string())
+    Ok(())
 }
+
+fn forbidden_extra_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase().replace('-', "_");
+    EXTRA_FORBIDDEN.iter().any(|blocked| normalized == *blocked)
+        || normalized.contains("api_key")
+        || normalized.contains("access_token")
+        || normalized.ends_with("_token")
+        || normalized.contains("secret")
+        || normalized.contains("password")
+}
+
+fn forbidden_extra_field(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::Object(map) => map.iter().find_map(|(key, value)| {
+            forbidden_extra_key(key)
+                .then_some(key.as_str())
+                .or_else(|| forbidden_extra_field(value))
+        }),
+        serde_json::Value::Array(values) => values.iter().find_map(forbidden_extra_field),
+        _ => None,
+    }
+}
+
+fn validate_base_url(base_url: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(base_url.trim())
+        .map_err(|_| anyhow::anyhow!("供应商地址不是有效 URL"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        anyhow::bail!("供应商地址只支持 HTTP(S)");
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("供应商地址不能携带认证信息、查询参数或片段");
+    }
+    Ok(())
+}
+
+/// 剥掉推理模型混进 `content` 的思考段（`<think>…</think>` 一族）。
+///
+/// 🔴 这不是「缺一个功能」，是**埋着的错答**：
+/// `prompt::extract_sql` 的兜底是「裸文本里第一个 SELECT」，而思考段里恰好总有几条
+/// **被模型自己推翻的** SQL 草稿。一旦某个供应商把思考混进 content（现用千问系是推理模型，
+/// `enable_thinking` 只是个请求参数，供应商侧默认值随时可能变），我们就会执行草稿而不是结论——
+/// 而它 EXPLAIN 能过、三段闸门能过、口径判据也可能过，**没有任何断言会红**。
+/// SQLBot 显式解析这一段并单独推给前端，我们至少要保证它不进 `extract_sql`。
+///
+/// 只剥**成对**的标签：单独一个 `</think>` 说明思考段被截断了，那时 content 里
+/// 剩下的是结论那一半，剥掉开头反而对（见判据 `strip_thinking_handles_truncation`）。
+fn strip_thinking(s: &str) -> String {
+    const PAIRS: &[(&str, &str)] = &[
+        ("<think>", "</think>"),
+        ("<thinking>", "</thinking>"),
+        ("<reasoning>", "</reasoning>"),
+    ];
+    let mut out = s.to_string();
+    for (open, close) in PAIRS {
+        loop {
+            let Some(i) = out.find(open) else {
+                // 只有闭标签：思考段在传输里被截了头，闭标签**之前**的全是思考
+                if let Some(j) = out.find(close) {
+                    out = out[j + close.len()..].to_string();
+                }
+                break;
+            };
+            let Some(j) = out[i..].find(close) else {
+                // 只有开标签：后面全是没写完的思考，整段丢掉
+                out.truncate(i);
+                break;
+            };
+            out.replace_range(i..i + j + close.len(), "");
+        }
+    }
+    out.trim().to_string()
+}
+
+/// 请求体构造。抽成纯函数是为了让「空 `extra` 与本功能引入前逐字节相同」成为**可测的断言**
+/// 而不是一句注释 —— 那条等价性是本改动的全部安全论证（DeepSeek 那边一个字节都不该变）。
+fn build_body(
+    model: &str,
+    system: &str,
+    user: &str,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [
+            Msg { role: "system", content: system },
+            Msg { role: "user", content: user },
+        ],
+        "temperature": 0.1,
+    });
+    // `extra` 空时这个循环一次都不转。保留键已在统一配置校验入口拦掉，
+    // 所以这里的 insert 不可能覆盖基础请求字段 —— 那条不变量由 `forbidden_keys_panic` 守。
+    if let Some(o) = body.as_object_mut() {
+        for (k, v) in extra {
+            o.insert(k.clone(), v.clone());
+        }
+    }
+    body
+}
+
+/// OpenAI 兼容响应的 `usage` 段 → `Usage`。缺段/缺字段（供应商不回用量）一律记 0，
+/// **绝不报错**：观测缺一格不能把这次问答变成失败。
+fn read_usage(v: &serde_json::Value) -> dms_kernel::llm::Usage {
+    let n = |k: &str| v[k].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
+    dms_kernel::llm::Usage {
+        prompt_tokens: n("prompt_tokens"),
+        completion_tokens: n("completion_tokens"),
+    }
+}
+
+/// 【K2】给现有客户端戴上 kernel 的 `ChatModel` 帽子——**不新建第二个 HTTP 客户端**
+/// （T4 才把实现整体搬进 `connector/llm.rs`，那之前两份客户端＝两份超时/重试语义）。
+///
+/// 一处刻意的语义收窄，随 T4 消失：`req.temperature` 被忽略（HTTP body 里写死 0.1，
+/// 而全部调用点传的正是 `Some(0.1)`）。错误一律落 `LlmError::Transport`，其 Display 是 `{m}`
+/// 原样透传，所以 `e.to_string()` 与迁移前的 anyhow 文案逐字相同
+/// （repair 轮把它喂给 LLM，文案是契约）。
+///
+/// 🔴 **usage 必须原样填回**：这里曾经写 `usage: Default::default()`（全 0）。T9 之后**所有**
+/// LLM 调用都走本 trait，那个 0 就等于把 `meta.query_log` 的 token 列静默清空 ——
+/// 没有任何测试会红，只有对账时发现成本统计恒 0。故走 `chat_with_usage` 并把真用量带出去。
+impl dms_kernel::ChatModel for LlmClient {
+    fn chat<'a>(
+        &'a self,
+        req: dms_kernel::ChatRequest,
+    ) -> dms_kernel::BoxFut<'a, Result<dms_kernel::ChatReply, dms_kernel::LlmError>> {
+        Box::pin(async move {
+            // 模型名从**当前快照**出（热切换后下一次调用立即用新模型）
+            let c = self.conf();
+            let model = match req.tier {
+                dms_kernel::ModelTier::Fast => c.model_fast.clone(),
+                dms_kernel::ModelTier::Precise => c.model_precise.clone(),
+            };
+            let (system, user) = split_roles(&req.messages);
+            let (content, usage) = self
+                .chat_with_conf(&c, &model, &system, &user)
+                .await
+                .map_err(|e| dms_kernel::LlmError::Transport(e.to_string()))?;
+            Ok(dms_kernel::ChatReply { content: Some(content), usage })
+        })
+    }
+}
+
+/// `messages` → 现有 `chat()` 的两个字符串：system 取第一条 system 角色，其余按序拼成 user。
+/// `ChatRequest::text` 产的正是「一条 system + 一条 user」，多轮形态先原样落平（v1 无多轮 LLM 调用）。
+fn split_roles(msgs: &[dms_kernel::Message]) -> (String, String) {
+    let mut system = String::new();
+    let mut user: Vec<&str> = Vec::new();
+    for m in msgs {
+        if m.role == "system" && system.is_empty() {
+            system = m.content.clone();
+        } else {
+            user.push(&m.content);
+        }
+    }
+    (system, user.join("\n\n"))
+}
+
+// `extract_sql` 随 prompt 渲染整块迁 `dms_agent::prompt`（T9，逐字搬运）：唯一的调用点
+// （`pipeline.rs` 的生成与自修）已在那边，server 侧留一份实现就是两份会漂的解析器。
+// 三个断言仍在本文件跑（见下面 `mod tests` 的 `use`）——它们守的是「围栏 / 裸 SELECT / 无 SQL」
+// 三种解析形态，与它住哪个 crate 无关，而断言只增不减。
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 实现在 agent（见上）；断言体一字未改，靠这一行把符号带回作用域。
+    use dms_agent::extract_sql;
+
+    /// 🔴 本改动的全部安全论证：`extra` 空时请求体与**引入本字段之前**完全相同 ——
+    /// DeepSeek 那边不该因为千问的需求多一个键、少一个键或改一个值。
+    ///
+    /// 第一版把期望写成手抄的序列化字面量，当场红：`serde_json::Map` 默认是 `BTreeMap`
+    /// （没开 `preserve_order`），输出按**字典序**而不是书写序。
+    /// 钉字节序会让这条判据绑在 serde 的一个实现细节上，而 HTTP body 的键序本就无意义。
+    /// 所以改成钉**键集合 + 逐字段值**：多一个键、少一个键、值漂了，三种都会红，
+    /// 而 serde 换排序策略不会误伤。
+    /// 🔴 思考段里的 SQL 草稿**绝不能**流到 `extract_sql`。
+    /// 判据直接用 `extract_sql` 对拍：那才是真正的下游，只断言「字符串里没有 think」
+    /// 挡不住「草稿被抽走」这件事本身。
+    #[test]
+    fn thinking_draft_never_reaches_extract_sql() {
+        // 🔴 风险形状是**结论不带围栏**。写这条判据时先踩了一次：结论带 ```sql 围栏时
+        // `extract_sql` 优先取围栏，抽到的本来就是正确那条 —— 那个形状下根本没有风险，
+        // 我的「量器自证」当场红，红得对。真正危险的是模型给裸 SELECT 结论：
+        // 那时走「裸文本里第一个 SELECT」兜底，第一个 SELECT 在思考段里 = 被自己推翻的草稿。
+        let raw = "<think>先试 SELECT SUM(amount) FROM t_wrong；\n\
+                   不对，amount 在明细表且有 2x 重复行，应该去重。</think>\n\
+                   SELECT SUM(x) FROM t_right";
+        // 量器自证：不剥的话真的会抽到草稿（这一条红了就说明本判据是空转的）
+        let unstripped = extract_sql(raw).expect("不剥时该抽到东西");
+        assert!(
+            unstripped.contains("t_wrong"),
+            "不剥时抽不到草稿？本判据没守住任何东西 —— 先核 extract_sql 改了什么：{unstripped}"
+        );
+        // 剥完之后抽到的是结论
+        let got = strip_thinking(raw);
+        assert!(!got.contains("t_wrong"), "草稿没剥掉：{got}");
+        assert_eq!(extract_sql(&got).unwrap(), "SELECT SUM(x) FROM t_right");
+        // 带围栏的形状也不许被剥坏（那个形状本来就安全，但不能因为剥而变坏）
+        let fenced = "<think>SELECT 1 FROM t_wrong</think>\n```sql\nSELECT SUM(x) FROM t_right\n```";
+        assert_eq!(extract_sql(&strip_thinking(fenced)).unwrap(), "SELECT SUM(x) FROM t_right");
+    }
+
+    /// 三种残缺形态：只有闭标签（头被截）、只有开标签（尾没写完）、多段。
+    #[test]
+    fn strip_thinking_handles_truncation() {
+        // 只有闭标签 ⇒ 之前的都是思考，剥掉开头是对的
+        assert_eq!(strip_thinking("想了半天</think>SELECT 1"), "SELECT 1");
+        // 只有开标签 ⇒ 后面是没写完的思考，整段丢
+        assert_eq!(strip_thinking("SELECT 1<think>还在想"), "SELECT 1");
+        // 多段 + 另一族标签名
+        assert_eq!(strip_thinking("<think>a</think>X<thinking>b</thinking>Y"), "XY");
+        // 没有思考段时**一个字符都不许动**（这是 DeepSeek 侧零变更的论证）
+        let plain = "```sql\nSELECT 1 FROM t\n```";
+        assert_eq!(strip_thinking(plain), plain);
+        // 只有首尾空白被 trim（`extract_sql` 本来就 trim，不改变行为）
+        assert_eq!(strip_thinking("  SELECT 1  "), "SELECT 1");
+    }
+
+    #[test]
+    fn empty_extra_changes_nothing() {
+        let got = build_body("m1", "sys", "usr", &serde_json::Map::new());
+        let o = got.as_object().expect("body 必须是对象");
+        let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["messages", "model", "temperature"], "键集合变了：{got}");
+        assert_eq!(o["model"], "m1");
+        assert_eq!(o["temperature"], serde_json::json!(0.1));
+        assert_eq!(
+            o["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "usr"},
+            ]),
+            "messages 的形状/顺序变了：{got}"
+        );
+    }
+
+    /// 千问要的那个键真的进得去，且**不动**原有三个键。
+    #[test]
+    fn extra_merges_without_touching_the_base() {
+        let mut e = serde_json::Map::new();
+        e.insert("enable_thinking".into(), serde_json::Value::Bool(false));
+        let got = build_body("m1", "sys", "usr", &e);
+        assert_eq!(got["enable_thinking"], serde_json::json!(false));
+        assert_eq!(got["model"], "m1");
+        assert_eq!(got["temperature"], serde_json::json!(0.1));
+        assert_eq!(got["messages"][1]["content"], "usr");
+        // 实测账：这个键关掉思考后同一道 SQL 题 780ms/65tok，不关 16626ms/2281tok，产出一样。
+        assert_eq!(got.as_object().unwrap().len(), 4, "只该多出一个键：{got}");
+    }
+
+    /// 覆盖 `messages`/`model` 必须 panic。两个各测一次 —— 只测一个的话
+    /// 另一个从白名单里掉出去也不会有人知道。
+    #[test]
+    fn forbidden_keys_panic() {
+        for k in EXTRA_FORBIDDEN {
+            let mut e = serde_json::Map::new();
+            e.insert((*k).to_string(), serde_json::json!("恶意值"));
+            let r = std::panic::catch_unwind(|| {
+                LlmClient::with_extra("http://x", "k", "f", "p", e.clone())
+            });
+            assert!(r.is_err(), "`{k}` 出现在 llm_extra_body 里必须 panic，不许静默接受");
+        }
+        // 正常键不许被误拦（否则上面那条可以靠「一律 panic」通过）
+        let mut ok = serde_json::Map::new();
+        ok.insert("enable_thinking".into(), serde_json::Value::Bool(false));
+        let _ = LlmClient::with_extra("http://x", "k", "f", "p", ok);
+    }
+
+    /// 【双供应商】热切换：下一次调用用新配置（保存即生效）；forbidden 键在运行时
+    /// 也拒（`Err` 不是 panic —— 那是运行时路径）；**拒绝后旧配置还在**（不许切一半）。
+    #[test]
+    fn hot_swap_takes_effect_and_never_halves() {
+        let conf = |url: &str, key: &str, f: &str, p: &str, v: Option<&str>| Conf {
+            provider: "test".into(),
+            base_url: url.into(),
+            api_key: key.into(),
+            model_fast: f.into(),
+            model_precise: p.into(),
+            extra: serde_json::Map::new(),
+            vision: v.map(str::to_string),
+        };
+        let c = LlmClient::with_conf(conf("https://a", "k1", "f1", "p1", None));
+        assert_eq!(c.public_conf().0, "https://a");
+        c.set_conf(conf("https://b", "k2", "f2", "p2", Some("v2"))).unwrap();
+        let (url, f, p, v, _) = c.public_conf();
+        assert_eq!((url.as_str(), f.as_str(), p.as_str(), v.as_deref()), ("https://b", "f2", "p2", Some("v2")));
+        assert_eq!(c.vision_model().as_deref(), Some("v2"));
+        // forbidden 键：运行时返回 Err，且旧配置一个字段都没动
+        let mut bad = serde_json::Map::new();
+        bad.insert("model".into(), serde_json::Value::Null);
+        let mut bad_conf = conf("https://c", "k3", "f3", "p3", None);
+        bad_conf.extra = bad;
+        assert!(c.set_conf(bad_conf).is_err());
+        assert_eq!(c.public_conf().0, "https://b", "拒了一半也算事故：旧配置必须完整在");
+    }
+
+    #[test]
+    fn vision_prefers_primary_and_uses_one_runtime_snapshot() {
+        let conf = |provider: &str, vision: Option<&str>| Conf {
+            provider: provider.into(),
+            base_url: "https://example.invalid/v1".into(),
+            api_key: "key".into(),
+            model_fast: "fast".into(),
+            model_precise: "precise".into(),
+            extra: serde_json::Map::new(),
+            vision: vision.map(str::to_string),
+        };
+        let client = LlmClient::with_conf_and_fallback(
+            conf("deepseek", None),
+            Some(conf("qwen", Some("qwen-vl"))),
+        );
+        let (_, fallback) = client.vision_route().unwrap();
+        assert_eq!((fallback.provider.as_str(), fallback.model.as_str(), fallback.fallback), ("qwen", "qwen-vl", true));
+
+        client
+            .set_runtime_configs(
+                conf("qwen-primary", Some("qwen-primary-vl")),
+                Some(conf("qwen-backup", Some("qwen-backup-vl"))),
+            )
+            .unwrap();
+        let (_, primary) = client.vision_route().unwrap();
+        assert_eq!(
+            (primary.provider.as_str(), primary.model.as_str(), primary.fallback),
+            ("qwen-primary", "qwen-primary-vl", false)
+        );
+    }
+
+    #[test]
+    fn primary_and_fallback_vision_hot_switch_independently() {
+        let conf = |provider: &str, vision: Option<&str>| Conf {
+            provider: provider.into(),
+            base_url: "https://example.invalid/v1".into(),
+            api_key: "key".into(),
+            model_fast: "fast".into(),
+            model_precise: "precise".into(),
+            extra: serde_json::Map::new(),
+            vision: vision.map(str::to_string),
+        };
+        let client = LlmClient::with_conf_and_fallback(
+            conf("deepseek", None),
+            Some(conf("qwen", Some("qwen-vl"))),
+        );
+
+        // 默认文本模型没有 vision：使用独立配置的备用千问。
+        let (_, route) = client.vision_route().unwrap();
+        assert_eq!(
+            (route.provider.as_str(), route.model.as_str(), route.fallback),
+            ("qwen", "qwen-vl", true)
+        );
+
+        // 只热切默认模型；备用配置不动。主模型有 vision 后必须直接走主模型。
+        client
+            .set_conf(conf("qwen-primary", Some("qwen-primary-vl")))
+            .unwrap();
+        let (_, route) = client.vision_route().unwrap();
+        assert_eq!(
+            (route.provider.as_str(), route.model.as_str(), route.fallback),
+            ("qwen-primary", "qwen-primary-vl", false)
+        );
+
+        // 再切回纯文本模型，备用千问应立即恢复接管；不需要重启或重设备用项。
+        client.set_conf(conf("deepseek-next", None)).unwrap();
+        let (_, route) = client.vision_route().unwrap();
+        assert_eq!(
+            (route.provider.as_str(), route.model.as_str(), route.fallback),
+            ("qwen", "qwen-vl", true)
+        );
+
+        // 备用模型也可单独热换与清除，且不改变当前文本模型。
+        client
+            .set_fallback_vision(Some(conf("qwen-backup", Some("qwen-vl-plus"))))
+            .unwrap();
+        let (_, route) = client.vision_route().unwrap();
+        assert_eq!(
+            (route.provider.as_str(), route.model.as_str(), route.fallback),
+            ("qwen-backup", "qwen-vl-plus", true)
+        );
+        assert_eq!(client.primary_provider(), "deepseek-next");
+        client.set_fallback_vision(None).unwrap();
+        assert!(matches!(
+            client.vision_route(),
+            Err(VisionError::Unavailable)
+        ));
+        assert_eq!(client.primary_provider(), "deepseek-next");
+    }
+
+    #[test]
+    fn rejected_fallback_hot_swap_keeps_the_previous_route() {
+        let conf = |provider: &str, vision: Option<&str>| Conf {
+            provider: provider.into(),
+            base_url: "https://example.invalid/v1".into(),
+            api_key: "key".into(),
+            model_fast: "fast".into(),
+            model_precise: "precise".into(),
+            extra: serde_json::Map::new(),
+            vision: vision.map(str::to_string),
+        };
+        let client = LlmClient::with_conf_and_fallback(
+            conf("deepseek", None),
+            Some(conf("qwen", Some("qwen-vl"))),
+        );
+        assert!(client
+            .set_fallback_vision(Some(conf("not-vision", None)))
+            .is_err());
+        let (_, route) = client.vision_route().unwrap();
+        assert_eq!(
+            (route.provider.as_str(), route.model.as_str(), route.fallback),
+            ("qwen", "qwen-vl", true),
+            "校验失败时旧备用路由必须完整保留"
+        );
+    }
+
+    #[test]
+    fn failed_settings_commit_restores_the_whole_runtime_snapshot() {
+        let conf = |provider: &str, vision: Option<&str>| Conf {
+            provider: provider.into(),
+            base_url: "https://example.invalid/v1".into(),
+            api_key: "key".into(),
+            model_fast: "fast".into(),
+            model_precise: "precise".into(),
+            extra: serde_json::Map::new(),
+            vision: vision.map(str::to_string),
+        };
+        let client = LlmClient::with_conf_and_fallback(
+            conf("old-primary", None),
+            Some(conf("old-vision", Some("old-vl"))),
+        );
+        assert!(client
+            .commit_runtime_configs(
+                conf("new-primary", Some("new-vl")),
+                None,
+                || anyhow::bail!("simulated settings write failure"),
+            )
+            .is_err());
+        assert_eq!(client.primary_provider(), "old-primary");
+        assert_eq!(client.fallback_vision_provider().as_deref(), Some("old-vision"));
+        let (_, route) = client.vision_route().unwrap();
+        assert_eq!((route.provider.as_str(), route.model.as_str(), route.fallback), ("old-vision", "old-vl", true));
+    }
+
+    #[test]
+    fn data_image_validation_checks_shape_and_url_size() {
+        assert_eq!(validate_vision_image("data:image/png;base64,TQ=="), Ok(()));
+        assert_eq!(validate_vision_image("https://images.example.com/a.png?sig=x"), Ok(()));
+        assert_eq!(validate_vision_image("https://user:secret@images.example.com/a.png"), Err(VisionError::InvalidImage));
+        assert_eq!(validate_vision_image("https://"), Err(VisionError::InvalidImage));
+        assert_eq!(
+            validate_vision_image("data:text/plain;base64,TQ=="),
+            Err(VisionError::InvalidImage)
+        );
+        assert_eq!(
+            validate_vision_image("data:image/png;base64,@@=="),
+            Err(VisionError::InvalidImage)
+        );
+        assert_eq!(
+            validate_vision_image("data:image/png;base64,TR=="),
+            Err(VisionError::InvalidImage),
+            "字符合法但填充位非零的 Base64 也必须拒绝"
+        );
+        assert_eq!(validate_vision_image_len(MAX_VISION_IMAGE_URL_BYTES), Ok(()));
+        assert_eq!(
+            validate_vision_image_len(MAX_VISION_IMAGE_URL_BYTES + 1),
+            Err(VisionError::ImageTooLarge)
+        );
+    }
+
+    #[test]
+    fn config_rejects_nested_credentials_and_authenticated_urls() {
+        let conf = |base_url: &str, extra: serde_json::Map<String, serde_json::Value>| Conf {
+            provider: "test".into(),
+            base_url: base_url.into(),
+            api_key: "key".into(),
+            model_fast: "fast".into(),
+            model_precise: "precise".into(),
+            extra,
+            vision: None,
+        };
+        let mut nested = serde_json::Map::new();
+        nested.insert("headers".into(), serde_json::json!({ "Authorization": "secret" }));
+        assert!(validate_conf(&conf("https://example.invalid/v1", nested), false).is_err());
+        assert!(validate_conf(&conf("https://user:secret@example.invalid/v1", serde_json::Map::new()), false).is_err());
+        assert!(validate_conf(&conf("https://example.invalid/v1?token=secret", serde_json::Map::new()), false).is_err());
+        let mut reserved = serde_json::Map::new();
+        reserved.insert("stream".into(), serde_json::json!(true));
+        assert!(validate_provider_shape(&conf("https://example.invalid/v1", reserved)).is_err());
+    }
 
     #[test]
     fn extracts_fenced_sql() {
@@ -95,5 +967,41 @@ mod tests {
     #[test]
     fn none_when_no_sql() {
         assert!(extract_sql("我不知道").is_none());
+    }
+
+    /// 用量解析：缺段一律 0（供应商不回 usage 时不能把这次问答判失败）
+    #[test]
+    fn usage_missing_fields_are_zero() {
+        let u = read_usage(&serde_json::json!({ "prompt_tokens": 1200, "completion_tokens": 80 }));
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (1200, 80));
+        let z = read_usage(&serde_json::Value::Null);
+        assert_eq!((z.prompt_tokens, z.completion_tokens), (0, 0));
+    }
+
+    /// 🔴 用量不许被丢。这里曾经是 `usage: Default::default()`（全 0）：T9 之后**所有** LLM 调用
+    /// 都走 `ChatModel`，那个 0 就是 `meta.query_log` 的 token 列恒空 —— 而它不报错、不返回错误、
+    /// 也没有任何运行时断言能碰到（真 usage 只有连上供应商才拿得到）。故用源码守。
+    #[test]
+    fn chat_model_never_drops_usage() {
+        let src = include_str!("llm.rs");
+        // 只扫非测试段（否则本测试写的 needle 会让自己恒绿——哑测试，裁决 二·F F2）。
+        // 锚点是测试模块声明而不是第一个 #[cfg(test)]：单测辅助构造器也带这个属性，
+        // 咬属性会把生产段切没（实测：usage 断言因此假红）
+        let body = src.split("#[cfg(test)]\nmod tests").next().expect("测试模块必然存在");
+        let code: Vec<&str> =
+            body.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        assert!(
+            !code.iter().any(|l| l.contains("Default::default()")),
+            "usage 被丢成全 0 了：查询日志的 token 列会静默变空"
+        );
+        assert!(code.iter().any(|l| l.contains("usage }")), "真 usage 必须原样进 ChatReply");
+    }
+
+    /// ChatModel 适配：system 必须落到 system 位，别把它拼进 user（提示词顺序是契约）
+    #[test]
+    fn chat_model_splits_system_and_user() {
+        let r = dms_kernel::ChatRequest::text(dms_kernel::ModelTier::Fast, "你是内核", "问句", None);
+        assert_eq!(split_roles(&r.messages), ("你是内核".into(), "问句".into()));
+        assert_eq!(split_roles(&[]), (String::new(), String::new()));
     }
 }

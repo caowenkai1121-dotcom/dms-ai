@@ -4,10 +4,10 @@ services:
     container_name: dms-ai-pg
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: dmsai_pg_2026
+      POSTGRES_PASSWORD: ${DMS_AI_PG_PASSWORD:?set DMS_AI_PG_PASSWORD}
       POSTGRES_DB: dms_ai
     ports:
-      - "15433:5432"
+      - "127.0.0.1:15433:5432"
     volumes:
       - dms_ai_pgdata:/var/lib/postgresql
       - ./init:/docker-entrypoint-initdb.d:ro

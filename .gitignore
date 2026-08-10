@@ -1,8 +1,58 @@
 /target
 node_modules/
 dist/
-settings.json
+# 🔴 通配 + 例外，不是逐个点名。settings 里有明文 DSN 与 LLM key（本仓唯一允许放它们的地方），
+# 而逐个点名的写法只保护已经存在的那两个文件 —— 下一个人建 settings.prod.json /
+# settings.qwen.json 就会把 key 提交上去，而 git 不会提示任何异常。
+# `settings.example.json` 必须留在版本库里（它是配置项的清单，里面全是占位符）。
+settings*.json
+!settings.example.json
+.env
+.env.*
+!.env.example
+.venv/
 *.log
+*.tmp
+*.bak
+*.pid
+*.prof
+*.trace
+*.coverage
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.p12
+*.pfx
 .DS_Store
 autodiscover.result.json
-tools/__pycache__/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+htmlcov/
+/.artifacts/
+/data/kb/
+/kb_data/
+/kbdata/
+/uploads/
+/storage/
+/screenshots/
+/tmp/
+/temp/
+/.cache/
+/.secrets/
+/secrets/
+/_d.json
+/_enum_hits.json
+/_regression_*.log
+/_regression_*.err
+/tp/
+/web/_dev.err
+/tools/model_ab_*.json
+/tools/why_gates_after.csv
+
+# 部署种子快照（含业务字典值，私下传递，不进仓库）
+/tools/registry_snapshot.json
+registry_snapshot.json

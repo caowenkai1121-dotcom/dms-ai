@@ -1,0 +1,20 @@
+[package]
+name = "dms-agent"
+version = "0.1.0"
+edition = "2021"
+
+# 🔴 硬规则：不得出现 axum（HTTP 是 server 的事，agent 要能被 CLI 与定时任务同样调用）。
+[dependencies]
+dms-kernel = { path = "../kernel" }
+dms-connector = { path = "../connector" }
+dms-policy = { path = "../policy" }
+dms-semantic = { path = "../semantic" }
+dms-knowledge = { path = "../knowledge" }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

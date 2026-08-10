@@ -1,13 +1,14 @@
 # DMS 智能助手 · 彻底重构：调研报告 + 技术选型 + 项目计划
 
-> 日期：2026-07-23。红线：**DMS 数据库（MySQL `xh_dms`）只读，只允许 SELECT**；三份源码（xh-dms / xh-dms-fornt / xh-xcx）只读不改。
-> 本文档 = 架构师提案，选型项待用户拍板后开工。
+> 日期：2026-07-23。本文是开工前的**历史提案**，不是当前部署手册；当前架构与配置以
+> `docs/ARCHITECTURE.md`、`docs/CONFIG.md` 为准。DMS 生产库只允许受控、简单、短超时的只读点查，
+> 统计分析走数仓；三份 DMS 源码只读不改。所有真实端点、账号和企业标识已从历史记录移除。
 
 ---
 
 ## 一、现有系统调研结论（4 路并行深读，均带源码证据）
 
-### 1.1 DMS 后端（D:\code\hjxh_code\xh-dms，Java）
+### 1.1 DMS 后端（只读参考源码，Java）
 
 - **栈**：Java 21 + Spring Boot 3.3.7 + MyBatis-Plus 3.5.10 + Druid + Redis/Redisson + RabbitMQ + **Sa-Token 1.37.0**（认证）。5 模块：gateway(Controller 144 个)→service→infrastructure→domain→support；另有独立 **mcp 模块**（销售订单 9 工具的 MCP 服务端，`/dms/mcp`，X-API-Key 鉴权）。
 - **规模**：约 200 张业务表（`t_` 前缀），Mapper 205 个。
@@ -22,15 +23,15 @@
   - 多角色不合并：当前激活单角色生效（roleCode 在 Redis）。
   - scope 集合按 loginName 缓存 Redis 当日过期；角色变更异步清缓存+踢下线。
 
-### 1.2 DMS 前端（D:\code\hjxh_code\xh-dms-fornt）
+### 1.2 DMS 前端（只读参考源码）
 
 - **栈**：**Vue 3.5 + Vite 8 + antdv-next（Ant Design Vue 次世代）+ Pinia + vue-router(hash) + ECharts 5.4.3**，SmartAdmin 底子。与重构目标栈同代。
 - **认证约定**：token 在 localStorage `smart_admin_user_token`，请求头 `x-access-token`，响应 `{code,msg,data}`，**code===1 成功**；登录返回 menuList/pointsList → 动态建路由 + `v-privilege` 按钮权限。
 - **嵌入机制现成**：菜单 `frameFlag/frameUrl` → iframe 渲染（`side-layout.vue:46`）；**无微前端框架**。首页 `views/system/home/index.vue` 已被裁空（只剩公告两列），顶栏已改名「DMS AI」。
 - 环境里已有 `dms-ai.huangjiaxiaohu.com` / `/chat-api` 代理 / `ai_chat_token`——原本就规划过挂 AI 服务。
-- 生产地址：`https://dms.huangjiaxiaohu.com/dms/#/`，API `.../dms-api`。
+- 生产 Web 与 API 地址仅在运行时配置或部署平台维护，不写入仓库文档。
 
-### 1.3 小程序（D:\code\hjxh_code\xh-xcx）
+### 1.3 小程序（只读参考源码）
 
 - uni-app + Vue3，**微信个人小程序**（appid `wx3d85c8985ed67d23`），与企业微信零关联。微信 code 登录 + 多角色选择 + permissionList，token 头同 `x-access-token`。业务覆盖进销存/门店要货配送/设备/巡店（已有 AI 巡店对话页）/台账/商城。
 - 结论：三端#3「企业微信」是**全新通道**（用企微自建应用），不是小程序改造。小程序仅作移动端形态参考。
@@ -46,10 +47,10 @@
 
 ### 1.5 基础设施现状
 
-- 生产 MySQL：`203.0.113.10:3306/xh_dms`（只读账号已有）；dev 环境 `1.95.167.10`。
+- DMS 身份与权限库：只读连接，具体端点和账号仅存运行时配置。
 - 本地 PG 17.7 容器（ParadeDB，:15432）：**pgvector 0.8.1 + pg_search(BM25) + pg_trgm 已装**；无 Apache AGE。
 - LLM：DeepSeek（key 已有，fast/precise 双模型）。
-- 企微：corpid `wwd8304eb63d2cb14c`，secret 已给（存 gitignore 配置，不入库不入文档）。
+- 企业微信：企业 ID、应用 secret 与 agentid 只存被 gitignore 的运行时配置。
 - Windows 编译约束：cargo 需 PowerShell + WinLibs mingw 置 PATH 最前（旧项目验证过的坑）。
 
 ---
@@ -70,11 +71,11 @@
 │ ├ Parser：确定性模板(单号直查/高频聚合) + LLM→S2SQL    │
 │ ├ Corrector：schema/时间/聚合/去重口径 确定性校正      │
 │ ├ Translator：S2SQL→MySQL 物理 SQL（sqlparser AST）    │
-│ ├ Executor：生产 MySQL 只读 SELECT（会话级 READ ONLY） │
+│ ├ Executor：数仓只读分析；生产 DMS 仅受控索引点查      │
 │ ├ 记忆闭环：few-shot 样例/口径记忆/语义缓存（pgvector）│
 │ └ 图关系：客户-商品-员工-部门 边表+递归CTE（PG）       │
 ├───────────────────────────────────────────────────────┤
-│ PG 17：元数据/语义层/向量/会话/缓存   MySQL：业务数据只读│
+│ PG：元数据/语义/向量/会话   数仓：分析   DMS：身份/点查  │
 │ LLM：DeepSeek（OpenAI 兼容 HTTP，无框架依赖）          │
 └───────────────────────────────────────────────────────┘
 ```
@@ -82,7 +83,7 @@
 要点：
 - **LLM 只产 S2SQL（逻辑层：指标/维度名），物理 SQL 确定性生成** —— SuperSonic 控幻觉核心，照搬。
 - **权限注入在 Translator 之后、执行之前**，AST 级注入（sqlparser-rs），语义按 §1.1 规格 1:1。
-- 业务数据不搬家：直连生产 MySQL 只读；PG 只放自有元数据。
+- 经营分析统一读取已验证的数仓 DWS/DWD/ADS；生产 DMS 不作为通用分析源，PG 只放自有元数据。
 
 ---
 
@@ -121,7 +122,7 @@
 
 | 端 | 方案 |
 |---|---|
-| ①独立 Web | 本地登录页：转发 DMS `POST /login`（admin/hjxh@2025 可测）→ 换自有会话 token；完全继承 DMS 账号密码与角色 |
+| ①独立 Web | 本地登录页转发 DMS `POST /login` → 换自有会话 token；联调凭据从受控运行时配置获取，完全继承 DMS 账号密码与角色 |
 | ②DMS 嵌入 | iframe URL 携带 DMS 的 `x-access-token` → 后端调 DMS `GET /login/getLoginInfo` 验真 + 拿角色 → 颁自有 token。**零新增凭证体系**（备选：HMAC 签名 URL，需 DMS 侧配合，暂不用） |
 | ③企微 | 企微 OAuth（code→userid）→ userid↔`t_employee` 映射（手机号/loginName 对照，映射表存 PG，管理页可维护）→ 颁自有 token |
 

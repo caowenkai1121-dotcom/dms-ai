@@ -1,38 +1,36 @@
-﻿# 启动 dms-ai 全栈：PG 容器 → embed 向量服务(:8077) → 后端(:8100)
-# embed 缺席不致命（熔断降级），但语义缓存/向量召回会静默掉线——常驻化保住快路径
+# 启动后端栈：PG -> 向量/解析服务 -> Rust API。
+# Rust 统一在 Docker 内构建，避免 Windows Smart App Control 拦截本地产物。
+$ErrorActionPreference = 'Stop'
 $root = "$PSScriptRoot\.."
 Set-Location $root
 
-# 0. PG 元数据库容器（缺席则拉起）
+# PG 密码只从 gitignore 的运行时配置读取，再临时注入 compose。
+$settingsPath = if (Test-Path "$root\settings.docker.json") {
+    "$root\settings.docker.json"
+} elseif (Test-Path "$root\settings.json") {
+    "$root\settings.json"
+} else {
+    throw '缺少 settings.docker.json 或 settings.json，请从 settings.example.json 创建'
+}
+# 元数据库端口只绑定本机回环。
 $pgUp = docker ps --format '{{.Names}}' 2>$null | Select-String -Quiet '^dms-ai-pg$'
 if (-not $pgUp) {
-    Write-Host "PG 容器未运行，docker compose up -d…"
-    docker compose -f "$root\docker\age\docker-compose.yml" up -d | Select-Object -Last 2
-}
-
-# 1. embed 向量服务（bge-small-zh 本地模型，:8077）
-$embedUp = $false
-try { $embedUp = (Invoke-RestMethod http://127.0.0.1:8077/health -TimeoutSec 1).ok } catch {}
-if (-not $embedUp) {
-    Write-Host "embed 服务未运行，启动中（模型加载约 5~15s）…"
-    Start-Process -FilePath "python" -ArgumentList "tools\embed_service.py serve 8077" -WorkingDirectory (Get-Location) `
-        -RedirectStandardOutput "$env:TEMP\dms-ai-embed.out.log" -RedirectStandardError "$env:TEMP\dms-ai-embed.err.log"
-    for ($i = 0; $i -lt 40; $i++) {
-        Start-Sleep -Milliseconds 500
-        try { if ((Invoke-RestMethod http://127.0.0.1:8077/health -TimeoutSec 1).ok) { $embedUp = $true; break } } catch {}
+    $settings = Get-Content $settingsPath -Raw | ConvertFrom-Json
+    $pgUri = [Uri]$settings.pg_url
+    $pgUserInfo = $pgUri.UserInfo -split ':', 2
+    if ($pgUserInfo.Count -ne 2 -or -not $pgUserInfo[1]) { throw 'pg_url 未包含密码' }
+    $env:DMS_AI_PG_PASSWORD = [Uri]::UnescapeDataString($pgUserInfo[1])
+    try {
+        Write-Host 'PG 容器未运行，docker compose up -d...'
+        docker compose -f "$root\docker\age\docker-compose.yml" up -d | Select-Object -Last 2
+        if ($LASTEXITCODE -ne 0) { throw 'PG 容器启动失败' }
+    } finally {
+        Remove-Item Env:DMS_AI_PG_PASSWORD -ErrorAction SilentlyContinue
     }
 }
-Write-Host "embed: $(if ($embedUp) { 'up :8077' } else { 'DOWN（熔断降级，语义缓存/向量召回停用）' })"
 
-# 2. 后端（先编译后运行，settings.json 在仓库根）
-& "$PSScriptRoot\build.ps1"
-Start-Process -FilePath ".\target\debug\dms-ai-server.exe" -WorkingDirectory (Get-Location) -RedirectStandardOutput "$env:TEMP\dms-ai-server.out.log" -RedirectStandardError "$env:TEMP\dms-ai-server.err.log"
-# 轮询 health
-for ($i = 0; $i -lt 20; $i++) {
-    Start-Sleep -Milliseconds 500
-    try {
-        $r = Invoke-RestMethod http://127.0.0.1:8100/api/health -TimeoutSec 2
-        Write-Host "health: $($r | ConvertTo-Json -Depth 5)"
-        break
-    } catch {}
-}
+& "$PSScriptRoot\ensure-services.ps1" -Parser
+if ($LASTEXITCODE -ne 0) { throw '向量或解析服务启动失败' }
+
+& "$PSScriptRoot\serve.ps1" -Build
+exit $LASTEXITCODE

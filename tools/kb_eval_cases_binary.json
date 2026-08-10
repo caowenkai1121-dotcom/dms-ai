@@ -1,0 +1,213 @@
+{
+  "_": [
+    "二进制格式题集：png(OCR) / pdf 文本层 / pdf 扫描件(OCR) / docx / pptx 各一题。",
+    "runner 是同一个 tools/kb_eval.py（判定逻辑一个字都不改），题集与主题集分开。",
+    "",
+    "🔴 **为什么不塞进 tools/kb_eval_cases.json（主题集）** —— 两条，第二条是决定性的：",
+    "① 任一题被阻塞 → summarize() 给 exit 2。主题集现在 16/16 全绿、退出码 0，",
+    "   塞进来就**恒非 0**，刚装好的反空转闸退化成噪声（红了没人再看是哪一题红）。",
+    "② 更狠：`missing_fixtures()` 在**跑任何一题之前** return 2。也就是说只要有一份夹具还没造出来，",
+    "   主题集不是「多一行红」，而是**16 题一题都不跑**（报告里是「执行 0 题」）。",
+    "   一份造不出来的夹具能删掉全部既有绿证据 —— 这是二选一里 (a) 方案的真实代价，",
+    "   不是「门禁看起来难看一点」。",
+    "所以：主题集保持全绿当门禁，二进制格式这批单独跑、单独报。",
+    "",
+    "怎么跑：",
+    "  python tools/kb_eval.py --cases tools/kb_eval_cases_binary.json",
+    "可叠加 `--filter KBB01`；依赖缺席默认退出 2，仅本地显式 `--allow-skip` 才允许跳过。",
+    "",
+    "夹具怎么来的：`tools/kb_fixtures/make_binary_fixtures.py`（二进制夹具的配方，判据 token 写在那里）。",
+    "本机只造得出手写 PDF 那一份，其余四份要一条 docker 命令 —— 两个 SAC 拦截，见该文件头。",
+    "",
+    "🔴 **夹具会进 A 的真实空间，与主题集同库**（同一个 PG、同一个 space_id=admin）。",
+    "所以这五份语料**一条主题集钉住的事实都不许重述**：重述就是给主题集人工造了一道多文档冲突题。",
+    "选题因此刻意远离已占的题面（差旅住宿/发票时限/审批权限/培训费/年度体检/通讯补贴/员工台账/",
+    "市内打车——后者是 KB13 的「库里没规定」，一旦被我这批文档覆盖到就直接判红）。",
+    "判据 token 600/1480/750/3400/5200/2580 逐个核过：在 tools/kb_fixtures/ 其余文件里一次都不出现，",
+    "且**互不为子串** —— `expect.keywords` 是子串比对，所以 pptx 的预算取 2580 而不是 2600（2600 含 600），",
+    "pptx 里那句「二十六学时」也刻意写成中文数字：写成 26 就与「2026」互相污染，不能当判据。",
+    "",
+    "本机各链现状（2026-07-29 实测，`/health` 的 parse_ok + 逐题跑过）：",
+    "  pdf   parse_ok=true（装到 pypdf 这一级，BSD-3）→ KBB02 **真绿**，这条链现在就有判据钉住",
+    "  docx  parse_ok=false（lxml 的 DLL 被 SAC 拦）→ KBB03 ⏭️ 夹具阻塞",
+    "  pptx  parse_ok=false（同上）             → KBB04 ⏭️ 夹具阻塞",
+    "  png   **上传就被拒**：`ingest::classify` 的白名单只有 pdf/docx/xlsx/csv/pptx/md/txt，",
+    "        400「不支持的文件类型 .png」——OCR 之前得先把图片扩展名放进白名单 → KBB01 ⏭️",
+    "  扫描件 pdf 走完 `_p_pdf` 三级降级后 `ParseError('no_text_layer')`，422 → KBB05 ⏭️",
+    "        （这份夹具的价值就在这儿：它是「有 PDF 依赖但没有 OCR」与「OCR 装好了」的分界线）",
+    "",
+    "🔴 **实测抓到：⏭️ 第三态只在第一次上传时成立，重跑就退化成 ❌**（缺陷在 runner，不在本文件）。",
+    "同一份夹具、同一个服务，两趟跑的原样输出：",
+    "  第 1 趟 `❌ 夹具上传失败（内部推荐奖金办法.docx → HTTP 400）…缺少依赖 python-docx` → `⏭️ 夹具阻塞`，exit 2",
+    "  第 2 趟 `✅ 语料 内部推荐奖金办法.docx → admin · failed 0 块`               → `❌ 回答缺[3400]…`，exit 1",
+    "成因链：第 1 趟 `ingest::ingest` 已经 `insert_doc` 才在解析阶段失败（状态置 Failed）；",
+    "第 2 趟 `store::find_by_sha` 命中同一个 sha 直接返回已有 doc_id → **HTTP 200**。",
+    "而 `upload_fixtures()` 只判 `code != 200` —— 它明明**打印**了 `status` 与 `chunk_count`，",
+    "却不拿它们判定（登记而不消费，正是本仓反复抓的那一族）。于是「门没开」被误报成「答错了」，",
+    "归因反了，而这两者分开正是 exit 1 / exit 2 存在的全部理由。",
+    "一行可修（kb_eval.py）：`if code != 200 or j.get('status') == 'failed' or not j.get('chunk_count')`。",
+    "注：png 那份不受影响 —— `classify` 在写库**之前**就 400，没有 sha 行可命中，所以它恒 ⏭️。",
+    "",
+    "还缺的判据（都要改 runner，不是写题能表达的）：",
+    "① **引用带章节路径**：`Citation.heading_path` 后端已有（chunk 回查的 JSON 里也带），但 `check()`",
+    "   消费不了 —— `chunk_keywords` 比的是整份 chunk JSON，而 heading_path 的文本必然也出现在",
+    "   block 正文里（`md_blocks` 把标题行本身也当一块 emit），所以拿它「钉 heading_path」是假绿：",
+    "   pypdf 那一级 `_blk(t, i, [])` 让 heading_path **恒为空串**，判据照样会过。",
+    "   要真钉住得加一个只看 citations[].heading_path 的 expect 键（如 `citation_heading`）。",
+    "   同理 `page`（扫描件/多页 pdf 的页归属）现在也没有任何判据钉得住。",
+    "② 旧二进制 Office（.doc/.xls/.ppt）**刻意没有题**：夹具要 LibreOffice headless 才造得出，",
+    "   而按上面第②条，题在夹具不在＝整趟 0 题执行。夹具造出来之前不写题，是为了别把这个题集也弄哑。",
+    "   它还缺白名单（同 png：EXTS 里没有 doc/xls/ppt）。见 needs_owner_to_run。"
+  ],
+  "logins": {
+    "a": "admin",
+    "b": "kbtest_b"
+  },
+  "fixtures": [
+    {
+      "file": "劳保用品采购标准_扫描通知.png",
+      "as": "a"
+    },
+    {
+      "file": "员工公寓管理办法_文本层.pdf",
+      "as": "a"
+    },
+    {
+      "file": "食堂就餐补助通知_扫描件无文本层.pdf",
+      "as": "a"
+    },
+    {
+      "file": "内部推荐奖金办法.docx",
+      "as": "a"
+    },
+    {
+      "file": "新员工入职引导.pptx",
+      "as": "a"
+    }
+  ],
+  "cases": [
+    {
+      "_": [
+        "OCR：判据是**数字准不准**，不是「有回答」。600 只写在这张图的像素里，别处一个字都没有，",
+        "所以 keywords 命中 = OCR 真读出来了；chunk_keywords 再往下钉一层：",
+        "600 必须在**入库的 chunk 原文**里，而不只是在模型的回答里 —— 否则「OCR 出来是乱码、",
+        "模型顺手编了个整数」这种形态照样能过 keywords。这是本题唯一值钱的地方。",
+        "夹具刻意是黑字白底、无噪声无倾斜：抖一下判据就变抛硬币，红了分不清是 OCR 退化还是采样。",
+        "真实扫描件的鲁棒性是另一道题，不该混在这里。"
+      ],
+      "name": "KBB01-ocr-图片扫描通知",
+      "kind": "recall",
+      "as": "a",
+      "fixture": "劳保用品采购标准_扫描通知.png",
+      "question": "劳保用品每人每年采购上限是多少元",
+      "expect": {
+        "cited": "yes",
+        "citations": "nonempty",
+        "keywords": [
+          "600"
+        ],
+        "chunk_keywords": [
+          "600"
+        ]
+      }
+    },
+    {
+      "_": [
+        "pdf 文本层：本机唯一能现在就绿的一条（pypdf 装着）。",
+        "1480 与「押金」都只在这份 pdf 里，chunk_keywords 钉住它们进了 chunk 原文 ——",
+        "也就是钉住「PDF 的文本流真被解开了」，而不是模型从别处凑了个数。",
+        "夹具是 2 页、内容流带 FlateDecode 压缩：解析器必须真解流，grep 明文过不了这题。",
+        "**注意这题过不代表 pdf 链完整**：pypdf 那一级只出逐页纯文本，heading_path 恒空、",
+        "章节路径丢失。装到 pymupdf4llm 那一级才有标题层级，而现在没有判据钉得住它（见文件头 ①）。"
+      ],
+      "name": "KBB02-pdf文本层-公寓押金",
+      "kind": "recall",
+      "as": "a",
+      "fixture": "员工公寓管理办法_文本层.pdf",
+      "question": "员工公寓入住要交多少押金，多久退还",
+      "expect": {
+        "cited": "yes",
+        "citations": "nonempty",
+        "keywords": [
+          "1480"
+        ],
+        "chunk_keywords": [
+          "1480",
+          "押金"
+        ]
+      }
+    },
+    {
+      "_": [
+        "docx：两个数刻意分居两条**不同的解析代码路径** —— 3400 在段落（`p` 分支）、",
+        "5200 只在表格里（`_p_docx` 的 `tbl` 分支，行渲染成 `a | b | c`）。",
+        "只钉 3400 的话，表格整体被丢掉也照样绿，而丢掉的是一张标准表（用户按错职级发钱）。",
+        "chunk_keywords 只钉 5200：它是「docx 表格真的进了索引」的唯一证据。"
+      ],
+      "name": "KBB03-docx-段落与表格",
+      "kind": "recall",
+      "as": "a",
+      "fixture": "内部推荐奖金办法.docx",
+      "question": "内部推荐奖金按职级分别是多少钱",
+      "expect": {
+        "cited": "yes",
+        "citations": "nonempty",
+        "keywords": [
+          "3400",
+          "5200"
+        ],
+        "chunk_keywords": [
+          "5200"
+        ]
+      }
+    },
+    {
+      "_": [
+        "pptx：2580 写在第 2 页的正文占位符里，第 1、3 页都没有它 ——",
+        "所以命中 = `_p_pptx` 真的逐页遍历了 `text_frame` 而不是只取了标题。",
+        "同一页那句「二十六学时」刻意用中文数字：写成 26 会与 2026 互相污染（子串比对），",
+        "当不了判据 —— 这条与主题集 KB08「1250 必须全语料唯一」是同一条纪律。"
+      ],
+      "name": "KBB04-pptx-页内正文",
+      "kind": "recall",
+      "as": "a",
+      "fixture": "新员工入职引导.pptx",
+      "question": "新员工入职引导的人均培训预算是多少",
+      "expect": {
+        "cited": "yes",
+        "citations": "nonempty",
+        "keywords": [
+          "2580"
+        ],
+        "chunk_keywords": [
+          "2580"
+        ]
+      }
+    },
+    {
+      "_": [
+        "扫描件 pdf（只有图、没有文本层）：与 KBB02 是**同一个扩展名、不同的失败面**。",
+        "KBB02 绿只证明「pdf 依赖装了」；这题绿才证明「OCR 装了」。",
+        "现在它必然 ⏭️：`_p_pdf` 三级降级全落空后 `raise ParseError('no_text_layer')`，",
+        "上传就 422 —— 那是**刻意的显式失败**（原实现返回空 blocks，等于静默入库一份空文档，",
+        "UI 上显示「已入库」而检索永远零命中）。所以这题的第三态本身就是那条契约还活着的证据。",
+        "750 只在这张图的像素里，与 KBB01 同一条 OCR 判据口径。"
+      ],
+      "name": "KBB05-ocr-扫描件pdf无文本层",
+      "kind": "recall",
+      "as": "a",
+      "fixture": "食堂就餐补助通知_扫描件无文本层.pdf",
+      "question": "食堂就餐补助每人每月多少钱",
+      "expect": {
+        "cited": "yes",
+        "citations": "nonempty",
+        "keywords": [
+          "750"
+        ],
+        "chunk_keywords": [
+          "750"
+        ]
+      }
+    }
+  ]
+}

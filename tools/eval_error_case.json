@@ -1,87 +1,22 @@
 [
  {
-  "name": "AS02-今年售后单完成率",
-  "q": "今年的售后单里已经处理完成的占比是多少？",
-  "detail": "第1行第1列 '95.81%'≠95.81"
+  "name": "AS04-今年退款金额占销售额比例",
+  "q": "今年售后退款金额占销售额的比例是多少？",
+  "detail": "第1行第1列 5.05≠5.14 · diff=where"
  },
  {
-  "name": "E09-售后单数",
-  "q": "本月售后单有多少",
-  "detail": "第1行第1列 329.0≠1176.0"
- },
- {
-  "name": "FIN03-待确认对账单张数与金额",
-  "q": "目前还有多少张对账单处于待确认状态，涉及金额一共多少",
-  "detail": "第1行第1列 0.0≠24770.0"
- },
- {
-  "name": "GOODS16-六月手抓饼分类销量",
-  "q": "2026年6月手抓饼这个分类卖了多少箱",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
+  "name": "E05-销量按商品分类",
+  "q": "本月各商品分类销量",
+  "detail": "行数 1≠12 · diff=where"
  },
  {
   "name": "GOODS17-六月分类销量Top5",
   "q": "2026年6月销量最高的5个商品分类是哪些",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "MKT01-市场费用Top5费用项目",
-  "q": "今年市场费用花得最多的前5个费用项目是哪些？各花了多少钱？",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "MKT02-大型活动场次",
-  "q": "大型活动一共办了多少场？",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "MKT03-活动临促人员费用",
-  "q": "今年活动临促人员的费用一共花了多少钱？",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "MKT04-本月活动执行人员费用",
-  "q": "这个月活动执行人员的费用是多少？",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "PERM01-城市经理今年售后单数",
-  "q": "今年售后单有多少",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "PERM02-城市经理可见客户数",
-  "q": "现在系统里一共有多少家客户",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
+  "detail": "行数 1≠5 · diff=where"
  },
  {
   "name": "SALE14-今年月度销售趋势",
   "q": "今年每个月的销售额趋势",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "SALE15-本月销量TOP10商品",
-  "q": "本月卖得最好的10个商品是哪些",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "SALE16-销售额环比",
-  "q": "本月销售额比上月增长了百分之多少",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "SALE17-湖南省销售额",
-  "q": "本月湖南省的销售额是多少",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "STK01-仓库库存金额TOP10",
-  "q": "目前哪个仓库的库存金额最高？给我看前10名",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
- },
- {
-  "name": "STK02-各省库存金额",
-  "q": "各省份现在的库存金额分别是多少",
-  "detail": "生成失败: Error: error communicating with database: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
+  "detail": "第8行第2列 46475617.6851≠38739844.6027 · diff=where"
  }
 ]

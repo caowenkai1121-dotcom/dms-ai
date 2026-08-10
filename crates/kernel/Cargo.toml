@@ -1,0 +1,11 @@
+[package]
+name = "dms-kernel"
+version = "0.1.0"
+edition = "2021"
+
+# 🔴 硬规则：不得出现 sqlx / reqwest / axum / tokio / chrono / thiserror / async-trait。
+# 时钟一律由调用方以参数注入；异步 trait 手写 BoxFut。
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlparser = { workspace = true }

@@ -1,81 +1,891 @@
 <script setup lang="ts">
-import BiChart from './BiChart.vue'
-import { fmt, type Semantic } from './format'
+import { computed, defineAsyncComponent, ref } from 'vue'
+import { fmt, semanticForLabel, toNum, type Semantic } from './format'
+
+const BiChart = defineAsyncComponent(() => import('./BiChart.vue'))
 
 interface ColSpec { name: string; role: string; semantic: Semantic }
-interface Delta { pct: number; dir: 'up' | 'down' | 'flat'; label: string }
+interface Delta {
+  pct: number; dir: 'up' | 'down' | 'flat'; label: string
+  baseline?: number; change?: number
+}
 interface Kpi { label: string; value: unknown; semantic: Semantic; delta?: Delta }
 interface Block {
   type: 'kpis' | 'entity' | 'chart' | 'table'
   items?: Kpi[]; pairs?: [string, unknown][]
   kind?: 'bar' | 'line' | 'pie'; x?: number; y?: number[]; top?: number | null
+  /** 多序列切分列下标（后端 `skip_serializing_if`，单序列时整键不上线 → 可选）。
+   *  不往下传 = 「时间 + 1 类别 + 1 指标」继续被画成一条混轴折线。 */
+  series?: number | null
 }
 interface ViewSpec { columns: ColSpec[]; blocks: Block[]; interact?: { drill?: string[] }; insight?: string }
+interface SupplementalResult {
+  columns: string[]; rows: unknown[][]; row_count: number
+  truncated: boolean; view: ViewSpec
+}
+// view 可选：知识库回答是 {kind:'text', markdown, citations} —— 没有 view。
+// 声明成必填时这里三处解引用会直接 TypeError 白屏（App.vue 只按 subs 是否为空分派）。
 interface Result {
-  columns: string[]; rows: unknown[][]; row_count: number; view: ViewSpec
+  columns: string[]; rows: unknown[][]; row_count: number; view?: ViewSpec
+  route?: string
+  sql?: string
+  /** 独立补充结果：用于结构拆解和明细，不得覆盖主 KPI/标量。 */
+  supplemental?: SupplementalResult
+  /** 是否命中行上限（后端 `agent::gate::MAX_ROWS` 判的）。**前端不持有那个数字** ——
+   *  否则就是第三处口径，而它必然漂（见下方 `shownRows` 的注释）。 */
+  truncated?: boolean
+  /** 敏感列防线（`connector::redact`，F5）把命中的列**整列置 Null** 后回报的列名。
+   *  不渲染它 = 用户把「已脱敏」读成「系统坏了 / 这列没数据」，
+   *  裁决 二·D T4-5 记的就是这笔债（后端一直在算，前端没有消费者）。
+   *  后端 `skip_serializing_if`（空数组不上线），故可选 —— 老服务端不带这个键也不崩。 */
+  redacted?: string[]
+  /** 口径复核未通过 / 命中行上限的两条标注。**子结果也带这两个字段**，
+   *  而此前只有 `App.vue` 顶层在读、本接口里压根没声明它们 ——
+   *  于是复合问每个子问的口径提醒与截断提醒一个字都看不见
+   *  （容器自身这两项恒 `None`，见 `agent::ctx::AskResult::compound`）。 */
+  caliber_note?: string
+  truncation_note?: string
+  /** 行级权限**生效了**的回显（后端 `skip_serializing_if`，故可选）。
+   *  不渲染它 = 受限用户看到子集却以为是全量，拿着被过滤的数下结论 ——
+   *  那件事不报错、也没有任何判据抓得到，属正确性而非产品面。 */
+  scope_note?: string
 }
 
 const props = defineProps<{ result: Result }>()
-const emit = defineEmits<{ (e: 'drill', dim: string): void }>()
+const emit = defineEmits<{ (e: 'drill', dim: string): void; (e: 'pick', q: string): void }>()
+
+const customIntent = ref('')
+const customIntentComposing = ref(false)
+const blocks = computed(() => props.result.view?.blocks ?? [])
+const kpis = computed(() => blocks.value.flatMap((b) => b.type === 'kpis' ? (b.items ?? []) : []))
+const trendCharts = computed(() => blocks.value.filter((b) => b.type === 'chart' && b.kind === 'line'))
+const compositionCharts = computed(() => blocks.value.filter((b) => b.type === 'chart' && b.kind !== 'line'))
+const entityBlocks = computed(() => blocks.value.filter((b) => b.type === 'entity'))
+const tableBlocks = computed(() => blocks.value.filter((b) => b.type === 'table'))
+const supplemental = computed(() => props.result.supplemental)
+const supplementalBlocks = computed(() => supplemental.value?.view.blocks ?? [])
+const supplementalKpis = computed(() => supplementalBlocks.value.flatMap((b) => b.type === 'kpis' ? (b.items ?? []) : []))
+const supplementalTrendCharts = computed(() => supplementalBlocks.value.filter((b) => b.type === 'chart' && b.kind === 'line'))
+const supplementalCompositionCharts = computed(() => supplementalBlocks.value.filter((b) => b.type === 'chart' && b.kind !== 'line'))
+const supplementalEntityBlocks = computed(() => supplementalBlocks.value.filter((b) => b.type === 'entity'))
+const supplementalTableBlocks = computed(() => supplementalBlocks.value.filter((b) => b.type === 'table'))
+const hasSupplemental = computed(() => {
+  const detail = supplemental.value
+  return !!detail && (
+    supplementalKpis.value.length > 0 || supplementalTrendCharts.value.length > 0
+    || supplementalCompositionCharts.value.length > 0 || supplementalEntityBlocks.value.length > 0
+    || (supplementalTableBlocks.value.length > 0 && detail.rows.length > 0)
+  )
+})
+const drillOptions = computed(() => props.result.view?.interact?.drill ?? [])
+const isEntityCandidate = computed(() =>
+  props.result.route === 'entity-card'
+  && (props.result.sql ?? '').startsWith('实体候选匹配：')
+  && drillOptions.value.length > 0,
+)
+const entityChoices = computed(() => isEntityCandidate.value
+  ? drillOptions.value.map((query, index) => {
+      const row = props.result.rows[index] ?? []
+      return {
+        query,
+        kind: String(row[0] ?? '业务对象'),
+        code: String(row[1] ?? ''),
+        name: String(row[2] ?? query),
+      }
+    })
+  : [],
+)
+const intentOptions = computed(() => drillOptions.value.filter((q) =>
+  !/^(?:输入想法|自由输入|其他|其它)(?:[（(].*[）)])?$|^other$/i.test(q.trim()),
+))
+
+const hasWideTable = computed(() => props.result.columns.length > 3)
+const supplementalHasWideTable = computed(() => (supplemental.value?.columns.length ?? 0) > 3)
+
+type InsightKind = 'conclusion' | 'risk' | 'action'
+interface InsightCard { kind: InsightKind; title: string; items: string[] }
+
+const insightText = computed(() => sanitizeInsight(props.result.view?.insight ?? ''))
+const displaySql = computed(() => {
+  const sql = (props.result.sql ?? '').trim()
+  return sql && !sql.startsWith('实体候选匹配：') ? sql : ''
+})
+const insightCards = computed<InsightCard[]>(() => {
+  if (isEntityCandidate.value) return []
+  if (!insightText.value) return []
+
+  const buckets: Record<InsightKind, string[]> = { conclusion: [], risk: [], action: [] }
+  let current: InsightKind = 'conclusion'
+  for (const rawLine of insightText.value.replace(/\r/g, '').split('\n')) {
+    const line = cleanInsight(rawLine)
+    if (!line) continue
+    const heading = line.replace(/[：:]$/, '')
+    if (/^(?:经营结论|结论|摘要|概览|总体结论|核心结论)$/.test(heading)) { current = 'conclusion'; continue }
+    if (/^(?:关键变化|模块分析|异常|风险|关键发现|异常与关注|问题|预警)$/.test(heading)) { current = 'risk'; continue }
+    if (/^(?:建议|行动建议|下周行动建议|下一步|措施|优化建议)$/.test(heading)) { current = 'action'; continue }
+
+    const cells = markdownTableCells(rawLine)
+    if (cells?.length === 0) continue
+    const fragments = cells
+      ? [cells.join('；')]
+      : (line.match(/[^。！？；]+[。！？；]?/g) ?? [line])
+    for (const sentence of fragments) {
+      const text = cleanInsight(sentence)
+      if (!text) continue
+      const kind = cells
+        ? current
+        : /建议|应当|可以|优先|下一步|行动|跟进|排查|优化|关注/.test(text)
+          ? 'action'
+          : /异常|风险|问题|预警|下降|波动|偏低|偏高|集中|缺失|失衡/.test(text)
+            ? 'risk'
+            : current
+      const clipped = clipInsight(text)
+      if (buckets[kind].length < 3 && !buckets[kind].includes(clipped)) buckets[kind].push(clipped)
+    }
+  }
+
+  const meta: Record<InsightKind, string> = {
+    conclusion: '结论',
+    risk: '异常与关注',
+    action: '建议',
+  }
+  return (['conclusion', 'risk', 'action'] as InsightKind[])
+    .filter((kind) => buckets[kind].length)
+    .map((kind) => ({ kind, title: meta[kind], items: buckets[kind] }))
+})
+
+function sanitizeInsight(text: string): string {
+  const visible: string[] = []
+  let hidingInternalSection = false
+  for (const rawLine of text.replace(/\r/g, '').split('\n')) {
+    const plainLine = rawLine.trim().replace(/^[-*>\d.、\s]+/, '').replace(/\*\*|__/g, '')
+    const heading = /^(#{1,6})\s*(.*)$/.exec(rawLine.trim())
+    const strongHeading = /^(?:\*\*([^*]+)\*\*|__([^_]+)__)$/.exec(rawLine.trim())
+    const headingText = heading?.[2] ?? strongHeading?.[1] ?? strongHeading?.[2]
+    if (headingText !== undefined) {
+      hidingInternalSection = /^(?:证据|证据与边界|数据边界|可信度|技术诊断|口径与可信度|内部校验)/.test(headingText.trim())
+      if (hidingInternalSection) continue
+    } else if (hidingInternalSection) {
+      continue
+    }
+    if (/^(?:证据(?:编号|与边界)?|数据边界|可信度|技术诊断|口径与可信度|内部校验)\s*[:：|]/.test(plainLine)) continue
+    if (rawLine.includes('|') && /\b(?:KPI|SEC|CON)-\d+\b/i.test(rawLine)) continue
+    if (!/^\s*\|?\s*(?:证据|证据编号|可信度|技术诊断)\s*\|/i.test(rawLine)) visible.push(rawLine)
+  }
+  return visible.join('\n')
+    .replace(/\[(?:KPI|SEC|CON)-\d+\]/gi, '')
+    .replace(/\b(?:KPI|SEC|CON)-\d+\b/gi, '')
+    .replace(/(?:证据编号|KPI引用|SEC引用)\s*[:：]?\s*/gi, '')
+    .replace(/证据不足/g, '数据不足')
+    .replace(/\s+([，。；：])/g, '$1')
+    .trim()
+}
+
+function markdownTableCells(rawLine: string): string[] | null {
+  const line = rawLine.trim()
+  if (!line.includes('|')) return null
+  const cells = line
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map(cleanInsight)
+    .filter(Boolean)
+  if (cells.length < 2) return null
+  if (cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return []
+  const header = /^(?:结论|业务影响|关键变化|原因判断|改进建议|模块|异常|影响|建议|行动|优先级|跟进事项|判断|变化|指标|说明|证据)$/
+  return cells.every((cell) => header.test(cell)) ? [] : cells
+}
+
+function cleanInsight(text: string): string {
+  return text
+    .replace(/^#{1,6}\s*/, '')
+    .replace(/^[-*•]\s*/, '')
+    .replace(/\*\*|__/g, '')
+    .replace(/`/g, '')
+    .trim()
+}
+
+function clipInsight(text: string): string {
+  return text.length > 76 ? `${text.slice(0, 75).trim()}…` : text
+}
+
+const deltaNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 })
+
+function entityValue(pair: [string, unknown]): string {
+  return displayValue(pair[0], pair[1]) || '—'
+}
+
+function isGrossMarginLabel(label: string): boolean {
+  const normalized = label.replace(/\s+/g, '')
+  return normalized === '毛利率' || normalized === '销售毛利率'
+}
+
+function displayValue(label: string, value: unknown, semantic?: Semantic, metric = false): string {
+  const number = toNum(value)
+  if (isGrossMarginLabel(label) && number !== null) return fmt(number * 100, 'percent')
+  const inferred = semanticForLabel(label)
+  const resolved = semantic && semantic !== 'none' ? semantic : inferred !== 'none' ? inferred : metric ? 'count' : 'none'
+  return fmt(value, resolved)
+}
+
+function formatDelta(value: number): string {
+  return deltaNumber.format(Math.abs(value))
+}
+
+function deltaDetail(kpi: Kpi): string {
+  const delta = kpi.delta
+  if (!delta || typeof delta.baseline !== 'number' || !Number.isFinite(delta.baseline)) return ''
+  const semantic = kpi.semantic === 'none' ? semanticForLabel(kpi.label) : kpi.semantic
+  const baseline = displayValue(kpi.label, delta.baseline, semantic, true)
+  const change = typeof delta.change === 'number' && Number.isFinite(delta.change)
+    ? `${delta.change > 0 ? '+' : delta.change < 0 ? '-' : ''}${displayValue(kpi.label, Math.abs(delta.change), semantic, true)}`
+    : '-'
+  return `基期 ${baseline} · 变化额 ${change}`
+}
+
+function chartTitle(block: Block, view = props.result.view): string {
+  const x = view?.columns[block.x ?? -1]?.name ?? '维度'
+  const metrics = (block.y ?? []).map((i) => view?.columns[i]?.name).filter(Boolean).join('、') || '指标'
+  if (block.kind === 'line') return `${metrics}趋势`
+  if (block.kind === 'pie') return `${x}构成`
+  return `${metrics}按${x}对比`
+}
+
+function chartCaption(block: Block, view = props.result.view): string {
+  const x = view?.columns[block.x ?? -1]?.name ?? '维度'
+  if (block.kind === 'line') return `按${x}观察变化与拐点`
+  if (block.kind === 'pie') return `各${x}占比与集中度`
+  return `各${x}贡献与排名`
+}
+
+function entityTitle(block: Block): string {
+  const labels = (block.pairs ?? []).map((p) => p[0]).join(' ')
+  if (/客户|经销商|storecode|storename/i.test(labels)) return '客户档案'
+  if (/门店|店铺|shop_|store_name|store_code/i.test(labels)) return '门店档案'
+  if (/商品|品类|品牌|规格/.test(labels)) return '商品档案'
+  if (/单号|订单|单据/.test(labels)) return '单据详情'
+  return '基础信息'
+}
+
+function submitCustomIntent(event?: Event): void {
+  if (customIntentComposing.value || (event instanceof KeyboardEvent && (event.isComposing || event.keyCode === 229))) return
+  if (event instanceof KeyboardEvent) event.preventDefault()
+  const q = customIntent.value.trim()
+  if (!q) return
+  emit('pick', q)
+  customIntent.value = ''
+}
+
+function finishCustomIntentComposition(): void {
+  // 部分中文输入法在 compositionend 后复用同一个 Enter 触发表单提交，延后一拍再解锁。
+  setTimeout(() => { customIntentComposing.value = false }, 0)
+}
+
+/** 🔴 **前端不再持有行数上限**。
+ *
+ *  原来这里是 `slice(0, 100)`，而后端截断文案说「本次只返回前 200 行」、CSV 导出也是 200 ——
+ *  三处口径不一致，界面上**没有一个字**说明下面还有 100 行，用户拿 100 行当全量下结论。
+ *
+ *  第一版的修法是 `const MAX_TABLE_ROWS: 200 = 200`，靠字面量类型「钉死口径」。
+ *  那是个**假闸**：实测把它改成 `: 100 = 100` 或 `: number = 100`，`vue-tsc` 都 exit 0 ——
+ *  唯一会红的是「注解写 200 而值写别的」，没人会那么改。真正的漂移源是后端
+ *  `agent::gate::MAX_ROWS`，而那一行与它之间没有任何连接。
+ *
+ *  正解是**没有第二个数字**：全部渲染服务端给的行，行数与截断都用服务端已经在返的
+ *  `row_count` / `truncated` / `truncation_note` 表达。没有第三处口径，就没有第三处口径可漂。
+ *  （200 行 DOM 不需要虚拟滚动：`overflow:auto` 的容器 + 200×N 个 `<td>` 是十毫秒级。） */
+const shownRows = computed(() => props.result.rows)
+/** 行数脚注：恒显示。截断由服务端判（`truncated`），前端不猜 ——
+ *  `row_count` 是**本次返回**的行数，不是表里的总行数；「后面还有」那句由后端的
+ *  `truncation_note` 说（它才知道上限是多少、怎么续读）。 */
+const rowFoot = computed(() => {
+  return rowFootFor(props.result, true)
+})
+const supplementalRowFoot = computed(() => supplemental.value ? rowFootFor(supplemental.value) : '')
+
+function rowFootFor(result: Pick<Result, 'rows' | 'row_count' | 'truncated'>, pointsToNotice = false): string {
+  const n = result.rows.length
+  const base = `共 ${n} 行`
+  if (!result.truncated) return base
+  return pointsToNotice ? `${base} · 当前展示部分数据` : `${base} · 部分数据`
+}
+
+const redacted = computed(() => props.result.redacted ?? [])
+const redactedSet = computed(() => new Set(redacted.value))
+function isRedacted(ci: number): boolean {
+  return redactedSet.value.has(props.result.columns[ci])
+}
 
 function cell(ri: number, ci: number): string {
-  return fmt(props.result.rows[ri][ci], props.result.view.columns[ci]?.semantic ?? 'none')
+  return cellFor(props.result, ri, ci)
+}
+function columnSemantic(ci: number): Semantic {
+  return columnSemanticFor(props.result, ci)
+}
+function columnSemanticFor(result: Pick<Result, 'columns' | 'view'>, ci: number): Semantic {
+  const spec = result.view?.columns[ci]
+  if (spec?.semantic && spec.semantic !== 'none') return spec.semantic
+  const inferred = semanticForLabel(result.columns[ci] ?? '')
+  return inferred !== 'none' ? inferred : spec?.role === 'metric' ? 'count' : 'none'
+}
+function cellTitle(ri: number, ci: number): string {
+  return cellTitleFor(props.result, ri, ci)
+}
+function cellFor(result: Pick<Result, 'columns' | 'rows' | 'view'>, ri: number, ci: number): string {
+  const value = displayValue(result.columns[ci] ?? '', result.rows[ri][ci], columnSemanticFor(result, ci))
+  return value || '—'
+}
+function cellTitleFor(result: Pick<Result, 'columns' | 'rows' | 'view'>, ri: number, ci: number): string {
+  const raw = result.rows[ri][ci]
+  if (raw === null || raw === undefined || raw === '') return '无数据'
+  return displayValue(result.columns[ci] ?? '', raw, columnSemanticFor(result, ci)) || '无数据'
 }
 function isMetric(ci: number): boolean {
-  return props.result.view.columns[ci]?.role === 'metric'
+  return isMetricFor(props.result, ci)
+}
+function isMetricFor(result: Pick<Result, 'view'>, ci: number): boolean {
+  return result.view?.columns[ci]?.role === 'metric'
+}
+function supplementalCell(ri: number, ci: number): string {
+  return supplemental.value ? cellFor(supplemental.value, ri, ci) : '—'
+}
+function supplementalCellTitle(ri: number, ci: number): string {
+  return supplemental.value ? cellTitleFor(supplemental.value, ri, ci) : '无数据'
+}
+function supplementalIsMetric(ci: number): boolean {
+  return supplemental.value ? isMetricFor(supplemental.value, ci) : false
 }
 </script>
 
 <template>
-  <div>
-    <div v-if="result.view.insight" class="insight">💡 {{ result.view.insight }}</div>
-    <div v-if="result.row_count === 0" class="empty-hint">
+  <!-- 无 view 早退：本组件只渲染表格类结果；文本类（知识库）由 KbAnswer.vue 接 -->
+  <div v-if="!result.view" class="empty-hint">该结果没有视图（view 缺失），无法按表格呈现。</div>
+  <div v-else class="result-panel">
+    <!-- 口径 / 截断标注在**每个结果自己**这一层渲染（含复合的每个子问）：
+         放在数字之前，否则「照返 + 标注」等于没标注。 -->
+    <!-- 【S3】need-intent 选择卡（datanote AskUserTool 对应物）：反问是**澄清**不是报错，
+         不用 error 红。选项 = 后端给的完整问法（view.interact.drill），点击原样发送 —
+         挂起/续跑由会话追问机制天然承担（rewrite_followup + 日期继承），无需状态机。 -->
+    <div v-if="result.route === 'need-intent'" class="ask-card">
+      <div class="ask-hd">🤔 先问清再查</div>
+      <div class="ask-q">{{ result.caliber_note }}</div>
+      <div class="ask-opts">
+        <button v-for="d in intentOptions" :key="d" type="button" class="ask-opt" @click.stop="emit('pick', d)">{{ d }}</button>
+      </div>
+      <form class="ask-custom" @submit.stop.prevent="submitCustomIntent" @click.stop @keydown.stop>
+        <input
+          v-model="customIntent"
+          class="ask-input"
+          type="text"
+          autocomplete="off"
+          aria-label="输入你的想法"
+          placeholder="输入你的想法"
+          @click.stop
+          @compositionstart="customIntentComposing = true"
+          @compositionend="finishCustomIntentComposition"
+          @keydown.enter.stop="submitCustomIntent"
+        >
+        <button class="ask-submit" type="submit" :disabled="!customIntent.trim()">提交</button>
+      </form>
+      <div class="ask-hint">选择一个问法，或输入自己的问题后按 Enter</div>
+    </div>
+    <div v-else-if="isEntityCandidate" class="entity-choice-card">
+      <div class="entity-choice-head">
+        <div>
+          <span class="section-kicker">精确匹配</span>
+          <h3>请选择具体对象</h3>
+        </div>
+        <span>{{ entityChoices.length }} 个候选</span>
+      </div>
+      <div class="entity-choice-list">
+        <button
+          v-for="choice in entityChoices"
+          :key="choice.query"
+          type="button"
+          class="entity-choice"
+          @click.stop="emit('pick', choice.query)"
+        >
+          <span class="entity-choice-kind">{{ choice.kind }}</span>
+          <span class="entity-choice-name">{{ choice.name }}</span>
+          <span v-if="choice.code" class="entity-choice-code">{{ choice.code }}</span>
+          <span class="entity-choice-action">查看详情 →</span>
+        </button>
+      </div>
+      <p class="entity-choice-hint">选择后将按编码精确查询，系统不会自动猜测。</p>
+    </div>
+    <div v-else-if="result.caliber_note" class="caliber-warn">当前结果未通过业务口径复核，请调整问法后重试。</div>
+    <!-- direct-derive：合同未覆盖时的 ODS 推导降级。提示条放数字之前 ——
+         与口径/截断标注同一纪律：先看见信任等级，再看数字。 -->
+    <div v-if="result.route === 'direct-derive'" class="derive-note">
+      <b>推导口径 · 未经合同验证</b>：以下结果由 ODS 明细推导，仅作排查参考；经营决策请使用已验证口径。
+    </div>
+    <div v-if="result.truncation_note" class="trunc-note">数据量较大，当前仅展示已返回的数据；可缩小查询范围获取更完整结果。</div>
+    <!-- 脱敏回显。单行实体卡会把 Null 列**整条丢掉**（`semantic::present` 的 pairs 过滤 Null），
+         所以这条横幅同时是实体形态下唯一的说明处 —— 列名在这里列全。 -->
+    <div v-if="redacted.length" class="redact-note">
+      敏感列已按数据策略<b>整列脱敏</b>：{{ redacted.join('、') }}
+    </div>
+
+    <!-- need-intent（反问）与 entity-card（总览卡）不是取数结果，不出「未找到数据」——
+         实测（tp/b39c9a32）：反问气泡下叠这句，读的人以为「这个客户没数据」 -->
+    <div v-if="result.row_count === 0 && result.route !== 'need-intent' && result.route !== 'entity-card' && result.route !== 'business-lookup'" class="empty-hint">
       未找到数据。可能：① 该口径本期无记录　② 数据权限范围内无此数据　③ 换个说法试试
     </div>
 
-    <template v-for="(b, bi) in result.view.blocks" :key="bi">
-      <div v-if="b.type === 'kpis'" class="kpi-row">
-        <div v-for="(k, ki) in b.items" :key="ki" class="metric-card">
-          <div class="mc-label">{{ k.label }}</div>
-          <div class="mc-val num">{{ fmt(k.value, k.semantic) }}</div>
-          <div v-if="k.delta" class="mc-delta" :class="k.delta.dir">
-            {{ k.delta.dir === 'up' ? '▲' : k.delta.dir === 'down' ? '▼' : '—' }}
-            {{ Math.abs(k.delta.pct) }}% <span class="mc-vs">{{ k.delta.label }}</span>
-          </div>
+    <section v-if="kpis.length" class="result-section kpi-section">
+      <div class="section-head">
+        <div>
+          <span class="section-kicker">关键结果</span>
+          <h3>核心指标</h3>
         </div>
       </div>
+      <div class="kpi-row">
+        <div v-for="(k, ki) in kpis" :key="ki" class="metric-card">
+          <div class="mc-label">{{ k.label }}</div>
+          <div class="mc-val num">{{ displayValue(k.label, k.value, k.semantic, true) }}</div>
+          <div v-if="k.delta" class="mc-delta" :class="k.delta.dir">
+            <span class="delta-mark">{{ k.delta.dir === 'up' ? '↑' : k.delta.dir === 'down' ? '↓' : '—' }}</span>
+            {{ formatDelta(k.delta.pct) }}% <span class="mc-vs">{{ k.delta.label }}</span>
+          </div>
+          <div v-if="deltaDetail(k)" class="mc-delta-detail">{{ deltaDetail(k) }}</div>
+        </div>
+      </div>
+    </section>
 
-      <div v-else-if="b.type === 'entity'" class="entity">
-        <div class="entity-hd">单据详情</div>
+    <section v-if="trendCharts.length" class="result-section">
+      <div class="section-head">
+        <div>
+          <span class="section-kicker">时间变化</span>
+          <h3>趋势变化</h3>
+        </div>
+      </div>
+      <div class="chart-grid">
+        <article v-for="(b, bi) in trendCharts" :key="`trend-${bi}`" class="chart-card">
+          <header class="chart-head">
+            <div>
+              <h4>{{ chartTitle(b) }}</h4>
+              <p>{{ chartCaption(b) }}</p>
+            </div>
+            <span class="chart-type">趋势</span>
+          </header>
+          <BiChart :kind="b.kind!" :columns="result.view.columns" :rows="result.rows" :x="b.x!" :y="b.y!" :top="b.top" :series="b.series" />
+        </article>
+      </div>
+    </section>
+
+    <section v-if="compositionCharts.length" class="result-section">
+      <div class="section-head">
+        <div>
+          <span class="section-kicker">结构分布</span>
+          <h3>构成与排名</h3>
+        </div>
+      </div>
+      <div class="chart-grid" :class="{ paired: compositionCharts.length > 1 }">
+        <article v-for="(b, bi) in compositionCharts" :key="`composition-${bi}`" class="chart-card">
+          <header class="chart-head">
+            <div>
+              <h4>{{ chartTitle(b) }}</h4>
+              <p>{{ chartCaption(b) }}</p>
+            </div>
+            <span class="chart-type">{{ b.kind === 'pie' ? '占比' : '排名' }}</span>
+          </header>
+          <BiChart :kind="b.kind!" :columns="result.view.columns" :rows="result.rows" :x="b.x!" :y="b.y!" :top="b.top" :series="b.series" />
+        </article>
+      </div>
+    </section>
+
+    <section v-if="entityBlocks.length" class="result-section">
+      <div class="section-head">
+        <div>
+          <span class="section-kicker">业务对象</span>
+          <h3>档案信息</h3>
+        </div>
+      </div>
+      <div v-for="(b, bi) in entityBlocks" :key="`entity-${bi}`" class="entity">
+        <div class="entity-hd">{{ entityTitle(b) }}</div>
         <div class="entity-grid">
           <div v-for="(p, pi) in b.pairs" :key="pi" class="entity-cell">
             <div class="ec-k">{{ p[0] }}</div>
-            <div class="ec-v">{{ p[1] }}</div>
+            <div class="ec-v">{{ entityValue(p) }}</div>
           </div>
         </div>
       </div>
+    </section>
 
-      <div v-else-if="b.type === 'chart'" class="chart-card">
-        <BiChart :kind="b.kind!" :columns="result.view.columns" :rows="result.rows" :x="b.x!" :y="b.y!" :top="b.top" />
+    <section v-if="tableBlocks.length && result.row_count > 0 && !isEntityCandidate" class="result-section table-section">
+      <div class="section-head table-heading">
+        <div>
+          <span class="section-kicker">业务数据</span>
+          <h3>业务明细</h3>
+        </div>
+        <span class="row-count">{{ rowFoot }}</span>
       </div>
-
-      <div v-else-if="b.type === 'table' && result.row_count > 0" class="tbl-wrap">
-        <table>
+      <div class="tbl-wrap">
+        <table aria-label="业务明细数据表">
           <thead>
-            <tr><th v-for="(c, ci) in result.columns" :key="ci" :class="{ num: isMetric(ci) }">{{ c }}</th></tr>
+            <tr>
+              <th class="row-index" scope="col">#</th>
+              <th v-for="(c, ci) in result.columns" :key="ci" :class="{ num: isMetric(ci) }">
+                {{ c }}<span v-if="isRedacted(ci)" class="redact-lock" title="敏感列：本列已整列脱敏">🔒</span>
+              </th>
+            </tr>
           </thead>
           <tbody>
-            <tr v-for="(row, ri) in result.rows.slice(0, 100)" :key="ri">
-              <td v-for="(_, ci) in result.columns" :key="ci" :class="{ num: isMetric(ci) }">{{ cell(ri, ci) }}</td>
+            <tr v-for="(row, ri) in shownRows" :key="ri">
+              <td class="row-index">{{ ri + 1 }}</td>
+              <!-- 脱敏列逐格写「已脱敏」：一列空值会被读成故障 -->
+              <td v-for="(_, ci) in result.columns" :key="ci"
+                  :title="isRedacted(ci) ? '敏感列已脱敏' : cellTitle(ri, ci)"
+                  :class="{ num: isMetric(ci) && !isRedacted(ci), 'redact-cell': isRedacted(ci) }">
+                {{ isRedacted(ci) ? '已脱敏' : cell(ri, ci) }}
+              </td>
             </tr>
           </tbody>
         </table>
       </div>
-    </template>
+      <div v-if="hasWideTable" class="table-scroll-hint">左右滑动可查看完整字段，悬停单元格可查看完整内容</div>
+    </section>
 
-    <div v-if="result.row_count > 0 && result.view.interact?.drill?.length" class="drill">
+    <!-- 补充结果拥有独立 rows/view；直接在本组件内渲染，避免递归 ResultPanel 产生重复操作栏。 -->
+    <section v-if="hasSupplemental && supplemental" class="supplemental-section" aria-label="结构与明细">
+      <div class="supplemental-head">
+        <div>
+          <span class="section-kicker">补充数据</span>
+          <h3>结构与明细</h3>
+          <p>在主结果之外展开构成、变化与业务记录</p>
+        </div>
+      </div>
+
+      <div v-if="supplementalKpis.length" class="kpi-row supplemental-kpis">
+        <div v-for="(k, ki) in supplementalKpis" :key="`supplemental-kpi-${ki}`" class="metric-card">
+          <div class="mc-label">{{ k.label }}</div>
+          <div class="mc-val num">{{ displayValue(k.label, k.value, k.semantic, true) }}</div>
+          <div v-if="k.delta" class="mc-delta" :class="k.delta.dir">
+            <span class="delta-mark">{{ k.delta.dir === 'up' ? '↑' : k.delta.dir === 'down' ? '↓' : '—' }}</span>
+            {{ formatDelta(k.delta.pct) }}% <span class="mc-vs">{{ k.delta.label }}</span>
+          </div>
+          <div v-if="deltaDetail(k)" class="mc-delta-detail">{{ deltaDetail(k) }}</div>
+        </div>
+      </div>
+
+      <div v-if="supplementalTrendCharts.length" class="supplemental-group">
+        <div class="supplemental-subhead"><h4>趋势变化</h4><span>观察时间变化与拐点</span></div>
+        <div class="chart-grid">
+          <article v-for="(b, bi) in supplementalTrendCharts" :key="`supplemental-trend-${bi}`" class="chart-card">
+            <header class="chart-head">
+              <div><h4>{{ chartTitle(b, supplemental.view) }}</h4><p>{{ chartCaption(b, supplemental.view) }}</p></div>
+              <span class="chart-type">趋势</span>
+            </header>
+            <BiChart :kind="b.kind!" :columns="supplemental.view.columns" :rows="supplemental.rows" :x="b.x!" :y="b.y!" :top="b.top" :series="b.series" />
+          </article>
+        </div>
+      </div>
+
+      <div v-if="supplementalCompositionCharts.length" class="supplemental-group">
+        <div class="supplemental-subhead"><h4>结构分布</h4><span>查看贡献、占比与排名</span></div>
+        <div class="chart-grid" :class="{ paired: supplementalCompositionCharts.length > 1 }">
+          <article v-for="(b, bi) in supplementalCompositionCharts" :key="`supplemental-composition-${bi}`" class="chart-card">
+            <header class="chart-head">
+              <div><h4>{{ chartTitle(b, supplemental.view) }}</h4><p>{{ chartCaption(b, supplemental.view) }}</p></div>
+              <span class="chart-type">{{ b.kind === 'pie' ? '占比' : '排名' }}</span>
+            </header>
+            <BiChart :kind="b.kind!" :columns="supplemental.view.columns" :rows="supplemental.rows" :x="b.x!" :y="b.y!" :top="b.top" :series="b.series" />
+          </article>
+        </div>
+      </div>
+
+      <div v-if="supplementalEntityBlocks.length" class="supplemental-group">
+        <div class="supplemental-subhead"><h4>关联信息</h4><span>补充业务对象属性</span></div>
+        <div v-for="(b, bi) in supplementalEntityBlocks" :key="`supplemental-entity-${bi}`" class="entity">
+          <div class="entity-hd">{{ entityTitle(b) }}</div>
+          <div class="entity-grid">
+            <div v-for="(p, pi) in b.pairs" :key="pi" class="entity-cell">
+              <div class="ec-k">{{ p[0] }}</div>
+              <div class="ec-v">{{ entityValue(p) }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="supplementalTableBlocks.length && supplemental.rows.length && supplemental.columns.length" class="supplemental-group supplemental-table">
+        <div class="supplemental-subhead"><h4>明细数据</h4><span>{{ supplementalRowFoot }}</span></div>
+        <div class="tbl-wrap">
+          <table aria-label="补充结构与明细数据表">
+            <thead><tr><th class="row-index" scope="col">#</th><th v-for="(c, ci) in supplemental.columns" :key="ci" :class="{ num: supplementalIsMetric(ci) }">{{ c }}</th></tr></thead>
+            <tbody>
+              <tr v-for="(row, ri) in supplemental.rows" :key="ri">
+                <td class="row-index">{{ ri + 1 }}</td>
+                <td v-for="(_, ci) in supplemental.columns" :key="ci" :title="supplementalCellTitle(ri, ci)" :class="{ num: supplementalIsMetric(ci) }">
+                  {{ supplementalCell(ri, ci) }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-if="supplementalHasWideTable" class="table-scroll-hint">左右滑动可查看完整字段，悬停单元格可查看完整内容</div>
+      </div>
+    </section>
+
+    <div v-if="result.row_count > 0 && result.view.interact?.drill?.length && !isEntityCandidate" class="drill">
       <span class="drill-t">换个维度看：</span>
       <span v-for="d in result.view.interact.drill" :key="d" class="pill" @click="emit('drill', d)">按{{ d }} ↓</span>
     </div>
+
+    <details v-if="displaySql" class="sql-details">
+      <summary>查看 SQL</summary>
+      <pre>{{ displaySql }}</pre>
+    </details>
+
+    <section v-if="insightCards.length" class="result-section insight-section">
+      <div class="section-head">
+        <div>
+          <span class="section-kicker">AI</span>
+          <h3>分析结论</h3>
+        </div>
+        <span class="analysis-basis">基于本次查询结果</span>
+      </div>
+      <div class="insight-grid">
+        <article v-for="card in insightCards" :key="card.kind" class="insight-card" :class="card.kind">
+          <div class="insight-card-head"><span class="insight-dot"></span>{{ card.title }}</div>
+          <ul>
+            <li v-for="(item, ii) in card.items" :key="ii">{{ item }}</li>
+          </ul>
+        </article>
+      </div>
+    </section>
   </div>
 </template>
+
+<style scoped>
+.result-panel { container-type: inline-size; min-width: 0; max-width: 100%; color: var(--text-regular); }
+
+/* direct-derive 提示条：warning 档（同 trunc-note 色系）——它不是错误（caliber-warn 的 error 红），
+   也不是「没数据」（empty-hint），是「有数但口径未经合同验证」。 */
+.derive-note {
+  margin-bottom: 12px; padding: 8px 12px; border-left: 3px solid var(--warning-text);
+  border-radius: var(--radius); background: var(--warning-bg);
+  color: var(--text-regular); font-size: 12px; line-height: 1.6;
+}
+.derive-note b { color: var(--warning-text); }
+
+.result-section { min-width: 0; margin: 22px 0 0; }
+.result-section:first-of-type { margin-top: 14px; }
+.section-head {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 14px;
+  margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--divider);
+}
+.section-head h3 { display: flex; align-items: center; gap: 7px; margin: 2px 0 0; color: var(--text-primary); font-size: 15px; line-height: 1.35; font-weight: 700; }
+.section-kicker { display: block; color: var(--primary); font-size: 10px; line-height: 1.2; font-weight: 750; }
+.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: 0; }
+.metric-card {
+  position: relative; min-width: 0; min-height: 116px; padding: 15px 16px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg-card); box-shadow: var(--shadow-sm); overflow: hidden;
+}
+.metric-card::before { content: ""; position: absolute; inset: 0 0 auto; height: 2px; background: var(--primary); }
+.mc-label { color: var(--text-muted); font-size: 12px; line-height: 1.4; text-transform: none; letter-spacing: 0; }
+.mc-val {
+  margin-top: 8px; color: var(--text-primary); font-size: 28px; line-height: 1.15; font-weight: 750;
+  font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
+}
+.mc-delta { display: flex; align-items: center; gap: 4px; margin-top: 8px; font-size: 12px; font-weight: 650; }
+.mc-delta.up { color: var(--error-text); }
+.mc-delta.down { color: var(--success-text); }
+.mc-delta.flat { color: var(--text-muted); }
+.delta-mark { font-size: 14px; line-height: 1; }
+.mc-delta .mc-vs { margin-left: 2px; color: var(--text-muted); font-weight: 500; }
+.mc-delta-detail { margin-top: 4px; color: var(--text-faint); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+
+.chart-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.chart-grid.paired { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.chart-card {
+  min-width: 0; margin: 0; padding: 14px 14px 8px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg-card); box-shadow: var(--shadow-sm); overflow: hidden;
+}
+.chart-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 0 2px 8px; }
+.chart-head > div { min-width: 0; }
+.chart-head h4 { margin: 0; color: var(--text-primary); font-size: 14px; line-height: 1.4; font-weight: 700; overflow-wrap: anywhere; }
+.chart-head p { margin: 3px 0 0; color: var(--text-muted); font-size: 11px; line-height: 1.45; }
+.chart-type {
+  flex: 0 0 auto; padding: 2px 7px; border: 1px solid rgba(var(--primary-rgb), .2);
+  border-radius: 4px; background: var(--primary-light); color: var(--primary); font-size: 10px; font-weight: 700;
+}
+
+.entity { margin: 0 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); overflow: hidden; }
+.entity:last-child { margin-bottom: 0; }
+.entity-hd { padding: 10px 13px; background: var(--bg-main); color: var(--text-primary); font-size: 13px; font-weight: 700; }
+.entity-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.entity-cell { min-width: 0; padding: 10px 13px; border-right: 1px solid var(--divider); border-bottom: 1px solid var(--divider); }
+.ec-k { color: var(--text-muted); font-size: 11px; }
+.ec-v { margin-top: 4px; color: var(--text-primary); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; word-break: normal; }
+
+.table-heading { align-items: center; }
+.row-count { color: var(--text-muted); font-size: 11px; text-align: right; }
+.tbl-wrap {
+  width: 100%; max-width: 100%; max-height: 520px; margin: 0; padding: 0;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); box-shadow: none;
+  overflow: auto; overscroll-behavior-inline: contain; scrollbar-gutter: stable;
+}
+.tbl-wrap table { width: 100%; border-collapse: collapse; border-radius: 0; font-size: 12.5px; }
+.tbl-wrap th, .tbl-wrap td { max-width: 320px; padding: 8px 11px; line-height: 1.45; overflow: hidden; text-overflow: ellipsis; }
+.tbl-wrap th { position: sticky; top: 0; z-index: 1; background: var(--bg-main); color: var(--text-regular); font-size: 11.5px; letter-spacing: 0; text-align: left; }
+.tbl-wrap tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--bg-main) 56%, var(--bg-card)); }
+.tbl-wrap tbody tr:hover td { background: var(--primary-light); }
+.tbl-wrap .row-index {
+  position: sticky; left: 0; z-index: 2; width: 38px; min-width: 38px; max-width: 38px;
+  padding-inline: 6px; background: var(--bg-card); color: var(--text-faint); text-align: center;
+  font-size: 10.5px; font-variant-numeric: tabular-nums;
+}
+.tbl-wrap thead .row-index { z-index: 3; background: var(--bg-main); }
+.tbl-wrap tbody tr:nth-child(even) .row-index { background: var(--bg-main); }
+.tbl-wrap tbody tr:hover .row-index { background: var(--primary-light); }
+.redact-lock { margin-left: 4px; font-size: 10px; }
+.table-scroll-hint { display: none; margin-top: 6px; color: var(--text-muted); font-size: 10.5px; text-align: right; }
+
+.supplemental-section { min-width: 0; margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--divider); }
+.supplemental-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.supplemental-head > div { min-width: 0; }
+.supplemental-head h3 { margin: 3px 0 0; color: var(--text-primary); font-size: 16px; line-height: 1.35; font-weight: 750; }
+.supplemental-head p { margin: 4px 0 0; color: var(--text-muted); font-size: 11.5px; line-height: 1.5; }
+.supplemental-kpis { margin-bottom: 16px; }
+.supplemental-group { min-width: 0; margin-top: 18px; }
+.supplemental-subhead { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.supplemental-subhead h4 { margin: 0; color: var(--text-primary); font-size: 13px; line-height: 1.4; font-weight: 700; }
+.supplemental-subhead span { color: var(--text-muted); font-size: 10.5px; text-align: right; }
+.supplemental-table .tbl-wrap { max-height: 440px; }
+
+.entity-choice-card {
+  padding: 16px; border: 1px solid rgba(var(--primary-rgb), .28); border-left: 3px solid var(--primary);
+  border-radius: 8px; background: color-mix(in srgb, var(--primary-light) 38%, var(--bg-card));
+}
+.entity-choice-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.entity-choice-head h3 { margin: 3px 0 0; color: var(--text-primary); font-size: 15px; line-height: 1.4; }
+.entity-choice-head > span { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+.entity-choice-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 13px; }
+.entity-choice {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "kind name action" "kind code action";
+  align-items: center; gap: 2px 10px; min-width: 0; padding: 11px 12px; border: 1px solid var(--border);
+  border-radius: 7px; background: var(--bg-card); color: var(--text-regular); text-align: left; cursor: pointer;
+}
+.entity-choice:hover { border-color: var(--primary); background: var(--primary-light); }
+.entity-choice:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.entity-choice-kind {
+  grid-area: kind; padding: 3px 6px; border-radius: 4px; background: var(--bg-main);
+  color: var(--primary); font-size: 10px; font-weight: 700; white-space: nowrap;
+}
+.entity-choice-name { grid-area: name; min-width: 0; color: var(--text-primary); font-size: 12.5px; font-weight: 700; overflow-wrap: anywhere; }
+.entity-choice-code { grid-area: code; min-width: 0; color: var(--text-muted); font-size: 10.5px; overflow-wrap: anywhere; }
+.entity-choice-action { grid-area: action; color: var(--primary); font-size: 11px; white-space: nowrap; }
+.entity-choice-hint { margin: 10px 0 0; color: var(--text-muted); font-size: 10.5px; line-height: 1.5; }
+
+.drill { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--divider); }
+.drill-t { color: var(--text-muted); }
+.pill { border-radius: 5px; }
+
+.sql-details {
+  margin-top: 18px; border: 1px solid var(--border); border-radius: 7px;
+  background: var(--bg-card); overflow: hidden;
+}
+.sql-details summary {
+  padding: 10px 13px; color: var(--text-muted); font-size: 11.5px; font-weight: 650;
+  cursor: pointer; user-select: none;
+}
+.sql-details[open] summary { border-bottom: 1px solid var(--divider); color: var(--text-primary); }
+.sql-details pre {
+  max-height: 320px; margin: 0; padding: 13px; overflow: auto; background: var(--bg-main);
+  color: var(--text-regular); font: 11.5px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre; tab-size: 2;
+}
+
+.insight-section { margin-top: 24px; padding-top: 2px; }
+.analysis-basis { color: var(--text-muted); font-size: 11px; }
+.insight-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.insight-card {
+  min-width: 0; padding: 13px 14px; border: 1px solid var(--border); border-left-width: 3px;
+  border-radius: 7px; background: var(--bg-card);
+}
+.insight-card.conclusion { border-left-color: var(--primary); }
+.insight-card.risk { border-left-color: var(--warning-text); }
+.insight-card.action { border-left-color: var(--success-text); }
+.insight-card-head { display: flex; align-items: center; gap: 7px; color: var(--text-primary); font-size: 12px; font-weight: 750; }
+.insight-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.insight-card.conclusion .insight-dot { color: var(--primary); }
+.insight-card.risk .insight-dot { color: var(--warning-text); }
+.insight-card.action .insight-dot { color: var(--success-text); }
+.insight-card ul { display: grid; gap: 7px; margin: 9px 0 0; padding: 0; list-style: none; }
+.insight-card li { position: relative; padding-left: 11px; color: var(--text-regular); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.insight-card li::before { content: ""; position: absolute; top: .72em; left: 0; width: 3px; height: 3px; border-radius: 50%; background: var(--text-faint); }
+.ask-custom {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.ask-input {
+  min-width: 0;
+  flex: 1;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+  background: var(--bg-card);
+  color: var(--text-regular);
+  font: inherit;
+}
+
+.ask-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-bg);
+}
+
+.ask-submit {
+  height: 36px;
+  padding: 0 16px;
+  border: 1px solid var(--primary);
+  border-radius: var(--radius);
+  background: var(--primary);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.ask-submit:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+@container (max-width: 720px) {
+  .chart-grid.paired, .insight-grid { grid-template-columns: 1fr; }
+  .entity-choice-list { grid-template-columns: 1fr; }
+  .entity-grid { grid-template-columns: 1fr; }
+  .entity-cell { border-right: 0; }
+  .kpi-row { grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); }
+  .table-scroll-hint { display: block; }
+  .supplemental-head { align-items: flex-start; }
+}
+
+@media (max-width: 600px) {
+  .result-section { margin-top: 18px; }
+  .section-head { align-items: flex-start; margin-bottom: 8px; }
+  .section-head h3 { font-size: 14px; }
+  .kpi-row { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+  .metric-card { min-height: 98px; padding: 13px 14px; }
+  .mc-val { font-size: 24px; }
+  .chart-grid.paired { grid-template-columns: 1fr; }
+  .chart-card { padding: 12px 8px 4px; }
+  .chart-head { padding: 0 5px 5px; }
+  .entity-grid { grid-template-columns: 1fr; }
+  .entity-cell { border-right: 0; }
+  .table-heading { align-items: flex-end; }
+  .row-count { max-width: 52%; }
+  .supplemental-head { align-items: flex-start; }
+  .supplemental-head .row-count { padding-top: 17px; }
+  .supplemental-subhead { align-items: flex-start; }
+  .tbl-wrap { max-height: 420px; }
+  .tbl-wrap th, .tbl-wrap td { max-width: 210px; padding: 8px 9px; font-size: 11.5px; }
+  .insight-grid { grid-template-columns: 1fr; gap: 8px; }
+  .analysis-basis { display: none; }
+  .ask-custom { flex-direction: column; }
+  .ask-submit { width: 100%; }
+}
+</style>

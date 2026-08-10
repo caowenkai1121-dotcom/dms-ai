@@ -1,0 +1,31 @@
+{
+ "summary": "DataFoundry（datagallery-lab/datafoundry，TS monorepo：apps/api Node 原生 http + apps/web Next.js15/CopilotKit + apps/tui Ink + packages/*9 库 + services/datalink Python）是企业数据 Agent 工作台。核心差异不在 NL2SQL 而在「任务治理」：数据分析协议状态机把一次分析拆成 requirements（带验收断言）→ QueryAttempt(plan→validate→execute→result-validate→evidence.bind→requirements.commit)，claim 数值必须与验证值容差一致才能提交，且每条 claim 强制绑定 artifact+audit_log_id；外围是带 token 预算与快照的 Context Package 工程、事件溯源式 run 持久化（run_events 全量落库+幂等重放+崩溃补发）、checkpoint/分支会话、三级语义降级链（DataLink live→快照→物理 schema，带 trust 标签）、28 数据源适配（credential_ref+AES-GCM 密文隔离）、Data Gateway（词法护栏+表 allowlist+行数/超时三层取最小+masking+全状态 SQL 审计）。与 dms-ai 对照：我方强在口径合同/权限注入/确定性模板与回归门禁；对方强在分析协议闭环、证据引用、上下文工程、会话拓扑与审计回放。",
+ "repo": "https://github.com/datagallery-lab/datafoundry（本地 target/tmp/research/datafoundry）",
+ "mechanisms": [
+  {"name": "数据分析协议状态机（验收驱动闭环）", "evidence": "packages/agent-runtime/src/protocol/protocols/data-analysis.ts（780 行，六相位 scope→semantic_grounding→query_planning→execution→validation→synthesis；claim 容差提交 ANALYSIS_CLAIM_VALUE_MISMATCH :719-751）；protocol-runtime.ts CAS revision+事件溯源；config/agent-runtime-limits.ts 动作预算500/驳回3次", "portable": true},
+  {"name": "需求/契约抽取器", "evidence": "model-analysis-requirement-extractor.ts（问题→带验收标准 requirements）；model-analysis-contract-grounder.ts（requirements 绑定物理 schema 生成 sourceTables/dimensions/sqlConstraints/resultChecks/claimValues 断言，带 UNKNOWN_TABLE/COLUMN 校验）；sql-semantic-validator.ts", "portable": true},
+  {"name": "证据引用 EvidenceRef（多轮指代消解）", "evidence": "packages/contracts/src/index.ts:29-96（EvidenceSelection/EvidenceRef 契约）；apps/api/src/evidence-reference-context.ts 解析进受管上下文+诊断", "portable": true},
+  {"name": "Context Package（token 预算+快照+投影）", "evidence": "packages/agent-runtime/src/context/（约60文件；inventory→policy→projection 三段管线；@huggingface/tokenizers 计数；context_package_snapshots 表）；tool-observation/ 每工具一个压缩适配器", "portable": true},
+  {"name": "checkpoint+分支会话+幂等重放", "evidence": "apps/api/src/session-branching.ts（限定状态集 fork）；run-checkpoint-resume.ts（checkpoint→context 快照种子）；run-identity.ts:35-44（replay）；protocol-event-recovery.ts（未确认事件补发）；排队追问为前端 sessionStorage（queued-chat-runs.ts，半成品）", "portable": true},
+  {"name": "SQL 审计+运行历史+Trace DAG", "evidence": "sql_audit_logs 表（含 blocked/timeout 全状态，data-gateway/src/index.ts:201-299）；query_history；run_events 全量；trace-dag.ts 语义 DAG + GET /api/v1/sessions/:id/trace-dag", "portable": true},
+  {"name": "三级语义降级链（trust 标签传导）", "evidence": "packages/agent-runtime/src/semantic/semantic-provider-chain.ts:33-85（live→snapshot→local→unavailable，trust=authoritative/verified/inferred/unknown）", "portable": true},
+  {"name": "DataLink 数据地图（外置语义）", "evidence": "services/datalink/（Connector→Extractor→Profiler→Inferrer→Mapper→Graph；inferrer/ 四类推断 joinable/correlated/distribution/synonym 带 confidence；MCP 单工具 datalink_explore，mcp/server.py:84-234）", "portable": true},
+  {"name": "Data Gateway 护栏组合", "evidence": "packages/data-gateway/src/readonly-guard.ts:113-137（词法级，非 AST——移植时用我方 AST 闸门更强）；index.ts 行数/超时三层取最小:217-226；maskFields 按列名替换 [MASKED]:480-497；表 allowlist 正则抽表:444-473", "portable": true},
+  {"name": "凭据引用化与密文隔离", "evidence": "credential_ref→encrypted_secrets AES-GCM（packages/metadata/src/config-store.ts:87-100）；读 API 永不回明文", "portable": true},
+  {"name": "28 数据源适配器", "evidence": "packages/data-gateway/src/supported-types.ts:3-255（duckdb/sqlite/csv/xlsx/pg/mysql/clickhouse/snowflake/bigquery/sqlserver/oracle/mongodb/gaussdb/access/redis/starrocks/trino/presto/spark/databricks/redshift/es/opensearch/doris/mariadb/tidb/oceanbase/greenplum）；adapter 三方法 inspectSchema/previewTable/runSqlReadonly（types.ts:163-167）", "portable": true},
+  {"name": "产物层（版本化+导出+跨会话复用）", "evidence": "packages/artifacts/（table|chart|markdown|html|file|image|citation_bundle；artifact_versions 版本化）；导出仅 csv/xlsx（config-api.ts:2202-2308）；promote 到 workspace 跨会话", "portable": true},
+  {"name": "认证全套+模型 profile 热切", "evidence": "apps/api/src/auth/routes.ts:37-144（register/verify-email/forgot/reset/CSRF/argon2/限流桶）；run-config-resolver.ts 每 run 重构 provider（热切）；多租户仅 personal workspace（半成品）", "portable": true},
+  {"name": "KB 工具启用集硬校验", "evidence": "agent-runtime/src/index.ts:415-425（KNOWLEDGE_BASE_NOT_ENABLED 硬错误）；knowledge 管线=上传→分块→OpenAI 兼容 embedding→SQLite 向量（packages/knowledge/），向量优先全文兜底", "portable": true},
+  {"name": "运行期限额全 env 化", "evidence": "config/agent-runtime-limits.ts（协议预算/上下文 token/SQL 字符数/工具错误截断等约30项 DATAFOUNDRY_*）", "portable": true},
+  {"name": "MCP/Skills 策略", "evidence": "policy-mcp-tools.ts（重名 MCP_TOOL_NAME_CONFLICT、per-server allowlist）；skills/src/index.ts:433-532（zip 路径穿越/符号链接/大小防护；selectSkillsForRun 打分+all/auto/none/selected）", "portable": true}
+ ],
+ "half_baked": [
+  "contracts 的 profile_dataset/generate_report/export_artifact/publish_artifact 四工具无实现（报告=agent 写 md 自动 ingest，chart=服务端函数）",
+  "capabilities 静态硬编码全 true，不做后端探测",
+  "多租户=个人空间（workspaces 只有 kind:personal/role:owner），无团队协作",
+  "排队追问在前端 sessionStorage，换浏览器即丢",
+  "DataLink「轨迹回流校准图」是愿景文案，无消费实现",
+  "SQL 护栏是词法级（复杂 CTE/别名 allowlist 可漏）",
+  "Oracle/Access 适配器需自备原生驱动（依赖未声明）"
+ ]
+}

@@ -1,0 +1,1 @@
+SELECT DATE_FORMAT(sf.order_date,'%Y-%m') AS `月份`, SUM(sf.amount) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= MAKEDATE((YEAR(CURDATE())),1) AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY) GROUP BY DATE_FORMAT(sf.order_date,'%Y-%m') ORDER BY DATE_FORMAT(sf.order_date,'%Y-%m') ASC LIMIT 200

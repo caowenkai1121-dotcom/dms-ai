@@ -1,0 +1,12 @@
+[package]
+name = "dms-policy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dms-kernel = { path = "../kernel" }
+dms-connector = { path = "../connector" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }

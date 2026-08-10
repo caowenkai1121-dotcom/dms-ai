@@ -1,482 +1,561 @@
 {
-  "_doc": "执行级评测题集（SuperSonic evaluation exec-only 思路）：不比 SQL 文本，比【生成 SQL 与 gold SQL 各自执行的结果集】。gold 口径均来自 PROGRESS 已坐实教训，写死在此作为回归基准。tags 供分层统计。",
-  "cases": [
-    {
-      "name": "AS01-今年各月退款金额趋势",
-      "login": "admin",
-      "q": "今年每个月的售后退款金额是多少？",
-      "tags": [
-        "趋势",
-        "分组",
-        "时间",
-        "聚合"
-      ],
-      "gold_sql": "SELECT DATE_FORMAT(after_sales_time, '%Y-%m') AS `月份`, ROUND(SUM(refund_amount), 2) AS `退款金额` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR) GROUP BY `月份` ORDER BY `月份`",
-      "note": "meta.metric 亲验：退款额=SUM(refund_amount)/after_sales_time/deleted_flag=0 无状态过滤，逐字吻合；after_sales_time 为 AfterSalesOrdeMapper 权威时间列 ｜ 复审重跑 7 行，首行 2026-01 13,485,748.43，1.2s，与作者 verified 一致"
-    },
-    {
-      "name": "AS02-今年售后单完成率",
-      "login": "admin",
-      "q": "今年的售后单里已经处理完成的占比是多少？",
-      "tags": [
-        "派生指标",
-        "占比",
-        "码值筛选",
-        "去重计数"
-      ],
-      "gold_sql": "SELECT ROUND(COUNT(DISTINCT CASE WHEN after_sales_status = '5' THEN after_sales_code END) * 100.0 / COUNT(DISTINCT after_sales_code), 2) AS `完成率` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)",
-      "note": "AfterSalesStatusEnum.java L26 COMPLETE('5','完成') 已亲验；分母为全部售后单 ｜ 复审重跑 1 行，完成率 95.81，1.2s，与作者 verified 一致"
-    },
-    {
-      "name": "AS03-今年退货类售后单数与退款额",
-      "login": "admin",
-      "q": "今年退货类型的售后单有多少单，一共申请退款多少钱？",
-      "tags": [
-        "码值筛选",
-        "口径",
-        "聚合",
-        "去重计数"
-      ],
-      "gold_sql": "SELECT COUNT(DISTINCT after_sales_code) AS `售后单数`, ROUND(SUM(refund_amount), 2) AS `申请退款金额` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_type = '1' AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)",
-      "note": "SystemConsant.java L148 AFTER_SALES_TYPE_1='1' 退货已亲验；该列无枚举类且 meta.value_map 未收录，混入 type3 中台售后会虚增 5 倍以上，区分度强 ｜ 复审重跑 1 行，2,970 单 / 6,343,349.74 元，1.1s，与作者 verified 一致"
-    },
-    {
-      "name": "AS04-今年退款金额占销售额比例",
-      "login": "admin",
-      "q": "今年售后退款金额占销售额的比例是多少？",
-      "tags": [
-        "派生指标",
-        "跨表",
-        "占比",
-        "口径"
-      ],
-      "gold_sql": "SELECT ROUND((SELECT SUM(refund_amount) FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)) * 100.0 / (SELECT SUM(total_amount) FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)), 2) AS `退款占比`",
-      "note": "分子分母各自聚合再相除，两侧口径均与 meta.metric 定义吻合；4.92% 业务量级合理 ｜ 复审重跑 1 行，退款占比 4.92，1.3s，与作者 verified 一致"
-    },
-    {
-      "name": "E01-本月销售额",
-      "login": "admin",
-      "q": "本月销售额是多少",
-      "tags": [
-        "聚合",
-        "时间",
-        "金额口径"
-      ],
-      "gold_sql": "SELECT SUM(total_amount) AS `销售额` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
-    },
-    {
-      "name": "E02-本月订单数",
-      "login": "admin",
-      "q": "本月有多少个订单",
-      "tags": [
-        "聚合",
-        "时间",
-        "去重计数"
-      ],
-      "gold_sql": "SELECT COUNT(DISTINCT sales_order_code) AS `订单数` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
-    },
-    {
-      "name": "E03-各省销售额",
-      "login": "admin",
-      "q": "本月各省销售额",
-      "tags": [
-        "分组",
-        "跨表",
-        "时间"
-      ],
-      "gold_sql": "SELECT COALESCE(NULLIF(cus.province,''),'未知') AS `省份`, SUM(o.total_amount) AS `销售额` FROM t_sales_order o LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0 WHERE o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND o.order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) GROUP BY COALESCE(NULLIF(cus.province,''),'未知') ORDER BY `销售额` DESC"
-    },
-    {
-      "name": "E04-成交客户数",
-      "login": "admin",
-      "q": "本月成交客户数",
-      "tags": [
-        "聚合",
-        "术语",
-        "去重计数"
-      ],
-      "gold_sql": "SELECT COUNT(DISTINCT customer_code) AS `客户数` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
-    },
-    {
-      "name": "E05-销量按商品分类",
-      "login": "admin",
-      "q": "本月各商品分类销量",
-      "tags": [
-        "分组",
-        "明细口径",
-        "去重",
-        "跨表"
-      ],
-      "gold_sql": "SELECT COALESCE(cat.category_name,'未分类') AS `商品分类`, SUM(t.box_quantity) AS `销量` FROM (SELECT DISTINCT d.sales_order_code, d.sku_code, d.sku_name, d.box_quantity, d.amount FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code WHERE d.item_type = '1' AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND o.order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)) t JOIN t_goods g ON g.goods_code = t.sku_code AND g.deleted_flag = 0 LEFT JOIN t_goods_category cat ON g.goods_category_code = cat.id GROUP BY COALESCE(cat.category_name,'未分类') ORDER BY `销量` DESC"
-    },
-    {
-      "name": "E06-客户销售额TOP10",
-      "login": "admin",
-      "q": "本月销售额前10的客户",
-      "tags": [
-        "排行",
-        "TopN",
-        "分组"
-      ],
-      "gold_sql": "SELECT customer_name AS `客户`, SUM(total_amount) AS `销售额` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) GROUP BY customer_name ORDER BY `销售额` DESC LIMIT 10"
-    },
-    {
-      "name": "E07-库存量最新快照",
-      "login": "admin",
-      "q": "现在总库存量是多少",
-      "tags": [
-        "快照口径",
-        "聚合"
-      ],
-      "gold_sql": "SELECT SUM(stock_quantity) AS `库存量` FROM t_winc_stock_report WHERE product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)"
-    },
-    {
-      "name": "E08-已开票金额",
-      "login": "admin",
-      "q": "本月开票金额",
-      "tags": [
-        "码值筛选",
-        "聚合",
-        "时间"
-      ],
-      "gold_sql": "SELECT SUM(amt) AS `开票金额` FROM (SELECT invoice_amount AS amt FROM t_invoice_apply_header WHERE deleted_flag = 0 AND invoice_status = '2' AND apply_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND apply_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) UNION ALL SELECT invoice_amount FROM t_invoice_new_apply_header WHERE deleted_flag = 0 AND invoice_status = '2' AND apply_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND apply_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)) u",
-      "note": "时间列 apply_time（Java ApplicationListHeaderMapper 权威；invoice_time 本库全 NULL）；必须 UNION ALL 新老双表——实测本月新表 275 单 2819 万 vs 老表 16 单 73 万，只查老表漏算 97%"
-    },
-    {
-      "name": "E09-售后单数",
-      "login": "admin",
-      "q": "本月售后单有多少",
-      "tags": [
-        "聚合",
-        "去重计数",
-        "时间"
-      ],
-      "gold_sql": "SELECT COUNT(DISTINCT after_sales_code) AS `售后单数` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)",
-      "note": "时间列 after_sales_time 为 Java AfterSalesOrdeMapper.xml 权威口径（本月=DATE_FORMAT %Y%m）"
-    },
-    {
-      "name": "E10-客单价",
-      "login": "admin",
-      "q": "本月客单价",
-      "tags": [
-        "派生指标",
-        "术语"
-      ],
-      "gold_sql": "SELECT ROUND(SUM(total_amount) / NULLIF(COUNT(DISTINCT sales_order_code),0), 2) AS `客单价` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
-    },
-    {
-      "name": "E11-权限隔离-城市经理销售额",
-      "login": "tanlibo",
-      "role": "city_manager",
-      "q": "本月销售额是多少",
-      "tags": [
-        "权限",
-        "聚合"
-      ],
-      "gold_sql": "SELECT SUM(total_amount) AS `销售额` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
-    },
-    {
-      "name": "E12-上月销售额",
-      "login": "admin",
-      "q": "上月销售额",
-      "tags": [
-        "时间",
-        "聚合"
-      ],
-      "gold_sql": "SELECT SUM(total_amount) AS `销售额` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) AND order_time < DATE_FORMAT(CURDATE(), '%Y-%m-01')"
-    },
-    {
-      "name": "FIN01-今年开票金额TOP10客户",
-      "login": "admin",
-      "q": "今年开票金额最多的前10个客户是哪些，各开了多少",
-      "tags": [
-        "排行",
-        "TopN",
-        "口径",
-        "码值筛选",
-        "跨表",
-        "时间"
-      ],
-      "gold_sql": "SELECT c.customer_name AS `客户`, SUM(u.invoice_amount) AS `开票金额` FROM (SELECT customer_code, invoice_amount FROM t_invoice_apply_header WHERE deleted_flag = 0 AND invoice_status = '2' AND apply_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND apply_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR) UNION ALL SELECT customer_code, invoice_amount FROM t_invoice_new_apply_header WHERE deleted_flag = 0 AND invoice_status = '2' AND apply_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND apply_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)) u JOIN t_customer c ON c.customer_code = u.customer_code AND c.deleted_flag = 0 GROUP BY c.customer_name ORDER BY `开票金额` DESC LIMIT 10",
-      "note": "发票双流 UNION ALL + invoice_status='2' + apply_time 三坑均与已知坑清单吻合，invoice_time 全 NULL 不可用 ｜ 复审重跑 10 行，首行 线下-沈阳浚恒贸易有限公司 3,704,122.60，第10名 1,333,256.40，1.2s，与作者 verified 一致"
-    },
-    {
-      "name": "FIN02-账户余额TOP10客户",
-      "login": "admin",
-      "q": "目前账户余额最高的10个客户是谁，各有多少余额",
-      "tags": [
-        "排行",
-        "TopN",
-        "快照口径",
-        "去重",
-        "跨表"
-      ],
-      "gold_sql": "SELECT c.customer_name AS `客户`, SUM(t.balance) AS `账户余额` FROM (SELECT customer_code, balance_type, balance, ROW_NUMBER() OVER (PARTITION BY customer_code, balance_type ORDER BY created_time DESC, id DESC) AS rn FROM t_customer_balance WHERE deleted_flag = 0 AND balance_status = '4' AND balance_type IN ('8','9')) t JOIN t_customer c ON c.customer_code = t.customer_code AND c.deleted_flag = 0 WHERE t.rn = 1 GROUP BY t.customer_code, c.customer_name ORDER BY `账户余额` DESC LIMIT 10",
-      "note": "meta.pitfall cash_scope 亲验：泛指账户余额只算 balance_type IN('8','9')；分桶 ROW_NUMBER 取最新快照口径亦在 pitfall 坐实；balance_status='4' 出自 CustomerBalanceMapper.xml L40/L113 已亲验 ｜ 复审重跑 10 行，首行 线下-临沂市康兴商贸有限公司 775,660.00，第10名 133,376.16，1.7s，与作者 verified 一致"
-    },
-    {
-      "name": "FIN03-待确认对账单张数与金额",
-      "login": "admin",
-      "q": "目前还有多少张对账单处于待确认状态，涉及金额一共多少",
-      "tags": [
-        "聚合",
-        "码值筛选",
-        "口径",
-        "去重计数"
-      ],
-      "gold_sql": "SELECT COUNT(DISTINCT bill_code) AS `对账单数`, SUM(balance) AS `金额合计` FROM t_account_bill_header WHERE deleted_flag = 0 AND bill_status = '0'",
-      "note": "该表实时写入是本批漂移最大的题，门禁必须近同时执行两侧；bill_status 字典出自 AccountBillStatusEnum，金额列为 balance ｜ 复审重跑 1 行，[24765, 401,922,117.52]，1.2s（作者测 24724/4.011 亿，库持续写入数小时漂 0.17%）；门禁两侧 SQL 秒级间隔执行时漂移约 0.01% 量级，在 0.5% 容差内"
-    },
-    {
-      "name": "FIN04-有信控余额的客户清单",
-      "login": "admin",
-      "q": "目前哪些客户还有信控余额，各剩多少",
-      "tags": [
-        "明细",
-        "快照口径",
-        "码值筛选",
-        "跨表"
-      ],
-      "gold_sql": "SELECT c.customer_name AS `客户`, t.balance AS `信控余额` FROM (SELECT customer_code, balance, ROW_NUMBER() OVER (PARTITION BY customer_code ORDER BY created_time DESC, id DESC) AS rn FROM t_customer_balance WHERE deleted_flag = 0 AND balance_status = '4' AND balance_type = '1') t JOIN t_customer c ON c.customer_code = t.customer_code AND c.deleted_flag = 0 WHERE t.rn = 1 AND t.balance > 0 ORDER BY `信控余额` DESC",
-      "note": "balance_type='1'=信控 出自 meta.pitfall 字典条已亲验；输出形状为客户+各自数值清单，命中 sql.shape.scalar_per_row 历史坑 ｜ 复审重跑 23 行，首行 线下-广东横琴雨燕供应链管理有限公司 27,691,782.67，1.3s，与作者 verified 一致"
-    },
-    {
-      "name": "GOODS13-上半年月度销量趋势",
-      "login": "admin",
-      "q": "2026年上半年每个月的销量是多少箱",
-      "tags": [
-        "趋势",
-        "时间",
-        "去重",
-        "口径",
-        "跨表",
-        "分组"
-      ],
-      "gold_sql": "SELECT t.ym AS `月份`, SUM(t.box_quantity) AS `销量` FROM (SELECT DISTINCT DATE_FORMAT(o.order_time,'%Y-%m') AS ym, d.sales_order_code, d.sku_code, d.sku_name, d.box_quantity, d.amount FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code WHERE d.item_type = '1' AND d.deleted_flag = 0 AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= '2026-01-01' AND o.order_time < '2026-07-01') t GROUP BY t.ym ORDER BY t.ym",
-      "note": "DISTINCT 键额外含 ym 但 ym 由 sales_order_code 函数依赖决定，不破坏五键去重；明细表无 order_time，须 JOIN 主表取时间 ｜ 复审重跑 6 行，首行 2026-01 1,699,191 箱，末行 2026-06 1,301,555 箱，7.0s，与作者 verified 一致"
-    },
-    {
-      "name": "GOODS14-六月赠品箱数",
-      "login": "admin",
-      "q": "2026年6月我们送出去的赠品有多少箱",
-      "tags": [
-        "聚合",
-        "码值筛选",
-        "去重",
-        "口径",
-        "时间"
-      ],
-      "gold_sql": "SELECT SUM(t.box_quantity) AS `赠品箱数` FROM (SELECT DISTINCT d.sales_order_code, d.sku_code, d.sku_name, d.box_quantity, d.amount FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code WHERE d.item_type = '2' AND d.deleted_flag = 0 AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= '2026-06-01' AND o.order_time < '2026-07-01') t",
-      "note": "SystemConsant.java L39 ITEM_TYPE02='2' 赠品已亲验；is_gift 与 item_type 不等价（作者实测冲突 3128 行），赠品权威口径是 item_type='2' ｜ 复审重跑 1 行，赠品箱数 127,211，2.0s，与作者 verified 一致"
-    },
-    {
-      "name": "GOODS15-六月动销商品数",
-      "login": "admin",
-      "q": "2026年6月动销商品有多少个",
-      "tags": [
-        "去重计数",
-        "口径",
-        "时间",
-        "跨表"
-      ],
-      "gold_sql": "SELECT COUNT(DISTINCT d.sku_code) AS `动销商品数` FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code WHERE d.item_type = '1' AND d.deleted_flag = 0 AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= '2026-06-01' AND o.order_time < '2026-07-01'",
-      "note": "若擅自加 box_quantity>0 得 151 差 14.5% 超容差；COUNT DISTINCT 天然免疫 2x 重复 ｜ 复审重跑 1 行，动销商品数 173，1.6s，与作者 verified 一致；meta.term 亲验：动销=统计期内有销售记录的商品(在明细出现过的 sku)，不要求箱数>0 tags 去掉不在规定清单里的「术语」（考点已由「口径」覆盖），SQL 未动"
-    },
-    {
-      "name": "GOODS16-六月手抓饼分类销量",
-      "login": "admin",
-      "q": "2026年6月手抓饼这个分类卖了多少箱",
-      "tags": [
-        "聚合",
-        "跨表",
-        "口径",
-        "去重",
-        "码值筛选"
-      ],
-      "gold_sql": "SELECT SUM(t.box_quantity) AS `销量` FROM (SELECT DISTINCT d.sales_order_code, d.sku_code, d.sku_name, d.box_quantity, d.amount FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code JOIN t_goods g ON g.goods_code = d.sku_code AND g.deleted_flag = 0 JOIN t_goods_category cat ON g.goods_category_code = cat.id AND cat.category_name LIKE '%手抓饼%' WHERE d.item_type = '1' AND d.deleted_flag = 0 AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= '2026-06-01' AND o.order_time < '2026-07-01') t",
-      "note": "复审探查：六月动销 sku 在 t_goods(deleted_flag=0) 零缺失，INNER JOIN 不丢行；JOIN 链 d.sku_code=g.goods_code→g.goods_category_code=cat.id 与已知坑清单一致 ｜ 复审重跑 1 行，销量 115,175 箱，2.3s，与作者 verified 一致；与 GOODS17 分类榜第 4 名手抓饼 115,175 交叉吻合"
-    },
-    {
-      "name": "GOODS17-六月分类销量Top5",
-      "login": "admin",
-      "q": "2026年6月销量最高的5个商品分类是哪些",
-      "tags": [
-        "排行",
-        "TopN",
-        "分组",
-        "去重",
-        "跨表",
-        "口径"
-      ],
-      "gold_sql": "SELECT COALESCE(cat.category_name,'未分类') AS `商品分类`, SUM(t.box_quantity) AS `销量` FROM (SELECT DISTINCT d.sales_order_code, d.sku_code, d.sku_name, d.box_quantity, d.amount FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code WHERE d.item_type = '1' AND d.deleted_flag = 0 AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= '2026-06-01' AND o.order_time < '2026-07-01') t JOIN t_goods g ON g.goods_code = t.sku_code AND g.deleted_flag = 0 LEFT JOIN t_goods_category cat ON g.goods_category_code = cat.id GROUP BY COALESCE(cat.category_name,'未分类') ORDER BY `销量` DESC LIMIT 5",
-      "note": "INNER JOIN t_goods 无丢行（六月 sku 零缺失已探查）；未分类桶居第一，写 INNER JOIN 分类表会整榜错位，区分度强 ｜ 复审重跑 5 行：未分类 233,696 / 脆皮烤肠 212,576 / 商用蛋挞 141,502 / 手抓饼 115,175 / 蛋挞 85,762，3.1s，与作者 verified 一致"
-    },
-    {
-      "name": "MKT01-市场费用Top5费用项目",
-      "login": "admin",
-      "q": "今年市场费用花得最多的前5个费用项目是哪些？各花了多少钱？",
-      "tags": [
-        "排行",
-        "TopN",
-        "分组",
-        "口径",
-        "时间"
-      ],
-      "gold_sql": "SELECT expense_item_name AS 费用项目, ROUND(SUM(expense_amount),2) AS 金额 FROM t_market_total_expense WHERE deleted_flag = 0 AND created_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') GROUP BY expense_item_name ORDER BY 金额 DESC LIMIT 5",
-      "note": "meta.metric 市场费用=SUM(expense_amount)/t_market_total_expense/deleted_flag=0/created_time 亲验逐字吻合；expense_item_name 与 expense_item 全库不同值，选错列全错 ｜ 复审重跑 5 行，首行 活动执行费用.活动执行外包人员费用 7,971,663.99，1.3s，与作者 verified 一致"
-    },
-    {
-      "name": "MKT02-大型活动场次",
-      "login": "admin",
-      "q": "大型活动一共办了多少场？",
-      "tags": [
-        "码值筛选",
-        "去重计数",
-        "口径"
-      ],
-      "gold_sql": "SELECT COUNT(DISTINCT activity_no) AS 场次 FROM t_activity_main WHERE deleted_flag = 0 AND activity_level = 3",
-      "note": "meta.pitfall activity_level 字典亲验：1小/2中/3大/4CP，且分布类禁剔暂存；meta.metric 活动场次=COUNT(DISTINCT activity_no)/deleted_flag=0 亲验吻合 ｜ 复审重跑 1 行，24 场，1.1s，与作者 verified 一致"
-    },
-    {
-      "name": "MKT03-活动临促人员费用",
-      "login": "admin",
-      "q": "今年活动临促人员的费用一共花了多少钱？",
-      "tags": [
-        "聚合",
-        "口径",
-        "时间"
-      ],
-      "gold_sql": "SELECT ROUND(SUM(total_amount),2) AS 临促费用 FROM t_activity_promoter_fee WHERE deleted_flag = 0 AND created_time >= DATE_FORMAT(CURDATE(), '%Y-01-01')",
-      "note": "Java ActivityMainMapper.xml 临促费用取 a.total_amount；考点在两表选择（错走执行表虚增近 5 倍），时间列差异本身在容差内 ｜ 复审重跑 1 行，1,644,599.27（作者测 1,643,309.27，实时写入漂 0.08%，门禁近同时执行无风险），1.2s"
-    },
-    {
-      "name": "MKT04-本月活动执行人员费用",
-      "login": "admin",
-      "q": "这个月活动执行人员的费用是多少？",
-      "tags": [
-        "聚合",
-        "时间",
-        "口径"
-      ],
-      "gold_sql": "SELECT ROUND(SUM(amount),2) AS 执行人员费用 FROM t_market_activity_promoter_expense WHERE deleted_flag = 0 AND created_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND created_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)",
-      "note": "activity_date 全 NULL 只准用 created_time（meta.pitfall 坐实）；金额列是 amount ｜ 复审重跑 1 行，911,279.00，1.2s，与作者 verified 一致"
-    },
-    {
-      "name": "PERM01-城市经理今年售后单数",
-      "login": "tanlibo",
-      "role": "city_manager",
-      "q": "今年售后单有多少",
-      "tags": [
-        "权限",
-        "时间",
-        "去重计数"
-      ],
-      "gold_sql": "SELECT COUNT(DISTINCT after_sales_code) AS `售后单数` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)",
-      "note": "gold 不带权限条件，由注入器统一补，与系统 ask 同路径同口径；隔离比 3.5% 远超容差，漏注入/漏公用客户段均拦得住 ｜ 复审以 exec-sql tanlibo … city_manager 重跑 1 行 696，1.1s；返回 SQL 中亲眼确认注入条件 owner_manager IN (78) OR customer_code IN (27 家公用客户)，与作者 verified 一致（超管同 SQL 19,781）"
-    },
-    {
-      "name": "PERM02-城市经理可见客户数",
-      "login": "tanlibo",
-      "role": "city_manager",
-      "q": "现在系统里一共有多少家客户",
-      "tags": [
-        "权限",
-        "聚合",
-        "口径"
-      ],
-      "gold_sql": "SELECT COUNT(*) AS `客户数` FROM t_customer WHERE deleted_flag = 0",
-      "note": "纯权限隔离题：漏注入答 3968、漏公用客户段答 0、空段误当哨兵 -1 也答 0，三种回归全拦 ｜ 复审以 exec-sql tanlibo … city_manager 重跑 1 行 27，1.2s；返回 SQL 亲验注入 area_manager_id IN (78) OR customer_code IN (27 家公用客户)，与作者 verified 一致（超管 3968）"
-    },
-    {
-      "name": "SALE13-各业务员销售额",
-      "login": "admin",
-      "q": "本月各业务员的销售额是多少",
-      "tags": [
-        "分组",
-        "跨表",
-        "时间",
-        "聚合"
-      ],
-      "gold_sql": "SELECT COALESCE(e.actual_name,'未知') AS `业务员`, SUM(o.total_amount) AS `销售额` FROM t_sales_order o LEFT JOIN t_employee e ON o.owner_manager = e.employee_id WHERE o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND o.order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) GROUP BY COALESCE(e.actual_name,'未知') ORDER BY `销售额` DESC",
-      "note": "Java 权威：salseOrder.xml L188 LEFT JOIN t_employee ON owner_manager=employee_id 已亲验；复审探查 t_employee.employee_id 全表唯一(3610/3610)，JOIN 无翻倍风险 ｜ 复审重跑 200 行，首行 月月 72,239,224.39，1.3s，与作者 verified 一致"
-    },
-    {
-      "name": "SALE14-今年月度销售趋势",
-      "login": "admin",
-      "q": "今年每个月的销售额趋势",
-      "tags": [
-        "趋势",
-        "时间",
-        "分组",
-        "聚合"
-      ],
-      "gold_sql": "SELECT DATE_FORMAT(order_time, '%Y-%m') AS `月份`, SUM(total_amount) AS `销售额` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') GROUP BY DATE_FORMAT(order_time, '%Y-%m') ORDER BY `月份`",
-      "note": "口径依据 meta.metric sales_amount；库里数据始于 2025-09，「今年」窗口写错会混入 2025 年月份 ｜ 复审重跑 7 行（2026-01~07），首行 2026-01 225,250,743.36，1.4s，与作者 verified 一致"
-    },
-    {
-      "name": "SALE15-本月销量TOP10商品",
-      "login": "admin",
-      "q": "本月卖得最好的10个商品是哪些",
-      "tags": [
-        "排行",
-        "TopN",
-        "去重",
-        "明细",
-        "口径"
-      ],
-      "gold_sql": "SELECT t.sku_name AS `商品`, SUM(t.box_quantity) AS `销量` FROM (SELECT DISTINCT d.sales_order_code, d.sku_code, d.sku_name, d.box_quantity, d.amount FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code WHERE d.item_type = '1' AND d.deleted_flag = 0 AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND o.order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)) t GROUP BY t.sku_name ORDER BY `销量` DESC LIMIT 10",
-      "note": "五键 DISTINCT 去重 + item_type='1' 口径出自 meta.metric sales_qty；SystemConsant.java L38 ITEM_TYPE01='1' 正品已亲验 ｜ 复审重跑修正版 10 行，首行 皇家小虎商用葡式蛋挞液0907G22 69,156，2.1s；与原版 Top10 逐值一致 补上 d.deleted_flag=0（原 gold 漏了，与同批 GOODS 系列及 Java SalseOrderDetailMapper 全查询口径不一致）；实测全表仅 1 行删除明细，补后 Top10 逐值不变，零风险修正"
-    },
-    {
-      "name": "SALE16-销售额环比",
-      "login": "admin",
-      "q": "本月销售额比上月增长了百分之多少",
-      "tags": [
-        "派生指标",
-        "时间",
-        "聚合"
-      ],
-      "gold_sql": "SELECT ROUND((cur.amt - prev.amt) / prev.amt * 100, 2) AS `环比增长率` FROM (SELECT SUM(total_amount) AS amt FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)) cur, (SELECT SUM(total_amount) AS amt FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) AND order_time < DATE_FORMAT(CURDATE(), '%Y-%m-01')) prev",
-      "note": "两窗均套有效订单口径；与 SALE14 的 2026-06/07 单月值交叉一致（187,006,979/181,496,871→+3.04%） ｜ 复审重跑 1 行，值 3.04，1.4s，与作者 verified 一致；两窗口互斥半开区间正确"
-    },
-    {
-      "name": "SALE17-湖南省销售额",
-      "login": "admin",
-      "q": "本月湖南省的销售额是多少",
-      "tags": [
-        "跨表",
-        "码值筛选",
-        "时间",
-        "聚合"
-      ],
-      "gold_sql": "SELECT SUM(o.total_amount) AS `销售额` FROM t_sales_order o JOIN t_customer c ON c.customer_code = o.customer_code AND c.deleted_flag = 0 JOIN t_regions r ON r.region_code = c.province WHERE r.region_name LIKE '%湖南%' AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND o.order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)",
-      "note": "t_customer.province 存 6 位区划码，须经 t_regions 翻译；系统当前对此题不做省份过滤直接返回全省分组，题目有强区分度 ｜ 复审重跑 1 行，值 46,520,283.70，1.5s，与作者 verified 一致；另探查本月有效订单中 customer_code 无有效客户的为 0 行 0 金额，INNER JOIN 不丢单"
-    },
-    {
-      "name": "STK01-仓库库存金额TOP10",
-      "login": "admin",
-      "q": "目前哪个仓库的库存金额最高？给我看前10名",
-      "tags": [
-        "快照口径",
-        "排行",
-        "TopN",
-        "聚合"
-      ],
-      "gold_sql": "SELECT warehouse_name AS `仓库`, SUM(stock_amount) AS `库存金额` FROM t_winc_stock_report WHERE product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report) GROUP BY warehouse_name ORDER BY `库存金额` DESC LIMIT 10",
-      "note": "meta.metric 库存金额亲验：scope_filter 即最新快照子查询，逐字吻合；不取最新日全量累加虚增 56 倍 ｜ 复审重跑 10 行，首行 长沙三子冰冻食品销售有限公司仓库 5,680,278.80，1.7s，与作者 verified 一致"
-    },
-    {
-      "name": "STK02-各省库存金额",
-      "login": "admin",
-      "q": "各省份现在的库存金额分别是多少",
-      "tags": [
-        "快照口径",
-        "分组",
-        "聚合",
-        "口径"
-      ],
-      "gold_sql": "SELECT COALESCE(NULLIF(province,''),'未知') AS `省份`, SUM(stock_amount) AS `库存金额` FROM t_winc_stock_report WHERE product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report) GROUP BY COALESCE(NULLIF(province,''),'未知') ORDER BY `库存金额` DESC",
-      "note": "省份用库存表自带 province 列；空串归未知；0 值行保留（擅自过滤会行数不齐） ｜ 复审重跑 13 行，首行 湖南省 5,700,153.30，末尾含重庆/未知/甘肃 3 个 0 金额省，1.7s，与作者 verified 一致"
-    }
-  ]
+ "_doc": "Doris 执行级评测题集：每题必须且只能声明 gold_sql 或 expected_unavailable。gold_sql 比执行结果；事实未同步题只接受明确 fail-closed 文案，不执行不存在的 gold。tags 供分层统计。",
+ "_protocol": {
+  "gold_sql": "当前 Doris 可执行的只读真值 SQL；执行失败在产品问答前直接判红，禁止静默跳过",
+  "expected_unavailable": {
+   "contains_any": "用户可见响应至少包含一个不可用关键词",
+   "contains_all": "用户可见响应必须同时点明的业务对象"
+  }
+ },
+ "cases": [
+  {
+   "name": "AS01-今年各月退款金额趋势",
+   "login": "admin",
+   "q": "今年每个月的售后退款金额是多少？",
+   "tags": [
+    "趋势",
+    "分组",
+    "时间",
+    "聚合"
+   ],
+   "gold_sql": "SELECT DATE_FORMAT(after_sales_time, '%Y-%m') AS `月份`, ROUND(SUM(refund_amount), 2) AS `退款金额` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR) GROUP BY `月份` ORDER BY `月份`",
+   "note": "meta.metric 亲验：退款额=SUM(refund_amount)/after_sales_time/deleted_flag=0 无状态过滤，逐字吻合；after_sales_time 为 AfterSalesOrdeMapper 权威时间列 ｜ 复审重跑 7 行，首行 2026-01 13,485,748.43，1.2s，与作者 verified 一致"
+  },
+  {
+   "name": "AS02-今年售后单完成率",
+   "login": "admin",
+   "q": "今年的售后单里已经处理完成的占比是多少？",
+   "tags": [
+    "派生指标",
+    "占比",
+    "码值筛选",
+    "去重计数"
+   ],
+   "gold_sql": "SELECT ROUND(COUNT(DISTINCT CASE WHEN after_sales_status = '5' THEN after_sales_code END) * 100.0 / COUNT(DISTINCT after_sales_code), 2) AS `完成率` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)",
+   "note": "AfterSalesStatusEnum.java L26 COMPLETE('5','完成') 已亲验；分母为全部售后单 ｜ 复审重跑 1 行，完成率 95.81，1.2s，与作者 verified 一致"
+  },
+  {
+   "name": "AS03-今年退货类售后单数与退款额",
+   "login": "admin",
+   "q": "今年退货类型的售后单有多少单，一共申请退款多少钱？",
+   "tags": [
+    "码值筛选",
+    "口径",
+    "聚合",
+    "去重计数"
+   ],
+   "gold_sql": "SELECT COUNT(DISTINCT after_sales_code) AS `售后单数`, ROUND(SUM(refund_amount), 2) AS `申请退款金额` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_type = '1' AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)",
+   "note": "SystemConsant.java L148 AFTER_SALES_TYPE_1='1' 退货已亲验；该列无枚举类且 meta.value_map 未收录，混入 type3 中台售后会虚增 5 倍以上，区分度强 ｜ 复审重跑 1 行，2,970 单 / 6,343,349.74 元，1.1s，与作者 verified 一致"
+  },
+  {
+   "name": "AS04-今年退款金额占销售额比例",
+   "login": "admin",
+   "q": "今年售后退款金额占销售额的比例是多少？",
+   "tags": [
+    "派生指标",
+    "跨表",
+    "占比",
+    "口径"
+   ],
+   "gold_sql": "SELECT ROUND((SELECT SUM(refund_amount) FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)) * 100.0 / NULLIF((SELECT SUM(sf.amount) FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND sf.order_date < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)), 0), 2) AS `退款占比`",
+   "note": "分子仍取售后事实 refund_amount；分母统一为 DWS 销售事实 SUM(amount)，两侧分别按自身时间列聚合后相除。"
+  },
+  {
+   "name": "E01-本月销售额",
+   "login": "admin",
+   "q": "本月销售额是多少",
+   "tags": [
+    "聚合",
+    "时间",
+    "金额口径"
+   ],
+   "gold_sql": "SELECT COALESCE(SUM(sf.amount), 0) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY)",
+   "note": "默认销售额只取 sales_dw.dws_off_offline_sale_dfn 的 SUM(amount)；本月截至今天（含今天）。旧发货 UNION/JOIN 已废止。"
+  },
+  {
+   "name": "E01T-今天销售额",
+   "login": "admin",
+   "q": "今天销售额是多少",
+   "tags": [
+    "聚合",
+    "时间",
+    "金额口径",
+    "自然日"
+   ],
+   "gold_sql": "SELECT COALESCE(SUM(sf.amount), 0) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= CURDATE() AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY)",
+   "note": "DWS 今天销售额按完整自然日半开区间取数，不使用旧发货专用截断。"
+  },
+  {
+   "name": "E02-本月订单数",
+   "login": "admin",
+   "q": "本月有多少个订单",
+   "tags": [
+    "聚合",
+    "时间",
+    "去重计数"
+   ],
+   "gold_sql": "SELECT COUNT(DISTINCT sales_order_code) AS `订单数` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
+  },
+  {
+   "name": "E03-本月不含税成本",
+   "login": "admin",
+   "q": "本月不含税成本是多少",
+   "tags": [
+    "聚合",
+    "时间",
+    "口径"
+   ],
+   "gold_sql": "SELECT SUM(sf.cost_excluding_tax) AS `不含税成本` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY)",
+   "note": "默认不含税成本使用 DWS SUM(cost_excluding_tax)，禁止旧订单或发货事实替代。"
+  },
+  {
+   "name": "E03R-各省区销售额",
+   "login": "admin",
+   "q": "本月各省区销售额",
+   "tags": [
+    "分组",
+    "时间",
+    "口径"
+   ],
+   "gold_sql": "SELECT COALESCE(NULLIF(sf.region,''),'未归属') AS `省区`, SUM(sf.amount) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY) GROUP BY COALESCE(NULLIF(sf.region,''),'未归属') ORDER BY `销售额` DESC",
+   "note": "省区是默认销售事实的业务确认维度，只能使用 region；不得替换为省份字段或回接客户表。"
+  },
+  {
+   "name": "E04-成交客户数",
+   "login": "admin",
+   "q": "本月成交客户数",
+   "tags": [
+    "聚合",
+    "术语",
+    "去重计数"
+   ],
+   "gold_sql": "SELECT COUNT(DISTINCT customer_code) AS `客户数` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
+  },
+  {
+   "name": "E05-本月不含税收入",
+   "login": "admin",
+   "q": "本月不含税收入是多少",
+   "tags": [
+    "聚合",
+    "时间",
+    "口径"
+   ],
+   "gold_sql": "SELECT SUM(sf.revenue_excluding_tax) AS `不含税收入` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY)",
+   "note": "默认不含税收入使用 DWS SUM(revenue_excluding_tax)。"
+  },
+  {
+   "name": "E06-客户销售额TOP10",
+   "login": "admin",
+   "q": "本月销售额前10的客户",
+   "tags": [
+    "排行",
+    "TopN",
+    "分组"
+   ],
+   "gold_sql": "SELECT COALESCE(NULLIF(sf.storename,''),NULLIF(sf.storecode,''),'未知') AS `客户`, SUM(sf.amount) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY) GROUP BY COALESCE(NULLIF(sf.storename,''),NULLIF(sf.storecode,''),'未知') ORDER BY `销售额` DESC LIMIT 10",
+   "note": "客户只使用 storename/storecode，不解释为门店；销售额只取 DWS SUM(amount)，旧发货 UNION/JOIN 已废止。"
+  },
+  {
+   "name": "E07-库存量最新快照",
+   "login": "admin",
+   "q": "现在总库存量是多少",
+   "tags": [
+    "快照口径",
+    "聚合"
+   ],
+   "gold_sql": "SELECT SUM(stock_quantity) AS `库存量` FROM t_winc_stock_report WHERE product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)"
+  },
+  {
+   "name": "E08-已开票金额",
+   "login": "admin",
+   "q": "本月开票金额",
+   "tags": [
+    "码值筛选",
+    "聚合",
+    "时间"
+   ],
+   "expected_unavailable": {
+    "contains_any": [
+     "不可计算",
+     "未同步",
+     "无法安全计算"
+    ],
+    "contains_all": [
+     "开票"
+    ]
+   },
+   "note": "Doris 当前未同步 DMS 新老开票事实流；产品必须明确不可安全计算，不得用 0 或相似指标替代"
+  },
+  {
+   "name": "E09-售后单数",
+   "login": "admin",
+   "q": "本月售后单有多少",
+   "tags": [
+    "聚合",
+    "去重计数",
+    "时间"
+   ],
+   "gold_sql": "SELECT COUNT(DISTINCT after_sales_code) AS `售后单数` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)",
+   "note": "时间列 after_sales_time 为 Java AfterSalesOrdeMapper.xml 权威口径（本月=DATE_FORMAT %Y%m）"
+  },
+  {
+   "name": "E10-客单价",
+   "login": "admin",
+   "q": "本月客单价",
+   "tags": [
+    "派生指标",
+    "术语"
+   ],
+   "gold_sql": "SELECT ROUND(SUM(total_amount) / NULLIF(COUNT(DISTINCT sales_order_code),0), 2) AS `客单价` FROM t_sales_order WHERE deleted_flag = 0 AND order_status NOT IN ('0','108','199') AND order_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND order_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)"
+  },
+  {
+   "name": "E11-权限隔离-城市经理销售额",
+   "login": "tanlibo",
+   "role": "city_manager",
+   "q": "本月销售额是多少",
+   "tags": [
+    "权限",
+    "聚合"
+   ],
+   "gold_sql": "SELECT COALESCE(SUM(sf.amount), 0) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY)",
+   "note": "权限评测沿用同一 DWS SUM(amount) 合同与本月至今窗口，旧发货 UNION/JOIN 已废止。"
+  },
+  {
+   "name": "E12-上月销售额",
+   "login": "admin",
+   "q": "上月销售额",
+   "tags": [
+    "时间",
+    "聚合"
+   ],
+   "gold_sql": "SELECT COALESCE(SUM(sf.amount), 0) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01') AND sf.order_date < DATE_FORMAT(CURDATE(), '%Y-%m-01')",
+   "note": "2026-08-06 迁移至已验证销售经营事实 sales_dw.dws_off_offline_sale_dfn；时间列 order_date，销售额 SUM(amount)、销量 SUM(qty)，维度使用表内确认字段，禁止旧发货 UNION/JOIN。"
+  },
+  {
+   "name": "FIN01-今年开票金额TOP10客户",
+   "login": "admin",
+   "q": "今年开票金额最多的前10个客户是哪些，各开了多少",
+   "tags": [
+    "排行",
+    "TopN",
+    "口径",
+    "码值筛选",
+    "跨表",
+    "时间"
+   ],
+   "expected_unavailable": {
+    "contains_any": [
+     "不可计算",
+     "未同步",
+     "无法安全计算"
+    ],
+    "contains_all": [
+     "开票"
+    ]
+   },
+   "note": "Doris 当前未同步 DMS 新老开票事实流；客户 Top10 同样必须 fail-closed，不能只查任一残表"
+  },
+  {
+   "name": "FIN02-账户余额TOP10客户",
+   "login": "admin",
+   "q": "目前账户余额最高的10个客户是谁，各有多少余额",
+   "tags": [
+    "排行",
+    "TopN",
+    "快照口径",
+    "去重",
+    "跨表"
+   ],
+   "gold_sql": "SELECT c.customer_name AS `客户`, SUM(t.balance) AS `账户余额` FROM (SELECT customer_code, balance_type, balance, ROW_NUMBER() OVER (PARTITION BY customer_code, balance_type ORDER BY created_time DESC, id DESC) AS rn FROM t_customer_balance WHERE deleted_flag = 0 AND balance_status = '4' AND balance_type IN ('8','9')) t JOIN t_customer c ON c.customer_code = t.customer_code AND c.deleted_flag = 0 WHERE t.rn = 1 GROUP BY t.customer_code, c.customer_name ORDER BY `账户余额` DESC LIMIT 10",
+   "note": "meta.pitfall cash_scope 亲验：泛指账户余额只算 balance_type IN('8','9')；分桶 ROW_NUMBER 取最新快照口径亦在 pitfall 坐实；balance_status='4' 出自 CustomerBalanceMapper.xml L40/L113 已亲验 ｜ 复审重跑 10 行，首行 线下-临沂市康兴商贸有限公司 775,660.00，第10名 133,376.16，1.7s，与作者 verified 一致"
+  },
+  {
+   "name": "FIN03-待确认对账单张数与金额",
+   "login": "admin",
+   "q": "目前还有多少张对账单处于待确认状态，涉及金额一共多少",
+   "tags": [
+    "聚合",
+    "码值筛选",
+    "口径",
+    "去重计数"
+   ],
+   "expected_unavailable": {
+    "contains_any": [
+     "不可计算",
+     "未同步",
+     "无法安全计算"
+    ],
+    "contains_all": [
+     "对账"
+    ]
+   },
+   "note": "Doris 当前未同步对账单事实；不得拿市场报销、应收或订单余额等相似表猜算"
+  },
+  {
+   "name": "FIN04-有信控余额的客户清单",
+   "login": "admin",
+   "q": "目前哪些客户还有信控余额，各剩多少",
+   "tags": [
+    "明细",
+    "快照口径",
+    "码值筛选",
+    "跨表"
+   ],
+   "gold_sql": "SELECT c.customer_name AS `客户`, t.balance AS `信控余额` FROM (SELECT customer_code, balance, ROW_NUMBER() OVER (PARTITION BY customer_code ORDER BY created_time DESC, id DESC) AS rn FROM t_customer_balance WHERE deleted_flag = 0 AND balance_status = '4' AND balance_type = '1') t JOIN t_customer c ON c.customer_code = t.customer_code AND c.deleted_flag = 0 WHERE t.rn = 1 AND t.balance > 0 ORDER BY `信控余额` DESC",
+   "note": "balance_type='1'=信控 出自 meta.pitfall 字典条已亲验；输出形状为客户+各自数值清单，命中 sql.shape.scalar_per_row 历史坑 ｜ 复审重跑 23 行，首行 线下-广东横琴雨燕供应链管理有限公司 27,691,782.67，1.3s，与作者 verified 一致"
+  },
+  {
+   "name": "GOODS13-上半年月度销量趋势",
+   "login": "admin",
+   "q": "2026年上半年每个月的销量是多少",
+   "tags": [
+    "趋势",
+    "时间",
+    "口径",
+    "分组"
+   ],
+   "gold_sql": "SELECT DATE_FORMAT(sf.order_date,'%Y-%m') AS `月份`, SUM(sf.qty) AS `销量` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= '2026-01-01' AND sf.order_date < '2026-07-01' GROUP BY DATE_FORMAT(sf.order_date,'%Y-%m') ORDER BY `月份` ASC",
+   "note": "默认销量统一使用 DWS 销售事实 SUM(qty)，时间列 order_date；问题不声明箱数，避免把 qty 擅自解释为箱。"
+  },
+  {
+   "name": "GOODS14-六月赠品箱数",
+   "login": "admin",
+   "q": "2026年6月我们送出去的赠品有多少箱",
+   "tags": [
+    "聚合",
+    "码值筛选",
+    "去重",
+    "口径",
+    "时间"
+   ],
+   "gold_sql": "SELECT SUM(t.box_quantity) AS `赠品箱数` FROM (SELECT DISTINCT d.sales_order_code, d.sku_code, d.sku_name, d.box_quantity, d.amount FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code WHERE d.item_type = '2' AND d.deleted_flag = 0 AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= '2026-06-01' AND o.order_time < '2026-07-01') t",
+   "note": "SystemConsant.java L39 ITEM_TYPE02='2' 赠品已亲验；is_gift 与 item_type 不等价（作者实测冲突 3128 行），赠品权威口径是 item_type='2' ｜ 复审重跑 1 行，赠品箱数 127,211，2.0s，与作者 verified 一致"
+  },
+  {
+   "name": "GOODS15-六月动销商品数",
+   "login": "admin",
+   "q": "2026年6月动销商品有多少个",
+   "tags": [
+    "去重计数",
+    "口径",
+    "时间",
+    "跨表"
+   ],
+   "gold_sql": "SELECT COUNT(DISTINCT d.sku_code) AS `动销商品数` FROM t_sales_order_detail d JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code WHERE d.item_type = '1' AND d.deleted_flag = 0 AND o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND o.order_time >= '2026-06-01' AND o.order_time < '2026-07-01'",
+   "note": "若擅自加 box_quantity>0 得 151 差 14.5% 超容差；COUNT DISTINCT 天然免疫 2x 重复 ｜ 复审重跑 1 行，动销商品数 173，1.6s，与作者 verified 一致；meta.term 亲验：动销=统计期内有销售记录的商品(在明细出现过的 sku)，不要求箱数>0 tags 去掉不在规定清单里的「术语」（考点已由「口径」覆盖），SQL 未动"
+  },
+  {
+   "name": "GOODS16-六月商品销量Top5",
+   "login": "admin",
+   "q": "2026年6月销量最高的5个商品是哪些",
+   "tags": [
+    "排行",
+    "TopN",
+    "分组",
+    "口径"
+   ],
+   "gold_sql": "SELECT COALESCE(NULLIF(sf.skuname,''),NULLIF(sf.skucode,''),'未知') AS `商品`, SUM(sf.qty) AS `销量` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= '2026-06-01' AND sf.order_date < '2026-07-01' GROUP BY COALESCE(NULLIF(sf.skuname,''),NULLIF(sf.skucode,''),'未知') ORDER BY `销量` DESC LIMIT 5",
+   "note": "商品销量只使用 skuname/skucode 与 SUM(qty)，不关联商品分类维表。"
+  },
+  {
+   "name": "GOODS17-客户不含税收入Top5",
+   "login": "admin",
+   "q": "2026年6月不含税收入最高的5个客户是哪些",
+   "tags": [
+    "排行",
+    "TopN",
+    "分组",
+    "口径"
+   ],
+   "gold_sql": "SELECT COALESCE(NULLIF(sf.storename,''),NULLIF(sf.storecode,''),'未知') AS `客户`, SUM(sf.revenue_excluding_tax) AS `不含税收入` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= '2026-06-01' AND sf.order_date < '2026-07-01' GROUP BY COALESCE(NULLIF(sf.storename,''),NULLIF(sf.storecode,''),'未知') ORDER BY `不含税收入` DESC LIMIT 5",
+   "note": "storename/storecode 是客户字段，不得解释为门店。"
+  },
+  {
+   "name": "MKT01-市场费用Top5费用项目",
+   "login": "admin",
+   "q": "今年市场费用花得最多的前5个费用项目是哪些？各花了多少钱？",
+   "tags": [
+    "排行",
+    "TopN",
+    "分组",
+    "口径",
+    "时间"
+   ],
+   "gold_sql": "SELECT * FROM (SELECT '长促督导' AS `费用分类`, COALESCE(SUM(COALESCE(f.sup_staff_cost,0)),0) AS `市场费用` FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE()) UNION ALL SELECT '客户赔偿', COALESCE(SUM(COALESCE(f.comp_pkg,0) + COALESCE(f.comp_cust_complaint,0) + COALESCE(f.comp_logistics,0) + COALESCE(f.comp_out_stock,0) + COALESCE(f.comp_other,0)),0) FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE()) UNION ALL SELECT '营销物料', COALESCE(SUM(COALESCE(f.mat_costume,0) + COALESCE(f.mat_card_sign,0) + COALESCE(f.mat_freight_install,0) + COALESCE(f.mat_ip_goods,0) + COALESCE(f.mat_sticker,0) + COALESCE(f.mat_tasting_table,0) + COALESCE(f.mat_stand_banner,0) + COALESCE(f.mat_kt_board,0) + COALESCE(f.mat_lightbox,0) + COALESCE(f.mat_other,0) + COALESCE(f.mat_insulated_bag,0) + COALESCE(f.mat_tent,0)),0) FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE()) UNION ALL SELECT '营销设备', COALESCE(SUM(COALESCE(f.eq_baking,0) + COALESCE(f.eq_other,0) + COALESCE(f.eq_freight,0) + COALESCE(f.eq_fridge,0) + COALESCE(f.eq_sausage,0)),0) FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE()) UNION ALL SELECT '终端费用', COALESCE(SUM(COALESCE(f.term_adv_fee,0) + COALESCE(f.term_other,0) + COALESCE(f.term_entry_barcode,0) + COALESCE(f.term_display,0) + COALESCE(f.term_display_material,0)),0) FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE()) UNION ALL SELECT '广告费用', COALESCE(SUM(COALESCE(f.offline_adv,0) + COALESCE(f.brand_adv,0)),0) FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE()) UNION ALL SELECT '活动执行', COALESCE(SUM(COALESCE(f.act_other,0) + COALESCE(f.act_outsource,0) + COALESCE(f.act_tasting_sample,0) + COALESCE(f.act_logistics,0) + COALESCE(f.act_venue,0) + COALESCE(f.act_material_build,0)),0) FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE()) UNION ALL SELECT '客户返利', COALESCE(SUM(COALESCE(f.rebate_key_cust,0) + COALESCE(f.rebate_fresh_food,0) + COALESCE(f.rebate_other,0)),0) FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE()) UNION ALL SELECT '非活动样品', COALESCE(SUM(COALESCE(f.not_act_tasting_sample,0)),0) FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE()) UNION ALL SELECT '其他', COALESCE(SUM(COALESCE(f.other,0)),0) FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE YEAR(f.data_month) = YEAR(CURDATE())) x ORDER BY `市场费用` DESC LIMIT 5",
+   "note": "2026-08-06 Doris 宽表口径：复用 direct.rs MARKET_COST_GROUPS 十类拆分，按 data_month 筛今年并取费用分类 Top5"
+  },
+  {
+   "name": "MKT02-大型活动场次",
+   "login": "admin",
+   "q": "大型活动一共办了多少场？",
+   "tags": [
+    "码值筛选",
+    "去重计数",
+    "口径"
+   ],
+   "gold_sql": "SELECT COUNT(DISTINCT activity_no) AS 场次 FROM t_activity_main WHERE deleted_flag = 0 AND activity_level = 3",
+   "note": "meta.pitfall activity_level 字典亲验：1小/2中/3大/4CP，且分布类禁剔暂存；meta.metric 活动场次=COUNT(DISTINCT activity_no)/deleted_flag=0 亲验吻合 ｜ 复审重跑 1 行，24 场，1.1s，与作者 verified 一致"
+  },
+  {
+   "name": "MKT03-活动临促人员费用",
+   "login": "admin",
+   "q": "今年活动临促人员的费用一共花了多少钱？",
+   "tags": [
+    "聚合",
+    "口径",
+    "时间"
+   ],
+   "gold_sql": "SELECT ROUND(SUM(total_amount),2) AS 临促费用 FROM t_activity_promoter_fee WHERE deleted_flag = 0 AND created_time >= DATE_FORMAT(CURDATE(), '%Y-01-01')",
+   "note": "Java ActivityMainMapper.xml 临促费用取 a.total_amount；考点在两表选择（错走执行表虚增近 5 倍），时间列差异本身在容差内 ｜ 复审重跑 1 行，1,644,599.27（作者测 1,643,309.27，实时写入漂 0.08%，门禁近同时执行无风险），1.2s"
+  },
+  {
+   "name": "MKT04-本月活动执行人员费用",
+   "login": "admin",
+   "q": "这个月活动执行人员的费用是多少？",
+   "tags": [
+    "聚合",
+    "时间",
+    "口径"
+   ],
+   "gold_sql": "SELECT ROUND(SUM(amount),2) AS 执行人员费用 FROM t_market_activity_promoter_expense WHERE deleted_flag = 0 AND created_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND created_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)",
+   "note": "activity_date 全 NULL 只准用 created_time（meta.pitfall 坐实）；金额列是 amount ｜ 复审重跑 1 行，911,279.00，1.2s，与作者 verified 一致"
+  },
+  {
+   "name": "PERM01-城市经理今年售后单数",
+   "login": "tanlibo",
+   "role": "city_manager",
+   "q": "今年售后单有多少",
+   "tags": [
+    "权限",
+    "时间",
+    "去重计数"
+   ],
+   "gold_sql": "SELECT COUNT(DISTINCT after_sales_code) AS `售后单数` FROM t_after_sales_order_header WHERE deleted_flag = 0 AND after_sales_time >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND after_sales_time < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-01-01'), INTERVAL 1 YEAR)",
+   "note": "gold 不带权限条件，由注入器统一补，与系统 ask 同路径同口径；隔离比 3.5% 远超容差，漏注入/漏公用客户段均拦得住 ｜ 复审以 exec-sql tanlibo … city_manager 重跑 1 行 696，1.1s；返回 SQL 中亲眼确认注入条件 owner_manager IN (78) OR customer_code IN (27 家公用客户)，与作者 verified 一致（超管同 SQL 19,781）"
+  },
+  {
+   "name": "PERM02-城市经理可见客户数",
+   "login": "tanlibo",
+   "role": "city_manager",
+   "q": "现在系统里一共有多少家客户",
+   "tags": [
+    "权限",
+    "聚合",
+    "口径"
+   ],
+   "gold_sql": "SELECT COUNT(*) AS `客户数` FROM t_customer WHERE deleted_flag = 0",
+   "note": "纯权限隔离题：漏注入答 3968、漏公用客户段答 0、空段误当哨兵 -1 也答 0，三种回归全拦 ｜ 复审以 exec-sql tanlibo … city_manager 重跑 1 行 27，1.2s；返回 SQL 亲验注入 area_manager_id IN (78) OR customer_code IN (27 家公用客户)，与作者 verified 一致（超管 3968）"
+  },
+  {
+   "name": "SALE13-各业务员销售额",
+   "login": "admin",
+   "q": "本月各业务员的销售额是多少",
+   "tags": [
+    "分组",
+    "跨表",
+    "时间",
+    "聚合"
+   ],
+   "note": "默认销售事实的业务确认字段不含业务员；未登记独立且可执行的业务员销售事实前，禁止 JOIN 旧订单事实拼接销售额。",
+   "expected_unavailable": {
+    "contains_any": [
+     "不可计算",
+     "无法安全计算",
+     "未接入"
+    ],
+    "contains_all": [
+     "业务员"
+    ]
+   }
+  },
+  {
+   "name": "SALE14-今年月度销售趋势",
+   "login": "admin",
+   "q": "今年每个月的销售额趋势",
+   "tags": [
+    "趋势",
+    "时间",
+    "分组",
+    "聚合"
+   ],
+   "gold_sql": "SELECT DATE_FORMAT(sf.order_date,'%Y-%m') AS `月份`, SUM(sf.amount) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-01-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY) GROUP BY DATE_FORMAT(sf.order_date,'%Y-%m') ORDER BY `月份` ASC",
+   "note": "今年趋势只取 DWS order_date 截至今天的数据，销售额为 SUM(amount)；旧发货 UNION/JOIN 已废止。"
+  },
+  {
+   "name": "SALE15-本月销量TOP10商品",
+   "login": "admin",
+   "q": "本月卖得最好的10个商品是哪些",
+   "tags": [
+    "排行",
+    "TopN",
+    "口径"
+   ],
+   "gold_sql": "SELECT COALESCE(NULLIF(sf.skuname,''),NULLIF(sf.skucode,''),'未知') AS `商品`, SUM(sf.qty) AS `销量` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY) GROUP BY COALESCE(NULLIF(sf.skuname,''),NULLIF(sf.skucode,''),'未知') ORDER BY `销量` DESC LIMIT 10",
+   "note": "商品销量只使用 DWS skuname/skucode 与 SUM(qty)，本月截至今天；不关联未确认分类维表。"
+  },
+  {
+   "name": "SALE16-销售额环比",
+   "login": "admin",
+   "q": "本月销售额比上月增长了百分之多少",
+   "tags": [
+    "派生指标",
+    "时间",
+    "聚合"
+   ],
+   "gold_sql": "SELECT ROUND(((SELECT COALESCE(SUM(sf.amount),0) FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY)) - (SELECT COALESCE(SUM(sf.amount),0) FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01') AND sf.order_date < LEAST(DATE_FORMAT(CURDATE(), '%Y-%m-01'), DATE_ADD(DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01'), INTERVAL DAY(CURDATE()) DAY)))) / NULLIF((SELECT COALESCE(SUM(sf.amount),0) FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01') AND sf.order_date < LEAST(DATE_FORMAT(CURDATE(), '%Y-%m-01'), DATE_ADD(DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01'), INTERVAL DAY(CURDATE()) DAY))), 0) * 100, 2) AS `环比增长率`",
+   "note": "本期为本月 1 日至今天（含今天），上期为上月 1 日至上月同日（短月封顶月末）；两期复用 DWS SUM(amount)，禁止用完整上月制造不可比环比。"
+  },
+  {
+   "name": "SALE17-各省区毛利额",
+   "login": "admin",
+   "q": "本月各省区毛利额是多少",
+   "tags": [
+    "分组",
+    "时间",
+    "聚合",
+    "口径"
+   ],
+   "gold_sql": "SELECT COALESCE(NULLIF(sf.region,''),'未归属') AS `省区`, SUM(sf.gross_profit) AS `毛利额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY) GROUP BY COALESCE(NULLIF(sf.region,''),'未归属') ORDER BY `毛利额` DESC",
+   "note": "region 是省区，不是省份；毛利额使用 SUM(gross_profit)。"
+  },
+  {
+   "name": "STK01-仓库库存金额TOP10",
+   "login": "admin",
+   "q": "目前哪个仓库的库存金额最高？给我看前10名",
+   "tags": [
+    "快照口径",
+    "排行",
+    "TopN",
+    "聚合"
+   ],
+   "gold_sql": "SELECT warehouse_name AS `仓库`, SUM(stock_amount) AS `库存金额` FROM t_winc_stock_report WHERE product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report) GROUP BY warehouse_name ORDER BY `库存金额` DESC LIMIT 10",
+   "note": "meta.metric 库存金额亲验：scope_filter 即最新快照子查询，逐字吻合；不取最新日全量累加虚增 56 倍 ｜ 复审重跑 10 行，首行 长沙三子冰冻食品销售有限公司仓库 5,680,278.80，1.7s，与作者 verified 一致"
+  },
+  {
+   "name": "STK02-各省库存金额",
+   "login": "admin",
+   "q": "各省份现在的库存金额分别是多少",
+   "tags": [
+    "快照口径",
+    "分组",
+    "聚合",
+    "口径"
+   ],
+   "gold_sql": "SELECT COALESCE(NULLIF(province,''),'未知') AS `省份`, SUM(stock_amount) AS `库存金额` FROM t_winc_stock_report WHERE product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report) GROUP BY COALESCE(NULLIF(province,''),'未知') ORDER BY `库存金额` DESC",
+   "note": "省份用库存表自带 province 列；空串归未知；0 值行保留（擅自过滤会行数不齐） ｜ 复审重跑 13 行，首行 湖南省 5,700,153.30，末尾含重庆/未知/甘肃 3 个 0 金额省，1.7s，与作者 verified 一致"
+  },
+  {
+   "name": "SALE18-各省区毛利率",
+   "login": "admin",
+   "q": "本月各省区毛利率是多少",
+   "tags": [
+    "分组",
+    "派生指标",
+    "时间",
+    "口径"
+   ],
+   "gold_sql": "SELECT COALESCE(NULLIF(sf.region,''),'未归属') AS `省区`, SUM(sf.gross_profit)/NULLIF(SUM(sf.revenue_excluding_tax),0) AS `毛利率` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY) GROUP BY COALESCE(NULLIF(sf.region,''),'未归属') ORDER BY `毛利率` DESC",
+   "note": "毛利率按省区分别聚合毛利额与不含税收入后相除，禁止 AVG(行毛利率)。"
+  }
+ ]
 }

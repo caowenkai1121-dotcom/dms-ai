@@ -1,0 +1,17 @@
+[package]
+name = "dms-semantic"
+version = "0.1.0"
+edition = "2021"
+
+# 🔴 硬规则：不得依赖 dms-policy（改口径永远碰不到权限内核）。
+[dependencies]
+dms-kernel = { path = "../kernel" }
+dms-connector = { path = "../connector" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# sqlparser 已在 workspace（kernel 唯一使用方）；datamap_usage 的 AST 只读遍历直接复用同一
+# 版本实例（dms_kernel::by_name 的方言对象），不是新增第三方 crate。
+sqlparser = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }

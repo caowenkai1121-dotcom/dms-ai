@@ -89,6 +89,7 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
@@ -388,14 +389,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "dms-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dms-connector",
+ "dms-kernel",
+ "dms-knowledge",
+ "dms-policy",
+ "dms-semantic",
+ "futures",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dms-ai-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "chrono",
+ "dms-agent",
+ "dms-connector",
+ "dms-kernel",
+ "dms-knowledge",
+ "dms-policy",
+ "dms-semantic",
  "futures",
  "reqwest",
+ "ring",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -405,6 +433,71 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "dms-connector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dms-kernel",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dms-kernel"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlparser",
+]
+
+[[package]]
+name = "dms-knowledge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dms-connector",
+ "dms-kernel",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "dms-policy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dms-connector",
+ "dms-kernel",
+ "serde",
+ "sqlx",
+ "tracing",
+]
+
+[[package]]
+name = "dms-semantic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dms-connector",
+ "dms-kernel",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "sqlx",
+ "tracing",
 ]
 
 [[package]]
@@ -420,6 +513,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -1089,6 +1191,23 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]

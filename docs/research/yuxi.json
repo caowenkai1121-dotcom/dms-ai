@@ -1,0 +1,33 @@
+{
+ "summary": "语析 Yuxi（xerrors/Yuxi v0.7.1，FastAPI + ARQ worker + Vue3；存储 PG/Redis/MinIO/Milvus/Neo4j）是知识库+知识图谱多智能体平台。RAG 主线：解析统一成 Markdown（Docling/MinerU/PaddleX/RapidOCR/云端 OCR 七引擎注册表）→ RAGFlow 式六种分块 preset（带字符偏移回链）→ uploaded→parsing→parsed→indexing→indexed 两段状态机（乐观锁抢占+Milvus/PG 双写回滚）→ Milvus 单库稠密+BM25 稀疏混合检索（WeightedRanker 0.7/0.3）→ 可选 reranker（失败回退向量分）→ 图谱增强（实体/三元组向量召回做种子 → Neo4j 2-hop 扩散 → networkx PPR 排 chunk → RRF k=60 融合）。图谱构建是三段流水：LLM 并发抽取（确定性实体 ID 哈希归一）→ 单写 Neo4j/PG → PG lease 批领向量索引。Agent 侧是 DeepAgents+LangChain create_agent + 中间件栈（steer 插话/沙盒文件系统/Skills 门控/子 agent/两级摘要/审批/用量）；会话可靠性=先落 PG 事实再投 ARQ 的 FIFO 队列（steer 插队）+ Redis Stream 两段 SSE。与 dms-ai 对照：我方强在 ACL 内联 SQL（文档级）、关联召回、口径化答案协议（角标/冲突披露/部分覆盖声明）与判官；对方强在解析引擎矩阵、分块 preset、混合检索与 rerank、文档级知识图谱+PPR、评估闭环、沙盒/审批/子 agent 中间件体系。",
+ "repo": "https://github.com/xerrors/Yuxi（本地 target/tmp/research/Yuxi，v0.7.1）",
+ "mechanisms": [
+  {"name": "解析引擎注册表（7 引擎）", "evidence": "knowledge/parser/registry.py:5-13 + factory.py:44-127（实例缓存+健康检查）；unified.py:293-432 按扩展名分发：docx/xlsx/pptx→Docling（python-docx 兜底）、PDF→OCR 或 PyPDFLoader、图片强制 OCR、zip 解包图片传 MinIO 回填链接", "portable": true},
+  {"name": "RAGFlow 式分块 preset", "evidence": "knowledge/chunking/ragflow_like/presets.py:10-35（general/qa/book/laws/semantic/separator）；qa 从表格抽问答对、laws 按法条层级合并、semantic 按标题层级切+注入标题路径；每条 chunk 记 start/end_char_pos 回链（dispatcher.py:22-44）", "portable": true},
+  {"name": "两段式入库状态机+双向回滚", "evidence": "base.py:31-38 uploaded→parsing→parsed→indexing→indexed；update_fields_if_status 乐观锁抢占（base.py:288-300）；Milvus+PG 双写失败双向回滚（implementations/milvus.py:538-578）；content_hash 去重（manager.py:1071-1078）", "portable": true},
+  {"name": "Milvus 单库混合检索", "evidence": "milvus.py:38,413-437（稠密 COSINE/IVF_FLAT + 内建 BM25 function 中文 analyzer + SPARSE_INVERTED_INDEX）；hybrid=AnnSearchRequest 双路+WeightedRanker(0.7,0.3)（milvus.py:1010-1033）；检索参数带 label/type/min/max/depend_on 元数据驱动前端表单", "portable": true},
+  {"name": "Reranker 可插拔+失败回退", "evidence": "models/rerank.py（OpenAIReranker/DashscopeReranker）；recall_top_k→精排→final_top_k，失败回退向量分（milvus.py:1062-1097）", "portable": true},
+  {"name": "知识图谱构建流水", "evidence": "extractors/llm.py:11-65（固定 JSON schema prompt+json_repair，禁自定义 prompt）；compute_entity_id=hash(kb_id:规范名:label) 天然归并（graph_utils.py:14-34）；三段 actor 流水：N 抽取 worker（重试退避）→单 write worker（Neo4j MERGE+PG upsert+chunk 回写 ent_ids）→vector worker（PG lease 300s 批领→Milvus upsert）（milvus_graph_service.py:230-509）；抽取配置确认后锁定", "portable": true},
+  {"name": "图谱增强检索（PPR+RRF）", "evidence": "milvus.py:1103-1242：query 召回实体/三元组做种子（权重 1.0/0.8/0.3）→Neo4j 2-hop 扩散（graph_max_nodes 上限）→networkx Personalized PageRank 排 chunk（rank_chunks_by_ppr，milvus_graph_service.py:917-970）→与 chunk 检索 RRF(k=60) 融合", "portable": true},
+  {"name": "三存储分工", "evidence": "Neo4j 存结构（Chunk/Entity 节点+MENTIONS/RELATION 边，每 KB 动态 label 隔离，graph_utils.py:97-150）；PG 存记录+chunk 的 ent_ids/graph_indexed 标记；Milvus 只存 {kb_id}_entity/{kb_id}_triple 向量", "portable": true},
+  {"name": "FIFO 队列+事务外投递", "evidence": "agent_request_queue_service.py:44-66（同一事务建消息+请求，提交后才投 ARQ；同 user+agent+thread 串行；策略 enqueue/reject/steer，guided/bridge 未实现）；worker 启动 recover_pending_dispatches 扫描恢复（run_worker.py:660）", "portable": true},
+  {"name": "中间件栈 agent 架构", "evidence": "buildin/chatbot/graph.py:33-84（Steer/沙盒文件系统/附件/Skills/SubAgent/两级摘要/TodoList/PatchToolCalls/ModelRetry/图片兼容/用量/审批）；Skills 依赖展开+动态激活门控（middlewares/skills.py，工具仅激活后可见）", "portable": true},
+  {"name": "两级摘要+大结果外置", "evidence": "middlewares/summary.py（100k tokens 触发，L1/L2 比例 0.4；超长工具结果外置沙盒文件只留预览）；ChunkedEventWriter 100ms/512 字批量刷 SSE（run_worker.py:36-37,104-120）", "portable": true},
+  {"name": "沙盒（隔离容器+路径白名单）", "evidence": "docker/sandbox_provisioner/app.py（按 thread 起容器）；backends/sandbox/backend.py:38-99（读 /home/gem/user-data 与 skills、写仅 workspace/outputs）；敏感工具 write/edit/execute 挂审批 interrupt（tool_approval.py:10-13）", "portable": true},
+  {"name": "share_config v2 双范围+角色上限", "evidence": "permissions/resource_permission.py:87-102,170-196（read_scope/manage_scope 各取 global/department/user，管理⊆读取，有效权限=min(授予, 角色上限)；KB user 上限 READ）", "portable": true},
+  {"name": "RAG 评估闭环", "evidence": "knowledge_eval_router.py + eval/（LLM 从 chunk 生成 QA 基准 benchmark_generation.py:117 可图增强选邻居；P/R/F1@k+LLM judge）", "portable": true},
+  {"name": "模型供应商 PG+Redis 双写缓存", "evidence": "models/providers/cache.py（api/worker 跨进程一致视图）；builtin.py 15+ OpenAI 兼容供应商；embedding 429/5xx 指数退避（embed.py:13-16）", "portable": true},
+  {"name": "外部 KB 连接器", "evidence": "external_kb_router.py（Dify/Notion 等只读 KB 的 files/retrieve/open/find）", "portable": true},
+  {"name": "管理面", "evidence": "dashboard_router.py（会话/用户/工具/知识库/agent 五类统计+时序）；knowledge_router.py ~50 端点（含 mindmap 生成/diff、sample-questions、export、generate-description）", "portable": true}
+ ],
+ "half_baked": [
+  "prompt 级引用已停用（buildin/chatbot/prompt.py:31-32「效果不好」），输出无强制 cite",
+  "semantic 分块名不副实（无聚类，是结构切分）",
+  "「Milvus 知识图谱」命名误导——结构在 Neo4j，Milvus 只存向量",
+  "队列策略 guided/bridge 未实现（agent_request_queue_service.py:42）",
+  "chunk 的 token 偏移恒为 None（只有字符偏移有效）",
+  "Tasker 是 API 进程内存队列，重启即丢（ARCHITECTURE.md:58 自承）",
+  "无文档级 ACL（权限边界在 KB 级）",
+  "无公开分享链接；Anthropic/Google provider 被注释"
+ ]
+}

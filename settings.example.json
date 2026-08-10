@@ -1,13 +1,45 @@
 {
   "mysql_url": "mysql://USER:PASSWORD@HOST:3306/xh_dms",
+  "mysql_targets": {
+    "doris_warehouse": {
+      "url": "mysql://READ_ONLY_USER:PASSWORD@DORIS_HOST:9030/dms_ods",
+      "type": "warehouse"
+    }
+  },
   "pg_url": "postgres://postgres:PASSWORD@localhost:15433/dms_ai",
+  "pg_ro_url": "postgres://dms_ai_ro:PASSWORD@localhost:15433/dms_ai",
+  "datasources": {
+    "crm_pg": "postgres://ro_user:PASSWORD@HOST:5432/crm"
+  },
   "listen": "127.0.0.1:8100",
-  "llm_base_url": "https://api.deepseek.com",
+  "service_url": "http://127.0.0.1:8077",
+  "kb_root": "data/kb",
+  "kb_max_mb": 20,
+  "kb_rrf_weights": { "metadata": 0.2, "relation": 0.25, "kg": 0.3, "ext_kb": 0.2 },
+  "llm_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "llm_api_key": "sk-***",
-  "llm_model_fast": "deepseek-v4-flash",
-  "llm_model_precise": "deepseek-v4-pro",
+  "llm_model_fast": "qwen3.7-flash",
+  "llm_model_precise": "qwen3.7-flash",
+  "llm_extra_body": { "enable_thinking": false },
+  "llm_provider": "qwen",
+  "fallback_vision_provider": "qwen",
+  "llm_keys": { "qwen": "sk-***", "deepseek": "sk-***", "custom_provider": "sk-***" },
+  "llm_providers": {
+    "custom_provider": {
+      "base_url": "https://api.example.com/v1",
+      "model_fast": "fast-model",
+      "model_precise": "precise-model",
+      "extra_body": {},
+      "vision": "vision-model"
+    }
+  },
+  "sc_samples": 1,
   "dms_base_url": "http://HOST/dms",
   "wework_corpid": "ww***",
   "wework_secret": "***",
-  "wework_agentid": ""
+  "wework_agentid": "",
+  "wework_redirect_url": "https://AGENT_HOST/api/wework/login",
+  "mcp_keys": {},
+  "insight_enabled": true,
+  "insecure_login_fallback": false
 }

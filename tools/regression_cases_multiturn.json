@@ -1,0 +1,68 @@
+{
+  "_why": "两轮题。跑法: python tools/regression.py --cases tools/regression_cases_multiturn.json",
+  "_note": [
+    "为什么单独一个文件：`regression_cases.json` 本轮不在我的改动面内（并行执行，另一位在改它）。",
+    "这三题要并进主题集才会进门禁 —— 合并动作与主题集的归属人一起做，键名与 runner 已经对齐。",
+    "三题都 llm:true：改写本身就是一次 fast LLM 调用，非确定，按旧惯例给 1 次重试。",
+    "prev_sql 是上一轮实际执行口径的真载荷，必须与当前 DWS 销售合同一致；旧订单销售额会直接把追问改写带回错误事实表。"
+  ],
+  "cases": [
+    {
+      "name": "M01-两轮-追问只换时间窗",
+      "note": "首轮成功 → 追问。改写后应等价于 A04「上月销售额」。判据靠的是**没有改写就答不出来**：「那上个月呢」单独一句既没有指标也没有维度，指标 only 装配器压根不命中 → 不会是 direct-agg。这就是这一题为什么算两轮题而不是单轮题。",
+      "login": "admin",
+      "prev": "本月销售额是多少",
+      "prev_sql": "SELECT COALESCE(SUM(sf.amount), 0) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(),'%Y-%m-01') AND sf.order_date < DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'), INTERVAL 1 MONTH)",
+      "q": "那上个月呢",
+      "llm": true,
+      "route": "direct-agg",
+      "sql_contains": [
+        "sales_dw.dws_off_offline_sale_dfn",
+        "SUM(sf.amount)"
+      ],
+      "sql_not_contains": [
+        "t_sales_order",
+        "t_customer",
+        "total_amount",
+        "UNION",
+        "sf.order_date < CURDATE()"
+      ],
+      "view0": "kpis",
+      "min_rows": 1
+    },
+    {
+      "name": "M02-两轮-追问加一个维度",
+      "note": "首轮成功 → 追问换维度。改写后虽能恢复为「本月销售额按省份」，但默认销售事实只确认省区 region；省份未接独立资产时必须明确 fail-closed，禁止回接客户表或偷换成省区。（2026-08-08 首次连库实跑：钉的列名按真实诚实卡形状订正——原钉（维度/无法安全计算）从未实跑验证过，语义不变：识别省份为未确认范围、禁止回接与偷换。）",
+      "login": "admin",
+      "prev": "本月销售额是多少",
+      "prev_sql": "SELECT COALESCE(SUM(sf.amount), 0) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(),'%Y-%m-01') AND sf.order_date < DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'), INTERVAL 1 MONTH)",
+      "q": "那按省份拆呢",
+      "llm": true,
+      "route": "direct-doc",
+      "sql_contains": [
+        "'不可计算' AS `数据状态`",
+        "'省份' AS `未确认范围`",
+        "sales_fact 合同没有该维度或语义"
+      ],
+      "sql_not_contains": [
+        "sales_dw.dws_off_offline_sale_dfn",
+        "t_sales_order",
+        "t_customer",
+        "total_amount",
+        "UNION"
+      ]
+    },
+    {
+      "name": "M03-两轮-上一轮没产出SQL",
+      "note": "首轮**失败轮** → 追问：给了 prev 但没给 prev_sql（真实形态＝上一轮走了知识库，payload 里连 sql 键都没有）。此时改写整段跳过，本轮问句原样进管线。刻意**不钉 route**：跳过之后这句走哪条路由是路由的事，钉它就把这题变成路由题了。\n⚠️ **这一题不校验跳过守卫**（订正一次自己写过的话）：`prev_sql` 缺省时 `PrevTurn` 第二位恒 `None`，`rewrite_followup` 的 `prev_sql.map(..).filter(..)` 无论守卫在不在都返 `None`，提示词压根拼不出来 —— 也就是说 `sql_not_contains` 在当前类型形状下**没有红的路径**，不是「缺实跑证据」而是结构上不可能红。它真正证的只有一件：失败轮不打断链路、不把后一轮带歪。跳过守卫的判据在 `ask.rs::a_failed_previous_turn_skips_the_rewrite_entirely`（调用计数，已枪测必红）。",
+      "login": "admin",
+      "prev": "报销制度是什么",
+      "q": "那本月销售额呢",
+      "llm": true,
+      "min_rows": 1,
+      "sql_not_contains": [
+        "报销"
+      ]
+    }
+  ]
+}

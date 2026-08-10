@@ -1,11 +1,41 @@
 [workspace]
 resolver = "2"
-members = ["crates/server"]
+members = [
+    "crates/kernel",
+    "crates/connector",
+    "crates/policy",
+    "crates/semantic",
+    "crates/knowledge",
+    "crates/agent",
+    "crates/server",
+]
 
+# 依赖版本单一事实源：各 crate 一律 { workspace = true }，禁止就地写版本号。
+# 零新增第三方依赖是硬规则（docs/ARCHITECTURE.md §0 D6）——新增一项必须先写明不可替代理由。
 [workspace.dependencies]
 anyhow = "1"
+# 【D1 凭据加密】settings.json 敏感字段 AES-256-GCM。ring/base64 本就在锁树里
+# （rustls/sqlx 的传递依赖），这里只是把直接依赖摆明 —— 锁树零新增第三方包。
+ring = "0.17"
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.8", features = ["multipart"] }
+sqlparser = { version = "0.53", features = ["visitor"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+chrono = "0.4"
+rust_decimal = "1"
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "mysql",
+    "postgres",
+    "chrono",
+    "rust_decimal",
+    "json",
+] }

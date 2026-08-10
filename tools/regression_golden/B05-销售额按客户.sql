@@ -1,0 +1,1 @@
+SELECT COALESCE(NULLIF(sf.storename,''),NULLIF(sf.storecode,''),'未知') AS `客户`, SUM(sf.amount) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(),'%Y-%m-01') AND sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY) GROUP BY COALESCE(NULLIF(sf.storename,''),NULLIF(sf.storecode,''),'未知') ORDER BY SUM(sf.amount) DESC LIMIT 200

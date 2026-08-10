@@ -1,17 +1,11 @@
-# 只读探针：候选维度列值域抽样（SELECT DISTINCT/GROUP BY，小表，DMS 生产库只读红线）
+# 只读探针：候选维度列值域抽样（SELECT DISTINCT/GROUP BY，走非 DMS 分析目标）
 # 用法: python tools/probe_values.py
-import json, pymysql, re
-from urllib.parse import unquote
-from pathlib import Path
+import pymysql
+import settings as st
 
-ROOT = Path(__file__).resolve().parent.parent
-cfg = json.load(open(ROOT / "settings.json", encoding="utf-8"))
-m = re.match(r"mysql://([^:]+):([^@]+)@([^:]+):(\d+)/(\w+)", cfg["mysql_url"])
-user, pwd, host, port, db = m.groups()
-conn = pymysql.connect(host=host, port=int(port), user=unquote(user), password=unquote(pwd),
-                       database=db, charset="utf8mb4")
+# 凭据与 URL 解析都在 tools/settings.py（明文口令只许住在 settings.json）
+conn = pymysql.connect(**st.analysis_mysql_kwargs())
 cur = conn.cursor()
-cur.execute("SET SESSION TRANSACTION READ ONLY")  # 只读铁律
 
 PROBES = [
     ("t_customer", "customer_class"),

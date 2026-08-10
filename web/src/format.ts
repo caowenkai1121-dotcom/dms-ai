@@ -1,14 +1,25 @@
-// 数值格式化：BI 呈现的"好看"基础——金额万/亿压缩、千分位、百分比。
+// 数值格式化：业务数值满 1 万统一按“万”展示，原始数据不变。
 
 export type Semantic = 'money' | 'count' | 'percent' | 'geo' | 'customer' | 'goods' | 'order' | 'none'
 
 export function toNum(v: unknown): number | null {
   if (typeof v === 'number') return v
   if (typeof v === 'string') {
-    const n = parseFloat(v)
+    const text = v.trim().replace(/,/g, '')
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(text)) return null
+    const n = Number(text)
     return Number.isFinite(n) ? n : null
   }
   return null
+}
+
+export function semanticForLabel(label: string): Semantic {
+  // 标识列优先于指标词：例如“税率编码”“状态码”必须原样显示，不能被当百分比。
+  if (/单号|编号|编码|代码|条码|状态(?:码)?$|区划码|身份证|手机号|电话|批次号|(?:^|_)id$|ID$/i.test(label)) return 'order'
+  if (/占比|比例|率|同比|环比|百分比/.test(label)) return 'percent'
+  if (/销售额|金额|费用|余额|单价|客单价|成本|利润|收入|支出|货值|资产|坪效|人效/.test(label)) return 'money'
+  if (/数量|销量|订单数|订单量|单量|笔数|客户数|门店数|商品数|件数|箱数|袋数|台数|人数|次数|库存(?:数|量)|总数|总量|合计数/.test(label)) return 'count'
+  return 'none'
 }
 
 // 省级行政区划码 → 省名（DMS province 列存区划码，翻名可读）
@@ -28,28 +39,31 @@ export function fmt(v: unknown, semantic: Semantic = 'none'): string {
   // 地理：省级区划码翻省名
   if (semantic === 'geo' && PROVINCE[String(v)]) return PROVINCE[String(v)]
   const n = toNum(v)
-  // 编码/订单/名称等非数值语义：原样（避免把手机号/编码压成万亿）
-  if (n === null || semantic === 'order' || semantic === 'customer' || semantic === 'goods') {
+  // 编码/订单/名称等非数值语义原样展示。
+  if (n === null || semantic === 'order' || semantic === 'customer' || semantic === 'goods' || semantic === 'geo') {
     return String(v)
   }
   if (semantic === 'percent') return `${round(n, 1)}%`
   if (semantic === 'money') return `¥${compress(n)}`
-  if (semantic === 'count') return grouping(n)
+  if (semantic === 'count') return compress(n)
+  // 普通维度可能是年份、日期码或未登记编码，不能擅自按“万”压缩。
   return String(v)
 }
 
-/** 万/亿压缩（对齐 SuperSonic getFormattedValue：亿 2 位、万 1 位） */
+/** 业务数值：绝对值满 1 万固定 3 位小数，否则千分位且最多 3 位小数。 */
 export function compress(n: number): string {
   const abs = Math.abs(n)
-  if (abs >= 1e8) return `${round(n / 1e8, 2)}亿`
-  if (abs >= 1e4) return `${round(n / 1e4, 1)}万`
-  return grouping(round(n, 2))
+  if (abs >= 1e4) return `${(n / 1e4).toFixed(3)}万`
+  return grouping(n)
 }
 
 function grouping(n: number): string {
-  const [int, dec] = String(n).split('.')
-  const g = int.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
-  return dec ? `${g}.${dec}` : g
+  const value = Math.abs(n) < 0.0005 ? 0 : n
+  return new Intl.NumberFormat('zh-CN', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 3,
+    useGrouping: true,
+  }).format(value)
 }
 
 function round(n: number, d: number): number {

@@ -1,0 +1,706 @@
+{
+  "meta": {
+    "version": 1,
+    "tool": "tools/kb_bench.py",
+    "created_at": "2026-08-08T13:48:23+00:00",
+    "base": "http://127.0.0.1:18100",
+    "source": "/api/kb/search",
+    "login": "admin",
+    "k": 6,
+    "cases_path": "D:\\code\\dms_ai\\tools\\kb_fixtures\\kb_bench_cases.json",
+    "cases_total": 18,
+    "cases_stale": 0,
+    "cases_run": 18,
+    "search_errors": 0,
+    "judge": false
+  },
+  "metrics": {
+    "recall@k": 1.0,
+    "precision@k": 0.4074,
+    "mrr": 1.0
+  },
+  "per_case": [
+    {
+      "id": "15916096d77e",
+      "question": "冬季高三泡沫箱里手抓饼1kg最多能装几袋？",
+      "doc_name": "高三泡沫箱拆单分析.xlsx",
+      "gold_chunk_id": 189,
+      "recall@k": 1.0,
+      "precision@k": 0.5,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 2,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 189,
+          "doc_name": "高三泡沫箱拆单分析.xlsx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 200,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "3bb3733e4e88",
+      "question": "夏季高三型号泡沫箱（套袋）里烧麦500g最多能装多少袋？",
+      "doc_name": "高三泡沫箱拆单分析.xlsx",
+      "gold_chunk_id": 189,
+      "recall@k": 1.0,
+      "precision@k": 0.5,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 2,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 189,
+          "doc_name": "高三泡沫箱拆单分析.xlsx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 200,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "0ca8201ebb61",
+      "question": "蛋挞皮480G和600G分别要几盒？",
+      "doc_name": "高三泡沫箱拆单分析.xlsx",
+      "gold_chunk_id": 190,
+      "recall@k": 1.0,
+      "precision@k": 0.5,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 2,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 189,
+          "doc_name": "高三泡沫箱拆单分析.xlsx",
+          "score": 0.032522473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 200,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "2d7f485e99f9",
+      "question": "烟熏蜜汁肠125g*45需要多少袋？",
+      "doc_name": "高三泡沫箱拆单分析.xlsx",
+      "gold_chunk_id": 190,
+      "recall@k": 1.0,
+      "precision@k": 0.5,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 2,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 190,
+          "doc_name": "高三泡沫箱拆单分析.xlsx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 200,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "85cdf47101a2",
+      "question": "鲜肉肠400克的箱规是多少盒？",
+      "doc_name": "高三泡沫箱拆单分析.xlsx",
+      "gold_chunk_id": 191,
+      "recall@k": 1.0,
+      "precision@k": 0.3333,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 3,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 189,
+          "doc_name": "高三泡沫箱拆单分析.xlsx",
+          "score": 0.032522473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 200,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 195,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "bbdf684cc93a",
+      "question": "红包的箱规是多少包？",
+      "doc_name": "高三泡沫箱拆单分析.xlsx",
+      "gold_chunk_id": 191,
+      "recall@k": 1.0,
+      "precision@k": 1.0,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 1,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 189,
+          "doc_name": "高三泡沫箱拆单分析.xlsx",
+          "score": 0.016393441706895828,
+          "relevant": true
+        }
+      ]
+    },
+    {
+      "id": "c561dc2f7a30",
+      "question": "第二期终端活动叫什么名字？是接着哪个计划办的？",
+      "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+      "gold_chunk_id": 193,
+      "recall@k": 1.0,
+      "precision@k": 0.5,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 2,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 193,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.016393441706895828,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 198,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "3ed464476aa2",
+      "question": "发起大单品爆破赛主要是想达到什么目的？",
+      "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+      "gold_chunk_id": 193,
+      "recall@k": 1.0,
+      "precision@k": 1.0,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 1,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 192,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.03226646035909653,
+          "relevant": true
+        }
+      ]
+    },
+    {
+      "id": "2d0f483ec09f",
+      "question": "城市经理积分排名第4到10名的奖金是多少？",
+      "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+      "gold_chunk_id": 196,
+      "recall@k": 1.0,
+      "precision@k": 0.5,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 2,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 195,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.032522473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 199,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "fa368e42af0b",
+      "question": "活动申报时，城市经理提交门店目标后，有哪些审核环节？",
+      "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+      "gold_chunk_id": 196,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 195,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.032522473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 180,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 147,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 165,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 150,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 134,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014492753893136978,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "44c405f3919e",
+      "question": "皇家小虎促销活动如果价格低于最低指导价会有什么后果？多次严重违反呢？",
+      "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+      "gold_chunk_id": 198,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 196,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.016393441706895828,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 165,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 175,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 188,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 131,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 147,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014492753893136978,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "eb882a95f0f4",
+      "question": "如果客户配合城市经理弄虚作假，会怎么处罚？",
+      "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+      "gold_chunk_id": 198,
+      "recall@k": 1.0,
+      "precision@k": 0.3333,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 3,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 198,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 161,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 196,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "4f8dcb47c6b3",
+      "question": "从哪天开始，省总和城市经理报销线下市场费用必须用DMS，不能再用云之家或金蝶了？",
+      "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+      "gold_chunk_id": 131,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 130,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.016393441706895828,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 165,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 128,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 142,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014492753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 162,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01315789483487606,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 156,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.012987012974917889,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "3de1afcd73f7",
+      "question": "4月27日之后，除了省总和城市经理，还有哪些岗位的人员也要用DMS来报销线下市场费用？",
+      "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+      "gold_chunk_id": 131,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 130,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.016393441706895828,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 181,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 133,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 137,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 128,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 150,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "7e21c82909d6",
+      "question": "报销时如果一部分有发票一部分没发票，该怎么提交申请？",
+      "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+      "gold_chunk_id": 147,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 147,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.016393441706895828,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 160,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 158,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 150,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 133,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 141,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "6fff9b3aa771",
+      "question": "填报销单的时候，费用发生日期和市场费用用途这两栏要怎么写？",
+      "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+      "gold_chunk_id": 147,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 147,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.032522473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 155,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.016393441706895828,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 184,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 179,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 158,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 153,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014492753893136978,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "d1546430ca94",
+      "question": "CZ202512101018 这个销售订单对应的 HJXH-DSO 编号是多少？",
+      "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+      "gold_chunk_id": 173,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 171,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.03226646035909653,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 143,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.016393441706895828,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 199,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.012820512987673283,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 149,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 136,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 167,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014084506779909134,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "2e300427709c",
+      "question": "CZ202512101017 关联的 HJXH-DSO 单号是什么？",
+      "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+      "gold_chunk_id": 173,
+      "recall@k": 1.0,
+      "precision@k": 0.5,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 2,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 171,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.016393441706895828,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 192,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.016393441706895828,
+          "relevant": false
+        }
+      ]
+    }
+  ]
+}

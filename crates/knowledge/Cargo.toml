@@ -1,0 +1,17 @@
+[package]
+name = "dms-knowledge"
+version = "0.1.0"
+edition = "2021"
+
+# 🔴 硬规则：不得依赖 dms-policy（用 Viewer{login,roles} 而非 Principal），
+# 也不得依赖 sqlparser —— 知识库路径在依赖层面就产不出 SQL。
+[dependencies]
+dms-kernel = { path = "../kernel" }
+dms-connector = { path = "../connector" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
