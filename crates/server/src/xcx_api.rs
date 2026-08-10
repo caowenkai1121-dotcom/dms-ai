@@ -97,19 +97,34 @@ fn first_non_empty<'a>(data: &'a Value, keys: &[&str]) -> Option<&'a str> {
 }
 
 /// 防御性解析 getLoginInfo 的 data：
-/// - 登录名：`loginName/userName/username/employeeCode` 取第一个非空；
-/// - 角色：`activeRoleCode` 优先，缺省回退 `roleVOList[0].roleCode`
-///   （数组缺失/为空/元素缺字段都不硬失败，角色就是 None）；
+/// - 登录名：`loginName/userName/username/employeeCode` 取第一个非空；顶层取不到再看
+///   `user/employee/sysUser/userInfo` 嵌套对象的同一组键（上游各端返回结构不一）。
+/// - 角色：`activeRoleCode/currentRoleCode/roleCode` 顶层键优先 → `activeRole.roleCode` →
+///   `roleVOList/roleList/roles` 任一数组首元素的 `roleCode`（`roleList` 不是猜的：小程序
+///   登录页 `pages/login/login.vue` 的令牌登录分支实证读 `data.roleList`）。
+///   数组缺失/为空/元素缺字段都不硬失败，角色就是 None —— 单角色直通、多角色由
+///   `load_principal` fail-closed（「请选择登录角色」），我们绝不替用户选。
 /// - 姓名：`actualName/name/nickName/employeeName` 取第一个非空，只用于 `/me` 展示。
 ///
 /// 返回 None = 拿不到登录名 —— 身份立不起来，调用方按 fail-closed 拒。
 fn parse_identity(data: &Value) -> Option<XcxIdentity> {
-    let login = first_non_empty(data, &["loginName", "userName", "username", "employeeCode"])?;
-    let role = first_non_empty(data, &["activeRoleCode"])
+    const LOGIN_KEYS: &[&str] = &["loginName", "userName", "username", "employeeCode"];
+    let login = first_non_empty(data, LOGIN_KEYS).or_else(|| {
+        ["user", "employee", "sysUser", "userInfo"]
+            .iter()
+            .filter_map(|k| data.get(k))
+            .find_map(|nested| first_non_empty(nested, LOGIN_KEYS))
+    })?;
+    let role = first_non_empty(data, &["activeRoleCode", "currentRoleCode", "roleCode"])
         .map(str::to_string)
         .or_else(|| {
-            let first = data.get("roleVOList")?.as_array()?.first()?;
-            first_non_empty(first, &["roleCode"]).map(str::to_string)
+            first_non_empty(data.get("activeRole")?, &["roleCode"]).map(str::to_string)
+        })
+        .or_else(|| {
+            ["roleVOList", "roleList", "roles"].iter().find_map(|k| {
+                let first = data.get(k)?.as_array()?.first()?;
+                first_non_empty(first, &["roleCode"]).map(str::to_string)
+            })
         });
     let name =
         first_non_empty(data, &["actualName", "name", "nickName", "employeeName"]).map(str::to_string);
@@ -336,7 +351,13 @@ pub async fn ask(
     // 身份 → Principal：员工禁用 / 多角色未选在这里被拒（与 Web 登录同一判据，零旁路）
     let p = principal::load_principal(&st.auth_mysql, &id.login_name, id.role_code.as_deref())
         .await
-        .map_err(|_| fail(StatusCode::FORBIDDEN, 403, "当前账号或角色不可用"))?;
+        .map_err(|e| {
+            // 客户端文案保持笼统（不泄权限结构），但服务端必须留可排查的真因 ——
+            // 「admin 角色无 administrator_flag 被拦」与「员工不存在」运维上是两条完全不同的路。
+            tracing::warn!(login = %id.login_name, role = ?id.role_code, reason = %e,
+                "小程序身份核验被 load_principal 拒");
+            fail(StatusCode::FORBIDDEN, 403, "当前账号或角色不可用")
+        })?;
     // 会话：带了就校验属主（同 api_ask 语义：非属主 403，不泄存在性之外的越权面）；
     // 没带就开新会话 —— 小程序客户端不必先调「新建会话」接口，一问即开。
     let conv_id = match req.conv_id {
@@ -507,6 +528,24 @@ mod tests {
         // 姓名键各形态（只喂 /me 展示，取不到是 None 不失败）
         let d = json!({ "loginName": "a", "actualName": "张三" });
         assert_eq!(parse_identity(&d).unwrap().name.as_deref(), Some("张三"));
+    }
+
+    /// 上游实证的另外两个形态：roleList 数组名（小程序登录页就读它）、user 嵌套对象
+    #[test]
+    fn parse_role_list_key_and_nested_user_object() {
+        let d = json!({ "loginName": "a", "roleList": [{ "roleCode": "staff" }] });
+        assert_eq!(parse_identity(&d).unwrap().role_code.as_deref(), Some("staff"));
+        let d = json!({ "loginName": "a", "roles": [{ "roleCode": "city_manager" }] });
+        assert_eq!(parse_identity(&d).unwrap().role_code.as_deref(), Some("city_manager"));
+        let d = json!({ "loginName": "a", "activeRole": { "roleCode": "admin" } });
+        assert_eq!(parse_identity(&d).unwrap().role_code.as_deref(), Some("admin"));
+        // 嵌套 user：顶层没有登录名时往里看
+        let d = json!({ "user": { "loginName": "yunfan", "actualName": "云帆" }, "roleList": [{ "roleCode": "admin" }] });
+        let id = parse_identity(&d).unwrap();
+        assert_eq!((id.login_name.as_str(), id.role_code.as_deref()), ("yunfan", Some("admin")));
+        // 顶层优先于嵌套
+        let d = json!({ "loginName": "top", "user": { "loginName": "nested" } });
+        assert_eq!(parse_identity(&d).unwrap().login_name, "top");
         assert_eq!(parse_identity(&json!({ "loginName": "a" })).unwrap().name, None);
     }
 
