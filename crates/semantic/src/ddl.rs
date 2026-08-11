@@ -40,13 +40,16 @@ CREATE SCHEMA IF NOT EXISTS meta;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS meta.table_doc(
-  table_name text PRIMARY KEY,
+  -- 新库直接带 ds_id 复合主键（老库本句 no-op，走 ALTER + rekey 路径），省一次主键重建
+  ds_id text NOT NULL DEFAULT 'dms',
+  table_name text NOT NULL,
   table_comment text NOT NULL DEFAULT '',
   domain text NOT NULL DEFAULT '',
   warn text NOT NULL DEFAULT '',
   row_estimate bigint NOT NULL DEFAULT 0,
   search_doc text NOT NULL DEFAULT '',
-  updated_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (ds_id, table_name)
 );
 CREATE INDEX IF NOT EXISTS idx_table_doc_trgm ON meta.table_doc USING gin (search_doc gin_trgm_ops);
 -- 表召回的向量半（`recall::schema::vector_tables`）。**2026-07-28 查库：这一列压根不存在** ——
@@ -113,9 +116,10 @@ CREATE TABLE IF NOT EXISTS meta.artifact(
 CREATE INDEX IF NOT EXISTS idx_artifact_conv ON meta.artifact(conv_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_artifact_kind ON meta.artifact(kind, id DESC);
 -- 【分享】`share_token`（空 = 未分享）：uuid 即能力 —— 持链接者可看，无需登录。
--- 只授读，不授写；撤销 = 清空这一列。查询路径只认 `share_token <> ''`（空串不进索引语义）。
+-- 只授读，不授写；撤销 = 清空这一列。查询路径只认 `share_token <> ''`（部分索引同口径，
+-- 空串不占索引；老库的全量索引由 migrate 的条件 DROP 升级）。
 ALTER TABLE meta.artifact ADD COLUMN IF NOT EXISTS share_token text NOT NULL DEFAULT '';
-CREATE INDEX IF NOT EXISTS idx_artifact_share ON meta.artifact(share_token);
+CREATE INDEX IF NOT EXISTS idx_artifact_share ON meta.artifact(share_token) WHERE share_token <> '';
 -- 【D6 版本链】同会话、同 (kind,title) 的产物重生成时版本自增，老版本保留可回看。
 -- title 即链键（slug 的最小形态：产物链的身份 = 「这个会话里叫这个名字的这类报告」），
 -- 版本自增在 artifact_api::INSERT_SQL 的 MAX(version)+1 子查询里，唯一索引兜底并发撞号。
@@ -270,10 +274,9 @@ ALTER TABLE meta.element ADD COLUMN IF NOT EXISTS embedding vector(512);
 -- 纠错反哺日志（自进化引擎B+）：确定性校正器每次出手都记录，同错累计→升格 pitfall 教训
 CREATE TABLE IF NOT EXISTS meta.correction_log(
   id bigserial PRIMARY KEY,
-  -- 自由文本列，现有九种：schema-fix / groupby-fix / agg-fix / value-fix / caliber-fix
-  -- / explain-fail / caliber-retry / caliber-unresolved / caliber-grader-error
-  -- （末三种由 agent::guard 的裁决落；`caliber-grader-error` = 判据自己没跑起来，
-  --   那个数就是「有多少答案压根没被校验过」，查它的人第一眼看的就是本清单）
+  -- 自由文本列：取值由产出方（校正器/复盘链，见 agent::guard 的裁决落点）各自登记，
+  -- 本表不维护枚举计数（在这里写死「现有 N 种」必漂）。「有多少答案没被校验过」看
+  -- caliber-* 族（caliber-grader-error 是判据没跑起来的那档）。
   kind text NOT NULL,
   question text NOT NULL,
   detail text NOT NULL,      -- 纠正要点（幻觉列名/聚合改写/码值换写等）
@@ -336,8 +339,10 @@ CREATE TABLE IF NOT EXISTS meta.kv(
   k text PRIMARY KEY,
   v text NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_correction_trace ON meta.correction_log(trace_id);
-CREATE INDEX IF NOT EXISTS idx_failure_trace    ON meta.failure_log(trace_id);
+-- trace_id 可空：老行没有。部分索引不含 NULL 行（查询只认非空 trace_id；老库全量索引
+-- 由 migrate 的条件 DROP 升级）。
+CREATE INDEX IF NOT EXISTS idx_correction_trace ON meta.correction_log(trace_id) WHERE trace_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_failure_trace    ON meta.failure_log(trace_id) WHERE trace_id IS NOT NULL;
 -- idx_query_trace 移交 server/query_log.rs（它是该表的唯一属主：本文件按分号逐句切执行，
 -- 在全新空库上跑在本表建表之前，CREATE INDEX 没有 IF EXISTS 表级容错）。
 -- JOIN 边注册表（SuperSonic JoinPath 思想）：表间可连接边+基数，组合器跨基表路径推导用
@@ -406,15 +411,64 @@ ALTER TABLE meta.metric        ADD COLUMN IF NOT EXISTS time_cap text NOT NULL D
 "#;
 
 pub async fn migrate(pg: &PgPool) -> anyhow::Result<()> {
+    // 版本回填只做一次（meta.kv 哨兵）：已收敛的库启动不再全表扫 + window 计算。
+    // ds:any —— meta.kv 是全局运行时开关表（无 ds_id 列），回填哨兵是全局状态，不按源切。
+    let backfill_done: Option<String> = sqlx::query_scalar(
+        "SELECT v FROM meta.kv WHERE k = 'artifact_version_backfill_done'",
+    )
+    .fetch_optional(pg)
+    .await
+    .unwrap_or(None); // 全新空库还没有 meta.kv（它在 DDL 后段建）→ 视为未做
+    let backfill_done = backfill_done.as_deref() == Some("1");
+    let mut n = 0usize;
     for stmt in DDL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        sqlx::query(stmt).execute(pg).await?;
+        if backfill_done && stmt.starts_with("UPDATE meta.artifact") {
+            continue;
+        }
+        sqlx::query(stmt).execute(pg).await.map_err(|e| {
+            // 逐句执行失败必须带是第几句（sqlx 默认不带 SQL 文本，60+ 句里定位靠猜）
+            let head: String = stmt.chars().take(80).collect();
+            anyhow::anyhow!("DDL 第 {} 句执行失败：{e}\n语句开头：{head}", n + 1)
+        })?;
+        n += 1;
+    }
+    if !backfill_done {
+        sqlx::query(
+            "INSERT INTO meta.kv(k, v) VALUES ('artifact_version_backfill_done', '1')
+             ON CONFLICT (k) DO NOTHING",
+        )
+        .execute(pg)
+        .await?;
+    }
+    // 老库的全量索引升级成部分索引（CREATE IF NOT EXISTS 不会替换既有索引定义，要 DROP 一次）
+    for (idx, create_sql) in [
+        ("meta.idx_artifact_share",
+         "CREATE INDEX IF NOT EXISTS idx_artifact_share ON meta.artifact(share_token) WHERE share_token <> ''"),
+        ("meta.idx_correction_trace",
+         "CREATE INDEX IF NOT EXISTS idx_correction_trace ON meta.correction_log(trace_id) WHERE trace_id IS NOT NULL"),
+        ("meta.idx_failure_trace",
+         "CREATE INDEX IF NOT EXISTS idx_failure_trace ON meta.failure_log(trace_id) WHERE trace_id IS NOT NULL"),
+    ] {
+        let def: Option<String> = sqlx::query_scalar("SELECT pg_get_indexdef(to_regclass($1))::text")
+            .bind(idx)
+            .fetch_optional(pg)
+            .await?
+            .flatten();
+        if let Some(def) = def {
+            if !def.contains("WHERE") {
+                sqlx::query(&format!("DROP INDEX {idx}")).execute(pg).await?;
+                sqlx::query(create_sql).execute(pg).await?;
+                tracing::info!("{idx} 已升级为部分索引");
+            }
+        }
     }
     rekey_ds_pk(pg).await?;
+    tracing::info!(statements = n, "meta DDL 迁移完成");
     Ok(())
 }
 
 /// 主键前置 `ds_id`（【K3-B ①】）：`(表, 新主键列序)`。
-/// 不在表里的三张：`pitfall`/`sql_exemplar` 主键是 bigserial id（不需要）、
+/// 不在表里的四张：`pitfall`/`sql_exemplar` 主键是 bigserial id（不需要）、
 /// `scope_binding` 见 `migrate` 里的注释、`datasource` 本身就是按 ds_id 建的。
 const DS_PKS: &[(&str, &str)] = &[
     ("table_doc", "ds_id, table_name"),
@@ -429,26 +483,53 @@ const DS_PKS: &[(&str, &str)] = &[
     ("table_scope", "ds_id, table_name"),
 ];
 
-/// PK 前置 ds_id，**幂等**：现有主键定义里已含 ds_id 就跳过，否则 DROP + ADD。
+/// 现有主键定义已前置 ds_id 才算迁移完成：`contains` 会把 `(table_name, ds_id)` 误判已迁移。
+fn pk_prefixed_with_ds(def: &str) -> bool {
+    def.starts_with("PRIMARY KEY (ds_id")
+}
+
+/// PK 前置 ds_id，**幂等**：现有主键已前置 ds_id 就跳过，否则 DROP + ADD（包一个事务：
+/// 进程在两句之间崩溃 = 该表无 PK 直到下次启动成功）。
 /// 跳过判定不可省——DROP/ADD 每次启动都跑一遍等于每次重建索引（`bootstrap_meta` 是
 /// 服务与每次 `exec-sql` 都走的路径）。表名与列序全是本文件的字面量，无用户输入。
 async fn rekey_ds_pk(pg: &PgPool) -> anyhow::Result<()> {
+    // 一次查询取回全部现状（原来逐表一趟 pg_constraint）
+    let names: Vec<String> = DS_PKS.iter().map(|(t, _)| format!("meta.{t}")).collect();
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT conrelid::regclass::text, conname::text, pg_get_constraintdef(oid)
+         FROM pg_constraint WHERE conrelid = ANY($1::regclass[]) AND contype = 'p'",
+    )
+    .bind(&names)
+    .fetch_all(pg)
+    .await?;
+    let mut defs: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    for (rel, conname, def) in rows {
+        // search_path 不同渲染可能剥掉 schema 前缀，两种形态都认
+        let table = rel.strip_prefix("meta.").unwrap_or(&rel).to_string();
+        defs.insert(table, (conname, def));
+    }
     for (t, cols) in DS_PKS {
-        let def: Option<(String,)> = sqlx::query_as(
-            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
-             WHERE conrelid = $1::regclass AND contype = 'p'",
-        )
-        .bind(format!("meta.{t}"))
-        .fetch_optional(pg)
-        .await?;
-        if def.is_some_and(|(d,)| d.contains("ds_id")) {
-            continue;
+        match defs.get(*t) {
+            Some((_, def)) if pk_prefixed_with_ds(def) => continue,
+            found => {
+                let mut tx = pg.begin().await?;
+                if let Some((conname, _)) = found {
+                    // 用查到的真实约束名 DROP（手工建过的非默认名不再空转后 ADD 报错；
+                    // 目录名按标识符转义）
+                    sqlx::query(&format!(
+                        "ALTER TABLE meta.{t} DROP CONSTRAINT IF EXISTS \"{}\"",
+                        conname.replace('"', "\"\"")
+                    ))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                sqlx::query(&format!("ALTER TABLE meta.{t} ADD PRIMARY KEY ({cols})"))
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                tracing::info!("meta.{t} 主键前置 ds_id：({cols})");
+            }
         }
-        sqlx::query(&format!("ALTER TABLE meta.{t} DROP CONSTRAINT IF EXISTS {t}_pkey"))
-            .execute(pg)
-            .await?;
-        sqlx::query(&format!("ALTER TABLE meta.{t} ADD PRIMARY KEY ({cols})")).execute(pg).await?;
-        tracing::info!("meta.{t} 主键前置 ds_id：({cols})");
     }
     Ok(())
 }
@@ -474,9 +555,9 @@ pub struct VectorReady {
 /// 扫，而第二个 `EXISTS` 落在 const 的第二行 ⇒ 两个窗口的交集只剩「紧贴」这一种放法
 /// （标记先放高两行、再放高一行，各判红一次 —— 那道守卫确实在看内容）。
 /// `ds:any` 的理由：三个位是**全局**体检（「向量路到底通不通」），按源切开就答不了那个问题。
-const VECTOR_READY_SQL: &str = "SELECT EXISTS(SELECT 1 FROM meta.table_doc WHERE embedding IS NOT NULL), \
-     EXISTS(SELECT 1 FROM meta.element WHERE status = 'active' AND embedding IS NOT NULL), \
-     EXISTS(SELECT 1 FROM meta.datasource WHERE status = 'active' AND embedding IS NOT NULL)";
+const VECTOR_READY_SQL: &str = "SELECT EXISTS(SELECT 1 FROM meta.table_doc WHERE embedding IS NOT NULL) AS table_doc, \
+     EXISTS(SELECT 1 FROM meta.element WHERE status = 'active' AND embedding IS NOT NULL) AS element, \
+     EXISTS(SELECT 1 FROM meta.datasource WHERE status = 'active' AND embedding IS NOT NULL) AS datasource";
 
 /// 向量就绪体检：**一句只读 SQL、三个 `EXISTS`**（命中即短路；全 NULL 时三张表全走顺序扫，
 /// 也就是今天的最坏情况）。2026-07-30 实测（`EXPLAIN ANALYZE`，254 + 1033 + 4 行全 NULL）：
@@ -493,9 +574,14 @@ const VECTOR_READY_SQL: &str = "SELECT EXISTS(SELECT 1 FROM meta.table_doc WHERE
 ///
 /// 消费者：`agent::source::nearest_visible`（省掉一次注定返空的 embed HTTP）+ `/api/health`。
 pub async fn vector_ready(pg: &PgPool) -> anyhow::Result<VectorReady> {
-    let (table_doc, element, datasource): (bool, bool, bool) =
-        sqlx::query_as(VECTOR_READY_SQL).fetch_one(pg).await?;
-    Ok(VectorReady { table_doc, element, datasource })
+    // 按列名解码（三个同型 bool 按位置取的话，列序一调就静默张冠李戴）
+    use sqlx::Row;
+    let row = sqlx::query(VECTOR_READY_SQL).fetch_one(pg).await?;
+    Ok(VectorReady {
+        table_doc: row.get("table_doc"),
+        element: row.get("element"),
+        datasource: row.get("datasource"),
+    })
 }
 
 #[cfg(test)]
@@ -586,5 +672,48 @@ mod tests {
         for (t, cols) in DS_PKS {
             assert!(cols.starts_with("ds_id"), "{t} 的主键没有前置 ds_id: {cols}");
         }
+        // 「已迁移」判定必须验前置：contains 会把 (table_name, ds_id) 误判已迁移
+        assert!(pk_prefixed_with_ds("PRIMARY KEY (ds_id, table_name)"));
+        assert!(!pk_prefixed_with_ds("PRIMARY KEY (table_name, ds_id)"));
+        // 建表即带 ds_id 主键的三张（不走 rekey）：内联 PRIMARY KEY 必须以 ds_id 开头
+        for t in ["value_domain", "table_snapshot", "document_family"] {
+            let needle = format!("meta.{t}(");
+            let at = DDL.find(&needle).unwrap_or_else(|| panic!("{t} 建表语句不见了"));
+            let body = &DDL[at..];
+            let head = &body[..body.find(");").expect("{t} 建表语句缺收尾")];
+            assert!(head.contains("PRIMARY KEY(ds_id"), "{t} 内联主键未前置 ds_id");
+        }
+        // 新库路径：table_doc 建表直接带 ds_id 复合主键（不再先 PK(table_name) 再 rekey）
+        let at = DDL
+            .find("CREATE TABLE IF NOT EXISTS meta.table_doc(")
+            .expect("table_doc 建表语句不见了");
+        let body = &DDL[at..];
+        let head = &body[..body.find(");").expect("table_doc 建表语句缺收尾")];
+        assert!(head.contains("PRIMARY KEY (ds_id, table_name)"), "table_doc 内联主键变了");
+    }
+
+    /// 🔴 DDL 注释行不许带半角分号（按分号逐句切执行：注释里的分号会把语句劈成两半，
+    /// 服务与全部 CLI 启动即语法错误 —— 踩过一次）。`DO $$` 块同理不许出现。
+    #[test]
+    fn ddl_comment_lines_have_no_semicolons() {
+        for (n, line) in DDL.lines().enumerate() {
+            if let Some(pos) = line.find("--") {
+                assert!(
+                    !line[pos..].contains(';'),
+                    "DDL 第 {} 行注释带半角分号：{line}",
+                    n + 1
+                );
+            }
+        }
+        // DO 块同理不许出现（判的是行首语句形态；注释里的字面提及不算）
+        assert!(
+            !DDL.lines().any(|l| l.trim_start().starts_with("DO $$")),
+            "DO 块会把切句劈碎"
+        );
+        // 版本回填哨兵锚点：migrate 按这个语句头跳过已收敛的回填
+        assert!(
+            DDL.contains("UPDATE meta.artifact a SET version"),
+            "回填语句形态变了 —— migrate 的哨兵跳过锚点要同步"
+        );
     }
 }

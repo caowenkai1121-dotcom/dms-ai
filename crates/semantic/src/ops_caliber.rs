@@ -10,6 +10,10 @@ use sqlx::PgPool;
 
 const DOC_VERSION: &str = "运营看板逐项血缘版 v0.1.19";
 
+/// 运营看板口径起算日（v0.1.19：只纳入该日及以后的数据）。
+/// `activity_valid`/`inspection_valid` 的 SQL 与 `TERMS` 文案三处共用（改口径只改这里）。
+const OPS_EPOCH: &str = "2026-06-01";
+
 struct Metric {
     code: &'static str,
     name: &'static str,
@@ -44,13 +48,15 @@ fn province_region(col: &str) -> String {
 
 fn activity_region(alias: &str) -> String {
     let fallback = province_region(&format!("{alias}.store_province"));
+    // REPLACE 归一链存局部复用（原来 IN 列表与 THEN 各写一份，漂移风险）
+    let normalized = format!("REPLACE(REPLACE({alias}.department_name,'省区',''),'大区','')");
     format!(
         "CASE \
          WHEN {alias}.department_name IN ('苏南大区','苏北大区','江苏省区') THEN '江苏' \
-         WHEN REPLACE(REPLACE({alias}.department_name,'省区',''),'大区','') IN \
+         WHEN {normalized} IN \
               ('福建','贵州','广东','云南','湖南','河北','天津','江苏','北京','浙江','湖北',\
                '川渝藏','山西','山东','河南','广西','江西','安徽','吉林','辽宁','黑龙江','内蒙','西北') \
-         THEN REPLACE(REPLACE({alias}.department_name,'省区',''),'大区','') \
+         THEN {normalized} \
          ELSE {fallback} END"
     )
 }
@@ -58,14 +64,14 @@ fn activity_region(alias: &str) -> String {
 fn activity_valid(alias: &str) -> String {
     format!(
         "{alias}.deleted_flag = 0 AND {alias}.status <> '0' \
-         AND {alias}.start_date >= '2026-06-01' AND ({}) IS NOT NULL",
+         AND {alias}.start_date >= '{OPS_EPOCH}' AND ({}) IS NOT NULL",
         activity_region(alias)
     )
 }
 
 fn inspection_valid(alias: &str) -> String {
     format!(
-        "{alias}.deleted_flag = 0 AND {alias}.inspection_date >= '2026-06-01' \
+        "{alias}.deleted_flag = 0 AND {alias}.inspection_date >= '{OPS_EPOCH}' \
          AND ({}) IS NOT NULL AND NOT EXISTS (\
            SELECT 1 FROM t_employee oe JOIN t_position op ON op.position_id = oe.position_id \
            WHERE oe.login_name = {alias}.inspector AND oe.deleted_flag = 0 AND op.deleted_flag = 0 \
@@ -103,39 +109,65 @@ fn region_and(region: Option<&str>, expr: String) -> String {
     region.map(|r| format!(" AND ({expr}) = '{r}'")).unwrap_or_default()
 }
 
+/// 活动/巡店域三个 agg 的共用片段：valid/time/region 一次算好
+/// （原来 `activity_agg`/`promoter_agg`/`inspection_agg` 各自重复 format! 同一串）。
+struct AggCtx {
+    valid: String,
+    time: String,
+    region: String,
+}
+
+impl AggCtx {
+    fn activity(question: Option<&str>, region: Option<&str>) -> Self {
+        Self {
+            valid: activity_valid("a"),
+            time: time_and(question, "a.start_date"),
+            region: region_and(region, activity_region("a")),
+        }
+    }
+
+    fn inspection(question: Option<&str>, region: Option<&str>) -> Self {
+        Self {
+            valid: inspection_valid("r"),
+            time: time_and(question, "r.inspection_date"),
+            region: region_and(region, province_region("r.province")),
+        }
+    }
+}
+
 fn activity_agg(expr: &str, question: Option<&str>, region: Option<&str>) -> String {
-    format!(
-        "(SELECT {expr} FROM t_activity_main a WHERE {}{}{})",
-        activity_valid("a"),
-        time_and(question, "a.start_date"),
-        region_and(region, activity_region("a"))
-    )
+    let c = AggCtx::activity(question, region);
+    format!("(SELECT {expr} FROM t_activity_main a WHERE {}{}{})", c.valid, c.time, c.region)
 }
 
 fn promoter_agg(expr: &str, question: Option<&str>, region: Option<&str>) -> String {
+    let c = AggCtx::activity(question, region);
     format!(
         "(SELECT {expr} FROM t_activity_promoter_fee p \
          JOIN t_activity_main a ON a.id = p.activity_id \
          WHERE p.deleted_flag = 0 AND {}{}{})",
-        activity_valid("a"),
-        time_and(question, "a.start_date"),
-        region_and(region, activity_region("a"))
+        c.valid, c.time, c.region
     )
 }
 
 fn inspection_agg(expr: &str, question: Option<&str>, region: Option<&str>) -> String {
+    let c = AggCtx::inspection(question, region);
     format!(
         "(SELECT {expr} FROM t_shop_inspection_records r WHERE {}{}{})",
-        inspection_valid("r"),
-        time_and(question, "r.inspection_date"),
-        region_and(region, province_region("r.province"))
+        c.valid, c.time, c.region
     )
+}
+
+/// 注册指标的 agg 表达式：缺分支当场指出 code（原来裸 unwrap，panic 不带是哪个指标）。
+fn expr_or_panic(code: &'static str) -> String {
+    metric_expr(code, None, None).unwrap_or_else(|| panic!("metric_expr 缺分支：{code}"))
 }
 
 fn metric_expr(code: &str, question: Option<&str>, region: Option<&str>) -> Option<String> {
     Some(match code {
+        // 与同族指标（sales/cost）的空集语义一致：空集返 0 而不是 NULL
         "ops_activity_sessions" => activity_agg(
-            "SUM(CASE WHEN a.duration_days > 0 THEN a.duration_days ELSE GREATEST(DATEDIFF(a.end_date,a.start_date)+1,1) END)",
+            "COALESCE(SUM(CASE WHEN a.duration_days > 0 THEN a.duration_days ELSE GREATEST(DATEDIFF(a.end_date,a.start_date)+1,1) END),0)",
             question,
             region,
         ),
@@ -175,7 +207,7 @@ fn metrics() -> Vec<Metric> {
             code: "ops_activity_sessions", name: "运营活动场次",
             aliases: &["运营看板活动场次", "线下运营活动场次", "按持续天数折算的活动场次"],
             source: "t_activity_main",
-            agg: metric_expr("ops_activity_sessions", None, None).unwrap(),
+            agg: expr_or_panic("ops_activity_sessions"),
             scope: "", time_col: "start_date",
             description: "有效活动持续天数之和；一条跨多日活动折算为多场。只纳入 status<>'0'、标准23省区，日期按活动开始日。与通用DMS指标“活动场次”(按活动编号去重)不是同一口径。",
             unit: "",
@@ -184,7 +216,7 @@ fn metrics() -> Vec<Metric> {
             code: "ops_activity_sales", name: "运营活动销售额",
             aliases: &["活动台账销售额", "线下活动销售额", "运营看板销售额"],
             source: "t_activity_promoter_fee / t_activity_main",
-            agg: metric_expr("ops_activity_sales", None, None).unwrap(), scope: "", time_col: "start_date",
+            agg: expr_or_panic("ops_activity_sales"), scope: "", time_col: "start_date",
             description: "活动销售额来自促销员明细 actual_sales 求和，不是订单销售额，也不在活动主表 total_amount 中。有效活动=status<>'0'且属于标准23省区。",
             unit: "",
         },
@@ -192,7 +224,7 @@ fn metrics() -> Vec<Metric> {
             code: "ops_activity_cost", name: "运营活动费用",
             aliases: &["六项活动费用", "活动六项费用", "运营看板活动费用"],
             source: "t_activity_main",
-            agg: metric_expr("ops_activity_cost", None, None).unwrap(), scope: "", time_col: "start_date",
+            agg: expr_or_panic("ops_activity_cost"), scope: "", time_col: "start_date",
             description: "六项费用合计：促销员+试吃+物料+场地+运输+其他。DMS只读对拍97条有效活动：主表 total_amount 与六张费用明细逐项合计差异0，可走主表快速聚合。",
             unit: "",
         },
@@ -200,7 +232,7 @@ fn metrics() -> Vec<Metric> {
             code: "ops_activity_cost_ratio", name: "活动费比",
             aliases: &["运营活动费比", "活动费用率", "运营看板费比"],
             source: "t_activity_main / t_activity_promoter_fee",
-            agg: metric_expr("ops_activity_cost_ratio", None, None).unwrap(),
+            agg: expr_or_panic("ops_activity_cost_ratio"),
             scope: "", time_col: "start_date",
             description: "整体活动费比=有效活动六项费用总和÷活动销售额总和，不是逐活动费比的算术平均；销售额为0时返回空值。",
             unit: "percent",
@@ -209,7 +241,7 @@ fn metrics() -> Vec<Metric> {
             code: "ops_activity_roi", name: "运营活动ROI",
             aliases: &["活动ROI", "整体ROI", "运营看板平均ROI"],
             source: "t_activity_main / t_activity_promoter_fee",
-            agg: metric_expr("ops_activity_roi", None, None).unwrap(),
+            agg: expr_or_panic("ops_activity_roi"),
             scope: "", time_col: "start_date",
             description: "活动主卡ROI=总销售额÷总费用，是整体加权ROI；优秀案例模块的平均ROI才是单条ROI算术平均，两者不可互换。",
             unit: "",
@@ -218,7 +250,7 @@ fn metrics() -> Vec<Metric> {
             code: "ops_promoter_day_price", name: "促销员人天单价",
             aliases: &["临促人天单价", "活动人天单价"],
             source: "t_activity_promoter_fee / t_activity_main",
-            agg: metric_expr("ops_promoter_day_price", None, None).unwrap(),
+            agg: expr_or_panic("ops_promoter_day_price"),
             scope: "", time_col: "start_date",
             description: "促销员费用合计÷临促人天合计；分母为0时返回空值，不按0处理。DMS服务同口径汇总 total_amount 与 work_days。",
             unit: "",
@@ -227,7 +259,7 @@ fn metrics() -> Vec<Metric> {
             code: "ops_inspection_count", name: "运营巡店次数",
             aliases: &["有效巡店次数", "巡店记录数", "运营看板巡店次数"],
             source: "t_shop_inspection_records",
-            agg: metric_expr("ops_inspection_count", None, None).unwrap(), scope: "", time_col: "inspection_date",
+            agg: expr_or_panic("ops_inspection_count"), scope: "", time_col: "inspection_date",
             description: "巡店按业务日期统计、按非空巡店ID去重，并排除职位含三方/副总的人员；省份必须能归一到标准23省区。DMS物理表主键id对应数据集inspection_id。",
             unit: "",
         },
@@ -235,7 +267,7 @@ fn metrics() -> Vec<Metric> {
             code: "ops_inspected_shop_count", name: "巡店门店数",
             aliases: &["去重巡店门店数", "巡过的门店数"],
             source: "t_shop_inspection_records",
-            agg: metric_expr("ops_inspected_shop_count", None, None).unwrap(),
+            agg: expr_or_panic("ops_inspected_shop_count"),
             scope: "", time_col: "inspection_date",
             description: "先执行有效巡店过滤，再按门店编码优先、名称兜底去重。",
             unit: "",
@@ -243,49 +275,58 @@ fn metrics() -> Vec<Metric> {
         Metric {
             code: "ops_avg_display_sku", name: "平均陈列SKU",
             aliases: &["平均陈列SKU数", "陈列SKU均值"], source: "t_shop_inspection_records",
-            agg: metric_expr("ops_avg_display_sku", None, None).unwrap(), scope: "", time_col: "inspection_date",
+            agg: expr_or_panic("ops_avg_display_sku"), scope: "", time_col: "inspection_date",
             description: "有效巡店范围内 sku_count 非空值的算术平均；0参与均值。", unit: "",
         },
         Metric {
             code: "ops_avg_freezer", name: "平均冰柜数",
             aliases: &["陈列冰柜均值", "平均陈列冰柜数"], source: "t_shop_inspection_records",
-            agg: metric_expr("ops_avg_freezer", None, None).unwrap(), scope: "", time_col: "inspection_date",
+            agg: expr_or_panic("ops_avg_freezer"), scope: "", time_col: "inspection_date",
             description: "有效巡店范围内 display_freezer_count 非空值的算术平均；0参与均值。", unit: "",
         },
         Metric {
             code: "ops_avg_sausage_price", name: "烤肠均价",
             aliases: &["烤肠平均零售价"], source: "t_shop_inspection_records",
-            agg: metric_expr("ops_avg_sausage_price", None, None).unwrap(), scope: "", time_col: "inspection_date",
+            agg: expr_or_panic("ops_avg_sausage_price"), scope: "", time_col: "inspection_date",
             description: "只排除空值，数值0仍参与均值；文档明确“非0”标题与实际代码有差异。", unit: "",
         },
         Metric {
             code: "ops_avg_tart_shell_price", name: "蛋挞皮均价",
             aliases: &["蛋挞皮平均零售价"], source: "t_shop_inspection_records",
-            agg: metric_expr("ops_avg_tart_shell_price", None, None).unwrap(), scope: "", time_col: "inspection_date",
+            agg: expr_or_panic("ops_avg_tart_shell_price"), scope: "", time_col: "inspection_date",
             description: "有效巡店范围内蛋挞皮零售价非空值平均，0参与。", unit: "",
         },
         Metric {
             code: "ops_avg_tart_liquid_price", name: "蛋挞液均价",
             aliases: &["蛋挞液平均零售价"], source: "t_shop_inspection_records",
-            agg: metric_expr("ops_avg_tart_liquid_price", None, None).unwrap(), scope: "", time_col: "inspection_date",
+            agg: expr_or_panic("ops_avg_tart_liquid_price"), scope: "", time_col: "inspection_date",
             description: "有效巡店范围内蛋挞液零售价非空值平均，0参与。", unit: "",
         },
     ]
 }
 
+/// 指标集进程内只构建一次（每条 agg 含多次 format!；原来 `direct_metric` 每问句重建、
+/// `seed_metrics` 每轮构建两遍）。
+fn metrics_cached() -> &'static [Metric] {
+    static MS: std::sync::OnceLock<Vec<Metric>> = std::sync::OnceLock::new();
+    MS.get_or_init(metrics)
+}
+
 /// 运营口径的无维度确定性命中。只承接“一个指标 + 可选时间窗”；任何省区、城市、
 /// 客户等未兑现限定都会被残留守卫拒绝，交回完整组合/LLM 链。
 pub fn direct_metric(question: &str) -> Option<(String, String)> {
-    let ms = metrics();
+    let ms = metrics_cached();
     let (m, hit) = ms
         .iter()
         .filter_map(|m| {
             let aliases = m.aliases.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             dms_kernel::nl::text::match_word(question, m.name, &aliases).map(|w| (m, w))
         })
+        // 词长平手时按名字字典序取最大：语义任意但**确定性**是有意的（同问句同结果）
         .max_by_key(|(m, w)| (w.chars().count(), m.name))?;
     let region = region_of(question);
-    let mut consumed = vec![hit, "呢".into(), "吗".into(), "总共".into(), "一共".into(), "了".into()];
+    // 「吗」「了」「呢」是本清单的增量；「总共/一共」已在 STRIP_WORDS 里（has_residue_with 会再剥）
+    let mut consumed = vec![hit, "呢".into(), "吗".into(), "了".into()];
     if let Some((word, _)) = region {
         consumed.push(word.into());
     }
@@ -329,7 +370,11 @@ const EDGES: &[(&str, &str, &str, &str, &str, &str)] = &[
 ];
 
 async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
-    for m in metrics() {
+    const ACTIVITY_DIMS: &[&str] = &["活动省区", "活动级别"];
+    const INSPECTION_DIMS: &[&str] = &["巡店省区", "巡店城市"];
+    // 单循环一次遍历（原来 insert/update 两循环各自重建一遍 metrics()）；
+    // UPDATE 0 行 = insert 与 policy 写漂，warn 留痕
+    for m in metrics_cached() {
         sqlx::query(
             "INSERT INTO meta.metric(ds_id,metric_code,name,aliases,source_table,agg_expr,scope_filter,time_col,dedup_keys,description,unit,time_cap)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'',$9,$10,'')
@@ -337,25 +382,25 @@ async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
                agg_expr=$6,scope_filter=$7,time_col=$8,dedup_keys='',description=$9,unit=$10,time_cap=''",
         )
         .bind(DMS_DS_ID).bind(m.code).bind(m.name)
-        .bind(m.aliases.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        .bind(m.source).bind(m.agg).bind(m.scope).bind(m.time_col)
+        .bind(m.aliases.to_vec())
+        .bind(m.source).bind(&m.agg).bind(m.scope).bind(m.time_col)
         .bind(format!("{}。依据：{DOC_VERSION}", m.description)).bind(m.unit)
         .execute(pg).await?;
-    }
-    const ACTIVITY_DIMS: &[&str] = &["活动省区", "活动级别"];
-    const INSPECTION_DIMS: &[&str] = &["巡店省区", "巡店城市"];
-    for m in metrics() {
         let dims = if m.code.starts_with("ops_activity") || m.code == "ops_promoter_day_price" {
             ACTIVITY_DIMS
         } else {
             INSPECTION_DIMS
         };
-        sqlx::query("UPDATE meta.metric SET version=$1, allowed_dimensions=$2 WHERE ds_id=$3 AND metric_code=$4")
+        let affected = sqlx::query("UPDATE meta.metric SET version=$1, allowed_dimensions=$2 WHERE ds_id=$3 AND metric_code=$4")
             .bind(DOC_VERSION)
-            .bind(dims.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .bind(dims.to_vec())
             .bind(DMS_DS_ID)
             .bind(m.code)
-            .execute(pg).await?;
+            .execute(pg).await?
+            .rows_affected();
+        if affected == 0 {
+            tracing::warn!("运营指标 policy 未命中行（code={} 与 insert 写漂？）", m.code);
+        }
     }
     Ok(())
 }
@@ -431,10 +476,19 @@ async fn seed_graph_and_docs(pg: &PgPool) -> anyhow::Result<()> {
         ("t_activity_main", "运营活动主表：开始/结束日期、持续天数、活动级别、客户/门店/经理。total_amount是六张费用明细合计；活动销售额不在本表，来自促销员明细actual_sales。"),
         ("t_activity_promoter_fee", "活动促销员明细：actual_sales=活动销售额，total_amount=促销员费用，work_days=临促人天；按activity_id关联活动主表。"),
     ];
+    let mut doc_missed: Vec<&str> = vec![];
     for (table, comment) in docs {
-        sqlx::query("UPDATE meta.table_doc SET custom_comment=$3 WHERE ds_id=$1 AND table_name=$2")
+        let affected = sqlx::query("UPDATE meta.table_doc SET custom_comment=$3 WHERE ds_id=$1 AND table_name=$2")
             .bind(DMS_DS_ID).bind(table).bind(format!("{comment} 依据：{DOC_VERSION}"))
-            .execute(pg).await?;
+            .execute(pg).await?
+            .rows_affected();
+        if affected == 0 {
+            doc_missed.push(table);
+        }
+    }
+    if !doc_missed.is_empty() {
+        // 表名打错时静默 seed 空气（首次启动 table_doc 为空属合法，对照 seed.rs 同款模式）
+        tracing::warn!("运营看板 custom_comment 未命中 table_doc 行：{doc_missed:?}");
     }
     Ok(())
 }
@@ -494,5 +548,48 @@ mod tests {
     #[test]
     fn non_unique_shop_master_is_not_claimed_as_many_to_one() {
         assert!(EDGES.iter().all(|(_, _, rt, _, _, _)| *rt != "t_master_shop"));
+    }
+
+    /// 无时间词问句的全时段语义钉住：直答照给，SQL 里留「时间条件必须加在这一行」提示注释
+    /// （刻意不拒答 —— 拒答会把这类问句赶回 LLM 链，属行为变更，需评审）。
+    #[test]
+    fn timeless_question_runs_full_range_with_marker() {
+        let (sql, _) = direct_metric("运营活动场次是多少").unwrap();
+        assert!(sql.contains("时间条件必须加在这一行"), "无时间词的全时段直答语义变了：{sql}");
+        assert!(sql.contains(OPS_EPOCH), "{sql}");
+    }
+
+    /// 维度组归属钉死：ops_activity_* + ops_promoter_day_price 归活动维度组，
+    /// 其余归巡店组；新增前缀不符的活动类指标会在这里红（原来靠 starts_with 静默分流）。
+    #[test]
+    fn dims_assignment_is_pinned() {
+        const ACTIVITY: &[&str] = &[
+            "ops_activity_sessions", "ops_activity_sales", "ops_activity_cost",
+            "ops_activity_cost_ratio", "ops_activity_roi", "ops_promoter_day_price",
+        ];
+        const INSPECTION: &[&str] = &[
+            "ops_inspection_count", "ops_inspected_shop_count", "ops_avg_display_sku",
+            "ops_avg_freezer", "ops_avg_sausage_price", "ops_avg_tart_shell_price",
+            "ops_avg_tart_liquid_price",
+        ];
+        for m in metrics_cached() {
+            let is_activity = m.code.starts_with("ops_activity") || m.code == "ops_promoter_day_price";
+            assert_eq!(is_activity, ACTIVITY.contains(&m.code), "{} 的维度组归属变了", m.code);
+            assert!(
+                ACTIVITY.contains(&m.code) || INSPECTION.contains(&m.code),
+                "新指标 {} 未登记维度组归属",
+                m.code
+            );
+            // 顺带：每个注册 code 都有 metric_expr 分支（expr_or_panic 的运行期兜底印证）
+            assert!(metric_expr(m.code, None, None).is_some(), "metric_expr 缺分支：{}", m.code);
+        }
+    }
+
+    /// 巡店/活动域的 customer 血缘边钉住（删边无断言会红，对照 seed.rs 的血缘钉法）。
+    #[test]
+    fn ops_lineage_edges_are_pinned() {
+        assert_eq!(EDGES.len(), 2, "巡店/活动域 customer 边数量变化需评审");
+        assert!(EDGES.iter().any(|e| e.0 == "t_shop_inspection_records" && e.2 == "t_customer"));
+        assert!(EDGES.iter().any(|e| e.0 == "t_activity_main" && e.2 == "t_customer"));
     }
 }

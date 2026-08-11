@@ -40,7 +40,12 @@
 //! - 取块两道 ACL：文档清单走 `store::list_docs`（`visible_docs` 内联）；正文块的 SQL 里
 //!   再内联一次空间级谓词（撤权发生在两步之间也不会带出正文 —— 同 `retrieve` 两步内联的理由）。
 //! - LLM（fast 档，20s 超时）失败/空解析 → 按文档名拼保守问题；无可见文档 → 空数组。
-//!   回退产物**也进缓存**（模型欠费时每个请求都重试一次 LLM = 白烧 20s × N）。
+//!   回退产物**也进缓存**（模型欠费时每个请求都重试一次 LLM = 白烧 20s × N）；
+//!   `"empty"`（无可见文档 / 文档名全是怪名）**不缓存** —— 空间刚传完文档，
+//!   不能被 24h 的空样例挡住。
+//! - 已知取舍：缓存 miss 无 singleflight，并发 N 个请求会各打一次 20s LLM
+//!   （KV_SET 是 upsert，写侧安全，纯浪费）。单飞要跨请求共享状态（动 `AppState`），
+//!   超出本文件自治范围，留此备查。
 
 use std::sync::Arc;
 
@@ -50,13 +55,8 @@ use axum::Json;
 use dms_kernel::{ChatModel, ChatRequest, ModelTier};
 use dms_knowledge::{acl, store, Viewer};
 
+use crate::admin_api::{err, ApiErr};
 use crate::AppState;
-
-type ApiErr = (StatusCode, Json<serde_json::Value>);
-
-fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
-    (code, Json(serde_json::json!({ "error": msg.to_string() })))
-}
 
 // ───────────────────────── ① 使用统计 ─────────────────────────
 
@@ -92,6 +92,8 @@ type RouteRow = (String, i64);
 type DailyRow = (String, i64);
 
 /// 管理员判据：DMS 校验后的 `Principal` 上读（见文件头）。抽成纯函数是为了能钉单测。
+/// 口径互指：`admin_api::is_admin` 只认 `administrator_flag`，本处多认 DMS 授出的 `admin`
+/// 角色（全局用量块口径）——差异是两边各自语义而非漂移，改任何一边都要评审另一边。
 fn is_admin(p: &dms_policy::Principal) -> bool {
     p.administrator_flag || p.role_code == "admin"
 }
@@ -104,32 +106,25 @@ pub struct UsageQuery {
 
 /// 三条聚合同一口径跑一遍；`login = None` 即全局（调用方必须先过 `is_admin`，fail-closed：
 /// 本函数自己不判权限，给不给 NULL 的决策只在 `usage_summary` 里那一处）。
+/// 三条 SQL 互不依赖，`try_join!` 并行；任一失败整体 500（同一通用文案，无优先级歧义）。
 async fn usage_block(
     st: &AppState,
     login: Option<&str>,
 ) -> Result<serde_json::Value, ApiErr> {
-    let summary = st
-        .owned
-        .fixed(SUMMARY_SQL)
-        .bind(login)
-        .fetch_optional::<SummaryRow>()
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .unwrap_or((0, 0, 0.0, 0.0, 0.0));
-    let routes = st
-        .owned
-        .fixed(ROUTES_SQL)
-        .bind(login)
-        .fetch_all::<RouteRow>()
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let daily = st
-        .owned
-        .fixed(DAILY_SQL)
-        .bind(login)
-        .fetch_all::<DailyRow>()
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // DB 错误不透 sqlx 原文（与 `sample_questions` 的通用文案同一条纪律）：warn 留痕 + 通用 500
+    let db_err = |e: dms_connector::ConnectorError| {
+        tracing::warn!(err = %e, "usage 聚合查询失败");
+        err(StatusCode::INTERNAL_SERVER_ERROR, "统计数据暂时不可用，请稍后重试")
+    };
+    let (summary, routes, daily) = tokio::try_join!(
+        st.owned.fixed(SUMMARY_SQL).bind(login).fetch_optional::<SummaryRow>(),
+        st.owned.fixed(ROUTES_SQL).bind(login).fetch_all::<RouteRow>(),
+        st.owned.fixed(DAILY_SQL).bind(login).fetch_all::<DailyRow>(),
+    )
+    .map_err(db_err)?;
+    // 无 GROUP BY 的聚合恒返一行，`fetch_optional` 的 None 分支不存在（`PgStmt` 没有
+    // fetch_one，用 expect 钉住这个不变量）
+    let summary = summary.expect("SUMMARY_SQL 是无 GROUP BY 聚合，恒返一行");
     Ok(serde_json::json!({
         "today": summary.1,
         "total": summary.0,
@@ -154,19 +149,36 @@ pub async fn usage_summary(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
     let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
-        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
-    let mut body = usage_block(&st, Some(&p.login_name)).await?;
-    // 全局块只在这一处挂上：判据在 DMS 校验后的 Principal 上（fail-closed 内联分支）
-    if is_admin(&p) {
-        let global = usage_block(&st, None).await?;
-        body.as_object_mut()
-            .expect("usage_block 恒返对象")
-            .insert("global".into(), global);
+        .map_err(principal_err)?;
+    // 全局块只在这一处挂上：判据在 DMS 校验后的 Principal 上（fail-closed 内联分支）。
+    // admin 时本人块与全局块（各三条 SQL）互不依赖，`try_join!` 并行。
+    let (mut body, global) = if is_admin(&p) {
+        let (b, g) = tokio::try_join!(
+            usage_block(&st, Some(&p.login_name)),
+            usage_block(&st, None),
+        )?;
+        (b, Some(g))
+    } else {
+        (usage_block(&st, Some(&p.login_name)).await?, None)
+    };
+    let obj = body.as_object_mut().expect("usage_block 恒返对象");
+    if let Some(global) = global {
+        obj.insert("global".into(), global);
     }
-    body.as_object_mut()
-        .expect("usage_block 恒返对象")
-        .insert("login_name".into(), serde_json::Value::from(p.login_name.clone()));
+    obj.insert("login_name".into(), serde_json::Value::from(p.login_name));
     Ok(Json(body))
+}
+
+/// `load_principal` 的错误分两档：查无此人/角色不可用（anyhow 文案）→ 403；
+/// DB 故障（`ConnectorError`：auth MySQL 超时/宕机）→ warn + 500 —— DB 故障报权限错误
+/// 会把排障方向带歪。
+fn principal_err(e: anyhow::Error) -> ApiErr {
+    if e.downcast_ref::<dms_connector::ConnectorError>().is_some() {
+        tracing::warn!(err = %e, "DMS 身份查询失败（auth MySQL）");
+        err(StatusCode::INTERNAL_SERVER_ERROR, "身份服务暂时不可用，请稍后重试")
+    } else {
+        err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用")
+    }
 }
 
 // ───────────────────────── ② 样例问题 ─────────────────────────
@@ -189,9 +201,12 @@ const CHUNK_CLIP_CHARS: usize = 300;
 ///   清单与取块之间，这条语句一行都返不出（同 `retrieve` 两步内联的理由）。
 /// 只内联空间级而不是整份 `visible_docs`：本端点先过了 `space_readable` 闸，doc 级授权
 /// （无空间授权的补充通道）在这条路径上不可达，引整份片段只会多一层永不命中的分支。
+/// `c.ord < $4`（$4 = `CHUNKS_PER_DOC`）库侧截断：每篇只用前 2 块，不把全部 chunk
+/// 拉回应用层再丢（大文档可达数千块）。
 const CHUNK_SQL: &str =
     "SELECT c.doc_id, c.text FROM kb.chunk c JOIN kb.doc d ON d.doc_id = c.doc_id
      WHERE c.doc_id = ANY($1::text[])
+       AND c.ord < $4
        AND d.enabled = true AND d.status IN ('chunked','embedded')
        AND EXISTS (SELECT 1 FROM kb.space s WHERE s.space_id = d.space_id
          AND (s.owner = $2 OR EXISTS (SELECT 1 FROM kb.acl a
@@ -213,11 +228,12 @@ fn now_secs() -> u64 {
 }
 
 /// 缓存值：`{"at": <unix>, "questions": [...]}`。任何畸形一律当 miss（回退路径照样能产出），
-/// 绝不能因为一行坏缓存把端点打挂。
+/// 绝不能因为一行坏缓存把端点打挂。`at` 在未来（时钟回拨/脏数据）同样当 miss ——
+/// 否则差值饱和为 0，旧问题集会被钉住直到那个未来时刻到期。
 fn cache_parse(v: &str, now: u64) -> Option<Vec<String>> {
     let j: serde_json::Value = serde_json::from_str(v).ok()?;
     let at = j.get("at")?.as_u64()?;
-    if now.saturating_sub(at) >= CACHE_TTL_SECS {
+    if at > now || now - at >= CACHE_TTL_SECS {
         return None;
     }
     let qs = j.get("questions")?.as_array()?;
@@ -234,14 +250,25 @@ fn cache_render(questions: &[String]) -> String {
 fn parse_questions(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in text.lines() {
-        // 剥行首的「1.」「1、」「1)」「- 」「• 」「* 」一族：数字与列举符号的任意前缀
-        let q = line
-            .trim()
-            .trim_start_matches(|c: char| {
-                c.is_ascii_digit()
-                    || matches!(c, '.' | '、' | ')' | '）' | '-' | '•' | '*' | ':' | '：' | ' ')
+        // 剥行首的「1.」「1、」「1)」「- 」「• 」「* 」一族：仅当数字串后紧跟
+        // 序号分隔符才视作编号剥掉 —— 「2026年预算怎么定？」是合法问题，不能削成
+        // 「年预算怎么定？」；项目符号（非数字开头）照旧整段剥
+        let line = line.trim();
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        let after = &line[digits..];
+        let is_numbered = digits > 0
+            && after
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c, '.' | '、' | ')' | '）' | ':' | '：'));
+        let q = if is_numbered {
+            after.trim_start_matches(|c: char| {
+                matches!(c, '.' | '、' | ')' | '）' | '-' | '•' | '*' | ':' | '：' | ' ')
             })
-            .trim();
+        } else {
+            line.trim_start_matches(|c: char| matches!(c, '-' | '•' | '*' | ' '))
+        }
+        .trim();
         if q.is_empty() {
             continue;
         }
@@ -264,17 +291,29 @@ fn parse_questions(text: &str) -> Vec<String> {
 fn fallback_questions(doc_names: &[String]) -> Vec<String> {
     const TEMPLATES: &[&str] = &["《{}》的主要内容是什么？", "请总结一下《{}》的要点"];
     let mut out = Vec::new();
-    for (i, name) in doc_names.iter().enumerate() {
+    for name in doc_names {
         if out.len() >= 5 {
             break;
         }
-        // 文件名去扩展名：「报销制度v2.pdf」→「报销制度v2」；去完是空的（".pdf" 这种
-        // 怪名）与空名一律跳过 —— 产出《.pdf》还不如少一条
-        let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name).trim();
+        // 文件名去扩展名：「报销制度v2.pdf」→「报销制度v2」。仅当末段像扩展名
+        // （≤5 字符且纯 ASCII 字母数字）才剥 —— 「v1.2报销制度」的点在中部不是
+        // 扩展名，剥了会截成「v1」。去完是空的（".pdf" 这种怪名）与空名一律跳过
+        // —— 产出《.pdf》还不如少一条
+        let stem = match name.rsplit_once('.') {
+            Some((stem, ext))
+                if !ext.is_empty()
+                    && ext.len() <= 5
+                    && ext.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+            {
+                stem.trim()
+            }
+            _ => name.trim(),
+        };
         if stem.is_empty() {
             continue;
         }
-        let q: String = TEMPLATES[i % TEMPLATES.len()].replace("{}", stem);
+        // 模板按产出数轮换：被跳过的怪名不占轮换位（产出不随跳过数漂）
+        let q: String = TEMPLATES[out.len() % TEMPLATES.len()].replace("{}", stem);
         if !out.contains(&q) {
             out.push(q);
         }
@@ -304,8 +343,8 @@ pub async fn sample_questions(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
     let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
-        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
-    let v = Viewer::new(p.login_name.clone(), vec![p.role_code.clone()]);
+        .map_err(principal_err)?;
+    let v = Viewer::new(p.login_name, vec![p.role_code]);
     // 空间级闸（fail-closed）：不可读的空间连「有没有文档」都不许探出来
     let readable = acl::space_readable(&st.owned, &v, space_id)
         .await
@@ -314,15 +353,22 @@ pub async fn sample_questions(
         return Err(err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {space_id}")));
     }
 
-    // 缓存命中直接返（坏行当 miss，见 `cache_parse`）
+    // 缓存命中直接返（坏行当 miss，见 `cache_parse`）。**读失败也降级为 miss**：
+    // 缓存是优化不是正确性（写失败同样只 warn，见下）——不许一行坏缓存把端点打挂
     let key = cache_key(space_id);
-    let cached: Option<(String,)> = st
+    let cached: Option<(String,)> = match st
         .owned
         .fixed(crate::admin_api::KV_GET_SQL)
         .bind(&key)
         .fetch_optional()
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(space_id, err = %e, "样例问题缓存读取失败（降级为 miss 重算）");
+            None
+        }
+    };
     if let Some(questions) = cached.and_then(|(v,)| cache_parse(&v, now_secs())) {
         return Ok(Json(serde_json::json!({
             "space_id": space_id, "questions": questions, "source": "cache", "cached": true,
@@ -330,16 +376,19 @@ pub async fn sample_questions(
     }
 
     let (questions, source) = generate_samples(&st, &v, space_id).await;
-    // 回退产物也写缓存（见文件头）；写失败只 warn —— 缓存是优化，不是正确性
-    if let Err(e) = st
-        .owned
-        .fixed(crate::admin_api::KV_SET_SQL)
-        .bind(&key)
-        .bind(cache_render(&questions))
-        .execute()
-        .await
-    {
-        tracing::warn!(space_id, err = %e, "样例问题缓存写入失败（降级不缓存）");
+    // 回退产物也写缓存（见文件头）；`"empty"` 不缓存 —— 空间刚传完文档，
+    // 不能被 24h 的空样例挡住。写失败只 warn —— 缓存是优化，不是正确性
+    if source != "empty" {
+        if let Err(e) = st
+            .owned
+            .fixed(crate::admin_api::KV_SET_SQL)
+            .bind(&key)
+            .bind(cache_render(&questions))
+            .execute()
+            .await
+        {
+            tracing::warn!(space_id, err = %e, "样例问题缓存写入失败（降级不缓存）");
+        }
     }
     Ok(Json(serde_json::json!({
         "space_id": space_id, "questions": questions, "source": source, "cached": false,
@@ -349,8 +398,15 @@ pub async fn sample_questions(
 /// 产出问题集。`(questions, source)`：`source ∈ {llm, fallback, empty}`。
 /// 任何一步失败都向下一档降级，这个函数本身不返回 Err。
 async fn generate_samples(st: &AppState, v: &Viewer, space_id: &str) -> (Vec<String>, &'static str) {
-    // 可见文档清单（ACL 在 list_docs 的 SQL 里）：既是候选集也是回退的素材
-    let docs = store::list_docs(&st.owned, v, space_id).await.unwrap_or_default();
+    // 可见文档清单（ACL 在 list_docs 的 SQL 里）：既是候选集也是回退的素材。
+    // 端点纪律是「绝不报错」，但排障侧该留痕：失败 warn 一条再降级空清单
+    let docs = match store::list_docs(&st.owned, v, space_id).await {
+        Ok(docs) => docs,
+        Err(e) => {
+            tracing::warn!(space_id, err = %e, "样例问题取文档清单失败（降级为空清单）");
+            Vec::new()
+        }
+    };
     let docs: Vec<(String, String)> = docs
         .into_iter()
         .filter(|d| d.enabled && matches!(d.status.as_str(), "chunked" | "embedded"))
@@ -363,15 +419,23 @@ async fn generate_samples(st: &AppState, v: &Viewer, space_id: &str) -> (Vec<Str
     let doc_names: Vec<String> = docs.iter().map(|(_, n)| n.clone()).collect();
 
     let doc_ids: Vec<String> = docs.iter().map(|(id, _)| id.clone()).collect();
-    let chunks: Vec<(String, String)> = st
+    // 同上的纪律：取块失败 warn 留痕再降级（下游按无摘录走 LLM/回退）
+    let chunks: Vec<(String, String)> = match st
         .owned
         .fixed(CHUNK_SQL)
         .bind(&doc_ids)
         .bind(&v.login)
         .bind(&v.roles)
+        .bind(CHUNKS_PER_DOC as i64)
         .fetch_all()
         .await
-        .unwrap_or_default();
+    {
+        Ok(chunks) => chunks,
+        Err(e) => {
+            tracing::warn!(space_id, err = %e, "样例问题取正文块失败（降级为无摘录）");
+            Vec::new()
+        }
+    };
     // 每篇取前 CHUNKS_PER_DOC 块（开头是标题/导语，最具代表性），每块截 300 字。
     // CHUNK_SQL 按 (doc_id, ord) 有序，同篇的块连续到达；**按 doc_id 分组**——文档可重名，
     // 按名分组会把两篇同名文档的摘录并进一条。
@@ -397,7 +461,9 @@ async fn generate_samples(st: &AppState, v: &Viewer, space_id: &str) -> (Vec<Str
             return (qs, "llm");
         }
     }
-    (fallback_questions(&doc_names), "fallback")
+    // 回退也可能一条都产不出（文档名全是怪名）：空集与 `"empty"` 同义，不混报 `"fallback"`
+    let qs = fallback_questions(&doc_names);
+    if qs.is_empty() { (qs, "empty") } else { (qs, "fallback") }
 }
 
 /// fast 档生成 5 问；失败/超时/空解析一律 `None`（调用方回退，绝不把错误透出端点）。
@@ -409,7 +475,9 @@ async fn llm_samples(st: &AppState, excerpts: &[(&str, Vec<String>)]) -> Option<
         只输出问题本身，每行一个，不要编号、不要解释、不要输出其他内容。问题用中文，每条不超过 40 字。";
     let mut user = String::new();
     for (name, texts) in excerpts {
-        user.push_str(&format!("文档《{name}》摘录：\n"));
+        user.push_str("文档《");
+        user.push_str(name);
+        user.push_str("》摘录：\n");
         for t in texts {
             user.push_str(t);
             user.push('\n');
@@ -510,6 +578,9 @@ mod tests {
         assert!(parse_questions(" \n- \n。\n").is_empty());
         // 不足 5 条不硬凑
         assert_eq!(parse_questions("只有一条问题").len(), 1);
+        // 数字开头但不是序号（后无分隔符）：合法问题原样保留，不削前缀
+        assert_eq!(parse_questions("2026年预算怎么定？"), ["2026年预算怎么定？"]);
+        assert_eq!(parse_questions("3 个报销档位分别是？"), ["3 个报销档位分别是？"]);
     }
 
     /// 回退问题：文档名去扩展名、模板轮换、封顶 5 条、怪名不炸
@@ -530,6 +601,16 @@ mod tests {
         assert!(fallback_questions(&[]).is_empty());
         let many: Vec<String> = (0..9).map(|i| format!("文档{i}")).collect();
         assert_eq!(fallback_questions(&many).len(), 5);
+        // 点在中部不是扩展名（后缀非纯字母数字）：「v1.2报销制度」不许截成「v1」
+        let qs = fallback_questions(&["v1.2报销制度".to_string()]);
+        assert!(qs[0].contains("v1.2报销制度"), "中部点不许当扩展名剥: {qs:?}");
+        // 真扩展名照旧剥：超 5 字符的后缀（".markdown"）不是扩展名，保留全名
+        let qs = fallback_questions(&["手册.markdown".to_string()]);
+        assert!(qs[0].contains("手册.markdown"), "超 5 字符后缀不剥: {qs:?}");
+        // 怪名被跳过后模板轮换按产出数走，不占位
+        let qs = fallback_questions(&[".pdf".to_string(), "甲制度".to_string(), "乙办法".to_string()]);
+        assert_eq!(qs.len(), 2, "{qs:?}");
+        assert!(qs[0].starts_with("《甲制度》的主要") && qs[1].starts_with("请总结"), "轮换不按跳过数漂: {qs:?}");
     }
 
     /// 缓存键形与 24h 过期；坏行一律 miss
@@ -546,6 +627,9 @@ mod tests {
         assert!(cache_parse(&edge, now).is_some());
         let stale = serde_json::json!({ "at": now - CACHE_TTL_SECS, "questions": ["q"] }).to_string();
         assert!(cache_parse(&stale, now).is_none(), "满 24h 即过期");
+        // at 在未来（时钟回拨/脏数据）按 miss：不许饱和差把旧问题集钉到未来时刻
+        let future = serde_json::json!({ "at": now + 3600, "questions": ["q"] }).to_string();
+        assert!(cache_parse(&future, now).is_none(), "未来 at 必须按 miss");
         // 畸形一律 miss：坏 JSON / 缺 at / 缺 questions / at 非数
         assert!(cache_parse("not json", now).is_none());
         assert!(cache_parse("{}", now).is_none());
@@ -558,21 +642,63 @@ mod tests {
 
     /// 取块 SQL 的 ACL 锚点（双侧）：本文件的常量与 `acl::space_readable` 的谓词必须同形状 ——
     /// 上游改了空间读判据，这里不改就当场红（防两份 ACL 各漂各的）。
+    /// acl.rs 侧判据已宏化（`space_acl_sql!`，读/写共用一条形状、perm 是参数）：钉宏体谓词
+    /// 碎片 + `space_readable` 传给宏的读权限实参，两侧任一漂移当场红。
     #[test]
     fn chunk_sql_inlines_space_acl_same_shape_as_acl_rs() {
         let acl_src = include_str!("../../knowledge/src/acl.rs");
-        let readable = acl_src.split("pub async fn space_readable").nth(1).unwrap();
-        let readable = readable.split("\n}\n").next().unwrap();
-        for frag in ["a.scope='space'", "a.perm IN ('read','write')", "a.grantee_kind='login'", "a.grantee_kind='role'"] {
-            assert!(readable.contains(frag), "acl.rs 的谓词变了: {frag}");
+        let mac = acl_src.split("macro_rules! space_acl_sql").nth(1).unwrap();
+        let mac = mac.split("\n}").next().unwrap();
+        for frag in ["a.scope='space'", "a.grantee_kind='login'", "a.grantee_kind='role'"] {
+            assert!(mac.contains(frag), "acl.rs 的谓词变了: {frag}");
             assert!(
                 CHUNK_SQL.replace(' ', "").contains(&frag.replace(' ', "")),
                 "取块 SQL 的空间谓词与 acl.rs 不同步: {frag}"
             );
         }
+        let readable = acl_src.split("pub async fn space_readable").nth(1).unwrap();
+        let readable = readable.split("\n}\n").next().unwrap();
+        assert!(readable.contains("a.perm IN ('read','write')"), "读权限谓词: {readable}");
+        assert!(CHUNK_SQL.contains("a.perm IN ('read','write')"), "读权限谓词: {CHUNK_SQL}");
         assert!(CHUNK_SQL.contains("s.owner = $2") && CHUNK_SQL.contains("ANY($3::text[])"), "{CHUNK_SQL}");
         assert!(CHUNK_SQL.contains("c.doc_id = ANY($1::text[])"), "候选集只许来自 ACL 过的清单: {CHUNK_SQL}");
         assert!(CHUNK_SQL.contains("d.enabled = true") && CHUNK_SQL.contains("('chunked','embedded')"), "{CHUNK_SQL}");
+        // 库侧截断：每篇只用前 CHUNKS_PER_DOC 块，不把全量 chunk 拉回应用层再丢
+        assert!(CHUNK_SQL.contains("c.ord < $4"), "每篇块数的库侧截断没了: {CHUNK_SQL}");
+    }
+
+    /// 缓存纪律锚点：读失败降级 miss 不 500（warn 留痕）；`"empty"` 不写缓存；
+    /// fallback 产出为空时 `source` 归 `"empty"` 不混报
+    #[test]
+    fn cache_discipline_anchors() {
+        let src = include_str!("usage_api.rs");
+        let body = src.split("pub async fn sample_questions").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("样例问题缓存读取失败"), "读失败必须 warn 留痕: {body}");
+        assert!(body.contains("None"), "读失败降级为 miss: {body}");
+        assert!(
+            body.contains(r#"if source != "empty""#),
+            "empty 结果不许进 24h 缓存: {body}"
+        );
+        let gen = src.split("async fn generate_samples").nth(1).unwrap();
+        let gen = gen.split("\n}\n").next().unwrap();
+        assert!(gen.contains(r#"(qs, "empty")"#), "fallback 空集要归 empty: {gen}");
+    }
+
+    /// `load_principal` 错误分档锚点：DB 故障（ConnectorError）500 + warn，
+    /// 查无此人/角色不可用 403 —— DB 宕机报权限错误会把排障方向带歪
+    #[test]
+    fn principal_err_splits_db_failure_from_forbidden() {
+        let src = include_str!("usage_api.rs");
+        let helper = src.split("fn principal_err").nth(1).unwrap();
+        let helper = helper.split("\n}\n").next().unwrap();
+        assert!(helper.contains("downcast_ref::<dms_connector::ConnectorError>"), "{helper}");
+        assert!(helper.contains("INTERNAL_SERVER_ERROR"), "DB 故障 500: {helper}");
+        assert!(helper.contains("当前 DMS 身份或角色不可用"), "查无此人 403: {helper}");
+        // 两个 handler 都走同一分档（不只 usage_summary 一处）
+        let body = src.split("pub async fn sample_questions").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("map_err(principal_err)"), "{body}");
     }
 
     /// 端点契约锚点：文件头写清两个端点；handler 形状不许漂（路由注册处按这个签名接线）

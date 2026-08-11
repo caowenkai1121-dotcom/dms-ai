@@ -34,6 +34,8 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
     seed_pitfalls(pg).await?;
     seed_terms(pg).await?;
     sync_elements(pg).await?;
+    // 二十余步半灌可自愈（步步幂等），但完成与耗时必须留痕 —— 首次启动排障就靠这一条
+    tracing::info!("语义种子全部完成");
     Ok(())
 }
 
@@ -68,13 +70,15 @@ async fn seed_document_families(pg: &PgPool) -> anyhow::Result<()> {
 
 /// 指标版本变化后，引用旧版本的 VQR 样例自动失效，等待重新执行验证。
 async fn invalidate_stale_exemplars(pg: &PgPool) -> anyhow::Result<()> {
+    // v <> ''：尾逗号/空段会产生空串元素，`split_part('','@',1)=''` 在 LEFT JOIN 下恒命中
+    // 「metric_code IS NULL」→ 整条样例被误判 stale（空段不算版本声明）
     sqlx::query(
         "UPDATE meta.sql_exemplar e
          SET validation_status='stale', invalid_reason='指标口径版本已变化，需要重新执行验证'
          WHERE e.validation_status='valid' AND e.metric_versions<>'' AND EXISTS (
            SELECT 1 FROM unnest(string_to_array(e.metric_versions, ',')) v
            LEFT JOIN meta.metric m ON m.ds_id=e.ds_id AND m.metric_code=split_part(v,'@',1)
-           WHERE m.metric_code IS NULL OR m.version<>split_part(v,'@',2)
+           WHERE v <> '' AND (m.metric_code IS NULL OR m.version<>split_part(v,'@',2))
          )",
     )
     .execute(pg)
@@ -111,13 +115,34 @@ async fn seed_warns(pg: &PgPool) -> anyhow::Result<()> {
         ("t_invoice_apply_header", "【⚠️发票双流并行且【两表都在持续写入】：老表 IO* 单今年 1925 单 7612 万 > 新表 t_invoice_new_apply_header SQ* 单 826 单 6986 万，交集为 0。问全量开票必须 UNION ALL 两表(只查一张漏 52%)；时间列用 apply_time——invoice_time 全表【全 NULL】】"),
     ];
     // 这一整套种子都是 DMS 业务语料 → 固定落 'dms' 那一格（其余列靠 DDL 的 DEFAULT 'dms'）
-    for (t, w) in WARNS {
-        sqlx::query("UPDATE meta.table_doc SET warn = $2 WHERE table_name = $1 AND ds_id = $3")
-            .bind(t)
-            .bind(w)
-            .bind(DMS_DS_ID)
-            .execute(pg)
-            .await?;
+    // 批量一次 UPDATE（原来逐行 21 次往返）；随后反查缺失行进 missed 警告（表名打错不再静默）
+    let tables: Vec<&str> = WARNS.iter().map(|(t, _)| *t).collect();
+    let warns: Vec<&str> = WARNS.iter().map(|(_, w)| *w).collect();
+    sqlx::query(
+        "UPDATE meta.table_doc d SET warn = u.w
+         FROM (SELECT * FROM unnest($1::text[], $2::text[])) AS u(t, w)
+         WHERE d.table_name = u.t AND d.ds_id = $3",
+    )
+    .bind(&tables)
+    .bind(&warns)
+    .bind(DMS_DS_ID)
+    .execute(pg)
+    .await?;
+    let missed: Vec<(String,)> = sqlx::query_as(
+        "SELECT u.t FROM unnest($1::text[]) AS u(t)
+         WHERE NOT EXISTS (SELECT 1 FROM meta.table_doc d WHERE d.table_name = u.t AND d.ds_id = $2)",
+    )
+    .bind(&tables)
+    .bind(DMS_DS_ID)
+    .fetch_all(pg)
+    .await?;
+    // 首次启动（table_doc 为空）会全量 missed，属合法；但表名打错时症状正是「没落到任何行」
+    if !missed.is_empty() {
+        let missed: Vec<String> = missed.into_iter().map(|(t,)| t).collect();
+        tracing::warn!(
+            tables = ?missed,
+            "以下表的 ⚠️ 警告未命中 table_doc 任何行 —— 若非首次启动，说明表名写错了"
+        );
     }
     Ok(())
 }
@@ -187,7 +212,7 @@ async fn seed_table_comments(pg: &PgPool) -> anyhow::Result<()> {
     if !missed.is_empty() {
         tracing::warn!(
             tables = ?missed,
-            "表注释修正没落到任何行 —— 若 meta.table_doc 非空，说明表名写错了"
+            "以下表注释修正未命中任何行 —— 若 meta.table_doc 非空，说明表名写错了"
         );
     }
     warn_shared_table_comments(pg).await
@@ -200,30 +225,32 @@ async fn seed_table_comments(pg: &PgPool) -> anyhow::Result<()> {
 #[test]
 fn schema_sync_never_overwrites_custom_comment() {
     let src = include_str!("ingest/schema_sync.rs");
-    for f in ["upsert_table_doc", "upsert_column_doc"] {
-        let body = src
-            .split(&format!("async fn {f}"))
-            .nth(1)
-            .unwrap_or_else(|| panic!("{f} 不见了 —— 判据锚点失效"))
-            .split("\n}")
-            .next()
-            .unwrap();
-        let set = body
-            .split("DO UPDATE SET")
-            .nth(1)
-            .unwrap_or_else(|| panic!("{f} 里没有 DO UPDATE SET —— 判据锚点失效"));
+    // 锚点数组提到循环外（原实现循环内重复 format! 分配）。
+    // 两条 upsert 已并入 `sync_schema` 的批量 SQL（一条表一条列），锚点咬函数名。
+    let body = src
+        .split("pub async fn sync_schema")
+        .nth(1)
+        .unwrap_or_else(|| panic!("sync_schema 不见了 —— 判据锚点失效"))
+        .split("async fn prune_stale_docs")
+        .next()
+        .unwrap();
+    for (i, _) in body.match_indices("DO UPDATE SET") {
+        let set = &body[i..];
         // SET 列表到该语句结尾（`"` 收尾）
         let set = set.split('"').next().unwrap_or(set);
         assert!(
             !set.contains("custom_comment"),
-            "{f} 的 DO UPDATE SET 里出现了 custom_comment —— 人工注释会被 meta sync 抹掉：{set}"
+            "DO UPDATE SET 里出现了 custom_comment —— 人工注释会被 meta sync 抹掉：{set}"
         );
     }
-    // 反向自证：两个函数确实都有 DO UPDATE SET（否则上面的断言是空转的）
-    assert_eq!(src.matches("DO UPDATE SET").count(), 2, "DO UPDATE 的数量变了，回来核判据");
+    // 反向自证：批量两条 upsert 确实都在（否则上面的断言是空转的）
+    assert_eq!(body.matches("DO UPDATE SET").count(), 2, "DO UPDATE 的数量变了，回来核判据");
+    assert_eq!(src.matches("DO UPDATE SET").count(), 2, "文件里多出了第三条 upsert，回来核判据");
 }
 
-/// 防复发守卫：扫出**仍被多张不同族表共用**的 comment 并 warn。
+/// 防复发守卫：扫出**仍被 ≥3 张表共用、且跨 ≥2 个族**的 comment 并 warn。
+/// （阈值 3 是刻意的：2 张共用覆盖主从/镜像表等常见合法形态，噪音面大 —— 注释与
+/// `HAVING count(*) >= 3` 对齐，别再写成「多张」。）
 ///
 /// 「同族」判据 = 表名**前两段**相同（`t_erp_invoice_header` / `t_erp_invoice_detail` 是同族，
 /// `t_device_demand_month_quota` 与它的 `_3` 分表是同族）。所以这条对分表和主从表天然免疫，
@@ -241,8 +268,8 @@ async fn warn_shared_table_comments(pg: &PgPool) -> anyhow::Result<()> {
     .fetch_all(pg)
     .await?;
     for (c, ts) in rows {
-        let families: std::collections::HashSet<String> =
-            ts.split(", ").map(|t| family_of(t)).collect();
+        let families: std::collections::HashSet<&str> =
+            ts.split(", ").map(family_of).collect();
         if families.len() >= 2 {
             tracing::warn!(
                 comment = %c, tables = %ts, families = families.len(),
@@ -254,9 +281,12 @@ async fn warn_shared_table_comments(pg: &PgPool) -> anyhow::Result<()> {
 }
 
 /// 表名的「族」= 前两个下划线段（`t_erp_invoice_header` → `t_erp`）。
-/// 纯函数，判据见 `family_immunises_shards_not_strangers`。
-fn family_of(t: &str) -> String {
-    t.split('_').take(2).collect::<Vec<_>>().join("_")
+/// 纯函数（切片零分配），判据见 `family_immunises_shards_not_strangers`。
+fn family_of(t: &str) -> &str {
+    match t.match_indices('_').nth(1) {
+        Some((i, _)) => &t[..i],
+        None => t,
+    }
 }
 
 /// 指标/维度来源表的**软删除口径**，数据驱动登记（不手写清单）。
@@ -285,6 +315,9 @@ fn family_of(t: &str) -> String {
 /// 已知风险与它的失败方向：若某张表的 `deleted_flag` 语义相反（1=未删），这条过滤会把
 /// 全部行滤掉 → **返 0 行**。那是响亮的失败（用户当场看见「没有数据」），
 /// 不是静默错数 —— 与本仓「宁可回落/报空，不出错数」的口径一致。
+///
+/// 已知不对称（待定，未动）：metric 子查询不带 `status='active'`（dimension 侧带）——
+/// 已禁用指标的来源表仍会被登记软删口径。收窄它属行为变更（表级过滤会少登记），需业务确认。
 async fn seed_soft_delete_scopes(pg: &PgPool) -> anyhow::Result<()> {
     let r = sqlx::query(
         "INSERT INTO meta.table_scope (table_name, filter, note, ds_id)
@@ -315,13 +348,6 @@ async fn seed_soft_delete_scopes(pg: &PgPool) -> anyhow::Result<()> {
 }
 
 async fn seed_kw_force(pg: &PgPool) -> anyhow::Result<()> {
-    // 召回读取允许 ds_id='*'；历史全局核心词会与当前 DMS 锚点同时命中，必须先 fail-closed 清掉。
-    sqlx::query(
-        "DELETE FROM meta.kw_force WHERE ds_id = '*' AND keyword IN \
-         ('销售','销售额','销量','毛利','订单','订单额','订单数')",
-    )
-    .execute(pg)
-    .await?;
     const KW_FORCE: &[(&str, &str)] = &[
         ("押金", "t_customer_balance"), ("信控", "t_customer_balance"), ("余额", "t_customer_balance"), ("欠款", "t_customer_balance"),
         ("售后", "t_after_sales_order_header"), ("退货", "t_after_sales_order_header"), ("退款", "t_after_sales_order_header"),
@@ -351,17 +377,30 @@ async fn seed_kw_force(pg: &PgPool) -> anyhow::Result<()> {
         ("客户", "t_customer"), ("商品", "t_goods"),
         ("员工", "t_employee"), ("门店", "t_master_shop"),
     ];
-    for (kw, t) in KW_FORCE {
-        sqlx::query(
-            "INSERT INTO meta.kw_force(ds_id, keyword, table_name) VALUES ($1, $2, $3)
-             ON CONFLICT (ds_id, keyword) DO UPDATE SET table_name = $3",
-        )
-        .bind(DMS_DS_ID)
-        .bind(kw)
-        .bind(t)
+    // 召回读取允许 ds_id='*'；历史全局核心词会与当前 DMS 锚点同时命中，必须先 fail-closed 清掉。
+    // 清理清单从 KW_FORCE 派生（锚到默认销售事实与订单头的那些词），不手抄第二份。
+    let core_kws: Vec<&str> = KW_FORCE
+        .iter()
+        .filter(|(_, t)| *t == crate::sales_fact::TABLE_NAME || *t == "t_sales_order")
+        .map(|(kw, _)| *kw)
+        .collect();
+    sqlx::query("DELETE FROM meta.kw_force WHERE ds_id = '*' AND keyword = ANY($1)")
+        .bind(&core_kws)
         .execute(pg)
         .await?;
-    }
+    // 批量一次 upsert（原来逐行 40+ 次往返）
+    let kws: Vec<&str> = KW_FORCE.iter().map(|(kw, _)| *kw).collect();
+    let tables: Vec<&str> = KW_FORCE.iter().map(|(_, t)| *t).collect();
+    sqlx::query(
+        "INSERT INTO meta.kw_force(ds_id, keyword, table_name)
+         SELECT $1, u.kw, u.t FROM unnest($2::text[], $3::text[]) AS u(kw, t)
+         ON CONFLICT (ds_id, keyword) DO UPDATE SET table_name = EXCLUDED.table_name",
+    )
+    .bind(DMS_DS_ID)
+    .bind(&kws)
+    .bind(&tables)
+    .execute(pg)
+    .await?;
     Ok(())
 }
 
@@ -387,15 +426,15 @@ pub const TABLE_SCOPES: &[(&str, &str, &str)] = &[
       默认销量=SUM(qty)、毛利额=SUM(gross_profit)，禁止从订单明细推算默认销售经营指标"),
 ];
 
-/// JOIN 边种子（全部来自已连库坐实的模板连接键；cardinality 标注扇出方向）
 /// 表级标准口径种子：该表被任何查询触及时都应成立的过滤（口径单一事实源）
 async fn seed_table_scopes(pg: &PgPool) -> anyhow::Result<()> {
     for (t, f, note) in TABLE_SCOPES {
+        // 显式写 ds_id（与 346 行注释同一纪律：不靠 DDL DEFAULT）
         sqlx::query(
-            "INSERT INTO meta.table_scope(table_name, filter, note) VALUES ($1,$2,$3)
+            "INSERT INTO meta.table_scope(table_name, filter, note, ds_id) VALUES ($1,$2,$3,$4)
              ON CONFLICT (ds_id, table_name) DO UPDATE SET filter=$2, note=$3",
         )
-        .bind(t).bind(f).bind(note)
+        .bind(t).bind(f).bind(note).bind(DMS_DS_ID)
         .execute(pg)
         .await?;
     }
@@ -415,12 +454,12 @@ async fn seed_table_snapshots(pg: &PgPool) -> anyhow::Result<()> {
     ];
     for (t, part, ord, extra, note) in SNAPS {
         sqlx::query(
-            "INSERT INTO meta.table_snapshot(table_name, partition_cols, order_cols, extra_filter, note)
-             VALUES ($1,$2,$3,$4,$5)
+            "INSERT INTO meta.table_snapshot(table_name, partition_cols, order_cols, extra_filter, note, ds_id)
+             VALUES ($1,$2,$3,$4,$5,$6)
              ON CONFLICT (ds_id, table_name)
              DO UPDATE SET partition_cols=$2, order_cols=$3, extra_filter=$4, note=$5",
         )
-        .bind(t).bind(part).bind(ord).bind(extra).bind(note)
+        .bind(t).bind(part).bind(ord).bind(extra).bind(note).bind(DMS_DS_ID)
         .execute(pg)
         .await?;
     }
@@ -440,16 +479,17 @@ async fn seed_value_domains(pg: &PgPool) -> anyhow::Result<()> {
     ];
     for (t, c, note) in DOMAINS {
         sqlx::query(
-            "INSERT INTO meta.value_domain(table_name, column_name, note) VALUES ($1,$2,$3)
+            "INSERT INTO meta.value_domain(table_name, column_name, note, ds_id) VALUES ($1,$2,$3,$4)
              ON CONFLICT (ds_id, table_name, column_name) DO UPDATE SET note=$3",
         )
-        .bind(t).bind(c).bind(note)
+        .bind(t).bind(c).bind(note).bind(DMS_DS_ID)
         .execute(pg)
         .await?;
     }
     Ok(())
 }
 
+/// JOIN 边种子（全部来自已连库坐实的模板连接键；cardinality 标注扇出方向）
 async fn seed_join_edges(pg: &PgPool) -> anyhow::Result<()> {
     // (left_table, left_col, right_table, right_col, card, note)
     const EDGES: &[(&str, &str, &str, &str, &str, &str)] = &[
@@ -506,22 +546,30 @@ async fn seed_join_edges(pg: &PgPool) -> anyhow::Result<()> {
     // XML 出 79 候选）+ 生产库 COUNT 实测基数（tools/probe_card.py，全非扇出 N:1/1:1）。
     // 「逐题对拍数字」的验收在回归（61 题数值断言）+ 「今年各省份的售后单数」实测
     // ≥20073（13 张原单作废的售后单靠 LEFT JOIN 保留）。
-    for (lt, lc, rt, rc, card, note) in EDGES {
-        sqlx::query(
-            "INSERT INTO meta.join_edge(left_table, left_col, right_table, right_col, card, note)
-             VALUES ($1,$2,$3,$4,$5,$6)
-             ON CONFLICT (ds_id, left_table, left_col, right_table, right_col)
-             DO UPDATE SET card=$5, note=$6",
-        )
-        .bind(lt)
-        .bind(lc)
-        .bind(rt)
-        .bind(rc)
-        .bind(card)
-        .bind(note)
-        .execute(pg)
-        .await?;
-    }
+    // 批量一次 upsert（原来逐行 20+ 次往返）；显式写 ds_id（不靠 DDL DEFAULT）
+    let lts: Vec<&str> = EDGES.iter().map(|e| e.0).collect();
+    let lcs: Vec<&str> = EDGES.iter().map(|e| e.1).collect();
+    let rts: Vec<&str> = EDGES.iter().map(|e| e.2).collect();
+    let rcs: Vec<&str> = EDGES.iter().map(|e| e.3).collect();
+    let cards: Vec<&str> = EDGES.iter().map(|e| e.4).collect();
+    let notes: Vec<&str> = EDGES.iter().map(|e| e.5).collect();
+    sqlx::query(
+        "INSERT INTO meta.join_edge(left_table, left_col, right_table, right_col, card, note, ds_id)
+         SELECT u.lt, u.lc, u.rt, u.rc, u.card, u.note, $7
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+              AS u(lt, lc, rt, rc, card, note)
+         ON CONFLICT (ds_id, left_table, left_col, right_table, right_col)
+         DO UPDATE SET card = EXCLUDED.card, note = EXCLUDED.note",
+    )
+    .bind(&lts)
+    .bind(&lcs)
+    .bind(&rts)
+    .bind(&rcs)
+    .bind(&cards)
+    .bind(&notes)
+    .bind(DMS_DS_ID)
+    .execute(pg)
+    .await?;
     Ok(())
 }
 
@@ -563,19 +611,22 @@ async fn seed_pitfalls(pg: &PgPool) -> anyhow::Result<()> {
           这 5 行差与 ROW_NUMBER 取最新无关（本表每客户每类型本就一行，rn=1 对行数恒等）——\
           漏的是 > 0 这一条。反之问『余额合计/总额度』不加此条件（0 余额不影响求和）"),
     ];
-    for (t, lesson) in LESSONS {
-        sqlx::query(
-            "INSERT INTO meta.pitfall(kind, trigger_words, lesson, status, ds_id)
-             SELECT 'pitfall', $1, $2, 'active', $3
-             WHERE NOT EXISTS (SELECT 1 FROM meta.pitfall
-                               WHERE trigger_words = $1 AND lesson = $2 AND ds_id = $3)",
-        )
-        .bind(t)
-        .bind(lesson)
-        .bind(DMS_DS_ID)
-        .execute(pg)
-        .await?;
-    }
+    // 批量一次写入（原来逐行 8 次往返）；NOT EXISTS 去重形态不变（种子文案演化策略见欠账：
+    // 文案改了旧行不更新不删除 —— pitfall 无 origin 列，种子与复核产物分不开，待设计）
+    let triggers: Vec<&str> = LESSONS.iter().map(|(t, _)| *t).collect();
+    let lessons: Vec<&str> = LESSONS.iter().map(|(_, l)| *l).collect();
+    sqlx::query(
+        "INSERT INTO meta.pitfall(kind, trigger_words, lesson, status, ds_id)
+         SELECT 'pitfall', u.t, u.l, 'active', $3
+         FROM unnest($1::text[], $2::text[]) AS u(t, l)
+         WHERE NOT EXISTS (SELECT 1 FROM meta.pitfall
+                           WHERE trigger_words = u.t AND lesson = u.l AND ds_id = $3)",
+    )
+    .bind(&triggers)
+    .bind(&lessons)
+    .bind(DMS_DS_ID)
+    .execute(pg)
+    .await?;
     Ok(())
 }
 

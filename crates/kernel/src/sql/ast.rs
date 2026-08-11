@@ -5,8 +5,8 @@
 //! `table_names_of` 是新增契约，复用同一次遍历（不写第二套 Visitor）。
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
-use core::ops::ControlFlow;
 use sqlparser::ast::{Expr, Query, SetExpr, TableFactor, Visit, Visitor};
 use sqlparser::parser::Parser;
 
@@ -36,6 +36,8 @@ impl Visitor for Collector {
 
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
         let key = q as *const Query as usize;
+        // 每个嵌套 Query 克隆一次外层 CTE 集：SQL 嵌套层级浅（LLM 产出 ≤ 几层）、
+        // CTE 数量个位数，整集克隆量级可忍；真深化了再换 Rc 作用域栈。
         let outer = self
             .cte_query_outer
             .remove(&key)
@@ -81,7 +83,10 @@ impl Visitor for Collector {
     fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
         if let TableFactor::Table { name, alias, .. } = tf {
             let parts: Vec<String> = name.0.iter().map(|p| p.value.to_lowercase()).collect();
-            let table = name.0.last().map(|p| p.value.to_lowercase()).unwrap_or_default();
+            if parts.is_empty() {
+                return ControlFlow::Continue(()); // 理论不可达（Table 必带名），不押 panic
+            }
+            let table = parts.last().cloned().unwrap_or_default();
             let key = alias
                 .as_ref()
                 .map(|a| a.name.value.to_lowercase())
@@ -90,6 +95,8 @@ impl Visitor for Collector {
             let is_cte = parts.len() == 1
                 && self.cte_scopes.last().is_some_and(|scope| scope.contains(&parts[0]));
             if !is_cte {
+                // 限定名按**首段**（库名/schema 名）入 real_tables：`db.t_x` 收的是 `db`。
+                // 下游已实测踩坑并绕开（server direct.rs 有注释）；改语义会动权限登记，不动。
                 self.real_tables.push(parts[0].clone());
                 self.table_refs.push(parts);
             }
@@ -136,6 +143,7 @@ fn collect_table_commands(
             collect_table_commands(left, ctes, out);
             collect_table_commands(right, ctes, out);
         }
+        // 未来新增 SetExpr 变体默认识漏（漏判方向：少收一个表引用，不是多收）
         _ => {}
     }
 }
@@ -156,14 +164,15 @@ pub fn collect(
     d: &dyn Dialect,
 ) -> Result<(HashMap<String, String>, Vec<(String, String)>), GuardError> {
     let c = walk(sql, d)?;
-    // 后出现的别名覆盖（同别名罕见）；派生表别名不会进 aliases（TableFactor::Derived 无 name）
+    // 后出现的别名覆盖（同别名罕见）；派生表别名不进 aliases——TableFactor::Derived
+    // 分支不匹配本 visitor 的 `Table` 臂（它有 alias 但没有**表名**）
     let amap: HashMap<String, String> = c.aliases.into_iter().collect();
     Ok((amap, c.cols))
 }
 
 /// 语句涉及的实表名（去重、字典序）。CTE 名不算实表——它在 FROM 里与实表同形，
 /// 当成实表会让「按表取权限档案/取列清单」对着一个不存在的表查。
-/// 排序是为了确定性：`aliases` 是 HashMap，迭代顺序不定。
+/// 排序+去重是为了输出规范化：与遍历顺序无关（下游 diff/断言才能稳定）。
 pub fn table_names_of(sql: &str, d: &dyn Dialect) -> Result<Vec<String>, GuardError> {
     let c = walk(sql, d)?;
     let mut out = c.real_tables;
@@ -194,15 +203,38 @@ pub fn function_names_of(sql: &str, d: &dyn Dialect) -> Result<Vec<Vec<String>>,
     Ok(out)
 }
 
-/// 收集 WHERE 中出现的列名（末段小写）
+/// 一次遍历同时取函数名与实表限定名（两个视图各自的 pub 入口仍在；两个都要的调用方
+/// 走这个，少 parse 一遍 —— connector 上传源的执行期 schema 闸就是两个都要的）。
+pub fn functions_and_table_refs_of(
+    sql: &str,
+    d: &dyn Dialect,
+) -> Result<(Vec<Vec<String>>, Vec<Vec<String>>), GuardError> {
+    let c = walk(sql, d)?;
+    let mut functions = c.functions;
+    functions.retain(|parts| !parts.is_empty());
+    functions.sort();
+    functions.dedup();
+    let mut refs = c.table_refs;
+    refs.retain(|parts| !parts.is_empty());
+    refs.sort();
+    refs.dedup();
+    Ok((functions, refs))
+}
+
+/// 收集 WHERE 中出现的列名（末段小写）。
+/// 递归无深度上限：输入都是已过 gate 的 AST，深度受 parser 限制，理论爆栈不接受为现实风险。
+/// 已知边界（刻意，漏收方向）：`InSubquery` 只收左端列，子查询内部不进结果；
+/// `Function` 只收参数列表里的 `Unnamed` 参数（`Named` 参数列不收）；
+/// `Expr::Case` 分支内的列不收 —— 消费者（修复提示的列覆盖判断）按「宁可少收」取值。
 pub fn collect_where_cols(e: &Expr, out: &mut HashSet<String>) {
     match e {
+        // sqlparser 的 Ident.value 本就去引号（trim_matches 是死防御，全仓统一说明在 caliber.rs）
         Expr::Identifier(i) => {
-            out.insert(i.value.trim_matches('`').to_lowercase());
+            out.insert(i.value.to_lowercase());
         }
         Expr::CompoundIdentifier(parts) => {
             if let Some(p) = parts.last() {
-                out.insert(p.value.trim_matches('`').to_lowercase());
+                out.insert(p.value.to_lowercase());
             }
         }
         Expr::BinaryOp { left, right, .. } => {

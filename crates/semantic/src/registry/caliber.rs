@@ -36,6 +36,7 @@ pub const UNIT_RATIO: &str = "ratio";
 /// 为什么不复用 `model::MetricDef`：它少一个 `unit`，而给它加字段会当场打断
 /// `server/src/direct.rs` 的 4 处结构体字面量（不是本任务的文件）。等 server 迁移落地后
 /// 这两个类型该并成一个 —— 见 `docs/PROGRESS.md` 的欠账。
+#[derive(Debug)]
 pub struct CaliberMetric {
     pub name: String,
     pub aliases: Vec<String>,
@@ -57,25 +58,28 @@ pub struct CaliberMetric {
     pub unit: String,
 }
 
+/// `meta.metric` 的口径投影行（11 列）：Vec 标注与 query_as 共用这一份，加列只改这里。
+type CaliberMetricRow = (
+    String,
+    Vec<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
 pub async fn load_caliber_metrics(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<CaliberMetric>> {
     let ds_pred = format!(
         "{}{}",
         crate::registry::ds_pred(1),
         source_asset_live_pred_at("", 1)
     );
-    let rows: Vec<(
-        String,
-        Vec<String>,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )> = sqlx::query_as(&format!(
+    let rows: Vec<CaliberMetricRow> = sqlx::query_as(&format!(
         "SELECT name, aliases, source_table, agg_expr, scope_filter, time_col, time_cap,
                 dedup_keys, unit, version, description
          FROM meta.metric WHERE status = 'active'{ds_pred} ORDER BY name",
@@ -125,32 +129,44 @@ pub async fn build_rules(
     question: &str,
     recalled_tables: &[String],
 ) -> anyhow::Result<Vec<CaliberRule>> {
-    let mut out = rules_from(
-        question,
-        recalled_tables,
-        &load_table_scope_rows(pg, ds).await?,
-        &load_table_snapshots(pg, ds).await?,
-        &load_caliber_metrics(pg, ds).await?,
-    );
+    // 九条加载互不依赖，一次并发取齐（问数热路径；合成顺序由代码固定，不受并发影响）
+    let (
+        scopes,
+        snaps,
+        metrics,
+        value_domains,
+        domain_values,
+        code_values,
+        enum_values,
+        code_eq_values,
+        join_edges,
+    ) = tokio::try_join!(
+        load_table_scope_rows(pg, ds),
+        load_table_snapshots(pg, ds),
+        load_caliber_metrics(pg, ds),
+        load_value_domains(pg, ds),
+        load_domain_values(pg, ds),
+        load_code_values(pg, ds),
+        load_enum_values(pg, ds),
+        load_code_eq_values(pg, ds),
+        load_join_edges(pg, ds),
+    )?;
+    let mut out = rules_from(question, recalled_tables, &scopes, &snaps, &metrics);
     // 值域那条不进 `rules_from`：它的输入是另外两张表，且与召回无关（表缺席本身就是它要判的
     // 违规）。合成两段而不是加两个形参 —— 那会改到既有断言体内的调用。
-    out.extend(domain_rules(
-        question,
-        &load_value_domains(pg, ds).await?,
-        &load_domain_values(pg, ds).await?,
-    ));
-    out.extend(code_rules(question, &load_code_values(pg, ds).await?));
+    out.extend(domain_rules(question, &value_domains, &domain_values));
+    out.extend(code_rules(question, &code_values));
     // 与 `code_rules` 分开取一次，不合并成一条 SQL：那条要 `length(code) >= 3` 早筛掉短码
     // （短码无区分度），而这条**一个取值都不许少** —— 少一个就等于把一个真实取值判成非法值。
-    out.extend(enum_rules(&load_enum_values(pg, ds).await?, recalled_tables));
+    out.extend(enum_rules(&enum_values, recalled_tables));
     // `RequireCodeEq`（SALE17 两次实测没拦住才加的判据）：码列上的名称写法必返 0 行
     // （`province LIKE '%湖南%'`）。**不依赖字典完整性**（名已登记在另一个码下面就是
     // 全部证据），所以连 seed 批次（非完整枚举）也收 —— 与 enum_rules 的 dict-only 刻意不同。
-    out.extend(code_eq_rules(&load_code_eq_values(pg, ds).await?, recalled_tables));
+    out.extend(code_eq_rules(&code_eq_values, recalled_tables));
     // 扇出判据（FIN01）：普适规则、不靠问句召回 —— 它只在 SQL 真把「一对多」的多侧键
     // JOIN 进来时才开火（自我限定），召回不召回都得拦。实测：为取客户名把发票
     // `LEFT JOIN t_sales_order ON customer_code`，开票金额放大 299 倍。
-    let keys = fanout_keys(&load_join_edges(pg, ds).await?);
+    let keys = fanout_keys(&join_edges);
     if !keys.is_empty() {
         out.push(CaliberRule::NoFanoutJoin {
             keys,
@@ -165,10 +181,20 @@ pub async fn build_rules(
 fn fanout_keys(edges: &[JoinEdge]) -> Vec<(String, String)> {
     let mut keys: Vec<(String, String)> = edges
         .iter()
-        .flat_map(|e| match e.card.as_str() {
-            "N:1" => vec![(e.lt.clone(), e.lc.clone())],
-            "1:N" => vec![(e.rt.clone(), e.rc.clone())],
-            _ => vec![],
+        .flat_map(|e| {
+            let card = e.card.trim();
+            // 大小写无关（种子写成小写 n:1 也中）；1:1 与未标注不产键（漏判方向）
+            if card.eq_ignore_ascii_case("n:1") {
+                vec![(e.lt.clone(), e.lc.clone())]
+            } else if card.eq_ignore_ascii_case("1:n") {
+                vec![(e.rt.clone(), e.rc.clone())]
+            } else {
+                if !card.is_empty() && !card.eq_ignore_ascii_case("1:1") {
+                    // 未知 card 值静默漏键是漏判方向：留痕
+                    tracing::warn!("join_edge 未知 card 值 {card:?}（{}→{}），不产扇出键", e.lt, e.rt);
+                }
+                vec![]
+            }
         })
         .collect();
     keys.sort();
@@ -292,7 +318,9 @@ fn is_recalled(recalled: &[String], t: &str) -> bool {
             .unwrap_or(table)
             .trim_matches(|c| matches!(c, '`' | '"'))
     }
-    recalled.iter().any(|r| bare(r).eq_ignore_ascii_case(bare(t)))
+    // bare(t) 与 r 无关，提出循环算一次（原来对每个 r 重算）
+    let bt = bare(t);
+    recalled.iter().any(|r| bare(r).eq_ignore_ascii_case(bt))
 }
 
 /// 完整枚举的码表列 → `RequireKnownValue`（**纯函数**，`rows` 形状同 `load_enum_values`）。
@@ -329,16 +357,17 @@ fn enum_rules(
 ) -> Vec<CaliberRule> {
     let mut by_col: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
     for (t, c, name, code, _) in rows.iter().filter(|r| r.4 == VALUE_ORIGIN_DICT) {
-        let vs = by_col.entry((t.to_lowercase(), c.to_lowercase())).or_default();
         let pair = (name.trim().to_string(), code.trim().to_string());
-        if !pair.0.is_empty() && !pair.1.is_empty() && !vs.contains(&pair) {
-            vs.push(pair);
+        if !pair.0.is_empty() && !pair.1.is_empty() {
+            // 先全收，排序后相邻去重（原来 vs.contains(&pair) 是 O(n²) 判重）
+            by_col.entry((t.to_lowercase(), c.to_lowercase())).or_default().push(pair);
         }
     }
     // 按**码**排一次：加载 SQL 没有 ORDER BY，而判词里那串合法取值必须逐次一致
     // （回炉指令有 golden 对比）。码序也正好是字典自己的序，读起来像那本字典。
     for vs in by_col.values_mut() {
         vs.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        vs.dedup();
     }
     let mut seen: BTreeMap<&str, &Vec<(String, String)>> = BTreeMap::new();
     let mut ambiguous: BTreeSet<&str> = BTreeSet::new();
@@ -440,11 +469,18 @@ fn code_rules(question: &str, rows: &[(String, String, String, String)]) -> Vec<
         .iter()
         .filter_map(|((t, c), vs)| {
             let hit = longest_value_hit(question, vs.iter().map(|(n, _)| *n))?;
-            Some((t, c, hit, vs.iter().find(|(n, _)| *n == hit)?.1))
+            // hit 是 vs 里某个名字的借用：按指针同一性找回（名,码）对，不再按值扫第二遍
+            let code = vs.iter().find(|(n, _)| std::ptr::eq(*n, hit))?.1;
+            Some((t, c, hit, code))
         })
         .collect();
+    // 同码出现的列数预统计（原来每条命中都对 hits 全扫一遍，O(n²)）
+    let mut code_count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for h in &hits {
+        *code_count.entry(h.3).or_default() += 1;
+    }
     hits.iter()
-        .filter(|h| hits.iter().filter(|x| x.3 == h.3).count() == 1)
+        .filter(|h| code_count[h.3] == 1)
         .map(|(t, c, name, code)| CaliberRule::RequireCodeOnColumn {
             table: t.to_string(),
             col: c.to_string(),
@@ -501,11 +537,14 @@ fn rules_from(
     //
     // 去重守卫是**载荷不是洁癖**：现存断言 `only_percent_unit_yields_scale_rule` 的问句含「比例」，
     // 去掉守卫那条当场红（两条规则 + human 串味）—— 等于自带一次非恒真验证。
-    let matched_ratio = metrics.iter().any(|metric| {
-        metric.unit == UNIT_RATIO
-            && match_word(question, &metric.name, &metric.aliases).is_some()
-    });
-    if PERCENT_WORDS.iter().any(|w| question.contains(w))
+    // 先判词再算：matched_ratio（全指标 match_word 扫问句）只在问句含占比词时才需要（短路）
+    let wants_percent = PERCENT_WORDS.iter().any(|w| question.contains(w));
+    let matched_ratio = wants_percent
+        && metrics.iter().any(|metric| {
+            metric.unit == UNIT_RATIO
+                && match_word(question, &metric.name, &metric.aliases).is_some()
+        });
+    if wants_percent
         && !matched_ratio
         && !out.iter().any(|r| matches!(r, CaliberRule::RequirePercentScale { .. }))
     {
@@ -571,7 +610,7 @@ fn metric_rules(question: &str, metrics: &[CaliberMetric]) -> Vec<CaliberRule> {
         // 那种 filter 切出来的列名不代表「必须被约束的列」，与 `add_scope_filter` 同一道门。
         if !m.scope_filter.trim().is_empty()
             && !base.is_empty()
-            && !m.scope_filter.to_uppercase().contains("SELECT")
+            && !scope_filter_has_subquery(&m.scope_filter)
         {
             let cols = cols_of_filter(&m.scope_filter);
             if !cols.is_empty() {
@@ -586,7 +625,7 @@ fn metric_rules(question: &str, metrics: &[CaliberMetric]) -> Vec<CaliberRule> {
                 });
             }
         }
-        if !m.dedup_keys.is_empty() && !base.is_empty() {
+        if !m.dedup_keys.trim().is_empty() && !base.is_empty() {
             out.push(CaliberRule::RequireDedup {
                 table: base.clone(),
                 keys: split_list(&m.dedup_keys),
@@ -645,6 +684,19 @@ fn metric_rules(question: &str, metrics: &[CaliberMetric]) -> Vec<CaliberRule> {
     out
 }
 
+/// scope_filter 含子查询判定：词边界 + 大小写无关的 SELECT（`'SELECTED'` 类字面量不误命中；
+/// 原实现 `to_uppercase().contains("SELECT")` 每指标每问句分配大写串且无词边界）。
+/// 不剥字符串字面量是有意的保守：误判 = 少造一条 RequireCols（漏判方向，宁缺毋滥）。
+fn scope_filter_has_subquery(filter: &str) -> bool {
+    let upper = filter.to_ascii_uppercase();
+    upper.match_indices("SELECT").any(|(i, _)| {
+        let before = upper[..i].chars().next_back();
+        let after = upper[i + "SELECT".len()..].chars().next();
+        before.map_or(true, |c: char| !c.is_ascii_alphabetic())
+            && after.map_or(true, |c: char| !c.is_ascii_alphabetic())
+    })
+}
+
 /// 来源表声明 → SQL 里会出现的**末段表名**（kernel 按它比对）：取第一个标识符。
 /// `t_sales_order_detail(JOIN t_sales_order 有效订单)` → `t_sales_order_detail`。
 /// `A UNION ALL B` 只认 A（B 不判 —— 漏判方向，符合「宁缺毋滥」）。
@@ -657,7 +709,8 @@ fn base_table(source_table: &str) -> String {
         .rsplit('.')
         .next()
         .unwrap_or_default()
-        .trim_matches('`');
+        // 反引号与双引号都剥（与 `registry::catalog_ident` 同口径）
+        .trim_matches(|c| matches!(c, '`' | '"'));
     table
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -727,6 +780,25 @@ mod tests {
         assert_eq!(base_table("t_invoice_apply_header UNION ALL t_invoice_new_apply_header"), "t_invoice_apply_header");
         assert_eq!(base_table("t_sales_order"), "t_sales_order");
         assert_eq!(base_table("sales_dw.dws_off_offline_sale_dfn"), "dws_off_offline_sale_dfn");
+        // 反引号与双引号都剥（与 catalog_ident 同口径）
+        assert_eq!(base_table("\"t_sales_order\""), "t_sales_order");
+        assert_eq!(base_table("`t_sales_order`"), "t_sales_order");
+    }
+
+    /// scope_filter 子查询判定的词边界：'SELECTED' 类字面量不误判；空白 dedup_keys 不产空键规则。
+    #[test]
+    fn subquery_check_word_boundary_and_blank_dedup_keys() {
+        assert!(scope_filter_has_subquery("product_stock_date = (SELECT MAX(x) FROM t)"));
+        assert!(scope_filter_has_subquery("x in (select 1 from t)"), "小写 select 同判");
+        assert!(!scope_filter_has_subquery("item_type = '1'"));
+        assert!(!scope_filter_has_subquery("selected_flag = 1"), "selected 不含词边界 SELECT");
+        // 空白 dedup_keys：不产 keys 为空的 RequireDedup（与 scope/time_col 的 trim 守卫同口径）
+        let blank = CaliberMetric { dedup_keys: "  ".into(), ..qty_metric() };
+        let r = rules_from("本月卖了多少箱", &[], &[], &[], &[blank]);
+        assert!(
+            !r.iter().any(|rule| matches!(rule, CaliberRule::RequireDedup { .. })),
+            "空白 dedup_keys 不许产规则：{r:?}"
+        );
     }
 
     /// 🔴 声明缺失 ≠ 违规：没召回到的表一条规则都不造（判错一条会让所有人学会忽略校验器）
@@ -1200,13 +1272,19 @@ mod tests {
     /// `join_edge` 的 card → 重复键清单：`N:1` 取左、`1:N` 取右、`1:1` 不产键。
     /// 取错侧 = 把「主档侧」判成扇出源，误伤每天的正确写法（`FROM 订单 JOIN 客户`）。
     #[test]
-    fn fanout_keys_picks_the_many_side() {        let edges = vec![
+    fn fanout_keys_picks_the_many_side() {
+        let edges = vec![
             JoinEdge { lt: "a".into(), lc: "x".into(), rt: "b".into(), rc: "y".into(), card: "N:1".into() },
             JoinEdge { lt: "c".into(), lc: "u".into(), rt: "d".into(), rc: "v".into(), card: "1:N".into() },
             JoinEdge { lt: "e".into(), lc: "k".into(), rt: "f".into(), rc: "k2".into(), card: "1:1".into() },
         ];
         let keys = fanout_keys(&edges);
         assert_eq!(keys, [("a".to_string(), "x".to_string()), ("d".to_string(), "v".to_string())]);
+        // 大小写无关：种子写成小写 n:1 也产键（旧版精确匹配会静默漏键）
+        let lower = vec![
+            JoinEdge { lt: "a".into(), lc: "x".into(), rt: "b".into(), rc: "y".into(), card: "n:1".into() },
+        ];
+        assert_eq!(fanout_keys(&lower).len(), 1, "小写 n:1 必须产键");
         // 排序去重：同一条键在两条边上出现只留一份（判词去重依赖它）
         let dup = vec![
             JoinEdge { lt: "a".into(), lc: "x".into(), rt: "b".into(), rc: "y".into(), card: "N:1".into() },

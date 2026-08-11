@@ -19,7 +19,9 @@ function Deny($label, $path, $pattern, [switch]$WarnOnly) {
         $script:fail = 1
         return
     }
-    # 注释行不参与匹配：规则本身要写在 crate 文档里（「不得引 axum」这句话不能把自己判红）
+    # 注释行不参与匹配：规则本身要写在 crate 文档里（「不得引 axum」这句话不能把自己判红）。
+    # 边界要自知：过滤只认行首的 //、*、/* —— 块注释中间行以别的字符开头、或代码行尾
+    # 注释里含关键词仍会命中（假红方向，需人工看行内容）；代码行不会因此漏检。
     $hit = Get-ChildItem -Path $path -Recurse -Filter *.rs -ErrorAction SilentlyContinue |
         Select-String -Pattern $pattern |
         Where-Object { $_.Line.Trim() -notmatch '^(//|\*|/\*)' }
@@ -38,7 +40,7 @@ function Deny($label, $path, $pattern, [switch]$WarnOnly) {
 
 # ① 只有 connector 能造池、能拼 SQL 串
 foreach ($c in 'kernel', 'policy', 'agent') {
-    Deny "$c 不得造连接池 / 不得 sqlx::query" "crates/$c/src" 'MySqlPoolOptions|PgPoolOptions|sqlx::query'
+    Deny "$c 不得造连接池 / 不得 sqlx::query*" "crates/$c/src" 'MySqlPoolOptions|PgPoolOptions|sqlx::query'
 }
 # semantic 只守「不造池」——**不**守 sqlx::query，这是裁决 F1（T7a）而非放水：
 # ARCHITECTURE §2 的 I2 残缺列从一开始就写着「semantic 的 30+ 处 &PgPool 是字面量 SQL，靠 grep 守」。
@@ -53,8 +55,8 @@ Deny 'semantic 不得造连接池' 'crates/semantic/src' 'MySqlPoolOptions|PgPoo
 # server 是唯一剩下的 WarnOnly：业务代码全部搬出（T10）后删掉 -WarnOnly。
 # knowledge 已于 T4 转正（OwnedStore::fixed 通道落地，25 处 → 0），从此按 FAIL 守——
 # 再出现一行 sqlx::query 就意味着有人绕开了字面量通道，那是「把问句拼进 SQL」的入口。
-Deny 'server 不得造连接池 / 不得 sqlx::query' 'crates/server/src' 'MySqlPoolOptions|PgPoolOptions|sqlx::query' -WarnOnly
-Deny 'knowledge 不得造连接池 / 不得 sqlx::query' 'crates/knowledge/src' 'MySqlPoolOptions|PgPoolOptions|sqlx::query'
+Deny 'server 不得造连接池 / 不得 sqlx::query*' 'crates/server/src' 'MySqlPoolOptions|PgPoolOptions|sqlx::query' -WarnOnly
+Deny 'knowledge 不得造连接池 / 不得 sqlx::query*' 'crates/knowledge/src' 'MySqlPoolOptions|PgPoolOptions|sqlx::query'
 # 🔴 不变量 I5 的结构性保证：知识库路径**产不出 SQL**。此前它只由两行注释支撑，零守卫。
 # 注意措辞：不是「依赖树里没有 sqlparser」——`dms-kernel` 就依赖它，传递必然在树里；
 # 可检查且真正成立的是「**源码**不 import 它、不构造 SQL newtype」。

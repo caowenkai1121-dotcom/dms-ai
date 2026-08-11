@@ -387,6 +387,14 @@ pub fn metadata_assets() -> Vec<WarehouseAsset> {
         .collect()
 }
 
+/// target 归一（trim + 小写）：版本标记、快照草稿、快照读取三处同一形态，别开第四份。
+fn normalize_target(target: &str) -> String {
+    target.trim().to_ascii_lowercase()
+}
+
+/// 🔴 与 `mark_synced` 的 `requested` 入参是同一口径的两端：调用方（main.rs 启动序）传的是
+/// 探针 `stats.requested`（资产条数）。两端相等仅靠「基础表名跨库唯一」（下方目录测试钉住）——
+/// 一旦出现跨库同名表，去重数 < 资产数，版本标记永不匹配 → 每次启动都全量探针。改任一端先读这条。
 fn requested_tables() -> usize {
     ASSETS
         .iter()
@@ -395,10 +403,13 @@ fn requested_tables() -> usize {
         .len()
 }
 
+/// 🔴 单 ds 前提：`tables`/`missing` 来自按 ds_id 过滤的 table_doc 计数，`requested` 却是
+/// 数仓全局白名单数 —— 多 ds 部署下两端作用域不同，标记永远不等（永久重同步）。
+/// 当前部署模型是单 DMS 数仓；要上多 ds，先把标记两端统一成同一作用域。
 fn version_marker(target: &str, requested: usize, tables: usize, missing: usize) -> String {
     format!(
         "{VERSION}|target={}|requested={requested}|tables={tables}|missing={missing}",
-        target.trim().to_ascii_lowercase()
+        normalize_target(target)
     )
 }
 
@@ -406,15 +417,17 @@ fn version_marker(target: &str, requested: usize, tables: usize, missing: usize)
 /// 物理上缺失的可选资产不会写入 table_doc，相关问数由活性门禁 fail-closed；缺失未归零时
 /// 标记永远不视为完成，因此后续启动会继续做白名单 information_schema 探针并自动发现补表。
 pub async fn needs_sync(pg: &PgPool, ds: &str, target: &str) -> anyhow::Result<bool> {
+    // ds:any —— meta.kv 是全局版本标记表（无 ds_id 列），标记是数仓全局状态，不按源切
     let marker: Option<(String,)> =
         sqlx::query_as("SELECT v FROM meta.kv WHERE k = $1")
             .bind(VERSION_KEY)
             .fetch_optional(pg)
             .await?;
     let names = ASSETS.iter().map(|asset| asset.table.to_string()).collect::<Vec<_>>();
+    // table_name 与目录名（全小写）统一按小写比：大小写混存的行不错漏（否则 default_ready 永假）
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT table_name, custom_comment FROM meta.table_doc
-         WHERE ds_id = $1 AND table_name = ANY($2)",
+         WHERE ds_id = $1 AND lower(table_name) = ANY($2)",
     )
     .bind(ds)
     .bind(&names)
@@ -425,9 +438,13 @@ pub async fn needs_sync(pg: &PgPool, ds: &str, target: &str) -> anyhow::Result<b
         .any(|(table, _)| table.eq_ignore_ascii_case(crate::sales_fact::TABLE_NAME));
     let comments_ready = rows.iter().all(|(_, comment)| !comment.trim().is_empty());
     let expected = version_marker(target, requested_tables(), rows.len(), 0);
-    Ok(!default_ready
-        || !comments_ready
-        || marker.as_ref().map_or(true, |(value,)| value != &expected))
+    let marker_match = marker.as_ref().is_some_and(|(value,)| value == &expected);
+    let needs = !default_ready || !comments_ready || !marker_match;
+    if needs {
+        // 三扇否决门任一挡住都返 true：是哪扇必须可观测，否则「为什么又全量探针」无从排查
+        tracing::debug!(default_ready, comments_ready, marker_match, "目录快照未就绪，本轮做全量探针");
+    }
+    Ok(needs)
 }
 
 /// 默认销售事实是目录的最低可用条件：表或任一业务确认字段缺失都不允许服务启动。
@@ -447,7 +464,7 @@ pub fn validate_required_snapshot(snapshot: &SchemaSnapshot) -> anyhow::Result<(
         .map(|(_, column)| column.name.to_ascii_lowercase())
         .collect::<std::collections::HashSet<_>>();
     let missing = crate::sales_fact::contract_columns()
-        .filter(|column| !available.contains(&column.to_ascii_lowercase()))
+        .filter(|column| !available.iter().any(|c| c.eq_ignore_ascii_case(column)))
         .collect::<Vec<_>>();
     anyhow::ensure!(
         missing.is_empty(),
@@ -532,7 +549,13 @@ struct SnapshotDraft {
 }
 
 /// 幂等建表。save/load 入口各自确保，不依赖 `ddl::migrate` 的执行顺序。
+/// 进程内只发一次 DDL（并发首发可能重复 —— `IF NOT EXISTS` 幂等，无害）。
 async fn ensure_snapshot_table(pg: &PgPool) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static READY: AtomicBool = AtomicBool::new(false);
+    if READY.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS meta.warehouse_catalog_snapshot(
            target text PRIMARY KEY,
@@ -548,11 +571,13 @@ async fn ensure_snapshot_table(pg: &PgPool) -> anyhow::Result<()> {
     )
     .execute(pg)
     .await?;
+    READY.store(true, Ordering::Relaxed);
     Ok(())
 }
 
 /// FNV-1a 64：零依赖、跨版本确定的摘要（`std` 的 DefaultHasher 不保证跨版本稳定）。
-fn fnv1a64(text: &str) -> String {
+/// pub(crate)：`autodiscover::register` 的 dim_code 截断哈希复用同一份。
+pub(crate) fn fnv1a64(text: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.as_bytes() {
         hash ^= u64::from(*byte);
@@ -568,11 +593,7 @@ fn snapshot_draft(
     stats: WarehouseCatalogStats,
 ) -> SnapshotDraft {
     let mut tables = snapshot.tables.iter().collect::<Vec<_>>();
-    tables.sort_by(|a, b| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    });
+    tables.sort_by_cached_key(|table| table.name.to_ascii_lowercase());
     let mut columns_by_table: std::collections::HashMap<String, Vec<&ColumnInfo>> =
         std::collections::HashMap::new();
     for (table, column) in &snapshot.columns {
@@ -581,32 +602,27 @@ fn snapshot_draft(
             .or_default()
             .push(column);
     }
+    use std::fmt::Write as _;
     let mut canonical = String::new();
     for table in &tables {
-        canonical.push_str(&format!(
-            "table|{}|{}\n",
-            table.name.to_ascii_lowercase(),
-            table.comment
-        ));
-        if let Some(columns) = columns_by_table.get_mut(&table.name.to_ascii_lowercase()) {
-            columns.sort_by(|a, b| {
-                a.ordinal
-                    .cmp(&b.ordinal)
-                    .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
-            });
+        let key = table.name.to_ascii_lowercase();
+        let _ = write!(canonical, "table|{key}|{}\n", table.comment);
+        if let Some(columns) = columns_by_table.get_mut(&key) {
+            columns.sort_by_cached_key(|column| (column.ordinal, column.name.to_ascii_lowercase()));
             for column in columns {
-                canonical.push_str(&format!(
+                let _ = write!(
+                    canonical,
                     "column|{}|{}|{}|{}\n",
                     column.name.to_ascii_lowercase(),
                     column.data_type,
                     column.ordinal,
                     column.comment
-                ));
+                );
             }
         }
     }
     SnapshotDraft {
-        target: target.trim().to_ascii_lowercase(),
+        target: normalize_target(target),
         version: VERSION.to_string(),
         stats,
         table_names: tables.iter().map(|table| table.name.clone()).collect(),
@@ -627,10 +643,11 @@ async fn persist_draft(pg: &PgPool, draft: &SnapshotDraft) -> anyhow::Result<()>
     )
     .bind(&draft.target)
     .bind(&draft.version)
-    .bind(draft.stats.requested as i64)
-    .bind(draft.stats.tables as i64)
-    .bind(draft.stats.columns as i64)
-    .bind(draft.stats.missing as i64)
+    // 计数超 i64 时饱和而不截断（as 强转会绕回负数）
+    .bind(i64::try_from(draft.stats.requested).unwrap_or(i64::MAX))
+    .bind(i64::try_from(draft.stats.tables).unwrap_or(i64::MAX))
+    .bind(i64::try_from(draft.stats.columns).unwrap_or(i64::MAX))
+    .bind(i64::try_from(draft.stats.missing).unwrap_or(i64::MAX))
     .bind(&draft.table_names)
     .bind(&draft.digest)
     .execute(pg)
@@ -651,6 +668,14 @@ pub async fn save_snapshot(
     persist_draft(pg, &snapshot_draft(target, snapshot, stats)).await
 }
 
+/// 快照统计 i64 → usize：负值/超界是脏数据，不静默清零 —— warn 留痕后按 0 计。
+fn snapshot_stat(v: i64) -> usize {
+    usize::try_from(v).unwrap_or_else(|_| {
+        tracing::warn!("warehouse_catalog_snapshot 统计脏值 {v}，按 0 处理");
+        0
+    })
+}
+
 /// 读 target 的最近一次成功快照；没有则为 `None`（调用方据此决定硬失败）。
 pub async fn load_snapshot(pg: &PgPool, target: &str) -> anyhow::Result<Option<CatalogSnapshot>> {
     ensure_snapshot_table(pg).await?;
@@ -669,7 +694,7 @@ pub async fn load_snapshot(pg: &PgPool, target: &str) -> anyhow::Result<Option<C
          -- ds:any 数仓目录快照按数仓 target 键控（一个数仓目标一行），无 ds 作用域维度（同 meta.kv 版本标记）
          FROM meta.warehouse_catalog_snapshot WHERE target = $1",
     )
-    .bind(target.trim().to_ascii_lowercase())
+    .bind(normalize_target(target))
     .fetch_optional(pg)
     .await?;
     Ok(row.map(
@@ -679,10 +704,10 @@ pub async fn load_snapshot(pg: &PgPool, target: &str) -> anyhow::Result<Option<C
                 version,
                 probed_at,
                 stats: WarehouseCatalogStats {
-                    requested: usize::try_from(requested).unwrap_or_default(),
-                    tables: usize::try_from(tables).unwrap_or_default(),
-                    columns: usize::try_from(columns).unwrap_or_default(),
-                    missing: usize::try_from(missing).unwrap_or_default(),
+                    requested: snapshot_stat(requested),
+                    tables: snapshot_stat(tables),
+                    columns: snapshot_stat(columns),
+                    missing: snapshot_stat(missing),
                 },
                 table_names,
                 digest,
@@ -696,8 +721,9 @@ pub async fn load_snapshot(pg: &PgPool, target: &str) -> anyhow::Result<Option<C
 enum FallbackPlan {
     /// 成功：落草稿 + 返回 authoritative 目录。
     Refresh { draft: SnapshotDraft, catalog: FallbackCatalog },
-    /// 降级：不落库，返回携带快照时间与当时统计的 degraded 目录。
-    Reuse { catalog: FallbackCatalog },
+    /// 降级：不落库，返回携带快照时间与当时统计的 degraded 目录；
+    /// `probe_err` 随计划带出，供入口打进 warn（否则探针失败原因无留痕）。
+    Reuse { catalog: FallbackCatalog, probe_err: String },
 }
 
 fn plan_fallback(
@@ -715,15 +741,27 @@ fn plan_fallback(
             },
         }),
         Err(probe_err) => match stored {
-            Some(stored) => Ok(FallbackPlan::Reuse {
-                catalog: FallbackCatalog {
-                    trust: CatalogTrust::Degraded {
-                        snapshot_at: stored.probed_at,
+            Some(stored) => {
+                if stored.version != VERSION {
+                    // 旧版快照只作降级透出（stats/snapshot_at），不参与信任裁决 ——
+                    // warn 留痕，但不升级为硬失败（降级的意义就是扛过探针失败期）
+                    tracing::warn!(
+                        stored = %stored.version,
+                        current = %VERSION,
+                        "目录快照来自旧版合同，degraded 启动沿用其统计"
+                    );
+                }
+                Ok(FallbackPlan::Reuse {
+                    catalog: FallbackCatalog {
+                        trust: CatalogTrust::Degraded {
+                            snapshot_at: stored.probed_at,
+                        },
+                        stats: stored.stats,
+                        snapshot: None,
                     },
-                    stats: stored.stats,
-                    snapshot: None,
-                },
-            }),
+                    probe_err,
+                })
+            }
             None => Err(format!(
                 "数仓目录探针失败且没有任何历史快照，拒绝用空/旧语义启动：{probe_err}"
             )),
@@ -759,12 +797,13 @@ pub async fn probe_with_fallback(
             persist_draft(pg, &draft).await?;
             Ok(catalog)
         }
-        FallbackPlan::Reuse { catalog } => {
+        FallbackPlan::Reuse { catalog, probe_err } => {
             if let CatalogTrust::Degraded { snapshot_at } = catalog.trust {
                 tracing::warn!(
                     target = %target,
                     snapshot_at = %snapshot_at,
                     stats = ?catalog.stats,
+                    probe_err = %probe_err,
                     "数仓目录探针失败，按历史快照降级启动（trust=degraded）"
                 );
             }
@@ -822,7 +861,7 @@ pub fn scored_assets(question: &str) -> Vec<(usize, &'static Asset)> {
         "销售成本", "成本", "成本额", "收入", "净收入", "毛利", "毛利额", "毛利润", "毛利率",
     ];
     const SPECIALIZED_CONTEXT: &[&str] = &[
-        "订单", "发货", "出库", "物流", "应收", "损益", "财务", "费用", "活动", "pos",
+        "订单", "发货", "出库", "物流", "应收", "损益", "财务", "费用", "活动",
         "第三方", "新品",
     ];
 
@@ -830,39 +869,34 @@ pub fn scored_assets(question: &str) -> Vec<(usize, &'static Asset)> {
     if question.is_empty() {
         return Vec::new();
     }
-    let windows = dms_kernel::nl::text::candidate_windows(&question)
+    // 窗口词先去重（问句重复短语不重复加分），权重随词 hoist 出资产循环
+    let windows: Vec<(String, usize)> = dms_kernel::nl::text::candidate_windows(&question)
         .into_iter()
         .map(|(_, word)| word)
         .filter(|word| !NOISE.contains(&word.as_str()))
-        .collect::<Vec<_>>();
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .map(|word| {
+            let weight = word.chars().count().min(8);
+            (word, weight)
+        })
+        .collect();
     let asks_default_sales = DEFAULT_SALES_TERMS.iter().any(|word| question.contains(word));
-    let specialized = SPECIALIZED_CONTEXT.iter().any(|word| question.contains(word));
+    let specialized = SPECIALIZED_CONTEXT.iter().any(|word| question.contains(word))
+        || has_pos_context(&question);
     let mut scored = ASSETS
         .iter()
-        .filter_map(|asset| {
-            let corpus = format!(
-                "{} {} {} {} {} {} {}",
-                asset.domain,
-                asset.grain,
-                asset.metrics,
-                asset.time_rule,
-                asset.database,
-                asset.table,
-                asset.comparison,
-            )
-            .to_ascii_lowercase();
-            let mut score = if question.contains(&asset.domain.to_ascii_lowercase()) {
-                32usize
-            } else {
-                0
-            };
-            for word in &windows {
-                if corpus.contains(word) {
-                    score += word.chars().count().min(8);
+        .zip(asset_corpora())
+        .filter_map(|(asset, (corpus, domain))| {
+            let mut score = if question.contains(domain) { 32usize } else { 0 };
+            for (word, weight) in &windows {
+                if corpus.contains(word.as_str()) {
+                    score += *weight;
                 }
             }
-            if asks_default_sales && asset.table == crate::sales_fact::TABLE_NAME {
-                score += if specialized { 0 } else { 40 };
+            // 专门上下文里的默认事实是「不加权」而不是扣分（原 +0 分支并入条件）
+            if asks_default_sales && !specialized && asset.table == crate::sales_fact::TABLE_NAME {
+                score += 40;
             }
             (score > 0).then_some((score, asset))
         })
@@ -876,30 +910,81 @@ pub fn scored_assets(question: &str) -> Vec<(usize, &'static Asset)> {
     scored
 }
 
+/// "pos" 按词匹配（不按子串）：英文问句里的 "post"/"purpose" 不再误判专门上下文。
+fn has_pos_context(question: &str) -> bool {
+    question
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == "pos")
+}
+
+/// 每资产的（小写语料, 小写 domain）：内容编译期确定，进程内只建一次
+/// （原来每问每资产 format!+lowercase 重建）。字段间用 `\n` 分隔 —— 单空格可能与
+/// 窗口词拼出跨字段幽灵命中（前字段尾 + 后字段头），`\n` 不可能出现在窗口词里。
+fn asset_corpora() -> &'static [(String, String)] {
+    static CORPORA: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    CORPORA.get_or_init(|| {
+        ASSETS
+            .iter()
+            .map(|asset| {
+                let corpus = format!(
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                    asset.domain,
+                    asset.grain,
+                    asset.metrics,
+                    asset.time_rule,
+                    asset.database,
+                    asset.table,
+                    asset.comparison,
+                )
+                .to_ascii_lowercase();
+                (corpus, asset.domain.to_ascii_lowercase())
+            })
+            .collect()
+    })
+}
+
+/// 层级序（与 `detail_layer` 同口径大小写不敏感；目录测试另钉大写不变量，这里不依赖它）。
 fn layer_rank(layer: &str) -> u8 {
-    match layer {
-        "ADS" => 4,
-        "DWS" => 3,
-        "DWD" => 2,
-        "ODS" => 1,
-        _ => 0,
+    if layer.eq_ignore_ascii_case("ads") {
+        4
+    } else if layer.eq_ignore_ascii_case("dws") {
+        3
+    } else if layer.eq_ignore_ascii_case("dwd") {
+        2
+    } else if layer.eq_ignore_ascii_case("ods") {
+        1
+    } else {
+        0
     }
 }
 
 pub async fn seed(pg: &PgPool, ds: &str) -> anyhow::Result<()> {
+    // 整批包一个事务：中途失败不留半更新的 table_doc（每次启动经 seed.rs 执行）
+    let mut tx = pg.begin().await?;
+    let mut missed: Vec<&str> = Vec::new();
     for asset in ASSETS {
         let comment = catalog_comment(asset);
         let warn = format!("{}；{}", asset.forbidden, asset.comparison);
-        sqlx::query(
-            "UPDATE meta.table_doc SET custom_comment=$1, domain=$2, warn=$3 WHERE ds_id=$4 AND table_name=$5",
+        // table_name 统一按小写比（目录名全小写）：大小写混存的行不错漏
+        let affected = sqlx::query(
+            "UPDATE meta.table_doc SET custom_comment=$1, domain=$2, warn=$3 WHERE ds_id=$4 AND lower(table_name)=$5",
         )
         .bind(&comment)
         .bind(asset.domain)
         .bind(&warn)
         .bind(ds)
         .bind(asset.table)
-        .execute(pg)
-        .await?;
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            // table_doc 缺行（同步跳过/失败）时不能静默 seed 空气
+            missed.push(asset.table);
+        }
+    }
+    tx.commit().await?;
+    if !missed.is_empty() {
+        tracing::warn!("目录 seed 未命中 table_doc 行（{} 张）：{}", missed.len(), missed.join(", "));
     }
     Ok(())
 }
@@ -1096,8 +1181,7 @@ mod tests {
         let (draft, catalog) = match plan {
             FallbackPlan::Refresh { draft, catalog } => (draft, catalog),
             FallbackPlan::Reuse { .. } => panic!("成功探针不允许走 Reuse 档"),
-        };
-        assert_eq!(catalog.trust, CatalogTrust::Authoritative);
+        };        assert_eq!(catalog.trust, CatalogTrust::Authoritative);
         assert_eq!(catalog.trust.as_str(), "authoritative");
         assert!(catalog.snapshot.is_some(), "authoritative 必须带回实时探针结果");
         assert_eq!(catalog.stats, stats);
@@ -1115,7 +1199,7 @@ mod tests {
         let plan = plan_fallback("sales_dw", Err("connection refused".to_string()), Some(stored.clone()))
             .expect("有历史快照时必须降级而不是硬失败");
         let catalog = match plan {
-            FallbackPlan::Reuse { catalog } => catalog,
+            FallbackPlan::Reuse { catalog, .. } => catalog,
             FallbackPlan::Refresh { .. } => panic!("失败探针不允许走 Refresh 档"),
         };
         assert_eq!(
@@ -1134,6 +1218,53 @@ mod tests {
             .expect_err("无快照时必须维持 fail-closed");
         assert!(err.contains("没有任何历史快照"), "{err}");
         assert!(err.contains("timeout after 8s"), "必须带原始探针错误：{err}");
+    }
+
+    /// 旧版快照仍走降级档（warn 语义，不升级为硬失败），且探针错误随计划带出供 warn 留痕。
+    #[test]
+    fn fallback_reuses_stale_version_snapshot_and_carries_probe_err() {
+        let mut stored = stored_snapshot();
+        stored.version = "2000.01.01-old-contract".into();
+        let plan = plan_fallback("sales_dw", Err("connection reset".to_string()), Some(stored))
+            .expect("旧版快照必须仍走降级（stats 只是透出，不是信任裁决）");
+        match plan {
+            FallbackPlan::Reuse { catalog, probe_err } => {
+                assert!(matches!(catalog.trust, CatalogTrust::Degraded { .. }));
+                assert_eq!(probe_err, "connection reset", "探针错误必须随 Reuse 带出");
+            }
+            FallbackPlan::Refresh { .. } => panic!("失败探针不允许走 Refresh 档"),
+        }
+    }
+
+    /// 打分器纪律：pos 按词匹配（post/purpose 不误伤）；重复窗口词不重复加分；
+    /// 语料字段间用 \n 分隔（不可能出现在窗口词里）。
+    #[test]
+    fn scoring_discipline_pos_word_dedup_and_separator() {
+        assert!(has_pos_context("销售额 pos机"));
+        assert!(has_pos_context("pos 销量"));
+        assert!(!has_pos_context("post sales"), "post 子串不许触发专门上下文");
+        assert!(!has_pos_context("purpose"), "purpose 子串不许触发专门上下文");
+        let fact = |q: &str| {
+            scored_assets(q)
+                .into_iter()
+                .find(|(_, a)| a.table == crate::sales_fact::TABLE_NAME)
+                .map(|(s, _)| s)
+        };
+        let base = fact("本月销售额").expect("销售问句必须命中默认事实");
+        // pos 词命中专门上下文 → 默认事实拿不到那 40 分（窗口词只加不减，方向断言足够）
+        assert!(
+            fact("本月销售额 pos机").expect("pos 问句仍命中默认事实") < base,
+            "pos 词必须让默认事实失去 +40"
+        );
+        assert_eq!(
+            fact("销售额销售额"),
+            fact("销售额"),
+            "重复窗口词只计一次分"
+        );
+        assert!(
+            asset_corpora()[0].0.contains('\n'),
+            "语料字段分隔符必须是不可能出现在窗口词里的 \\n"
+        );
     }
 
     #[test]

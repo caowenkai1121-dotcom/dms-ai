@@ -32,14 +32,16 @@ use crate::source::{DsPolicy, RowSet, SchemaSnapshot, SourceKind, SqlSource};
 const OWNED_VISIBLE: &str = "SELECT coalesce(bool_or(has_schema_privilege(n.nspname, 'usage')), false)
      FROM pg_namespace n WHERE n.nspname IN ('meta', 'kb', 'chat')";
 
+/// 建连期/健康检查探针预算：公网或慢链路下不许悬挂（mysql.rs 的目录探针 60s 先例的 PG 档）。
+const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct PostgresSource {
     pool: sqlx::PgPool,
     ds: DsId,
     sensitive: &'static [&'static str],
-    /// 上传源唯一允许访问的 schema；普通客户 PG 源为 None。
-    schema: Option<String>,
-    /// 当前上传 schema 的真实关系名。与 schema 闸一起阻断 pg_catalog/public 回退。
-    tables: Option<HashSet<String>>,
+    /// 上传源的 (schema, 真实关系名白名单)：两者必须同有同无，故收进同一个 Option。
+    /// 普通客户 PG 源为 None。schema 闸与表白名单一起阻断 pg_catalog/public 回退。
+    schema_tables: Option<(String, HashSet<String>)>,
     /// 【A8】数据源级查询策略（`fetch` 入口与调用方值取 min，只许更紧）。
     ds_policy: std::sync::Mutex<DsPolicy>,
 }
@@ -57,10 +59,19 @@ impl PostgresSource {
         sensitive: &'static [&'static str],
         schema: Option<&str>,
     ) -> Result<Self, ConnectorError> {
-        let schema = schema.map(str::to_string);
-        let set_path = search_path_stmt(ds.as_str(), schema.as_deref())?;
+        let schema_tables: Option<(String, HashSet<String>)> = match schema {
+            Some(s) => Some((s.to_string(), HashSet::new())),
+            None => None,
+        };
+        let set_path =
+            search_path_stmt(ds.as_str(), schema_tables.as_ref().map(|(s, _)| s.as_str()))?;
+        // max_conn=0 与 MySQL 侧（mysql.rs effective_max_connections）对齐钳到 ≥1
+        let options: sqlx::postgres::PgConnectOptions = std::str::FromStr::from_str(url)
+            .map_err(|e| ConnectorError::connect(ds.as_str(), e))?;
+        // application_name 带 ds_id：运维在 pg_stat_activity 能归因连接属于哪个源
+        let options = options.application_name(&format!("dms-ai-ro:{}", ds.as_str()));
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(max_conn)
+            .max_connections(max_conn.max(1))
             .after_connect(move |conn, _| {
                 let set_path = set_path.clone();
                 Box::pin(async move {
@@ -73,48 +84,64 @@ impl PostgresSource {
                     Ok(())
                 })
             })
-            .connect(url)
+            .connect_with(options)
             .await
             .map_err(|e| ConnectorError::connect(ds.as_str(), e))?;
-        let tables = match schema.as_deref() {
-            Some(s) => Some(
-                sqlx::query_scalar::<_, String>(
-                    "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
-                     WHERE n.nspname=$1 AND c.relkind IN ('r','p')",
+        let schema_tables = match schema_tables {
+            Some((s, _)) => Some((
+                s.clone(),
+                // 建连期探针：公网/慢链路下不能悬挂（mysql.rs 的目录探针给了 60s 先例）
+                tokio::time::timeout(
+                    CONNECT_PROBE_TIMEOUT,
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+                         WHERE n.nspname=$1 AND c.relkind IN ('r','p')",
+                    )
+                    .bind(s)
+                    .fetch_all(&pool),
                 )
-                .bind(s)
-                .fetch_all(&pool)
                 .await
+                .map_err(|_| ConnectorError::timeout(ds.as_str(), CONNECT_PROBE_TIMEOUT))?
                 .map_err(|e| sqlx_err(ds.as_str(), e))?
                 .into_iter()
                 .map(|t| t.to_lowercase())
                 .collect(),
-            ),
+            )),
             None => None,
         };
         let src = Self {
             pool,
             ds,
             sensitive,
-            schema,
-            tables,
+            schema_tables,
             ds_policy: std::sync::Mutex::new(DsPolicy::default()),
         };
-        deny_if_owned_visible(src.owned_schema_visible().await?, src.ds.as_str())?;
+        let visible = src.owned_schema_visible().await?;
+        if let Err(e) = deny_if_owned_visible(visible, src.ds.as_str()) {
+            // F3 失败显式关池（与 mysql.rs:426 同口径），不靠 Drop 隐式收尾
+            src.pool.close().await;
+            return Err(e);
+        }
         Ok(src)
     }
 
+    /// 静态 SQL 通道（`&'static str`，数据全走 bind）：自有库上的框架自查语句。
+    /// 仍受会话只读约束（`default_transaction_read_only = on`），不是写通道。
     pub fn fixed(&self, sql: &'static str) -> crate::fixed::PgStmt<'_> {
         crate::fixed::PgStmt::new(&self.pool, self.ds.as_str(), sql)
     }
 
-    /// F3 的那个布尔，公开给 `/api/health`：授权可以在启动**之后**被改坏
-    /// （谁给只读角色 GRANT 了 USAGE），只在 connect 查一次等于只防第一天。
+    /// `/api/health` 用：授权可以在启动**之后**被改坏（谁给只读角色 GRANT 了 USAGE），
+    /// 只在 connect 查一次等于只防第一天。带超时：PG 挂起时健康检查不许跟着悬挂
+    /// （超时按 Err 上报 —— connect 路径 fail-closed，health 路径报不健康）。
     pub async fn owned_schema_visible(&self) -> Result<bool, ConnectorError> {
-        sqlx::query_scalar::<_, bool>(OWNED_VISIBLE)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| sqlx_err(self.ds.as_str(), e))
+        tokio::time::timeout(
+            CONNECT_PROBE_TIMEOUT,
+            sqlx::query_scalar::<_, bool>(OWNED_VISIBLE).fetch_one(&self.pool),
+        )
+        .await
+        .map_err(|_| ConnectorError::timeout(self.ds.as_str(), CONNECT_PROBE_TIMEOUT))?
+        .map_err(|e| sqlx_err(self.ds.as_str(), e))
     }
 }
 
@@ -143,8 +170,9 @@ fn enforce_schema(
 ) -> Result<(), ConnectorError> {
     let Some(allowed) = allowed else { return Ok(()) };
     let tables = tables.ok_or_else(|| ConnectorError::config(at, "上传数据源缺表白名单"))?;
-    let functions = dms_kernel::sql::ast::function_names_of(sql, &PostgresDialect)
-        .map_err(|e| ConnectorError::query(at, e))?;
+    let (functions, refs) =
+        dms_kernel::sql::ast::functions_and_table_refs_of(sql, &PostgresDialect)
+            .map_err(|e| ConnectorError::query(at, e))?;
     if let Some(name) = functions.iter().filter_map(|parts| parts.last()).find(|name| {
         forbidden_upload_function(name)
     }) {
@@ -153,15 +181,16 @@ fn enforce_schema(
             format!("上传数据源不允许调用动态 SQL 或服务端函数 {name}"),
         ));
     }
-    let refs = dms_kernel::sql::ast::table_refs_of(sql, &PostgresDialect)
-        .map_err(|e| ConnectorError::query(at, e))?;
     for parts in refs {
         let valid_schema = match parts.as_slice() {
             [_table] => true,
             [schema, _table] => schema.eq_ignore_ascii_case(allowed),
             _ => false,
         };
-        let table = parts.last().expect("AST 实表名非空");
+        let table = match parts.last() {
+            Some(t) => t,
+            None => continue, // AST 实表名非空由 kernel 侧 retain 保证；这里不押 panic
+        };
         if !valid_schema || !tables.contains(table) {
             return Err(ConnectorError::query(
                 at,
@@ -192,6 +221,12 @@ fn forbidden_upload_function(name: &str) -> bool {
                 | "set_config"
                 | "nextval"
                 | "setval"
+                // 管理/复制函数（需特权，纵深防御缺口补齐）
+                | "pg_create_restore_point"
+                | "pg_switch_wal"
+                | "pg_backup_start"
+                | "pg_backup_stop"
+                | "pg_promote"
         )
 }
 
@@ -220,7 +255,8 @@ impl SqlSource for PostgresSource {
     }
 
     fn set_ds_policy(&self, policy: DsPolicy) {
-        *self.ds_policy.lock().expect("pg 策略锁中毒") = policy;
+        // DsPolicy 是 Copy、持锁段无 panic 点：中毒直接恢复，口径与 registry.rs 一致
+        *self.ds_policy.lock().unwrap_or_else(|e| e.into_inner()) = policy;
     }
 
     fn fetch<'a>(
@@ -232,8 +268,13 @@ impl SqlSource for PostgresSource {
         Box::pin(async move {
             let at = self.ds.as_str();
             // 【A8】入口先与 ds 级策略取 min（只许更紧），再进 schema 闸与执行
-            let (max, t) = self.ds_policy.lock().expect("pg 策略锁中毒").clamp(max, t);
-            enforce_schema(at, self.schema.as_deref(), self.tables.as_ref(), sql.wire())?;
+            let (max, t) =
+                self.ds_policy.lock().unwrap_or_else(|e| e.into_inner()).clamp(max, t);
+            let (schema, tables) = match &self.schema_tables {
+                Some((s, t)) => (Some(s.as_str()), Some(t)),
+                None => (None, None),
+            };
+            enforce_schema(at, schema, tables, sql.wire())?;
             let rows = tokio::time::timeout(t, sqlx::query(sql.wire()).fetch_all(&self.pool))
                 .await
                 .map_err(|_| ConnectorError::timeout(at, t))?
@@ -250,14 +291,18 @@ impl SqlSource for PostgresSource {
         t: Duration,
     ) -> BoxFut<'a, Result<Option<String>, ConnectorError>> {
         Box::pin(async move {
-            enforce_schema(
-                self.ds.as_str(),
-                self.schema.as_deref(),
-                self.tables.as_ref(),
-                sql.wire(),
-            )?;
+            let at = self.ds.as_str();
+            // 【A8】与 fetch 同口径：ds 级策略只许收紧 explain 预算（行上限对 explain 无意义）
+            let (_, t) =
+                self.ds_policy.lock().unwrap_or_else(|e| e.into_inner()).clamp(usize::MAX, t);
+            let (schema, tables) = match &self.schema_tables {
+                Some((s, t)) => (Some(s.as_str()), Some(t)),
+                None => (None, None),
+            };
+            enforce_schema(at, schema, tables, sql.wire())?;
             let stmt = format!("EXPLAIN {}", sql.wire());
-            match tokio::time::timeout(t, sqlx::query(&stmt).fetch_all(&self.pool)).await {
+            // 只要「数据库判没判错」，计划行本身用不上：execute 不物化计划行
+            match tokio::time::timeout(t, sqlx::query(&stmt).execute(&self.pool)).await {
                 Ok(Ok(_)) => Ok(None),
                 Ok(Err(e)) => Ok(e.as_database_error().map(|db| db.message().to_string())),
                 Err(_) => Ok(None),
@@ -268,18 +313,29 @@ impl SqlSource for PostgresSource {
     fn probe_schema<'a>(&'a self) -> BoxFut<'a, Result<SchemaSnapshot, ConnectorError>> {
         Box::pin(async move {
             let at = self.ds.as_str();
-            let tables: Vec<(String, String, Option<i64>)> =
-                sqlx::query_as(self.dialect().table_probe())
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|e| sqlx_err(at, e))?;
-            // ⚠️ `pg_attribute.attnum` 是 **int2**：解成 i64 会直接类型不匹配报错
-            // （同 MySQL 侧 LONGBLOB 必须 CAST 的那类坑）。这里解 i16 再抬成契约的 i64。
-            let cols: Vec<(String, String, String, String, i16)> =
-                sqlx::query_as(self.dialect().column_probe())
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|e| sqlx_err(at, e))?;
+            // 两条探针并行 + 统一超时：串行无超时会让慢链路把 schema 采集挂死
+            let (tables, cols) = tokio::join!(
+                tokio::time::timeout(
+                    CONNECT_PROBE_TIMEOUT,
+                    sqlx::query_as::<_, (String, String, Option<i64>)>(self.dialect().table_probe())
+                        .fetch_all(&self.pool),
+                ),
+                tokio::time::timeout(
+                    CONNECT_PROBE_TIMEOUT,
+                    // ⚠️ `pg_attribute.attnum` 是 **int2**：解成 i64 会直接类型不匹配报错
+                    // （同 MySQL 侧 LONGBLOB 必须 CAST 的那类坑）。这里解 i16 再抬成契约的 i64。
+                    sqlx::query_as::<_, (String, String, String, String, i16)>(
+                        self.dialect().column_probe(),
+                    )
+                    .fetch_all(&self.pool),
+                ),
+            );
+            let tables = tables
+                .map_err(|_| ConnectorError::timeout(at, CONNECT_PROBE_TIMEOUT))?
+                .map_err(|e| sqlx_err(at, e))?;
+            let cols = cols
+                .map_err(|_| ConnectorError::timeout(at, CONNECT_PROBE_TIMEOUT))?
+                .map_err(|e| sqlx_err(at, e))?;
             let cols = cols
                 .into_iter()
                 .map(|(t, n, ty, c, ord)| (t, n, ty, c, ord as i64))
@@ -290,22 +346,15 @@ impl SqlSource for PostgresSource {
 }
 
 fn to_table(rows: &[sqlx::postgres::PgRow], max: usize) -> (Vec<String>, Vec<Vec<Value>>) {
-    let mut columns: Vec<String> = vec![];
-    let mut data: Vec<Vec<Value>> = vec![];
-    for (i, row) in rows.iter().enumerate() {
-        if i == 0 {
-            columns = row.columns().iter().map(|c| c.name().to_string()).collect();
-        }
-        data.push(
-            row.columns()
-                .iter()
-                .enumerate()
-                .map(|(ci, col)| cell_to_json(row, ci, col.type_info().name()))
-                .collect(),
-        );
-        if data.len() >= max {
-            break;
-        }
+    let Some(first) = rows.first() else { return (vec![], vec![]) };
+    let columns: Vec<String> = first.columns().iter().map(|c| c.name().to_string()).collect();
+    // 类型名 → 取值路径只算一次（逐行逐 cell 重算 type_info().name() 是纯浪费）
+    let kinds: Vec<Cell> =
+        first.columns().iter().map(|c| pg_cell_kind(c.type_info().name())).collect();
+    // 先判后收：max=0（DsPolicy 最紧档，source.rs 契约「恒空结果」）一行都不能返
+    let mut data: Vec<Vec<Value>> = Vec::with_capacity(rows.len().min(max));
+    for row in rows.iter().take(max) {
+        data.push(row.columns().iter().enumerate().map(|(ci, _)| cell_to_json(row, ci, &kinds[ci])).collect());
     }
     (columns, data)
 }
@@ -314,7 +363,9 @@ fn to_table(rows: &[sqlx::postgres::PgRow], max: usize) -> (Vec<String>, Vec<Vec
 /// NUMERIC 同样走字符串保精度。未列举一律 Text。
 pub(crate) fn pg_cell_kind(ty: &str) -> Cell {
     match ty {
-        "INT2" | "INT4" | "INT8" | "SMALLSERIAL" | "SERIAL" | "BIGSERIAL" => Cell::Int,
+        // sqlx 的 type_info().name() 对 serial 列返回底层 INT4/INT8（serial 是建表语法不是
+        // 类型），SMALLSERIAL/SERIAL/BIGSERIAL 是死分支，不收
+        "INT2" | "INT4" | "INT8" => Cell::Int,
         "FLOAT4" | "FLOAT8" => Cell::Float,
         "NUMERIC" | "MONEY" => Cell::Dec,
         "DATE" | "TIMESTAMP" | "TIMESTAMPTZ" => Cell::Time,
@@ -322,13 +373,15 @@ pub(crate) fn pg_cell_kind(ty: &str) -> Cell {
     }
 }
 
+/// fmt_dt 的口径：秒级精度（丢毫秒）、TIMESTAMPTZ 按 UTC 渲染且不标时区 —— 与 MySQL 侧
+/// 一致的既定形态，改精度/时区要两侧同改。
 fn fmt_dt(d: sqlx::types::chrono::NaiveDateTime) -> Value {
     Value::from(d.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
-fn cell_to_json(row: &sqlx::postgres::PgRow, i: usize, ty: &str) -> Value {
+fn cell_to_json(row: &sqlx::postgres::PgRow, i: usize, kind: &Cell) -> Value {
     use sqlx::types::chrono::{DateTime, NaiveDate, Utc};
-    match pg_cell_kind(ty) {
+    match kind {
         // INT2/INT4/INT8 是三个不同的 PG 类型，i64 只解 INT8——必须逐级回落
         Cell::Int => try_get(row, i, |v: i64| Value::from(v))
             .or_else(|| try_get(row, i, |v: i32| Value::from(v)))
@@ -343,7 +396,11 @@ fn cell_to_json(row: &sqlx::postgres::PgRow, i: usize, ty: &str) -> Value {
             .or_else(|| try_get(row, i, |v: DateTime<Utc>| fmt_dt(v.naive_utc())))
             .or_else(|| try_get(row, i, |v: NaiveDate| Value::from(v.format("%Y-%m-%d").to_string())))
             .unwrap_or(Value::Null),
-        Cell::Text => try_get(row, i, |v: String| Value::from(v)).unwrap_or(Value::Null),
+        // BOOL 列 sqlx 拒解 String，逐级回落到 bool（UUID/JSONB 等仍落 Null —— 未开 uuid
+        // feature 的类型不猜，与「未列举一律 Text」的保守口径一致）
+        Cell::Text => try_get(row, i, |v: String| Value::from(v))
+            .or_else(|| try_get(row, i, |v: bool| Value::from(v)))
+            .unwrap_or(Value::Null),
     }
 }
 
@@ -421,6 +478,8 @@ mod tests {
             "SELECT query_to_xml('SELECT * FROM up_b.sheet1', true, false, '')",
             "SELECT dblink('host=elsewhere', 'SELECT 1')",
             "SELECT pg_read_file('/etc/passwd')",
+            "SELECT pg_promote()",
+            "SELECT pg_switch_wal()",
         ] {
             let e = enforce_schema("upload_d1", Some("up_a"), Some(&tables), bad).unwrap_err();
             assert!(matches!(e, ConnectorError::Query(_)), "{e}");
@@ -446,6 +505,7 @@ mod tests {
     /// （min 语义由 `DsPolicy::clamp` 的单测守着，这里钉的是「接线没断」。）
     #[test]
     fn fetch_entry_clamps_with_ds_policy() {
+        // include_str! 自指是故意脆的接线守卫：改名/拆文件即 panic，提醒同步这里
         let src = include_str!("postgres.rs");
         let body = src.split("impl SqlSource for PostgresSource").nth(1).expect("impl 不见了");
         let fetch = body.split("fn fetch<'a>").nth(1).expect("fetch 不见了");

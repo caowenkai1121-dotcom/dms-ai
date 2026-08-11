@@ -16,7 +16,8 @@
 //!   两样都收进 `AskCtx` 之后它就是个普通成员 ——「加一种能力＝加一个 Answerer」才 5/5 成立。
 //! - **hybrid（两路都答）不做**：`triage::Intent` 只有两个变体，见那边的文件头。
 
-use std::sync::Arc;
+use std::fmt::Write as _;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -86,7 +87,7 @@ pub struct AskDeps<'a> {
     pub pg: &'a PgPool,
     /// **实例式**（connector 侧禁全局单例）：`Clone` 共享熔断状态，wire 侧传 `AppState` 那一份。
     pub embed: &'a EmbedClient,
-    /// 五个校正器（实现在 `server/src/corrector.rs`，同一笔 T8/T10 的债）
+    /// schema 校正 + 七件确定性校正（实现在 `server/src/corrector.rs`，同一笔 T8/T10 的债）
     pub correctors: &'a dyn Correctors,
     pub detect: DetectFn,
     pub compose_hit: HitFn,
@@ -122,7 +123,7 @@ pub async fn ask(
     // 权限集合按当轮用户算一次（`compute_scope_cached` 本来就带缓存，子问题共用同一份，I4 不变）
     let scope = compute_scope_cached(d.auth, p).await?;
     // 多轮追问改写：把"那上个月呢"结合上一轮改写成"上月销售额"再走管线
-    let rewritten = rewrite_followup(&**d.llm, question, prev).await;
+    let rewritten = rewrite_followup(&**d.llm, d.on_usage, question, prev).await;
     // 【A17 ①】日期继承：改写后的问题**没有时间词**、而上一轮问句有 ——
     // 把上一轮的时间表面词接到尾巴（「那品类第二的呢」→「那品类第二的呢，上月」），
     // 别退回全历史（那看着就像「数据不对」）。纯词法：`time_phrase_of` 只认表面词，
@@ -164,6 +165,10 @@ pub async fn ask(
     // 而 `try_compound` 要反复调它（`Fn`）—— 与 `scope` 同一个理由。
     let (trace_id, conv_id) = (d.trace_id.clone(), d.conv_id.clone());
     let (trace_id, conv_id) = (&trace_id, &conv_id);
+    // Router 一次问答只组一次：成员只持依赖引用、无 per-call 状态，复合拆解的每个子问
+    // 共用同一表（原来每个子问都重建 7 个 Box）。
+    let members = router(d.embed, d.detect, d.compose_hit, d.direct_hit, d.correctors, d.sc_samples);
+    let members = &members;
     let one = |q: String| async move {
         let cx = AskCtx {
             p,
@@ -186,7 +191,7 @@ pub async fn ask(
         };
         // 结果出口统一过一道呈现中文化（列名中文 + 码值翻名）：所有路由共用这一个收口，
         // 内部全降级（词表加载不到/译不动就原样），绝不让增强把一次成功取数变成失败。
-        let mut r = ask_single(d, &cx).await?;
+        let mut r = ask_single(&cx, members).await?;
         // 【判官实测·问题 3】空结果 + 出界主题无注册表覆盖 → 换 no-topic 文案
         // （「请确认筛选条件」对「主题根本不存在」不对症）。在 localize 之前整份换掉。
         if let Some(nt) = out_of_scope_empty_reply(&cx, &mut r).await {
@@ -199,6 +204,32 @@ pub async fn ask(
         return Ok(r);
     }
     one(rewritten).await
+}
+
+/// 🔴 破坏性词表（`need_intent_reply` ① 的前置门；模块级 = 生产判据与单测共用一份）。
+/// Fast 也会把「删除所有订单」判成 answer（它有明确目标），但破坏性请求不得借疑问词或
+/// “AI 认为可执行”越过澄清门。真正的 SQL gate 仍会 fail-closed；这里是在更早处避免浪费生成
+/// 并保持红线题的稳定 need-intent 体验。
+const DESTRUCTIVE: &[&str] = &[
+    "删除", "清空", "写入数据库", "插入数据", "建表", "删表", "drop", "truncate",
+    "delete from", "update ", "insert into", "alter table", "create table",
+];
+
+/// 破坏性词命中（纯函数）：中文词 plain contains；ASCII 词加**词边界**（前后邻字符是
+/// ASCII 字母/数字/下划线 = 词内）——「dropdown」「waterdrop」这类英文词混入问句不得误判红线反问。
+fn destructive_hit(question: &str) -> bool {
+    let lower = question.to_ascii_lowercase();
+    let wordy = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    DESTRUCTIVE.iter().any(|w| {
+        if !w.is_ascii() {
+            return lower.contains(w);
+        }
+        lower.match_indices(w).any(|(i, _)| {
+            let before_ok = lower[..i].chars().next_back().map_or(true, |c| !wordy(c));
+            let after_ok = lower[i + w.len()..].chars().next().map_or(true, |c| !wordy(c));
+            before_ok && after_ok
+        })
+    })
 }
 
 /// 意图不足时的反问（`None` = 有意图，照常走管线）。
@@ -230,18 +261,11 @@ pub(crate) async fn need_intent_reply(
     ds: &str,
     question: &str,
     t0: Instant,
-) -> anyhow::Result<Option<AskResult>> {
-    // 🔴 ① 破坏性词先于一切模型判定：Fast 也会把「删除所有订单」判成 answer（它有明确目标），
-    // 但破坏性请求不得借疑问词或“AI 认为可执行”越过澄清门。真正的 SQL gate 仍会
-    // fail-closed；这里是在更早处避免浪费生成并保持红线题的稳定 need-intent 体验。
-    const DESTRUCTIVE: &[&str] = &[
-        "删除", "清空", "写入数据库", "插入数据", "建表", "删表", "drop", "truncate",
-        "delete from", "update ", "insert into", "alter table", "create table",
-    ];
-    let lower = question.to_ascii_lowercase();
-    if DESTRUCTIVE.iter().any(|w| lower.contains(w)) {
+) -> Option<AskResult> {
+    // 🔴 ① 破坏性词先于一切模型判定（词表与命中判据收口在 `destructive_hit`，纯函数可单测）
+    if destructive_hit(question) {
         // 破坏性请求不给候选问法（不引导、也不为它多烧一次 fast 调用）
-        return Ok(Some(intent_reply(question, t0, vec![])));
+        return Some(intent_reply(question, t0, vec![]));
     }
 
     // ② 精简模式统一入口：**所有**确定性路由未命中、走到 LLM 兜底的问句，先过一次
@@ -262,7 +286,7 @@ pub(crate) async fn need_intent_reply(
                 Ok(covered) if hold_back_uncovered(question, covered) => {
                     tracing::info!(question, "Fast 判可执行但注册表零覆盖且无查询目标 → 意图反问（不产 SQL）");
                     let options = clarify_options_for(llm, on_usage, question).await;
-                    return Ok(Some(intent_reply(question, t0, options)));
+                    return Some(intent_reply(question, t0, options));
                 }
                 Ok(_) => {
                     tracing::info!(question, "精简模式 Fast 理解判为可执行 → 继续 SQL 生成链");
@@ -271,19 +295,19 @@ pub(crate) async fn need_intent_reply(
                     tracing::warn!(err = %e, "覆盖兜底读注册表失败 → 本轮不拦截，照常走管线");
                 }
             }
-            return Ok(None);
+            return None;
         }
         Some(GateVerdict::Clarify) => {
             tracing::info!(question, "精简模式 Fast 理解判为含糊 → 反问（不产 SQL）");
             // need-intent 增强：fast 在线才生成结构化候选；任何失败都降级为空数组
             // （= 纯文本反问，wire 上 `clarify_options` 整键不上线，老客户端零影响）。
             let options = clarify_options_for(llm, on_usage, question).await;
-            return Ok(Some(intent_reply(question, t0, options)));
+            return Some(intent_reply(question, t0, options));
         }
         Some(GateVerdict::Unsupported(topic)) => {
             tracing::info!(question, topic, "精简模式 Fast 判主题未接入 → 直接告知能问什么（不产 SQL）");
             let options = topic_options_for(llm, on_usage, question).await;
-            return Ok(Some(no_topic_reply(question, &topic, t0, options)));
+            return Some(no_topic_reply(question, &topic, t0, options));
         }
         None => {}
     }
@@ -303,16 +327,16 @@ pub(crate) async fn need_intent_reply(
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(err = %e, "意图判据读指标失败 → 本轮不反问，照常走管线");
-            return Ok(None);
+            return None;
         }
     };
     if !hits.is_empty() {
-        return Ok(None);
+        return None;
     }
     // 剥掉通用虚词后还剩实义字 = 那点内容是个名字/未知词。`consumed` 传空：
     // 一个指标都没命中，所以没有任何业务词该被消化。
     if !dms_kernel::nl::text::has_residue_with(question, &[], dms_kernel::nl::lexicon::STRIP_WORDS) {
-        return Ok(None);
+        return None;
     }
     // 🔴 **③ 问句里有疑问/度量词就不反问** —— 那说明用户问得很清楚，
     // 只是我们**没声明那个指标**，该照常走 LLM 去查。
@@ -327,11 +351,11 @@ pub(crate) async fn need_intent_reply(
     if ASKING.iter().any(|w| question.contains(w))
         || crate::triage::analytical_question_hit(question)
     {
-        return Ok(None);
+        return None;
     }
     tracing::info!(question, "意图不足 → 反问（不产 SQL）");
     // ③ 到达这里说明 fast 已经失败过一次 —— 不为候选问法再付一次超时，直接纯文本反问
-    Ok(Some(intent_reply(question, t0, vec![])))
+    Some(intent_reply(question, t0, vec![]))
 }
 
 /// 疑问/度量词表（模块级：③ 的本地降级与 ②b 的覆盖兜底 `hold_back_uncovered` 共用 ——
@@ -348,6 +372,17 @@ const ASKING: &[&str] = &[
 const KNOWN_TOPICS: &[&str] = &[
     "销售", "订单", "客户", "商品", "门店", "库存", "费用", "市场活动", "售后", "开票", "对账", "业务员", "仓库",
 ];
+
+/// KNOWN_TOPICS 的顿号串：三个消费者（fast 意图门 prompt / no-topic 文案 / topic system）
+/// 共用这一份，`OnceLock` 只拼一次（原来每次调用都重新分配同一个字符串）。
+fn known_topics_joined() -> &'static str {
+    static JOINED: OnceLock<String> = OnceLock::new();
+    JOINED.get_or_init(|| KNOWN_TOPICS.join("、"))
+}
+
+/// fast 档辅助判定的统一超时（三词意图门 / 反问候选 / 追问改写）：fast 实现自带 90s HTTP
+/// 超时，这些辅助判定等不起 —— 卡 90s 整条问答都废了（与 triage.rs 的 `LLM_TIMEOUT` 同一本账）。
+const FAST_CALL_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// fast 判 answer 后的覆盖兜底判据（**纯函数**，IO 那半是 `triage::registry_hit`）：
 /// 注册表零覆盖 + 剥掉虚词有实义残留 + 无疑问词 + 无关系词 + 无单据/表名形 → 扣住反问。
@@ -395,7 +430,7 @@ async fn topic_options_for(
     on_usage: &(dyn Fn(&Usage) + Send + Sync),
     question: &str,
 ) -> Vec<ClarifyOption> {
-    clarify_options_with(llm, on_usage, question, TOPIC_SYSTEM).await
+    clarify_options_with(llm, on_usage, question, &topic_system()).await
 }
 
 const CLARIFY_SYSTEM: &str = "你是 DMS 数据问答的意图澄清助手。用户的问题缺少明确查询目标。\
@@ -403,12 +438,19 @@ const CLARIFY_SYSTEM: &str = "你是 DMS 数据问答的意图澄清助手。用
               短标签不超过 6 个汉字（如：销售表现、订单明细、基础资料）。\
               问句必须具体、可直接执行（带指标或明细目标），不许复述原问题，不要解释、不要编号外的文字。";
 
-const TOPIC_SYSTEM: &str = "你是 DMS 数据问答的引导助手。用户问的主题还没有接入数据。\
-              从已接入的主题（销售、订单、客户、商品、门店、库存、费用、市场活动、售后）里，\
-              给出 2 到 4 个用户最可能想改问的完整问句，每行一个，格式：短标签|完整问句。\
-              短标签不超过 6 个汉字（如：销售表现、订单明细、库存现状）。\
-              问句必须具体、可直接执行（带指标或明细目标），不许再围绕用户原来那个未接入的主题，\
-              不要解释、不要编号外的文字。";
+/// 「主题未接入」候选的 system。主题清单 `format!` 注入 `KNOWN_TOPICS`（与 ③ 意图门同法）——
+/// 硬编码第二份清单已经漂过一次（缺 开票/对账/业务员/仓库），两处必须同源。
+fn topic_system() -> String {
+    format!(
+        "你是 DMS 数据问答的引导助手。用户问的主题还没有接入数据。\
+         从已接入的主题（{}）里，\
+         给出 2 到 4 个用户最可能想改问的完整问句，每行一个，格式：短标签|完整问句。\
+         短标签不超过 6 个汉字（如：销售表现、订单明细、库存现状）。\
+         问句必须具体、可直接执行（带指标或明细目标），不许再围绕用户原来那个未接入的主题，\
+         不要解释、不要编号外的文字。",
+        known_topics_joined()
+    )
+}
 
 async fn clarify_options_with(
     llm: &dyn ChatModel,
@@ -416,11 +458,10 @@ async fn clarify_options_with(
     question: &str,
     system: &str,
 ) -> Vec<ClarifyOption> {
-    const TIMEOUT: Duration = Duration::from_secs(4);
     let user = format!("用户问题：{question}\n候选问法：");
     let mut req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
     req.max_tokens = Some(200);
-    let reply = match tokio::time::timeout(TIMEOUT, llm.chat(req)).await {
+    let reply = match tokio::time::timeout(FAST_CALL_TIMEOUT, llm.chat(req)).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(e)) => {
             tracing::warn!(err = %e, "反问候选 fast 调用失败 → 纯文本反问");
@@ -438,8 +479,17 @@ async fn clarify_options_with(
         .unwrap_or_default()
 }
 
+/// 反问候选解析的护栏（与本文件 `REFS_FRAG_MAX_CHARS` 同一纪律：魔法数必须具名）。
+/// 标签上限预期 6 字、留一倍余量；问句过长的是模型开始写解释了。
+const CLARIFY_LABEL_MAX_CHARS: usize = 12;
+const CLARIFY_QUESTION_MIN_CHARS: usize = 4;
+const CLARIFY_QUESTION_MAX_CHARS: usize = 60;
+const CLARIFY_MAX_OPTIONS: usize = 4;
+/// 少于这个数 = 空（单条不构成「选项」）
+const CLARIFY_MIN_OPTIONS: usize = 2;
+
 /// 解析「标签|问句」行（**纯函数**）：剥序号/项目符号、认半角全角竖线、过滤不合法行，
-/// 去重、去掉与原问句相同的项，最多 4 条；**少于 2 条 = 空**（单条不构成「选项」）。
+/// 去重、去掉与原问句相同的项，最多 `CLARIFY_MAX_OPTIONS` 条；**少于 `CLARIFY_MIN_OPTIONS` 条 = 空**。
 fn parse_clarify_options(reply: &str, question: &str) -> Vec<ClarifyOption> {
     let mut out: Vec<ClarifyOption> = vec![];
     for line in reply.lines() {
@@ -452,109 +502,113 @@ fn parse_clarify_options(reply: &str, question: &str) -> Vec<ClarifyOption> {
         let Some((label, q)) = line.split_once('|').or_else(|| line.split_once('｜')) else {
             continue;
         };
-        let (label, q) = (label.trim(), q.trim().trim_matches('"').trim_matches('"').trim());
-        // 标签 ≤12 字（预期 ≤6，留一倍余量）；问句 4~60 字（过长的是模型开始写解释了）
-        if label.is_empty() || label.chars().count() > 12 {
+        // 直/弯引号都剥（原来同字符 `trim_matches('"')` 写两遍，弯引号根本没剥到）
+        let (label, q) = (label.trim(), q.trim().trim_matches(|c: char| matches!(c, '"' | '“' | '”')).trim());
+        if label.is_empty() || label.chars().count() > CLARIFY_LABEL_MAX_CHARS {
             continue;
         }
-        if q.chars().count() < 4 || q.chars().count() > 60 || q == question {
+        let q_chars = q.chars().count();
+        if q_chars < CLARIFY_QUESTION_MIN_CHARS || q_chars > CLARIFY_QUESTION_MAX_CHARS || q == question {
             continue;
         }
         if out.iter().any(|o| o.question == q) {
             continue;
         }
         out.push(ClarifyOption { label: label.to_string(), question: q.to_string() });
-        if out.len() >= 4 {
+        if out.len() >= CLARIFY_MAX_OPTIONS {
             break;
         }
     }
-    if out.len() < 2 {
+    if out.len() < CLARIFY_MIN_OPTIONS {
         return vec![];
     }
     out
 }
 
-/// 意图不明时的反问（route = `need-intent`）：**意图分析是回答主体，不是报错** ——
-/// 文案只说「我不确定你要查什么 + 可以怎么问」，不出现任何内部措辞（闸门/校验/生成失败）。
-fn intent_reply(question: &str, t0: Instant, clarify_options: Vec<ClarifyOption>) -> AskResult {
-    let mut view = dms_semantic::present::build(&[], &[]);
-    // 模板三问只给「裸实体名」族（嗨肉/某客户有限公司）：那是它实测有效的场景
-    // （`need_intent_has_its_own_route_label` 钉着）。非实体问句套「X 的销售表现」是噪音，
-    // 候选由 clarify_options（fast 生成）承担；两者都空时前端还剩自填框（ask-card 的输入行恒在）。
-    if crate::answerers::entity::entity_form_hit(question) {
-        view.interact.drill = vec![
-            format!("{question} 的销售表现"),
-            format!("{question} 的订单明细"),
-            format!("{question} 的基础资料"),
-        ];
-    }
+/// 「不产 SQL 的固定文案回答」共用的空脚手架（need-intent / no-topic / business-lookup 三处）。
+/// 差异字段（route / 文案 / steps / 候选 / drill）由调用方覆写 —— 15+ 个字段逐字段抄三遍，
+/// 加字段时漏一处就是一处静默漂移。
+fn empty_reply(route: &str, elapsed_ms: u128, note: String) -> AskResult {
     AskResult {
         sql: String::new(),
         columns: vec![],
         rows: vec![],
         row_count: 0,
         truncated: false,
-        elapsed_ms: t0.elapsed().as_millis(),
-        route: NEED_INTENT.into(),
-        view,
+        elapsed_ms,
+        route: route.into(),
+        view: dms_semantic::present::build(&[], &[]),
         supplemental: None,
         comparisons: vec![],
         subs: vec![],
-        caliber_note: Some(format!(
-            "我没能完全确定「{question}」要查的具体数据。可以点一个最接近的问法，或补充说明想看的对象和指标。"
-        )),
+        caliber_note: Some(note),
         truncation_note: None,
         redacted: vec![],
         scope_note: None,
         trust: None,
-        // 反问没走 Router，steps 恒空（不出现在 JSON 里）
         steps: vec![],
-        clarify_options,
+        clarify_options: vec![],
         value_labels: vec![],
         sales_context: None,
     }
+}
+
+/// 用户原文插进**用户可见文案**前的长度护栏（与 refs 段的 500 字同一份纪律）：
+/// 问句本身没有长度上限，文案出口不能没有。
+fn clip_user_text(s: &str) -> String {
+    s.chars().take(REFS_FRAG_MAX_CHARS).collect()
+}
+
+/// 意图不明时的反问（route = `need-intent`）：**意图分析是回答主体，不是报错** ——
+/// 文案只说「我不确定你要查什么 + 可以怎么问」，不出现任何内部措辞（闸门/校验/生成失败）。
+fn intent_reply(question: &str, t0: Instant, clarify_options: Vec<ClarifyOption>) -> AskResult {
+    let mut r = empty_reply(
+        NEED_INTENT,
+        t0.elapsed().as_millis(),
+        format!(
+            "我没能完全确定「{}」要查的具体数据。可以点一个最接近的问法，或补充说明想看的对象和指标。",
+            clip_user_text(question)
+        ),
+    );
+    // 模板三问只给「裸实体名」族（嗨肉/某客户有限公司）：那是它实测有效的场景
+    // （`need_intent_has_its_own_route_label` 钉着）。非实体问句套「X 的销售表现」是噪音，
+    // 候选由 clarify_options（fast 生成）承担；两者都空时前端还剩自填框（ask-card 的输入行恒在）。
+    if crate::answerers::entity::entity_form_hit(question) {
+        r.view.interact.drill = vec![
+            format!("{question} 的销售表现"),
+            format!("{question} 的订单明细"),
+            format!("{question} 的基础资料"),
+        ];
+    }
+    // 反问没走 Router，steps 恒空（不出现在 JSON 里）
+    r.clarify_options = clarify_options;
+    r
 }
 
 /// 「主题未接入」的回答（route = `no-topic`）：明说「这个主题还没有数据」+ 列能问的主题
 /// + 候选问法，**不产 SQL**。与 `need-intent` 分两个 route：判官脚本要把「问法含糊」与
 /// 「主题不存在」分开钉，前端卡标题也按 route 分开。
 fn no_topic_reply(question: &str, topic: &str, t0: Instant, clarify_options: Vec<ClarifyOption>) -> AskResult {
-    let mut view = dms_semantic::present::build(&[], &[]);
+    // 主题词是 fast 从问句里摘的（如「积分」）；摘不出来时就着原问句说，不编造。
+    let what = if topic.is_empty() { format!("「{}」这个主题", clip_user_text(question)) } else { format!("「{topic}」这个主题") };
+    let mut r = empty_reply(
+        NO_TOPIC,
+        t0.elapsed().as_millis(),
+        format!(
+            "{what}还没有接入数据，目前能查的是：{}。可以试试下面的问法，或换个已接入的主题。",
+            known_topics_joined(),
+        ),
+    );
     // 兜底候选 = 确定能答的入口题（各自钉在回归题集里：A01 / E02 / E07 / E06）；
     // fast 在线时另有围绕已接入主题的候选（clarify_options，渲染在 ask-card 下方的 chip 区）。
-    view.interact.drill = vec![
+    r.view.interact.drill = vec![
         "本月销售额是多少".into(),
         "本月有多少个订单".into(),
         "现在总库存量是多少".into(),
         "本月活动费用是多少".into(),
     ];
-    // 主题词是 fast 从问句里摘的（如「积分」）；摘不出来时就着原问句说，不编造。
-    let what = if topic.is_empty() { format!("「{question}」这个主题") } else { format!("「{topic}」这个主题") };
-    AskResult {
-        sql: String::new(),
-        columns: vec![],
-        rows: vec![],
-        row_count: 0,
-        truncated: false,
-        elapsed_ms: t0.elapsed().as_millis(),
-        route: NO_TOPIC.into(),
-        view,
-        supplemental: None,
-        comparisons: vec![],
-        subs: vec![],
-        caliber_note: Some(format!(
-            "{what}还没有接入数据，目前能查的是：{}。可以试试下面的问法，或换个已接入的主题。",
-            KNOWN_TOPICS.join("、"),
-        )),
-        truncation_note: None,
-        redacted: vec![],
-        scope_note: None,
-        trust: None,
-        steps: vec![],
-        clarify_options,
-        value_labels: vec![],
-        sales_context: None,
-    }
+    r.clarify_options = clarify_options;
+    r
 }
 
 // ─────────────────────── 【判官实测 2026-08-10·问题 3】空结果的出界主题出口 ───────────────────────
@@ -568,6 +622,12 @@ fn no_topic_reply(question: &str, topic: &str, t0: Instant, clarify_options: Vec
 /// 被当成筛选条件硬查。合同路径（direct-agg 等）的空结果是「窗口内真没数」，
 /// present 的「请确认时间范围」文案对症，不许抢。
 const OUT_OF_SCOPE_ROUTES: &[&str] = &["direct-derive", "llm", "llm+repair", "llm+schema-fix"];
+
+/// 成员值探针覆盖的维度清单（`topic_covered` 与 `dimension_value_hit` 共用 —— 加维度只许改这一处）。
+const PROBE_DIMS: [dms_semantic::sales_fact::Dimension; 2] = [
+    dms_semantic::sales_fact::Dimension::WarZone,
+    dms_semantic::sales_fact::Dimension::Region,
+];
 
 /// 换文案判据（纯函数，故有单测）：空结果 + route 在圈内 + 无既有风险标注
 /// （口径复核未通过等标注不许被换文案盖掉）+ 有出界主题 + 主题无覆盖。缺一不可。
@@ -585,6 +645,34 @@ fn no_topic_verdict(
         && !topic_covered
 }
 
+/// 标点过滤字集（`residue_after_strip` 用；出界主题与值词残留两处必须同一份）。
+const PUNCT_CHARS: &str = "，。？?、,.~～!！:：;；「」『』()（）";
+
+/// 汉字计数：「残留够不够一个词」的判据（单字残留当噪音）。
+fn hanzi_count(s: &str) -> usize {
+    s.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count()
+}
+
+/// 「剥 consumed（长词优先，与 kernel `has_residue_with` 同一剥法）→ 剥通用虚词 →
+/// 滤数字/空白/标点」的公共残渣流水线：`out_of_scope_topic` 与 `value_word_residue` 共用，
+/// 剥法两份必漂。「够不够一个词」（汉字 ≥2）留给调用方判 —— 出界主题在判定前还要剥方位词尾。
+fn residue_after_strip(question: &str, consumed: &[&'static str]) -> String {
+    let mut s = question.to_string();
+    // 词长先算好再排（`sort_by_key` 的比较器会按比较次数重算 key）
+    let mut consumed: Vec<(usize, &'static str)> =
+        consumed.iter().map(|w| (w.chars().count(), *w)).collect();
+    consumed.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    for (_, w) in &consumed {
+        s = s.replace(w, "");
+    }
+    for w in dms_kernel::nl::lexicon::STRIP_WORDS {
+        s = s.replace(w, "");
+    }
+    s.chars()
+        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !PUNCT_CHARS.contains(*c))
+        .collect()
+}
+
 /// 出界主题提取（纯函数）：剥掉命中的合同指标词 / 销售合同维度词 / 已接入主题词
 /// （`KNOWN_TOPICS`）/ 通用虚词后的残留，再剥方位词尾（「火星上」的「上」不是主题的一部分）。
 /// `None` = 没有可归咎的出界主题：
@@ -595,33 +683,21 @@ fn out_of_scope_topic(question: &str) -> Option<String> {
     if crate::triage::doc_code_hit(question) || crate::triage::table_hit(question) {
         return None;
     }
-    let mut s = question.to_string();
-    let mut consumed: Vec<String> = vec![];
+    let mut consumed: Vec<&'static str> = vec![];
     for (m, _) in crate::run::sales_contract_metrics(question) {
-        consumed.push(m.name().to_string());
-        consumed.extend(m.aliases().iter().map(|a| (*a).to_string()));
-        consumed.extend(crate::run::sales_metric_extra_words(m).iter().map(|a| (*a).to_string()));
+        consumed.push(m.name());
+        consumed.extend(m.aliases().iter().copied());
+        consumed.extend(crate::run::sales_metric_extra_words(m).iter().copied());
     }
     for d in dms_semantic::sales_fact::DIMENSIONS {
-        consumed.push(d.name().to_string());
-        consumed.extend(d.aliases().iter().map(|a| (*a).to_string()));
+        consumed.push(d.name());
+        consumed.extend(d.aliases().iter().copied());
     }
-    consumed.extend(KNOWN_TOPICS.iter().map(|t| (*t).to_string()));
-    // 长词优先（与 kernel `has_residue_with` 同一剥法：短词先剥会把长词拆散）
-    consumed.sort_by_key(|w| std::cmp::Reverse(w.chars().count()));
-    for w in &consumed {
-        s = s.replace(w.as_str(), "");
-    }
-    for w in dms_kernel::nl::lexicon::STRIP_WORDS {
-        s = s.replace(w, "");
-    }
-    let s: String = s
-        .chars()
-        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"，。？?、,.~～!！:：;；「」『』()（）".contains(*c))
-        .collect();
+    consumed.extend(KNOWN_TOPICS.iter().copied());
+    let s = residue_after_strip(question, &consumed);
     let s = s.trim_end_matches(|c| matches!(c, '上' | '下' | '里' | '内' | '中' | '旁' | '侧')).to_string();
     // 至少两个汉字才有「主题」可谈（单字残留当噪音，不为它换文案）
-    if s.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count() < 2 {
+    if hanzi_count(&s) < 2 {
         return None;
     }
     if crate::answerers::entity::entity_form_hit(&s) {
@@ -638,7 +714,6 @@ fn out_of_scope_topic(question: &str) -> Option<String> {
 /// 🔴 全部**失败开放**：任何一路读挂了都当成「有覆盖」—— 换文案是补救路径，
 /// 它自己挂了不许把一次原本成立的回答换成另一副面孔。
 async fn topic_covered(cx: &AskCtx<'_>, topic: &str) -> bool {
-    use dms_semantic::sales_fact::Dimension;
     if KNOWN_TOPICS.iter().any(|t| topic.contains(t)) {
         return true;
     }
@@ -666,7 +741,7 @@ async fn topic_covered(cx: &AskCtx<'_>, topic: &str) -> bool {
             return true;
         }
     }
-    for dim in [Dimension::WarZone, Dimension::Region] {
+    for dim in PROBE_DIMS {
         if probe_dimension_member(cx, dim, &dimension_probe_values(dim, topic)).await.is_some() {
             return true;
         }
@@ -725,7 +800,6 @@ async fn ai_query_is_actionable(
     on_usage: &(dyn Fn(&Usage) + Send + Sync),
     question: &str,
 ) -> Option<GateVerdict> {
-    const TIMEOUT: Duration = Duration::from_secs(4);
     let system = format!(
         "你只判断一个 DMS 业务数据问题该如何处理。本系统已接入的数据主题只有：{}。\
          若问题的主题明显不在上述范围内（如积分、会员等级、考勤、工资、人事），输出 unsupported|主题词。\
@@ -734,13 +808,15 @@ async fn ai_query_is_actionable(
          只有缺少具体对象和查询目标、仅有代词/寒暄、或对象无法辨认时输出 clarify。\
          拿不准主题是否已接入时输出 answer，不许猜 unsupported（后面还有一道注册表覆盖检查接住它）。\
          不识别表，不生成 SQL，不回答数据，不补写用户问题；只输出 answer、clarify 或 unsupported|主题词。",
-        KNOWN_TOPICS.join("、")
+        known_topics_joined()
     );
     let user = format!("问题：{question}\n判定：");
+    // 温度 0.0：三词协议的输出就一个词，温度抖动是纯噪音；与 triage 二分类的 0.1 不同档，
+    // 那边的答错代价只是路由差一点（兜底恒 Data），两边各自的理由都写在各自注释里
     let mut req = ChatRequest::text(ModelTier::Fast, &system, &user, Some(0.0));
     // 「unsupported|主题词」比单词回复长，预算给到 24（answer/clarify 时代是 8）
     req.max_tokens = Some(24);
-    let reply = match tokio::time::timeout(TIMEOUT, llm.chat(req)).await {
+    let reply = match tokio::time::timeout(FAST_CALL_TIMEOUT, llm.chat(req)).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(e)) => {
             tracing::warn!(err = %e, "精简模式 Fast 理解失败 → 保持澄清");
@@ -772,7 +848,10 @@ fn parse_gate_verdict(reply: &str) -> Option<GateVerdict> {
         "clarify" if topic.is_empty() => Some(GateVerdict::Clarify),
         "unsupported" => {
             let topic: String = topic.chars().filter(|c| !c.is_control()).take(12).collect();
-            let topic = topic.trim_matches('"').trim_matches('"').trim_matches('「').trim_matches('」').trim_matches('。').to_string();
+            // 直/弯引号、书名号、句号一把剥（原来同字符 `trim_matches('"')` 写两遍，弯引号没剥到）
+            let topic = topic
+                .trim_matches(|c: char| matches!(c, '"' | '“' | '”' | '「' | '」' | '。'))
+                .to_string();
             Some(GateVerdict::Unsupported(topic))
         }
         _ => None,
@@ -780,7 +859,11 @@ fn parse_gate_verdict(reply: &str) -> Option<GateVerdict> {
 }
 
 /// 单问：Router 有序表遍历 → LLM 兜底。逐条转写 `pipeline.rs:643-713` 的五支内联 if。
-async fn ask_single(d: &AskDeps<'_>, cx: &AskCtx<'_>) -> anyhow::Result<AskResult> {
+/// `members` 由 `ask()` 组一次传入（复合拆解的子问共用同一表，成员无 per-call 状态）。
+async fn ask_single(
+    cx: &AskCtx<'_>,
+    members: &[Box<dyn Answerer + '_>],
+) -> anyhow::Result<AskResult> {
     // 生产 MySQL 被选为当前业务源时，硬切成独占轻查询通道。不能先跑 graph/direct/cache/LLM：
     // 那些路径允许聚合、JOIN 或模型 SQL，哪怕最终 SQL gate 只读也可能给业务库造成负载。
     if cx.ds == ds_reg::DMS_DS_ID && !cx.source.is_warehouse() {
@@ -796,8 +879,8 @@ async fn ask_single(d: &AskDeps<'_>, cx: &AskCtx<'_>) -> anyhow::Result<AskResul
     // A6 分步留痕：一个成员一步（含 skip —— 「为什么没走缓存/图」只能在这里看到），
     // 命中后整体挂到 `AskResult.steps`。只记 {表标签, 结果, 耗时}，问句与 SQL 原文
     // `query_log` 已存，不在这里再带一份。
-    let mut steps = Vec::new();
-    for a in router(d.embed, d.detect, d.compose_hit, d.direct_hit, d.correctors, d.sc_samples) {
+    let mut steps = Vec::with_capacity(crate::ROUTER_ORDER.len());
+    for a in members {
         let t = Instant::now();
         // 🔴 `accept` 不许漏：graph 的「免注入资格」门禁就在那里，漏掉等于绕过它
         if !a.accept(cx) {
@@ -808,32 +891,36 @@ async fn ask_single(d: &AskDeps<'_>, cx: &AskCtx<'_>) -> anyhow::Result<AskResul
         // 权限注入失败是 fail-closed 信号，绝不降级成「换下一路重试」
         if let Some(mut r) = a.answer(cx).await? {
             steps.push(Step { stage: a.route(), kind: "hit", ms: t.elapsed().as_millis() });
-            // 数仓单据优先由 direct-doc 查询。少数单据族在 Doris 只有头表、没有明细表；
-            // 此时才通过既有 production light-lookup 按同一单号补明细，生产侧仍是独立单表点查。
-            if r.route == "direct-doc" && needs_production_detail_fallback(cx.question, cx.source.is_warehouse()) {
-                let lookup = crate::answerers::business_lookup::BusinessLookupAnswerer::new();
-                let lookup_t = Instant::now();
-                if let Some(mut enriched) = lookup.answer(cx).await? {
+            if r.route == "direct-doc" {
+                // 单据解析在这条命中路径上只算一次：明细回填判据与单据身份块共用同一份
+                // （原来是两个函数各自 `resolve_document` 一遍）
+                let wh = cx.source.is_warehouse();
+                let document = dms_semantic::document::resolve_document(cx.question, wh);
+                // 数仓单据优先由 direct-doc 查询。少数单据族在 Doris 只有头表、没有明细表；
+                // 此时才通过既有 production light-lookup 按同一单号补明细，生产侧仍是独立单表点查。
+                if needs_production_detail_fallback(document.as_ref(), wh) {
+                    let lookup = crate::answerers::business_lookup::BusinessLookupAnswerer::new();
+                    let lookup_t = Instant::now();
+                    if let Some(mut enriched) = lookup.answer(cx).await? {
+                        steps.push(Step {
+                            stage: lookup.route(),
+                            kind: "hit",
+                            ms: lookup_t.elapsed().as_millis(),
+                        });
+                        // 路由标签保持 direct-doc：单据的识别与主表答案来自确定性单据通道，
+                        // 生产轻查询只补明细 —— 这不是一次独立的 business-lookup 答案。
+                        enriched.route = "direct-doc".into();
+                        enriched.steps = steps;
+                        attach_trust(cx, &mut enriched);
+                        return Ok(enriched);
+                    }
                     steps.push(Step {
                         stage: lookup.route(),
-                        kind: "hit",
+                        kind: "miss",
                         ms: lookup_t.elapsed().as_millis(),
                     });
-                    // 路由标签保持 direct-doc：单据的识别与主表答案来自确定性单据通道，
-                    // 生产轻查询只补明细 —— 这不是一次独立的 business-lookup 答案。
-                    enriched.route = "direct-doc".into();
-                    enriched.steps = steps;
-                    attach_trust(cx, &mut enriched);
-                    return Ok(enriched);
                 }
-                steps.push(Step {
-                    stage: lookup.route(),
-                    kind: "miss",
-                    ms: lookup_t.elapsed().as_millis(),
-                });
-            }
-            if r.route == "direct-doc" {
-                attach_document_identity(cx.question, cx.source.is_warehouse(), &mut r);
+                attach_document_identity(document.as_ref(), wh, &mut r);
             }
             r.steps = steps;
             attach_trust(cx, &mut r);
@@ -846,21 +933,30 @@ async fn ask_single(d: &AskDeps<'_>, cx: &AskCtx<'_>) -> anyhow::Result<AskResul
     anyhow::bail!("Router 未产出答案：`llm` 兜底成员不在表里（ROUTER_ORDER 被改坏）")
 }
 
-fn needs_production_detail_fallback(question: &str, warehouse: bool) -> bool {
+/// 明细回填判据（纯函数）：数仓只有头表、生产有明细的单据族才回填。
+/// 单据解析由调用方做一次传进来（同一命中路径上 `attach_document_identity` 也要用同一份）。
+fn needs_production_detail_fallback(
+    document: Option<&dms_semantic::document::ResolvedDocument>,
+    warehouse: bool,
+) -> bool {
     if !warehouse {
         return false;
     }
-    let Some(document) = dms_semantic::document::resolve_document(question, true) else {
+    let Some(document) = document else {
         return false;
     };
-    let (Some(warehouse), Some(production)) = (document.family.warehouse, document.family.production) else {
+    let (Some(wh), Some(production)) = (document.family.warehouse, document.family.production) else {
         return false;
     };
-    warehouse.details.is_empty() && !production.details.is_empty()
+    wh.details.is_empty() && !production.details.is_empty()
 }
 
-fn attach_document_identity(question: &str, warehouse: bool, result: &mut AskResult) {
-    let Some(document) = dms_semantic::document::resolve_document(question, warehouse) else {
+fn attach_document_identity(
+    document: Option<&dms_semantic::document::ResolvedDocument>,
+    warehouse: bool,
+    result: &mut AskResult,
+) {
+    let Some(document) = document else {
         return;
     };
     let Some(source) = document.family.source(warehouse) else {
@@ -898,36 +994,18 @@ fn attach_document_identity(question: &str, warehouse: bool, result: &mut AskRes
 }
 
 fn production_lookup_only_reply(cx: &AskCtx<'_>, ms: u128) -> AskResult {
-    let mut view = dms_semantic::present::build(&[], &[]);
-    view.interact.drill = vec![
+    let mut r = empty_reply(
+        "business-lookup",
+        cx.t0.elapsed().as_millis(),
+        "当前选中的是生产 DMS 业务库。为避免影响业务运行，这里只允许按单号、客户编码或商品编码做单表点查；名称检索、统计、聚合、趋势和跨表分析请切换到 Doris 数仓。".into(),
+    );
+    r.view.interact.drill = vec![
         "查单号 HJXH-DSO...".into(),
         "客户编码 C...".into(),
         "商品编码 SKU...".into(),
     ];
-    AskResult {
-        sql: String::new(),
-        columns: vec![],
-        rows: vec![],
-        row_count: 0,
-        truncated: false,
-        elapsed_ms: cx.t0.elapsed().as_millis(),
-        route: "business-lookup".into(),
-        view,
-        supplemental: None,
-        comparisons: vec![],
-        subs: vec![],
-        caliber_note: Some(
-            "当前选中的是生产 DMS 业务库。为避免影响业务运行，这里只允许按单号、客户编码或商品编码做单表点查；名称检索、统计、聚合、趋势和跨表分析请切换到 Doris 数仓。".into(),
-        ),
-        truncation_note: None,
-        redacted: vec![],
-        scope_note: None,
-        trust: None,
-        steps: vec![Step { stage: "business-lookup", kind: "miss", ms }],
-        clarify_options: vec![],
-        value_labels: vec![],
-        sales_context: None,
-    }
+    r.steps = vec![Step { stage: "business-lookup", kind: "miss", ms }];
+    r
 }
 
 // ─────────────────────── 【判官实测 2026-08-10·问题 2】维度成员值优先门 ───────────────────────
@@ -980,7 +1058,6 @@ impl Answerer for DimensionFirstHit {
 
 /// 维度成员值命中 → 直接装配合同答案；`None` = 这扇门不接（原样委托内层）。
 async fn dimension_value_hit(cx: &AskCtx<'_>) -> Option<DirectHit> {
-    use dms_semantic::sales_fact::Dimension;
     // 销售合同只在数仓源上成立（与 direct.rs `customer_filtered_sales` 同一前提）
     if !cx.source.is_warehouse() {
         return None;
@@ -989,9 +1066,10 @@ async fn dimension_value_hit(cx: &AskCtx<'_>) -> Option<DirectHit> {
     if hits.is_empty() {
         return None;
     }
-    let word = value_word_residue(cx.question)?;
+    // 已算的命中结果传下去：`value_word_residue` 的剥词表必须与命中判据同一份（不许重算一遍）
+    let word = value_word_residue(cx.question, &hits)?;
     // 战区先于省区：两列撞同名值时取战区（判官实测案例所在列；撞车本就罕见）
-    for dim in [Dimension::WarZone, Dimension::Region] {
+    for dim in PROBE_DIMS {
         let candidates = dimension_probe_values(dim, &word);
         if let Some(member) = probe_dimension_member(cx, dim, &candidates).await {
             tracing::info!(
@@ -1007,33 +1085,25 @@ async fn dimension_value_hit(cx: &AskCtx<'_>) -> Option<DirectHit> {
     None
 }
 
-/// 候选过滤值提取（纯函数）：剥命中的合同指标词（长词优先，与 kernel `has_residue_with`
-/// 同一剥法）→ 剥通用虚词 → 滤数字/空白/标点。镜像 direct.rs `customer_name_fragment` 的
-/// 剥法，差别只在**这里不剥维度词** —— 维度词尾留给 `dimension_probe_values` 的词干处理
-/// （「直营战区」先整词试、再剥尾试「直营」）。
+/// 候选过滤值提取（纯函数）：剥命中的合同指标词（`hits` 由调用方算好 —— 与命中判据
+/// 同一份，不许重算）→ 剥通用虚词 → 滤数字/空白/标点（公共流水线是 `residue_after_strip`）。
+/// 镜像 direct.rs `customer_name_fragment` 的剥法，差别只在**这里不剥维度词** —— 维度词尾
+/// 留给 `dimension_probe_values` 的词干处理（「直营战区」先整词试、再剥尾试「直营」）。
 /// 至少两个汉字才值得探库（与 customer_name_fragment 同一门槛）。
 /// 「直营和加盟」这类多值问句剥完是融合串，等值探针必不中 → 原样委托内层，
 /// 绝不静默只取一个值（与 direct.rs `stock_snapshot` 的多省判据同一取舍）。
-fn value_word_residue(question: &str) -> Option<String> {
-    let mut s = question.to_string();
+fn value_word_residue(
+    question: &str,
+    hits: &[(dms_semantic::sales_fact::Metric, &'static str)],
+) -> Option<String> {
     let mut consumed: Vec<&'static str> = vec![];
-    for (m, _) in crate::run::sales_contract_metrics(question) {
+    for (m, _) in hits {
         consumed.push(m.name());
         consumed.extend(m.aliases().iter().copied());
-        consumed.extend(crate::run::sales_metric_extra_words(m).iter().copied());
+        consumed.extend(crate::run::sales_metric_extra_words(*m).iter().copied());
     }
-    consumed.sort_by_key(|w| std::cmp::Reverse(w.chars().count()));
-    for w in consumed {
-        s = s.replace(w, "");
-    }
-    for w in dms_kernel::nl::lexicon::STRIP_WORDS {
-        s = s.replace(w, "");
-    }
-    let s: String = s
-        .chars()
-        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"，。？?、,.~～!！:：;；「」『』()（）".contains(*c))
-        .collect();
-    if s.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count() < 2 {
+    let s = residue_after_strip(question, &consumed);
+    if hanzi_count(&s) < 2 {
         return None;
     }
     Some(s)
@@ -1042,11 +1112,17 @@ fn value_word_residue(question: &str) -> Option<String> {
 /// 维度名词尾：「直营战区」的「战区」是维度词不是值。长词先剥（「大战区」先于「战区」）。
 const DIMENSION_NOUN_TAILS: &[&str] = &["大战区", "战区", "省区", "区域", "渠道"];
 
+/// 标量命中的明细行数上限（与 direct.rs 合同装配器的明细窗同值：`direct.rs:1654`）。
+const DETAIL_ROWS: u32 = 100;
+
 /// 成员值探针候选（纯函数）：原词 → 剥维度词尾的词干。
 /// 词干是**裸值**时才再补一个「词干+本维度惯用后缀」的候选（省区值多带「省区」后缀：
 /// 用户说「湖南」，库里是「湖南省区」）；词尾本来就是用户给的，剥完不再画蛇添足。
 /// 去重保序。
 fn dimension_probe_values(dim: dms_semantic::sales_fact::Dimension, word: &str) -> Vec<String> {
+    use dms_semantic::sales_fact::Dimension;
+    // 调用点只传 WarZone/Region（PROBE_DIMS）；给 Dimension 加变体时这里必须同步，不许静默产空串
+    debug_assert!(matches!(dim, Dimension::WarZone | Dimension::Region));
     let stem = DIMENSION_NOUN_TAILS.iter().find_map(|t| word.strip_suffix(t)).unwrap_or(word);
     let mut out: Vec<String> = vec![word.to_string()];
     if stem != word {
@@ -1054,11 +1130,12 @@ fn dimension_probe_values(dim: dms_semantic::sales_fact::Dimension, word: &str) 
         return out;
     }
     let suffixed = match dim {
-        dms_semantic::sales_fact::Dimension::WarZone => format!("{stem}战区"),
-        dms_semantic::sales_fact::Dimension::Region => format!("{stem}省区"),
+        Dimension::WarZone => format!("{stem}战区"),
+        Dimension::Region => format!("{stem}省区"),
         _ => String::new(),
     };
-    if !suffixed.is_empty() && !out.contains(&suffixed) {
+    // 到这步词干就是原词：suffixed 恒 ≠ out 里已有的原词，只挡空串（未来新变体的占位）
+    if !suffixed.is_empty() {
         out.push(suffixed);
     }
     out
@@ -1088,8 +1165,22 @@ async fn probe_dimension_member(
         dms_semantic::sales_fact::ALIAS,
         dms_semantic::sales_fact::ALIAS,
     );
-    let scoped = crate::gate::gate_on(cx.p, &probe, cx.scope, cx.ds_global, cx.source.dialect()).ok()?;
-    let rs = cx.source.fetch(&scoped, crate::gate::MAX_ROWS, crate::gate::EXEC_TIMEOUT).await.ok()?;
+    let scoped = match crate::gate::gate_on(cx.p, &probe, cx.scope, cx.ds_global, cx.source.dialect()) {
+        Ok(s) => s,
+        Err(e) => {
+            // 「探针今天跑没跑」必须可证伪：失败 = 委托内层（语义不变），但留 debug 痕迹
+            // （与本文件 808 行「权限注入失败是 fail-closed 信号」的纪律对照读：主路 fail-closed 不变）
+            tracing::debug!(err = %e, "维度成员值探针权限注入失败 → 原样委托内层");
+            return None;
+        }
+    };
+    let rs = match cx.source.fetch(&scoped, crate::gate::MAX_ROWS, crate::gate::EXEC_TIMEOUT).await {
+        Ok(rs) => rs,
+        Err(e) => {
+            tracing::debug!(err = %e, "维度成员值探针取数失败 → 原样委托内层");
+            return None;
+        }
+    };
     rs.rows.first()?.first()?.as_str().map(str::to_string)
 }
 
@@ -1120,22 +1211,20 @@ fn build_dimension_value_hit(
     let sql = with(&begin, &end, metrics);
     // 标量（单指标无维度）才有环比/同比/明细/同窗补充 —— 与合同装配器同一约定
     let scalar = metrics.len() == 1;
-    let prev = scalar.then(|| dms_kernel::nl::time::prev_window(question)).flatten().and_then(
-        |(template, label)| {
-            let (b, e) = sales_fact::comparison_time_bounds(question, template)?;
-            Some((with(&b, &e, metrics), label.to_string()))
-        },
-    );
-    let comparisons = scalar
-        .then(|| dms_kernel::nl::time::yoy_window(question))
-        .flatten()
+    let prev_window = if scalar { dms_kernel::nl::time::prev_window(question) } else { None };
+    let prev = prev_window.and_then(|(template, label)| {
+        let (b, e) = sales_fact::comparison_time_bounds(question, template)?;
+        Some((with(&b, &e, metrics), label.to_string()))
+    });
+    let yoy_window = if scalar { dms_kernel::nl::time::yoy_window(question) } else { None };
+    let comparisons = yoy_window
         .and_then(|(template, label)| {
             let (b, e) = sales_fact::comparison_time_bounds(question, template)?;
             Some((with(&b, &e, metrics), label.to_string()))
         })
         .into_iter()
         .collect();
-    let detail = scalar.then(|| sales_fact::detail_sql(&begin, &end, &predicates, 100));
+    let detail = scalar.then(|| sales_fact::detail_sql(&begin, &end, &predicates, DETAIL_ROWS));
     let sales_context = scalar.then(|| with(&begin, &end, sales_fact::CONTEXT_METRICS));
     // route 与合同装配器同款：direct-agg（`land` 按它走 verified 信任级）
     Some(DirectHit { sql, route: "direct-agg".into(), prev, comparisons, detail, sales_context })
@@ -1230,7 +1319,12 @@ pub fn is_followup(q: &str) -> bool {
 /// 【证据引用】`refs` 非空时多第七段「#用户引用」（`refs_section_of` 拼装，空则**一字不多**）。
 /// 它只给改写当指代消解素材 —— 不改写就不注入：四条降级路一条不动（触发条件不吃 refs），
 /// 因为「要不要改写」是既有行为契约，引用只是改写时的额外上下文，不是新的触发器。
-async fn rewrite_followup(llm: &dyn ChatModel, question: &str, prev: Option<PrevTurn<'_>>) -> String {
+async fn rewrite_followup(
+    llm: &dyn ChatModel,
+    on_usage: &(dyn Fn(&Usage) + Send + Sync),
+    question: &str,
+    prev: Option<PrevTurn<'_>>,
+) -> String {
     let Some((prev_q, prev_sql, refs)) = prev else {
         return question.to_string();
     };
@@ -1255,9 +1349,30 @@ async fn rewrite_followup(llm: &dyn ChatModel, question: &str, prev: Option<Prev
     );
     // 温度 0.1 = 搬运前 `LlmClient::chat` 写死的那个值（`server/src/llm.rs:53`）
     let req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
-    match llm.chat(req).await.ok().and_then(|r| r.content) {
+    // fast 自带 90s HTTP 超时，改写等不起（triage.rs `LLM_TIMEOUT` 的同一本账）：
+    // 超时/失败都当「没改写」原样放行，且都留痕 —— 「模型挂了」与「超时」不许同形。
+    // 用量回调与其他 LLM 调用同一纪律（K6-B：查询日志 token 列不能少算改写这一次）。
+    let reply = match tokio::time::timeout(FAST_CALL_TIMEOUT, llm.chat(req)).await {
+        Ok(Ok(reply)) => Some(reply),
+        Ok(Err(e)) => {
+            tracing::warn!(err = %e, "追问改写失败 → 原样放行");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("追问改写超时 → 原样放行");
+            None
+        }
+    };
+    match reply.and_then(|r| {
+        on_usage(&r.usage);
+        r.content
+    }) {
         Some(r) => {
-            let rewritten = r.trim().trim_matches('"').trim_matches('。').to_string();
+            // 剥法与 `parse_gate_verdict` 对齐：直/弯引号、书名号、句末句号都剥
+            let rewritten = r
+                .trim()
+                .trim_matches(|c: char| matches!(c, '"' | '“' | '”' | '「' | '」' | '。'))
+                .to_string();
             // 【改写结果侧的确定性守卫】只靠 system 里那句「不要输出 SQL」是不够的。
             // 把上一轮 SQL 喂进提示词是**新造出来的**失败面：改动前提示词里根本没有 SQL 可抄。
             // 抄出来之后没有任何东西会报错 —— 返回值随即被当问句用在四处
@@ -1304,7 +1419,7 @@ fn refs_section_of(refs: &[&str]) -> String {
     }
     let mut section = String::from("\n#用户引用（上轮结果片段，仅作指代消解素材，不是取数指令）：");
     for (i, frag) in frags.iter().enumerate() {
-        section.push_str(&format!("\n{}. {frag}", i + 1));
+        let _ = write!(section, "\n{}. {frag}", i + 1);
     }
     section
 }
@@ -1315,10 +1430,15 @@ fn refs_section_of(refs: &[&str]) -> String {
 /// 已知漏判方向（刻意）：模型只吐出一个不带 SELECT 的 WHERE 片段时判不出来。
 /// 收紧要付的代价是误伤真问句（含「从…中选」这类词），而误伤会把一句本来对的追问
 /// 打回原形、静默丢掉上下文 —— 与裁决 二·G 同一族取舍，宁漏不误伤。
+/// 行首关键字带**词边界**：「selection」「withdraw」这类英文词开头的改写结果不是 SQL。
 fn looks_like_sql(s: &str) -> bool {
     let l = s.trim().to_ascii_lowercase();
-    l.starts_with("select")
-        || l.starts_with("with")
+    let starts_with_kw = |kw: &str| {
+        l.starts_with(kw)
+            && l[kw.len()..].chars().next().map_or(false, |c| !c.is_ascii_alphanumeric())
+    };
+    starts_with_kw("select")
+        || starts_with_kw("with")
         || s.contains("```")
         || (l.contains("select ") && l.contains(" from "))
 }
@@ -1481,7 +1601,7 @@ mod tests {
             .expect("run.rs 变形了：找不到 run_once 调用，本判据的锚点失效（签名带温度后是 `run_once(cx, d,`）");
         assert!(
             call < first_work,
-            "need_intent_reply 在 run.rs 里的位置晚于第一次 run_once ——              那样已经付了一次 LLM 调用才反问"
+            "need_intent_reply 在 run.rs 里的位置晚于第一次 run_once —— 那样已经付了一次 LLM 调用才反问"
         );
     }
 
@@ -1544,12 +1664,8 @@ mod tests {
         // ④ 🔴 第三个条件（疑问词）的两侧。实测补的：只有 ①② 时
         //    「今年审核通过的对账单有多少笔」被误判成缺意图 —— 它意图明确，
         //    只是「对账单数」不在声明指标里。那一族被反问比让 LLM 去查更坏。
-        let asking = |q: &str| {
-            ["多少", "几", "哪些", "那些", "哪几", "哪家", "谁", "哪个", "什么", "怎么", "统计", "列出", "排行", "排名",
-             "最高", "最低", "最多", "最少", "趋势", "占比", "比例", "对比", "明细", "清单", "分布", "top", "TOP", "前"]
-                .iter()
-                .any(|w| q.contains(w))
-        };
+        //    词表直接引 `ASKING` 本体（抄第二份必漂 —— 本文件 337-338 行注释自己写明过）
+        let asking = |q: &str| ASKING.iter().any(|w| q.contains(w));
         for q in [
             "今年审核通过的对账单有多少笔",
             "被驳回的开票申请有哪些",
@@ -1587,12 +1703,15 @@ mod tests {
         assert_eq!(sales.family.name, "销售订单");
         assert_eq!(sales_source.header_table, "dms_ods.t_sales_order");
         assert_eq!(sales_source.details[0].table, "dms_ods.t_sales_order_detail");
-        assert!(!needs_production_detail_fallback("HJXH-DXO2026072300384", true));
+        let needs = |q: &str, wh: bool| {
+            needs_production_detail_fallback(dms_semantic::document::resolve_document(q, wh).as_ref(), wh)
+        };
+        assert!(!needs("HJXH-DXO2026072300384", true));
 
-        assert!(needs_production_detail_fallback("IO2025123456", true));
-        assert!(needs_production_detail_fallback("SQ2026052345", true));
-        assert!(!needs_production_detail_fallback("HJXH-DZD20261230000261", true));
-        assert!(!needs_production_detail_fallback("IO2025123456", false));
+        assert!(needs("IO2025123456", true));
+        assert!(needs("SQ2026052345", true));
+        assert!(!needs("HJXH-DZD20261230000261", true));
+        assert!(!needs("IO2025123456", false));
     }
 
     /// 反问的 route 标签必须**独立于 `llm`**：判官脚本要能把「缺意图」与「LLM 答错」分开钉。
@@ -1658,6 +1777,11 @@ mod tests {
             Some(GateVerdict::Unsupported("会员等级".into()))
         );
         assert_eq!(parse_gate_verdict("unsupported"), Some(GateVerdict::Unsupported(String::new())));
+        // 弯引号/书名号同样剥（与改写结果的剥法对齐）
+        assert_eq!(
+            parse_gate_verdict("unsupported|“会员等级”。"),
+            Some(GateVerdict::Unsupported("会员等级".into()))
+        );
         // 答非所问一律 None
         assert_eq!(parse_gate_verdict("answer because"), None);
         assert_eq!(parse_gate_verdict("可以查询"), None);
@@ -1712,6 +1836,11 @@ mod tests {
         // 模型回空/答非所问 → 空
         assert!(parse_clarify_options("", "嗨肉").is_empty());
         assert!(parse_clarify_options("我不知道怎么回答", "嗨肉").is_empty());
+        // 弯引号包裹的问句照剥（与直引号同一待遇）
+        let quoted = "销售表现|“嗨肉本月销售额”\n订单明细|嗨肉本月的订单明细";
+        let got = parse_clarify_options(quoted, "嗨肉");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].question, "嗨肉本月销售额", "{got:?}");
     }
 
     /// 顺序假模型：按队列逐次出回复（第一次 = 意图判定，第二次 = 候选生成），`None` = 该次调用失败。
@@ -1750,7 +1879,6 @@ mod tests {
         let ok = Seq::of(&[Some("clarify"), Some("销售表现|嗨肉本月销售额\n订单明细|嗨肉本月的订单明细")]);
         let r = need_intent_reply(&ok, &|_| {}, &pg, "dms", "嗨肉", Instant::now())
             .await
-            .unwrap()
             .expect("判含糊必须反问");
         assert_eq!(r.route, NEED_INTENT);
         assert_eq!(r.clarify_options.len(), 2, "{:?}", r.clarify_options);
@@ -1760,7 +1888,6 @@ mod tests {
         let down = Seq::of(&[Some("clarify"), None]);
         let r = need_intent_reply(&down, &|_| {}, &pg, "dms", "嗨肉", Instant::now())
             .await
-            .unwrap()
             .expect("判含糊必须反问");
         assert!(r.clarify_options.is_empty());
         assert!(serde_json::to_value(&r).unwrap().get("clarify_options").is_none());
@@ -1768,7 +1895,6 @@ mod tests {
         let garbage = Seq::of(&[Some("clarify"), Some("我无法理解这个问题")]);
         let r = need_intent_reply(&garbage, &|_| {}, &pg, "dms", "嗨肉", Instant::now())
             .await
-            .unwrap()
             .unwrap();
         assert!(r.clarify_options.is_empty(), "{:?}", r.clarify_options);
     }
@@ -1780,10 +1906,43 @@ mod tests {
         let m = Seq::of(&[]);
         let r = need_intent_reply(&m, &|_| {}, &pg, "dms", "删除所有订单", Instant::now())
             .await
-            .unwrap()
             .expect("破坏性词必须反问");
         assert!(r.clarify_options.is_empty());
         assert!(m.replies.lock().unwrap().is_empty(), "红线问句不该消费任何回复");
+    }
+
+    /// 🔴 破坏性词的**词边界**（纯函数）：英文词内的子串（"dropdown"/"waterdrop"）不得误判红线，
+    /// 真红线写法一个不许漏。
+    #[test]
+    fn destructive_words_need_ascii_word_boundaries() {
+        for q in ["删除所有订单", "drop table t_user", "把这张表 truncate 掉", "帮我 DROP 一下", "执行 delete from t"] {
+            assert!(destructive_hit(q), "红线写法漏判：{q}");
+        }
+        for q in ["dropdown 怎么配置", "waterdrop 是什么", "本月销售额是多少", "backdrop 门店怎么用"] {
+            assert!(!destructive_hit(q), "英文词内的子串不许误判红线：{q}");
+        }
+    }
+
+    /// 用户可见文案里的问句原文有长度护栏（与 refs 段同一 500 字纪律）：再长的问句
+    /// 也不能原样灌进 caliber_note。
+    #[test]
+    fn user_text_in_notes_is_capped() {
+        let long = "长".repeat(REFS_FRAG_MAX_CHARS + 100);
+        let note = intent_reply(&long, Instant::now(), vec![]).caliber_note.unwrap();
+        assert!(note.contains(&"长".repeat(REFS_FRAG_MAX_CHARS)), "{note}");
+        assert!(!note.contains(&"长".repeat(REFS_FRAG_MAX_CHARS + 1)), "第 501 字起必须截掉：{note}");
+        // no-topic 主题词缺席时就着原问句说 —— 同样截
+        let note = no_topic_reply(&long, "", Instant::now(), vec![]).caliber_note.unwrap();
+        assert!(!note.contains(&"长".repeat(REFS_FRAG_MAX_CHARS + 1)), "{note}");
+    }
+
+    /// topic system 的主题清单必须与 `KNOWN_TOPICS` 同源 —— 硬编码第二份清单已经漂过一次。
+    #[test]
+    fn topic_system_lists_every_known_topic() {
+        let s = topic_system();
+        for t in KNOWN_TOPICS {
+            assert!(s.contains(t), "topic system 漏了主题 {t}：{s}");
+        }
     }
 
     /// 🔴 Fast 判定是精简模式的**统一入口**：所有确定性路由未命中、走到 LLM 兜底的
@@ -1799,7 +1958,7 @@ mod tests {
             .split("fn intent_reply(")
             .next()
             .unwrap();
-        let destructive = body.find(concat!("const DESTR", "UCTIVE")).expect("缺红线词门");
+        let destructive = body.find("destructive_hit(question)").expect("缺红线词门");
         let fast = body
             .find("ai_query_is_actionable(llm, on_usage, question)")
             .expect("缺 Fast 判定调用");
@@ -1818,10 +1977,10 @@ mod tests {
             "Fast 四态分支不完整：{body}"
         );
         // 🔴 ②b 覆盖兜底的接线：answer 分支里必须先过 `registry_hit` + `hold_back_uncovered`
-        // 才放行（`return Ok(None)`）—— 删掉这道，「积分」族又回到「fast 说能答就去猜 SQL」。
+        // 才放行（`return None`）—— 删掉这道，「积分」族又回到「fast 说能答就去猜 SQL」。
         let answer_arm = body.find("Some(GateVerdict::Answer)").unwrap();
         let answer_body = &body[answer_arm..];
-        let pass_through = answer_body.find("return Ok(None)").expect("answer 分支缺放行");
+        let pass_through = answer_body.find("return None;").expect("answer 分支缺放行");
         let cover = answer_body.find("crate::triage::registry_hit(pg, ds, question)").expect("缺覆盖兜底调用");
         let hold = answer_body.find("hold_back_uncovered(question, covered)").expect("缺覆盖兜底判据");
         assert!(cover < hold && hold < pass_through, "覆盖兜底必须在放行之前：{answer_body}");
@@ -1841,7 +2000,7 @@ mod tests {
             .split("if let Some(r) = compound::try_compound")
             .next()
             .expect("one 闭包边界没了");
-        let single = body.find("ask_single(d, &cx)").expect("缺 ask_single 调用");
+        let single = body.find("ask_single(&cx, members)").expect("缺 ask_single 调用");
         let loc = body
             .find("localize_result(&cx")
             .expect("缺呈现中文化收口 —— 英文列名/状态码会原样透出到前端");
@@ -1901,7 +2060,6 @@ mod tests {
         let ok = Seq::of(&[Some("unsupported|积分"), Some("销售表现|本月销售额是多少\n库存现状|现在总库存量是多少")]);
         let r = need_intent_reply(&ok, &|_| {}, &pg, "dms", "本月的积分情况", Instant::now())
             .await
-            .unwrap()
             .expect("判 unsupported 必须直接回答");
         assert_eq!(r.route, NO_TOPIC);
         assert!(r.sql.is_empty(), "no-topic 不许带 SQL（不走试探）");
@@ -1912,7 +2070,6 @@ mod tests {
         let down = Seq::of(&[Some("unsupported|积分"), None]);
         let r = need_intent_reply(&down, &|_| {}, &pg, "dms", "本月的积分情况", Instant::now())
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(r.route, NO_TOPIC);
         assert!(r.clarify_options.is_empty());
@@ -1927,27 +2084,33 @@ mod tests {
     #[tokio::test]
     async fn rewrite_falls_back_to_the_original_question() {
         let boom = Fake::new(None); // 一调就挂
-        assert_eq!(rewrite_followup(&boom, "那上月呢", None).await, "那上月呢");
+        assert_eq!(rewrite_followup(&boom, &|_| {}, "那上月呢", None).await, "那上月呢");
         assert_eq!(
-            rewrite_followup(&boom, "本月各省份销售额是多少", Some(("上月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&boom, &|_| {}, "本月各省份销售额是多少", Some(("上月销售额", Some(PREV_SQL), &[]))).await,
             "本月各省份销售额是多少"
         );
         assert_eq!(boom.calls(), 0, "「没有上一轮」与「不是追问」两档都不许调模型");
         // 追问 + 有上一轮 + 上一轮真有 SQL → 调模型；挂了照样原样返回
         assert_eq!(
-            rewrite_followup(&boom, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&boom, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
             "那上月呢"
         );
         assert_eq!(boom.calls(), 1, "这一档必须真的调了一次，否则上面那两条恒绿");
         let ok = Fake::new(Some("  \"上月销售额是多少。\"  "));
         assert_eq!(
-            rewrite_followup(&ok, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&ok, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
             "上月销售额是多少"
+        );
+        // 弯引号/书名号同样剥（与 `parse_gate_verdict` 同一剥法）
+        let curly = Fake::new(Some("「上月按区域的销售额」"));
+        assert_eq!(
+            rewrite_followup(&curly, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            "上月按区域的销售额"
         );
         // 模型回空串 → 不许把问句变成空的
         let blank = Fake::new(Some("  "));
         assert_eq!(
-            rewrite_followup(&blank, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&blank, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
             "那上月呢"
         );
     }
@@ -1963,7 +2126,7 @@ mod tests {
         for prev_sql in [None, Some("[复合问题拆解]"), Some("   "), Some("上月销售额是多少")] {
             let f = Fake::new(Some("上月销售额是多少"));
             assert_eq!(
-                rewrite_followup(&f, "那上月呢", Some(("本月销售额", prev_sql, &[]))).await,
+                rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", prev_sql, &[]))).await,
                 "那上月呢"
             );
             assert_eq!(f.calls(), 0, "上一轮 SQL = {prev_sql:?} 时仍然调了模型");
@@ -1971,7 +2134,7 @@ mod tests {
         // 反面：上一轮真有一条查询 → 必须改写
         let f = Fake::new(Some("上月销售额是多少"));
         assert_eq!(
-            rewrite_followup(&f, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
             "上月销售额是多少"
         );
         assert_eq!(f.calls(), 1);
@@ -1984,7 +2147,7 @@ mod tests {
     #[tokio::test]
     async fn rewrite_prompt_carries_the_previous_sql() {
         let f = Fake::new(Some("上月销售额是多少"));
-        rewrite_followup(&f, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await;
+        rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await;
         let p = f.prompt();
         assert_eq!(f.calls(), 1, "提示词判据的输入必须真的产生过一次调用（否则 p 为空串、恒绿）");
         assert!(p.contains(PREV_SQL), "提示词里没有上一轮 SQL：{p}");
@@ -1992,6 +2155,24 @@ mod tests {
         for slot in ["#角色", "#任务", "#规则", "#上一轮问题", "#上一轮SQL", "#本轮追问"] {
             assert!(p.contains(slot), "缺槽位标签 {slot}：{p}");
         }
+    }
+
+    /// 🔴 改写的用量必须进 `on_usage`（K6-B：查询日志 token 列不能少算改写这一次）——
+    /// 全文件其他 LLM 调用都报，独缺这次就是静默漏账。
+    #[tokio::test]
+    async fn rewrite_reports_usage_like_every_other_llm_call() {
+        let usages = AtomicUsize::new(0);
+        let count = |_: &Usage| {
+            usages.fetch_add(1, Ordering::SeqCst);
+        };
+        let f = Fake::new(Some("上月销售额是多少"));
+        let out = rewrite_followup(&f, &count, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await;
+        assert_eq!(out, "上月销售额是多少");
+        assert_eq!(usages.load(Ordering::SeqCst), 1, "改写成功必须报一次用量");
+        // 调用失败没有 usage 可报（回调数不涨）
+        let boom = Fake::new(None);
+        rewrite_followup(&boom, &count, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await;
+        assert_eq!(usages.load(Ordering::SeqCst), 1, "失败没有 usage，不该回调");
     }
 
     /// 🔴 模型把 SQL 抄进问句 → 必须丢掉、退回原问句。
@@ -2009,7 +2190,7 @@ mod tests {
         for r in leaked {
             let f = Fake::new(Some(r));
             assert_eq!(
-                rewrite_followup(&f, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+                rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
                 "那上月呢",
                 "泄了 SQL 还被当问句用：{r}"
             );
@@ -2018,12 +2199,16 @@ mod tests {
         // 反面①：正常改写结果照用（否则把守卫写成恒丢也全绿）
         let ok = Fake::new(Some("上月销售额是多少"));
         assert_eq!(
-            rewrite_followup(&ok, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&ok, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
             "上月销售额是多少"
         );
         // 反面②：判据是同一个函数的两个极性 —— 它对真 SQL 必须为真、对真问句必须为假
         assert!(looks_like_sql(PREV_SQL));
         assert!(!looks_like_sql("上月销售额是多少"));
+        // 行首词边界：英文词开头的改写结果不是 SQL（「selection」「withdraw」不许被当 SQL 丢掉）
+        assert!(!looks_like_sql("selection 条件怎么填"));
+        assert!(!looks_like_sql("withdraw 是什么意思"));
+        assert!(looks_like_sql("with t as (select 1) select * from t"), "CTE 必须仍判 SQL");
     }
 
     /// 🔴 【证据引用】空 refs ⇒ 提示词与引入前**逐字相同**（多轮题集 3/3 钉的就是那版文案）。
@@ -2036,7 +2221,7 @@ mod tests {
         );
         for refs in [&[][..], &["", "   ", "\x07"][..]] {
             let f = Fake::new(Some("上月销售额是多少"));
-            let out = rewrite_followup(&f, "那上月呢", Some(("本月销售额", Some(PREV_SQL), refs))).await;
+            let out = rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), refs))).await;
             assert_eq!(out, "上月销售额是多少");
             assert_eq!(f.calls(), 1, "输入必须真的产生过一次调用，否则提示词断言恒绿");
             assert!(f.prompt().ends_with(&expected_user), "空 refs 改了提示词：{}", f.prompt());
@@ -2050,7 +2235,7 @@ mod tests {
     async fn refs_reach_the_prompt_capped_at_three() {
         let refs = ["华东区上月销售额 12 万", "片段乙", "片段丙", "片段丁（第四段，不许出现）"];
         let f = Fake::new(Some("上月按区域的销售额"));
-        let out = rewrite_followup(&f, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &refs))).await;
+        let out = rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &refs))).await;
         assert_eq!(out, "上月按区域的销售额", "引用不许改变改写结果的消费方式");
         assert_eq!(f.calls(), 1);
         let p = f.prompt();
@@ -2072,7 +2257,7 @@ mod tests {
     async fn a_ref_fragment_is_truncated_at_500_chars() {
         let long: String = "长".repeat(600);
         let f = Fake::new(Some("上月销售额是多少"));
-        rewrite_followup(&f, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[long.as_str()]))).await;
+        rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[long.as_str()]))).await;
         assert_eq!(f.calls(), 1);
         let p = f.prompt();
         assert!(p.contains(&"长".repeat(500)), "500 字以内必须保留");
@@ -2084,7 +2269,7 @@ mod tests {
     #[tokio::test]
     async fn refs_are_stripped_of_control_characters() {
         let f = Fake::new(Some("上月销售额是多少"));
-        rewrite_followup(&f, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &["甲\x00\x07\x1b乙\n丙\t丁"]))).await;
+        rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &["甲\x00\x07\x1b乙\n丙\t丁"]))).await;
         assert_eq!(f.calls(), 1);
         let p = f.prompt();
         assert!(p.contains("甲乙丙丁"), "剥完控制字符的片段必须进提示词：{p}");
@@ -2127,15 +2312,17 @@ mod tests {
     /// 判官原案「直营上月销售额」→ 候选「直营」；客户名族原样保留（委托内层探主档）。
     #[test]
     fn value_word_residue_extracts_the_filter_candidate() {
-        assert_eq!(value_word_residue("直营上月销售额").as_deref(), Some("直营"));
-        assert_eq!(value_word_residue("直营战区上月销售额").as_deref(), Some("直营战区"));
+        let residue =
+            |q: &str| value_word_residue(q, &crate::run::sales_contract_metrics(q));
+        assert_eq!(residue("直营上月销售额").as_deref(), Some("直营"));
+        assert_eq!(residue("直营战区上月销售额").as_deref(), Some("直营战区"));
         // 客户名族：残留是名字，探针不中 → 原样委托内层（客户名 LIKE 兜底保留）
-        assert_eq!(value_word_residue("恒众餐饮本月买了多少").as_deref(), Some("恒众餐饮"));
+        assert_eq!(residue("恒众餐饮本月买了多少").as_deref(), Some("恒众餐饮"));
         // 纯指标/时间问句没有值词 → 门不接
-        assert_eq!(value_word_residue("上月销售额"), None);
-        assert_eq!(value_word_residue("昨天销量"), None);
+        assert_eq!(residue("上月销售额"), None);
+        assert_eq!(residue("昨天销量"), None);
         // 多值问句剥完是融合串：等值探针必不中 → 委托内层，绝不静默只取一个值
-        assert_eq!(value_word_residue("直营和加盟上月销售额").as_deref(), Some("直营加盟"));
+        assert_eq!(residue("直营和加盟上月销售额").as_deref(), Some("直营加盟"));
     }
 
     /// 【问题 2】探针候选：原词 → 剥维度词尾的词干 → 词干+本维度惯用后缀。
@@ -2257,7 +2444,7 @@ mod tests {
             .split("if let Some(r) = compound::try_compound")
             .next()
             .expect("one 闭包边界没了");
-        let single = one.find("ask_single(d, &cx)").expect("ask_single 调用没了");
+        let single = one.find("ask_single(&cx, members)").expect("ask_single 调用没了");
         let reroute =
             one.find(concat!("out_of_scope_empty_", "reply(&cx, &mut r)")).expect("出界出口没接线");
         let loc = one.find("localize_result(&cx").expect("localize 收口没了");

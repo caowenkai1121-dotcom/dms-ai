@@ -17,4 +17,7 @@ chrono = { workspace = true }
 # 版本实例（dms_kernel::by_name 的方言对象），不是新增第三方 crate。
 sqlparser = { workspace = true }
 sqlx = { workspace = true }
+# tokio 已在 workspace（agent/connector/knowledge/server 同款引用）：召回/加载的并发 join
+# （try_join!/join!）复用同一运行时实例，不是新增第三方版本。
+tokio = { workspace = true }
 tracing = { workspace = true }

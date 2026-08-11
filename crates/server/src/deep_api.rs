@@ -69,6 +69,11 @@ fn compact_sql(sql: &str) -> String {
         .collect()
 }
 
+/// 指标合同表达式的 compact 形态（每指标常量，调用方预算一次后复用，不在循环里重算）。
+fn measure_contract_compact(measure: SalesMeasure) -> [String; 2] {
+    [measure.expression(), measure.sql_expression()].map(|expression| compact_sql(expression))
+}
+
 /// 指标不仅要来自 DWS 表，聚合表达式也必须与 `sales_fact` 合同一致。
 /// 这道门会明确拒绝 `COUNT(*) AS 销售额` 之类“表对、口径错”的结果。
 fn uses_sales_measure_contract(sql: &str, measure: SalesMeasure) -> bool {
@@ -76,10 +81,9 @@ fn uses_sales_measure_contract(sql: &str, measure: SalesMeasure) -> bool {
         return false;
     }
     let sql = compact_sql(sql);
-    [measure.expression(), measure.sql_expression()]
+    measure_contract_compact(measure)
         .iter()
-        .map(|expression| compact_sql(expression))
-        .any(|expression| sql.contains(&expression))
+        .any(|expression| sql.contains(expression))
 }
 
 /// 主结果对应的 DWS 销售事实指标。先看结果列，再看原问句；
@@ -88,12 +92,18 @@ fn primary_sales_measure(question: &str, r: &dms_agent::AskResult) -> Option<Sal
     if !uses_dws_sales_fact(&r.sql) {
         return None;
     }
+    // r.sql 的 compact 提升到 find 循环外：每个候选指标共享同一份，不重复压缩
+    let sql = compact_sql(&r.sql);
     r.columns
         .iter()
         .map(String::as_str)
         .chain(std::iter::once(question))
         .filter_map(sales_measure_from_text)
-        .find(|measure| uses_sales_measure_contract(&r.sql, *measure))
+        .find(|measure| {
+            measure_contract_compact(*measure)
+                .iter()
+                .any(|expression| sql.contains(expression))
+        })
 }
 
 /// 该结果是否应进入完整 DWS 经营报告。标量、结构和趋势都要补齐
@@ -111,7 +121,7 @@ fn should_enrich(question: &str, r: &dms_agent::AskResult) -> bool {
     }
     // 已是拆解/排行/趋势/明细形的问句不重复拆（与 direct 模板让路词同族）
     const BREAKDOWN_WORDS: &[&str] = &[
-        "按", "各", "前五", "前十", "前10", "排行", "排名", "分布", "对比", "趋势", "明细", "占比",
+        "按", "各", "前五", "前十", "前10", "前5", "排行", "排名", "分布", "对比", "趋势", "明细", "占比",
     ];
     if BREAKDOWN_WORDS.iter().any(|w| question.contains(w)) {
         return false;
@@ -269,24 +279,14 @@ fn explicit_period_end(question: &str) -> Option<chrono::NaiveDate> {
         .windows(10)
         .filter_map(|bytes| std::str::from_utf8(bytes).ok())
         .filter_map(|text| chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok())
+        // 问句里的首个日期 = 周期开始，次个（nth(1)）= 周期结束
         .nth(1)
 }
 
-fn expected_comparison_labels(question: &str) -> std::collections::HashSet<String> {
-    [
-        dms_kernel::nl::time::prev_window(question),
-        dms_kernel::nl::time::yoy_window(question),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(|(_, label)| comparison_from_values(label, 1.0, 1.0).map(|item| item.label))
-    .collect()
-}
-
-fn comparison_from_values(label: &str, current: f64, baseline: f64) -> Option<Comparison> {
-    let pct = (baseline.abs() >= f64::EPSILON)
-        .then(|| (current - baseline) / baseline * 100.0);
-    let (display, basis) = if label == "同比" {
+/// 比较口径的（展示标签, 依据文案）映射：同比/环比/日环比归一。
+/// 只需展示标签的调用方用 `display_label`，不必构造整个 Comparison 再丢弃。
+fn comparison_label_basis(label: &str) -> (&str, &str) {
+    if label == "同比" {
         ("同比", "较去年同期")
     } else if label.contains("上月") {
         ("环比", "较上月同期")
@@ -296,8 +296,30 @@ fn comparison_from_values(label: &str, current: f64, baseline: f64) -> Option<Co
         ("日环比", label)
     } else {
         (label, label)
-    };
-    Some(Comparison {
+    }
+}
+
+fn display_label(label: &str) -> &str {
+    comparison_label_basis(label).0
+}
+
+fn expected_comparison_labels(question: &str) -> std::collections::HashSet<String> {
+    [
+        dms_kernel::nl::time::prev_window(question),
+        dms_kernel::nl::time::yoy_window(question),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(_, label)| display_label(label).to_string())
+    .collect()
+}
+
+fn comparison_from_values(label: &str, current: f64, baseline: f64) -> Comparison {
+    // 变化率按 |基期| 归一：基期为负时符号仍与增减方向一致（-100→-50 是改善 +50%）
+    let pct = (baseline.abs() >= f64::EPSILON)
+        .then(|| (current - baseline) / baseline.abs() * 100.0);
+    let (display, basis) = comparison_label_basis(label);
+    Comparison {
         label: display.into(),
         basis: basis.into(),
         current,
@@ -311,7 +333,7 @@ fn comparison_from_values(label: &str, current: f64, baseline: f64) -> Option<Co
         } else {
             "flat"
         },
-    })
+    }
 }
 
 #[derive(Clone)]
@@ -332,7 +354,6 @@ impl EvidenceItem {
     fn is_gap(&self) -> bool {
         self.body.contains("数据状态=")
     }
-
 }
 
 const MAX_SECTION_CONCURRENCY: usize = 2;
@@ -383,13 +404,13 @@ fn primary_comparisons(
         return r
             .comparisons
             .iter()
-            .filter_map(|item| comparison_from_values(&item.label, item.current, item.baseline))
+            .map(|item| comparison_from_values(&item.label, item.current, item.baseline))
             .filter(|item| expected.contains(&item.label))
             .collect();
     }
     r.view.blocks.iter().find_map(|block| match block {
         dms_kernel::present::Block::Kpis { items } => items.first()?.delta.as_ref()
-            .and_then(|delta| comparison_from_values(&delta.label, delta.baseline + delta.change, delta.baseline))
+            .map(|delta| comparison_from_values(&delta.label, delta.baseline + delta.change, delta.baseline))
             .filter(|item| expected.contains(&item.label))
             .map(|comparison| vec![comparison]),
         _ => None,
@@ -417,6 +438,12 @@ fn comparison_rate_text(comparison: &Comparison) -> String {
     }
 }
 
+/// 变化额 = 符号 + 按指标语义格式化的绝对值（证据目录与 BI 页同一处口径，改一处两边同改）。
+fn fmt_signed_change(label: &str, delta: f64) -> String {
+    let sign = if delta > 0.0 { "+" } else if delta < 0.0 { "-" } else { "" };
+    format!("{sign}{}", fmt_metric_number(label, delta.abs()))
+}
+
 /// 【D8】page 载荷的验收断言透出区：`verdict` 缺 = 待评/无判词（LLM 降级时断言仍透出）。
 fn assertion_payloads(
     assertions: &[dms_agent::analysis::Assertion],
@@ -439,23 +466,30 @@ fn assertion_payloads(
 fn section_highlights(sections: &[Section]) -> Vec<Highlight> {
     let mut out = vec![];
     for sec in sections.iter().filter(|section| section.kind != "table") {
-        let yi = sec.columns.len().saturating_sub(1);
         if !(2..=3).contains(&sec.columns.len()) || sec.rows.is_empty() {
             continue;
         }
+        // 列数校验通过后再取指标列下标（合法输入恒 2..=3 列）
+        let yi = sec.columns.len().saturating_sub(1);
         if sec.kind == "line" {
             let vals: Vec<_> = sec.rows.iter().filter_map(|r| number(r.get(yi)?)).collect();
             let Some(cur) = vals.last().copied() else { continue };
             let latest_period = sec.rows.last().and_then(|r| r.first()).map(fmt_value).unwrap_or_default();
+            // "YYYY-MM" 形状之外还要月份合法（01-12）："2026-99" 不是月度周期，不出环比文案
             let monthly = latest_period.len() == 7
                 && latest_period.as_bytes().get(4) == Some(&b'-')
-                && latest_period.chars().enumerate().all(|(i, c)| i == 4 || c.is_ascii_digit());
+                && latest_period.chars().enumerate().all(|(i, c)| i == 4 || c.is_ascii_digit())
+                && latest_period[5..7].parse::<u32>().is_ok_and(|month| (1..=12).contains(&month));
             let partial = monthly && latest_period == chrono::Local::now().format("%Y-%m").to_string();
             let note = if monthly {
                 vals.get(vals.len().saturating_sub(2)).and_then(|prev| {
-                    if prev.abs() < f64::EPSILON { None } else if partial {
-                        Some(format!("本月累计 · 较上月 {:+.1}%（未完整周期）", (cur / prev - 1.0) * 100.0))
-                    } else { Some(format!("较上一期 {:+.1}%", (cur / prev - 1.0) * 100.0)) }
+                    if prev.abs() < f64::EPSILON { None } else {
+                        // 变化率按 |基期| 归一：基期为负时符号仍与增减方向一致
+                        let rate = (cur - prev) / prev.abs() * 100.0;
+                        if partial {
+                            Some(format!("本月累计 · 较上月 {rate:+.1}%（未完整周期）"))
+                        } else { Some(format!("较上一期 {rate:+.1}%")) }
+                    }
                 }).unwrap_or_else(|| "最新可用期间".into())
             } else {
                 format!("{} · 当前展示值", latest_period)
@@ -465,11 +499,11 @@ fn section_highlights(sections: &[Section]) -> Vec<Highlight> {
                 sec.rows.last().and_then(|r| r.get(yi)).unwrap_or(&serde_json::Value::Null),
             );
             out.push(Highlight { label: sec.title.clone(), value, note });
-        } else if let Some(top) = sec.rows.iter().max_by(|a, b| {
-            number(a.get(yi).unwrap_or(&serde_json::Value::Null)).unwrap_or(0.0)
-                .total_cmp(&number(b.get(yi).unwrap_or(&serde_json::Value::Null)).unwrap_or(0.0))
-        }) {
-            let val = number(top.get(yi).unwrap_or(&serde_json::Value::Null)).unwrap_or(0.0);
+        } else if let Some((top, val)) = sec.rows.iter()
+            .filter_map(|row| number(row.get(yi)?).map(|value| (row, value)))
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        {
+            // 非数值行不参与比大；全空板块到此已 None，不会产出「头部=0」假 highlight
             let total: f64 = sec.rows.iter().filter_map(|r| number(r.get(yi)?)).filter(|v| *v > 0.0).sum();
             let name = row_dimension_label(top, yi);
             let gross_margin = sec
@@ -540,7 +574,8 @@ fn contribution_rows(sections: &[Section]) -> Vec<Vec<serde_json::Value>> {
         let mut ranked = sec
             .rows
             .iter()
-            .filter_map(|row| Some((row_dimension_label(row, yi), number(row.get(yi)?)?)))
+            // 先取数值再拼标签：值缺失的行不白分配标签字符串
+            .filter_map(|row| number(row.get(yi)?).map(|value| (row_dimension_label(row, yi), value)))
             .collect::<Vec<_>>();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
         let total: f64 = ranked.iter().map(|(_, value)| value.max(0.0)).sum();
@@ -580,8 +615,7 @@ fn evidence_items(
         let rate = comparison_rate_text(cmp);
         let current = fmt_metric_number(metric_label, cmp.current);
         let baseline = fmt_metric_number(metric_label, cmp.baseline);
-        let change = fmt_metric_number(metric_label, cmp.change.abs());
-        let change = format!("{}{}", if cmp.change > 0.0 { "+" } else if cmp.change < 0.0 { "-" } else { "" }, change);
+        let change = fmt_signed_change(metric_label, cmp.change);
         out.push(EvidenceItem {
             id: format!("KPI-{:02}", index + 2),
             kind: "kpi",
@@ -625,12 +659,18 @@ fn evidence_items(
                 .iter()
                 .zip(row)
                 .map(|(label, value)| {
-                    let display_label = if *label == "指标值" {
-                        row.get(3).and_then(serde_json::Value::as_str).unwrap_or(*label)
+                    // 「指标值」按指标名格式化：指标列位置按 labels 查（不硬编码下标，labels 改序不错位）
+                    let value_label = if *label == "指标值" {
+                        labels
+                            .iter()
+                            .position(|candidate| *candidate == "指标")
+                            .and_then(|index| row.get(index))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(*label)
                     } else {
                         *label
                     };
-                    format!("{label}={}", fmt_metric(display_label, value))
+                    format!("{label}={}", fmt_metric(value_label, value))
                 })
                 .collect::<Vec<_>>()
                 .join("；");
@@ -722,15 +762,24 @@ fn validate_evidence_insight(raw: &str, evidence: &[EvidenceItem]) -> Option<Str
 
 /// 提取数值 token：连续数字（含千分位/小数/百分号），尾部 万/亿 压缩单位一并保留，
 /// 让「2.06亿」作为整体参与证据绑定，而不是被截成 2.06 后按错误量级放行。
+/// 前导负号仅紧挨数字时并入（"-20.0%" 的符号是主张的一部分，符号翻转不许蒙混过闸）。
 fn number_tokens(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         if c.is_ascii_digit() || matches!(c, '.' | ',' | '%' | '％') {
+            current.push(c);
+        } else if c == '-' && current.is_empty() && chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+            // 仅 token 起始且紧跟数字的 '-' 是负号；"10-20" 之类的连字符仍按分隔处理
             current.push(c);
         } else {
             if matches!(c, '万' | '亿') && current.chars().any(|ch| ch.is_ascii_digit()) {
                 current.push(c);
+                // 单位可组合（"1.2万亿"）：紧挨的后续单位字符一并吃进再 flush
+                while chars.peek().is_some_and(|next| matches!(next, '万' | '亿')) {
+                    current.push(chars.next().expect("peek 已确认有字符"));
+                }
             }
             if current.chars().any(|ch| ch.is_ascii_digit()) {
                 out.push(current.replace(',', ""));
@@ -747,15 +796,22 @@ fn number_tokens(text: &str) -> Vec<String> {
 const CLAIM_VALUE_REL_TOLERANCE: f64 = 0.005;
 
 /// 把数值 token 归一化为（展开 万/亿 量级后的值，是否百分数）：
-/// "2.06亿" → (206000000.0, false)，"25.6%" → (25.6, true)。
+/// "2.06亿" → (206000000.0, false)，"25.6%" → (25.6, true)；单位可组合："1.2万亿" → 1.2e12。
 fn claim_value(raw: &str) -> Option<(f64, bool)> {
     let percent = raw.ends_with('%') || raw.ends_with('％');
     let body = raw.trim_end_matches(|c| c == '%' || c == '％');
-    let (digits, scale) = match body.chars().last() {
-        Some('万') => (&body[..body.len() - '万'.len_utf8()], 1e4),
-        Some('亿') => (&body[..body.len() - '亿'.len_utf8()], 1e8),
-        _ => (body, 1.0),
-    };
+    // 从尾部逐个吃掉 万/亿 并累乘量级（"万亿" = 1e4 × 1e8）
+    let mut digits = body;
+    let mut scale = 1.0f64;
+    while let Some(last) = digits.chars().last() {
+        let factor = match last {
+            '万' => 1e4,
+            '亿' => 1e8,
+            _ => break,
+        };
+        digits = &digits[..digits.len() - last.len_utf8()];
+        scale *= factor;
+    }
     let value = digits.replace(',', "").parse::<f64>().ok()?;
     Some((value * scale, percent))
 }
@@ -772,12 +828,9 @@ fn rounded_equal(left: f64, right: f64) -> bool {
 /// ① 字符串相同或 0~2 位小数格式化等价；② 金额/数量允许 ±0.5% 相对误差；
 /// ③ 万/亿 压缩形按展开量级比较（2.06亿 ↔ 20608.482万）；
 /// ④ 百分数 ×100 形按比例归一后精确等价（25.6% ↔ 0.256），不放相对容差。
-fn claim_value_binds(claim: &str, evidence: &str) -> bool {
-    if claim == evidence {
-        return true;
-    }
-    let Some((claim, claim_percent)) = claim_value(claim) else { return false };
-    let Some((evidence, evidence_percent)) = claim_value(evidence) else { return false };
+fn parsed_claim_value_binds(claim: (f64, bool), evidence: (f64, bool)) -> bool {
+    let (claim, claim_percent) = claim;
+    let (evidence, evidence_percent) = evidence;
     if claim_percent == evidence_percent {
         if rounded_equal(claim, evidence) {
             return true;
@@ -790,16 +843,38 @@ fn claim_value_binds(claim: &str, evidence: &str) -> bool {
     (claim_ratio - evidence_ratio).abs() < 1e-9 || rounded_equal(claim_ratio, evidence_ratio)
 }
 
+fn claim_value_binds(claim: &str, evidence: &str) -> bool {
+    if claim == evidence {
+        return true;
+    }
+    let (Some(claim), Some(evidence)) = (claim_value(claim), claim_value(evidence)) else { return false };
+    parsed_claim_value_binds(claim, evidence)
+}
+
 /// 返回分析文本里第一个绑不上任何证据的数值主张；None = 全部绑定成功。
 /// 纯函数拆分：容差判定集中在 claim_value_binds，单测无需构造 validate 全文。
 fn first_unbound_claim_value(text: &str, evidence: &[EvidenceItem]) -> Option<String> {
+    // 证据 token 预解析一次、主张 token 各解析一次，比较走数值而非反复字符串解析
     let allowed = evidence
         .iter()
         .flat_map(|item| number_tokens(&item.body))
+        .map(|token| {
+            let parsed = claim_value(&token);
+            (token, parsed)
+        })
         .collect::<Vec<_>>();
     number_tokens(text)
         .into_iter()
-        .find(|token| !allowed.iter().any(|candidate| claim_value_binds(token, candidate)))
+        .find(|token| {
+            let parsed = claim_value(token);
+            !allowed.iter().any(|(candidate, candidate_parsed)| {
+                match (parsed, candidate_parsed) {
+                    (Some(claim), Some(evidence)) => parsed_claim_value_binds(claim, *evidence),
+                    // 任一侧解析不了（罕见畸形 token）退回字符串级判据（同串即绑）
+                    _ => claim_value_binds(token, candidate),
+                }
+            })
+        })
 }
 
 fn internal_reference_len(text: &str) -> Option<usize> {
@@ -917,16 +992,25 @@ async fn evidence_insight(
             wrap_untrusted(&hits), question, kind.label(), ids, assertion_lines
         )
     };
-    let system = if is_weekly_report(question) {
+    let weekly = is_weekly_report(question);
+    let system = if weekly {
         WEEKLY_EVIDENCE_SYSTEM
     } else {
         EVIDENCE_SYSTEM
     };
     let mut req = ChatRequest::text(ModelTier::Precise, system, &user, Some(0.0));
     // 断言版要多容纳 JSON 壳与判词数组：+220 tokens 余量
-    req.max_tokens = Some(if is_weekly_report(question) { 560 } else { 420 }
+    req.max_tokens = Some(if weekly { 560 } else { 420 }
         + if assertions.is_empty() { 0 } else { 220 });
-    let Some(raw) = llm.chat(req).await.ok().and_then(|reply| reply.content) else {
+    let reply = match llm.chat(req).await {
+        Ok(reply) => reply.content,
+        Err(e) => {
+            // 与闸门失败的 warn 同口径：LLM 故障降级为确定性摘要也要留痕，不许静默
+            tracing::warn!(error = %e, "深度解读 LLM 调用失败 → 使用确定性摘要");
+            None
+        }
+    };
+    let Some(raw) = reply else {
         return (None, Vec::new());
     };
     // 【D8】有断言：先按 JSON 契约解析；模型直接给了纯 markdown = 退回老校验（向后兼容），
@@ -979,8 +1063,9 @@ fn align_verdicts(
 /// 模型不可用或输出越界时，仍给经营可读、无内部编号的确定性摘要。
 fn factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
     fn field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+        // 分段两次 strip_prefix（key 再 '='），不为匹配分配临时 String
         body.split('；')
-            .find_map(|part| part.trim().strip_prefix(&format!("{key}=")).map(str::trim))
+            .find_map(|part| part.trim().strip_prefix(key)?.strip_prefix('=').map(str::trim))
     }
     let first = evidence.first()?;
     let main = evidence
@@ -1025,6 +1110,10 @@ fn weekly_factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
     fn available(item: Option<&EvidenceItem>) -> Option<&EvidenceItem> {
         item.filter(|item| !item.is_gap())
     }
+    // 证据为空 = 无内容可写（原先 _follow 兜底链与此早退等价，绑定后从不使用）
+    if evidence.is_empty() {
+        return None;
+    }
     let section = |label: &str| evidence.iter().find(|item| item.label == label);
     let core = section("核心经营指标");
     let current = section("本周销售结构");
@@ -1051,8 +1140,8 @@ fn weekly_factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
     } else {
         (
             "周度销售对比存在数据缺口",
-            "部分周期尚无同口径省区证据",
-            "当前证据不足",
+            "部分周期尚无同口径省区数据",
+            "当前数据不足",
             "先补齐同口径数据再判断变化",
         )
     };
@@ -1075,6 +1164,9 @@ fn weekly_factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
             out.push_str(&format!("\n| {label} | 本次数据未覆盖 | 暂不判断 | 补齐可按省区归属的数据后再分析 |"));
         }
     }
+    // 覆盖判据两处口径不同是有意的：上方经营模块用 available（gap 板块不算覆盖 → 写
+    // 「本次数据未覆盖」）；下方口径板块恒为 gap（body 必带「数据状态=」），只要存在
+    // 就要列出它的限制说明，故用 is_some 原样判在不在。
     for (label, item, reason, action) in [
         (
             "订单数与客单价",
@@ -1091,7 +1183,7 @@ fn weekly_factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
         (
             "坪效与人效",
             efficiency_caliber,
-            "缺少可按省区归属的面积与人员证据",
+            "缺少可按省区归属的面积与人员数据",
             "补齐门店面积和人员归属后再判断",
         ),
     ] {
@@ -1099,12 +1191,6 @@ fn weekly_factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
             out.push_str(&format!("\n| {label} | 本次数据未覆盖 | {reason} | {action} |"));
         }
     }
-    let _follow = available(shop)
-        .or_else(|| available(sku))
-        .or_else(|| available(core))
-        .or_else(|| available(current))
-        .or(current)
-        .or_else(|| evidence.first())?;
     out.push_str("\n\n## 异常与跟进\n| 事项 | 风险 | 跟进动作 |\n|---|---|---|\n| 周度结构变化 | 原因尚未由数据直接证明 | 按表格异常项逐笔核查 |");
     out.push_str("\n\n## 下周行动\n| 优先级 | 行动 | 预期目标 |\n|---|---|---|\n| 高 | 先核对销售变化最大的分类与客户 | 明确主要增减来源 |\n| 中 | 复核单品、费用与库存的关联明细 | 形成可执行跟进清单 |");
     Some(out)
@@ -1163,7 +1249,8 @@ fn scoped_sales_where(sql: &str) -> Option<sqlparser::ast::Expr> {
     use sqlparser::dialect::MySqlDialect;
     use sqlparser::parser::Parser;
 
-    let main = sql.split(DETAIL_SQL_SEPARATOR).next()?.trim().trim_end_matches(';');
+    // split 恒产出 ≥1 项（无分隔符时就是整个 sql），unwrap_or 只是收敛 Option 形态
+    let main = sql.split(DETAIL_SQL_SEPARATOR).next().unwrap_or(sql).trim().trim_end_matches(';');
     if !uses_dws_sales_fact(main) {
         return None;
     }
@@ -1257,7 +1344,12 @@ fn join_and(mut predicates: Vec<sqlparser::ast::Expr>) -> Option<sqlparser::ast:
 }
 
 fn is_sales_time_predicate(expr: &sqlparser::ast::Expr) -> bool {
-    compact_sql(&expr.to_string()).contains("sf.order_date")
+    // 与 compact_sql 同口径但原地完成（retain + ASCII 小写化）：匹配目标是纯 ASCII 的
+    // "sf.order_date"，Unicode 小写化在该判据下与 ASCII 版等价，省一次中转分配
+    let mut text = expr.to_string();
+    text.retain(|ch| !ch.is_whitespace() && ch != '`');
+    text.make_ascii_lowercase();
+    text.contains("sf.order_date")
 }
 
 fn sales_where_for_time(
@@ -1492,12 +1584,9 @@ async fn recent_orders(
     if question.contains("设备订单") || question.contains("设备销售单") {
         return None; // 主结果已经是该时间窗的完整设备订单明细，避免再混入今天的“最近订单”。
     }
-    let device = "";
-    let sql = format!(
-        "SELECT sales_order_code AS `单号`, order_time AS `时间`, customer_name AS `客户`, \
+    let sql = "SELECT sales_order_code AS `单号`, order_time AS `时间`, customer_name AS `客户`, \
          total_amount AS `金额`, order_status AS `状态` FROM t_sales_order \
-         WHERE deleted_flag = 0{device} ORDER BY order_time DESC LIMIT 8"
-    );
+         WHERE deleted_flag = 0 ORDER BY order_time DESC LIMIT 8";
     let scope = dms_policy::scope::compute_scope_cached(&st.auth_mysql, p).await.ok()?;
     let scoped = dms_agent::gate_on(p, &sql, &scope, false, st.mysql.dialect())
         .map_err(|e| tracing::warn!(err = %e, "深度模式明细闸门未过 → 该 section 缺席"))
@@ -1578,9 +1667,7 @@ async fn sales_comparisons(
         candidates.push((format!("{}同比基期", measure.name()), template, label));
     }
     candidates.retain(|(_, _, label)| {
-        let display = comparison_from_values(label, current, current)
-            .map(|comparison| comparison.label)
-            .unwrap_or_else(|| (*label).to_string());
+        let display = display_label(label);
         !existing.iter().any(|comparison| comparison.label == display)
     });
 
@@ -1591,7 +1678,7 @@ async fn sales_comparisons(
                 let sql = sales_comparison_sql(primary_sql, measure, template)?;
                 let (_, rows, sql) = fetch_sales_sql(st, p, &sql, &title).await?;
                 let baseline = rows.first()?.first().and_then(number)?;
-                let comparison = comparison_from_values(label, current, baseline)?;
+                let comparison = comparison_from_values(label, current, baseline);
                 Some((comparison, (title, sql)))
             })
             .collect(),
@@ -1665,7 +1752,8 @@ fn change_rate_value(current: &serde_json::Value, baseline: &serde_json::Value) 
     let Some(baseline) = number(baseline).filter(|value| value.abs() >= f64::EPSILON) else {
         return serde_json::Value::Null;
     };
-    serde_json::json!((current - baseline) / baseline * 100.0)
+    // 变化率按 |基期| 归一：基期为负时符号仍与增减方向一致（与 comparison_from_values 同口径）
+    serde_json::json!((current - baseline) / baseline.abs() * 100.0)
 }
 
 fn change_value(current: &serde_json::Value, baseline: &serde_json::Value) -> serde_json::Value {
@@ -1767,12 +1855,12 @@ async fn weekly_core_metrics(
     if let (Some(current), Some(previous)) =
         (number(&current.sales_amount), number(&previous.sales_amount))
     {
-        comparisons.push(comparison_from_values("较上周", current, previous)?);
+        comparisons.push(comparison_from_values("较上周", current, previous));
     }
     if let (Some(current), Some(year_ago)) =
         (number(&current.sales_amount), number(&year_ago.sales_amount))
     {
-        comparisons.push(comparison_from_values("同比", current, year_ago)?);
+        comparisons.push(comparison_from_values("同比", current, year_ago));
     }
     let sqls = results
         .iter()
@@ -1791,9 +1879,8 @@ fn is_gross_margin_value_label(label: &str) -> bool {
     matches!(label.trim(), "毛利率" | "销售毛利率")
 }
 
-fn raw_value(label: &str, v: &serde_json::Value) -> String {
-    fmt_metric(label, v)
-}
+/// 单据头字段 / 实体字段 / 明细列三处投影共用同一展示预算（页面阅读密度合同）。
+const MAX_PRIMARY_FIELDS: usize = 14;
 
 /// `sales_fact::GrossMargin` 的合同值是 0~1 比例；其他“率”仍沿用系统原有的
 /// 百分数表示。只在确切毛利率标签下做 ×100，避免影响环比/同比。
@@ -1888,20 +1975,20 @@ fn primary_facts(r: &dms_agent::AskResult, kind: dms_agent::AnalysisKind) -> Vec
             .iter()
             .filter_map(|(label, aliases)| {
                 pairs.iter().find(|(key, _)| aliases.contains(&key.as_str())).and_then(|(_, value)| {
-                    let value = raw_value(label, value);
+                    let value = fmt_metric(label, value);
                     (!value.trim().is_empty()).then(|| Fact { label: (*label).into(), value })
                 })
             })
-            .take(14)
+            .take(MAX_PRIMARY_FIELDS)
             .collect();
     }
     pairs
         .into_iter()
         .filter_map(|(label, value)| {
-            let value = raw_value(&label, &value);
+            let value = fmt_metric(&label, &value);
             (!value.trim().is_empty()).then(|| Fact { label, value })
         })
-        .take(14)
+        .take(MAX_PRIMARY_FIELDS)
         .collect()
 }
 
@@ -1943,7 +2030,7 @@ fn primary_display(
         .filter_map(|(label, aliases)| {
             r.columns.iter().position(|column| aliases.contains(&column.as_str())).map(|index| ((*label).to_string(), index))
         })
-        .take(14)
+        .take(MAX_PRIMARY_FIELDS)
         .collect::<Vec<_>>();
     if selected.is_empty() {
         return (r.columns.clone(), r.rows.clone());
@@ -2004,6 +2091,8 @@ static PROGRESS: std::sync::LazyLock<
 
 /// 一次深度请求的进度：属主 + 固定脱敏阶段 + 板块级子任务状态。
 struct ProgressEntry {
+    /// 最后活跃时间（每次写入即刷新）：淘汰按它判定，跑超 10 分钟的进行中报告
+    /// 在繁忙实例（条目超上限触发清理）下也不会被中途误杀。
     at: std::time::Instant,
     /// 属主登录名（compose/resume 身份解析后登记）：`/api/deep/progress` 属主闸的依据之一
     ///（内存级；重启后由 PG `deep_run.login_name` 接手判定）。
@@ -2057,20 +2146,25 @@ impl ProgressStage {
     }
 }
 
+/// 进度条目上限：超过即按「最后活跃」淘汰 10 分钟未动条目（深度页就那么长）。
+const PROGRESS_MAX_ENTRIES: usize = 200;
+
 fn progress_entry<'m>(
     m: &'m mut std::collections::HashMap<String, ProgressEntry>,
     rid: &str,
 ) -> &'m mut ProgressEntry {
-    if m.len() > 200 {
+    if m.len() > PROGRESS_MAX_ENTRIES {
         let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(600);
         m.retain(|_, entry| entry.at > cutoff);
     }
-    m.entry(rid.to_string()).or_insert_with(|| ProgressEntry {
+    let entry = m.entry(rid.to_string()).or_insert_with(|| ProgressEntry {
         at: std::time::Instant::now(),
         owner: None,
         steps: vec![],
         sections: vec![],
-    })
+    });
+    entry.at = std::time::Instant::now();
+    entry
 }
 
 fn note(rid: &str, stage: ProgressStage) {
@@ -2105,6 +2199,15 @@ fn note_owner(rid: &str, login_name: &str) {
 /// 两者都查不到 = 属主不可证 → 拒（调用方统一 404，与「不存在」同形，不泄 rid 存在性）。
 fn progress_visible(caller: &str, mem_owner: Option<&str>, pg_owner: Option<&str>) -> bool {
     mem_owner == Some(caller) || pg_owner == Some(caller)
+}
+
+/// 完成判据（纯函数）：内存阶段含 完成/失败，或 PG 账本已是终态。
+/// 重启后内存 steps 为空，没有 PG 这一半前端「完成即停轮询」永远等不到。
+fn progress_done(steps: &[String], pg_state: Option<&str>) -> bool {
+    steps
+        .iter()
+        .any(|s| s == ProgressStage::Done.label() || s == ProgressStage::Failed.label())
+        || matches!(pg_state, Some("done" | "failed"))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -2159,8 +2262,7 @@ pub async fn progress(
     if !progress_visible(&login, mem_owner.as_deref(), pg_row.as_ref().map(|(owner, _)| owner.as_str())) {
         return Err(progress_not_found());
     }
-    let done = steps.iter().any(|s| s == ProgressStage::Done.label())
-        || steps.iter().any(|s| s == ProgressStage::Failed.label());
+    let done = progress_done(&steps, pg_row.as_ref().map(|(_, state)| state.as_str()));
     // 运行态（PG 真相）：running 且本进程执行器已死 → 视作可续跑（收割判据同一处）
     let (state, resumable) = match pg_row {
         Some((_, state)) => {
@@ -2201,9 +2303,13 @@ fn note_section_state(rid: &str, index: usize, state: &'static str, ms: Option<u
         return;
     }
     let mut m = PROGRESS.lock().expect("progress 锁中毒");
-    if let Some(section) = m.get_mut(rid).and_then(|entry| entry.sections.get_mut(index)) {
-        section.state = state;
-        section.ms = ms;
+    if let Some(entry) = m.get_mut(rid) {
+        // 板块推进也是活跃信号：刷新 at，长跑报告不被按创建时间淘汰
+        entry.at = std::time::Instant::now();
+        if let Some(section) = entry.sections.get_mut(index) {
+            section.state = state;
+            section.ms = ms;
+        }
     }
 }
 
@@ -2265,10 +2371,17 @@ CREATE TABLE IF NOT EXISTS meta.deep_section(
 );
 "#;
 
+/// DDL 进程内只跑一轮（幂等但每轮 3 次往返）；失败不置位，下次调用自动重试。
+static RUN_MIGRATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn run_migrate(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    if RUN_MIGRATED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
     for stmt in RUN_DDL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         sqlx::query(stmt).execute(pool).await?;
     }
+    RUN_MIGRATED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -2277,26 +2390,30 @@ static ACTIVE_RUNS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// 并发闸锁的统一中毒策略：中毒 = 某持锁者 panic，但集合本身仍可安全读写 ——
+/// 取回内部值继续工作，不让一次 panic 崩掉后续所有认领、也不让 rid 被永锁。
+fn active_runs_lock() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    ACTIVE_RUNS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// RAII：guard 存活 = 本进程有执行器在跑这个 rid；drop（含 future 被取消、panic 展开）
 /// 即撤出 —— 运行重新可被收割/续跑，绝不因为一个死执行器永久锁死。
 struct RunGuard(String);
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        if let Ok(mut set) = ACTIVE_RUNS.lock() {
-            set.remove(&self.0);
-        }
+        active_runs_lock().remove(&self.0);
     }
 }
 
 /// 并发闸认领：rid 已在执行 = None（调用方 409）。
 fn claim_active(rid: &str) -> Option<RunGuard> {
-    let mut set = ACTIVE_RUNS.lock().expect("active runs 锁中毒");
+    let mut set = active_runs_lock();
     set.insert(rid.to_string()).then(|| RunGuard(rid.to_string()))
 }
 
 fn run_is_active(rid: &str) -> bool {
-    ACTIVE_RUNS.lock().map(|set| set.contains(rid)).unwrap_or(false)
+    active_runs_lock().contains(rid)
 }
 
 /// 续跑状态机（纯函数，判据打这里）：哪些态可续。
@@ -2385,6 +2502,9 @@ async fn deep_run_start(
         return Ok(None);
     };
     run_migrate(pool).await?;
+    // 开跑落账三步（建/重置运行行、清旧板块、批量插入新板块）包进一个事务：
+    // 中途崩溃不留「running 运行 + 0 板块」的半截账本（那种残留续跑只能标 failed）。
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO meta.deep_run(rid,login_name,conv_id,question,display_question,ds,state,understanding) \
          VALUES($1,$2,$3,$4,$5,$6,'running',$7) \
@@ -2398,28 +2518,31 @@ async fn deep_run_start(
     .bind(display_question)
     .bind(ds)
     .bind(understanding)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     // 全新运行 = 旧板块行整体重建（同 rid 的 interrupted/failed 残留一并收敛，幂等重入）
-    sqlx::query("DELETE FROM meta.deep_section WHERE rid=$1").bind(rid).execute(pool).await?;
-    for (idx, section) in sections.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO meta.deep_section(rid,idx,title,question,chart,assertion) \
-             VALUES($1,$2,$3,$4,$5,$6)",
-        )
-        .bind(rid)
-        .bind(idx as i32)
-        .bind(&section.title)
-        .bind(&section.question)
-        .bind(&section.chart)
-        .bind(section.assertion.as_deref().unwrap_or(""))
-        .execute(pool)
-        .await?;
+    sqlx::query("DELETE FROM meta.deep_section WHERE rid=$1").bind(rid).execute(&mut *tx).await?;
+    if !sections.is_empty() {
+        // 单条多值 INSERT：N 板块一次往返（逐条插入 = N 次）
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO meta.deep_section(rid,idx,title,question,chart,assertion) ",
+        );
+        builder.push_values(sections.iter().enumerate(), |mut row, (idx, section)| {
+            row.push_bind(rid)
+                .push_bind(idx as i32)
+                .push_bind(&section.title)
+                .push_bind(&section.question)
+                .push_bind(&section.chart)
+                .push_bind(section.assertion.as_deref().unwrap_or(""));
+        });
+        builder.build().execute(&mut *tx).await?;
     }
+    tx.commit().await?;
     Ok(Some(guard))
 }
 
 /// 板块终态落账 + 摸运行行 updated_at（活着的运行 updated_at 一直在动 —— 收割与运维判据）。
+/// 一条 CTE 完成两次写入，省一次 PG 往返。
 async fn deep_section_finish(
     pool: &sqlx::PgPool,
     rid: &str,
@@ -2432,8 +2555,11 @@ async fn deep_section_finish(
         serde_json::to_value(StoredSection::of(section)).unwrap_or(serde_json::Value::Null)
     });
     sqlx::query(
-        "UPDATE meta.deep_section SET state=$3,result=$4,ms=$5,updated_at=now() \
-         WHERE rid=$1 AND idx=$2",
+        "WITH s AS (\
+           UPDATE meta.deep_section SET state=$3,result=$4,ms=$5,updated_at=now() \
+           WHERE rid=$1 AND idx=$2\
+         ) \
+         UPDATE meta.deep_run SET updated_at=now() WHERE rid=$1",
     )
     .bind(rid)
     .bind(idx as i32)
@@ -2442,10 +2568,6 @@ async fn deep_section_finish(
     .bind(ms as i64)
     .execute(pool)
     .await?;
-    sqlx::query("UPDATE meta.deep_run SET updated_at=now() WHERE rid=$1")
-        .bind(rid)
-        .execute(pool)
-        .await?;
     Ok(())
 }
 
@@ -2483,12 +2605,14 @@ async fn deep_run_finish(
 /// 与 kg/eval 的启动收割同一思想；本包不改 main.rs、没有启动钩子，故收割挂在
 /// 续跑/进度查询路径上，以 ACTIVE_RUNS 为「执行器死活」的权威。
 async fn deep_run_reap(pool: &sqlx::PgPool, rid: &str) -> anyhow::Result<()> {
+    // 状态翻转与板块收敛同一事务：要么都成要么都不成，不留半截收割
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE meta.deep_run SET state='interrupted', error='服务重启中断', updated_at=now() \
          WHERE rid=$1 AND state='running'",
     )
     .bind(rid)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     // 被掐死在 running 的板块回 queued：半截状态收敛 —— 续跑重跑它（续跑 = 天然幂等）。
     sqlx::query(
@@ -2496,8 +2620,9 @@ async fn deep_run_reap(pool: &sqlx::PgPool, rid: &str) -> anyhow::Result<()> {
          WHERE rid=$1 AND state='running'",
     )
     .bind(rid)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2581,7 +2706,7 @@ async fn deep_run_owner_state(pool: &sqlx::PgPool, rid: &str) -> anyhow::Result<
 // Precise 模型提出经营重点；销售报告仍编译回固定的受信维度框架，非销售报告才直接采用
 // 校验后的模型板块。系统负责执行（同一 ask 管线）、计划校验和渲染。
 
-/// 保留输入顺序，且任一时刻最多轮询两个子任务。
+/// 保留输入顺序，且任一时刻最多并发执行两个子任务。
 async fn ordered_bounded<F: std::future::Future>(futs: Vec<F>) -> Vec<F::Output> {
     futures::stream::iter(futs)
         .buffered(MAX_SECTION_CONCURRENCY)
@@ -2694,9 +2819,12 @@ fn explicit_calendar_phrase(question: &str) -> Option<String> {
 
 fn explicit_iso_period(question: &str) -> Option<String> {
     let mut dates = Vec::new();
+    let mut seen = 0usize; // 命中的日期总数（去重前）：区分「单日窗口」与「只提了一个日子」
     for bytes in question.as_bytes().windows(10) {
         let Ok(text) = std::str::from_utf8(bytes) else { continue };
         if chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok() {
+            seen += 1;
+            // 去重只为压缩重复扫描；起=止 的单日窗口（同一日期出现两次）是合法周期，保留
             if dates.last().map_or(true, |last: &String| last != text) {
                 dates.push(text.to_string());
             }
@@ -2705,7 +2833,11 @@ fn explicit_iso_period(question: &str) -> Option<String> {
             }
         }
     }
-    let [start, end] = dates.as_slice() else { return None };
+    let (start, end) = match dates.as_slice() {
+        [only] if seen >= 2 => (only, only),
+        [start, end, ..] => (start, end),
+        _ => return None,
+    };
     (start <= end).then(|| format!("{start} 至 {end}"))
 }
 
@@ -2859,15 +2991,16 @@ fn validate_plan(sections: Vec<PlanSection>) -> Option<Vec<PlanSection>> {
 
 /// 从模型输出里挖第一个完整 JSON 对象（括号配平；模型爱在 JSON 外面包话）。
 fn extract_json(s: &str) -> Option<&str> {
-    let start = s.find('{')?;
+    let start = s.find('{')?; // find 返回的是**字节**下标
     let mut depth = 0usize;
-    for (i, c) in s.char_indices().skip(start) {
+    // 在切片上按相对下标配平：'{' 前有多字节字符（中文前言）时 skip(字节数) 会错位截断
+    for (offset, c) in s[start..].char_indices() {
         match c {
             '{' => depth += 1,
             '}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some(&s[start..=i]);
+                    return Some(&s[start..=start + offset]);
                 }
             }
             _ => {}
@@ -3044,7 +3177,8 @@ fn weekly_report_plan(question: &str) -> Option<(Option<String>, Vec<PlanSection
 /// `主查询 → Precise 规划` 的串行等待；实体名、单号、明细与已经分组/趋势的问题不抢跑，
 /// 避免为了几十毫秒的主查询反而白等一次模型调用。
 fn should_prefetch_plan(question: &str, ds: &str) -> bool {
-    if weekly_report_plan(question).is_some() {
+    // 轻量预判：周报命中只需「是周报 + 周期可解析」，命中后 plan_report 才构造整份计划
+    if is_weekly_report(question) && weekly_periods(question).is_some() {
         return true;
     }
     if ds == dms_semantic::registry::datasource::DMS_DS_ID
@@ -3107,6 +3241,24 @@ async fn report_source_allows_analysis(
     source_kind_allows_analysis(ds, main_is_warehouse, kind.as_deref())
 }
 
+/// 同一请求内同一 ds 的能力判定只查一次 PG（显式 ds 校验 / 预取判定 / report_ds 判定
+/// 三处可能完全同参；单槽 memo：ds 变了就覆盖重查，语义与重复调用完全一致）。
+async fn source_allows_cached(
+    st: &AppState,
+    memo: &mut Option<(String, bool)>,
+    ds: &str,
+    main_is_warehouse: bool,
+) -> bool {
+    if let Some((cached, result)) = memo.as_ref() {
+        if cached == ds {
+            return *result;
+        }
+    }
+    let result = report_source_allows_analysis(st, ds, main_is_warehouse).await;
+    *memo = Some((ds.to_string(), result));
+    result
+}
+
 fn primary_allows_analysis(primary: &dms_agent::AskResult, source_allows: bool) -> bool {
     source_allows && primary.route != "business-lookup"
 }
@@ -3162,6 +3314,13 @@ fn planning_catalog(
     catalog
 }
 
+/// understanding 展示口径：trim + 截 80 字（与 PLAN_SYSTEM 要求的「最多80字」同一数）；
+/// 空白 = None（不显示理解区）。
+fn clean_understanding(raw: Option<String>) -> Option<String> {
+    raw.map(|u| u.trim().chars().take(80).collect::<String>())
+        .filter(|u| !u.is_empty())
+}
+
 async fn plan_report(
     st: &Arc<AppState>,
     question: &str,
@@ -3185,9 +3344,18 @@ async fn plan_report(
         dms_semantic::registry::model::load_metrics(st.owned.pool(), ds),
         dms_semantic::registry::model::load_dimensions(st.owned.pool(), ds),
     );
-    let (Ok(ms), Ok(dimensions)) = (metrics, dims) else {
-        tracing::warn!("PLAN 目录读失败 → 回退启发式板块");
-        return None;
+    let (ms, dimensions) = match (metrics, dims) {
+        (Ok(ms), Ok(dimensions)) => (ms, dimensions),
+        (metrics, dims) => {
+            // 错误原文必须带出：只说「读失败」线上无从排查
+            if let Err(e) = &metrics {
+                tracing::warn!(error = %e, "PLAN 指标目录读失败 → 回退启发式板块");
+            }
+            if let Err(e) = &dims {
+                tracing::warn!(error = %e, "PLAN 维度目录读失败 → 回退启发式板块");
+            }
+            return None;
+        }
     };
     let catalog = planning_catalog(
         ds,
@@ -3208,6 +3376,8 @@ async fn plan_report(
         dms_kernel::ChatRequest::text(dms_kernel::ModelTier::Precise, &system, &user, Some(0.1)),
     )
     .await
+    // 与下方解析失败的 warn 同口径：LLM 故障回退启发式也要留痕，不许静默
+    .map_err(|e| tracing::warn!(error = %e, "PLAN 模型调用失败 → 回退启发式板块"))
     .ok()?;
     let text = reply.content?;
     let js = extract_json(text.trim())?;
@@ -3218,10 +3388,7 @@ async fn plan_report(
     if secs.is_none() {
         tracing::warn!("PLAN 校验不过 → 回退启发式板块");
     }
-    let understanding = plan
-        .understanding
-        .map(|u| u.trim().chars().take(100).collect::<String>())
-        .filter(|u| !u.is_empty());
+    let understanding = clean_understanding(plan.understanding);
     let result = secs.and_then(|sections| {
         let sections = dedupe_plan_sections(question, sections);
         if sections.is_empty() {
@@ -3262,23 +3429,26 @@ fn report_ds_id(
 
 /// 表格段（系统生成的安全 HTML：单元格全 escape）
 fn table_html(cols: &[String], rows: &[Vec<serde_json::Value>], cap: usize) -> String {
+    use std::fmt::Write as _;
+
     let mut s = String::from("<table><tr>");
     for c in cols {
-        s.push_str(&format!("<th>{}</th>", crate::artifact_api::escape(c)));
+        let _ = write!(s, "<th>{}</th>", crate::artifact_api::escape(c));
     }
     s.push_str("</tr>");
     for r in rows.iter().take(cap) {
         s.push_str("<tr>");
         for (index, v) in r.iter().enumerate() {
             let t = fmt_metric(section_cell_label(cols, r, index), v);
-            s.push_str(&format!("<td>{}</td>", crate::artifact_api::escape(&t)));
+            // 单元格是热路径：直接 write! 进缓冲，不走 format! 临时串
+            let _ = write!(s, "<td>{}</td>", crate::artifact_api::escape(&t));
         }
         s.push_str("</tr>");
     }
     s.push_str("</table>");
     if rows.len() > cap {
         let total = crate::chart_svg::display_number("行数", rows.len() as f64);
-        s.push_str(&format!("<p class=\"more\">共 {total} 行，上表为前 {cap} 行</p>"));
+        let _ = write!(s, "<p class=\"more\">共 {total} 行，上表为前 {cap} 行</p>");
     }
     s
 }
@@ -3286,8 +3456,10 @@ fn table_html(cols: &[String], rows: &[Vec<serde_json::Value>], cap: usize) -> S
 /// 优美 BI 页（**纯函数，判据打这里**）。
 /// 段序：头部 → KPI/经营摘要 → 板块×N（图+表）→ 明细 → SQL → AI 分析收尾。
 /// `svgs` 与 `sections` 一一对应（空串 = 那段没有图）。
+/// `period_question` 只用于 KPI 卡的周期注记识别 —— 必须传执行问句：展示文案可能被
+/// 改写（模板短标题），拿它识别「本月/本周」会把「截至今日 · 未完整周期」标错。
 fn bi_page(
-    question: &str,
+    period_question: &str,
     report: dms_agent::ReportSpec,
     understanding: Option<&str>,
     kpi: Option<(&str, &str)>,
@@ -3303,6 +3475,8 @@ fn bi_page(
     sqls: &[String],
     _trust: Option<&dms_agent::TrustEnvelope>,
 ) -> String {
+    use std::fmt::Write as _;
+
     let esc = crate::artifact_api::escape;
     let mut s = String::new();
     s.push_str(&format!(
@@ -3317,27 +3491,28 @@ fn bi_page(
     }
     if let Some((label, val)) = kpi {
         s.push_str("<div class=\"kpi-grid\">");
-        s.push_str(&format!(
+        let _ = write!(
+            s,
             "<div class=\"kpi\"><div class=\"l\">{}</div><div class=\"v\">{}</div><div class=\"n\">{}</div></div>",
-            esc(label), esc(val), esc(current_period_note(question))
-        ));
+            esc(label), esc(val), esc(current_period_note(period_question))
+        );
         for cmp in comparisons {
             let rate = comparison_rate_text(cmp);
             let baseline = fmt_metric_number(label, cmp.baseline);
-            let change = fmt_metric_number(label, cmp.change.abs());
-            let change = format!("{}{}", if cmp.change > 0.0 { "+" } else if cmp.change < 0.0 { "-" } else { "" }, change);
-            s.push_str(&format!(
+            let change = fmt_signed_change(label, cmp.change);
+            let _ = write!(
+                s,
                 "<div class=\"kpi comparison {}\"><div class=\"l\">{}</div><div class=\"v\">{}</div><div class=\"n\">{} · 基期 {} · 变化额 {}</div></div>",
                 esc(cmp.dir), esc(&cmp.label), esc(&rate),
                 esc(&cmp.basis), esc(&baseline), esc(&change)
-            ));
+            );
         }
         s.push_str("</div>");
     }
     if !facts.is_empty() {
         s.push_str("<section class=\"fact-sec\"><div class=\"section-kicker\"><span>业务对象</span><b>关键字段</b></div><div class=\"fact-grid\">");
         for fact in facts {
-            s.push_str(&format!("<div class=\"fact\"><span>{}</span><b>{}</b></div>", esc(&fact.label), esc(&fact.value)));
+            let _ = write!(s, "<div class=\"fact\"><span>{}</span><b>{}</b></div>", esc(&fact.label), esc(&fact.value));
         }
         s.push_str("</div></section>");
     }
@@ -3347,7 +3522,7 @@ fn bi_page(
     if !highlights.is_empty() {
         s.push_str("<div class=\"highlight-grid\">");
         for h in highlights {
-            s.push_str(&format!("<div class=\"highlight\"><div class=\"l\">{}</div><div class=\"v\">{}</div><div class=\"n\">{}</div></div>", esc(&h.label), esc(&h.value), esc(&h.note)));
+            let _ = write!(s, "<div class=\"highlight\"><div class=\"l\">{}</div><div class=\"v\">{}</div><div class=\"n\">{}</div></div>", esc(&h.label), esc(&h.value), esc(&h.note));
         }
         s.push_str("</div>");
     }
@@ -3362,10 +3537,11 @@ fn bi_page(
     }
     for (i, sec) in sections.iter().enumerate() {
         let row_count = crate::chart_svg::display_number("行数", sec.rows.len() as f64);
-        s.push_str(&format!(
+        let _ = write!(
+            s,
             "<section class=\"bi-sec\"><div class=\"sec-head\"><div><span class=\"eyebrow\">分析板块 {:02}</span><h2>{}</h2><p>{}</p></div><span class=\"sec-note\">{} 行</span></div>",
             i + 1, esc(&sec.title), esc(&sec.question), row_count
-        ));
+        );
         if let Some(svg) = svgs.get(i).filter(|x| !x.is_empty()) {
             s.push_str(svg);
         }
@@ -3386,10 +3562,10 @@ fn bi_page(
         ));
     }
     if let Some(ai) = ai.filter(|x| !x.trim().is_empty()) {
-        let tokens = _evidence.iter().map(|item| format!("[{}]", item.id)).collect::<Vec<_>>();
-        let ai = sanitize_insight_for_display(ai, &tokens);
+        // insight 进来前已完成净化（validate_evidence_insight 出口 sanitize 过一次；
+        // 确定性兜底文案本身无编号、用「数据」措辞），这里不再重复清洗。
         s.push_str("<section class=\"bi-ai\"><div class=\"sec-head\"><div><span class=\"eyebrow\">分析收尾</span><h2>AI 分析摘要</h2></div><span class=\"sec-note\">结论与行动，基于上方数据</span></div><div class=\"ai-grid\">");
-        s.push_str(&crate::artifact_api::md_to_html(&ai));
+        s.push_str(&crate::artifact_api::md_to_html(ai));
         s.push_str("</div></section>");
     }
     s
@@ -3418,8 +3594,9 @@ fn display_sqls(primary: &str, sections: &[Section]) -> Vec<(String, String)> {
 }
 
 fn uses_dws_sales_fact(sql: &str) -> bool {
-    sql.to_ascii_lowercase().contains(DWS_SALES_FACT)
-        || sql.to_ascii_lowercase().contains("dws_off_offline_sale_dfn")
+    // lowercase 一次再 contains 两次（原实现每次 contains 都重新分配一份小写串）
+    let lower = sql.to_ascii_lowercase();
+    lower.contains(DWS_SALES_FACT) || lower.contains("dws_off_offline_sale_dfn")
 }
 
 /// 报表级核数：同时间窗、同指标的维度板块合计必须与主 KPI 一致。
@@ -3481,8 +3658,11 @@ fn reconciliation_checks(
                 .filter_map(|row| row.last().and_then(number))
                 .sum();
             let delta = total - main;
-            if delta.abs() <= 0.01 {
-                checks.push(format!("{}合计与主指标一致（差异≤0.01）", section.title));
+            // 混合容差：大额指标的浮点/Decimal 换算误差可超 0.01 绝对值，
+            // 再按主指标相对 1e-9 兜底，正确报表不被误标「需复核」
+            let tolerance = 0.01_f64.max(main.abs() * 1e-9);
+            if delta.abs() <= tolerance {
+                checks.push(format!("{}合计与主指标一致（容差内）", section.title));
             } else {
                 review = true;
                 checks.push(format!(
@@ -3544,7 +3724,6 @@ fn attach_report_checks(
     }
 }
 
-
 /// `POST /api/deep/compose` → `{ result, artifact }`。
 /// 深度模式的**单入口**：前端不再串 ask+analysis+report 三脚（那是三个端点三套身份校验，
 /// 而深度页的素材必须出自同一次取数 —— 分时取数会拼出一页自相矛盾的报表）。
@@ -3554,6 +3733,27 @@ pub async fn compose(
     Json(req): Json<crate::AskReq>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     compose_inner(st, headers, req, None).await
+}
+
+/// 执行问句：周报改写为「省区 + 本周窗口 + 销售额」；其余 = trim 后的原问句
+///（与 display_question 的兜底 trim 同口径，同一问题不留两份）。
+fn execution_question_of(question: &str) -> String {
+    weekly_periods(question)
+        .map(|scope| format!("{} {} 销售额", scope.province, scope.current))
+        .unwrap_or_else(|| question.trim().to_string())
+}
+
+/// 会话消息落库失败只留痕（不带 payload）：落库失败不该 500，但完全静默会让消息丢失无迹可查。
+async fn save_chat_msg(
+    pool: &sqlx::PgPool,
+    conv_id: i64,
+    role: &str,
+    question: &str,
+    payload: Option<&serde_json::Value>,
+) {
+    if let Err(e) = crate::chat::save_msg(pool, conv_id, role, question, payload).await {
+        tracing::warn!(error = %e, "深度模式会话消息落库失败（不影响响应）");
+    }
 }
 
 /// 【D4】全新运行的落账开启：并发闸 → 建/重置运行行与板块行（queued）。
@@ -3591,7 +3791,9 @@ async fn track_run_start(
             guard,
         ))),
         Ok(None) => {
-            note(rid, ProgressStage::Failed);
+            // 撞的是活执行器：rid 的进度条目属于正在跑的那份，不能往共享条目写「处理失败」
+            //（否则健康运行的进度被误标，前端按 done 判据提前停轮询）
+            tracing::warn!(rid, "深度报告撞活执行器 → 409（不碰共享进度条目）");
             Err(err(
                 StatusCode::CONFLICT,
                 "该报告正在执行中：同一运行不许多份执行器并发（可查询进度，或稍后续跑）",
@@ -3619,9 +3821,7 @@ async fn compose_inner(
         .map(str::trim)
         .filter(|question| !question.is_empty())
         .unwrap_or(req.question.trim());
-    let execution_question = weekly_periods(&req.question)
-        .map(|scope| format!("{} {} 销售额", scope.province, scope.current))
-        .unwrap_or_else(|| req.question.clone());
+    let execution_question = execution_question_of(&req.question);
     let (login_name, role_code) = crate::resolve_identity(&st, &headers, &req.login_name, &req.role_code)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
     // 身份权限来自 DMS，聊天归属来自自有 PG；两项互不依赖，先并行完成再统一放行。
@@ -3646,7 +3846,14 @@ async fn compose_inner(
     let (prev, intent) = tokio::join!(
         async {
             match req.conv_id {
-                Some(cid) => crate::chat::last_turn(st.owned.pool(), cid).await.ok().flatten(),
+                Some(cid) => match crate::chat::last_turn(st.owned.pool(), cid).await {
+                    Ok(turn) => turn,
+                    Err(e) => {
+                        // 上一轮上下文悄悄丢失会拉低追问分诊质量：按 None 降级但要留痕
+                        tracing::warn!(error = %e, "深度模式上一轮上下文读取失败 → 按无上下文继续");
+                        None
+                    }
+                },
                 None => None,
             }
         },
@@ -3682,17 +3889,19 @@ async fn compose_inner(
         })?;
         let result = serde_json::to_value(&answer).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(cid) = req.conv_id {
-            let _ = crate::chat::save_msg(st.owned.pool(), cid, "user", display_question, None).await;
+            save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
             let payload = serde_json::json!({ "result": result });
-            let _ = crate::chat::save_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+            save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
         }
         note(&rid, ProgressStage::Done);
         return Ok(Json(serde_json::json!({ "result": result })));
     }
+    // 同一 ds 的能力判定一次请求内只查一次 PG（显式校验 / 预取 / report_ds 三处共用此 memo）
+    let mut source_allows_memo: Option<(String, bool)> = None;
     if let Some(explicit_ds) = req.ds.as_deref() {
         let (_, main_is_warehouse) = st.mysql.target_snapshot();
         if explicit_ds != dms_semantic::registry::datasource::DMS_DS_ID
-            && !report_source_allows_analysis(&st, explicit_ds, main_is_warehouse).await
+            && !source_allows_cached(&st, &mut source_allows_memo, explicit_ds, main_is_warehouse).await
         {
             return Err(err(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -3711,7 +3920,7 @@ async fn compose_inner(
     let prefetch_allowed = if prefetch_ds == dms_semantic::registry::datasource::DMS_DS_ID {
         prefetch_main_is_warehouse
     } else {
-        report_source_allows_analysis(&st, &prefetch_ds, prefetch_main_is_warehouse).await
+        source_allows_cached(&st, &mut source_allows_memo, &prefetch_ds, prefetch_main_is_warehouse).await
     };
     let mut plan_future =
         (resume.is_none() && prefetch_allowed && should_prefetch_plan(&req.question, &prefetch_ds)).then(|| {
@@ -3752,21 +3961,23 @@ async fn compose_inner(
     let (main_target, main_is_warehouse) = st.mysql.target_snapshot();
     let report_ds = report_ds_id(&primary, req.ds.as_deref(), &main_target);
     let source_allows_analysis =
-        report_source_allows_analysis(&st, &report_ds, main_is_warehouse).await;
+        source_allows_cached(&st, &mut source_allows_memo, &report_ds, main_is_warehouse).await;
     let report_allows_analysis = primary_allows_analysis(&primary, source_allows_analysis);
 
+    // 主指标只认一次（内部含 SQL compact 与多指标扫描）：下方 analysis_plan 与
+    // sales_report 判据共用这同一份结果，两个 expect 的不变量也由单点保证
+    let sales_measure = primary_sales_measure(&execution_question, &primary);
     let analysis_plan = dms_agent::analysis::plan(
         &execution_question,
         dms_agent::AnalysisShape {
             route: &primary.route,
             row_count: primary.row_count,
             columns: &primary.columns,
-            dws_sales_metric: primary_sales_measure(&execution_question, &primary).is_some(),
+            dws_sales_metric: sales_measure.is_some(),
             document_evidence: document_evidence(&primary),
         },
     );
     let report_spec = analysis_plan.report_spec();
-    let sales_measure = primary_sales_measure(&execution_question, &primary);
     let facts = primary_facts(&primary, analysis_plan.kind);
     let (primary_display_columns, primary_display_rows) = primary_display(&primary, analysis_plan.kind);
     note(&rid, ProgressStage::Plan);
@@ -3813,7 +4024,8 @@ async fn compose_inner(
             }
             let sales_report = sales_measure.is_some();
             // 续跑的板块是账本里的**最终计划**：编译/去重/理解重写早已定稿，一律不再重放
-            let plan_secs = if resume.is_none() && sales_report && !is_weekly_report(&req.question) {
+            let compile_plan = resume.is_none() && sales_report && !is_weekly_report(&req.question);
+            let plan_secs = if compile_plan {
                 compile_sales_plan(
                     &req.question,
                     sales_measure.expect("sales_report 已确认指标"),
@@ -3828,7 +4040,7 @@ async fn compose_inner(
                 plan_secs
             };
             requested_sections = plan_secs.clone();
-            if resume.is_none() && sales_report && !is_weekly_report(&req.question) {
+            if compile_plan {
                 let dimensions = plan_secs
                     .iter()
                     .map(|s| s.title.as_str())
@@ -3840,12 +4052,11 @@ async fn compose_inner(
                     dimensions
                 ));
             }
-            if let Some(_u) = &understanding {
-                note(&rid, ProgressStage::Plan);
-            }
+            // understanding 到此恒有值（进入分支前已置默认文案兜底），直接登记 Plan 阶段
+            note(&rid, ProgressStage::Plan);
             note(&rid, ProgressStage::Related);
             // 【D4】计划定稿即落账：全新运行建/重置运行行；续跑复用账本行（resume 已认领）。
-            let conv_str = req.conv_id.map(|c| c.to_string()).unwrap_or_default();
+            let conv_str = conv_id.clone().unwrap_or_default();
             run_tracking = if resume.is_some() {
                 valid_progress_id(&rid).then(|| {
                     (RunCtx { pool: st.owned.pool().clone(), rid: rid.clone() }, None)
@@ -3924,7 +4135,7 @@ async fn compose_inner(
                     sales_measure.expect("enrich 已确认指标"),
                     vec![],
                 );
-                let conv_str = req.conv_id.map(|c| c.to_string()).unwrap_or_default();
+                let conv_str = conv_id.clone().unwrap_or_default();
                 run_tracking = track_run_start(
                     &st,
                     &rid,
@@ -4065,7 +4276,6 @@ async fn compose_inner(
     let kpi = kpi.as_ref().map(|(l, v)| (l.as_str(), v.as_str()));
     let mut sql_entries = display_sqls(&primary.sql, &sections);
     // 无板块时主结果也要有个落点：用主结果自己当唯一板块
-    let mut svgs = svgs;
     if sections.is_empty() && primary.row_count > 0 {
         sections.push(Section {
             title: "查询结果".into(),
@@ -4109,10 +4319,11 @@ async fn compose_inner(
     } else if let (true, Some(measure), Some(current)) =
         (report_allows_analysis, sales_measure, current)
     {
+        // 与上方 primary_comparisons 同一问句口径（执行问句）：同源比较不各看一份
         let (extra, comparison_sqls) = sales_comparisons(
             &st,
             &p,
-            &req.question,
+            &execution_question,
             &primary.sql,
             measure,
             current,
@@ -4157,7 +4368,7 @@ async fn compose_inner(
         }
     });
     let html_body = bi_page(
-        display_question,
+        &execution_question,
         report_spec,
         understanding.as_deref(),
         kpi,
@@ -4175,7 +4386,7 @@ async fn compose_inner(
     );
     let title: String = display_question.chars().take(40).collect();
     let html = crate::artifact_api::page_shell(&title, &html_body);
-    let conv = req.conv_id.map(|c| c.to_string()).unwrap_or_default();
+    let conv = conv_id.clone().unwrap_or_default();
     // 【D4】产物保存失败 = 致命错误 → 运行标 failed（可续跑：已完成板块都在账本里）
     let id = match crate::artifact_api::save_artifact(&st, &conv, "report", &title, &html, &login_name)
         .await
@@ -4230,9 +4441,9 @@ async fn compose_inner(
             .collect::<Vec<_>>(),
     });
     if let Some(cid) = req.conv_id {
-        let _ = crate::chat::save_msg(st.owned.pool(), cid, "user", display_question, None).await;
+        save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
         let payload = serde_json::json!({ "result": result, "artifact": artifact, "page": page });
-        let _ = crate::chat::save_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+        save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
     }
     Ok(Json(serde_json::json!({ "result": result, "artifact": artifact, "page": page })))
 }
@@ -4242,6 +4453,15 @@ pub struct ResumeReq {
     rid: String,
     login_name: Option<String>,
     role_code: Option<String>,
+}
+
+/// 续跑的统一拒答：404 固定文案。「不存在」与「非属主」同形 —— 响应差异会泄露
+/// rid 是否真实存在（rid 可能随分享链接/浏览器历史/服务端日志流出），与进度端点同一纪律。
+fn resume_not_found() -> ApiErr {
+    err(
+        StatusCode::NOT_FOUND,
+        "该运行不存在或从未落账（只有带 rid 且规划出板块的深度报告可续跑）",
+    )
 }
 
 /// 【D4】手动续跑 `POST /api/deep/resume` → 与 compose 完全同形 `{ result, artifact, page }`。
@@ -4268,8 +4488,6 @@ pub async fn resume(
     }
     let (login_name, role_code) = crate::resolve_identity(&st, &headers, &req.login_name, &req.role_code)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
-    // 属主登记：续跑沿用同一 rid，进度轮询的属主闸（内存一级）要在第一拍轮询前就位
-    note_owner(&rid, &login_name);
     let pool = st.owned.pool().clone();
     run_migrate(&pool)
         .await
@@ -4277,16 +4495,16 @@ pub async fn resume(
     let run = deep_run_load(&pool, &rid)
         .await
         .map_err(|e| internal_err("续跑账本读取失败", e))?
-        .ok_or_else(|| {
-            err(
-                StatusCode::NOT_FOUND,
-                "该运行不存在或从未落账（只有带 rid 且规划出板块的深度报告可续跑）",
-            )
-        })?;
-    // 账本与 chat.msg 同级：只有属主能续跑（板块结果含数据，不能凭 rid 枚举他人报告）
+        .ok_or_else(resume_not_found)?;
+    // 账本与 chat.msg 同级：只有属主能续跑（板块结果含数据，不能凭 rid 枚举他人报告）。
+    // 非属主与「不存在」同形 404：响应差异会泄露 rid 存在性（进度端点同一纪律）。
     if run.login_name != login_name {
-        return Err(err(StatusCode::FORBIDDEN, "无权续跑他人的报告"));
+        return Err(resume_not_found());
     }
+    // 属主登记必须在属主校验之后：先登记的话，任何人拿 rid 调一次 resume（吃 404）就把自己
+    // 登记成该 rid 的内存属主，进度端点的属主闸随即被架空（板块标题/断言本身是经营信息）。
+    // 续跑沿用同一 rid，登记抢在状态机与 compose_inner 之前，第一拍轮询前到位。
+    note_owner(&rid, &login_name);
     // 状态机：done = 终态没得续；running 看执行器死活 —— 活 = 并发闸 409，死 = 收割
     if run.state == "done" {
         return Err(err(StatusCode::CONFLICT, "报告已完成，无需续跑"));
@@ -4414,6 +4632,7 @@ mod tests {
         assert!(should_enrich("今年销售业绩", &kpi_result()));
         assert!(!should_enrich("本月销售额按省份", &kpi_result()), "已是拆解形");
         assert!(!should_enrich("销售额前五省份", &kpi_result()), "前五=维度词");
+        assert!(!should_enrich("销售额前5省份", &kpi_result()), "前5=维度词（阿拉伯数字同族）");
         assert!(!should_enrich("可颂香肠卷", &kpi_result()), "非销售词");
         let mut multi = kpi_result();
         multi.row_count = 5;
@@ -4481,6 +4700,19 @@ mod tests {
         note_owner("bad rid", "alice");
         let m = PROGRESS.lock().expect("progress 锁中毒");
         assert!(m.get("bad rid").is_none());
+    }
+
+    /// done 判据：内存阶段终态 或 PG 账本终态。重启后内存 steps 为空，
+    /// 没有 PG 这一半前端「完成即停轮询」永远等不到。
+    #[test]
+    fn progress_done_counts_memory_steps_and_pg_terminal_state() {
+        assert!(!progress_done(&[], None));
+        assert!(progress_done(&["完成".into()], None));
+        assert!(progress_done(&["处理失败".into()], None));
+        assert!(progress_done(&[], Some("done")), "重启后内存为空：PG 终态也算 done");
+        assert!(progress_done(&[], Some("failed")));
+        assert!(!progress_done(&[], Some("running")));
+        assert!(!progress_done(&["检索知识库".into()], Some("interrupted")));
     }
 
     /// 进度端点必须鉴权：handler 体内身份解析 + 属主闸 + 统一 404 出口三件套钉死
@@ -5104,6 +5336,87 @@ mod tests {
         assert!(!h[0].note.contains("较上一期"), "小时桶不是时间周期环比：{}", h[0].note);
     }
 
+    /// "YYYY-MM" 形状之外月份必须合法（01-12）："2026-99" 不是月度周期，不出环比文案
+    #[test]
+    fn invalid_month_period_is_not_misreported_as_period_growth() {
+        let sections = vec![Section {
+            title: "月度趋势".into(), question: "q".into(), kind: "line",
+            columns: vec!["月份".into(), "销售额".into()],
+            rows: vec![
+                vec![serde_json::Value::from("2026-13"), serde_json::Value::from(100)],
+                vec![serde_json::Value::from("2026-99"), serde_json::Value::from(120)],
+            ], sql: "SELECT 1".into(),
+        }];
+        let h = section_highlights(&sections);
+        assert_eq!(h.len(), 1);
+        assert!(!h[0].note.contains("较上一期"), "非法月份不是周期环比：{}", h[0].note);
+        assert!(h[0].note.contains("当前展示值"), "{}", h[0].note);
+    }
+
+    /// null/非数值行不参与头部比大：全空板块不出「头部=0」的假 highlight
+    #[test]
+    fn null_rows_do_not_fabricate_a_top_highlight() {
+        let sections = vec![Section {
+            title: "区域结构".into(), question: "q".into(), kind: "bar",
+            columns: vec!["省份".into(), "销售额".into()],
+            rows: vec![
+                vec![serde_json::Value::from("A"), serde_json::Value::Null],
+                vec![serde_json::Value::from("B"), serde_json::Value::from("无数据")],
+            ], sql: "SELECT 1".into(),
+        }];
+        assert!(section_highlights(&sections).is_empty());
+    }
+
+    /// 负数基期：变化率按 |基期| 归一，符号与增减方向一致（-100→-50 是改善 +50%，不是 -50%）
+    #[test]
+    fn negative_baseline_keeps_rate_sign_consistent_with_direction() {
+        let improved = comparison_from_values("同比", -50.0, -100.0);
+        assert_eq!(improved.pct, Some(50.0));
+        assert_eq!(improved.dir, "up");
+        let worsened = comparison_from_values("同比", -150.0, -100.0);
+        assert_eq!(worsened.pct, Some(-50.0));
+        assert_eq!(worsened.dir, "down");
+        // 周报核心表的变化率同一口径
+        assert_eq!(
+            change_rate_value(&serde_json::json!(-50.0), &serde_json::json!(-100.0)),
+            serde_json::json!(50.0)
+        );
+    }
+
+    /// 单日窗口（起=止，同一日期出现两次）是合法周期；只提一个日子不算窗口（交原回落链）
+    #[test]
+    fn single_day_iso_period_is_a_valid_window() {
+        assert_eq!(
+            explicit_iso_period("2026-08-01 至 2026-08-01销售额"),
+            Some("2026-08-01 至 2026-08-01".into())
+        );
+        assert_eq!(
+            explicit_iso_period("2026-08-01 至 2026-08-05销售额"),
+            Some("2026-08-01 至 2026-08-05".into())
+        );
+        assert_eq!(explicit_iso_period("2026-08-01销售额"), None, "单个日期不是窗口");
+        assert_eq!(explicit_iso_period("销售额"), None);
+    }
+
+    /// 执行问句与展示兜底同口径 trim；周报仍改写为「省区 + 本周窗口 + 销售额」
+    #[test]
+    fn execution_question_is_trimmed_like_display_fallback() {
+        assert_eq!(execution_question_of("  本月销售额  "), "本月销售额");
+        let weekly = "请生成【单省区周度经营分析报告】。\n省区：湖南省\n周期：2026-08-03 至 2026-08-09";
+        assert!(execution_question_of(weekly).starts_with("湖南省 2026-08-03 至"));
+    }
+
+    /// understanding 截断口径与 PLAN_SYSTEM 的「最多80字」一致（提示词与闸门同一条）
+    #[test]
+    fn understanding_is_capped_at_the_prompted_limit() {
+        assert!(PLAN_SYSTEM.contains("最多80字"));
+        let long = "解".repeat(120);
+        assert_eq!(clean_understanding(Some(long)).map(|u| u.chars().count()), Some(80));
+        assert_eq!(clean_understanding(Some("  核对销售额  ".into())).as_deref(), Some("核对销售额"));
+        assert_eq!(clean_understanding(Some("   ".into())), None, "空白 = 不显示");
+        assert_eq!(clean_understanding(None), None);
+    }
+
     #[test]
     fn factual_insight_keeps_deep_report_useful_without_business_guessing() {
         let evidence = vec![
@@ -5154,6 +5467,8 @@ mod tests {
         // 括号配平的 JSON 挖取（模型爱在外面包话）
         assert_eq!(extract_json("前言 {\"a\":1} 后记"), Some("{\"a\":1}"));
         assert_eq!(extract_json("{\"a\":{\"b\":2}}"), Some("{\"a\":{\"b\":2}}"));
+        // 中文前缀（多字节）+ 嵌套 JSON：find 的字节下标不许当字符数用（配平错位会截断）
+        assert_eq!(extract_json("前言 {\"a\":{\"b\":2}} 后记"), Some("{\"a\":{\"b\":2}}"));
         assert_eq!(extract_json("没有 JSON"), None);
         assert_eq!(extract_json("{没配平"), None);
     }
@@ -5393,6 +5708,21 @@ mod tests {
         };
         let (review, checks) = reconciliation_checks("本月销售额", &primary, &[related]);
         assert!(review && checks.iter().any(|c| c.contains("商品毛利未使用已验证的 Doris")), "{checks:?}");
+
+        // 大额合计：浮点/Decimal 换算误差可超 0.01 绝对值，混合容差（相对 1e-9）不误标需复核
+        let big = Section {
+            title: "省区销售结构".into(),
+            question: "本月销售额按省区".into(),
+            kind: "bar",
+            columns: vec!["省区".into(), "销售额".into()],
+            rows: vec![vec![
+                serde_json::Value::from("A"),
+                serde_json::Value::from(206084819.21), // 与主指标差 0.02，在 2.06e8 × 1e-9 容差内
+            ]],
+            sql: "SELECT region, SUM(amount) FROM sales_dw.dws_off_offline_sale_dfn GROUP BY region".into(),
+        };
+        let (review, checks) = reconciliation_checks("本月销售额", &primary, &[big]);
+        assert!(!review && checks.iter().any(|c| c.contains("合计与主指标一致")), "{checks:?}");
     }
 
     #[test]
@@ -5568,6 +5898,7 @@ mod tests {
         assert!(fallback.contains("| 营销费用 | 本次数据未覆盖 |"));
         assert!(fallback.contains("| 订单数与客单价 | 本次数据未覆盖 |"));
         assert!(fallback.contains("| 坪效与人效 | 本次数据未覆盖 |"));
+        assert!(!fallback.contains("证据"), "兜底文案对用户只露「数据」措辞（bi_page 不再二次清洗）：{fallback}");
     }
 
     #[test]
@@ -5618,6 +5949,21 @@ mod tests {
         assert!(claim_value_binds("0.256", "25.6%"), "×100 形双向");
         assert!(!claim_value_binds("99.9%", "100%"), "百分数不放相对容差");
         assert!(claim_value_binds("20%", "20.0%"), "去尾零仍认");
+    }
+
+    /// 负号是数值主张的一部分："-20.0%" 只能绑负值证据，符号翻转蒙混不过闸门；
+    /// 组合单位「万亿」按乘积展开（1.2万亿 ↔ 12000亿），不再截成「1.2万」误杀整段分析。
+    #[test]
+    fn signed_and_combined_unit_claims_bind_by_value() {
+        assert_eq!(number_tokens("-20.0%"), vec!["-20.0%"]);
+        assert_eq!(number_tokens("区间10-20%"), vec!["10", "20%"], "连字符不是负号");
+        assert_eq!(number_tokens("约1.2万亿"), vec!["1.2万亿"], "组合单位不截断");
+        assert!(claim_value_binds("-20.0%", "-20%"));
+        assert!(!claim_value_binds("-20.0%", "20.0%"), "符号翻转不得绑定");
+        assert!(!claim_value_binds("20.0%", "-20.0%"));
+        let (value, percent) = claim_value("1.2万亿").expect("组合单位可解析");
+        assert!((value - 1.2e12).abs() < 1.0 && !percent, "万亿 = 1e4 × 1e8");
+        assert!(claim_value_binds("1.2万亿", "12000亿"), "组合单位与展开量级互认");
     }
 
     /// 容差内通过 / 超出容差整段判失败（validate 全文级）。
@@ -5754,6 +6100,90 @@ mod tests {
             columns: vec![], rows: vec![], sql: String::new(),
         };
         assert_eq!(weird.into_section().kind, "bar", "未知 kind 白名单回落 bar");
+    }
+
+    /// 409 撞活分支不许污染共享进度条目：第一个健康运行的进度被写上「处理失败」，
+    /// 前端会按 done 判据提前停轮询。
+    #[test]
+    fn conflict_path_does_not_write_failed_progress() {
+        let src = include_str!("deep_api.rs").replace("\r\n", "\n");
+        let body = src
+            .split("async fn track_run_start(")
+            .nth(1)
+            .expect("track_run_start 没了")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let conflict = body
+            .split("Ok(None) =>")
+            .nth(1)
+            .expect("409 分支")
+            .split("Err(e)")
+            .next()
+            .unwrap();
+        assert!(!conflict.contains("ProgressStage::Failed"), "409 不写共享进度：{conflict}");
+        assert!(conflict.contains("CONFLICT"), "409 语义保留：{conflict}");
+    }
+
+    /// 开跑落账原子性：运行行 upsert、旧板块清理、新板块插入必须同事务（半截账本 = 续跑
+    /// 只能标 failed）；板块插入单条多值（N 板块一次往返）；板块终态与 run 摸时合并 CTE。
+    #[test]
+    fn run_start_persistence_is_atomic_and_batched() {
+        let src = include_str!("deep_api.rs").replace("\r\n", "\n");
+        let body = src
+            .split("async fn deep_run_start(")
+            .nth(1)
+            .expect("deep_run_start 没了")
+            .split("Ok(Some(guard))")
+            .next()
+            .unwrap();
+        assert!(body.contains("pool.begin()"), "开跑落账必须包事务：{body}");
+        assert!(body.contains("tx.commit()"), "事务必须提交：{body}");
+        assert!(body.contains("push_values"), "板块插入必须单条多值批量：{body}");
+        assert!(!body.contains(".execute(pool)"), "事务内不得绕过 tx 直连 pool：{body}");
+        let finish = src
+            .split("async fn deep_section_finish(")
+            .nth(1)
+            .expect("deep_section_finish 没了")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(finish.contains("WITH s AS ("), "板块终态与 run 摸时合并为一条 CTE：{finish}");
+    }
+
+    /// 安全：resume 的属主登记必须在属主校验之后 —— 先登记的话，任何人凭 rid 调一次
+    /// resume（吃拒答）即把自己登记成内存属主，进度属主闸被架空（板块标题/断言是经营信息）。
+    /// 非属主与「不存在」同形 404，不泄 rid 存在性（与 progress 端点同一纪律）。
+    #[test]
+    fn resume_registers_owner_after_check_and_hides_existence() {
+        let src = include_str!("deep_api.rs").replace("\r\n", "\n");
+        let body = src
+            .split("pub async fn resume(")
+            .nth(1)
+            .expect("resume handler 没了")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let check = body.find("run.login_name != login_name").expect("属主判据保留");
+        let register = body.find("note_owner(&rid, &login_name)").expect("属主登记保留");
+        assert!(check < register, "属主登记必须在属主校验之后：{body}");
+        assert!(!body.contains("FORBIDDEN"), "非属主续跑不许回 403（泄 rid 存在性）：{body}");
+    }
+
+    /// 周期注记按执行问句识别：展示文案（display_question）可能被模板改写，
+    /// 拿它识别「本月/本周」会把「截至今日 · 未完整周期」标错。
+    #[test]
+    fn bi_page_period_note_uses_execution_question() {
+        let src = include_str!("deep_api.rs").replace("\r\n", "\n");
+        let call = src
+            .split("let html_body = bi_page(")
+            .nth(1)
+            .expect("bi_page 调用")
+            .split(");")
+            .next()
+            .unwrap();
+        assert!(call.contains("&execution_question"), "周期注记须用执行问句：{call}");
+        assert!(!call.contains("display_question"), "展示文案不参与周期识别：{call}");
     }
 
     // ───────────────── 【D8】验收断言：规划透出 / 降级 / 自评对齐 ─────────────────

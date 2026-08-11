@@ -19,6 +19,9 @@ use crate::mysql::{sqlx_err, ReadOnlyMySql};
 use crate::postgres::PostgresSource;
 use crate::source::{DsPolicy, SourceKind, SqlSource};
 
+/// 「测试连接」探针预算：黑洞主机不许让按钮永远转圈
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 一个数据源的配置形态。**无口令**：`dsn_ref` 是配置里那张映射表的键名。
 #[derive(Debug, Clone)]
 pub struct DsSpec {
@@ -43,6 +46,8 @@ pub struct SourceRegistry {
 
 impl SourceRegistry {
     pub fn new(dsns: HashMap<String, String>) -> Self {
+        // 启动零 DSN 多半是配置事故：留痕键数，排障时第一眼要看的就是它
+        tracing::debug!(dsn_keys = dsns.len(), "数据源注册表已建");
         Self {
             dsns,
             pools: Mutex::new(HashMap::new()),
@@ -52,21 +57,24 @@ impl SourceRegistry {
 
     /// 预置一个已建好的源（DMS 主源在启动时就建好，注册进来复用 —— 全程只有一个池）。
     pub fn preload(&self, src: Arc<dyn SqlSource>) {
-        self.lock().insert(src.ds_id().clone(), src);
+        if let Some(old) = self.lock().insert(src.ds_id().clone(), src) {
+            tracing::debug!(ds = %old.ds_id(), "preload 覆盖了同名源的已建池");
+        }
     }
 
     /// 【A8】登记/更新数据源级策略：先记账（`policies`），再对已建池的源当场生效 ——
     /// 这个顺序让「`set_policy` 与首次 `get` 建池并发」最终收敛到账本里那份。
     /// `close` 不摘账：策略属于 ds_id（配置），不属于某一代池。
     pub fn set_policy(&self, ds: &DsId, policy: DsPolicy) {
-        self.policies.lock().unwrap_or_else(|e| e.into_inner()).insert(ds.clone(), policy);
+        self.policies_lock().insert(ds.clone(), policy);
         if let Some(src) = self.lock().get(ds).cloned() {
             src.set_ds_policy(policy);
         }
     }
 
     /// 懒建 + 复用。先查缓存，miss 才建池；**建池期间不持锁**（否则一个连不上的源会
-    /// 把所有源的取数一起堵死）。
+    /// 把所有源的取数一起堵死）。缓存命中不校验 spec：dsn_ref/max_conn/schema 改了
+    /// 必须先 `close` 再 `get` 才重建 —— 复用的是「建池那一刻的配置」。
     ///
     /// ponytail: 并发首访同一个源可能各建一个池，先到者入表、后到者的池随 Arc 落地即释放。
     /// 代价是偶发一次多余握手；换成「按 ds 排队」要引一张 in-flight 表，不值。
@@ -77,7 +85,7 @@ impl SourceRegistry {
         let built = self.build(spec).await?;
         let src = self.lock().entry(spec.ds_id.clone()).or_insert(built).clone();
         // 【A8】建池前登记过的策略在这里带上（与 `set_policy` 的并发收敛序见其注释）
-        if let Some(p) = self.policies.lock().unwrap_or_else(|e| e.into_inner()).get(&spec.ds_id).copied() {
+        if let Some(p) = self.policies_lock().get(&spec.ds_id).copied() {
             src.set_ds_policy(p);
         }
         Ok(src)
@@ -85,7 +93,14 @@ impl SourceRegistry {
 
     /// 连通性测试（新增数据源时的「测试连接」按钮）：一条**独立短连接**问版本号，
     /// 不进池 —— 配错的 DSN 不该在注册表里留下一个坏池。
+    /// 整段包超时：黑洞主机不能让按钮永远转圈。
     pub async fn probe(&self, spec: &DsSpec) -> Result<String, ConnectorError> {
+        tokio::time::timeout(PROBE_TIMEOUT, self.probe_inner(spec))
+            .await
+            .map_err(|_| ConnectorError::timeout(spec.ds_id.as_str(), PROBE_TIMEOUT))?
+    }
+
+    async fn probe_inner(&self, spec: &DsSpec) -> Result<String, ConnectorError> {
         let at = spec.ds_id.as_str();
         let dsn = self.dsn(spec)?;
         match spec.kind {
@@ -108,6 +123,20 @@ impl SourceRegistry {
                     .fetch_one(&mut c)
                     .await
                     .map_err(|e| sqlx_err(at, e))?;
+                // 配了 schema 就校验其存在性：schema 配错也能「测通」，之后 schema 采集才空手
+                if let Some(s) = spec.schema.as_deref() {
+                    let exists: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",
+                    )
+                    .bind(s)
+                    .fetch_one(&mut c)
+                    .await
+                    .map_err(|e| sqlx_err(at, e))?;
+                    if !exists {
+                        let _ = c.close().await;
+                        return Err(ConnectorError::config(at, format!("schema 不存在: {s}")));
+                    }
+                }
                 let _ = c.close().await;
                 Ok(v)
             }
@@ -124,7 +153,13 @@ impl SourceRegistry {
 
     async fn build(&self, spec: &DsSpec) -> Result<Arc<dyn SqlSource>, ConnectorError> {
         let dsn = self.dsn(spec)?.to_string();
-        tracing::info!("建池 {} -> {}", spec.ds_id, redact_dsn(&dsn));
+        tracing::info!(
+            "建池 {} -> {} (kind={}, max_conn={})",
+            spec.ds_id,
+            redact_dsn(&dsn),
+            spec.kind,
+            spec.max_conn
+        );
         let ds = spec.ds_id.clone();
         Ok(match spec.kind {
             SourceKind::Mysql => Arc::new(
@@ -152,20 +187,29 @@ impl SourceRegistry {
 
     fn dsn(&self, spec: &DsSpec) -> Result<&str, ConnectorError> {
         self.dsns.get(&spec.dsn_ref).map(String::as_str).ok_or_else(|| {
-            // 只报键名，不报值：这条错误会进日志
-            ConnectorError::config(spec.ds_id.as_str(), format!("dsn_ref 未配置: {}", spec.dsn_ref))
+            // 只报键名，不报值：这条错误会进日志。带上已配置键数，省一遍翻配置
+            ConnectorError::config(
+                spec.ds_id.as_str(),
+                format!("dsn_ref 未配置: {}（已配置 {} 键）", spec.dsn_ref, self.dsns.len()),
+            )
         })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<DsId, Arc<dyn SqlSource>>> {
-        // 中毒只可能来自持锁时 panic，而持锁段里只有 HashMap 操作
+        // 持锁段只有 HashMap 操作，中毒本不可能；恢复分支是纯防御（真中毒也不拖垮注册表）
         self.pools.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn policies_lock(&self) -> std::sync::MutexGuard<'_, HashMap<DsId, DsPolicy>> {
+        self.policies.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 /// 日志用：口令段换成 `***`。**纯函数**，DSN 一进日志就再也收不回来，故必须单测。
 ///
 /// 覆盖两种漏法：`scheme://user:pass@host/db` 的 userinfo，与 `?password=` / `?pwd=` 查询参数。
+/// 覆盖边界：无 `://` 的 `user:pass@host` 裸形态不进 userinfo 遮蔽分支（无 scheme 时
+/// userinfo 与路径不可区分）——那种形态只有 `password=`/`pwd=` 键会被 mask。
 pub fn redact_dsn(dsn: &str) -> String {
     let Some((scheme, rest)) = dsn.split_once("://") else {
         return mask_params(dsn);
@@ -183,31 +227,34 @@ pub fn redact_dsn(dsn: &str) -> String {
 
 /// `password=xxx` / `pwd=xxx` 参数值换成 `***`（PG 的 URI 与 keyword/value DSN 都这么写口令）
 fn mask_params(s: &str) -> String {
+    // ascii 小写化不改字节长度：全程复用这一份小写找键，下标直接切回原串
+    let low = s.to_ascii_lowercase();
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = find_secret_key(rest) {
-        let (head, tail) = rest.split_at(i);
-        out.push_str(head);
-        let (key, val) = tail.split_once('=').unwrap_or((tail, ""));
-        out.push_str(key);
-        out.push_str("=***");
-        // 值到下一个分隔符为止（`&` 查询参数 / ` ` keyword-value DSN）
-        rest = match val.find(['&', ' ']) {
-            Some(j) => &val[j..],
-            None => "",
+    let mut at = 0;
+    while let Some(i) = find_secret_key(&low[at..]).map(|i| at + i) {
+        out.push_str(&s[at..i]);
+        let eq = i + low[i..].find('=').expect("find_secret_key 保证有 =") + 1;
+        out.push_str(&s[i..eq]);
+        out.push_str("***");
+        // 值到下一个分隔符为止（`&`/`?` 查询参数、` ` keyword-value、`;` ADO 风格）
+        at = match low[eq..].find(['&', ' ', ';']) {
+            Some(j) => eq + j,
+            None => s.len(),
         };
     }
-    out.push_str(rest);
+    out.push_str(&s[at..]);
     out
 }
 
 /// 下一个 `password` / `pwd` 键的起点（键名必须紧跟 `=`，避免误伤库名里的 `pwd`）。
-/// `to_ascii_lowercase` 而非 `to_lowercase`：后者会改字节长度，索引拿回原串就可能切在字符中间 panic。
-fn find_secret_key(s: &str) -> Option<usize> {
-    let low = s.to_ascii_lowercase();
+/// 入参必须是**已小写化**的串（调用方在 `mask_params` 里只 `to_ascii_lowercase` 一次）。
+/// 键边界：前一字符必须是起始 / `&` / `?` / 空格 / `;` —— `expwd=x`、路径 `/expwd=1` 不算键。
+fn find_secret_key(low: &str) -> Option<usize> {
+    // match_indices 而非 find：首个命中被键边界过滤掉时，后面合法的命中不能丢
     ["password=", "pwd=", "passwd="]
         .iter()
-        .filter_map(|k| low.find(k))
+        .flat_map(|k| low.match_indices(k).map(|(i, _)| i).collect::<Vec<_>>())
+        .filter(|i| *i == 0 || matches!(low.as_bytes()[i - 1], b'&' | b'?' | b' ' | b';'))
         .min()
 }
 
@@ -242,6 +289,11 @@ mod tests {
         assert_eq!(redact_dsn("not a dsn"), "not a dsn");
         // 库名里含 pwd 不该被当成键（键名必须紧跟 =）
         assert_eq!(redact_dsn("mysql://u:p@h/pwd_db"), "mysql://u:***@h/pwd_db");
+        // ADO 风格分号终止符：剩余参数不被吃掉
+        assert_eq!(redact_dsn("Password=s3cret;User ID=u"), "Password=***;User ID=u");
+        // 键边界：expwd/xpwd 这类前缀不是键，不被误遮
+        assert_eq!(redact_dsn("mysql://u:p@h/db?expwd=1"), "mysql://u:***@h/db?expwd=1");
+        assert_eq!(redact_dsn("host=h;expwd=1;pwd=s3cret"), "host=h;expwd=1;pwd=***");
     }
 
     fn spec(dsn_ref: &str) -> DsSpec {
@@ -263,7 +315,10 @@ mod tests {
             reg.probe(&spec("dms-main")).await.err().unwrap(),
         ] {
             assert!(matches!(e, ConnectorError::Config(_)), "{e}");
-            assert_eq!(e.to_string(), "配置错误 [ds-7] dsn_ref 未配置: dms-main");
+            assert_eq!(
+                e.to_string(),
+                "配置错误 [ds-7] dsn_ref 未配置: dms-main（已配置 0 键）"
+            );
         }
         // 摘一个从没建过的源不 panic
         reg.close(&DsId::new("ds-7")).await;

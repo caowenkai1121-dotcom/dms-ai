@@ -9,11 +9,13 @@
 
 /// `meta.query_log` 的唯一 INSERT（列顺序＝server `query_log.rs` 建表 DDL 的语义顺序）。
 /// 两个写口共用这一条：改列清单只许改这里。
-pub const INSERT_SQL: &str =
-    "INSERT INTO meta.query_log
-     (login_name, ds_id, route, question, sql, row_count, elapsed_ms, cache_hit,
-      prompt_tokens, completion_tokens, error, trace_id, conv_id, llm_calls, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)";
+/// （`concat!` 拼单行：字节即最终 SQL——内嵌换行/缩进会原样进慢查询日志，全是噪声空白。）
+pub const INSERT_SQL: &str = concat!(
+    "INSERT INTO meta.query_log ",
+    "(login_name, ds_id, route, question, sql, row_count, elapsed_ms, cache_hit, ",
+    "prompt_tokens, completion_tokens, error, trace_id, conv_id, llm_calls, status) ",
+    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"
+);
 
 /// `route` 列的 KB 取值。`Answer::text`（wire 上的 route）与 knowledge 落账共用同一常量 ——
 /// 两处同值是「usage 路由分布 / admin 质量页 / 反馈绑定」对上号的前提。
@@ -33,6 +35,10 @@ pub const CLIP_CHARS: usize = 2000;
 
 /// 按**字符**截断（按字节截会把中文切成半个字，入库即乱码）
 pub fn clip(s: &str) -> String {
+    // 快路径：字节数 ≤ CLIP_CHARS 则字符数必 ≤ CLIP_CHARS（字符数 ≤ 字节数）
+    if s.len() <= CLIP_CHARS {
+        return s.to_string();
+    }
     s.chars().take(CLIP_CHARS).collect()
 }
 
@@ -45,14 +51,16 @@ pub fn sanitize(s: &str) -> String {
 
 /// `scheme://user:pass@host` → `scheme://***@host`。userinfo 只认「`://` 之后、
 /// 第一段不含路径分隔符的 `@`」这一形态，误剥面限定在真 URL 上。
+/// 已知形态假设：多 `@`（`user@h1@h2`）只剥到第一个 `@`，残留第二段 —— 罕见且方向安全。
 fn redact_url_userinfo(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find("://") {
         let head_end = i + 3; // "://" 之后
         let tail = &rest[head_end..];
+        // 空白一律排除（含 \n\r：多行错误文案里 `@` 在下一行时不能跨行误剥正常文本）
         match tail.find('@').filter(|&a| {
-            !tail[..a].chars().any(|c| matches!(c, '/' | '?' | '#' | ' ' | '\t'))
+            !tail[..a].chars().any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#'))
         }) {
             Some(a) => {
                 out.push_str(&rest[..head_end]);
@@ -69,22 +77,33 @@ fn redact_url_userinfo(s: &str) -> String {
     out
 }
 
-/// `password=abc` → `password=***`。键大小写不敏感；值剥到空白 / `&` / `;` / 引号为止。
+/// `password=abc` → `password=***`。键大小写不敏感；值剥到空白 / `&` / `;` / `,` / 引号为止。
 fn redact_key_values(s: &str) -> String {
-    /// 键名命中即剥值（覆盖 DSN 参数与 LLM 配置里出现过的形态）
-    const SENSITIVE_KEYS: &[&str] =
-        &["password", "passwd", "pwd", "secret", "api_key", "apikey", "token", "access_token"];
-    let mut out = String::with_capacity(s.len());
+    /// 键名命中即剥值（覆盖 DSN 参数与 LLM 配置里出现过的形态；
+    /// passphrase/authorization/cookie 同样可能回带凭据）
+    const SENSITIVE_KEYS: &[&str] = &[
+        "password", "passwd", "pwd", "secret", "api_key", "apikey", "token", "access_token",
+        "passphrase", "authorization", "cookie",
+    ];
+    let mut out = String::with_capacity(s.len()); // 注：容量不是上界（`pwd=1`→`pwd=***` 反而变长），push_str 自扩容
     let mut rest = s;
     while let Some(i) = rest.find('=') {
+        // 键名字符集含 `-` `.`（`api-key=`/`x.api.key=` 不能被截成 "key" 而漏剥）
         let key_start = rest[..i]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'))
             .map(|p| p + 1)
             .unwrap_or(0);
-        if SENSITIVE_KEYS.iter().any(|k| rest[key_start..i].eq_ignore_ascii_case(k)) {
+        // `-`/`.` 归一成 `_` 再比对（api-key ≡ api_key）
+        let key = &rest[key_start..i];
+        let normalized: std::borrow::Cow<str> = if key.contains(['-', '.']) {
+            std::borrow::Cow::Owned(key.replace(['-', '.'], "_"))
+        } else {
+            std::borrow::Cow::Borrowed(key)
+        };
+        if SENSITIVE_KEYS.iter().any(|k| normalized.eq_ignore_ascii_case(k)) {
             let val_start = i + 1;
             let val_end = rest[val_start..]
-                .find(|c: char| c.is_whitespace() || matches!(c, '&' | ';' | '\'' | '"'))
+                .find(|c: char| c.is_whitespace() || matches!(c, '&' | ';' | ',' | '\'' | '"'))
                 .map(|p| val_start + p)
                 .unwrap_or(rest.len());
             out.push_str(&rest[..val_start]);
@@ -101,10 +120,11 @@ fn redact_key_values(s: &str) -> String {
 
 /// 超时文案判据（两个写口的 status 分类共用）：本仓错误文案里这三个词只用于真超时。
 /// typed 判据（各 crate 自己的错误类型）在各写口自己手里，这里只管丢了类型的文案形态。
+/// 覆盖范围声明：只覆盖 reqwest（"operation timed out"）与本仓自研（"超时"/"timeout"）两类
+/// 来源；gRPC 的 "deadline exceeded" 暂不认（今天没有 tonic 类客户端，引入了再补词）。
 pub fn timeout_marked(msg: &str) -> bool {
-    msg.contains("超时")
-        || msg.to_ascii_lowercase().contains("timed out")
-        || msg.to_ascii_lowercase().contains("timeout")
+    let lower = msg.to_ascii_lowercase();
+    msg.contains("超时") || lower.contains("timed out") || lower.contains("timeout")
 }
 
 #[cfg(test)]
@@ -156,6 +176,16 @@ mod tests {
         assert!(s.contains("postgres://***@db.internal"), "{s}");
         assert!(s.contains("password=***") && s.contains("API_KEY=***"), "{s}");
         assert_eq!(sanitize("查询失败 [dms] Unknown column 'x'"), "查询失败 [dms] Unknown column 'x'");
+        // 键名归一（api-key ≡ api_key）与新键（passphrase/cookie）
+        let s = sanitize("api-key=sk-9 passphrase: 不对"); // 冒号不是本判据形态，不剥
+        assert!(s.contains("api-key=***"), "{s}");
+        let s = sanitize("cookie=session42; passphrase=abc");
+        assert!(!s.contains("session42") && !s.contains("abc"), "{s}");
+        // 值终止符含逗号：`password=abc,host=db` 只剥 abc，不整段吞
+        assert_eq!(sanitize("password=abc,host=db"), "password=***,host=db");
+        // 多行错误文案：`@` 在下一行时不跨行误剥
+        let s = sanitize("连接失败 postgres://db\n@稍后重试");
+        assert!(s.contains("@稍后重试"), "{s}");
     }
 
     /// 超时判据：中文「超时」、reqwest 的「operation timed out」、裸「timeout」都认，

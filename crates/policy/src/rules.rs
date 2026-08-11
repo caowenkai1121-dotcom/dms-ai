@@ -1,6 +1,6 @@
 //! 表权限档案注册表：进程内快照 + `meta.scope_binding` 播种/加载。
 //!
-//! 两处相对 server/src/inject.rs 的改动，都是缺陷修复而非「顺手优化」：
+//! 两处相对 server/src/inject.rs（已删除）的改动，都是缺陷修复而非「顺手优化」：
 //! ① `OnceLock` → `RwLock<Arc<RuleSet>>`：`OnceLock` 只能设一次，管理面改完档案要重启进程才生效；
 //!    每请求 `snapshot()` clone 的是一个 `Arc`，不再 clone 32 行 `HashMap`。
 //! ② 多参解码函数 → `BindingRow`（D4）：同型 `Option<String>` 连排传错顺序**不会编译报错**，
@@ -31,6 +31,8 @@ pub fn snapshot() -> Arc<RuleSet> {
 
 /// 热更新的唯一写入口（`load_rules` 与管理面「重载权限档案」共用）
 pub fn install(rules: RuleSet) {
+    // 档案热更新是运维事件：不留痕就查不了「档案何时被换」
+    tracing::info!("权限档案热更新: {} 条", rules.len());
     *cell().write().unwrap_or_else(PoisonError::into_inner) = Arc::new(rules);
 }
 
@@ -39,7 +41,10 @@ pub fn install(rules: RuleSet) {
 /// 列绑定本质只服务 DMS 源，别的库没有这套列，非 DMS 源在 `meta.datasource` 里走
 /// `policy_kind='global'` 根本不进注入。这里只需保证「不把 DMS 的列绑定加载给别的源」。
 const LOAD: &str = "SELECT table_name, mode, customer_col, customer_kind, owner_col, owner_kind, via_table, via_local_col, via_remote_col
-     FROM meta.scope_binding WHERE 1 = 1 AND ds_id IN ($1, '*')";
+     FROM meta.scope_binding WHERE ds_id IN ($1, '*')
+     ORDER BY CASE WHEN ds_id = '*' THEN 0 ELSE 1 END, table_name";
+// ORDER BY 的说明：主键是 table_name，同一表 '*' 行与 ds 专属行今天不可能共存（PK 唯一），
+// 排序是给「将来主键加 ds_id 前缀」备的确定性——届时专属行后写胜出（collect 是后写覆盖先写）。
 
 /// `ON CONFLICT (table_name)`：`meta.scope_binding` 的主键没有前置 ds_id（K3-B 只加列不改主键），
 /// 灌的就是 DMS 语料，ds_id 由列默认值填 'dms'。真要按源分档案时随主键一起改。
@@ -96,16 +101,19 @@ impl BindingRow {
             via_remote_col: None,
         };
         match rule {
-            TableRule::Global => {}
+            TableRule::Global => {
+                // Global/Via 臂不落 `Some("codes")` 这种误导性列值（读侧忽略，但种子行别撒谎）
+                r.customer_kind = None;
+            }
             TableRule::Scoped(b) => {
                 r.mode = "scoped".into();
-                r.customer_col = b.customer_col.clone();
                 r.customer_kind = Some(match b.customer_kind {
                     CustomerKind::Codes => "codes",
                     CustomerKind::RequiredCodes => "required_codes",
                     CustomerKind::ManagerCodes => "manager_codes",
                     CustomerKind::ShopCodes => "shop_codes",
                 }.into());
+                r.customer_col = b.customer_col.clone();
                 r.owner_col = b.owner_col.clone();
                 r.owner_kind = Some(match b.owner_kind {
                     OwnerKind::Ids => "ids",
@@ -115,6 +123,7 @@ impl BindingRow {
             }
             TableRule::Via { table, local_col, remote_col } => {
                 r.mode = "via".into();
+                r.customer_kind = None;
                 r.via_table = Some(table.clone());
                 r.via_local_col = Some(local_col.clone());
                 r.via_remote_col = Some(remote_col.clone());
@@ -123,8 +132,8 @@ impl BindingRow {
         r
     }
 
-    /// 行 → 档案（加载方向）。缺列/未知枚举一律 `None` = 跳过该表 = 该表 fail-closed 拒绝。
-    pub fn to_rule(&self) -> Option<TableRule> {
+    /// 行 → 档案（加载方向，消费本行）。缺列/未知枚举一律 `None` = 跳过该表 = 该表 fail-closed 拒绝。
+    pub fn to_rule(self) -> Option<TableRule> {
         // 删除是迁移清理，读侧拒绝才是运行时安全边界：即使旧行位于自定义 ds_id、
         // 清理尚未执行或管理员误恢复，也不能重新进入进程权限快照。
         if is_retired_table(&self.table_name) {
@@ -160,29 +169,27 @@ impl BindingRow {
                     }
                 };
                 Some(TableRule::Scoped(Binding {
-                    customer_col: self.customer_col.clone(),
+                    customer_col: self.customer_col,
                     customer_kind,
-                    owner_col: self.owner_col.clone(),
+                    owner_col: self.owner_col,
                     owner_kind,
                 }))
             }
-            "via" => {
-                let (Some(t), Some(l), Some(r)) = (
-                    self.via_table.clone(),
-                    self.via_local_col.clone(),
-                    self.via_remote_col.clone(),
-                ) else {
+            "via" => match (self.via_table, self.via_local_col, self.via_remote_col) {
+                (Some(table), Some(local_col), Some(remote_col)) => {
+                    Some(TableRule::Via { table, local_col, remote_col })
+                }
+                _ => {
                     tracing::warn!(
                         "scope_binding {} via 缺列，跳过（该表将 fail-closed 拒绝）",
                         self.table_name
                     );
-                    return None;
-                };
-                Some(TableRule::Via { table: t, local_col: l, remote_col: r })
-            }
+                    None
+                }
+            },
             other => {
                 tracing::warn!(
-                    "scope_binding {} 未知 mode={other}，跳过（该表将 fail-closed 拒绝）",
+                    "scope_binding {} 未知 mode={other:?}，跳过（该表将 fail-closed 拒绝）",
                     self.table_name
                 );
                 None
@@ -210,15 +217,20 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BindingRow {
     }
 }
 
-/// 内置种子灌入 `meta.scope_binding`（upsert，代码为种子真相；管理员手工加的行保留）
+/// 内置种子灌入 `meta.scope_binding`（upsert，代码为种子真相；管理员手工加的行保留）。
+/// 不在事务里（DELETE_RETIRED + 39 条 UPSERT）：中途失败留混合态，但两步都幂等 ——
+/// 失败重跑即自愈。
 pub async fn seed_rules(store: &OwnedStore) -> anyhow::Result<()> {
     store
         .fixed(DELETE_RETIRED)
         .bind(RETIRED.iter().map(|name| (*name).to_string()).collect::<Vec<_>>())
         .execute()
         .await?;
-    for (t, rule) in builtin_rules() {
-        let r = BindingRow::of(&t, &rule);
+    // HashMap 迭代序不定：排序后 upsert 的执行/日志顺序逐轮一致
+    let mut seeded: Vec<(String, TableRule)> = builtin_rules().into_iter().collect();
+    seeded.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (t, rule) in &seeded {
+        let r = BindingRow::of(t, rule);
         store
             .fixed(UPSERT)
             .bind(r.table_name)
@@ -241,10 +253,17 @@ pub async fn seed_rules(store: &OwnedStore) -> anyhow::Result<()> {
 pub async fn load_rules(store: &OwnedStore, ds: &str) -> anyhow::Result<usize> {
     let rows: Vec<BindingRow> = store.fixed(LOAD).bind(ds).fetch_all().await?;
     let m: HashMap<String, TableRule> = rows
-        .iter()
-        .filter_map(|r| r.to_rule().map(|rule| (r.table_name.clone(), rule)))
+        .into_iter()
+        .filter_map(|r| {
+            let table_name = r.table_name.clone();
+            r.to_rule().map(|rule| (table_name, rule))
+        })
         .collect();
     let n = m.len();
+    if n == 0 {
+        // 一条都没装上多半是 ds 名写错这类运维事故：空表 = 全表 fail-closed，不能静默
+        tracing::warn!("load_rules 装载 0 条权限档案（ds={ds}），受限用户将全表 fail-closed");
+    }
     install(RuleSet::from(m));
     Ok(n)
 }
@@ -323,7 +342,7 @@ mod tests {
             remote_col: "c".into(),
         });
         r.via_remote_col = None;
-        assert!(r.to_rule().is_none(), "via 缺列必须跳过");
+        assert!(r.clone().to_rule().is_none(), "via 缺列必须跳过");
         r.mode = "whatever".into();
         assert!(r.to_rule().is_none(), "未知 mode 必须跳过");
 
@@ -337,7 +356,7 @@ mod tests {
             }),
         );
         r.customer_kind = Some("shop_code".into());
-        assert!(r.to_rule().is_none(), "未知 customer_kind 不得退化为客户编码");
+        assert!(r.clone().to_rule().is_none(), "未知 customer_kind 不得退化为客户编码");
         r.customer_kind = Some("codes".into());
         r.owner_kind = None;
         assert!(r.to_rule().is_none(), "缺失 owner_kind 不得退化为员工 ID");

@@ -44,6 +44,9 @@ const INVOICE_NEW_DETAIL: DmsLookupPolicy =
 const CUSTOMER: DmsLookupPolicy = DmsLookupPolicy::new("t_customer", &["customer_code"]);
 const GOODS: DmsLookupPolicy = DmsLookupPolicy::new("t_goods", &["goods_code"]);
 
+/// `table_result` 的「永不截断」档：SQL 自带 LIMIT 1 时行数判据只是兜底形状（usize::MAX 太魔法）。
+const NO_TRUNC: usize = usize::MAX;
+
 pub struct BusinessLookupAnswerer;
 
 impl BusinessLookupAnswerer {
@@ -97,7 +100,7 @@ async fn document(
         )));
     };
     let Some(header_code_col) = source.header_code_cols.first() else { return Ok(None) };
-    let code = exact_literal(code)?;
+    let code = exact_literal(code)?; // 注册表识别的单号形状保证不可达（纯防御，fail-closed 不回落）
     let deleted = source.header_deleted_flag.then_some(" AND deleted_flag = 0").unwrap_or("");
     let header_sql = format!(
         "SELECT {} FROM {} WHERE {} = '{}'{} LIMIT 1",
@@ -114,20 +117,37 @@ async fn document(
     }
 
     let mut executed = vec![header_sql];
+    // 明细族并发（彼此无依赖，串行时每族白付一个 RTT）：`join_all` 保序，`executed` 与串行同序。
+    // 注册表声明了明细却没有点查策略的表：跳过必须留痕（原来是静默 continue）。
+    let jobs: Vec<_> = source
+        .details
+        .iter()
+        .filter_map(|detail| match detail_policy(detail.table) {
+            Some(policy) => {
+                let deleted = detail.deleted_flag.then_some(" AND deleted_flag = 0").unwrap_or("");
+                let sql = format!(
+                    "SELECT {} FROM {} WHERE {} = '{code}'{} LIMIT 50",
+                    detail.projection, detail.table, detail.code_col, deleted
+                );
+                Some((detail.table, sql, policy))
+            }
+            None => {
+                tracing::warn!(table = %detail.table, "明细表无点查策略，跳过");
+                None
+            }
+        })
+        .collect();
+    let results =
+        futures::future::join_all(jobs.iter().map(|(_, sql, policy)| lookup(cx, sql, policy))).await;
     let mut detail_sets = Vec::new();
-    for detail in source.details {
-        let Some(policy) = detail_policy(detail.table) else { continue };
-        let deleted = detail.deleted_flag.then_some(" AND deleted_flag = 0").unwrap_or("");
-        let sql = format!(
-            "SELECT {} FROM {} WHERE {} = '{code}'{} LIMIT 50",
-            detail.projection, detail.table, detail.code_col, deleted
-        );
-        let rows = lookup(cx, &sql, policy).await?;
+    for ((table, sql, _), rows) in jobs.into_iter().zip(results) {
+        let rows = rows?;
         executed.push(sql);
         if !rows.rows.is_empty() {
-            detail_sets.push((detail.table, rows));
+            detail_sets.push((table, rows));
         }
     }
+    let detail_truncated = detail_sets.iter().any(|(_, rs)| rs.rows.len() >= 50);
     let details = merge_rowsets(detail_sets);
     Ok(Some(document_answer(
         cx,
@@ -136,6 +156,7 @@ async fn document(
         executed.join(";\n"),
         header,
         details,
+        detail_truncated,
     )))
 }
 
@@ -150,7 +171,7 @@ async fn entity(
     kind: EntityKind,
     value: &str,
 ) -> anyhow::Result<Option<AskResult>> {
-    let value = exact_literal(value)?;
+    let value = exact_literal(value)?; // 上游 `entity_query` 已 `valid_entity_value` 过滤，此行纯防御（fail-closed）
     let sql = match kind {
         EntityKind::Customer => format!(
             "SELECT customer_code, customer_name, customer_short_name, province, city, district, \
@@ -172,31 +193,33 @@ async fn entity(
     };
     let mut rows = lookup(cx, &sql, policy).await?;
     if matches!(kind, EntityKind::Customer) {
-        retain_visible_rows(cx, &mut rows, Visibility::CustomerOrEmployee("area_manager_id"));
+        // 可见集合一次问答算一次（主档行过滤 + 订单补充过滤两回；Goods 路径不构建）
+        let sets = VisibleSets::of(cx);
+        retain_visible_rows(cx, &sets, &mut rows, Visibility::CustomerOrEmployee("area_manager_id"));
+        if rows.rows.len() == 1 {
+            return Ok(Some(
+                customer_answer(cx, &sets, sql, rows, "已识别客户主档；下方补充该客户的订单概览。")
+                    .await?,
+            ));
+        }
     }
     if rows.rows.is_empty() {
         return Ok(None);
     }
-    if matches!(kind, EntityKind::Customer) && rows.rows.len() == 1 {
-        return Ok(Some(
-            customer_answer(cx, sql, rows, "已识别客户主档；下方补充该客户的订单概览。")
-                .await?,
-        ));
-    }
-    let mut answer = table_result(cx, sql, rows, 10);
+    let mut answer = table_result(cx, sql, rows, 1); // SQL 自带 LIMIT 1，limit 只是兜底形状
     if matches!(kind, EntityKind::Goods) {
         answer.view.insight = Some(
             "已识别商品主档。生产 DMS 只允许商品编码单表点查；销售、客户与订单关联请在 Doris 数仓中查询。".into(),
         );
     }
-    if answer.row_count > 1 {
-        answer.view.insight = Some("匹配到多个候选，请确认具体对象，系统未自动猜测。".into());
-    }
+    // （两类实体 SQL 都 LIMIT 1，`row_count > 1` 不可达 —— 原来的多候选分支是死代码，已删；
+    //  多候选形态走 entity.rs 的 candidate_card，别在这里加回来。）
     Ok(Some(answer))
 }
 
 async fn customer_answer(
     cx: &AskCtx<'_>,
+    sets: &VisibleSets,
     main_sql: String,
     customer_rows: RowSet,
     insight: &str,
@@ -204,13 +227,14 @@ async fn customer_answer(
     let customer_code = cell_by_name(&customer_rows, 0, "customer_code")
         .and_then(value_text)
         .map(str::to_string);
-    let mut answer = table_result(cx, main_sql.clone(), customer_rows, usize::MAX);
+    let mut answer = table_result(cx, main_sql, customer_rows, NO_TRUNC);
     answer.view.insight = Some(insight.into());
     let Some(customer_code) = customer_code.filter(|code| valid_entity_value(code)) else {
         return Ok(answer);
     };
     let customer_scope_allows_orders = cx.scope.unrestricted_by_role()
-        || visible_customer_codes(cx)
+        || sets
+            .customers
             .iter()
             .any(|allowed| allowed.eq_ignore_ascii_case(&customer_code));
     if !customer_scope_allows_orders {
@@ -221,11 +245,12 @@ async fn customer_answer(
          FROM t_sales_order WHERE customer_code = '{customer_code}' AND deleted_flag = 0 LIMIT 20"
     );
     let mut orders = lookup(cx, &sql, &SALES_BY_CUSTOMER).await?;
-    retain_visible_rows(cx, &mut orders, Visibility::CustomerOrEmployee("owner_manager"));
+    retain_visible_rows(cx, sets, &mut orders, Visibility::CustomerOrEmployee("owner_manager"));
     if !orders.rows.is_empty() {
         answer.supplemental = Some(supplemental(orders, 20));
     }
-    answer.sql = format!("{main_sql};\n{sql}");
+    // main_sql 已 move 进 answer.sql：就地拼上补充查询，不再克隆第二回
+    answer.sql = format!("{};\n{sql}", std::mem::take(&mut answer.sql));
     Ok(answer)
 }
 
@@ -278,8 +303,10 @@ async fn document_row_visible(
     {
         return Ok(true);
     }
+    // 可见集合一次问答算一次（原先 `row_visible`/`retain_visible_rows` 各自重复构建）
+    let sets = VisibleSets::of(cx);
     if kind != DocumentKind::DeviceRequisition {
-        return Ok(row_visible(cx, header, 0, document_visibility(kind)));
+        return Ok(row_visible(cx, &sets, header, 0, document_visibility(kind)));
     }
     let Some(customer_code) = cell_by_name(header, 0, "customer_code")
         .and_then(value_text)
@@ -298,41 +325,49 @@ async fn document_row_visible(
     }
     Ok(row_visible(
         cx,
+        &sets,
         &customer,
         0,
         Visibility::CustomerOrEmployee("area_manager_id"),
     ))
 }
 
-fn row_visible(cx: &AskCtx<'_>, rows: &RowSet, row: usize, visibility: Visibility) -> bool {
+/// 一次问答算一次的可见集合：`visible_customer_codes`/`visible_employee_ids` 各自要
+/// filter+clone 一遍整个集合，一轮问答在多个函数里重复构建太浪费（权限判据不变，只是算一次）。
+struct VisibleSets {
+    customers: Vec<String>,
+    employees: Vec<i64>,
+}
+
+impl VisibleSets {
+    fn of(cx: &AskCtx<'_>) -> Self {
+        Self { customers: visible_customer_codes(cx), employees: visible_employee_ids(cx) }
+    }
+}
+
+fn row_visible(cx: &AskCtx<'_>, sets: &VisibleSets, rows: &RowSet, row: usize, visibility: Visibility) -> bool {
     if cx.scope.unrestricted_by_role() {
         return true;
     }
-    let customer = cell_by_name(rows, row, "customer_code").and_then(value_text);
     match visibility {
         Visibility::AccountBillManager(column) => manager_visible(
             cell_by_name(rows, row, column).and_then(value_text),
-            &visible_employee_ids(cx),
+            &sets.employees,
             cx.scope.manager_names(),
         ),
         Visibility::Customer
         | Visibility::CustomerOrEmployee(_)
         | Visibility::Employee(_)
         | Visibility::FailClosed => {
+            // customer 只在这一族里用：AccountBillManager 臂不白取白扫
+            let customer = cell_by_name(rows, row, "customer_code").and_then(value_text);
             let employee = match visibility {
                 Visibility::CustomerOrEmployee(column) | Visibility::Employee(column) => {
                     cell_by_name(rows, row, column).and_then(value_i64)
                 }
                 _ => None,
             };
-            scope_visible(
-                false,
-                customer,
-                employee,
-                &visible_customer_codes(cx),
-                &visible_employee_ids(cx),
-                visibility,
-            )
+            scope_visible(false, customer, employee, &sets.customers, &sets.employees, visibility)
         }
     }
 }
@@ -350,20 +385,20 @@ fn manager_visible(manager: Option<&str>, allowed_ids: &[i64], allowed_names: &[
             .any(|name| name.as_str() != "-1" && name.eq_ignore_ascii_case(manager))
 }
 
-fn retain_visible_rows(cx: &AskCtx<'_>, rows: &mut RowSet, visibility: Visibility) {
+fn retain_visible_rows(cx: &AskCtx<'_>, sets: &VisibleSets, rows: &mut RowSet, visibility: Visibility) {
     let unrestricted = cx.scope.unrestricted_by_role();
-    let customers = visible_customer_codes(cx);
-    let employees = visible_employee_ids(cx);
+    // 列下标在闭包外各算一次：原来每行 `position` 线性找，O(行×列)
     let columns = rows.columns.clone();
+    let index_of = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
+    let customer_i = index_of("customer_code");
+    let employee_i = match visibility {
+        Visibility::CustomerOrEmployee(column) | Visibility::Employee(column) => index_of(column),
+        _ => None,
+    };
     rows.rows.retain(|row| {
-        let customer = value_at(&columns, row, "customer_code").and_then(value_text);
-        let employee = match visibility {
-            Visibility::CustomerOrEmployee(column) | Visibility::Employee(column) => {
-                value_at(&columns, row, column).and_then(value_i64)
-            }
-            _ => None,
-        };
-        scope_visible(unrestricted, customer, employee, &customers, &employees, visibility)
+        let customer = customer_i.and_then(|i| row.get(i)).and_then(value_text);
+        let employee = employee_i.and_then(|i| row.get(i)).and_then(value_i64);
+        scope_visible(unrestricted, customer, employee, &sets.customers, &sets.employees, visibility)
     });
 }
 
@@ -393,6 +428,8 @@ fn scope_visible(
         Visibility::Employee(_) => {
             employee.is_some_and(|id| id != -1 && allowed_employees.contains(&id))
         }
+        // 只对未来误用者生效的两臂（fail-closed）：AccountBillManager 在 `row_visible` 上层
+        // 已分流去 `manager_visible`；FailClosed 族在 `document_row_visible` 单独判
         Visibility::AccountBillManager(_) => false,
         Visibility::FailClosed => false,
     }
@@ -423,8 +460,7 @@ fn value_at<'a>(
 }
 
 fn cell_by_name<'a>(rows: &'a RowSet, row: usize, name: &str) -> Option<&'a serde_json::Value> {
-    let column = rows.columns.iter().position(|column| column.eq_ignore_ascii_case(name))?;
-    rows.rows.get(row)?.get(column)
+    value_at(&rows.columns, rows.rows.get(row)?, name)
 }
 
 fn visible_customer_codes(cx: &AskCtx<'_>) -> Vec<String> {
@@ -442,6 +478,8 @@ fn visible_employee_ids(cx: &AskCtx<'_>) -> Vec<i64> {
 }
 
 fn entity_query(question: &str) -> Option<(EntityKind, String)> {
+    // 客套前缀/尾巴词表与 `entity.rs` 的 LEADING_INTENT/TRAILING_INTENT 大比例重叠
+    // （那边多「看看」族）。两份是有意的（各自词法门独立演化），但改动时两边都要看一眼 —— 互指防漂移。
     let mut q = question.trim().trim_matches(|c: char| matches!(c, '，' | ',' | '。' | '?' | '？'));
     loop {
         let Some(rest) = [
@@ -500,8 +538,7 @@ fn valid_entity_value(value: &str) -> bool {
     (2..=60).contains(&value.chars().count())
         && !value
             .chars()
-            .any(|c| matches!(c, '\'' | '"' | '%' | ';' | '\\'))
-        && !value.chars().any(char::is_control)
+            .any(|c| matches!(c, '\'' | '"' | '%' | ';' | '\\') || c.is_control())
 }
 
 fn exact_literal(value: &str) -> anyhow::Result<String> {
@@ -549,9 +586,10 @@ fn merge_rowsets(parts: Vec<(&str, RowSet)>) -> RowSet {
         return RowSet::default();
     }
     let mut columns = vec!["来源表".to_string()];
+    let mut seen = std::collections::HashSet::from(["来源表"]);
     for (_, rows) in &parts {
         for column in &rows.columns {
-            if !columns.contains(column) {
+            if seen.insert(column.as_str()) {
                 columns.push(column.clone());
             }
         }
@@ -599,15 +637,9 @@ fn document_answer(
     header_sql: String,
     mut header: RowSet,
     mut details: RowSet,
+    detail_truncated: bool,
 ) -> AskResult {
-    let mut pairs = document_identity_pairs(family, code);
-    pairs.extend(header
-        .columns
-        .iter()
-        .cloned()
-        .zip(header.rows.first().cloned().unwrap_or_default())
-        .filter(|(_, value)| !value.is_null())
-    );
+    let pairs = header_pairs(document_identity_pairs(family, code), &header);
     let has_details = !details.rows.is_empty();
     if has_details {
         details.redacted.extend(header.redacted.drain(..));
@@ -615,17 +647,19 @@ fn document_answer(
         details.redacted.dedup();
     }
     let rows = if has_details { details } else { header };
+    // build 只调一次：原先先算一遍 blocks 又被整体覆盖，白做一次全量决策
+    let mut view = dms_semantic::present::build(&rows.columns, &rows.rows);
     let mut blocks = vec![Block::Entity { pairs }];
     if has_details {
-        blocks.extend(dms_semantic::present::build(&rows.columns, &rows.rows).blocks);
+        blocks.extend(std::mem::take(&mut view.blocks));
     }
-    let mut view = dms_semantic::present::build(&rows.columns, &rows.rows);
     view.blocks = blocks;
     view.insight = Some(format!(
         "已识别{}并按当前 DMS 账号权限核验；主表与明细按同一单号分别执行轻量点查。",
         family.name
     ));
-    let truncated = rows.rows.len() >= 50;
+    // 截断按「任一单表明细顶到 LIMIT 50」判：合并后行数对单表上限判会误报（两个 30 行 → 60 ≥ 50）
+    let truncated = has_details && detail_truncated;
     result(cx, header_sql, rows, view, truncated)
 }
 
@@ -639,9 +673,11 @@ fn document_identity_pairs(
         ("主表".into(), serde_json::Value::String(family.header_table.into())),
         (
             "明细表".into(),
-            serde_json::Value::String(
-                family.details.iter().map(|(table, _)| *table).collect::<Vec<_>>().join("、"),
-            ),
+            serde_json::Value::String(if family.details.is_empty() {
+                "（无）".to_string() // 空清单不拼出空串（头卡「明细表：（空）」是坏展示）
+            } else {
+                family.details.iter().map(|(table, _)| *table).collect::<Vec<_>>().join("、")
+            }),
         ),
     ]
 }
@@ -661,6 +697,25 @@ fn document_registry_answer(
     result(cx, String::new(), RowSet::default(), view, false)
 }
 
+/// 头卡 pairs = 身份四件 + header 投影行。header 投影里若含与身份同 label 的列（如「单号」），
+/// 先过滤 —— 同一标签在头卡出现两次是展示事故。
+fn header_pairs(
+    identity: Vec<(String, serde_json::Value)>,
+    header: &RowSet,
+) -> Vec<(String, serde_json::Value)> {
+    let mut pairs = identity;
+    // 先收集再并入：filter 闭包对 pairs 的不可变借用止于 collect，不与 extend 打架
+    let extra = header
+        .columns
+        .iter()
+        .cloned()
+        .zip(header.rows.first().cloned().unwrap_or_default())
+        .filter(|(label, value)| !value.is_null() && !pairs.iter().any(|(l, _)| l == label))
+        .collect::<Vec<_>>();
+    pairs.extend(extra);
+    pairs
+}
+
 fn table_result(cx: &AskCtx<'_>, sql: String, rows: RowSet, limit: usize) -> AskResult {
     let truncated = rows.rows.len() >= limit;
     let view = dms_semantic::present::build(&rows.columns, &rows.rows);
@@ -678,7 +733,7 @@ fn result(
     let row_count = rows.len();
     AskResult {
         sql,
-        columns: columns.clone(),
+        columns,
         rows,
         row_count,
         truncated,
@@ -724,6 +779,23 @@ mod tests {
         assert!(entity_query("客户 线下-长沙某客户").is_none());
         assert!(entity_query("本月销售额是多少").is_none());
         assert!(entity_query("客户编码 %").is_none());
+    }
+
+    #[test]
+    fn header_pairs_drop_columns_duplicating_identity_labels() {
+        let family = dms_semantic::document::DOCUMENT_FAMILIES
+            .iter()
+            .find(|f| f.kind == DocumentKind::SalesOrder)
+            .unwrap();
+        let header = RowSet {
+            columns: vec!["单号".into(), "客户".into()],
+            rows: vec![vec![serde_json::json!("X1"), serde_json::json!("恒众")]],
+            redacted: vec![],
+        };
+        let pairs = header_pairs(document_identity_pairs(family, "X1"), &header);
+        // 「单号」只在身份四件里出现一次（header 投影的同名列被滤掉）
+        assert_eq!(pairs.iter().filter(|(l, _)| l == "单号").count(), 1, "{pairs:?}");
+        assert!(pairs.iter().any(|(l, _)| l == "客户"), "{pairs:?}");
     }
 
     #[test]
@@ -778,7 +850,7 @@ mod tests {
     #[test]
     fn recognized_but_unverified_documents_still_return_exact_registry_identity() {
         for (code, kind, header, details) in [
-            ("CG2603090123", DocumentKind::PurchaseTransfer, "t_winc_purchase_transfer", ""),
+            ("CG2603090123", DocumentKind::PurchaseTransfer, "t_winc_purchase_transfer", "（无）"),
             ("SHOP_PH20260805100005", DocumentKind::ShopShipment, "t_shop_shipment_order", "t_shop_order_header、t_shop_order_detail"),
             ("PZ20260805100003", DocumentKind::Voucher, "t_voucher_header", "t_voucher_detail"),
         ] {

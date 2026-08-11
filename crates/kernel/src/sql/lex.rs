@@ -8,6 +8,11 @@
 
 /// 词法剥离：去掉字符串字面量（'…'/"…"，支持 \ 转义与 '' 重复转义）与注释（--、#、/* */）。
 /// 安全关键词扫描专用——字面量里的敏感词不再干扰判定。
+///
+/// 已知方言偏差（从宽，刻意）：① `\` 转义对所有方言生效——PG `standard_conforming_strings=on`
+/// 下 `'\'` 是完整字面量，这里会把后续文本吞进字符串态（AST 主防线在，这是二防的漏判方向）；
+/// ② `#` 一律当行注释——PG 里 `#` 是位运算 XOR，`a # b` 之后的文本会被吞（同为二防漏判）；
+/// ③ `--` 不要求后随空白（MySQL 需要 `-- `），`1--2` 会被当注释（从宽处理，方向是多剥）。
 pub fn strip_literals_and_comments(sql: &str) -> String {
     let b: Vec<char> = sql.chars().collect();
     let mut out = String::with_capacity(sql.len());
@@ -79,9 +84,14 @@ pub fn split_top_and(filter: &str) -> Vec<String> {
             }
             _ if depth == 0
                 && chars[i..].len() >= 5
-                && chars[i..i + 5].iter().collect::<String>().eq_ignore_ascii_case(" and ") =>
+                && chars[i..i + 5]
+                    .iter()
+                    .zip(" and ".chars())
+                    .all(|(a, b)| a.eq_ignore_ascii_case(&b)) =>
             {
-                out.push(cur.trim().to_string());
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
                 cur.clear();
                 i += 5;
                 continue;
@@ -93,22 +103,32 @@ pub fn split_top_and(filter: &str) -> Vec<String> {
     if !cur.trim().is_empty() {
         out.push(cur.trim().to_string());
     }
-    out.into_iter().filter(|s| !s.is_empty()).collect()
+    out
 }
 
-/// 取条件串里的第一个标识符（列名），小写去反引号
+/// 取条件串里的第一个标识符（列名），小写去反引号/双引号。
+/// 首字符非字母/`_`/引号（如 `"1 = 1"` 的数字）返回 None：数字不是标识符，
+/// 消费者拿它查列名必落空。
 pub fn first_ident_of(cond: &str) -> Option<String> {
+    let first = cond.trim_start().chars().next()?;
+    if !(first.is_alphabetic() || first == '_' || first == '`' || first == '"') {
+        return None;
+    }
     let t: String = cond
         .trim()
         .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '`')
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '`' || *c == '"')
         .collect();
-    let t = t.trim_matches('`').to_lowercase();
+    let t = t.trim_matches(|c| c == '`' || c == '"').to_lowercase();
     if t.is_empty() { None } else { Some(t) }
 }
 
 /// 从 FROM 串里解析出 (真实表名, 别名) 列表：`t_x a JOIN t_y b ON ...` / `(子查询) a`。
-/// 纯文本扫描（组合器自己拼的串形态固定），子查询段跳过。纯函数可单测。
+/// 纯文本扫描，子查询段跳过。纯函数可单测。
+///
+/// ⚠️ **DMS 形态专用**：只认 `t_` 前缀的表（这个「零 DMS 语料」的 crate 里唯一的例外，
+/// 消费者是 server 侧装配/管理面（direct.rs / main.rs / admin_api.rs），它们喂的正是
+/// DMS 形态的 SQL）。通用化时把前缀改成参数。
 pub fn from_table_aliases(from: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![];
     // 去掉括号内内容（子查询/ON 条件里的函数），避免误把子查询里的表当作 FROM 项
@@ -147,10 +167,9 @@ pub fn from_table_aliases(from: &str) -> Vec<(String, String)> {
 
 /// 收集 SQL 片段里对某别名的列引用（`别名.列`），小写去重。纯函数可单测。
 pub fn base_col_refs(frag: &str, alias: &str) -> Vec<String> {
-    let pat = format!("{alias}.");
     let mut out: Vec<String> = vec![];
     let lower = frag.to_lowercase();
-    let pat = pat.to_lowercase();
+    let pat = alias.to_lowercase() + ".";
     let mut from = 0usize;
     while let Some(pos) = lower[from..].find(&pat) {
         let start = from + pos;
@@ -173,16 +192,19 @@ pub fn base_col_refs(frag: &str, alias: &str) -> Vec<String> {
     out
 }
 
+/// `qualify_cols` 的 SQL 关键词表。**必须保持字典序**（binary_search），tests 里有断言。
+/// 注意：加词即改行为（装配器输出会跟着变），每加一个都要过一遍装配侧回归。
+const KEYWORDS: &[&str] = &[
+    "AND", "AS", "ASC", "AVG", "BETWEEN", "CASE", "COALESCE", "COUNT", "CURDATE", "DATE",
+    "DATE_ADD", "DATE_FORMAT", "DATE_SUB", "DAY", "DESC", "DISTINCT", "ELSE", "END", "EXISTS",
+    "FALSE", "GROUP_CONCAT", "IF", "IFNULL", "IN", "INTERVAL", "IS", "LIKE", "MAX", "MIN",
+    "MONTH", "NOT", "NOW", "NULL", "NULLIF", "OR", "ROUND", "SUM", "THEN", "TRUE", "WHEN",
+    "YEAR", "YEARWEEK",
+];
+
 /// 裸列限定到基表别名：非函数、未限定、非关键字的标识符 → alias.col。
 /// 单引号字面量段原样跳过；已有前缀（a.col）的列原样跳过。纯函数可单测。
 pub fn qualify_cols(expr: &str, alias: &str) -> String {
-    const KEYWORDS: &[&str] = &[
-        "AND", "OR", "NOT", "IN", "IS", "NULL", "DISTINCT", "CASE", "WHEN", "THEN", "ELSE", "END",
-        "AS", "ASC", "DESC", "LIKE", "BETWEEN", "EXISTS", "TRUE", "FALSE", "COALESCE", "NULLIF",
-        "DATE", "YEAR", "MONTH", "DAY", "CURDATE", "NOW", "INTERVAL", "YEARWEEK", "DATE_FORMAT",
-        "DATE_ADD", "DATE_SUB", "ROUND", "IF", "IFNULL",
-        "SUM", "COUNT", "AVG", "MAX", "MIN", "GROUP_CONCAT",
-    ];
     let mut out = String::with_capacity(expr.len() + 16);
     let mut in_quote = false;
     let mut after_dot = false; // '.' 后的标识符=已被前缀限定的列，原样跳过
@@ -193,8 +215,10 @@ pub fn qualify_cols(expr: &str, alias: &str) -> String {
         }
         let up = tok.to_uppercase();
         let word = tok.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false);
-        if qualify && word && !KEYWORDS.contains(&up.as_str()) {
-            out.push_str(&format!("{alias}.{tok}"));
+        if qualify && word && KEYWORDS.binary_search(&up.as_str()).is_err() {
+            out.push_str(alias);
+            out.push('.');
+            out.push_str(tok);
         } else {
             out.push_str(tok);
         }
@@ -257,6 +281,19 @@ mod tests {
     #[test]
     fn first_ident_strips_backticks() {
         assert_eq!(first_ident_of("`Deleted_Flag` = 0"), Some("deleted_flag".to_string()));
+        assert_eq!(first_ident_of("\"Deleted_Flag\" = 0"), Some("deleted_flag".to_string()), "双引号标识符同剥");
+    }
+
+    #[test]
+    fn first_ident_rejects_digit_leading() {
+        assert_eq!(first_ident_of("1 = 1"), None, "数字不是标识符");
+    }
+
+    #[test]
+    fn keywords_stay_sorted_for_binary_search() {
+        let mut sorted = KEYWORDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, KEYWORDS, "KEYWORDS 必须保持字典序");
     }
 
     #[test]

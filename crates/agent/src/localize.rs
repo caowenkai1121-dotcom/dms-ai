@@ -8,11 +8,11 @@
 
 use crate::ctx::{AskCtx, AskResult, ValueLabel};
 
-/// 出口钩子（`ask()` 每个子问各调一次）。空结果（反问/复合容器/0 列）直接过，
-/// 连词表都不加载 —— 没有列可译时不许白付一次缓存查找。
+/// 出口钩子（`ask()` 每个子问各调一次）。空结果（反问/复合容器：主列与 supplemental 列**都**空）
+/// 直接过，连词表都不加载 —— 没有列可译时不许白付一次缓存查找。
 pub(crate) async fn localize_result(cx: &AskCtx<'_>, r: &mut AskResult) {
     let has_cols = !r.columns.is_empty()
-        || r.supplemental.as_ref().map_or(false, |s| !s.columns.is_empty());
+        || r.supplemental.as_ref().is_some_and(|s| !s.columns.is_empty());
     if !has_cols {
         return;
     }
@@ -24,11 +24,15 @@ pub(crate) async fn localize_result(cx: &AskCtx<'_>, r: &mut AskResult) {
 fn apply_to_result(cn: &dms_semantic::present_cn::PresentCn, r: &mut AskResult) {
     let mut labels = cn.apply(&mut r.columns, &mut r.rows, &mut r.view, &mut r.redacted);
     if let Some(s) = r.supplemental.as_mut() {
-        // SupplementalResult 没有 redacted 字段（脱敏列名只在顶层回显）
+        // SupplementalResult 没有 redacted 字段（脱敏列名只在顶层回显）——
+        // 所以 supplemental 列若被标脱敏，这条痕迹随 scratch 一起丢（今天无消费者，先记在这里）
         let mut scratch = vec![];
         labels.extend(cn.apply(&mut s.columns, &mut s.rows, &mut s.view, &mut scratch));
     }
     // (列, 码) 去重，保留首次出现序（同一码在 200 行里重复出现只留一条痕）
+    // localize 是 value_labels 的唯一写入点（grep 可证其余全是初始化 vec![]）：
+    // 上游将来若预填，不许被这里的整体覆盖静默吞掉
+    debug_assert!(r.value_labels.is_empty(), "value_labels 已有值 —— 覆盖前必须先合并");
     let mut seen = std::collections::HashSet::new();
     r.value_labels = labels
         .into_iter()

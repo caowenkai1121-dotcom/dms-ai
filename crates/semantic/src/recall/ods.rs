@@ -3,7 +3,7 @@
 //! 候选池 = 静态目录里 layer 为 ODS/DIM 的资产，按 `warehouse_catalog::scored_assets`
 //! 的问句相关性排序。血缘边（`meta.datamap_edge` kind='lineage'，DWS/ADS←ODS）是**可选
 //! 增强**：血缘作业还没跑 / 表为空 / 读失败，都只按目录打分序返回 —— 降级路径自身
-//! 绝不因为增强缺席而失败（ warn 留痕）。
+//! 绝不因为增强缺席而失败（warn 留痕）。
 //!
 //! 调用方（server `direct.rs` 的 direct-derive）拿到的只是候选表名：LLM 只看见这些表的
 //! schema 卡，生成的 SQL 仍过与直连完全相同的三段闸门与行上限。
@@ -19,6 +19,10 @@ use crate::warehouse_catalog::{self, detail_layer};
 /// 血缘边以它们为端点找 ODS 对端；锚点取得越多，加权越接近「全目录平推」，失去意义。
 const LINEAGE_ANCHORS: usize = 3;
 
+/// datamap 推断边进 JOIN 证据的置信下限：低于它只信人工确认（status='accepted'）。
+/// （两处 `status <> 'rejected'` 依赖两张边表的 status 均为 NOT NULL —— DDL 钉着，无 NULL 漏网。）
+const JOIN_MIN_CONFIDENCE: f64 = 0.9;
+
 /// 推导候选表（裸表名，目录内唯一），按「血缘命中优先、问句相关性次之」排序，最多 `limit` 张。
 ///
 /// 血缘读不到（表空/未跑/读失败）= 零加权，照常返回目录打分序 —— 本函数因此不返回 `Result`：
@@ -29,33 +33,32 @@ pub async fn ods_candidate_tables(
     question: &str,
     limit: usize,
 ) -> Vec<&'static str> {
-    let scored = warehouse_catalog::scored_assets(question);
-    let pool: Vec<(usize, &'static str)> = scored
-        .iter()
-        .filter(|(_, asset)| detail_layer(asset.layer))
-        .map(|(score, asset)| (*score, asset.table))
-        .collect();
+    // 一遍循环同时产出候选池（明细层）与血缘锚点（合同层前 LINEAGE_ANCHORS 张，两谓词互补）
+    let mut pool: Vec<(usize, &'static str)> = Vec::new();
+    let mut anchors: Vec<String> = Vec::new();
+    let mut anchor_tables = 0usize;
+    for (score, asset) in warehouse_catalog::scored_assets(question) {
+        if detail_layer(asset.layer) {
+            pool.push((score, asset.table));
+        } else if anchor_tables < LINEAGE_ANCHORS {
+            // 裸名 + 限定名两种形态都喂：归一化靠 `warehouse_asset`（血缘写入侧用哪种都能中）
+            anchor_tables += 1;
+            anchors.push(asset.table.to_string());
+            anchors.push(format!("{}.{}", warehouse_catalog::database_of(asset), asset.table));
+        }
+    }
     if pool.is_empty() {
         return Vec::new();
     }
-    // 血缘锚点 = 问句最相关的合同层表（裸名 + 限定名两种形态都喂，血缘写入侧用哪种都能中）
-    let anchors: Vec<String> = scored
-        .iter()
-        .filter(|(_, asset)| !detail_layer(asset.layer))
-        .take(LINEAGE_ANCHORS)
-        .flat_map(|(_, asset)| {
-            [
-                asset.table.to_string(),
-                format!("{}.{}", warehouse_catalog::database_of(asset), asset.table),
-            ]
-        })
-        .collect();
     let boosted = lineage_boost(pg, ds, &anchors).await;
-    apply_boost(pool, &boosted)
+    let pool_n = pool.len();
+    let out: Vec<&'static str> = apply_boost(pool, &boosted)
         .into_iter()
         .take(limit)
         .map(|(_, table)| table)
-        .collect()
+        .collect();
+    tracing::debug!(pool = pool_n, boosted = boosted.len(), taken = out.len(), "ODS 推导候选");
+    out
 }
 
 /// 血缘命中者排前，其余维持目录打分序（分数 desc → 表名 asc）。
@@ -65,23 +68,40 @@ fn apply_boost(
     boosted: &HashSet<String>,
 ) -> Vec<(usize, &'static str)> {
     let mut pool = pool;
-    pool.sort_by(|(left_score, left), (right_score, right)| {
-        boosted
-            .contains(*right)
-            .cmp(&boosted.contains(*left))
-            .then_with(|| right_score.cmp(left_score))
-            .then_with(|| left.cmp(right))
+    // 全序键（boosted desc → score desc → 表名 asc）：每元素算一次，行为与多段比较器全等
+    pool.sort_by_key(|(score, table)| {
+        (std::cmp::Reverse(boosted.contains(*table)), std::cmp::Reverse(*score), *table)
     });
     pool
 }
 
 /// 一条 JOIN 证据边（两源统一形状）：左表.左列 = 右表.右列。
 /// 表名原样带出（可能裸名也可能限定名），归一化在匹配侧（server `direct.rs` 的纯函数）。
+#[derive(Debug)]
 pub struct JoinEvidenceRow {
     pub left_table: String,
     pub left_col: String,
     pub right_table: String,
     pub right_col: String,
+}
+
+/// 「查得到就用、读失败留痕返空集」的统一形态：血缘/JOIN 证据都是可选增强，
+/// 读失败不许炸召回（两个调用点的 warn 文案自带后果说明）。
+async fn fetch_or_empty<T>(
+    pg: &PgPool,
+    q: sqlx::query::QueryAs<'_, sqlx::Postgres, T, sqlx::postgres::PgArguments>,
+    warn: &str,
+) -> Vec<T>
+where
+    T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+{
+    match q.fetch_all(pg).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(err = %e, "{warn}");
+            Vec::new()
+        }
+    }
 }
 
 /// direct-derive 的 JOIN 证据边集：**一次** PG 查询取两源 ——
@@ -93,36 +113,36 @@ pub async fn join_evidence_edges(pg: &PgPool, ds: &str, tables: &[&str]) -> Vec<
     if tables.is_empty() {
         return Vec::new();
     }
-    let forms: Vec<String> = tables
+    // 裸名 + 目录限定名两种形态都喂；先过 `catalog_ident` 归一（去空白/反引号），与
+    // `warehouse_asset` 的判定同一标准；去重防重名表让 `ANY($1)` 数组白膨胀
+    let mut forms: Vec<String> = tables
         .iter()
+        .map(|t| crate::registry::catalog_ident(t))
         .flat_map(|table| {
             let qualified = warehouse_asset(table)
                 .map(|asset| format!("{}.{}", warehouse_catalog::database_of(asset), asset.table));
-            [Some(table.to_string()), qualified]
+            [table.to_string()].into_iter().chain(qualified)
         })
-        .flatten()
         .collect();
-    let rows: Vec<(String, String, String, String)> = match sqlx::query_as(&format!(
-        "SELECT left_table, left_col, right_table, right_col FROM meta.join_edge \
-         WHERE status = 'active' AND left_table = ANY($1) AND right_table = ANY($1){ds_pred} \
-         UNION ALL \
-         SELECT left_table, left_col, right_table, right_col FROM meta.datamap_edge \
-         WHERE kind = 'joinable' AND status <> 'rejected' \
-           AND (confidence >= 0.9 OR status = 'accepted') \
-           AND left_table = ANY($1) AND right_table = ANY($1){ds_pred}",
-        ds_pred = ds_pred(2)
-    ))
-    .bind(&forms)
-    .bind(ds)
-    .fetch_all(pg)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(err = %e, "JOIN 证据边读取失败 → 带 JOIN 的推导将因无证据被拒");
-            return Vec::new();
-        }
-    };
+    forms.sort();
+    forms.dedup();
+    let rows: Vec<(String, String, String, String)> = fetch_or_empty(
+        pg,
+        sqlx::query_as(&format!(
+            "SELECT left_table, left_col, right_table, right_col FROM meta.join_edge \
+             WHERE status = 'active' AND left_table = ANY($1) AND right_table = ANY($1){ds_pred} \
+             UNION ALL \
+             SELECT left_table, left_col, right_table, right_col FROM meta.datamap_edge \
+             WHERE kind = 'joinable' AND status <> 'rejected' \
+               AND (confidence >= {JOIN_MIN_CONFIDENCE} OR status = 'accepted') \
+               AND left_table = ANY($1) AND right_table = ANY($1){ds_pred}",
+            ds_pred = ds_pred(2)
+        ))
+        .bind(&forms)
+        .bind(ds),
+        "JOIN 证据边读取失败 → 带 JOIN 的推导将因无证据被拒",
+    )
+    .await;
     rows.into_iter()
         .map(|(left_table, left_col, right_table, right_col)| JoinEvidenceRow {
             left_table,
@@ -139,26 +159,23 @@ async fn lineage_boost(pg: &PgPool, ds: &str, anchors: &[String]) -> HashSet<Str
     if anchors.is_empty() {
         return HashSet::new();
     }
-    let rows: Vec<(String, String)> = match sqlx::query_as(&format!(
-        "SELECT left_table, right_table FROM meta.datamap_edge \
-         WHERE kind = 'lineage' AND status <> 'rejected' \
-           AND (left_table = ANY($1) OR right_table = ANY($1)){ds_pred}",
-        ds_pred = ds_pred(2)
-    ))
-    .bind(anchors)
-    .bind(ds)
-    .fetch_all(pg)
-    .await
-    {
-        Ok(rows) => rows,
+    let rows: Vec<(String, String)> = fetch_or_empty(
+        pg,
+        sqlx::query_as(&format!(
+            "SELECT left_table, right_table FROM meta.datamap_edge \
+             WHERE kind = 'lineage' AND status <> 'rejected' \
+               AND (left_table = ANY($1) OR right_table = ANY($1)){ds_pred}",
+            ds_pred = ds_pred(2)
+        ))
+        .bind(anchors)
+        .bind(ds),
         // 血缘是可选增强：表还没建 / 作业还没跑 / PG 抖动，都只留痕，不影响候选序
-        Err(e) => {
-            tracing::warn!(err = %e, "血缘边读取失败 → 推导候选按目录打分序（零加权）");
-            return HashSet::new();
-        }
-    };
+        "血缘边读取失败 → 推导候选按目录打分序（零加权）",
+    )
+    .await;
     rows.iter()
         .flat_map(|(left, right)| [left, right])
+        // 端点归一（裸名/限定名两种形态都中）靠 `warehouse_asset` 内部的 `warehouse_table_parts` 剥库名
         .filter_map(|endpoint| warehouse_asset(endpoint))
         .filter(|asset| detail_layer(asset.layer))
         .map(|asset| asset.table.to_string())
@@ -197,6 +214,17 @@ mod tests {
             .map(|(_, asset)| asset.table)
             .collect();
         assert_eq!(order_pool.first(), Some(&"t_sales_order"), "{order_pool:?}");
+    }
+
+    /// 空锚点早退钉住：`anchors.is_empty()` 的 return 必须在血缘查询之前
+    /// （早退丢失 = 每轮白付一次空集 PG 往返）。
+    #[test]
+    fn empty_anchors_short_circuit_is_pinned() {
+        let src = include_str!("ods.rs");
+        let body = &src[src.find("async fn lineage_boost").unwrap()..];
+        let early = body.find("anchors.is_empty()").unwrap();
+        let query = body.find("SELECT left_table, right_table").unwrap();
+        assert!(early < query, "空锚点早退必须在血缘查询之前");
     }
 
     /// 血缘加权只把命中者提到前面，不打乱其余打分序；空集合 = 恒等（血缘缺席的降级形态）。

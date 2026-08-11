@@ -8,8 +8,6 @@
 //! 一律不接（那些归别人）；剩下的短问句才轮到我。商品名带时间词（「可颂香肠卷，本月」）
 //! 合法 —— 时间词是卡片窗口的参数，不是指标。
 
-use std::collections::HashSet;
-
 use dms_connector::source::RowSet;
 use dms_kernel::present::{Block, ColumnSpec, Interact, Kpi, Role, Semantic, ViewSpec};
 use dms_semantic::sales_fact::{
@@ -24,6 +22,8 @@ use crate::gate::{gate_on, EXEC_TIMEOUT, MAX_ROWS};
 
 mod category;
 
+// 客套前缀/尾巴词表与 `business_lookup::entity_query` 那份大比例重叠（本表多「看看」族）——
+// 两份是有意的（各自词法门独立演化），但改动时两边都要看一眼（互指防漂移，那边有同款注释）。
 const LEADING_INTENT: &[&str] = &[
     "请帮我查询一下", "请帮我查一下", "帮我查询一下", "帮我查一下", "请帮我看看",
     "帮我看一下", "帮我看看", "请查询一下", "请查一下", "查询一下", "查一下", "请问",
@@ -45,12 +45,12 @@ const TIME_AFFIXES: &[&str] = &[
 ];
 
 /// 这些是“要分析什么”的尾部语义，不是实体名。只检查完整尾部，不再对正文做子串黑名单。
+/// （同族短尾已覆盖的长尾不列：「的销售额」⊂「销售额」这类 ends_with 死条目已清。）
 const ANALYSIS_TAILS: &[&str] = &[
-    "的销售额", "的销量", "的销售量", "的成本", "的毛利", "的毛利额", "的毛利率",
-    "的订单数", "的订单量", "的订单明细", "的下单信息", "的销售明细", "有哪些订单",
+    "的成本", "的毛利", "的订单明细", "的下单信息", "的销售明细", "有哪些订单",
     "有哪些客户", "有哪些商品", "有多少订单", "卖了多少", "哪个卖得好", "卖得好",
     "销售趋势", "销量趋势", "销售额趋势", "销售额", "销售量", "销量", "成本",
-    "毛利额", "毛利率", "订单数", "订单量", "买过的客户", "购买客户", "的客户",
+    "毛利额", "毛利率", "订单数", "订单量", "购买客户", "的客户",
     "的库存", "的费用", "的退款", "的售后", "按省份", "按月份", "按客户", "按商品",
 ];
 
@@ -259,10 +259,12 @@ fn parse_entity(question: &str) -> Option<ParsedEntity> {
         }
     }
     let value = trim_edge(body);
-    if value.chars().count() < 2
-        || value.chars().count() > 80
+    let value_len = value.chars().count();
+    // 非法字符集与 `business_lookup::valid_entity_value` 同口径（含 `;` 与控制字符）
+    if value_len < 2
+        || value_len > 80
         || looks_like_doc_code(value)
-        || ['\'', '"', '%', '\\'].iter().any(|ch| value.contains(*ch))
+        || value.chars().any(|ch| matches!(ch, '\'' | '"' | '%' | ';' | '\\') || ch.is_control())
     {
         return None;
     }
@@ -337,7 +339,8 @@ fn looks_like_goods_spec(value: &str) -> bool {
     UNITS.iter().any(|unit| {
         value
             .match_indices(unit)
-            .any(|(i, _)| value[..i].chars().last().is_some_and(|c| c.is_ascii_digit()))
+            // 前一个字符是否 ASCII 数字：按字节取（数字必 ASCII），不再从头扫一遍 chars
+            .any(|(i, _)| i > 0 && value.as_bytes()[i - 1].is_ascii_digit())
     })
 }
 
@@ -421,18 +424,22 @@ fn drop_combo_goods(candidates: Vec<Candidate>) -> Vec<Candidate> {
         c.kind == Kind::Goods && {
             let name = c.name.trim();
             name.contains('|')
-                || name.contains('：')
+                // 全/半角冒号都要**尾巴全数字**才判组合：正常商品名带冒号（「联名款：XX」）不误剔
+                || name
+                    .rsplit_once('：')
+                    .is_some_and(|(_, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()))
                 || name
                     .rsplit_once(':')
                     .is_some_and(|(_, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()))
         }
     };
-    let kept: Vec<Candidate> = candidates.iter().filter(|c| !is_combo(c)).cloned().collect();
-    if kept.is_empty() { candidates } else { kept }
-}
-
-fn prefix_hint(question: &str) -> Option<Kind> {
-    parse_entity(question).and_then(|parsed| parsed.kind)
+    // 先判形态再动刀：全不是组合（常态）零克隆原样返回；全是组合也原样返回
+    // （剔完一个都不剩时宁可让用户挑，不静默答错）
+    let combo_mask: Vec<bool> = candidates.iter().map(&is_combo).collect();
+    if combo_mask.iter().all(|m| !m) || combo_mask.iter().all(|m| *m) {
+        return candidates;
+    }
+    candidates.into_iter().zip(combo_mask).filter(|(_, m)| !m).map(|(c, _)| c).collect()
 }
 
 /// 一次「查名取行」。SQL 全走闸门（只读红线 + 权限注入），失败一律 None（回落后续成员）。
@@ -443,14 +450,14 @@ async fn fetch_rows(
     let scoped = match gate_on(cx.p, sql, cx.scope, cx.ds_global, cx.source.dialect()) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("实体卡 SQL 未过闸门，回落: {e}");
+            tracing::warn!(err = %e, sql = %sql, "实体卡 SQL 未过闸门 → 回落");
             return Ok(None);
         }
     };
     match cx.source.fetch(&scoped, MAX_ROWS, EXEC_TIMEOUT).await {
         Ok(rs) => Ok(Some(rs)),
         Err(e) => {
-            tracing::warn!("实体卡取数失败，回落: {e}");
+            tracing::warn!(err = %e, sql = %scoped.wire(), "实体卡取数失败 → 回落");
             Ok(None)
         }
     }
@@ -542,10 +549,16 @@ fn push_sales_kpis(
     sales: &RowSet,
     specs: &[(usize, &str, Semantic)],
 ) {
+    // 时间谓词一次算好：原先每个 KPI 都重解析一遍问句（一次卡片 6 遍）
+    let phrase = dms_kernel::nl::time::time_phrase_of(question);
     for &(index, label, semantic) in specs {
         if let Some(value) = opt_num_at(sales, index) {
+            let label = match &phrase {
+                Some(ph) => format!("{ph}{label}"),
+                None => format!("累计{label}（全期）"),
+            };
             items.push(Kpi {
-                label: period_label(question, label),
+                label,
                 value: serde_json::Value::from(value),
                 semantic,
                 delta: None,
@@ -577,6 +590,8 @@ impl Answerer for EntityAnswerer {
     }
 
     /// 词法门（同步无 IO）：只解析“实体本身/实体资料”问法；带指标或关系的长问句交给分析链。
+    /// （`answer` 会复跑一次完整 `parse_entity` —— Router 形状要求 accept/answer 分离，
+    ///   同 graph.rs 的「第二次识别」注释；词法门本就为省 IO，重复 CPU 解析是有意付的。）
     fn accept(&self, cx: &AskCtx<'_>) -> bool {
         parse_entity(cx.question).is_some()
     }
@@ -585,7 +600,7 @@ impl Answerer for EntityAnswerer {
         Box::pin(async move {
             let Some(parsed) = parse_entity(cx.question) else { return Ok(None) };
             if parsed.kind == Some(Kind::Category) {
-                return category::card(cx, &parsed.value).await;
+                return category::card(cx, &parsed.value, true).await;
             }
             resolve_entity(cx, &parsed).await
         })
@@ -600,7 +615,8 @@ struct Candidate {
 }
 
 fn can_view_employee(cx: &AskCtx<'_>) -> bool {
-    cx.p.administrator_flag || cx.p.role_code == "admin"
+    // 大小写口径与 `business_lookup` 对齐（权限判据本身不动：administrator_flag 仍是第一证据）
+    cx.p.administrator_flag || cx.p.role_code.eq_ignore_ascii_case("admin")
 }
 
 fn candidate_kinds(cx: &AskCtx<'_>, requested: Option<Kind>) -> Vec<Kind> {
@@ -640,7 +656,7 @@ async fn resolve_entity(
         return Ok(Some(candidate_card(cx, &parsed.value, fuzzy)));
     }
     if parsed.kind.is_none() {
-        return category::card(cx, &parsed.value).await;
+        return category::card(cx, &parsed.value, false).await;
     }
     Ok(None)
 }
@@ -658,14 +674,16 @@ async fn collect_candidates(
             .map(|kind| candidates_for(cx, kind, parsed.field, &parsed.value, exact)),
     )
     .await;
-    let mut seen = HashSet::new();
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
     for result in results {
         for candidate in result? {
-            let key = (candidate.kind, candidate.code.clone(), candidate.name.clone());
-            if seen.insert(key) {
-                candidates.push(candidate);
+            // 候选量小（截 20），线性判重零分配（原来每个候选为 HashSet 键克隆两个 String）
+            if candidates.iter().any(|c| {
+                c.kind == candidate.kind && c.code == candidate.code && c.name == candidate.name
+            }) {
+                continue;
             }
+            candidates.push(candidate);
         }
     }
     candidates.sort_by(|a, b| {
@@ -724,6 +742,8 @@ async fn candidates_for(
              WHERE g.deleted_flag = 0 AND g.brand_name <> '' AND ({condition}) ORDER BY g.brand_name LIMIT 8"
         ),
         Kind::Shop => format!(
+            // 门店无独立主档表，候选只能 LIKE 扫订单表 —— 实体卡最重的一条候选 SQL，
+            // 实测成本可接受；将来引门店维度表再换掉这条
             "SELECT DISTINCT COALESCE(NULLIF(o.shop_code,''),o.shop_name), o.shop_name FROM t_sales_order o \
              WHERE o.deleted_flag = 0 AND o.shop_name <> '' AND ({condition}) ORDER BY o.shop_name LIMIT 8"
         ),
@@ -770,9 +790,9 @@ fn candidate_condition(kind: Kind, field: MatchField, safe: &str, exact: bool) -
         (Kind::Shop, MatchField::Code) => &["o.shop_code"],
         (Kind::Shop, MatchField::Name) => &["o.shop_name"],
         (Kind::Shop, _) => &["o.shop_code", "o.shop_name"],
-        (Kind::Employee, MatchField::Code) => &["CAST(e.employee_id AS CHAR)"],
+        (Kind::Employee, MatchField::Code) => &["CAST(e.employee_id AS CHAR)"], // WHERE 包列函数让 employee_id 索引失效；t_employee 千行级实测可接受，值非纯数字时不改等值写法，先记成本
         (Kind::Employee, _) => &["e.actual_name"],
-        (Kind::Category, _) => &[],
+        (Kind::Category, _) => unreachable!("Category 在 candidates_for 入口已分流，到不了这里"),
     };
     fields
         .iter()
@@ -795,7 +815,8 @@ async fn render_candidate(
         Kind::Brand => brand_card(cx, candidate).await,
         Kind::Shop => shop_card(cx, candidate).await,
         Kind::Employee => employee_card(cx, candidate).await,
-        Kind::Category => category::card(cx, &candidate.name).await,
+        // Category 候选今天不可达（`candidates_for` 对它恒空）；真到这里按非显式处理
+        Kind::Category => category::card(cx, &candidate.name, false).await,
     }
 }
 
@@ -861,29 +882,32 @@ fn candidate_card(cx: &AskCtx<'_>, query: &str, candidates: Vec<Candidate>) -> A
 
 fn employee_denied(cx: &AskCtx<'_>) -> AskResult {
     let mut answer = candidate_card(cx, "员工目录", Vec::new());
+    // 拒绝卡不顶「候选匹配」的展示 SQL：日志/前端按它展示，别让拒绝长得像一次匹配
+    answer.sql = "员工目录访问被拒（权限不足）".to_string();
     answer.view.insight = Some(
         "当前 DMS 身份未能证明具备员工目录查看权限，已按最小权限原则拒绝展示。".into(),
     );
     answer
 }
 
-/// SQL 字面量转义（库里来的值也要过一道 —— 客户/商品卡已有的约定）
+/// SQL 字面量转义（库里来的值也要过一道 —— 客户/商品卡已有的约定）。
+/// 顺序即正确性：`\` 最先转（否则后两步引入的转义符被二次转义）；
+/// `_` → `\_`（`%` 在 parse_entity 已被拒，`_` 没有 —— 名称含 `_` 时 LIKE 模糊面悄悄变大）。
+/// `=` 语境下 `\_`/`\\` 在 MySQL 字面值里解码回 `_`/`\`，等值语义不变（Doris 同为 MySQL 方言）。
 fn esc(s: &str) -> String {
-    s.replace('\'', "''")
+    s.replace('\\', "\\\\").replace('\'', "''").replace('_', "\\_")
 }
 
 /// 品牌不伪造 DWS 品牌维度，只展示已唯一确认品牌的主档商品集合。
 async fn brand_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Option<AskResult>> {
     let brand = candidate.name.clone();
     let b = esc(&brand);
-    let Some(goods) = fetch_rows(
-        cx,
-        &format!(
-            "SELECT goods_name AS `商品`, goods_code AS `商品编码` FROM t_goods \
-             WHERE deleted_flag = 0 AND brand_name = '{b}' ORDER BY goods_name LIMIT 20"
-        ),
-    )
-    .await? else { return Ok(None) };
+    let goods_sql = format!(
+        "SELECT goods_name AS `商品`, goods_code AS `商品编码` FROM t_goods \
+         WHERE deleted_flag = 0 AND brand_name = '{b}' ORDER BY goods_name LIMIT 20"
+    );
+    // 展示 SQL 嵌真实 goods_sql（其余卡都嵌真实 SQL，「查看 SQL」/query_log 口径一致）
+    let Some(goods) = fetch_rows(cx, &goods_sql).await? else { return Ok(None) };
     let goods_n = goods.rows.len() as i64;
     let items = vec![
         Kpi { label: "品牌".into(), value: serde_json::Value::from(brand.clone()), semantic: Semantic::Goods, delta: None },
@@ -891,8 +915,7 @@ async fn brand_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Op
     ];
     let drill = vec![format!("{brand}有哪些商品")];
     Ok(Some(build_card(
-        &format!("SELECT … FROM t_goods WHERE brand_name = '{b}'; 品牌总览卡"),
-        &brand,
+        &format!("{goods_sql}; 品牌总览卡"),
         items,
         goods,
         drill,
@@ -917,14 +940,14 @@ async fn shop_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Opt
     let recent_sql = format!(
         "SELECT sales_order_code AS `单号`, order_time AS `时间`, customer_name AS `客户`, \
                 total_amount AS `订单金额`, order_status AS `状态` \
-         FROM t_sales_order o WHERE deleted_flag = 0 AND {shop_predicate} \
+         FROM t_sales_order o WHERE deleted_flag = 0 AND {shop_predicate}{otime} \
          ORDER BY order_time DESC LIMIT 5"
     );
     let (stats, recent) = futures::join!(fetch_rows(cx, &stats_sql), fetch_rows(cx, &recent_sql));
     let Some(stats) = stats? else { return Ok(None) };
     let Some(recent) = recent? else { return Ok(None) };
-    let orders_n = stats.rows.first().and_then(|r| r.first()).and_then(crate::answerers::hits::cell_num).unwrap_or(0.0);
-    let cust_n = stats.rows.first().and_then(|r| r.get(1)).and_then(crate::answerers::hits::cell_num).unwrap_or(0.0);
+    let orders_n = num(&stats);
+    let cust_n = num_at(&stats, 1);
     let items = vec![
         Kpi { label: "门店".into(), value: serde_json::Value::from(shop.clone()), semantic: Semantic::None, delta: None },
         Kpi { label: period_label(cx.question, "订单数"), value: serde_json::Value::from(orders_n), semantic: Semantic::Count, delta: None },
@@ -933,7 +956,6 @@ async fn shop_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Opt
     let drill = vec![format!("门店{shop}的订单明细")];
     Ok(Some(build_card(
         &format!("{stats_sql}; 门店总览卡"),
-        &shop,
         items,
         recent,
         drill,
@@ -962,7 +984,7 @@ async fn employee_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result
     let recent_sql = format!(
         "SELECT sales_order_code AS `单号`, order_time AS `时间`, customer_name AS `客户`, \
                 total_amount AS `订单金额`, order_status AS `状态` \
-         FROM t_sales_order o WHERE deleted_flag = 0 AND o.owner_manager = '{e}' \
+         FROM t_sales_order o WHERE deleted_flag = 0 AND o.owner_manager = '{e}'{otime} \
          ORDER BY order_time DESC LIMIT 5"
     );
     let (profile, stats, recent) = futures::join!(
@@ -973,8 +995,8 @@ async fn employee_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result
     let profile = profile?;
     let Some(stats) = stats? else { return Ok(None) };
     let Some(recent) = recent? else { return Ok(None) };
-    let orders_n = stats.rows.first().and_then(|r| r.first()).and_then(crate::answerers::hits::cell_num).unwrap_or(0.0);
-    let cust_n = stats.rows.first().and_then(|r| r.get(1)).and_then(crate::answerers::hits::cell_num).unwrap_or(0.0);
+    let orders_n = num(&stats);
+    let cust_n = num_at(&stats, 1);
     let items = vec![
         Kpi { label: "员工".into(), value: serde_json::Value::from(ename.clone()), semantic: Semantic::None, delta: None },
         Kpi { label: period_label(cx.question, "订单数"), value: serde_json::Value::from(orders_n), semantic: Semantic::Count, delta: None },
@@ -983,7 +1005,6 @@ async fn employee_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result
     let drill = vec![format!("员工{ename}的订单明细"), format!("员工{ename}的客户有哪些")];
     Ok(Some(with_entity(build_card(
         &format!("{profile_sql}; 员工总览卡"),
-        &ename,
         items,
         recent,
         drill,
@@ -994,7 +1015,6 @@ async fn employee_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result
 /// 客户总览卡：客户主档 + 销售/订单/信控摘要 + 最近订单。
 async fn customer_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Option<AskResult>> {
     let code = candidate.code.clone();
-    let cname = candidate.name.clone();
     let c = esc(&code);
     let employee_profile = if can_view_employee(cx) {
         (", COALESCE(e.actual_name,'') AS `大区经理`", "LEFT JOIN t_employee e ON e.employee_id = c.area_manager_id AND e.deleted_flag = 0")
@@ -1010,16 +1030,16 @@ async fn customer_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result
                 COALESCE(CASE c.customer_class WHEN '01' THEN '货架店铺' WHEN '02' THEN '新媒体店铺' \
                   WHEN '03' THEN '社团店铺' WHEN '04' THEN '线下客户' WHEN '05' THEN '内部客户' \
                   WHEN '06' THEN '其他财务专用' WHEN '99' THEN '外部客户的店铺' END, c.customer_class, '未分类') AS `客户分类`, \
-                COALESCE(rp.region_name,c.province,'') AS `省份`, COALESCE(rc.region_name,c.city,'') AS `城市`{} , \
+                COALESCE(rp.region_name,c.province,'') AS `省份`, COALESCE(rc.region_name,c.city,'') AS `城市`{select_extra}, \
                 COALESCE(c.contacts_name,'') AS `联系人`, \
                 CASE c.is_enable WHEN 1 THEN '启用' WHEN 0 THEN '停用' ELSE COALESCE(c.customer_status,'未设置') END AS `主档状态` \
          FROM t_customer c \
          LEFT JOIN t_regions rp ON rp.region_code = c.province AND rp.deleted_flag = 0 \
          LEFT JOIN t_regions rc ON rc.region_code = c.city AND rc.deleted_flag = 0 \
-         {} \
+         {join_extra} \
          WHERE c.deleted_flag = 0 AND c.customer_code = '{c}' LIMIT 1",
-        employee_profile.0,
-        employee_profile.1,
+        select_extra = employee_profile.0,
+        join_extra = employee_profile.1,
     );
     let otime = entity_time_suffix(cx.question, "o.order_time");
     let orders_sql = format!(
@@ -1153,13 +1173,25 @@ async fn customer_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result
     }
     let card = with_supplemental(build_card(
         &format!("{profile_sql}; 客户总览卡（经营指标来自 DWS，订单上下文独立）"),
-        &cname,
         items,
         recent,
         drill,
         cx,
-    ), goods);
+    ), goods.map(|g| {
+        // DWS 关系查询 LIMIT 10：截断态按这一路的行数判
+        let truncated = g.rows.len() >= 10;
+        (g, truncated)
+    }));
     Ok(Some(with_entity(card, pairs)))
+}
+
+/// 数仓商品 profile 投影里「物料类型」列的下标（与 `goods_card` 的 profile_sql 投影一一对应
+/// —— 投影加/减列时必须同步，否则静默读错字段）。
+const WAREHOUSE_MATERIALTYPE_COL: usize = 7;
+
+/// 商品卡首行 KPI 标签：品牌为空时只用分类（不拖一个空分隔符尾「XX · 」）。
+fn goods_card_label(gcat: &str, gbrand: &str) -> String {
+    if gbrand.is_empty() { gcat.to_string() } else { format!("{gcat} · {gbrand}") }
 }
 
 /// 商品总览卡：商品主档 + 下单/销售摘要 + 最近关联订单。
@@ -1290,7 +1322,7 @@ async fn goods_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Op
     let gcat = profile.rows[0].get(4).and_then(value_text).unwrap_or("未分类").to_string();
     // 设备（物料类型=资产）用设备订单口径措辞：它们不在线下销售事实里，订单上下文就是全部
     let is_device = cx.source.is_warehouse()
-        && profile.rows[0].get(7).and_then(value_text).is_some_and(|v| v.trim() == "资产");
+        && profile.rows[0].get(WAREHOUSE_MATERIALTYPE_COL).and_then(value_text).is_some_and(|v| v.trim() == "资产");
     let (qty_label, amt_label) =
         if is_device { ("设备下单数量", "设备下单金额") } else { ("销售下单数量", "销售下单金额") };
     let drill = if is_device {
@@ -1307,7 +1339,7 @@ async fn goods_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Op
         ]
     };
     let mut items = vec![
-        Kpi { label: format!("{gcat} · {gbrand}"), value: serde_json::Value::from(gname.clone()), semantic: Semantic::Goods, delta: None },
+        Kpi { label: goods_card_label(&gcat, &gbrand), value: serde_json::Value::from(gname.clone()), semantic: Semantic::Goods, delta: None },
     ];
     if let Some(stats) = stats.as_ref() {
         items.push(Kpi { label: period_label(cx.question, qty_label), value: serde_json::Value::from(num(stats)), semantic: Semantic::Count, delta: None });
@@ -1336,7 +1368,6 @@ async fn goods_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Op
     }
     let card = with_supplemental(build_card(
         &format!("{profile_sql}; 商品总览卡（经营指标与分布来自 DWS，订单上下文独立）"),
-        &gname,
         items,
         recent,
         drill,
@@ -1347,10 +1378,14 @@ async fn goods_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Op
 
 /// 客户分布与省区分布合并成一张标准化补充表：两个查询都由 `sales_fact` 生成、
 /// 经过同一 `gate_on`，这里只做行拼接（客户行带编码，省区行编码留空）。
-fn merge_distribution(customers: Option<RowSet>, regions: Option<RowSet>) -> Option<RowSet> {
+/// 返回值带「任一路顶到 LIMIT 10」的截断标记：合并后行数（两路各 ≤10，最多 20）
+/// 对单路上限判会误报（6+6=12 也报截断），截断态按来源路透传。
+fn merge_distribution(customers: Option<RowSet>, regions: Option<RowSet>) -> Option<(RowSet, bool)> {
     fn cell(row: &[serde_json::Value], index: usize) -> serde_json::Value {
         row.get(index).cloned().unwrap_or(serde_json::Value::Null)
     }
+    let truncated = customers.as_ref().is_some_and(|c| c.rows.len() >= 10)
+        || regions.as_ref().is_some_and(|r| r.rows.len() >= 10);
     let mut rows = Vec::new();
     if let Some(c) = customers {
         for row in &c.rows {
@@ -1377,11 +1412,14 @@ fn merge_distribution(customers: Option<RowSet>, regions: Option<RowSet>) -> Opt
     if rows.is_empty() {
         return None;
     }
-    Some(RowSet {
-        columns: vec!["分布维度".into(), "编码".into(), "名称".into(), "销量".into(), "销售额".into()],
-        rows,
-        redacted: vec![],
-    })
+    Some((
+        RowSet {
+            columns: vec!["分布维度".into(), "编码".into(), "名称".into(), "销量".into(), "销售额".into()],
+            rows,
+            redacted: vec![],
+        },
+        truncated,
+    ))
 }
 
 fn with_entity(mut card: AskResult, pairs: Vec<(String, serde_json::Value)>) -> AskResult {
@@ -1391,8 +1429,8 @@ fn with_entity(mut card: AskResult, pairs: Vec<(String, serde_json::Value)>) -> 
     card
 }
 
-fn with_supplemental(mut card: AskResult, rows: Option<RowSet>) -> AskResult {
-    let Some(rows) = rows.filter(|rows| !rows.rows.is_empty()) else {
+fn with_supplemental(mut card: AskResult, rows: Option<(RowSet, bool)>) -> AskResult {
+    let Some((rows, truncated)) = rows.filter(|(rows, _)| !rows.rows.is_empty()) else {
         return card;
     };
     let row_count = rows.rows.len();
@@ -1401,7 +1439,8 @@ fn with_supplemental(mut card: AskResult, rows: Option<RowSet>) -> AskResult {
         columns: rows.columns,
         rows: rows.rows,
         row_count,
-        truncated: row_count >= 10,
+        // 截断态由调用方按「任一来源路顶到它自己的 LIMIT」透传：合并行数对单路上限判会误报
+        truncated,
         view,
     });
     card
@@ -1410,7 +1449,6 @@ fn with_supplemental(mut card: AskResult, rows: Option<RowSet>) -> AskResult {
 /// 组装卡片（客户/商品共用）：KPI 块 + 最近订单表格 + 下钻 chips。
 fn build_card(
     sql: &str,
-    _title: &str,
     items: Vec<Kpi>,
     recent: RowSet,
     drill: Vec<String>,
@@ -1433,7 +1471,7 @@ fn build_card(
                     name: c.clone(),
                     role: if c.contains("时间") || c.contains("日期") {
                         Role::Time
-                    } else if c.contains('率') || c.contains("金额") || c.contains('额') || c.contains("数量") || c.contains("销量") {
+                    } else if c.contains('率') || c.contains('额') || c.contains("数量") || c.contains("销量") {
                         Role::Metric
                     } else if c.contains("单号") {
                         Role::Id
@@ -1442,7 +1480,7 @@ fn build_card(
                     },
                     semantic: if c.contains('率') {
                         Semantic::Percent
-                    } else if c.contains("金额") || c.contains('额') {
+                    } else if c.contains('额') { // 「金额」必含「额」，单列是死条件
                         Semantic::Money
                     } else if c.contains("数量") || c.contains("销量") {
                         Semantic::Count
@@ -1617,7 +1655,8 @@ mod tests {
     }
 
     #[test]
-    fn longest_prefix_and_match_field_are_preserved() {        for (question, kind, field, value) in [
+    fn longest_prefix_and_match_field_are_preserved() {
+        for (question, kind, field, value) in [
             ("客户名称 浏阳品元商贸有限公司", Kind::Customer, MatchField::Name, "浏阳品元商贸有限公司"),
             ("客户简称 品元商贸", Kind::Customer, MatchField::Alias, "品元商贸"),
             ("客户编码 C001", Kind::Customer, MatchField::Code, "C001"),
@@ -1687,6 +1726,8 @@ mod tests {
             assert!(bare_name(q).is_none(), "{q} 不该被裸名称门接住");
         }
         assert!(bare_name("恒众'%").is_none());
+        assert!(bare_name("恒众; DROP").is_none(), "分号同样拒（与 business_lookup 同口径）");
+        assert!(bare_name("恒众\u{0007}").is_none(), "控制字符同样拒");
         assert!(looks_like_doc_code("HJXH-DXO2026072300384"));
         assert!(!looks_like_doc_code("DHT150-6"), "设备型号不能被单据码门拒绝");
     }
@@ -1718,7 +1759,7 @@ mod tests {
     fn employee_directory_is_fail_closed_at_every_entry() {
         let src = include_str!("entity.rs");
         let auth = src.split("fn can_view_employee").nth(1).unwrap().split("fn candidate_kinds").next().unwrap();
-        assert!(auth.contains("cx.p.administrator_flag || cx.p.role_code == \"admin\""));
+        assert!(auth.contains("cx.p.administrator_flag || cx.p.role_code.eq_ignore_ascii_case(\"admin\")"));
         let resolve = src.split("async fn resolve_entity").nth(1).unwrap().split("async fn collect_candidates").next().unwrap();
         assert!(resolve.contains("parsed.kind == Some(Kind::Employee) && !can_view_employee(cx)"));
         let lookup = src.split("async fn candidates_for").nth(1).unwrap().split("fn candidate_condition").next().unwrap();
@@ -1862,5 +1903,77 @@ mod tests {
         assert!(goods_customers.contains("AS `客户编码`") && goods_customers.contains("AS `客户`"), "{goods_customers}");
         assert!(!goods_customers.contains("AS `门店`"), "storename/storecode 表示客户，不是门店：{goods_customers}");
         assert!(!goods_customers.contains(" JOIN "), "关联客户只能走共享 DWS 单表：{goods_customers}");
+    }
+
+    /// ENTITY_PREFIXES 的同族（一个是另一个的前缀）必须长在前：顺序即匹配优先级，
+    /// 短前缀在前会把长前缀饿死（「商品分类」排在「商品」后的话永远匹配不到）。
+    #[test]
+    fn entity_prefixes_longest_first_within_family() {
+        for (i, (a, ..)) in ENTITY_PREFIXES.iter().enumerate() {
+            for (b, ..) in &ENTITY_PREFIXES[i + 1..] {
+                assert!(
+                    !(b.starts_with(a) && b != a),
+                    "同族短前缀在前：{a} 在 {b} 前 —— {b} 永远匹配不到"
+                );
+            }
+        }
+    }
+
+    /// esc：单引号双写、反斜杠与 `_` 都转义（顺序：反斜杠最先）。
+    #[test]
+    fn esc_escapes_quotes_backslash_and_like_wildcards() {
+        assert_eq!(esc("o'x"), "o''x");
+        assert_eq!(esc("a_b"), "a\\_b");
+        assert_eq!(esc("a\\b"), "a\\\\b");
+        assert_eq!(esc("SKU_001"), "SKU\\_001");
+        assert_eq!(esc("普通名称"), "普通名称");
+    }
+
+    /// 组合判据：全/半角冒号都要尾巴全数字才剔（「联名款：XX」是正常商品名，不许误剔）。
+    #[test]
+    fn combo_goods_requires_digit_tail_after_colon() {
+        let g = |name: &str| Candidate { kind: Kind::Goods, code: "C".into(), name: name.into() };
+        let kept = drop_combo_goods(vec![g("联名款：限定"), g("皇家小虎可颂香肠卷0400G00:4"), g("烤肠：4")]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "联名款：限定");
+        // 全不是组合：原样返回（零克隆路径）
+        assert_eq!(drop_combo_goods(vec![g("烤肠"), g("火腿")]).len(), 2);
+        // 全是组合：原样返回（宁可让用户挑，不静默答错）
+        assert_eq!(drop_combo_goods(vec![g("a:1"), g("b：2")]).len(), 2);
+    }
+
+    /// 商品卡首行 KPI 标签：品牌为空不拖分隔符尾。
+    #[test]
+    fn goods_card_label_omits_empty_brand() {
+        assert_eq!(goods_card_label("粮食设备", ""), "粮食设备");
+        assert_eq!(goods_card_label("粮食设备", "皇家小虎"), "粮食设备 · 皇家小虎");
+    }
+
+    /// 分布合并的截断态按「任一来源路顶到 LIMIT 10」透传，不按合并后行数判。
+    #[test]
+    fn merge_distribution_reports_per_source_truncation() {
+        let mk = |n: usize| RowSet {
+            columns: vec!["编码".into(), "名称".into(), "销量".into(), "销售额".into()],
+            rows: (0..n)
+                .map(|i| {
+                    vec![
+                        serde_json::json!(format!("c{i}")),
+                        serde_json::json!("n"),
+                        serde_json::json!(1),
+                        serde_json::json!(2),
+                    ]
+                })
+                .collect(),
+            redacted: vec![],
+        };
+        // 6+6=12 行：合并后 ≥10 但两路都没顶到 LIMIT —— 不许误报截断
+        let (merged, truncated) = merge_distribution(Some(mk(6)), Some(mk(6))).unwrap();
+        assert_eq!(merged.rows.len(), 12);
+        assert!(!truncated, "6+6 不许报截断");
+        // 一路顶到 10 → 截断
+        let (_, truncated) = merge_distribution(Some(mk(10)), Some(mk(3))).unwrap();
+        assert!(truncated);
+        // 两路都空 → None
+        assert!(merge_distribution(Some(mk(0)), None).is_none());
     }
 }

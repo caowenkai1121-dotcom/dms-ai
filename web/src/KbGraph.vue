@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, markRaw, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { FONT_FAMILY, GRAPH_PALETTE } from './panel-utils'
 
 interface GNode {
   id: string; label: string; type: string; weight: number
@@ -14,15 +15,32 @@ interface RawGraphEdge { srcId: string; dstId: string; label: string }
 const props = defineProps<{ token?: string; spaceId?: string; writable?: boolean }>()
 const emit = defineEmits<{ (e: 'auth-expired'): void }>()
 
-const PALETTE = ['#f0a63c', '#e1655b', '#4a90d9', '#9b6de8', '#3bb273', '#38b6c9', '#e87ab0', '#c9a53c', '#7b89f0', '#d45f9e']
-// canvas 的 font 不解析 CSS 变量，这里与 theme.css 的 --font-sans 保持同一字族
-const FONT_FAMILY = '"Segoe UI","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif'
+const PALETTE = GRAPH_PALETTE
+
+// —— 力导布局常量（调参只改这里）——
+const REPULSION = 2600       // 节点间斥力系数
+const SPRING = 0.02          // 边弹簧系数
+const GRAVITY = 0.012        // 向心引力
+const DAMPING = 0.86         // 速度阻尼
+const ALPHA_DECAY = 0.995    // 冷却速率
+const ALPHA_MIN = 0.015      // 低于此值停止 tick
+const REPULSION_CUTOFF2 = 160000  // 斥力截断距离的平方：远距节点互不算，省 O(n²) 里的常数
+const LABEL_MAX_NODES = 260  // 画布节点超过此不画标签（全景不糊字）
+const LABEL_MAX_EDGES = 40   // 边数超过此只为焦点/放大态画边标签
+const SUBGRAPH_LIMIT = 200   // 首屏子图节点上限
+const EXPAND_LIMIT = 120     // 邻居展开节点上限
+const BUILD_TIMEOUT_MS = 10 * 60 * 1000  // 构建轮询最长 10 分钟
+const POLL_MS = 2000         // 构建状态轮询间隔
+const RESUME_POLL_MS = 1200  // 接入在途构建的首次轮询间隔
+const POLL_MAX_FAILURES = 3  // 轮询连续失败这么多次才放弃（瞬断不放弃）
 
 const wrapEl = ref<HTMLDivElement>()
 const canvasEl = ref<HTMLCanvasElement>()
 const loading = ref(false)
 const unavailable = ref(false)
 const note = ref('')
+/** 提示条分级：warn 错误黄（默认）/ ok 成功绿 / info 中性灰。 */
+const noteKind = ref<'warn' | 'ok' | 'info'>('warn')
 const nodes = ref<GNode[]>([])
 const edges = ref<GEdge[]>([])
 const statEntities = ref<number | null>(null)
@@ -38,6 +56,8 @@ const failedItems = ref<Array<{ chunk_id: number; doc_id: string; ord: number; k
 const failedTotal = ref(0)
 const failedOffset = ref(0)
 const FAILED_PAGE = 50
+/** 失败块 kind 白名单映射：未知 kind 显示原值、走中性样式（不冒充「失败」警示色）。 */
+const FAILED_KIND_LABEL: Record<string, string> = { failed: '失败', pending: '待建' }
 const resetting = ref(false)
 const reconciling = ref(false)
 const hoverId = ref('')
@@ -50,10 +70,13 @@ const MAX_CANVAS_NODES = 800
 let raf = 0
 let alpha = 0
 let resizeObserver: ResizeObserver | null = null
+let themeObserver: MutationObserver | null = null
 let pollTimer = 0
+let pollFailures = 0
 let graphEpoch = 0
 const view = { scale: 1, ox: 0, oy: 0 }
-const drag = { mode: '' as '' | 'node' | 'pan', id: '', sx: 0, sy: 0, moved: false }
+// sx/sy 是平移锚点（随 move 更新）；ix/iy 是按下原点（判 moved 阈值）；gx/gy 是抓取偏移
+const drag = { mode: '' as '' | 'node' | 'pan', id: '', sx: 0, sy: 0, ix: 0, iy: 0, gx: 0, gy: 0, moved: false }
 
 function headers(): Record<string, string> {
   const token = props.token?.trim()
@@ -62,6 +85,14 @@ function headers(): Record<string, string> {
     throw new Error('登录会话已失效，请重新登录。')
   }
   return { Authorization: `Bearer ${token}` }
+}
+/** headers() 抛的会话失效消息要能被 catch 透出（不认的话会被显示成「图谱暂不可用」误导）。 */
+function sessionMsg(e: unknown): string {
+  return e instanceof Error && e.message.includes('登录会话') ? e.message : ''
+}
+function setNote(text: string, kind: 'warn' | 'ok' | 'info' = 'warn') {
+  note.value = text
+  noteKind.value = kind
 }
 
 // 类型着色：同一实体类型哈希到同一颜色（跨次加载稳定）；未标注类型用固定中性色，
@@ -73,8 +104,13 @@ function colorOf(type: string): string {
   return PALETTE[Math.abs(hash) % PALETTE.length]
 }
 
-// 响应 → 归一化中间形态。名称优先取 name（label 在契约里是实体类型，不是显示名）；
-// 边端点优先取 src/dst（服务端契约），再回退各种兼容键。
+/** 标签截断加省略号：截过的名字不该被当成全名。 */
+function clipText(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}…` : s
+}
+
+// 响应 → 归一化中间形态。名称优先取 name（label 在契约里是实体类型，不是显示名；
+// name 缺失时回退用 label 作显示名）；边端点优先取 src/dst（服务端契约），再回退各种兼容键。
 function parseGraph(data: Record<string, unknown>): { nodes: RawGraphNode[]; edges: RawGraphEdge[] } {
   const rawNodes = Array.isArray(data.nodes) ? data.nodes : []
   const rawEdges = Array.isArray(data.edges) ? data.edges : []
@@ -86,7 +122,9 @@ function parseGraph(data: Record<string, unknown>): { nodes: RawGraphNode[]; edg
     const id = String(item.id ?? item.name ?? item.label ?? index)
     if (seenId.has(id)) return
     seenId.add(id)
-    const weight = Math.max(0, Number(item.weight ?? item.count ?? 1) || 1)
+    // weight 允许显式 0（0 权节点照样画，只是半径最小）；非数字/缺失才落 1
+    const w = Number(item.weight ?? item.count ?? 1)
+    const weight = Number.isFinite(w) ? Math.max(0, w) : 1
     const hasName = item.name != null && String(item.name) !== ''
     nodes.push({
       id,
@@ -113,11 +151,12 @@ function parseGraph(data: Record<string, unknown>): { nodes: RawGraphNode[]; edg
   return { nodes, edges }
 }
 
-// 中间形态 → 画布节点：首屏按环形播种；邻居展开时落在锚点周围（新节点不会乱飞）
+// 中间形态 → 画布节点：首屏按环形播种；邻居展开时落在锚点周围（新节点不会乱飞）。
+// markRaw：tick 每帧改写 x/y/vx/vy，深响应式 proxy setter 是纯浪费（模板只读 label/type/weight）。
 function toGNode(raw: RawGraphNode, index: number, total: number, anchor?: GNode): GNode {
   const angle = (index / Math.max(1, total)) * Math.PI * 2
   const radius = anchor ? 80 + Math.random() * 60 : 180
-  return {
+  return markRaw({
     id: raw.id,
     label: raw.label,
     type: raw.type,
@@ -127,7 +166,7 @@ function toGNode(raw: RawGraphNode, index: number, total: number, anchor?: GNode
     vx: 0, vy: 0,
     r: Math.min(26, 6 + Math.sqrt(raw.weight) * 3.2),
     color: colorOf(raw.type),
-  }
+  })
 }
 
 function normalizeGraph(data: Record<string, unknown>): { nodes: GNode[]; edges: GEdge[] } {
@@ -144,12 +183,13 @@ function normalizeGraph(data: Record<string, unknown>): { nodes: GNode[]; edges:
 }
 
 // 邻域子图合并进当前视图：已有节点保留原位，新节点落在锚点周围；边按 (src,dst,label) 去重。
-// 返回新增节点数（0 = 没有更多邻居，调用方给提示）。
-function mergeSubgraph(data: Record<string, unknown>, anchorId: string): number {
+// 返回新增节点/边数（都为 0 = 没有更多邻居，调用方给提示）。
+function mergeSubgraph(data: Record<string, unknown>, anchorId: string): { added: number; addedEdges: number } {
   const parsed = parseGraph(data)
   const indexById = new Map(nodes.value.map((n, i) => [n.id, i]))
   const anchor = nodes.value.find((n) => n.id === anchorId)
   let added = 0
+  let addedEdges = 0
   for (const raw of parsed.nodes) {
     if (indexById.has(raw.id)) continue
     indexById.set(raw.id, nodes.value.length)
@@ -165,8 +205,9 @@ function mergeSubgraph(data: Record<string, unknown>, anchorId: string): number 
     if (have.has(key)) continue
     have.add(key)
     edges.value.push({ source, target, label: raw.label })
+    addedEdges++
   }
-  return added
+  return { added, addedEdges }
 }
 
 function canvasSize(): { w: number; h: number } {
@@ -196,9 +237,6 @@ function tick() {
   const ns = nodes.value
   const es = edges.value
   if (!ns.length) return
-  const REPULSION = 2600
-  const SPRING = 0.02
-  const GRAVITY = 0.012
   for (let i = 0; i < ns.length; i++) {
     const a = ns[i]
     for (let j = i + 1; j < ns.length; j++) {
@@ -206,7 +244,7 @@ function tick() {
       let dx = a.x - b.x
       let dy = a.y - b.y
       let dist2 = dx * dx + dy * dy
-      if (dist2 > 160000) continue
+      if (dist2 > REPULSION_CUTOFF2) continue
       if (dist2 < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; dist2 = 1 }
       const force = (REPULSION / dist2) * alpha
       const dist = Math.sqrt(dist2)
@@ -233,14 +271,14 @@ function tick() {
     node.vx += -node.x * GRAVITY * alpha
     node.vy += -node.y * GRAVITY * alpha
     if (drag.mode === 'node' && drag.id === node.id) { node.vx = 0; node.vy = 0; continue }
-    node.vx *= 0.86
-    node.vy *= 0.86
+    node.vx *= DAMPING
+    node.vy *= DAMPING
     node.x += node.vx
     node.y += node.vy
   }
-  alpha *= 0.995
+  alpha *= ALPHA_DECAY
   render()
-  if (alpha > 0.015 || drag.mode === 'node') raf = requestAnimationFrame(tick)
+  if (alpha > ALPHA_MIN || drag.mode === 'node') raf = requestAnimationFrame(tick)
 }
 
 function toWorld(event: PointerEvent | MouseEvent | WheelEvent): { x: number; y: number } {
@@ -265,21 +303,24 @@ function hitNode(wx: number, wy: number): GNode | null {
 }
 
 const matchSet = computed(() => {
-  const needle = search.value.trim().toLocaleLowerCase()
+  const needle = search.value.trim().toLowerCase()
   if (!needle) return null
-  return new Set(nodes.value.filter((n) => n.label.toLocaleLowerCase().includes(needle)).map((n) => n.id))
+  return new Set(nodes.value.filter((n) => n.label.toLowerCase().includes(needle)).map((n) => n.id))
 })
 const matchCount = computed(() => matchSet.value?.size ?? 0)
 
 // 类型图例：当前画布出现过的实体类型 → 颜色（与节点着色同一函数，顺序按首次出现）
-const legend = computed(() => {
+const legendAll = computed(() => {
   const seen = new Map<string, string>()
   for (const n of nodes.value) {
     const key = n.type || '未标注'
     if (!seen.has(key)) seen.set(key, colorOf(n.type))
   }
-  return [...seen.entries()].slice(0, 12).map(([type, color]) => ({ type, color }))
+  return [...seen.entries()].map(([type, color]) => ({ type, color }))
 })
+const LEGEND_MAX = 12
+const legend = computed(() => legendAll.value.slice(0, LEGEND_MAX))
+const legendMore = computed(() => Math.max(0, legendAll.value.length - LEGEND_MAX))
 
 // 搜索即定位：高亮由 matchSet/isDimmed 完成；这里防抖把最佳命中（权重最高的骨干实体）
 // 平移到画布中心。变换口径与 render 一致：screen = w/2 + ox + x*scale。
@@ -301,22 +342,38 @@ watch(search, () => {
   }, 240)
 })
 
+// 焦点邻接 Set 预算（computed 缓存）：render 每帧逐节点查表 O(1)，不再逐节点 edges.some O(N·E)
+const focusNeighborSet = computed(() => {
+  const focus = hoverId.value || selectedId.value
+  if (!focus) return null
+  const set = new Set<string>([focus])
+  for (const e of edges.value) {
+    const s = nodes.value[e.source]?.id
+    const t = nodes.value[e.target]?.id
+    if (s === focus && t) set.add(t)
+    if (t === focus && s) set.add(s)
+  }
+  return set
+})
+
 function isDimmed(node: GNode): boolean {
   const matches = matchSet.value
   if (matches) return !matches.has(node.id)
-  const focus = hoverId.value || selectedId.value
-  if (!focus) return false
-  if (node.id === focus) return false
-  return !edges.value.some((e) =>
-    (nodes.value[e.source].id === focus && nodes.value[e.target].id === node.id)
-    || (nodes.value[e.target].id === focus && nodes.value[e.source].id === node.id))
+  const adj = focusNeighborSet.value
+  if (!adj) return false
+  return !adj.has(node.id)
 }
 
 function edgeDimmed(edge: GEdge): boolean {
   const focus = hoverId.value || selectedId.value
-  if (!focus) return matchSet.value != null
   const sourceId = nodes.value[edge.source]?.id
   const targetId = nodes.value[edge.target]?.id
+  if (!focus) {
+    // 搜索态：两端都命中的边保留（命中路径信息不丢），其余压暗
+    const matches = matchSet.value
+    if (!matches) return false
+    return !(matches.has(sourceId ?? '') && matches.has(targetId ?? ''))
+  }
   return sourceId !== focus && targetId !== focus
 }
 
@@ -336,7 +393,7 @@ function render() {
   const dark = document.documentElement.dataset.theme === 'dark'
   const labelColor = dark ? 'rgba(232,235,246,.88)' : 'rgba(16,22,43,.78)'
   const faintColor = dark ? 'rgba(232,235,246,.18)' : 'rgba(16,22,43,.12)'
-  const drawLabels = ns.length <= 260
+  const drawLabels = ns.length <= LABEL_MAX_NODES
   for (const edge of edges.value) {
     const a = ns[edge.source]
     const b = ns[edge.target]
@@ -348,11 +405,11 @@ function render() {
     ctx.lineTo(b.x, b.y)
     ctx.stroke()
     // 关系边标签：缩放到位（≥1）、挂在焦点节点上、或边足够少时才画 —— 全景不糊字
-    if (edge.label && drawLabels && (view.scale >= 1 || (!dim && !!focus) || edges.value.length <= 40)) {
+    if (edge.label && drawLabels && (view.scale >= 1 || (!dim && !!focus) || edges.value.length <= LABEL_MAX_EDGES)) {
       ctx.fillStyle = dim ? faintColor : dark ? 'rgba(139,147,173,.9)' : 'rgba(100,109,135,.85)'
       ctx.font = `9px ${FONT_FAMILY}`
       ctx.textAlign = 'center'
-      ctx.fillText(edge.label.slice(0, 12), (a.x + b.x) / 2, (a.y + b.y) / 2 - 3)
+      ctx.fillText(clipText(edge.label, 12), (a.x + b.x) / 2, (a.y + b.y) / 2 - 3)
     }
   }
   for (const node of ns) {
@@ -379,7 +436,7 @@ function render() {
       ctx.fillStyle = dim ? faintColor : labelColor
       ctx.font = `${node.r > 14 ? 11 : 10}px ${FONT_FAMILY}`
       ctx.textAlign = 'center'
-      ctx.fillText(node.label.slice(0, 10), node.x, node.y + node.r + 11)
+      ctx.fillText(clipText(node.label, 10), node.x, node.y + node.r + 11)
     }
     ctx.globalAlpha = 1
   }
@@ -392,10 +449,13 @@ function onPointerDown(event: PointerEvent) {
   drag.id = node?.id ?? ''
   drag.sx = event.clientX
   drag.sy = event.clientY
+  drag.ix = event.clientX
+  drag.iy = event.clientY
   drag.moved = false
   if (node) {
-    node.x = point.x
-    node.y = point.y
+    // 记录抓取偏移：节点中心不瞬移到指针（点大节点边缘不跳）
+    drag.gx = point.x - node.x
+    drag.gy = point.y - node.y
     wake(0.4)
   }
   canvasEl.value?.setPointerCapture(event.pointerId)
@@ -406,9 +466,10 @@ function onPointerMove(event: PointerEvent) {
   if (drag.mode === 'node') {
     const node = nodes.value.find((n) => n.id === drag.id)
     if (node) {
-      node.x = point.x
-      node.y = point.y
-      drag.moved = true
+      node.x = point.x - drag.gx
+      node.y = point.y - drag.gy
+      // 3px 位移阈值：点击手滑 1px 不丢「点选」语义
+      if (!drag.moved && Math.hypot(event.clientX - drag.ix, event.clientY - drag.iy) >= 3) drag.moved = true
       wake(0.2)
     }
     return
@@ -418,7 +479,7 @@ function onPointerMove(event: PointerEvent) {
     view.oy += event.clientY - drag.sy
     drag.sx = event.clientX
     drag.sy = event.clientY
-    drag.moved = true
+    if (!drag.moved && Math.hypot(event.clientX - drag.ix, event.clientY - drag.iy) >= 3) drag.moved = true
     render()
     return
   }
@@ -431,14 +492,29 @@ function onPointerMove(event: PointerEvent) {
   }
 }
 
+function endDrag(event: PointerEvent) {
+  drag.mode = ''
+  drag.id = ''
+  // 未持捕获时 release 会抛 DOMException（pointercancel 后即是如此）
+  const canvas = canvasEl.value
+  if (canvas && canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
+}
+
 function onPointerUp(event: PointerEvent) {
   if (drag.mode === 'node' && !drag.moved) {
     selectedId.value = selectedId.value === drag.id ? '' : drag.id
     render()
+  } else if (drag.mode === 'pan' && !drag.moved && selectedId.value) {
+    // 点画布空白（未拖动）清除选中：详情卡不用非得点×或再点节点
+    selectedId.value = ''
+    render()
   }
-  drag.mode = ''
-  drag.id = ''
-  canvasEl.value?.releasePointerCapture(event.pointerId)
+  endDrag(event)
+}
+
+function onPointerCancel(event: PointerEvent) {
+  // 触摸被打断：drag 状态必须收尾，否则拖曳态滞留
+  endDrag(event)
 }
 
 function onWheel(event: WheelEvent) {
@@ -453,16 +529,38 @@ function onWheel(event: WheelEvent) {
   render()
 }
 
+/** 缩放按钮（键盘/触屏的滚轮替代）：围绕画布中心缩放。 */
+function zoomBy(factor: number) {
+  view.scale = Math.min(3, Math.max(0.25, view.scale * factor))
+  render()
+}
+function resetView() {
+  view.scale = 1
+  view.ox = 0
+  view.oy = 0
+  render()
+}
+
 const selectedNode = computed(() => nodes.value.find((n) => n.id === selectedId.value) ?? null)
 const selectedNeighbors = computed<Neighbor[]>(() => {
   const node = selectedNode.value
   if (!node) return []
   const rows: Neighbor[] = []
+  const seen = new Set<string>()
   for (const edge of edges.value) {
     const sourceId = nodes.value[edge.source]?.id
     const targetId = nodes.value[edge.target]?.id
-    if (sourceId === node.id) rows.push({ label: nodes.value[edge.target].label, relation: edge.label || '关联' })
-    else if (targetId === node.id) rows.push({ label: nodes.value[edge.source].label, relation: edge.label || '关联' })
+    let label = ''
+    if (sourceId === node.id) label = nodes.value[edge.target]?.label ?? ''
+    else if (targetId === node.id) label = nodes.value[edge.source]?.label ?? ''
+    else continue
+    if (!label) continue
+    const relation = edge.label || '关联'
+    // 双向同关系边（A→B、B→A 同 label）只显示一条，:key 也不撞
+    const key = `${relation}|${label}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    rows.push({ label, relation })
     if (rows.length >= 8) break
   }
   return rows
@@ -491,7 +589,7 @@ async function loadSubgraph(epoch: number) {
   loading.value = true
   unavailable.value = false
   try {
-    const response = await fetch(`/api/kb/graph/subgraph?space_id=${encodeURIComponent(props.spaceId ?? '')}&limit=200`, { headers: headers() })
+    const response = await fetch(`/api/kb/graph/subgraph?space_id=${encodeURIComponent(props.spaceId ?? '')}&limit=${SUBGRAPH_LIMIT}`, { headers: headers() })
     if (response.status === 401) emit('auth-expired')
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const data = await response.json().catch(() => ({}))
@@ -504,13 +602,15 @@ async function loadSubgraph(epoch: number) {
     view.scale = 1
     view.ox = 0
     view.oy = 0
-    alpha = 1
-    if (!raf) raf = requestAnimationFrame(tick)
-  } catch {
+    wake(1)
+  } catch (e) {
     if (epoch === graphEpoch) {
       nodes.value = []
       edges.value = []
       unavailable.value = true
+      // 会话失效要说真实原因（需重新登录），不是「图谱暂不可用」
+      const msg = sessionMsg(e)
+      if (msg) setNote(msg)
       render()
     }
   } finally {
@@ -548,15 +648,16 @@ async function pollStatus(epoch: number) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const data = await response.json().catch(() => ({}))
     if (epoch !== graphEpoch || !building.value) return
+    pollFailures = 0
     const status = normalizeStatus(data)
     buildPercent.value = status.percent
     buildMessage.value = status.message
     if (status.running) {
-      if (Date.now() - buildingStartedAt.value < 10 * 60 * 1000) {
-        pollTimer = window.setTimeout(() => void pollStatus(epoch), 2000)
+      if (Date.now() - buildingStartedAt.value < BUILD_TIMEOUT_MS) {
+        pollTimer = window.setTimeout(() => void pollStatus(epoch), POLL_MS)
       } else {
         building.value = false
-        note.value = '构建超时，请稍后手动刷新查看结果。'
+        setNote('构建超时，请稍后手动刷新查看结果。')
       }
     } else {
       building.value = false
@@ -565,11 +666,24 @@ async function pollStatus(epoch: number) {
       await loadSubgraph(epoch)
       await loadStats(epoch)
     }
-  } catch {
-    if (epoch === graphEpoch) {
+  } catch (e) {
+    if (epoch !== graphEpoch) return
+    // 会话失效是持续性错误：直接停轮询并透出真实原因，不做无意义重试
+    const session = sessionMsg(e)
+    if (session) {
       building.value = false
       buildPercent.value = null
-      note.value = '图谱构建状态查询暂不可用。'
+      setNote(session)
+      return
+    }
+    // 轮询瞬断（网络抖动）有限重试：连续失败才放弃，服务端构建仍在跑
+    pollFailures += 1
+    if (pollFailures < POLL_MAX_FAILURES) {
+      pollTimer = window.setTimeout(() => void pollStatus(epoch), POLL_MS + 1000)
+    } else {
+      building.value = false
+      buildPercent.value = null
+      setNote('图谱构建状态查询暂不可用。')
     }
   }
 }
@@ -589,7 +703,7 @@ async function resumeBuilding(epoch: number) {
     buildPercent.value = status.percent
     buildMessage.value = status.message
     buildingStartedAt.value = Date.now()
-    pollTimer = window.setTimeout(() => void pollStatus(epoch), 1200)
+    pollTimer = window.setTimeout(() => void pollStatus(epoch), RESUME_POLL_MS)
   } catch { /* 静默：见函数注释 */ }
 }
 
@@ -597,6 +711,8 @@ async function build() {
   if (building.value || !props.writable) return
   const epoch = graphEpoch
   note.value = ''
+  // fetch 前置位：快速双击不会发出两个 POST（与 KbMindmap regenerate 同口径）
+  building.value = true
   try {
     const response = await fetch('/api/kb/graph/build', {
       method: 'POST',
@@ -606,12 +722,15 @@ async function build() {
     if (response.status === 401) emit('auth-expired')
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     if (epoch !== graphEpoch) return
-    building.value = true
+    pollFailures = 0
     buildPercent.value = 0
     buildingStartedAt.value = Date.now()
-    pollTimer = window.setTimeout(() => void pollStatus(epoch), 1200)
-  } catch {
-    if (epoch === graphEpoch) note.value = '图谱构建接口暂不可用。'
+    pollTimer = window.setTimeout(() => void pollStatus(epoch), RESUME_POLL_MS)
+  } catch (e) {
+    if (epoch === graphEpoch) {
+      building.value = false
+      setNote(sessionMsg(e) || '图谱构建接口暂不可用。')
+    }
   }
 }
 
@@ -638,9 +757,11 @@ async function loadFailed(offset: number) {
     if (epoch !== graphEpoch) return
     failedItems.value = Array.isArray(data.items) ? data.items : []
     failedTotal.value = Number(data.total ?? 0) || 0
-    failedOffset.value = Number(data.offset ?? 0) || 0
+    // 服务端不回 offset 字段时按本次请求的 offset 记：第 2 页数据不配第 1 页的页码
+    const echo = Number(data.offset)
+    failedOffset.value = Number.isFinite(echo) ? echo : offset
   } catch (e) {
-    if (epoch === graphEpoch) note.value = e instanceof Error ? e.message : '失败块清单读取失败。'
+    if (epoch === graphEpoch) setNote(e instanceof Error ? e.message : '失败块清单读取失败。')
   } finally {
     if (epoch === graphEpoch) failedLoading.value = false
   }
@@ -648,7 +769,11 @@ async function loadFailed(offset: number) {
 
 function toggleFailed() {
   failedOpen.value = !failedOpen.value
-  if (failedOpen.value) void loadFailed(0)
+  if (failedOpen.value) {
+    // 打开抽屉前清掉上一条操作提示（「图谱已清空」之类），不残留错语境
+    note.value = ''
+    void loadFailed(0)
+  }
 }
 
 // 清空图谱：确认里写明后果（删实体与关系、不动文档）；完成后整图重载。
@@ -668,10 +793,13 @@ async function resetGraph() {
     if (!response.ok) throw await opsError(response, 'reset')
     if (epoch !== graphEpoch) return
     failedOpen.value = false
-    note.value = '图谱已清空。'
+    // reload() 会 ++graphEpoch 令 finally 的 epoch 判等永假：先复位 busy 再重载；
+    // 成功文案也要放在 reload 之后（reload 会清 note）
+    resetting.value = false
     await reload()
+    setNote('图谱已清空。', 'ok')
   } catch (e) {
-    if (epoch === graphEpoch) note.value = e instanceof Error ? e.message : '图谱清空失败。'
+    if (epoch === graphEpoch) setNote(e instanceof Error ? e.message : '图谱清空失败。')
   } finally {
     if (epoch === graphEpoch) resetting.value = false
   }
@@ -694,11 +822,12 @@ async function reconcileGraph() {
     if (!probe.ok) throw await opsError(probe, 'reconcile')
     const plan = await probe.json().catch(() => ({}))
     if (epoch !== graphEpoch) return
-    const orphans = Number(plan.orphan_chunks ?? 0)
-    const dangling = Number(plan.dangling_entities ?? 0)
-    const relations = Number(plan.relations_from_orphans ?? 0)
+    // Number(...) || 0：非数字字符串（NaN）按 0 处理，不误判「需要/无需修复」
+    const orphans = Number(plan.orphan_chunks) || 0
+    const dangling = Number(plan.dangling_entities) || 0
+    const relations = Number(plan.relations_from_orphans) || 0
     if (!orphans && !dangling && !relations) {
-      note.value = '图谱无需修复：没有孤儿块或悬空实体。'
+      setNote('图谱无需修复：没有孤儿块或悬空实体。', 'info')
       return
     }
     if (!window.confirm(`文档删改遗留：孤儿块 ${orphans}、悬空实体 ${dangling}、孤儿关系 ${relations}。\n确认清理？（只删图数据，不动文档）`)) return
@@ -708,11 +837,13 @@ async function reconcileGraph() {
     const result = await done.json().catch(() => ({}))
     if (epoch !== graphEpoch) return
     const d = result.deleted ?? {}
-    note.value = `修复完成：清理孤儿块 ${d.chunks ?? 0}、悬空实体 ${d.entities ?? 0}、关系 ${d.relations ?? 0}。`
+    const doneText = `修复完成：清理孤儿块 ${d.chunks ?? 0}、悬空实体 ${d.entities ?? 0}、关系 ${d.relations ?? 0}。`
     failedOpen.value = false
+    reconciling.value = false
     await reload()
+    setNote(doneText, 'ok')
   } catch (e) {
-    if (epoch === graphEpoch) note.value = e instanceof Error ? e.message : '图谱修复失败。'
+    if (epoch === graphEpoch) setNote(e instanceof Error ? e.message : '图谱修复失败。')
   } finally {
     if (epoch === graphEpoch) reconciling.value = false
   }
@@ -723,24 +854,25 @@ async function reconcileGraph() {
 async function expandNeighbors(id: string) {
   if (expanding.value || !props.spaceId) return
   if (nodes.value.length >= MAX_CANVAS_NODES) {
-    note.value = `画布已达 ${MAX_CANVAS_NODES} 个实体，刷新后可重新展开。`
+    setNote(`画布已达 ${MAX_CANVAS_NODES} 个实体，刷新后可重新展开。`, 'info')
     return
   }
   expanding.value = true
   note.value = ''
   const epoch = graphEpoch
   try {
-    const url = `/api/kb/graph/subgraph?space_id=${encodeURIComponent(props.spaceId)}&limit=120&center=${encodeURIComponent(id)}`
+    const url = `/api/kb/graph/subgraph?space_id=${encodeURIComponent(props.spaceId)}&limit=${EXPAND_LIMIT}&center=${encodeURIComponent(id)}`
     const response = await fetch(url, { headers: headers() })
     if (response.status === 401) emit('auth-expired')
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const data = await response.json().catch(() => ({}))
     if (epoch !== graphEpoch) return
-    const added = mergeSubgraph(data, id)
-    if (!added) note.value = '该实体在当前可见文档内没有更多邻居。'
+    const { added, addedEdges } = mergeSubgraph(data, id)
+    if (!added && !addedEdges) setNote('该实体在当前可见文档内没有更多邻居。', 'info')
+    else if (!added) setNote('邻居已在图中，已补充新关系。', 'info')
     wake(0.6)
   } catch {
-    if (epoch === graphEpoch) note.value = '邻居展开失败，请稍后重试。'
+    if (epoch === graphEpoch) setNote('邻居展开失败，请稍后重试。')
   } finally {
     if (epoch === graphEpoch) expanding.value = false
   }
@@ -761,6 +893,12 @@ async function reload() {
   buildMessage.value = ''
   note.value = ''
   failedOpen.value = false
+  // 换空间/整图重载：所有在途标志位统一复位，不许有按钮永久卡死
+  expanding.value = false
+  reconciling.value = false
+  resetting.value = false
+  failedLoading.value = false
+  pollFailures = 0
   window.clearTimeout(pollTimer)
   if (raf) { cancelAnimationFrame(raf); raf = 0 }
   nodes.value = []
@@ -773,8 +911,9 @@ async function reload() {
     return
   }
   await loadSubgraph(epoch)
-  if (epoch === graphEpoch) await loadStats(epoch)
-  if (epoch === graphEpoch) await resumeBuilding(epoch)
+  // 子图加载失败（unavailable）时不再拉统计/接入构建：状态自相矛盾的 UI 不出
+  if (epoch === graphEpoch && !unavailable.value) await loadStats(epoch)
+  if (epoch === graphEpoch && !unavailable.value) await resumeBuilding(epoch)
 }
 
 watch(() => props.spaceId, () => { void reload() })
@@ -782,6 +921,9 @@ watch(() => props.spaceId, () => { void reload() })
 onMounted(() => {
   resizeObserver = new ResizeObserver(resizeCanvas)
   if (wrapEl.value) resizeObserver.observe(wrapEl.value)
+  // 力导冷却后切主题不重排：监听 data-theme 变化补一次 render
+  themeObserver = new MutationObserver(() => render())
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
   resizeCanvas()
   void reload()
 })
@@ -792,6 +934,7 @@ onBeforeUnmount(() => {
   window.clearTimeout(searchTimer)
   if (raf) cancelAnimationFrame(raf)
   resizeObserver?.disconnect()
+  themeObserver?.disconnect()
 })
 </script>
 
@@ -807,13 +950,14 @@ onBeforeUnmount(() => {
           <input v-model="search" type="search" placeholder="搜索实体" aria-label="搜索实体" />
         </label>
         <span v-if="search.trim()" class="graph-hits">{{ matchCount }} 个匹配</span>
-        <span v-if="statEntities != null" class="graph-stats">实体 {{ statEntities }} · 关系 {{ statRelations ?? 0 }}</span>
+        <!-- 全量口径统计（服务端 stats）；两个数任一缺失就整段不显示，不把「未知」伪装成 0 -->
+        <span v-if="statEntities != null && statRelations != null" class="graph-stats">全量实体 {{ statEntities }} · 关系 {{ statRelations }}</span>
         <button
           class="secondary-btn" type="button"
           :disabled="building || !writable"
           :title="writable ? '从当前空间文档重新抽取实体与关系' : '只读空间不能构建图谱'"
           @click="build"
-        >{{ building ? '构建中' : '构建图谱' }}</button>
+        >{{ building ? '构建中…' : '构建图谱' }}</button>
         <button
           v-if="writable" class="secondary-btn" type="button" :disabled="building"
           title="查看未入图的文本块（抽取失败或构建后新增）"
@@ -832,15 +976,18 @@ onBeforeUnmount(() => {
       </div>
     </div>
     <div v-if="building" class="graph-progress" role="status">
-      <div class="graph-progress-bar"><i :style="{ width: `${buildPercent ?? 12}%` }"></i></div>
+      <div
+        class="graph-progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+        :aria-valuenow="buildPercent ?? undefined" :aria-busy="buildPercent == null"
+      ><i :style="{ width: `${buildPercent ?? 12}%` }"></i></div>
       <span>{{ buildMessage || '正在构建图谱' }}{{ buildPercent != null ? ` ${buildPercent.toFixed(0)}%` : '…' }}</span>
     </div>
-    <div v-if="note" class="graph-note" role="status">{{ note }}</div>
+    <div v-if="note" class="graph-note" :class="noteKind" role="status">{{ note }}</div>
 
     <div ref="wrapEl" class="graph-canvas-wrap">
       <canvas
-        ref="canvasEl" aria-label="知识图谱画布"
-        @pointerdown="onPointerDown" @pointermove="onPointerMove" @pointerup="onPointerUp"
+        ref="canvasEl" role="img" aria-label="知识图谱画布"
+        @pointerdown="onPointerDown" @pointermove="onPointerMove" @pointerup="onPointerUp" @pointercancel="onPointerCancel"
         @dblclick="onDblClick"
         @wheel.prevent="onWheel"
       ></canvas>
@@ -848,15 +995,22 @@ onBeforeUnmount(() => {
         <strong>正在读取图谱</strong><span>节点较多时需要几秒钟。</span>
       </div>
       <div v-else-if="!nodes.length" class="graph-state">
-        <strong>{{ unavailable ? '知识图谱暂不可用' : '图谱尚未构建' }}</strong>
-        <span>{{ unavailable ? '服务端图谱接口尚未就绪，接口上线后会自动展示。' : '点击右上角「构建图谱」从当前空间文档抽取实体与关系。' }}</span>
-        <button v-if="writable && !unavailable" class="primary-btn" type="button" :disabled="building" @click="build">构建图谱</button>
+        <strong>{{ !spaceId ? '请先选择知识空间' : unavailable ? '知识图谱暂不可用' : '图谱尚未构建' }}</strong>
+        <span>{{ !spaceId ? '在左侧选择一个知识空间后展示图谱。' : unavailable ? '服务端图谱接口尚未就绪，接口上线后刷新页面即可展示。' : '点击右上角「构建图谱」从当前空间文档抽取实体与关系。' }}</span>
+        <button v-if="writable && !unavailable && spaceId" class="primary-btn" type="button" :disabled="building" @click="build">构建图谱</button>
       </div>
-      <div v-if="nodes.length" class="graph-count" aria-hidden="true">实体 {{ nodes.length }} · 关系 {{ edges.length }}</div>
+      <!-- 缩放/重置按钮：滚轮之外的键盘与触屏替代 -->
+      <div v-if="nodes.length" class="graph-zoom">
+        <button type="button" title="放大" aria-label="放大" @click="zoomBy(1.25)">+</button>
+        <button type="button" title="缩小" aria-label="缩小" @click="zoomBy(0.8)">−</button>
+        <button type="button" title="重置视角" aria-label="重置视角" @click="resetView">⌂</button>
+      </div>
+      <div v-if="nodes.length" class="graph-count" aria-hidden="true">画布实体 {{ nodes.length }} · 关系 {{ edges.length }}</div>
       <div v-if="legend.length" class="graph-legend" aria-label="实体类型图例">
         <span v-for="item in legend" :key="item.type"><i :style="{ background: item.color }"></i>{{ item.type }}</span>
+        <span v-if="legendMore" class="graph-legend-more">+{{ legendMore }} 类</span>
       </div>
-      <aside v-if="failedOpen" class="graph-failed" aria-label="未入图块清单">
+      <aside v-if="failedOpen" class="graph-failed" role="dialog" aria-label="未入图块清单">
         <header>
           <strong>未入图块 {{ failedTotal }}</strong>
           <button class="icon-btn" type="button" title="关闭清单" aria-label="关闭清单" @click="failedOpen = false">×</button>
@@ -864,8 +1018,8 @@ onBeforeUnmount(() => {
         <div v-if="failedLoading" class="graph-failed-state" role="status">读取中…</div>
         <div v-else-if="!failedItems.length" class="graph-failed-state">没有未入图的块：抽取全部成功（或尚未构建）。</div>
         <ul v-else>
-          <li v-for="item in failedItems" :key="item.chunk_id">
-            <span class="graph-failed-kind" :data-kind="item.kind">{{ item.kind === 'failed' ? '失败' : '待建' }}</span>
+          <li v-for="item in failedItems" :key="`${item.doc_id}-${item.chunk_id}`">
+            <span class="graph-failed-kind" :data-kind="item.kind">{{ FAILED_KIND_LABEL[item.kind] ?? (item.kind || '未知') }}</span>
             <span class="graph-failed-id" :title="item.doc_id">{{ item.doc_id }} · 块 {{ item.chunk_id }}</span>
             <span v-if="item.error" class="graph-failed-err" :title="item.error">{{ item.error }}</span>
           </li>
@@ -882,7 +1036,7 @@ onBeforeUnmount(() => {
           >下一页</button>
         </footer>
       </aside>
-      <aside v-if="selectedNode" class="graph-detail" aria-label="实体详情">
+      <aside v-if="selectedNode" class="graph-detail" role="dialog" aria-label="实体详情" @keydown.esc="selectedId = ''; render()">
         <header>
           <strong :title="selectedNode.label">{{ selectedNode.label }}</strong>
           <button class="icon-btn" type="button" title="关闭详情" aria-label="关闭详情" @click="selectedId = ''; render()">×</button>
@@ -896,6 +1050,7 @@ onBeforeUnmount(() => {
           <span v-for="neighbor in selectedNeighbors" :key="`${neighbor.relation}-${neighbor.label}`">
             {{ neighbor.relation }} · {{ neighbor.label }}
           </span>
+          <span v-if="selectedDegree > selectedNeighbors.length" class="graph-neighbors-more">等 {{ selectedDegree }} 个</span>
         </div>
         <button
           class="secondary-btn graph-expand" type="button" :disabled="expanding"
@@ -911,7 +1066,8 @@ onBeforeUnmount(() => {
 .graph-panel { width: 100%; display: flex; flex-direction: column; }
 .graph-head { display: flex; align-items: flex-end; gap: 16px; }
 .graph-head h3 { color: var(--text-primary); font-size: 14px; }
-.graph-head span { display: block; margin-top: 3px; color: var(--text-muted); font-size: 11.5px; }
+/* 只圈头部描述文字：别命中工具区里的 .graph-stats/.graph-hits */
+.graph-head > div > span { display: block; margin-top: 3px; color: var(--text-muted); font-size: 11.5px; }
 .graph-tools { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .graph-search input {
   width: min(200px, 26vw); height: 32px; padding: 0 10px; border: 1px solid var(--border);
@@ -934,6 +1090,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .graph-progress-bar i { display: block; height: 100%; border-radius: 999px; background: var(--primary); transition: width .4s ease; }
 .graph-progress span { flex: none; color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .graph-note { margin-top: 8px; padding: 7px 10px; border-left: 3px solid var(--warning-text); background: var(--warning-bg); color: var(--warning-text); font-size: 11.5px; }
+.graph-note.ok { border-left-color: var(--success-text); background: var(--success-bg); color: var(--success-text); }
+.graph-note.info { border-left-color: var(--text-faint); background: var(--bg-main); color: var(--text-muted); }
 .graph-canvas-wrap {
   position: relative; min-height: 430px; margin-top: 12px; overflow: hidden;
   border: 1px solid var(--border); border-radius: 6px; background: var(--bg-main);
@@ -947,6 +1105,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .graph-state strong { color: var(--text-primary); font-size: 14px; }
 .graph-state span { max-width: 460px; line-height: 1.6; }
 .graph-state .primary-btn { margin-top: 6px; }
+.graph-zoom { position: absolute; left: 10px; top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.graph-zoom button {
+  width: 26px; height: 26px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-card); color: var(--text-regular); cursor: pointer; font-size: 14px; line-height: 1;
+}
+.graph-zoom button:hover { border-color: var(--primary); color: var(--primary); }
 .graph-count {
   position: absolute; left: 10px; bottom: 8px; color: var(--text-faint); font-size: 11px;
   font-variant-numeric: tabular-nums; pointer-events: none;
@@ -961,6 +1125,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap;
 }
 .graph-legend i { flex: none; width: 8px; height: 8px; border-radius: 50%; }
+.graph-legend-more { color: var(--text-faint); }
 .graph-expand { width: 100%; margin-top: 9px; }
 .graph-failed {
   position: absolute; top: 10px; left: 10px; width: min(320px, calc(100% - 20px));
@@ -976,11 +1141,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   border-top: 1px solid var(--border); font-size: 11px;
 }
 .graph-failed li:first-child { border-top: 0; }
+/* kind 白名单：failed 黄警示，pending 与其余未知 kind 一律中性灰 */
 .graph-failed-kind {
   flex: none; padding: 1px 6px; border-radius: 999px;
-  background: var(--warning-bg); color: var(--warning-text); font-size: 10px;
+  background: var(--bg-sunken); color: var(--text-muted); font-size: 10px;
 }
-.graph-failed-kind[data-kind="pending"] { background: var(--bg-sunken); color: var(--text-muted); }
+.graph-failed-kind[data-kind="failed"] { background: var(--warning-bg); color: var(--warning-text); }
 .graph-failed-id { color: var(--text-regular); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .graph-failed-err { color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .graph-failed-state { padding: 12px; color: var(--text-muted); font-size: 11.5px; }
@@ -1006,6 +1172,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   padding: 2px 7px; border: 1px solid var(--border); border-radius: 999px;
   background: var(--bg-main); color: var(--text-muted); font-size: 10px;
 }
+.graph-neighbors-more { color: var(--text-faint); }
 @media (max-width: 820px) {
   .graph-head { align-items: stretch; flex-direction: column; gap: 10px; }
   .graph-tools { margin-left: 0; flex-wrap: wrap; }

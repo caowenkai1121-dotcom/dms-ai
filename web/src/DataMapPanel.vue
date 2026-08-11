@@ -1,18 +1,22 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { FONT_FAMILY, authHeaders, authQuery, authTail, errMessage, errText } from './panel-utils'
 
 /** 【数据地图】`GET /api/datamap/nodes` + `GET /api/datamap/edges` 的全屏抽屉。
- *  节点=表、边=表间关系：kind ∈ joinable/synonym/distribution_similar/co_occurs/correlated（决定颜色），
+ *  节点=表、边=表间关系：kind ∈ join（已注册关联）/lineage（血缘）/joinable/synonym/
+ *  distribution_similar/co_occurs/correlated 共 7 值（决定颜色），
  *  status ∈ pending（推断边，虚线）/ accepted（人工确认，实线）/ rejected（不上画布，只留在左侧列表）。
  *  点节点/边看 evidence 与置信度卡；接受/拒绝走 `POST /api/datamap/edges/{id}/accept|reject`，
  *  按钮只对 admin 渲染 —— 与 SkillsPanel 同一纪律：前端显隐只是体验，后端鉴权仍是唯一判据。
  *  路径查询 `GET /api/datamap/paths?from=&to=` 命中后在画布高亮路径上的表与边。
  *  力学模拟（斥力/弹簧/重力 + alpha 冷却、节点拖拽/滚轮缩放/空白平移）与 KbGraph.vue 同一思路。
- *  字段做宽容归一（id/name/table、source/from、status/state 都可），接口未上线/空体按内联提示处理。
+ *  字段做宽容归一：节点 id/name/table（列节点另有 column）、边端点 left_table/right_table
+ *  （注意边的 source 是来源标识 'inferred'/'registry'，不是端点！）、status/state 都可，
+ *  接口未上线/空体按内联提示处理。
  *  Esc/遮罩关闭；401 交回父组件走会话过期。弹窗模式与 UsagePanel.vue 同款。 */
 type EdgeStatus = 'pending' | 'accepted' | 'rejected'
 interface MapNode {
-  id: string; label: string; kind: string; comment: string
+  id: string; label: string; kind: string; domain: string; comment: string
   degree: number
   x: number; y: number; vx: number; vy: number; r: number; color: string
 }
@@ -28,21 +32,25 @@ const emit = defineEmits<{
   (e: 'auth-expired'): void
 }>()
 
-// 边颜色按 kind（未知 kind 落灰）；节点颜色按 kind 哈希进调色板。
-// canvas 的 font/stroke 不解析 CSS 变量，字族与 KbGraph.vue 保持同一组
+// 边颜色按 kind（未知 kind 落灰）；节点颜色按 kind 哈希进调色板。色相已拉开（合同关联红/可关联蓝/血缘紫/同义表粉）。
 const KIND_COLORS: Record<string, string> = {
-  join: '#2f6fd0', lineage: '#7a5af5', joinable: '#4a90d9', synonym: '#9b6de8', distribution_similar: '#3bb273', co_occurs: '#f0a63c', correlated: '#38b6c9',
+  join: '#e1655b', lineage: '#7a5af5', joinable: '#4a90d9', synonym: '#d45f9e', distribution_similar: '#3bb273', co_occurs: '#f0a63c', correlated: '#38b6c9',
 }
 const KIND_LABELS: Record<string, string> = {
-  join: '合同关联', lineage: '血缘', joinable: '可关联', synonym: '同义表', distribution_similar: '分布相似', co_occurs: '共现', correlated: '相关',
+  join: '已注册关联', lineage: '血缘', joinable: '可关联', synonym: '同义表', distribution_similar: '分布相似', co_occurs: '共现', correlated: '相关',
 }
 const STATUS_LABELS: Record<EdgeStatus, string> = { pending: '待确认', accepted: '已接受', rejected: '已拒绝' }
+/** 节点 kind（table/column）的中文映射：边有 KIND_LABELS，节点也别裸显英文。 */
+const NODE_KIND_LABELS: Record<string, string> = { table: '表', column: '列' }
 const NODE_PALETTE = ['#4a90d9', '#f0a63c', '#9b6de8', '#3bb273', '#38b6c9', '#e87ab0', '#e1655b']
-const FONT_FAMILY = '"Segoe UI","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif'
-const legendKinds = Object.keys(KIND_COLORS)
+/** 空 kind 节点的固定色（按 index 取色会让同批空 kind 节点颜色不一、随加载顺序漂移）。 */
+const NODE_FALLBACK_COLOR = '#8b93ad'
+/** 图例只列当前数据里出现过的 kind（没出现的 kind 不占图例）。 */
+const legendKinds = computed(() => Object.keys(KIND_COLORS).filter((k) => edges.value.some((e) => e.kind === k)))
 
 const wrapEl = ref<HTMLDivElement>()
 const canvasEl = ref<HTMLCanvasElement>()
+const closeBtn = ref<HTMLButtonElement | null>(null)
 const loading = ref(true)
 const error = ref('')
 const note = ref('')
@@ -66,25 +74,13 @@ const pathPairs = ref<Set<string> | null>(null)
 let raf = 0
 let alpha = 0
 let resizeObserver: ResizeObserver | null = null
+let themeObserver: MutationObserver | null = null
+let aborter: AbortController | null = null
+let alive = true
+let noteTimer = 0
 const view = { scale: 1, ox: 0, oy: 0 }
-const drag = { mode: '' as '' | 'node' | 'pan', id: '', sx: 0, sy: 0, moved: false }
-
-function authQuery(): string {
-  return props.token ? '' : `?login_name=${encodeURIComponent(props.login ?? '')}`
-}
-function authTail(): string {
-  return props.token ? '' : `&login_name=${encodeURIComponent(props.login ?? '')}`
-}
-function authHeaders(): Record<string, string> {
-  return props.token ? { Authorization: `Bearer ${props.token}` } : {}
-}
-/** 先取 text 再试解析：端点未上线时 axum 兜底 404 是空体，直接 .json() 只会抛 SyntaxError。 */
-async function errText(r: Response, fallback: string): Promise<string> {
-  const raw = await r.text()
-  let body: { error?: string } | null = null
-  try { body = raw ? JSON.parse(raw) : null } catch { /* 非 JSON 按原文报 */ }
-  return body?.error || raw.trim().slice(0, 200) || `${fallback}（HTTP ${r.status}）`
-}
+// sx/sy 是平移锚点（随 move 更新）；ix/iy 是按下原点（判 moved 阈值）；gx/gy 是抓取偏移
+const drag = { mode: '' as '' | 'node' | 'pan', id: '', sx: 0, sy: 0, ix: 0, iy: 0, gx: 0, gy: 0, moved: false }
 
 function kindColor(kind: string): string {
   return KIND_COLORS[kind] ?? '#8b93ad'
@@ -95,16 +91,24 @@ function kindLabel(kind: string): string {
 function statusLabel(status: EdgeStatus): string {
   return STATUS_LABELS[status] ?? status
 }
+function nodeKindLabel(kind: string): string {
+  return NODE_KIND_LABELS[kind] ?? kind
+}
 function nodeColor(kind: string, index: number): string {
-  if (!kind) return NODE_PALETTE[index % NODE_PALETTE.length]
+  if (!kind) return NODE_FALLBACK_COLOR
   let hash = 0
   for (let i = 0; i < kind.length; i++) hash = (hash * 31 + kind.charCodeAt(i)) | 0
   return NODE_PALETTE[Math.abs(hash) % NODE_PALETTE.length]
 }
+/** 标签截断加省略号：截过的名字不该被当成全名。 */
+function clipText(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}…` : s
+}
 
 function normStatus(raw: unknown): EdgeStatus {
   const s = String(raw ?? '').toLowerCase()
-  if (s === 'accepted' || s === 'approved' || s === 'confirmed') return 'accepted'
+  // active 是后端 registry（合同）边的状态：等价已接受，不是「待确认」
+  if (s === 'accepted' || s === 'approved' || s === 'confirmed' || s === 'active') return 'accepted'
   if (s === 'rejected' || s === 'denied') return 'rejected'
   return 'pending'
 }
@@ -126,19 +130,22 @@ function evidenceText(raw: unknown): string {
   return String(raw)
 }
 
-function makeNode(id: string, label: string, kind: string, comment: string, index: number, total: number): MapNode {
+function makeNode(id: string, label: string, kind: string, domain: string, comment: string, index: number, total: number): MapNode {
   const angle = (index / Math.max(1, total)) * Math.PI * 2
   return {
-    id, label, kind, comment, degree: 0,
+    id, label, kind, domain, comment, degree: 0,
     x: Math.cos(angle) * 190 + (Math.random() - 0.5) * 40,
     y: Math.sin(angle) * 190 + (Math.random() - 0.5) * 40,
+    // 半径初值只是占位：finishGraph 按度数重算（9 + sqrt(degree) * 3.4，上限 24）
     vx: 0, vy: 0, r: 10,
     color: nodeColor(kind, index),
   }
 }
 
-/** 节点契约 {id|name|table, kind?, comment?}；边契约 {id, source|from, target|to, kind, status, confidence, evidence}。
- *  边端点不在节点清单里时补占位节点 —— 边不该因为节点接口缺行而凭空消失。 */
+/** 节点契约 {id|name|table（+column）, kind?, domain?, comment?}；
+ *  边契约 {id, left_table|right_table（端点）, kind, status, confidence, evidence}。
+ *  边端点不在节点清单里时补占位节点 —— 边不该因为节点接口缺行而凭空消失。
+ *  索引同时按 id 与 label（裸表名）建：后端节点 id 是 `table:t_a`、边端点是裸表名。 */
 function normalizeGraph(nodesRaw: unknown, edgesRaw: unknown): { nodes: MapNode[]; edges: MapEdge[] } {
   const nodeList = Array.isArray(nodesRaw) ? nodesRaw : []
   const outNodes: MapNode[] = []
@@ -147,11 +154,18 @@ function normalizeGraph(nodesRaw: unknown, edgesRaw: unknown): { nodes: MapNode[
     if (!item || typeof item !== 'object') return
     const row = item as Record<string, unknown>
     const id = String(row.id ?? row.name ?? row.table ?? row.table_name ?? index)
+    const table = String(row.table ?? row.table_name ?? '')
+    const column = String(row.column ?? '')
+    // 列节点（id 形如 `column:t.c`）的 label 必须带列名，否则同表列节点无法区分
+    const fallbackLabel = column ? (table ? `${table}.${column}` : column) : (table || id)
+    const label = String(row.label ?? row.name ?? fallbackLabel)
     indexById.set(id, outNodes.length)
+    if (label && !indexById.has(label)) indexById.set(label, outNodes.length)
     outNodes.push(makeNode(
       id,
-      String(row.label ?? row.name ?? row.table ?? row.table_name ?? id),
+      label,
       String(row.kind ?? row.type ?? ''),
+      String(row.domain ?? ''),
       String(row.comment ?? row.description ?? ''),
       index, nodeList.length,
     ))
@@ -161,7 +175,7 @@ function normalizeGraph(nodesRaw: unknown, edgesRaw: unknown): { nodes: MapNode[
     if (hit != null) return hit
     const index = outNodes.length
     indexById.set(id, index)
-    outNodes.push(makeNode(id, id, '', '', index, index + 1))
+    outNodes.push(makeNode(id, id, '', '', '', index, index + 1))
     return index
   }
   const edgeList = Array.isArray(edgesRaw) ? edgesRaw : []
@@ -169,8 +183,10 @@ function normalizeGraph(nodesRaw: unknown, edgesRaw: unknown): { nodes: MapNode[
   edgeList.forEach((item, index) => {
     if (!item || typeof item !== 'object') return
     const row = item as Record<string, unknown>
-    const src = String(row.source ?? row.from ?? row.source_table ?? row.src ?? '')
-    const dst = String(row.target ?? row.to ?? row.target_table ?? row.dst ?? '')
+    // 端点归一：left_table/right_table 是后端真实端点键，必须在 source 之前
+    // （source 在这条 wire 上是来源标识 'inferred'/'registry'，当端点用会把每条边都丢掉）
+    const src = String(row.left_table ?? row.source ?? row.from ?? row.source_table ?? row.src ?? '')
+    const dst = String(row.right_table ?? row.target ?? row.to ?? row.target_table ?? row.dst ?? '')
     if (!src || !dst || src === dst) return
     outEdges.push({
       id: String(row.id ?? row.edge_id ?? `e${index}`),
@@ -185,7 +201,8 @@ function normalizeGraph(nodesRaw: unknown, edgesRaw: unknown): { nodes: MapNode[
   return { nodes: outNodes, edges: outEdges }
 }
 
-/** 度数与半径在数据变化后重算（接受/拒绝会撤边）；rejected 不计入度数也不上画布。 */
+/** 度数与半径在数据变化后重算（接受/拒绝会撤边）；rejected 不计入度数也不上画布。
+ *  max(0,…)：0 度节点半径小于 1 度节点，度数信息不丢档。 */
 function finishGraph() {
   for (const n of nodes.value) n.degree = 0
   for (const e of edges.value) {
@@ -193,7 +210,7 @@ function finishGraph() {
     nodes.value[e.source].degree++
     nodes.value[e.target].degree++
   }
-  for (const n of nodes.value) n.r = Math.min(24, 9 + Math.sqrt(Math.max(1, n.degree)) * 3.4)
+  for (const n of nodes.value) n.r = Math.min(24, 9 + Math.sqrt(Math.max(0, n.degree)) * 3.4)
 }
 
 const canvasEdges = computed(() => edges.value.filter((e) => e.status !== 'rejected'))
@@ -220,14 +237,14 @@ function wake(strength = 0.3) {
   if (!raf) raf = requestAnimationFrame(tick)
 }
 
+const REPULSION = 2600
+const SPRING = 0.02
+const GRAVITY = 0.012
 function tick() {
   raf = 0
   const ns = nodes.value
   const es = canvasEdges.value
   if (!ns.length) return
-  const REPULSION = 2600
-  const SPRING = 0.02
-  const GRAVITY = 0.012
   for (let i = 0; i < ns.length; i++) {
     const a = ns[i]
     for (let j = i + 1; j < ns.length; j++) {
@@ -320,14 +337,25 @@ function edgePairKey(e: MapEdge): string {
   return pairKey(nodes.value[e.source]?.id ?? '', nodes.value[e.target]?.id ?? '')
 }
 
+// 焦点邻接 Set 预算（computed 缓存）：hover 时 render 每帧逐节点查表 O(1)，不再逐节点 canvasEdges.some
+const focusNeighbors = computed(() => {
+  const focus = hoverNodeId.value || selectedNodeId.value
+  if (!focus) return null
+  const set = new Set<string>([focus])
+  for (const e of canvasEdges.value) {
+    const s = nodes.value[e.source]?.id
+    const t = nodes.value[e.target]?.id
+    if (s === focus && t) set.add(t)
+    if (t === focus && s) set.add(s)
+  }
+  return set
+})
+
 function nodeDimmed(node: MapNode): boolean {
   if (pathNodes.value) return !pathNodes.value.has(node.id)
-  const focus = hoverNodeId.value || selectedNodeId.value
-  if (!focus) return false
-  if (node.id === focus) return false
-  return !canvasEdges.value.some((e) =>
-    (nodes.value[e.source].id === focus && nodes.value[e.target].id === node.id)
-    || (nodes.value[e.target].id === focus && nodes.value[e.source].id === node.id))
+  const adj = focusNeighbors.value
+  if (!adj) return false
+  return !adj.has(node.id)
 }
 
 function edgeDimmed(e: MapEdge): boolean {
@@ -376,7 +404,7 @@ function render() {
       ctx.fillStyle = dark ? 'rgba(139,147,173,.9)' : 'rgba(100,109,135,.85)'
       ctx.font = `9px ${FONT_FAMILY}`
       ctx.textAlign = 'center'
-      ctx.fillText(kindLabel(edge.kind).slice(0, 10), (a.x + b.x) / 2, (a.y + b.y) / 2 - 4)
+      ctx.fillText(clipText(kindLabel(edge.kind), 10), (a.x + b.x) / 2, (a.y + b.y) / 2 - 4)
     }
   }
   ctx.setLineDash([])
@@ -406,7 +434,7 @@ function render() {
       ctx.fillStyle = dim ? faintColor : labelColor
       ctx.font = `${node.r > 14 ? 11 : 10}px ${FONT_FAMILY}`
       ctx.textAlign = 'center'
-      ctx.fillText(node.label.slice(0, 12), node.x, node.y + node.r + 11)
+      ctx.fillText(clipText(node.label, 12), node.x, node.y + node.r + 11)
     }
     ctx.globalAlpha = 1
   }
@@ -419,10 +447,13 @@ function onPointerDown(event: PointerEvent) {
   drag.id = node?.id ?? ''
   drag.sx = event.clientX
   drag.sy = event.clientY
+  drag.ix = event.clientX
+  drag.iy = event.clientY
   drag.moved = false
   if (node) {
-    node.x = point.x
-    node.y = point.y
+    // 记录抓取偏移：节点中心不瞬移到指针（点大节点边缘不跳）
+    drag.gx = point.x - node.x
+    drag.gy = point.y - node.y
     wake(0.4)
   }
   canvasEl.value?.setPointerCapture(event.pointerId)
@@ -433,9 +464,10 @@ function onPointerMove(event: PointerEvent) {
   if (drag.mode === 'node') {
     const node = nodes.value.find((n) => n.id === drag.id)
     if (node) {
-      node.x = point.x
-      node.y = point.y
-      drag.moved = true
+      node.x = point.x - drag.gx
+      node.y = point.y - drag.gy
+      // 4px 位移阈值：点击手抖不变成拖拽/反选
+      if (!drag.moved && Math.hypot(event.clientX - drag.ix, event.clientY - drag.iy) >= 4) drag.moved = true
       wake(0.2)
     }
     return
@@ -445,7 +477,7 @@ function onPointerMove(event: PointerEvent) {
     view.oy += event.clientY - drag.sy
     drag.sx = event.clientX
     drag.sy = event.clientY
-    drag.moved = true
+    if (!drag.moved && Math.hypot(event.clientX - drag.ix, event.clientY - drag.iy) >= 4) drag.moved = true
     render()
     return
   }
@@ -456,6 +488,14 @@ function onPointerMove(event: PointerEvent) {
     if (canvasEl.value) canvasEl.value.style.cursor = node ? 'pointer' : 'default'
     render()
   }
+}
+
+function endDrag(event: PointerEvent) {
+  drag.mode = ''
+  drag.id = ''
+  // 未持捕获时 release 会抛 DOMException
+  const canvas = canvasEl.value
+  if (canvas && canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
 }
 
 function onPointerUp(event: PointerEvent) {
@@ -471,20 +511,42 @@ function onPointerUp(event: PointerEvent) {
     }
     render()
   }
-  drag.mode = ''
-  drag.id = ''
-  canvasEl.value?.releasePointerCapture(event.pointerId)
+  endDrag(event)
+}
+
+function onPointerCancel(event: PointerEvent) {
+  // 触摸被打断：drag 状态必须收尾，否则拖曳态滞留、RAF 因 drag.mode==='node' 永不停
+  endDrag(event)
+}
+
+function onPointerLeave() {
+  // 指针离画布：hover 高亮与 cursor 一并复位，不滞留
+  if (hoverNodeId.value) {
+    hoverNodeId.value = ''
+    render()
+  }
+  if (canvasEl.value) canvasEl.value.style.cursor = 'default'
 }
 
 function onWheel(event: WheelEvent) {
+  // deltaMode 归一：Firefox 行滚动（=1）换算成像素级，缩放不暴涨
+  const dy = event.deltaMode === 1 ? event.deltaY * 33 : event.deltaY
   const before = toWorld(event)
-  view.scale = Math.min(3, Math.max(0.25, view.scale * (event.deltaY < 0 ? 1.12 : 0.89)))
+  view.scale = Math.min(3, Math.max(0.25, view.scale * (dy < 0 ? 1.12 : 0.89)))
   const { w, h } = canvasSize()
   const rect = canvasEl.value?.getBoundingClientRect()
   const cx = rect ? event.clientX - rect.left : w / 2
   const cy = rect ? event.clientY - rect.top : h / 2
   view.ox = cx - w / 2 - before.x * view.scale
   view.oy = cy - h / 2 - before.y * view.scale
+  render()
+}
+
+/** 复位视图（缩放/平移只有重开面板才复位是不够的）。 */
+function resetView() {
+  view.scale = 1
+  view.ox = 0
+  view.oy = 0
   render()
 }
 
@@ -504,15 +566,20 @@ const selectedEdge = computed(() => edges.value.find((e) => e.id === selectedEdg
 const selectedEdgeNodes = computed(() => {
   const e = selectedEdge.value
   if (!e) return null
-  return { a: nodes.value[e.source], b: nodes.value[e.target] }
+  // 索引异常（数据漂移）时返回 null，详情卡整体不渲染，不运行时报错
+  const a = nodes.value[e.source]
+  const b = nodes.value[e.target]
+  if (!a || !b) return null
+  return { a, b }
 })
-const selectedNodeEdges = computed(() => {
+const selectedNodeEdgesAll = computed(() => {
   const node = selectedNode.value
   if (!node) return []
   return canvasEdges.value
     .filter((e) => nodes.value[e.source]?.id === node.id || nodes.value[e.target]?.id === node.id)
-    .slice(0, 8)
 })
+const NODE_EDGES_MAX = 8
+const selectedNodeEdges = computed(() => selectedNodeEdgesAll.value.slice(0, NODE_EDGES_MAX))
 
 function edgeLabel(e: MapEdge): string {
   return `${nodes.value[e.source]?.label ?? '?'} ↔ ${nodes.value[e.target]?.label ?? '?'}`
@@ -536,23 +603,38 @@ const edgeRows = computed(() => {
     if (!needle.value) return true
     const a = nodes.value[e.source]
     const b = nodes.value[e.target]
+    // 原始 kind 与中文标签都参与匹配（输「共现」也能搜到 co_occurs）
     return !!(a?.label.toLowerCase().includes(needle.value) || b?.label.toLowerCase().includes(needle.value)
-      || e.kind.toLowerCase().includes(needle.value))
+      || e.kind.toLowerCase().includes(needle.value) || kindLabel(e.kind).toLowerCase().includes(needle.value))
   })
   // 待确认的推断边排最前（这是 admin 的工作队列），同状态按置信度降序
   const rank = (s: EdgeStatus) => (s === 'pending' ? 0 : s === 'accepted' ? 1 : 2)
   return [...list].sort((x, y) => rank(x.status) - rank(y.status) || (y.confidence ?? 0) - (x.confidence ?? 0))
 })
 const pendingCount = computed(() => edges.value.filter((e) => e.status === 'pending').length)
+/** 路径候选表名去重（列节点 label 与表名重复时，候选列表不大量重复）。 */
+const tableOptions = computed(() => [...new Set(nodes.value.map((n) => n.label))])
+
+/** 边的 id 是合成串（`e${index}`，registry 边 id 为 null 时）时不能走接受/拒绝接口 —— POST 必 404。 */
+function edgeOperable(e: MapEdge): boolean {
+  return /^\d+$/.test(e.id)
+}
+
+/** 成功提示自动消隐：不与后续的路径结果/错误长期并存。 */
+function flashNote(text: string) {
+  note.value = text
+  window.clearTimeout(noteTimer)
+  noteTimer = window.setTimeout(() => { note.value = '' }, 4000)
+}
 
 async function decide(edge: MapEdge, action: 'accept' | 'reject') {
-  if (!props.admin || actionBusy.value) return
+  if (!props.admin || actionBusy.value || !edgeOperable(edge)) return
   actionBusy.value = edge.id
   error.value = ''
   note.value = ''
   try {
-    const r = await fetch(`/api/datamap/edges/${encodeURIComponent(edge.id)}/${action}${authQuery()}`, {
-      method: 'POST', headers: authHeaders(),
+    const r = await fetch(`/api/datamap/edges/${encodeURIComponent(edge.id)}/${action}${authQuery(props.token, props.login)}`, {
+      method: 'POST', headers: authHeaders(props.token),
     })
     if (r.status === 401) {
       emit('auth-expired')
@@ -563,36 +645,49 @@ async function decide(edge: MapEdge, action: 'accept' | 'reject') {
       error.value = await errText(r, action === 'accept' ? '接受失败' : '拒绝失败')
       return
     }
+    if (!alive) return
     // 后端回最终状态就采信，没回就按动作落态；rejected 边随即从画布撤下
     const j: { status?: unknown } = await r.json().catch(() => ({}))
     edge.status = normStatus(j.status ?? (action === 'accept' ? 'accepted' : 'rejected'))
     finishGraph()
-    note.value = `${action === 'accept' ? '已接受' : '已拒绝'} ${edgeLabel(edge)}`
+    flashNote(`${action === 'accept' ? '已接受' : '已拒绝'} ${edgeLabel(edge)}`)
     wake(0.3)
     render()
   } catch (e) {
-    error.value = `${action === 'accept' ? '接受' : '拒绝'}失败（网络）：${e}`
+    if (alive) error.value = `${action === 'accept' ? '接受' : '拒绝'}失败（网络）：${errMessage(e)}`
   } finally {
     actionBusy.value = ''
   }
 }
 
-/** 路径响应宽容归一：{paths: [[ref,…],…]} / {path: [ref,…]} / {nodes: [ref,…]} 都接；
- *  ref 可以是字符串（表名/id）或带 id|name|table 的对象。 */
+/** 路径响应宽容归一：{nodes: [裸表名,…]} 优先；{paths: [[ref,…],…]} / {path: [hop,…]} 也接；
+ *  ref 可以是字符串（表名/id）或带 id|name|table|left_table 的对象；
+ *  hop 对象数组（left_table/right_table 成对，后端 paths 端点契约）串成节点序列。 */
 function extractPaths(j: unknown): string[][] {
   const root = (j && typeof j === 'object' ? j : {}) as Record<string, unknown>
-  const raw = root.paths ?? root.path ?? root.nodes ?? []
+  const raw = root.nodes ?? root.paths ?? root.path ?? []
   if (!Array.isArray(raw) || !raw.length) return []
   const asRef = (v: unknown): string => {
     if (typeof v === 'string') return v
     if (v && typeof v === 'object') {
       const o = v as Record<string, unknown>
-      return String(o.id ?? o.name ?? o.table ?? o.table_name ?? o.label ?? '')
+      return String(o.id ?? o.name ?? o.table ?? o.table_name ?? o.label ?? o.left_table ?? '')
     }
     return ''
   }
   if (raw.every((v) => Array.isArray(v))) {
     return (raw as unknown[][]).map((p) => p.map(asRef).filter(Boolean)).filter((p) => p.length)
+  }
+  if (raw.every((v) => !!v && typeof v === 'object' && 'left_table' in (v as Record<string, unknown>))) {
+    const hops = raw as Record<string, unknown>[]
+    const seq: string[] = []
+    const first = String(hops[0].left_table ?? '')
+    if (first) seq.push(first)
+    for (const h of hops) {
+      const rt = String(h.right_table ?? '')
+      if (rt) seq.push(rt)
+    }
+    return seq.length > 1 ? [seq] : []
   }
   const single = raw.map(asRef).filter(Boolean)
   return single.length ? [single] : []
@@ -608,13 +703,17 @@ async function runPath() {
   const from = pathFrom.value.trim()
   const to = pathTo.value.trim()
   if (!from || !to || pathLoading.value) return
+  if (from === to) {
+    pathMsg.value = '起点与终点相同，无需查询'
+    return
+  }
   pathLoading.value = true
   pathMsg.value = ''
   error.value = ''
   try {
     const r = await fetch(
-      `/api/datamap/paths?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${authTail()}`,
-      { headers: authHeaders() },
+      `/api/datamap/paths?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${authTail(props.token, props.login)}`,
+      { headers: authHeaders(props.token) },
     )
     if (r.status === 401) {
       emit('auth-expired')
@@ -626,6 +725,7 @@ async function runPath() {
       return
     }
     const paths = extractPaths(await r.json().catch(() => ({})))
+    if (!alive) return
     if (!paths.length) {
       clearPath()
       pathMsg.value = `${from} → ${to} 之间没有找到路径`
@@ -640,9 +740,15 @@ async function runPath() {
     const pn = new Set<string>()
     const pp = new Set<string>()
     for (const path of paths) {
-      const ids = path.map((refName) => byName.get(refName.toLowerCase()) ?? '').filter(Boolean)
-      ids.forEach((id) => pn.add(id))
-      for (let i = 0; i + 1 < ids.length; i++) pp.add(pairKey(ids[i], ids[i + 1]))
+      // 未解析的引用会断段：有缺口就断开，不把不相邻两点连成假路径高亮
+      let prev = ''
+      for (const refName of path) {
+        const id = byName.get(refName.toLowerCase()) ?? ''
+        if (!id) { prev = ''; continue }
+        pn.add(id)
+        if (prev) pp.add(pairKey(prev, id))
+        prev = id
+      }
     }
     if (!pn.size) {
       clearPath()
@@ -658,13 +764,24 @@ async function runPath() {
     selectedEdgeId.value = ''
     render()
   } catch (e) {
-    pathMsg.value = `路径查询失败（网络）：${e}`
+    if (alive) pathMsg.value = `路径查询失败（网络）：${errMessage(e)}`
   } finally {
     pathLoading.value = false
   }
 }
 
+/** 包裹键宽容归一：nodes/edges 之外，items/rows/records 也接（与 SqlAuditPanel 同口径）。 */
+function bag(j: unknown, keys: string[]): unknown[] {
+  if (Array.isArray(j)) return j
+  const o = (j && typeof j === 'object' ? j : {}) as Record<string, unknown>
+  for (const k of keys) if (Array.isArray(o[k])) return o[k] as unknown[]
+  return []
+}
+
 async function load() {
+  aborter?.abort()
+  const ctl = new AbortController()
+  aborter = ctl
   loading.value = true
   error.value = ''
   note.value = ''
@@ -672,10 +789,11 @@ async function load() {
   selectedNodeId.value = ''
   selectedEdgeId.value = ''
   hoverNodeId.value = ''
+  if (canvasEl.value) canvasEl.value.style.cursor = 'default'
   try {
     const [rn, re] = await Promise.all([
-      fetch(`/api/datamap/nodes${authQuery()}`, { headers: authHeaders() }),
-      fetch(`/api/datamap/edges${authQuery()}`, { headers: authHeaders() }),
+      fetch(`/api/datamap/nodes${authQuery(props.token, props.login)}`, { headers: authHeaders(props.token), signal: ctl.signal }),
+      fetch(`/api/datamap/edges${authQuery(props.token, props.login)}`, { headers: authHeaders(props.token), signal: ctl.signal }),
     ])
     if (rn.status === 401 || re.status === 401) {
       emit('auth-expired')
@@ -692,22 +810,19 @@ async function load() {
     }
     const jn: unknown = await rn.json().catch(() => ({}))
     const je: unknown = await re.json().catch(() => ({}))
-    const nodesRaw = Array.isArray(jn) ? jn : (jn as { nodes?: unknown[] })?.nodes
-    const edgesRaw = Array.isArray(je) ? je : (je as { edges?: unknown[] })?.edges
-    const graph = normalizeGraph(nodesRaw, edgesRaw)
+    const graph = normalizeGraph(bag(jn, ['nodes', 'items', 'rows', 'records']), bag(je, ['edges', 'items', 'rows', 'records']))
     nodes.value = graph.nodes
     edges.value = graph.edges
     finishGraph()
     view.scale = 1
     view.ox = 0
     view.oy = 0
-    alpha = 1
-    if (!raf) raf = requestAnimationFrame(tick)
-    render()
+    wake(1)
   } catch (e) {
-    error.value = `数据地图加载失败（网络）：${e}`
+    if (ctl.signal.aborted) return
+    error.value = `数据地图加载失败（网络）：${errMessage(e)}`
   } finally {
-    loading.value = false
+    if (aborter === ctl) loading.value = false
   }
 }
 
@@ -717,14 +832,22 @@ function onEsc(e: KeyboardEvent) {
 onMounted(() => {
   resizeObserver = new ResizeObserver(resizeCanvas)
   if (wrapEl.value) resizeObserver.observe(wrapEl.value)
+  // 主题切换不重排力导：监听 data-theme 补一次 render，画布配色不留滞到下次交互
+  themeObserver = new MutationObserver(() => render())
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
   resizeCanvas()
   void load()
   window.addEventListener('keydown', onEsc)
+  closeBtn.value?.focus()
 })
 onBeforeUnmount(() => {
+  alive = false
+  aborter?.abort()
+  window.clearTimeout(noteTimer)
   window.removeEventListener('keydown', onEsc)
   if (raf) cancelAnimationFrame(raf)
   resizeObserver?.disconnect()
+  themeObserver?.disconnect()
 })
 </script>
 
@@ -736,32 +859,37 @@ onBeforeUnmount(() => {
           <span class="dm-kicker">数据地图</span>
           <h2 id="dm-title">表关系图谱<span v-if="pendingCount" class="dm-pending-tag">{{ pendingCount }} 条待确认</span></h2>
           <p class="dm-sub">
-            节点=表，边=表间关系（虚线=待确认推断边，实线=已接受）。点节点/边看证据与置信度{{ admin ? '，可接受或拒绝推断边' : '' }}；画布支持拖拽、滚轮缩放。
+            节点=表，边=表间关系（虚线=待确认推断边，实线=已接受）。点节点/边看证据与置信度{{ admin ? '，可接受或拒绝推断边' : '' }}；画布支持拖拽、滚轮缩放、空白拖动平移。
           </p>
         </div>
-        <button type="button" class="dm-close" title="关闭" @click="emit('close')">✕</button>
+        <button ref="closeBtn" type="button" class="dm-close" title="关闭" aria-label="关闭" @click="emit('close')">×</button>
       </header>
 
       <!-- 路径查询：from/to 表名 → GET /api/datamap/paths，命中路径在画布高亮 -->
       <div class="dm-path">
-        <input v-model="pathFrom" list="dm-tables" placeholder="起点表名" aria-label="起点表名" @keyup.enter="runPath" />
+        <input v-model="pathFrom" list="dm-tables" placeholder="起点表名" aria-label="起点表名" @keydown.enter="!$event.isComposing && runPath()" />
         <span class="dm-path-arrow">→</span>
-        <input v-model="pathTo" list="dm-tables" placeholder="终点表名" aria-label="终点表名" @keyup.enter="runPath" />
+        <input v-model="pathTo" list="dm-tables" placeholder="终点表名" aria-label="终点表名" @keydown.enter="!$event.isComposing && runPath()" />
         <datalist id="dm-tables">
-          <option v-for="n in nodes" :key="n.id" :value="n.label" />
+          <option v-for="l in tableOptions" :key="l" :value="l" />
         </datalist>
-        <button type="button" class="dm-btn primary" :disabled="pathLoading || !pathFrom.trim() || !pathTo.trim()" @click="runPath">
+        <button
+          type="button" class="dm-btn primary"
+          :disabled="pathLoading || !pathFrom.trim() || !pathTo.trim() || pathFrom.trim() === pathTo.trim()"
+          :title="pathFrom.trim() && pathFrom.trim() === pathTo.trim() ? '起点与终点相同' : ''"
+          @click="runPath"
+        >
           {{ pathLoading ? '查询中…' : '查路径' }}
         </button>
         <button v-if="pathNodes" type="button" class="dm-btn" @click="clearPath(); render()">清除高亮</button>
-        <span v-if="pathMsg" class="dm-path-msg">{{ pathMsg }}</span>
+        <span v-if="pathMsg" class="dm-path-msg" role="status">{{ pathMsg }}</span>
       </div>
 
-      <div v-if="error" class="dm-error">{{ error }}</div>
-      <div v-else-if="note" class="dm-note">{{ note }}</div>
+      <div v-if="error" class="dm-error" role="alert">{{ error }}</div>
+      <div v-else-if="note" class="dm-note" role="status">{{ note }}</div>
 
       <div class="dm-body">
-        <!-- 左列表：关系（pending 在前，是 admin 的确认队列）/ 表（按度数排序） -->
+        <!-- 左列表：关系（pending 在前，是 admin 的确认队列，计数含已拒绝）/ 表（按度数排序） -->
         <aside class="dm-side">
           <div class="dm-tabs">
             <button type="button" :class="{ on: tab === 'edges' }" @click="tab = 'edges'">关系 <b>{{ edges.length }}</b></button>
@@ -770,7 +898,7 @@ onBeforeUnmount(() => {
           <input v-model="search" class="dm-search" type="search" placeholder="过滤表名 / 关系类型" aria-label="过滤" />
           <div class="dm-list">
             <template v-if="tab === 'edges'">
-              <div v-if="!edgeRows.length" class="dm-empty">暂无关系</div>
+              <div v-if="!edgeRows.length" class="dm-empty">{{ needle ? '无匹配结果' : '暂无关系' }}</div>
               <button
                 v-for="e in edgeRows" :key="e.id" type="button"
                 class="dm-row" :class="{ on: selectedEdgeId === e.id }"
@@ -783,7 +911,7 @@ onBeforeUnmount(() => {
               </button>
             </template>
             <template v-else>
-              <div v-if="!nodeRows.length" class="dm-empty">暂无表节点</div>
+              <div v-if="!nodeRows.length" class="dm-empty">{{ needle ? '无匹配结果' : '暂无表节点' }}</div>
               <button
                 v-for="n in nodeRows" :key="n.id" type="button"
                 class="dm-row" :class="{ on: selectedNodeId === n.id }"
@@ -791,7 +919,7 @@ onBeforeUnmount(() => {
               >
                 <span class="dm-dot" :style="{ background: n.color }"></span>
                 <span class="dm-row-t" :title="n.comment || n.label">{{ n.label }}</span>
-                <span class="dm-conf">{{ n.degree }} 边</span>
+                <span class="dm-conf">{{ n.degree }} 条关系</span>
               </button>
             </template>
           </div>
@@ -802,6 +930,7 @@ onBeforeUnmount(() => {
           <canvas
             ref="canvasEl" aria-label="数据地图画布"
             @pointerdown="onPointerDown" @pointermove="onPointerMove" @pointerup="onPointerUp"
+            @pointercancel="onPointerCancel" @pointerleave="onPointerLeave"
             @wheel.prevent="onWheel"
           ></canvas>
           <div v-if="loading" class="dm-state" role="status">
@@ -811,8 +940,10 @@ onBeforeUnmount(() => {
             <strong>暂无表节点</strong>
             <span>数据地图接口尚未返回任何表；接口上线或推断任务跑完后会自动展示。</span>
           </div>
-          <div v-if="nodes.length" class="dm-count" aria-hidden="true">表 {{ nodes.length }} · 关系 {{ canvasEdges.length }}</div>
-          <div class="dm-legend" aria-hidden="true">
+          <button v-if="nodes.length" type="button" class="dm-reset" title="复位缩放与平移" @click="resetView">复位视图</button>
+          <!-- 画布口径计数：不含已拒绝边（左侧 tab 计数含已拒绝，两处口径不同是有意的） -->
+          <div v-if="nodes.length" class="dm-count" aria-hidden="true">表 {{ nodes.length }} · 画布关系 {{ canvasEdges.length }}</div>
+          <div v-if="nodes.length" class="dm-legend" aria-hidden="true">
             <span v-for="k in legendKinds" :key="k"><i class="dm-swatch" :style="{ background: KIND_COLORS[k] }"></i>{{ KIND_LABELS[k] }}</span>
             <span><i class="dm-line"></i>已接受</span>
             <span><i class="dm-line dash"></i>待确认</span>
@@ -822,7 +953,7 @@ onBeforeUnmount(() => {
           <aside v-if="selectedEdge && selectedEdgeNodes" class="dm-detail" aria-label="关系详情">
             <header>
               <strong :title="edgeLabel(selectedEdge)">{{ selectedEdgeNodes.a.label }} ↔ {{ selectedEdgeNodes.b.label }}</strong>
-              <button type="button" class="dm-x" title="关闭详情" @click="selectEdge(selectedEdge.id)">×</button>
+              <button type="button" class="dm-x" title="关闭详情" aria-label="关闭详情" @click="selectEdge(selectedEdge.id)">×</button>
             </header>
             <dl>
               <div><dt>类型</dt><dd><span class="dm-dot" :style="{ background: kindColor(selectedEdge.kind) }"></span>{{ kindLabel(selectedEdge.kind) }}</dd></div>
@@ -834,13 +965,16 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="selectedEdge.evidence" class="dm-evidence">{{ selectedEdge.evidence }}</div>
             <div v-else class="dm-evidence dm-none">暂无证据说明</div>
-            <div v-if="admin && selectedEdge.status !== 'accepted'" class="dm-ops">
+            <!-- 合成 id（registry 边 id:null 落的 e${index}）没有可操作的后端记录，不渲染操作区 -->
+            <div v-if="admin && edgeOperable(selectedEdge) && selectedEdge.status !== 'accepted'" class="dm-ops">
               <button type="button" class="dm-btn primary" :disabled="!!actionBusy" @click="decide(selectedEdge, 'accept')">
                 {{ actionBusy === selectedEdge.id ? '提交中…' : '接受' }}
               </button>
-              <button v-if="selectedEdge.status !== 'rejected'" type="button" class="dm-btn danger" :disabled="!!actionBusy" @click="decide(selectedEdge, 'reject')">拒绝</button>
+              <button v-if="selectedEdge.status !== 'rejected'" type="button" class="dm-btn danger" :disabled="!!actionBusy" @click="decide(selectedEdge, 'reject')">
+                {{ actionBusy === selectedEdge.id ? '提交中…' : '拒绝' }}
+              </button>
             </div>
-            <div v-else-if="admin && selectedEdge.status === 'accepted'" class="dm-ops">
+            <div v-else-if="admin && edgeOperable(selectedEdge) && selectedEdge.status === 'accepted'" class="dm-ops">
               <button type="button" class="dm-btn danger" :disabled="!!actionBusy" @click="decide(selectedEdge, 'reject')">
                 {{ actionBusy === selectedEdge.id ? '提交中…' : '撤销接受' }}
               </button>
@@ -851,10 +985,10 @@ onBeforeUnmount(() => {
           <aside v-else-if="selectedNode" class="dm-detail" aria-label="表详情">
             <header>
               <strong :title="selectedNode.label">{{ selectedNode.label }}</strong>
-              <button type="button" class="dm-x" title="关闭详情" @click="selectNode(selectedNode.id)">×</button>
+              <button type="button" class="dm-x" title="关闭详情" aria-label="关闭详情" @click="selectNode(selectedNode.id)">×</button>
             </header>
             <dl>
-              <div v-if="selectedNode.kind"><dt>类型</dt><dd>{{ selectedNode.kind }}</dd></div>
+              <div v-if="selectedNode.kind"><dt>类型</dt><dd>{{ nodeKindLabel(selectedNode.kind) }}<template v-if="selectedNode.domain"> · {{ selectedNode.domain }}</template></dd></div>
               <div><dt>关系数</dt><dd>{{ selectedNode.degree }}</dd></div>
             </dl>
             <div v-if="selectedNode.comment" class="dm-evidence">{{ selectedNode.comment }}</div>
@@ -868,6 +1002,7 @@ onBeforeUnmount(() => {
                 <span class="dm-pill" :data-s="e.status">{{ statusLabel(e.status) }}</span>
               </button>
             </div>
+            <div v-if="selectedNodeEdgesAll.length > NODE_EDGES_MAX" class="dm-rel-more">还有 {{ selectedNodeEdgesAll.length - NODE_EDGES_MAX }} 条关系未列出</div>
           </aside>
         </div>
       </div>
@@ -886,8 +1021,8 @@ onBeforeUnmount(() => {
 .dm-close { width: 30px; height: 30px; flex-shrink: 0; border: 0; border-radius: 5px; background: transparent; color: var(--text-muted); cursor: pointer; }
 .dm-close:hover { background: var(--bg-hover); color: var(--text-primary); }
 
-.dm-path { display: flex; align-items: center; gap: 7px; padding: 2px 20px 10px; }
-.dm-path input { width: min(210px, 24vw); height: 30px; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; outline: 0; background: var(--bg-card); color: var(--text-primary); font: inherit; font-size: 12px; }
+.dm-path { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 2px 20px 10px; }
+.dm-path input { width: min(210px, 24vw); min-width: 120px; height: 30px; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; outline: 0; background: var(--bg-card); color: var(--text-primary); font: inherit; font-size: 12px; }
 .dm-path input:focus { border-color: var(--primary); box-shadow: var(--ring); }
 .dm-path-arrow { color: var(--text-faint); }
 .dm-path-msg { color: var(--text-muted); font-size: 11.5px; }
@@ -929,6 +1064,9 @@ onBeforeUnmount(() => {
 .dm-state span { max-width: 460px; line-height: 1.6; }
 .dm-spin { width: 14px; height: 14px; border: 2px solid var(--primary); border-top-color: transparent; border-radius: 50%; animation: dmSpin .7s linear infinite; }
 @keyframes dmSpin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .dm-spin { animation: none; } }
+.dm-reset { position: absolute; left: 10px; top: 10px; height: 26px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text-regular); font-size: 11px; cursor: pointer; }
+.dm-reset:hover { border-color: var(--primary); color: var(--primary); }
 .dm-count { position: absolute; left: 10px; bottom: 8px; color: var(--text-faint); font-size: 11px; font-variant-numeric: tabular-nums; pointer-events: none; }
 .dm-legend { position: absolute; right: 10px; bottom: 8px; display: flex; align-items: center; gap: 10px; color: var(--text-faint); font-size: 10.5px; pointer-events: none; }
 .dm-legend span { display: inline-flex; align-items: center; gap: 4px; }
@@ -953,6 +1091,7 @@ onBeforeUnmount(() => {
 .dm-rel { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; }
 .dm-rel-row { display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px 6px; border: 0; border-radius: 5px; background: transparent; color: var(--text-regular); font: inherit; font-size: 11.5px; cursor: pointer; text-align: left; }
 .dm-rel-row:hover { background: var(--bg-hover); }
+.dm-rel-more { margin-top: 5px; color: var(--text-faint); font-size: 10.5px; }
 
 @media (max-width: 860px) {
   .dm-body { flex-direction: column; }

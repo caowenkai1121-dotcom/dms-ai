@@ -24,7 +24,7 @@ type ApiErr = (StatusCode, Json<serde_json::Value>);
 type ApiOk = Json<serde_json::Value>;
 
 /// 沿用现有 `{"error": msg}` 形状（前端只认这一种）
-fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
+pub(crate) fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
     (code, Json(serde_json::json!({ "error": msg.to_string() })))
 }
 
@@ -52,8 +52,8 @@ fn identity_err(login: &str, e: impl std::fmt::Display) -> ApiErr {
 
 #[derive(serde::Deserialize, Default)]
 pub struct DsQuery {
-    login_name: Option<String>,
-    role_code: Option<String>,
+    pub(crate) login_name: Option<String>,
+    pub(crate) role_code: Option<String>,
 }
 
 /// `ds_id='dms'` 是存量主源，注销它等于让所有取数无源可用——**任何身份都不许删**。
@@ -105,7 +105,7 @@ fn ds_json(d: &ds_reg::DsSpecRow) -> serde_json::Value {
 
 /// `GET /api/ds` —— 只回该 viewer 可见的源。
 /// 可见集合由 `visible_datasources` 在 SQL 内算（含 `kb.acl` 的 ds 级授权）；
-/// 这里的 `retain` 只是与那份 SQL 结果取交集，**不可能放宽**。
+/// 这里的 filter 只是与那份 SQL 结果取交集，**不可能放宽**。
 pub async fn list(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -113,14 +113,15 @@ pub async fn list(
 ) -> Result<ApiOk, ApiErr> {
     let p = caller(&st, &headers, &q).await?;
     let pg = st.owned.pool();
-    let visible = ds_reg::visible_datasources(pg, &p.login_name, &[p.role_code.clone()])
+    let visible = ds_reg::visible_datasources(pg, &p.login_name, std::slice::from_ref(&p.role_code))
         .await
         .map_err(|e| internal_err("数据源可见性判定失败", e))?;
     let rows = ds_reg::list_datasources(pg)
         .await
         .map_err(|e| internal_err("数据源列表读取失败", e))?;
+    let visible: std::collections::HashSet<&str> = visible.iter().map(String::as_str).collect();
     let ds: Vec<serde_json::Value> =
-        rows.iter().filter(|r| visible.contains(&r.ds_id)).map(ds_json).collect();
+        rows.iter().filter(|r| visible.contains(r.ds_id.as_str())).map(ds_json).collect();
     Ok(Json(serde_json::json!({ "datasources": ds })))
 }
 
@@ -168,6 +169,7 @@ pub async fn remove(
     ds_reg::delete_datasource(pg, &id)
         .await
         .map_err(|e| internal_err("数据源注销失败", e))?;
+    // close 无失败路径（返回 ()，注册表内部已 info 留痕），无需处理结果
     st.sources.close(&DsId::new(&id)).await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -187,7 +189,7 @@ pub async fn probe(
         kind: ds_reg::source_kind(&row.kind)
             .ok_or_else(|| err(StatusCode::UNPROCESSABLE_ENTITY, "kind 非法"))?,
         dsn_ref: row.dsn_ref.clone(),
-        max_conn: 2,
+        max_conn: 2, // 探测单连接即可完成；2 只是池选项的宽松余量，不放大并发
         schema: dms_knowledge::tabular::upload_schema_of_ds(&row.ds_id),
     };
     // 安全审查②：错误原文不再回前端（连接细节属内部结构）—— 响应固定文案，
@@ -216,7 +218,7 @@ pub async fn sync(
     if id != ds_reg::DMS_DS_ID {
         return Err(err(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("{id} 的 schema 采集需先完成注册表 ds_id 化（K3-B）；当前只支持 ds_id=dms"),
+            format!("{id} 暂不支持 schema 采集：多数据源隔离尚未完成，当前只支持 ds_id=dms"),
         ));
     }
     // 采集（IO）在 server，入库（PG）在 semantic。`ds` 传 `DMS_DS_ID` 就是上面那道校验的语义
@@ -226,7 +228,14 @@ pub async fn sync(
         .probe_schema_with_warehouse_catalog(&assets)
         .await
         .map_err(|e| unprocessable_err("schema 探测失败", e))?;
-    let warehouse_comments = st.mysql.enrich_dms_snapshot(&mut snap).await.unwrap_or(0);
+    // 注释富化失败 = 注释列本轮悄悄缺失：按 0 条计但必须留痕（与 seed/sync 失败的 warn 同级）
+    let warehouse_comments = match st.mysql.enrich_dms_snapshot(&mut snap).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "DMS 注释富化失败，按 0 条计");
+            0
+        }
+    };
     let (tables, columns) =
         // `true`＝过滤备份表：DMS 是别人建的库，里头确有 bak_*/日期后缀的垃圾表
         dms_semantic::ingest::schema_sync::sync_schema(pg, ds_reg::DMS_DS_ID, &snap, true)
@@ -252,6 +261,7 @@ async fn ensure_row(pg: &sqlx::PgPool, id: &str) -> Result<ds_reg::DsSpecRow, Ap
     ds_reg::get_datasource(pg, id)
         .await
         .map_err(|e| internal_err("数据源登记读取失败", e))?
+        // 回显 id 是刻意的：ds_id 走 valid_ds_id 白名单（无注入面）且不是秘密
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("数据源 {id} 未登记")))
 }
 
@@ -270,9 +280,8 @@ fn check_dsn_ref(s: &str) -> Result<(), String> {
         return Err("dsn_ref 不能为空（填 settings.json 里的键名，如 mysql_url）".into());
     }
     if !valid_ds_id(s) {
-        return Err(format!(
-            "dsn_ref 只能填键名（字母数字与 _-），不许填明文 DSN：{s}"
-        ));
+        // 不回显原值：误填的明文 DSN 含口令，随 400 回浏览器/前端日志等于二次泄露
+        return Err("dsn_ref 只能填键名（字母数字与 _-），不许填明文 DSN".into());
     }
     Ok(())
 }
@@ -281,6 +290,7 @@ fn check_dsn_ref(s: &str) -> Result<(), String> {
 /// `policy_kind` 默认 `global`（可见性只靠 ds 级 ACL），**不默认 `dms_datascope`**——
 /// 那一档对所有认证用户可见，绝不能靠「忘填」拿到。
 fn validate(r: &DsUpsertReq) -> Result<ds_reg::DsSpecRow, String> {
+    // 回显 ds_id 无害（白名单字符集、非秘密）；dsn_ref 例外——那里面可能是口令（见 check_dsn_ref）
     if !valid_ds_id(&r.ds_id) {
         return Err(format!("ds_id 只允许字母数字与 _- 且 ≤64 字符：{}", r.ds_id));
     }
@@ -291,6 +301,11 @@ fn validate(r: &DsUpsertReq) -> Result<ds_reg::DsSpecRow, String> {
             return Err(format!("{label} 只能是 mysql | postgres：{v}"));
         }
     }
+    // 显式 dialect 必须与 kind 同源（source_kind 是精确小写匹配，过上面闸后字符串比较即同义比较）：
+    // mysql + postgres 的组合会落出一行自相矛盾的注册记录
+    if r.dialect.is_some() && dialect != r.kind {
+        return Err(format!("dialect 与 kind 不一致：{} × {dialect}", r.kind));
+    }
     let policy_kind = r.policy_kind.clone().unwrap_or_else(|| "global".into());
     if !matches!(policy_kind.as_str(), "dms_datascope" | "global") {
         return Err(format!("policy_kind 只能是 dms_datascope | global：{policy_kind}"));
@@ -299,14 +314,23 @@ fn validate(r: &DsUpsertReq) -> Result<ds_reg::DsSpecRow, String> {
     if !matches!(status.as_str(), "active" | "disabled") {
         return Err(format!("status 只能是 active | disabled：{status}"));
     }
+    let name = r.name.clone().unwrap_or_else(|| r.ds_id.clone());
+    // name/description 会经 list 全量回显：无上限的脏字段会把列表响应撑爆
+    if name.chars().count() > 128 {
+        return Err("name 不能超过 128 字符".into());
+    }
+    let description = r.description.clone().unwrap_or_default();
+    if description.chars().count() > 2000 {
+        return Err("description 不能超过 2000 字符".into());
+    }
     Ok(ds_reg::DsSpecRow {
         ds_id: r.ds_id.clone(),
-        name: r.name.clone().unwrap_or_else(|| r.ds_id.clone()),
+        name,
         kind: r.kind.clone(),
         dialect,
         dsn_ref: r.dsn_ref.clone(),
         policy_kind,
-        description: r.description.clone().unwrap_or_default(),
+        description,
         status,
     })
 }
@@ -353,6 +377,7 @@ mod tests {
         let bad = req(r#"{"ds_id":"crm_pg","kind":"postgres","dsn_ref":"postgres://u:p@h/db"}"#);
         let e = validate(&bad).unwrap_err();
         assert!(e.contains("不许填明文 DSN"), "{e}");
+        assert!(!e.contains("postgres://"), "被拒原值（可能含口令）不许回显：{e}");
         assert!(validate(&req(r#"{"ds_id":"x","kind":"mysql","dsn_ref":""}"#)).is_err());
     }
 
@@ -378,6 +403,31 @@ mod tests {
         ] {
             assert!(validate(&req(j)).is_err(), "该拒未拒：{j}");
         }
+    }
+
+    /// 显式 dialect 必须与 kind 同源：mysql × postgres 的自相矛盾注册行不许落库
+    #[test]
+    fn dialect_must_match_kind() {
+        let j = r#"{"ds_id":"crm_pg","kind":"mysql","dsn_ref":"k","dialect":"postgres"}"#;
+        assert!(validate(&req(j)).unwrap_err().contains("不一致"));
+        // 一致组合与缺省跟随（dialect 不传）不受影响
+        assert!(validate(&req(r#"{"ds_id":"x","kind":"mysql","dsn_ref":"k","dialect":"mysql"}"#)).is_ok());
+        assert!(validate(&req(r#"{"ds_id":"x","kind":"mysql","dsn_ref":"k"}"#)).is_ok());
+    }
+
+    /// name/description 加上限：两者都会经 list 全量回显
+    #[test]
+    fn upsert_fields_have_length_caps() {
+        let long_name = format!(r#"{{"ds_id":"x","kind":"mysql","dsn_ref":"k","name":"{}"}}"#, "n".repeat(129));
+        assert!(validate(&req(&long_name)).unwrap_err().contains("128"));
+        let long_desc = format!(r#"{{"ds_id":"x","kind":"mysql","dsn_ref":"k","description":"{}"}}"#, "d".repeat(2001));
+        assert!(validate(&req(&long_desc)).unwrap_err().contains("2000"));
+        let ok = format!(
+            r#"{{"ds_id":"x","kind":"mysql","dsn_ref":"k","name":"{}","description":"{}"}}"#,
+            "n".repeat(128),
+            "d".repeat(2000)
+        );
+        assert!(validate(&req(&ok)).is_ok(), "边界值必须放行");
     }
 
     /// 响应体不许带明文 DSN/口令（只回 dsn_ref 键名）
@@ -422,6 +472,7 @@ mod tests {
             "err(StatusCode::INTERNAL_SERVER_ERROR, e)",
             "err(StatusCode::UNPROCESSABLE_ENTITY, e)",
             "err(StatusCode::FORBIDDEN, e)",
+            "err(code, e)",
         ] {
             assert!(!code.contains(bad), "错误原文泄露回来了：{bad}");
         }

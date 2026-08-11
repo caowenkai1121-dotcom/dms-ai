@@ -1,7 +1,7 @@
 //! 【K5】知识库适配器：`Principal` → `Viewer` → `dms_knowledge` 的检索与作答。
 //! 变更原因＝「问数身份怎么变成看文档的身份」。
 //!
-//! 搬运源 `server/src/main.rs:569-576`（`kb_answer`），逐行搬运（含那段「roles 必须用解出来的
+//! 搬运源 `server/src/main.rs:569-576`（`kb_answer`，行号为搬运时点），逐行搬运（含那段「roles 必须用解出来的
 //! role_code」的依据）。
 //!
 //! ## 为什么它是本目录里唯一不实现 `Answerer` 的成员
@@ -29,7 +29,7 @@ use dms_policy::Principal;
 /// 知识库回答。`space = None` 表示**不限空间**（全部可见文档），不是个人空间：
 /// 被授权看别人空间的人也得能检索到，ACL 由 `retrieve` 在 SQL 内把关，这里不拼第二份。
 ///
-/// 形参 6 个是**透传**（与 `dms_knowledge::answer::answer` 一一对应）：为它造一个只有一个调用点的
+/// 形参是**透传**（与 `dms_knowledge::answer::answer` 一一对应）：为它造一个只有一个调用点的
 /// 上下文结构，只会多一层要跟着漂的类型。
 ///
 /// `weights` 由调用方给 settings 快照（`st.cfg().kb_rrf_weights`）——主链与
@@ -72,15 +72,16 @@ mod tests {
 
     /// 🔴 不变量 I5 的结构性保证，变成一条会红的断言：知识库路径不许出现 SQL 类型。
     /// 判据与 `scripts/check-arch.ps1` 同款——**注释行不参与匹配**（规则本身要写在文件头，
-    /// 否则这句话会把自己判红）。
+    /// 否则这句话会把自己判红）。只滤 `//` 行注释：块注释不参与豁免（本文件没有；有了会误判红）。
     #[test]
     fn no_sql_types_in_the_knowledge_path() {
         let src = include_str!("knowledge.rs");
-        let body = src.split("#[cfg(test)]").next().expect("文件头必然存在");
+        let body = src.split("#[cfg(test)]").next().unwrap_or(src); // split 首段恒存在
         let code: Vec<&str> =
             body.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
-        // 三个 SQL 类型名。**不查 sqlx 的查询宏**：`scripts/check-arch.ps1` 已对整个
-        // `crates/agent/src` 守着它，在这里复述一遍反而让本文件自己撞上那条 grep（实测撞过）。
+        // 三个 SQL 类型名。「Scoped」是裸子串 —— 误判面：任何含它的合法标识符/字符串都会撞红
+        // （今天的命中面就是 ScopedSql，先记在这里）。**不查 sqlx 的查询宏**：`scripts/check-arch.ps1`
+        // 已对整个 `crates/agent/src` 守着它，在这里复述一遍反而让本文件自己撞上那条 grep（实测撞过）。
         for needle in ["sqlparser", "RawSql", "Scoped"] {
             assert!(
                 !code.iter().any(|l| l.contains(needle)),

@@ -135,11 +135,14 @@ pub fn output_shape(sql: &str) -> Option<Vec<String>> {
         s.projection
             .iter()
             .map(|p| match p {
-                SelectItem::ExprWithAlias { alias, .. } => alias.value.trim_matches('`').to_lowercase(),
+                // Ident.value parser 已去引号，不再 trim（死防御集中说明见 `col_name`）
+                SelectItem::ExprWithAlias { alias, .. } => alias.value.to_lowercase(),
                 // 🔴 裸引用也要剥反引号：模型把 `SELECT sku_name AS 商品名称` 改写成
                 // `SELECT `商品名称` FROM (…)`（引别名、不重命名）时，输出列其实一个都没动，
                 // 带反引号比原文会让**合规的修复被形状闸整批否决**（SALE15 实测：两次回炉
                 // 全被这一句挡掉，坏 SQL 原样返回 —— 闸门的形状必须比的是列不是字节）。
+                // 注意这里是 `to_string()` 的渲染串（引号真实存在），不是 Ident.value ——
+                // 全仓唯一真正需要的 trim_matches('`')，别随死防御清理把它删了。
                 other => other.to_string().trim_matches('`').to_lowercase(),
             })
             .collect(),
@@ -165,6 +168,8 @@ pub fn check_caliber(sql: &str, rules: &[CaliberRule]) -> Vec<Violation> {
     // ponytail: 固定 GenericDialect（它同时吃反引号与双引号标识符）。签名不带方言是刻意的——
     // 本函数只在「已经过 check() 闸」的 SQL 上跑，方言差异导致的解析失败一律降级为漏判。
     let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else {
+        // parse 失败 = 口径校验「整场弃权」且零观测（kernel 无 tracing 依赖，先留 TODO：
+        // 真要观测，由调用方对空结果打点，或给 kernel 引 feature 化的 tracing）
         return vec![];
     };
     let mut f = Facts::default();
@@ -223,8 +228,12 @@ fn judge(r: &CaliberRule, f: &Facts) -> Option<Violation> {
     match r {
         CaliberRule::RequireCols { table, cols, human } => {
             let al = f.aliases_of(table);
-            let miss: Vec<String> =
-                cols.iter().filter(|c| !f.constrained(table, &al, c)).map(|c| c.to_lowercase()).collect();
+            let base_tables = f.base_table_count();
+            let miss: Vec<String> = cols
+                .iter()
+                .filter(|c| !f.constrained(table, &al, c, base_tables))
+                .map(|c| c.to_lowercase())
+                .collect();
             if al.is_empty() || miss.is_empty() {
                 return None;
             }
@@ -257,7 +266,7 @@ fn judge(r: &CaliberRule, f: &Facts) -> Option<Violation> {
             // 误判方向：多判一条去重违规 → 回炉 → 保守（本仓「宁可回落，绝不出错数」）。
             // 表根本没出现（`al.is_empty()`）时一律不判，那一档由 `RequireCols` 的口径管。
             let touches_table = f.agg_cols.iter().any(|(p, c)| {
-                al.contains(p)
+                al.contains(&p.as_str())
                     || (p.is_empty()
                         && (f.distinct_select
                             || keys.iter().any(|k| k.trim().eq_ignore_ascii_case(c.trim()))))
@@ -296,13 +305,17 @@ fn judge(r: &CaliberRule, f: &Facts) -> Option<Violation> {
                           (PARTITION BY … ORDER BY … DESC) 后取 rn = 1，或关联 (SELECT MAX(…)) 子查询",
                         partition.join(", ")))
         }
-        CaliberRule::RequirePercentScale { metric, human } => (f.divide && !f.times_100)
-            .then(|| viol("require_percent_scale", metric, human,
-                          format!("{metric} 是占比：除法结果须 * 100.0 后再 ROUND(…, 2)")))
-            .flatten(),
+        CaliberRule::RequirePercentScale { metric, human } => {
+            if f.divide && !f.times_100 {
+                viol("require_percent_scale", metric, human,
+                     format!("{metric} 是占比：除法结果须 * 100.0 后再 ROUND(…, 2)"))
+            } else {
+                None
+            }
+        }
         CaliberRule::RequireJoinAndFilter { table, col, human } => {
             let al = f.aliases_of(table);
-            if !al.is_empty() && f.constrained(table, &al, col) {
+            if !al.is_empty() && f.constrained(table, &al, col, f.base_table_count()) {
                 return None;
             }
             viol("require_join_and_filter", &format!("{table}.{col}"), human,
@@ -359,17 +372,18 @@ fn judge(r: &CaliberRule, f: &Facts) -> Option<Violation> {
                 //     正解是 JOIN 订单头、把时间过滤放到它的列上，并带上它的口径过滤。
                 // 本判据在 kernel、**拿不到 schema**，分不清是哪一种（这是刻意的：
                 // 变体不带表名才能跨表判）。故措辞给两条分支 + 明确禁止盲目改名。
-                false => format!(
-                    "时间过滤用错了列：现在约束的是 {}，而该指标的时间语义钉在 {col} 上。\
-                     ① 若 {col} 就在当前已连接的表上 —— 把 WHERE 里 {} 的那几个条件整段改成 {col}，其余一字不动；\
-                     ② 若 {col} 在另一张表上（明细按订单头的下单时点算就是这种）—— 必须 JOIN 那张表、\
-                     把时间过滤放到它的 {col} 上，并且**连带补上那张表的口径过滤**（漏了它就等于放开了无效单）。\
-                     **不要把 {} 就地改名成 {col}** —— 列不在这张表上时那是个不存在的列。\
-                     两列是不同业务时点，换错会漏掉「上一期发生、本期才产生该业务动作」的那批单",
-                    wrong.join(" / "),
-                    wrong.join(" / "),
-                    wrong.join(" / ")
-                ),
+                false => {
+                    let w = wrong.join(" / ");
+                    format!(
+                        "时间过滤用错了列：现在约束的是 {}，而该指标的时间语义钉在 {col} 上。\
+                         ① 若 {col} 就在当前已连接的表上 —— 把 WHERE 里 {} 的那几个条件整段改成 {col}，其余一字不动；\
+                         ② 若 {col} 在另一张表上（明细按订单头的下单时点算就是这种）—— 必须 JOIN 那张表、\
+                         把时间过滤放到它的 {col} 上，并且**连带补上那张表的口径过滤**（漏了它就等于放开了无效单）。\
+                         **不要把 {} 就地改名成 {col}** —— 列不在这张表上时那是个不存在的列。\
+                         两列是不同业务时点，换错会漏掉「上一期发生、本期才产生该业务动作」的那批单",
+                        w, w, w
+                    )
+                }
                 true => format!(
                     "时间过滤必须用 {col} 列（该指标的时间语义钉在它上面）：\
                      换成同表的别的时间列会按另一种业务时点分组，\
@@ -448,7 +462,7 @@ fn judge(r: &CaliberRule, f: &Facts) -> Option<Violation> {
             viol("require_code_eq", &format!("{table}.{col}"), human, format!(
                 "{table}.{col} 存的是**码不是名**：现在写的 `{want}` 用了名称「{name}」 —— \
                  名称写法在码列上**必返 0 行**（`{want}` 里没有一个字是码）。\
-                 「{name}」登记的码是 `{code}`：把条件改成 `{want} = '{code}'，其余一字不动"))
+                 「{name}」登记的码是 `{code}`：把条件改成 `{want} = '{code}'`，其余一字不动"))
         }
     }
 }
@@ -627,10 +641,17 @@ struct Facts {
     cap_curdate: HashSet<String>,
 }
 
+/// 列名词法上「看起来像时间列」：`time_ish_conds`（判词措辞）与桶列采集共用这一个谓词，
+/// 改一处两处同步 —— 它曾以复制粘贴的形态存在第三份。
+fn looks_timeish(c: &str) -> bool {
+    c.contains("time") || c.contains("date") || c.contains("_at")
+}
+
 impl Facts {
-    fn aliases_of(&self, table: &str) -> Vec<String> {
+    /// 别名集（只读借用）：调用点只判空/contains/传给 `constrained`，clone 出 Vec<String> 是纯浪费
+    fn aliases_of(&self, table: &str) -> Vec<&str> {
         let t = table.to_lowercase();
-        self.aliases.iter().filter(|(_, tb)| *tb == t).map(|(a, _)| a.clone()).collect()
+        self.aliases.iter().filter(|(_, tb)| *tb == t).map(|(a, _)| a.as_str()).collect()
     }
     /// 条件里出现的、**看起来是时间列**的列名（去重、排序稳定），排除 `except`。
     ///
@@ -638,13 +659,12 @@ impl Facts {
     /// 词法特征就够，不必去查真实类型。判宽了最坏是判词里多点一个列名（模型照样知道换哪个），
     /// 判窄了则退回原来那句泛泛的措辞：两个方向都不会改变红/绿。
     fn time_ish_conds(&self, except: &str) -> Vec<String> {
-        let ish = |c: &str| c.contains("time") || c.contains("date") || c.contains("_at");
         let mut v: Vec<String> = self
             .cond_bare
             .iter()
             .cloned()
             .chain(self.cond_cols.iter().map(|(_, c)| c.clone()))
-            .filter(|c| c != except && ish(c))
+            .filter(|c| c != except && looks_timeish(c))
             .collect();
         v.sort();
         v.dedup();
@@ -667,11 +687,12 @@ impl Facts {
 
     /// 列被约束＝以任一别名限定出现在条件里；**裸列只在两类安全形态下才算**：
     /// 该表没写别名，或整条 SQL 只有一张基表（见 `Facts::aliased` 的文档）。
-    fn constrained(&self, table: &str, aliases: &[String], col: &str) -> bool {
+    /// `base_tables` 由调用方在列循环外算一次传入（`base_table_count()` 按列重算是白扫）。
+    fn constrained(&self, table: &str, aliases: &[&str], col: &str, base_tables: usize) -> bool {
         let c = col.to_lowercase();
-        let bare_safe = !self.aliased.contains(&table.to_lowercase()) || self.base_table_count() <= 1;
+        let bare_safe = !self.aliased.contains(&table.to_lowercase()) || base_tables <= 1;
         (bare_safe && self.cond_bare.contains(&c))
-            || aliases.iter().any(|a| self.cond_cols.contains(&(a.clone(), c.clone())))
+            || self.cond_cols.iter().any(|(p, x)| x == &c && aliases.contains(&p.as_str()))
     }
 }
 
@@ -734,6 +755,8 @@ fn scan_select(s: &Select, f: &mut Facts, nested: bool) {
         f.grouped |= !gs.is_empty();
     }
     for e in s.having.iter().chain(s.qualify.iter()) {
+        // HAVING/QUALIFY 以 cond=false 采集：里面的 `col = '码'` 不算约束 —— 漏判方向
+        // （刻意，与「条件里的除法不算占比」同一侧；哪天真要算，再改 cond=true 并过回归）。
         grab(e, f, false);
     }
 }
@@ -801,7 +824,7 @@ fn prefixed_col(e: &Expr) -> Option<(String, String)> {
     }
     Some((
         p[p.len() - 2].value.to_lowercase(),
-        p[p.len() - 1].value.trim_matches('`').to_lowercase(),
+        p[p.len() - 1].value.to_lowercase(),
     ))
 }
 
@@ -903,7 +926,7 @@ impl Visitor for Grab<'_> {
             Expr::CompoundIdentifier(p) if p.len() >= 2 => {
                 let pair = (
                     p[p.len() - 2].value.to_lowercase(),
-                    p[p.len() - 1].value.trim_matches('`').to_lowercase(),
+                    p[p.len() - 1].value.to_lowercase(),
                 );
                 if self.agg {
                     self.f.agg_cols.insert(pair.clone());
@@ -916,7 +939,7 @@ impl Visitor for Grab<'_> {
                 }
             }
             Expr::Identifier(i) => {
-                let c = i.value.trim_matches('`').to_lowercase();
+                let c = i.value.to_lowercase();
                 // 🔴 **无前缀的聚合列也要收**（前缀记空串）。
                 //
                 // 原来这一支只在 `self.cond` 时收进 `cond_bare`，于是 CTE / 派生表外层的
@@ -1018,7 +1041,7 @@ impl Grab<'_> {
         // 只在**投影**里采（`!self.cond`）：WHERE 里的 `DATE_FORMAT(col,…)` 是过滤不是桶。
         // 函数名限定日期截断族，且首参必须是列引用 —— 没有这两条收窄时 `LEFT(sku_name, 2)`
         // 会被当成桶列，把 GOODS17 那条正确 SQL 当场判红（那类假红会把对的答案回炉改错）。
-        // 复用 `time_ish_conds` 里那个 `ish` 词法谓词：含 time/date/_at 才算时间列。
+        // 复用 `time_ish_conds` 同款的 `looks_timeish` 词法谓词：含 time/date/_at 才算时间列。
         if !self.cond
             && matches!(
                 name.as_str(),
@@ -1028,7 +1051,7 @@ impl Grab<'_> {
         {
             if let Some(arg) = first_arg_column(fun) {
                 let col = arg.to_lowercase();
-                if col.contains("time") || col.contains("date") || col.contains("_at") {
+                if looks_timeish(&col) {
                     self.f.bucket_cols.insert(col);
                 }
             }
@@ -1067,14 +1090,17 @@ fn first_arg_column(fun: &Function) -> Option<String> {
     None
 }
 
-/// 表达式是列引用 → 末段列名（小写、去反引号）。别的形态一律 `None`（函数包裹的列不认，漏判方向）。
+/// 表达式是列引用 → 末段列名（小写）。别的形态一律 `None`（函数包裹的列不认，漏判方向）。
+/// 集中说明：sqlparser 的 `Ident.value` **本就去引号**，对它 `trim_matches('`')` 是死防御，
+/// 全仓（ast.rs / 本文件）一律不再写；唯一例外是 `output_shape` 的 `other.to_string()`
+/// 渲染串（引号真实存在，SALE15 实测），那边有现场注释。
 fn col_name(e: &Expr) -> Option<String> {
     let id = match e {
         Expr::Identifier(i) => i,
         Expr::CompoundIdentifier(p) => p.last()?,
         _ => return None,
     };
-    Some(id.value.trim_matches('`').to_lowercase())
+    Some(id.value.to_lowercase())
 }
 
 /// `CURDATE()` 函数调用（`RequireTimeCap` 认的唯一上限形态）。
@@ -1190,7 +1216,9 @@ mod tests {
         check_caliber(sql, r).into_iter().map(|v| v.rule).collect()
     }
 
-    /// 只采事实、不判规则：给「事实采集本身」的判据用（方言与 `check_caliber` 保持同一个）。
+    /// 只采事实、不判规则：给「事实采集本身」的判据用。
+    /// 🔴 方言钉死：`facts()` 与 `check_caliber` 必须同为 GenericDialect —— 两处不一致时
+    /// 事实测试与判据行为静默分叉（`rules_of` 走 `check_caliber`，本函数手扫）。
     fn facts(sql: &str) -> Facts {
         let mut f = Facts::default();
         for s in &Parser::parse_sql(&GenericDialect {}, sql).expect("测试 SQL 必须可解析") {

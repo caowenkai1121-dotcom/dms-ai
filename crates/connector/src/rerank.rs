@@ -6,37 +6,47 @@
 //! 配置只走环境变量（`from_env`）：`DMS_RERANK_BASE_URL` / `DMS_RERANK_MODEL` 缺一即关闭，
 //! `DMS_RERANK_API_KEY` 可空（内网自建 rerank 常不鉴权）。关闭时检索路径一行都不变。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// 单次请求超时（对齐 embed 问句侧的 3s）：精排在检索关键路径上，用户在等。
-const TIMEOUT_SECS: u64 = 3;
-/// send 失败后的冷却期（对齐 embed 的 300s）：rerank 服务挂时每问白等一个 3s 超时才是事故。
-const COOLDOWN_SECS: u64 = 300;
+use crate::{now, COOLDOWN_SECS, HTTP_CALL_TIMEOUT_SECS};
 
 #[derive(Clone)]
 pub struct RerankClient {
     url: String,
     api_key: Option<String>,
     model: String,
-    cooldown_until: Arc<AtomicU64>,
+    cooldown_until: Arc<std::sync::atomic::AtomicU64>,
+    /// 实例级复用的 HTTP 客户端（与 `EmbedClient` 同一条修法）：超时逐请求设。
+    http: reqwest::Client,
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+// 手写 Debug：derive 会把 api_key 打进日志
+impl std::fmt::Debug for RerankClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankClient")
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 impl RerankClient {
     /// `base_url` 例 `http://127.0.0.1:8090`（请求打 `{base}/rerank`）。
     pub fn new(base_url: &str, api_key: Option<&str>, model: &str) -> Self {
+        // 空 base/model 只能来自手调 new（from_vars 已拦截）：debug 构建当场炸
+        debug_assert!(
+            !base_url.trim().is_empty() && !model.trim().is_empty(),
+            "空 base/model 请走 from_vars 判据"
+        );
         Self {
             url: format!("{}/rerank", base_url.trim_end_matches('/')),
             api_key: api_key.map(str::trim).filter(|k| !k.is_empty()).map(str::to_string),
             model: model.to_string(),
-            cooldown_until: Arc::new(AtomicU64::new(0)),
+            cooldown_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // build() 只在 TLS 后端缺失这类部署事故时失败：启动即崩是刻意取舍（同 embed.rs）
+            http: reqwest::Client::builder().build().expect("rerank http client"),
         }
     }
 
@@ -60,19 +70,19 @@ impl RerankClient {
     }
 
     /// 对 `docs` 逐条打相关度分，返回**与输入等长、按下标对齐**的分数。
-    /// 空输入 / 熔断中 / 超时 / 服务挂 / 响应形状不符 → `None`（调用方回退原排序）。
+    /// 空输入 / 空问句 / 熔断中 / 超时 / 服务挂 / 响应形状不符 → `None`（调用方回退原排序）。
     pub async fn rerank(&self, query: &str, docs: &[&str]) -> Option<Vec<f32>> {
-        if docs.is_empty() {
+        if docs.is_empty() || query.trim().is_empty() {
+            return None;
+        }
+        if docs.len() > MAX_DOCS {
+            // 调用方传几千篇就是巨型 body：整批降级回 RRF 原序，不硬发
+            tracing::debug!(docs = docs.len(), max = MAX_DOCS, "rerank 文档数超上限，整批降级");
             return None;
         }
         if now() < self.cooldown_until.load(Ordering::Relaxed) {
             return None;
         }
-        // ponytail: 每次调用新建 Client＝与 embed.rs 同款的历史行为（丢连接复用）。
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-            .build()
-            .ok()?;
         // `top_n = 文档数`：要的是全量重排，不是截断 —— 截断由调用方按自己的窗口做。
         let body = serde_json::json!({
             "model": self.model,
@@ -80,24 +90,43 @@ impl RerankClient {
             "documents": docs,
             "top_n": docs.len(),
         });
-        let mut req = client.post(&self.url).json(&body);
+        let mut req = self
+            .http
+            .post(&self.url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(HTTP_CALL_TIMEOUT_SECS));
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
         match req.send().await {
             Ok(resp) => {
-                let v: serde_json::Value = resp.json().await.ok()?;
+                if !resp.status().is_success() {
+                    // 401/403（key 错）与形状不符要能区分（不熔断，对齐形状语义）
+                    tracing::warn!(status = %resp.status(), "rerank 服务返回非 2xx，降级");
+                    return None;
+                }
+                let v: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!(err = %e, "rerank 响应解析失败，降级");
+                        return None;
+                    }
+                };
                 // 形状不符不熔断（对齐 embed）：服务活着只是回了别的，熔断解决不了它。
                 parse_scores(&v, docs.len())
             }
-            Err(_) => {
+            Err(e) => {
                 // send 失败（连接拒/超时）才熔断 300s（对齐 embed）。
+                tracing::debug!(err = %e, "rerank 服务不可达，熔断 {COOLDOWN_SECS}s");
                 self.cooldown_until.store(now() + COOLDOWN_SECS, Ordering::Relaxed);
                 None
             }
         }
     }
 }
+
+/// 单次调用的文档数上限：调用方传几千篇就是巨型 body（top_n = 文档数原样透传）
+const MAX_DOCS: usize = 500;
 
 /// 响应 `{"results":[{"index":i,"relevance_score":s},…]}` → 与输入等长的分数向量。
 ///
@@ -106,13 +135,16 @@ impl RerankClient {
 fn parse_scores(v: &serde_json::Value, n: usize) -> Option<Vec<f32>> {
     let arr = v["results"].as_array()?;
     if arr.len() != n {
+        tracing::debug!(got = arr.len(), want = n, "rerank 条数不符，整体降级");
         return None;
     }
     let mut out: Vec<Option<f32>> = vec![None; n];
     for item in arr {
         let i = usize::try_from(item["index"].as_u64()?).ok()?;
         let s = item["relevance_score"].as_f64()? as f32;
-        if i >= n {
+        // NaN/Inf 进分数向量会污染下游排序：形状不符处理
+        if i >= n || !s.is_finite() {
+            tracing::debug!(index = i, "rerank 下标越界或分数非有限值，整体降级");
             return None;
         }
         out[i] = Some(s);
@@ -160,8 +192,8 @@ mod tests {
         ]}), 2).is_none(), "条数不符（重复下标顶掉了名额）");
     }
 
-    /// 最小 HTTP 桩（与 embed.rs 测试同款：不引新依赖）。记录每次请求的 body 与是否带 key，
-    /// 按 `score_of` 给第 i 篇文档打分。`hang` 时直接不写响应（逼客户端 3s 超时）。
+    /// 最小 HTTP 桩（`crate::test_stub` 共用件）。记录每次请求的 body 与是否带 key，
+    /// 按 `score_of` 给第 i 篇文档打分。
     async fn stub(
         score_of: fn(usize) -> f32,
     ) -> (String, Arc<std::sync::Mutex<Vec<(serde_json::Value, bool)>>>) {
@@ -174,57 +206,26 @@ mod tests {
                 let Ok((mut sock, _)) = l.accept().await else { return };
                 let s = s0.clone();
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = Vec::new();
-                    let head = loop {
-                        if let Some(h) = find(&buf, b"\r\n\r\n") {
-                            if buf.len() >= h + 4 + content_len(&buf[..h]) {
-                                break h;
-                            }
-                        }
-                        let mut b = [0u8; 8192];
-                        match sock.read(&mut b).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => buf.extend_from_slice(&b[..n]),
-                        }
+                    use tokio::io::AsyncWriteExt;
+                    let Some((head_text, raw)) =
+                        crate::test_stub::read_request(&mut sock).await
+                    else {
+                        return;
                     };
-                    let head_text = String::from_utf8_lossy(&buf[..head]).to_lowercase();
                     let authed = head_text.contains("authorization: bearer ");
-                    let v: serde_json::Value = serde_json::from_slice(&buf[head + 4..]).unwrap();
-                    let n = v["documents"].as_array().unwrap().len();
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&raw).expect("stub 收到坏 JSON");
+                    let n = v["documents"].as_array().expect("stub 收到非 documents 请求").len();
                     s.lock().unwrap().push((v, authed));
                     let results: Vec<serde_json::Value> = (0..n)
                         .map(|i| serde_json::json!({"index": i, "relevance_score": score_of(i)}))
                         .collect();
                     let body = serde_json::json!({"results": results}).to_string();
-                    let _ = sock
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                body.len()
-                            )
-                            .as_bytes(),
-                        )
-                        .await;
+                    let _ = sock.write_all(&crate::test_stub::json_response(&body)).await;
                 });
             }
         });
         (base, seen)
-    }
-
-    fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-        hay.windows(needle.len()).position(|w| w == needle)
-    }
-
-    fn content_len(head: &[u8]) -> usize {
-        String::from_utf8_lossy(head)
-            .to_lowercase()
-            .split("content-length:")
-            .nth(1)
-            .and_then(|t| t.split("\r\n").next())
-            .and_then(|t| t.trim().parse().ok())
-            .unwrap_or(0)
     }
 
     #[tokio::test]
@@ -255,6 +256,24 @@ mod tests {
     async fn empty_docs_short_circuits_without_touching_the_breaker() {
         let c = RerankClient::new("http://127.0.0.1:1", None, "m");
         assert!(c.rerank("q", &[]).await.is_none());
+        assert!(c.rerank("  ", &["a"]).await.is_none(), "空问句同样短路（与 external_kb 同口径）");
         assert_eq!(c.cooldown_until.load(Ordering::Relaxed), 0, "空输入是调用方的事，不熔断");
+    }
+
+    /// 超限批量 / 非有限分数：都按形状不符整批降级，不熔断
+    #[tokio::test]
+    async fn oversized_batch_and_non_finite_scores_degrade() {
+        let c = RerankClient::new("http://127.0.0.1:1", None, "m");
+        let refs: Vec<&str> = vec!["a"; MAX_DOCS + 1];
+        assert!(c.rerank("q", &refs).await.is_none(), "超限批量整批降级");
+        assert_eq!(c.cooldown_until.load(Ordering::Relaxed), 0, "降级不熔断");
+        // NaN 分数污染下游排序：整体 None
+        let v = serde_json::json!({"results": [{"index": 0, "relevance_score": 1e300}]});
+        assert!(parse_scores(&v, 1).is_none(), "1e300 → inf 必须整批降级");
+        // Debug 不泄 key
+        let c = RerankClient::new("http://h:1", Some("s3cret-key"), "m");
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("s3cret-key"), "{dbg}");
+        assert!(dbg.contains("***"), "{dbg}");
     }
 }

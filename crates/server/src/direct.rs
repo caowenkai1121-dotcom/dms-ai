@@ -27,22 +27,25 @@ pub use dms_semantic::registry::model::{
     DimensionDef as DimDef, JoinEdge, MetricDef, TableSnapshot, ValueRef,
 };
 
+/// `DirectHit` 的单一构造点：只出 sql+route 的命中全走这里（prev/comparisons/detail/
+/// sales_context 默认空），要带字段的用结构更新语法覆盖 —— 那五字段字面量曾散写了 19 处。
+fn hit(sql: String, route: &str) -> DirectHit {
+    DirectHit {
+        sql,
+        route: route.into(),
+        prev: None,
+        comparisons: vec![],
+        detail: None,
+        sales_context: None,
+    }
+}
+
 /// 通用组合器（S3，SuperSonic 语义层组合思想）：指标×维度 数据驱动装配，退役手工模板。
 /// 问句同时命中指标注册表与维度注册表 → 装配 GROUP BY 查询。门控（宁缺毋滥，装配不出就回落）：
 /// 同基表直拼 / 跨基表走 join_edge BFS 路径（≤3 跳，扇出边仅 COUNT(DISTINCT) 聚合可过）、
 /// 口径无子查询、实体守卫、时间窗=order_time 在 FROM 内或可经一条边桥接 t_sales_order。
 /// 【K3-B ②】`ds` 只作用于**注册表加载**（四条 SQL 在 `registry::model`，各带一条 `ds_pred`），
 /// 下面的装配逻辑一字未动 —— DMS 的口径卡绝不能被别的库用上，反之亦然。
-/// 诊断：这个问句为什么没走确定性装配。逐条报出**第一个**不成立的门。
-///
-/// 🔴 为什么值得有：实测 38 题里 route 分布是 `llm 24 / direct-agg 8 / llm+repair 5 /
-/// semantic-cache 1` —— **76% 过 LLM，而全部失败都出在 LLM 路径**（确定性路径至今 0 失败）。
-/// 也就是说「提高确定性覆盖」是质量的第一杠杆，而要提高就得先知道**每一句被哪道门卡住**。
-/// 靠读代码猜是不行的：`try_compose` 有五道门（指标命中 / 维度命中 / 快照 / 装配 / 残留），
-/// 它们只回一个 `None`。
-///
-/// 与 `try_compose` **共用同一批加载与判据**，不抄第二份：抄了会漂出
-/// 「诊断说能装配、实际回落 LLM」。
 /// 谁会服务这个问句里的**确定性**部分：`agg_template`（订单口径指标）/
 /// `sales_breakdown`（受信 DWS 销售事实维度）/ 单号直查。空串 = 没有确定性模板接它。
 ///
@@ -70,6 +73,16 @@ fn doc_binding_hit(question: &str) -> bool {
     sniff_doc_code(question, true).is_some()
 }
 
+/// 诊断：这个问句为什么没走确定性装配。逐条报出**第一个**不成立的门。
+///
+/// 🔴 为什么值得有：实测 38 题里 route 分布是 `llm 24 / direct-agg 8 / llm+repair 5 /
+/// semantic-cache 1` —— **76% 过 LLM，而全部失败都出在 LLM 路径**（确定性路径至今 0 失败）。
+/// 也就是说「提高确定性覆盖」是质量的第一杠杆，而要提高就得先知道**每一句被哪道门卡住**。
+/// 靠读代码猜是不行的：`try_compose` 有五道门（指标命中 / 维度命中 / 快照 / 装配 / 残留），
+/// 它们只回一个 `None`。
+///
+/// 与 `try_compose` **共用同一批加载与判据**，不抄第二份：抄了会漂出
+/// 「诊断说能装配、实际回落 LLM」。
 pub async fn why_not_compose(pg: &sqlx::PgPool, ds: &str, question: &str) -> String {
     if !warehouse_sales_metrics(question).is_empty() {
         return match hardcoded_producer(question) {
@@ -108,17 +121,17 @@ async fn compose_verdict(pg: &sqlx::PgPool, ds: &str, question: &str) -> String 
     let edges = say!("meta.join_edge", reg::load_join_edges(pg, ds));
     let scopes = say!("meta.table_scope", reg::load_table_scopes(pg, ds));
     let snaps = say!("meta.table_snapshot", reg::load_table_snapshots(pg, ds));
-    let Some(m) = pick(question, &metrics, |x| (&x.name, &x.aliases)) else {
+    let Some((m, m_word)) = pick(question, &metrics, |x| (&x.name, &x.aliases)) else {
         return "① 指标不命中（问句里没有任何已声明指标的名/别名）".into();
     };
     // 与 `try_compose` 逐字同一份判定（含减词）—— 诊断自己重判一遍就会漂
-    let Some(d) = pick_excluding(question, &dims, |x| (&x.name, &x.aliases), &metric_word(question, m))
+    let Some(d) = pick_excluding(question, &dims, |x| (&x.name, &x.aliases), &m_word)
     else {
         // 维度不命中不等于走不了确定性路径：无维度问句由指标 only 接。
         // 这里**真去跑同一份判定**（`metric_only`）并报出具名理由 ——
         // 诊断自己重判一遍会漂出「诊断说能装配、实际回落」，把三种理由合成一句
         // 则会让下一个人照着报告去补一个不需要的声明。
-        return match metric_only(pg, ds, question).await {
+        return match metric_only(pg, ds, question, agg_template(question).is_some()).await {
             MetricOnly::Hit(_) => format!("✅ 可装配（指标 only）：「{}」", m.name),
             MetricOnly::YieldToTemplate => {
                 "⓿ 让路给硬编码模板（`agg_template`）—— 数与 KPI 环比以模板为准，这是刻意的".into()
@@ -150,6 +163,8 @@ async fn compose_verdict(pg: &sqlx::PgPool, ds: &str, question: &str) -> String 
     // 说的是一个**已经不存在的行为**。这正是本文件反复强调的那件事：
     // 诊断必须调真正的判定（下面的 `compose_gated`），不许自己再判一遍。
     let vals = say!("meta.value_map", reg::load_value_map(pg, ds));
+    // `value_filters` 这里算一遍喂残留守卫，下面 `compose_gated` 内部还会再算一遍 ——
+    // 诊断路径低频，这点重复可接受（省掉它得给 compose_gated 加形参，不值）。
     if has_entity_residue(question, m, d, &value_filters(question, &vals, &registry_words(m, d))) {
         // 残留守卫是 E16 抓出来的实证防线，报出来的是「它认为还没被消化的东西」
         return format!(
@@ -229,34 +244,32 @@ pub async fn try_compose(pg: &sqlx::PgPool, ds: &str, question: &str) -> Option<
             vec![]
         }
     };
-    let metric = pick(question, &metrics, |m| (&m.name, &m.aliases))?;
+    let (metric, m_word) = pick(question, &metrics, |m| (&m.name, &m.aliases))?;
     // 维度侧**减去指标已消化的词**（见 `pick_excluding`：「成交客户数」里的「客户」不是维度）
-    let dim = pick_excluding(question, &dims, |d| (&d.name, &d.aliases), &metric_word(question, metric))?;
+    let dim = pick_excluding(question, &dims, |d| (&d.name, &d.aliases), &m_word)?;
     if !metric_dimension_allowed(&policies, &metric.name, &dim.name) {
         tracing::info!(metric = %metric.name, dimension = %dim.name, "指标维度未在白名单，回落 LLM");
         return None;
     }
-    compose_gated(metric, dim, question, &edges, &scopes, &snaps, &vals).map(|sql| DirectHit {
-        sql: dms_semantic::registry::warehouse_qualified_source(ds, &sql),
-        route: "direct-agg".into(),
-        prev: None,
-        comparisons: vec![],
-        detail: None,
-        sales_context: None,
-    })
+    compose_gated(metric, dim, question, &edges, &scopes, &snaps, &vals)
+        .map(|sql| hit(dms_semantic::registry::warehouse_qualified_source(ds, &sql), "direct-agg"))
 }
 
-/// 快照门（**通用防线**）：指标来源表登记在 `meta.table_snapshot` 里 → 一律不装配。
+/// 快照门（**通用防线**）：指标来源表登记在 `meta.table_snapshot` 里 → **按声明装配**：
+/// 照声明的分区键/排序/额外过滤包一层 `ROW_NUMBER() … rn = 1`（取每分区最新一条）。
+/// 仍拒的只有两种：① 声明缺分区键或排序（包不出确定的「最新一条」）；
+/// ② 同一张表既声明去重键又声明快照（两层怎么叠是未定义的，宁可回落 LLM）。
 ///
-/// 装配器是「指标 × 维度」平铺 GROUP BY，**不懂「取每个分区最新一条」**：余额类指标一装配
-/// 就丢掉 `rn = 1`，把同一 (客户,账余类型) 的历史流水行全部求和（数字虚高），而 route 恒为
-/// `direct-agg` —— 确定性路径不跑口径校验、连回炉都没机会，错数直接出给用户。
-/// 回落 LLM 后由口径卡 + `RequireLatest` 判据接管（它们才认识快照语义）。
+/// 为什么不能平铺：装配器是「指标 × 维度」GROUP BY，**不懂「取每个分区最新一条」**——
+/// 余额类指标一平铺就丢 `rn = 1`，把同一 (客户,账余类型) 的历史流水行全部求和（数字虚高），
+/// 而 route 恒为 `direct-agg`，确定性路径不跑口径校验、连回炉都没机会，错数直接出给用户。
+/// 声明不全而回落 LLM 时，由口径卡 + `RequireLatest` 判据接管（它们才认识快照语义）。
 ///
-/// 库存类指标（`stock_qty`/`stock_amount`）此前没出事是**碰巧**：它们的 `scope_filter` 含
+/// 历史注记：本函数曾经是「见快照就一律不装配」。那正确但过度 —— 把余额/库存一族永久
+/// 留在 LLM 路径上，而实测 LLM 把 `rn = 1` 写对的概率约 1/3。库存类指标
+/// （`stock_qty`/`stock_amount`）彼时没出事是**碰巧**：它们的 `scope_filter` 含
 /// `(SELECT MAX(product_stock_date) …)`，撞上了 `compose_sql_with` 的「含 SELECT 即不装配」
 /// 那道门。那是偶然，不是防线 —— 声明才是。
-/// ⚠️ 本函数**不再一律拒快照表** —— 见下。
 fn compose_gated(
     m: &MetricDef,
     d: &DimDef,
@@ -340,13 +353,14 @@ fn ranking_limit(question: &str) -> usize {
 /// 赢家是 `客户分类` 时才装配正确。**也就是说回归 E17 只是碰巧绿的**，
 /// 无代码变更就可能翻红。同理「区域经理」会被业务员的别名「经理」遮蔽。
 /// 长词更具体这条判据与 `kernel::nl::text::match_word` 同源（那边是同一元素内选别名）。
+/// 返回值连同**命中词**一起带出（同一个 `match_word` 算的）——调用点拿它做减词，别再算一遍。
 fn pick<'a, T>(
     question: &str,
     defs: &'a [T],
     of: impl Fn(&'a T) -> (&'a String, &'a Vec<String>),
-) -> Option<&'a T> {
+) -> Option<(&'a T, String)> {
     // `taken` 空串 = 不减词，逐字等于本函数原来的行为（指标侧就是这么调的）
-    pick_excluding(question, defs, of, "")
+    pick_inner(question, defs, of, "")
 }
 
 /// `pick` 的**减词**版：`taken`（指标的命中词）已经消化掉的词不再算维度命中。
@@ -374,21 +388,35 @@ fn pick_excluding<'a, T>(
     of: impl Fn(&'a T) -> (&'a String, &'a Vec<String>),
     taken: &str,
 ) -> Option<&'a T> {
-    // `taken` 为空时 `contains` 恒 false（w 非空），后面那次 `replace` 因短路不会执行
-    let pseudo = |w: &str| w != taken && taken.contains(w) && !question.replace(taken, "").contains(w);
+    pick_inner(question, defs, of, taken).map(|(d, _)| d)
+}
+
+/// 选取核心：返回（选中的定义, 它的命中词）。`pick` 连词一起要（调用点拿去减词，
+/// 不用对同一指标再算一遍 `match_word`）；`pick_excluding` 只要定义。
+fn pick_inner<'a, T>(
+    question: &str,
+    defs: &'a [T],
+    of: impl Fn(&'a T) -> (&'a String, &'a Vec<String>),
+    taken: &str,
+) -> Option<(&'a T, String)> {
+    // `taken` 为空时 `contains` 恒 false（w 非空），`pseudo` 在第二条件就短路；
+    // 整句 replace 只在这里做一次（原来闭包对每个维度候选词都重新分配一遍）
+    let without_taken = question.replace(taken, "");
+    let pseudo = |w: &str| w != taken && taken.contains(w) && !without_taken.contains(w);
     defs.iter()
         .filter_map(|d| {
             let (name, aliases) = of(d);
             dms_kernel::nl::text::match_word(question, name, aliases)
                 .filter(|w| !pseudo(w))
-                .map(|w| ((w.chars().count(), name.as_str()), d))
+                .map(|w| ((w.chars().count(), name.as_str()), w, d))
         })
-        .max_by_key(|(k, _)| *k)
-        .map(|(_, d)| d)
+        .max_by_key(|(k, _, _)| *k)
+        .map(|(_, w, d)| (d, w))
 }
 
-/// 指标已消化的命中词。**必须与 `pick` 同一个 `match_word`**：自己再判一遍就会漂出
-/// 「减的词与选中指标的词不是同一个」，那比不减更难查。
+/// 指标已消化的命中词。生产路径直接用 `pick` 带回来的词；本函数留给单测构造
+/// `pick_excluding` 的 `taken`（与 `pick` 同一个 `match_word`，自己再判一遍就会漂）。
+#[cfg(test)]
 fn metric_word(question: &str, m: &MetricDef) -> String {
     dms_kernel::nl::text::match_word(question, &m.name, &m.aliases).unwrap_or_default()
 }
@@ -401,6 +429,12 @@ fn metric_dimension_allowed(
     })
 }
 
+/// 表名比较的唯一判据。注册表/声明/拼出来的 FROM 串都可能带大小写漂移 ——
+/// 一处用 `==`，漂移时就是「路径找不到 / 表级口径漏挂」（后者正是 41% 虚增的失败面）。
+fn table_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
 /// BFS 找 metric 基表 → 维度驱动表 的最短 join 路径（≤3 跳）。返回 hop 序列。
 fn find_path<'a>(
     from: &str,
@@ -408,7 +442,7 @@ fn find_path<'a>(
     edges: &'a [JoinEdge],
 ) -> Option<Vec<(String, String, String, bool)>> {
     // hop = (to_table, to_col, from_col, fanout)
-    if from == to {
+    if table_eq(from, to) {
         return Some(vec![]);
     }
     let mut queue: std::collections::VecDeque<(String, Vec<(String, String, String, bool)>)> =
@@ -420,10 +454,11 @@ fn find_path<'a>(
         if path.len() >= 3 {
             continue;
         }
+        // 注册表边数很小（几十条），每层全表扫 + 每点一次克隆足够，别为省克隆绕弯
         for e in edges {
-            let (next, to_col, from_col, fanout) = if e.lt == cur {
+            let (next, to_col, from_col, fanout) = if table_eq(&e.lt, &cur) {
                 (e.rt.clone(), e.rc.clone(), e.lc.clone(), e.card == "1:N")
-            } else if e.rt == cur {
+            } else if table_eq(&e.rt, &cur) {
                 (e.lt.clone(), e.lc.clone(), e.rc.clone(), e.card == "N:1")
             } else {
                 continue;
@@ -433,11 +468,11 @@ fn find_path<'a>(
             }
             let mut p = path.clone();
             p.push((next.clone(), to_col, from_col, fanout));
-            if next == to {
+            if table_eq(&next, to) {
                 return Some(p);
             }
-            visited.insert(next.clone());
-            queue.push_back((next, p));
+            queue.push_back((next.clone(), p));
+            visited.insert(next);
         }
     }
     None
@@ -447,9 +482,9 @@ fn find_path<'a>(
 fn find_edge<'a>(a: &str, b: &str, edges: &'a [JoinEdge]) -> Option<(&'a JoinEdge, bool)> {
     // 返回 (edge, a_is_left)
     edges.iter().find_map(|e| {
-        if e.lt == a && e.rt == b {
+        if table_eq(&e.lt, a) && table_eq(&e.rt, b) {
             Some((e, true))
-        } else if e.rt == a && e.lt == b {
+        } else if table_eq(&e.rt, a) && table_eq(&e.lt, b) {
             Some((e, false))
         } else {
             None
@@ -457,7 +492,7 @@ fn find_edge<'a>(a: &str, b: &str, edges: &'a [JoinEdge]) -> Option<(&'a JoinEdg
     })
 }
 
-/// 组合 SQL 装配（纯函数可单测）。无表级口径的简化入口，测试与旧调用点用。
+/// 组合 SQL 装配（纯函数可单测）。无表级口径的简化入口，测试用。
 #[cfg(test)]
 fn compose_sql(m: &MetricDef, d: &DimDef, question: &str, edges: &[JoinEdge]) -> Option<String> {
     compose_sql_with(m, d, question, edges, &[])
@@ -470,7 +505,7 @@ fn compose_sql(m: &MetricDef, d: &DimDef, question: &str, edges: &[JoinEdge]) ->
 /// （再进 WHERE 会把 LEFT 打回 INNER —— 前置②，两条必须一起，只改一条会被另一条抵消）。
 fn left_join(to: &str, alias: &str, on_cond: &str, table_scopes: &[(String, String)]) -> String {
     let mut j = format!(" LEFT JOIN {to} {alias} ON {on_cond}");
-    if let Some((_, f)) = table_scopes.iter().find(|(tn, _)| tn == to) {
+    if let Some((_, f)) = table_scopes.iter().find(|(tn, _)| table_eq(tn, to)) {
         if !f.trim().is_empty() {
             j.push_str(&format!(" AND {}", qualify_cols(f, alias)));
         }
@@ -505,6 +540,13 @@ fn compose_sql_with(
     compose_sql_with_snap(m, d, question, edges, table_scopes, None, None, &[])
 }
 
+/// 大写归一后的 SQL 文本里是否含某个**词元**（SELECT/UNION 这类关键字；非字母数字都算词界）。
+/// `contains` 子串判两头错：`'SELECTED'` 这类字面量会误中（过度拒，安全方向但白扔覆盖），
+/// 而 `" UNION "` 要求两侧都是空格 —— `UNION\nALL`（换行）会从网眼漏掉（该拒没拒）。
+fn sql_has_keyword(sql_up: &str, kw: &str) -> bool {
+    sql_up.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == kw)
+}
+
 /// 组合 SQL 装配（带表级标准口径 + 可选快照声明）
 fn compose_sql_with_snap(
     m: &MetricDef,
@@ -525,10 +567,11 @@ fn compose_sql_with_snap(
     let m_src = strip_annotations(&m.source_table);
     let m_scope = strip_annotations(&m.scope_filter);
     let m_agg = strip_annotations(&m.agg_expr);
-    if m_scope.to_uppercase().contains("SELECT") || m_agg.to_uppercase().contains("SELECT") {
+    // 关键字按词元判（`sql_has_keyword`）：子串判会误中 'SELECTED' 字面量、漏掉 UNION\nALL
+    if sql_has_keyword(&m_scope.to_uppercase(), "SELECT") || sql_has_keyword(&m_agg.to_uppercase(), "SELECT") {
         return None; // 子查询内裸列归属子查询表，限定会改错——走 LLM
     }
-    if m_src.to_uppercase().contains(" UNION ") {
+    if sql_has_keyword(&m_src.to_uppercase(), "UNION") {
         return None; // 多流来源（发票新老双表）须 UNION ALL 合并，模板拼不出——交 LLM 按口径卡写
     }
     // 值过滤：问句里能被**唯一**一条码值声明解释的词，先认下来（下面它会被残留守卫消化），
@@ -537,14 +580,14 @@ fn compose_sql_with_snap(
     if has_entity_residue(question, m, d, &vfs) {
         return None; // 实体问句（恒众餐饮本月销售额）→ 实体/安全分析路径
     }
-    let dim_base = d.source_table.split_whitespace().next()?.to_string();
-    let dim_alias = d.source_table.split_whitespace().nth(1)?.to_string();
-    let dim_rest: String = {
-        let mut parts = d.source_table.splitn(3, char::is_whitespace);
-        parts.next();
-        parts.next();
-        parts.next().unwrap_or("").to_string()
-    };
+    // 维度来源与指标侧同规格：先剥人类注解（`t_x(JOIN …)`）再取标识符 ——
+    // 否则带注解的声明会取出 `t_x(JOIN` 这种既不是表也不是别名的串，路径/桥接全找不到
+    let d_src = strip_annotations(&d.source_table);
+    let dim_base = dms_kernel::sql::lex::first_ident_of(&d_src)?;
+    let dim_alias = d_src.split_whitespace().nth(1)?.to_string();
+    // split_whitespace 合并连续空白；`splitn` 不合并 —— `"t  cus JOIN…"` 会把 `"cus JOIN…"`
+    // 错当 rest，FROM 拼出 `t cus cus JOIN` 这种坏串
+    let dim_rest: String = d_src.split_whitespace().skip(2).collect::<Vec<_>>().join(" ");
 
     // 去重键：来源表含系统级重复行（ETL 双写）时，基表换成 DISTINCT 子查询再聚合，
     // 否则 SUM 直接虚增（实测明细 100.7 万行 vs 去重 83.2 万行，销量虚高 41%）。
@@ -556,14 +599,14 @@ fn compose_sql_with_snap(
         .collect();
 
     let m_tcol = strip_annotations(&m.time_col);
-    let metric_bound_time_dim = dim_base != m_src && is_time_expr(&d.expr) && !m_tcol.is_empty();
+    let metric_bound_time_dim = !table_eq(&dim_base, &m_src) && is_time_expr(&d.expr) && !m_tcol.is_empty();
 
     // FROM 装配 + 扇出检查 + 各表别名登记
     let mut from: String;
     let mut table_aliases: Vec<(String, String)> = vec![]; // (table, alias)
-    if dim_base == m_src {
-        // 同基表：直接用维度来源串（含其内部 JOIN 链）
-        from = d.source_table.clone();
+    if table_eq(&dim_base, &m_src) {
+        // 同基表：直接用维度来源串（剥过注解、含其内部 JOIN 链）
+        from = d_src.clone();
         table_aliases.push((dim_base.clone(), dim_alias.clone()));
     } else if metric_bound_time_dim {
         // 时间维度是分桶定义，不要求 JOIN 它登记时的业务表。
@@ -572,7 +615,8 @@ fn compose_sql_with_snap(
     } else {
         // 跨基表：BFS 路径拼接；扇出边仅 COUNT(DISTINCT) 聚合可过（防 SUM 单头列虚增）
         let path = find_path(&m_src, &dim_base, edges)?;
-        if path.iter().any(|h| h.3) && !m_agg.to_uppercase().starts_with("COUNT(DISTINCT") {
+        // 先 trim 再判：声明的前导空格会让这道扇出检查失效（SUM 沿 1:N 虚增的防线不能被空格绕过）
+        if path.iter().any(|h| h.3) && !m_agg.trim().to_uppercase().starts_with("COUNT(DISTINCT") {
             return None;
         }
         from = format!("{m_src} b0");
@@ -615,8 +659,9 @@ fn compose_sql_with_snap(
             format!(" AND {}", fill_time_col(&tpl, &format!("{base_alias}.{m_tcol}")))
         }
         Some(tpl) => {
-            let p = fill_time_col(&tpl, "order_time");
-            let alias = if let Some((_, a)) = table_aliases.iter().find(|(t, _)| t == "t_sales_order") {
+            // 先定别名、再带别名填列：填完再拿子串替换会把模板里任何含 `order_time` 的
+            // 标识符（如 `prev_order_time`）一起改坏，且填了再换是两次活
+            let alias = if let Some((_, a)) = table_aliases.iter().find(|(t, _)| table_eq(t, "t_sales_order")) {
                 a.clone()
             } else if let Some((e, base_is_left)) = find_edge(&m_src, "t_sales_order", edges) {
                 let (c_base, c_ord) = if base_is_left { (&e.lc, &e.rc) } else { (&e.rc, &e.lc) };
@@ -630,7 +675,7 @@ fn compose_sql_with_snap(
             } else {
                 return None;
             };
-            format!(" AND {}", p.replace("order_time", &format!("{alias}.order_time")))
+            format!(" AND {}", fill_time_col(&tpl, &format!("{alias}.order_time")))
         }
         None => String::new(),
     };
@@ -646,9 +691,13 @@ fn compose_sql_with_snap(
     // 扇出边一律拒：`SUM` 沿 1:N 边会把单头列乘一遍（实测销量虚高 41% 就是这么来的）。
     // 「本月湖南省的销售额」这条路是 明细→订单头→客户，两跳都是 N:1（收敛），所以能过。
     let mut vf_conds: Vec<(String, String)> = vec![]; // (列引用, 条件)
+    // FROM 的 (表, 别名) 只扫一次，桥进新表后增量登记 —— 原来每个 vf、每一跳都重扫一遍 FROM 串
+    let mut from_aliases = from_table_aliases(&from);
     for (i, v) in vfs.iter().enumerate() {
-        let alias = match from_table_aliases(&from).into_iter().find(|(t, _)| *t == v.table) {
-            Some((_, a)) => a,
+        let existing =
+            from_aliases.iter().find(|(t, _)| table_eq(t, &v.table)).map(|(_, a)| a.clone());
+        let alias = match existing {
+            Some(a) => a,
             None => {
                 let path = find_path(&m_src, &v.table, edges)?;
                 if path.iter().any(|h| h.3) {
@@ -659,14 +708,17 @@ fn compose_sql_with_snap(
                 for (j, (to, to_col, from_col, _)) in path.iter().enumerate() {
                     // 路径上已在 FROM 里的表复用其别名（例如时间窗刚桥进来的 `o_time`），
                     // 不重复 JOIN 同一张表
-                    match from_table_aliases(&from).into_iter().find(|(t, _)| t == to) {
-                        Some((_, ex)) => {
+                    let found =
+                        from_aliases.iter().find(|(t, _)| table_eq(t, to)).map(|(_, a)| a.clone());
+                    match found {
+                        Some(ex) => {
                             prev = ex.clone();
                             last = ex;
                         }
                         None => {
                             let na = format!("vf{i}_{j}");
                             from.push_str(&left_join(to, &na, &format!("{na}.{to_col} = {prev}.{from_col}"), table_scopes));
+                            from_aliases.push((to.clone(), na.clone()));
                             prev = na.clone();
                             last = na;
                         }
@@ -698,7 +750,7 @@ fn compose_sql_with_snap(
         }
         let base_scope = table_scopes
             .iter()
-            .find(|(tn, _)| *tn == m_src)
+            .find(|(tn, _)| table_eq(tn, &m_src))
             .map(|(_, f)| f.trim())
             .unwrap_or("");
         // 🔴 按**原子条件**去重，不是整串去重：`balance_status='4'` 一次作为独立的
@@ -751,7 +803,7 @@ fn compose_sql_with_snap(
         // 构建期守卫 `deterministic_templates_satisfy_table_scopes` 就是抓到这一条的。
         let base_scope = table_scopes
             .iter()
-            .find(|(tn, _)| *tn == m_src)
+            .find(|(tn, _)| table_eq(tn, &m_src))
             .map(|(_, f)| f.trim())
             .unwrap_or("");
         let mut inner: Vec<&str> = vec![];
@@ -790,7 +842,7 @@ fn compose_sql_with_snap(
         if caliber_in_on(&from, &t, &alias) {
             continue;
         }
-        if let Some((_, f)) = table_scopes.iter().find(|(tn, _)| *tn == t) {
+        if let Some((_, f)) = table_scopes.iter().find(|(tn, _)| table_eq(tn, &t)) {
             let qualified = qualify_cols(f, &alias);
             if !scope_parts.contains(&qualified) {
                 scope_parts.push(qualified);
@@ -812,6 +864,8 @@ fn compose_sql_with_snap(
         // G2：该列已被口径约束 → 拒。销量口径是 `item_type = '1'`，若问句说「赠品」
         // （声明 `item_type = '2'`）就会拼出两条互斥条件 = 恒 0 行，而这是确定性路径，
         // 静默返回「0」比回落 LLM 坏得多。口径与问句冲突该由人去看，不是装配器调和。
+        // `contains(col_ref)` 是**子串**判据（`b0.qty` 会被 `b0.qty_total` 误中）——
+        // 刻意的宽判：误中的代价是多拒一条（回落 LLM），漏判的代价是恒 0 行静默答错。
         if scope_parts.iter().any(|p| p.contains(col_ref)) || time_and.contains(col_ref) {
             return None;
         }
@@ -881,27 +935,24 @@ fn bind_time_dimension(expr: &str, column: &str) -> Option<String> {
 /// ③ 残留守卫由伪维度的空名/空别名参与 —— 消化词是指标名/别名**加上能被 `meta.value_map`
 ///    唯一解释的值过滤名**：「本月湖南省的销售额」的「湖南」如今被声明消化并装成
 ///    `cus.province = '430000'`；解释不了或装不上（G1/G2）则照旧残留 → 回落 LLM。
+///
+/// `agg_template_hit`：调用方对同一问句已算过的 `agg_template` 命中结果（让路判定）——
+/// `compose_hit` 的让路门刚跑过这一遍，传进来免得 `metric_only` 再全句重扫一次。
 pub async fn try_compose_metric_only(
     pg: &sqlx::PgPool,
     ds: &str,
     question: &str,
+    agg_template_hit: bool,
 ) -> Option<DirectHit> {
     if !warehouse_sales_metrics(question).is_empty() {
         return None;
     }
     if ds == dms_semantic::registry::datasource::DMS_DS_ID {
         if let Some((sql, _name)) = dms_semantic::ops_caliber::direct_metric(question) {
-            return Some(DirectHit {
-                sql: dms_semantic::registry::warehouse_qualified_source(ds, &sql),
-                route: "direct-agg".into(),
-                prev: None,
-                comparisons: vec![],
-                detail: None,
-                sales_context: None,
-            });
+            return Some(hit(dms_semantic::registry::warehouse_qualified_source(ds, &sql), "direct-agg"));
         }
     }
-    match metric_only(pg, ds, question).await {
+    match metric_only(pg, ds, question, agg_template_hit).await {
         MetricOnly::Hit(h) => Some(h),
         _ => None,
     }
@@ -927,7 +978,7 @@ enum MetricOnly {
     RegistryDown(&'static str),
 }
 
-async fn metric_only(pg: &sqlx::PgPool, ds: &str, question: &str) -> MetricOnly {
+async fn metric_only(pg: &sqlx::PgPool, ds: &str, question: &str, agg_template_hit: bool) -> MetricOnly {
     use dms_semantic::registry::model as reg;
     macro_rules! load {
         ($what:literal, $call:expr) => {
@@ -963,15 +1014,16 @@ async fn metric_only(pg: &sqlx::PgPool, ds: &str, question: &str) -> MetricOnly 
     //    但那是**装配器这一侧**的修法；门撤掉还要逐题对拍数字才算安全（二·AR）。
     // ④ **客单价丢 ROUND**：见 ① 末句。撤门前要先把 ROUND 补进声明。
     // 撤门的前置是③的逐题对拍与④的精度统一。
-    if agg_template(question).is_some() {
+    // 命中结果由调用方传入（`compose_hit` 的让路门对同一问句刚算过同一函数，别重扫一遍）
+    if agg_template_hit {
         return MetricOnly::YieldToTemplate;
     }
-    let Some(m) = pick(question, &metrics, |x| (&x.name, &x.aliases)) else {
+    let Some((m, m_word)) = pick(question, &metrics, |x| (&x.name, &x.aliases)) else {
         return MetricOnly::NoMetric;
     };
     // 同样减词：不减的话「上周成交客户数」会被判成「有维度」→ 连指标 only 这条路也走不了
     // （伪维度把两条确定性路径一起堵死，实测那两句只能回落 LLM 或出 200 行名单）
-    if pick_excluding(question, &dims, |x| (&x.name, &x.aliases), &metric_word(question, m)).is_some() {
+    if pick_excluding(question, &dims, |x| (&x.name, &x.aliases), &m_word).is_some() {
         return MetricOnly::DimPresent; // 有维度 → 那是 `try_compose` 的活
     }
     let (edges, scopes, snaps, vals) = tokio::join!(
@@ -1029,7 +1081,7 @@ async fn metric_only(pg: &sqlx::PgPool, ds: &str, question: &str) -> MetricOnly 
         })
         .into_iter()
         .collect();
-    MetricOnly::Hit(DirectHit { sql, route: "direct-agg".into(), prev, comparisons, detail: None, sales_context: None })
+    MetricOnly::Hit(DirectHit { prev, comparisons, ..hit(sql, "direct-agg") })
 }
 
 /// 残留守卫（纯函数）：把问句里被模板/组合器「消化掉」的词剥光后，
@@ -1069,7 +1121,8 @@ fn value_filters<'a>(question: &str, vals: &'a [ValueRef], words: &[String]) -> 
     // 它防的是下一条声明写进来的时候。）
     let hits: Vec<&ValueRef> = vals
         .iter()
-        .filter(|v| v.name.chars().count() >= 2 && question.contains(v.name.as_str()))
+        // `contains` 才是选择性条件，放前面短路（936 行逐行数字数再 contains 是反的）
+        .filter(|v| question.contains(v.name.as_str()) && v.name.chars().count() >= 2)
         .collect();
     let unambiguous = |v: &ValueRef| {
         hits.iter()
@@ -1159,7 +1212,8 @@ fn has_entity_residue(question: &str, m: &MetricDef, d: &DimDef, vfs: &[&ValueRe
 /// 识别图关系问题并抽实体名。顺序敏感：共购(还买)先于买过，买过先于"X买了"。
 pub fn detect_relation(q: &str) -> Option<Relation> {
     // 共购：买X还买 / 买了X还买什么
-    if (q.contains("还买") || q.contains("还购买") || q.contains("关联购买") || q.contains("一起买")) && q.contains("买") {
+    // （四个析取项字字都含「买」，原来再合取 `q.contains("买")` 恒真 —— 死条件，已删）
+    if q.contains("还买") || q.contains("还购买") || q.contains("关联购买") || q.contains("一起买") {
         let name = strip_relation_words(q);
         if !name.is_empty() {
             return Some(Relation::Copurchase(name));
@@ -1188,9 +1242,19 @@ fn strip_relation_words(q: &str) -> String {
     for w in [
         "还买过什么", "还买什么", "还买了什么", "还购买", "还买", "关联购买", "一起买",
         "买过什么", "买了什么", "买过哪些", "买了哪些", "购买清单", "购买过", "买过", "买了",
-        "的客户", "哪些客户", "哪些门店", "哪些", "客户", "门店", "商品", "有", "的", "是", "什么", "都", "买",
+        "的客户", "哪些客户", "哪些门店", "哪些", "客户", "门店", "商品", "什么",
     ] {
         s = s.replace(w, "");
+    }
+    // 单字词只在**边界**剥：实体名里可能含这些字（「美的」的「的」），
+    // 全局 replace 会把实体名吃掉（「买过美的冰箱的客户」剥完剩「美冰箱」，探库/过滤全错）
+    for w in ["有", "的", "是", "都", "买"] {
+        if let Some(rest) = s.strip_prefix(w) {
+            s = rest.to_string();
+        }
+        if let Some(rest) = s.strip_suffix(w) {
+            s = rest.to_string();
+        }
     }
     s.trim().to_string()
 }
@@ -1293,6 +1357,8 @@ fn warehouse_sales_metrics(
         }
         selected.push(candidate);
     }
+    // word 上游（`longest_sales_fact_word`）已按 `contains` 筛过，`find` 恒 Some；
+    // 兜底 MAX 是防御写法（上游筛法若改，未知位置排最后），不会真取到
     selected.sort_by_key(|(_, word)| question.find(*word).unwrap_or(usize::MAX));
     selected
 }
@@ -1335,6 +1401,7 @@ fn warehouse_sales_dimensions(
     }
     selected.sort_by_key(|(dimension, word)| {
         let time_axis = !matches!(dimension, sales_fact::Dimension::Month | sales_fact::Dimension::OrderDate);
+        // 同上：`find` 恒 Some（word 上游按 `contains` 筛过），MAX 只是防御兜底
         (time_axis, question.find(*word).unwrap_or(usize::MAX))
     });
     selected
@@ -1353,12 +1420,13 @@ fn warehouse_sales_question(question: &str) -> bool {
 }
 
 const WAREHOUSE_SALES_UNSUPPORTED: &[&str] = &[
-        "品牌", "牌子", "门店", "店铺", "终端", "店号", "门店编码", "门店名称",
-        "客户分类", "客户类别", "客户类型", "业务员", "销售员", "负责人", "区域经理",
-        "大区经理", "大区负责人", "经理", "manger", "省份", "商品分类",
-        "商品类型", "二级分类", "末级分类", "品类", "TYPE", "销售类型", "城市",
-        "价格组", "来源订单类型", "订单类型", "订单", "退货", "发货", "出库", "物流", "应收",
-        "损益", "财务",
+    "品牌", "牌子", "门店", "店铺", "终端", "店号", "门店编码", "门店名称",
+    "客户分类", "客户类别", "客户类型", "业务员", "销售员", "负责人", "区域经理",
+    // 「manger」是当年拼错的收录；补上正确的「manager」同档拦（多拦一类问句进失败关闭卡）
+    "大区经理", "大区负责人", "经理", "manger", "manager", "省份", "商品分类",
+    "商品类型", "二级分类", "末级分类", "品类", "TYPE", "销售类型", "城市",
+    "价格组", "来源订单类型", "订单类型", "订单", "退货", "发货", "出库", "物流", "应收",
+    "损益", "财务",
 ];
 
 fn warehouse_sales_unsupported_semantic(question: &str) -> Option<&'static str> {
@@ -1432,25 +1500,46 @@ fn answerable_tail_words(question: &str, scalar: bool) -> Vec<String> {
     words
 }
 
-/// 「解析失败」卡要点名的那段：剥掉指标/维度词、通用虚词与可答尾词后剩下的实义残留。
-/// 与 `has_residue` 的剥离完全同构（同一词表、同一算法），只是返回残留文本而不是布尔。
-fn unrecognized_residue(question: &str) -> String {
-    let metrics = warehouse_sales_metrics(question);
-    let dimensions = warehouse_sales_dimensions(question);
+/// sales_fact 两条路（装配 / 「解析失败」卡）**共用同一份**消化词构造：
+/// 指标名/别名/extras + 维度名/别名/extras + 「最低」补丁 + 已探明客户名 + 可答尾词，
+/// 顺带给出标量判定（无维度单指标）。各抄一份必漂出「一边说能消化、另一边报残留」。
+fn sales_fact_consumed(
+    question: &str,
+    metric_hits: &[(dms_semantic::sales_fact::Metric, &'static str)],
+    dimension_hits: &[(dms_semantic::sales_fact::Dimension, &'static str)],
+    customer: Option<&str>,
+) -> (Vec<String>, bool) {
     let mut consumed: Vec<String> = vec![];
-    for (metric, _) in &metrics {
+    for (metric, _) in metric_hits {
         consumed.push(metric.name().to_string());
         consumed.extend(metric.aliases().iter().map(|word| (*word).to_string()));
         consumed.extend(sales_fact_metric_extra_words(*metric).iter().map(|word| (*word).to_string()));
     }
-    for (dimension, _) in &dimensions {
+    for (dimension, _) in dimension_hits {
         consumed.push(dimension.name().to_string());
         consumed.extend(dimension.aliases().iter().map(|word| (*word).to_string()));
-        consumed
-            .extend(sales_fact_dimension_extra_words(*dimension).iter().map(|word| (*word).to_string()));
+        consumed.extend(sales_fact_dimension_extra_words(*dimension).iter().map(|word| (*word).to_string()));
     }
-    let scalar = dimensions.is_empty() && metrics.len() == 1;
+    // 「最低」补丁：STRIP_WORDS 有最高/最多/最少/最大/最小独缺它（kernel 词表侧另有纪律，不动），
+    // 与 `has_entity_residue` 手工补的那颗对齐 —— 否则「本月销售额最低的客户」残留「最低」，
+    // 落「未确认限定」卡，而下面的 ASC 排序分支本来就为它写着。
+    consumed.push("最低".to_string());
+    if let Some(name) = customer {
+        consumed.push(name.to_string());
+    }
+    // 尾部问法修饰词（怎么样/同比增长多少/其中X占多少…）：兑现得了的才剥，判残留前并进 consumed。
+    let scalar = dimension_hits.is_empty() && metric_hits.len() == 1;
     consumed.extend(answerable_tail_words(question, scalar));
+    (consumed, scalar)
+}
+
+/// 「解析失败」卡要点名的那段：剥掉指标/维度词、通用虚词与可答尾词后剩下的实义残留。
+/// 与 `has_residue` 的剥离完全同构（同一词表、同一算法），只是返回残留文本而不是布尔。
+fn unrecognized_residue(question: &str) -> String {
+    let metric_hits = warehouse_sales_metrics(question);
+    let dimension_hits = warehouse_sales_dimensions(question);
+    // 消化词与装配路径共用同一份构造（`sales_fact_consumed`），各写一份会漂
+    let (consumed, _) = sales_fact_consumed(question, &metric_hits, &dimension_hits, None);
     residual_text(question, &consumed.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
@@ -1470,18 +1559,14 @@ fn sales_fact_unavailable(
         .collect::<Vec<_>>()
         .join("、");
     let requested = unsupported.unwrap_or("当前业务数据源");
-    Some(DirectHit {
-        sql: format!(
+    Some(hit(
+        format!(
             "SELECT '不可计算' AS `数据状态`, '{names}' AS `指标`, \
                     '{requested}' AS `未确认范围`, '{reason}' AS `原因`, \
                     '{advice}' AS `处理建议` \n             FROM dms_ods.t_dict_value LIMIT 1"
         ),
-        route: "direct-doc".into(),
-        prev: None,
-        comparisons: vec![],
-        detail: None,
-        sales_context: None,
-    })
+        "direct-doc",
+    ))
 }
 
 fn warehouse_sales_semantics_unavailable(question: &str) -> Option<DirectHit> {
@@ -1502,9 +1587,10 @@ fn warehouse_sales_semantics_unavailable(question: &str) -> Option<DirectHit> {
     // 未确认范围保持「未确认限定」：`direct_hit` 靠这四个字识别本卡去探客户主档，一个字不许改。
     let residue = unrecognized_residue(question);
     let residue = if residue.is_empty() { "问句中的部分限定".to_string() } else { residue };
-    // 进 SQL 字面量前转义引号/反斜杠，并截断兜底（卡面不是日志，别把整句问句塞进去）。
-    let residue = residue.replace('\\', "\\\\").replace('\'', "''");
+    // 先截断再转义（卡面不是日志，别把整句问句塞进去）：转义会把 `\`/`'` 翻倍，
+    // 先转义后截断可能把 `\\`/`''` 对劈开、留下奇数引号 —— 兜底卡自己的 SQL 语法错误。
     let residue: String = residue.chars().take(20).collect();
+    let residue = residue.replace('\\', "\\\\").replace('\'', "''");
     sales_fact_unavailable(
         question,
         Some("未确认限定"),
@@ -1556,36 +1642,18 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
     let dimensions = dimension_hits.iter().map(|(dimension, _)| *dimension).collect::<Vec<_>>();
     // 标量 = 无维度单指标：只有它能挂 KPI delta（prev/comparisons 只在这时装配），
     // 「同比/环比多少」类尾词因此只在标量下才允许剥（见 `answerable_tail_words` 的纪律）。
-    let scalar = dimensions.is_empty() && metrics.len() == 1;
-
-    let mut consumed = vec![];
-    for (metric, _) in &metric_hits {
-        consumed.push(metric.name().to_string());
-        consumed.extend(metric.aliases().iter().map(|word| (*word).to_string()));
-        consumed.extend(sales_fact_metric_extra_words(*metric).iter().map(|word| (*word).to_string()));
-    }
-    for (dimension, _) in &dimension_hits {
-        consumed.push(dimension.name().to_string());
-        consumed.extend(dimension.aliases().iter().map(|word| (*word).to_string()));
-        consumed.extend(
-            sales_fact_dimension_extra_words(*dimension).iter().map(|word| (*word).to_string()),
-        );
-    }
-
+    // 消化词与「解析失败」卡共用同一份构造（`sales_fact_consumed`，含「最低」补丁与客户名）。
+    let (consumed, scalar) = sales_fact_consumed(question, &metric_hits, &dimension_hits, customer);
     let predicates = customer
         .map(|name| vec![dms_semantic::sales_fact::Predicate::contains(Dimension::Customer, name)])
         .unwrap_or_default();
-    if let Some(name) = customer {
-        consumed.push(name.to_string());
-    }
-    // 尾部问法修饰词（怎么样/同比增长多少/其中X占多少…）：兑现得了的才剥，判残留前并进 consumed。
-    consumed.extend(answerable_tail_words(question, scalar));
     if has_residue(question, &consumed) {
         return None;
     }
 
     let (begin, end) = warehouse_sales_time_bounds(question)?;
-    let requested_top_n = detect_top_n(question);
+    // 「最低 N 个」走带补丁的入口：`detect_top_n` 的极值词表不含「最低」，`ranking_limit` 有
+    let requested_top_n = ranking_limit(question);
     let explicit_limit = (requested_top_n < 200).then_some(requested_top_n as u32);
     let ranking = ["排行", "排名", "最高", "最多", "最大", "最少", "最小", "最低", "最好"]
         .iter()
@@ -1600,12 +1668,10 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
         .iter()
         .copied()
         .find(|dimension| matches!(dimension, Dimension::Month | Dimension::OrderDate));
-    let sort = if dimensions.is_empty() {
-        None
-    } else if time_dimension.is_some() && !ranking {
-        Some(Sort::dimension(time_dimension.unwrap(), SortDirection::Asc))
-    } else {
-        Some(Sort::metric(metrics[0], direction))
+    let sort = match (dimensions.is_empty(), time_dimension, ranking) {
+        (true, _, _) => None,
+        (false, Some(td), false) => Some(Sort::dimension(td, SortDirection::Asc)),
+        _ => Some(Sort::metric(metrics[0], direction)),
     };
     let has_categorical_dimension = dimensions
         .iter()
@@ -1676,13 +1742,20 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
     })
 }
 
+/// 关系 SQL 的实体名字面量转义：与 `sales_fact::quote` 同规格（`\` 与 `'` 都处理）。
+/// 只转 `'` 时，实体名以 `\` 结尾会吃掉闭引号 → 兜底 SQL 自己语法错误。
+/// LIKE 通配符（`%`/`_`）不剥 —— 与合同侧 `Predicate::contains` 同一口径（已知的语义放宽）。
+fn rel_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "''")
+}
+
 /// 图谱只允许全量权限账号；受限账号用同义只读 SQL 回答关系问题，继续经过 `gate_on` 行权限注入。
 /// Router 顺序仍是 graph 在先，所以全量账号不会被这里抢走。
 fn relation_rows(question: &str) -> Option<DirectHit> {
     let rel = detect_relation(question)?;
     let sql = match rel {
         Relation::BuyersOfGoods(name) => {
-            let safe = name.replace('\'', "''");
+            let safe = rel_quote(&name);
             format!(
                 "SELECT o.customer_code AS `客户编码`, MAX(o.customer_name) AS `客户`, \
                         COUNT(DISTINCT o.sales_order_code) AS `订单数`, \
@@ -1699,7 +1772,7 @@ fn relation_rows(question: &str) -> Option<DirectHit> {
             )
         }
         Relation::GoodsOfCustomer(name) => {
-            let safe = name.replace('\'', "''");
+            let safe = rel_quote(&name);
             format!(
                 "SELECT d.sku_code AS `商品编码`, MAX(d.sku_name) AS `商品`, \
                         COUNT(DISTINCT o.sales_order_code) AS `订单数`, \
@@ -1716,7 +1789,7 @@ fn relation_rows(question: &str) -> Option<DirectHit> {
             )
         }
         Relation::Copurchase(name) => {
-            let safe = name.replace('\'', "''");
+            let safe = rel_quote(&name);
             format!(
                 "SELECT d.sku_code AS `商品编码`, MAX(d.sku_name) AS `商品`, \
                         COUNT(DISTINCT o.sales_order_code) AS `共同订单数`, \
@@ -1737,7 +1810,7 @@ fn relation_rows(question: &str) -> Option<DirectHit> {
             )
         }
     };
-    Some(DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail: None, sales_context: None })
+    Some(hit(sql, "direct-doc"))
 }
 
 const MARKET_COST_GROUPS: &[(&str, &[&str])] = &[
@@ -1765,12 +1838,12 @@ fn market_cost_where(question: &str) -> String {
 
 fn warehouse_market_cost(question: &str) -> DirectHit {
     let pred = market_cost_where(question);
-    let all_cols: Vec<&str> = MARKET_COST_GROUPS.iter().flat_map(|(_, cols)| cols.iter().copied()).collect();
-    let total = format!(
-        "SELECT COALESCE(SUM({}),0) AS `市场费用` \
-         FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE {pred}",
-        market_cost_expr("f", &all_cols),
-    );
+    let top_n = detect_top_n(question);
+    // 裸「前」不是触发词（「目前市场费用」会误中）：「前+N/前十」形态由 `detect_top_n`
+    // 带时间单位黑名单判；「top」归一小写后判一次（原来 "top"/"TOP" 两枚举还漏 "Top"）
+    let rank = ["最多", "最高", "排行", "排名"].iter().any(|word| question.contains(word))
+        || question.to_lowercase().contains("top")
+        || top_n < 200;
     let detail = MARKET_COST_GROUPS
         .iter()
         .map(|(name, cols)| format!(
@@ -1780,6 +1853,17 @@ fn warehouse_market_cost(question: &str) -> DirectHit {
         ))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
+    let detail = format!("SELECT * FROM ({detail}) x ORDER BY `市场费用` DESC LIMIT {top_n}");
+    if rank {
+        // 排行问法的主结果就是分类明细：总额/上期不再先拼出来再丢
+        return hit(detail, "direct-agg");
+    }
+    let all_cols: Vec<&str> = MARKET_COST_GROUPS.iter().flat_map(|(_, cols)| cols.iter().copied()).collect();
+    let total = format!(
+        "SELECT COALESCE(SUM({}),0) AS `市场费用` \
+         FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE {pred}",
+        market_cost_expr("f", &all_cols),
+    );
     let prev = prev_window(question).map(|(p, label)| {
         let p = fill_time_col(p, "f.data_month");
         (format!(
@@ -1788,49 +1872,27 @@ fn warehouse_market_cost(question: &str) -> DirectHit {
             market_cost_expr("f", &all_cols),
         ), label.to_string())
     });
-    let rank = ["最多", "最高", "排行", "排名", "前", "top", "TOP"]
-        .iter()
-        .any(|word| question.contains(word));
-    let detail = format!(
-        "SELECT * FROM ({detail}) x ORDER BY `市场费用` DESC LIMIT {}",
-        detect_top_n(question)
-    );
-    DirectHit {
-        sql: if rank { detail.clone() } else { total },
-        route: "direct-agg".into(),
-        prev: if rank { None } else { prev },
-        comparisons: vec![],
-        detail: (!rank).then_some(detail),
-        sales_context: None,
-    }
+    DirectHit { prev, detail: Some(detail), ..hit(total, "direct-agg") }
 }
 
 fn warehouse_invoice_unavailable() -> DirectHit {
-    DirectHit {
-        sql: "SELECT '不可计算' AS `数据状态`, '开票金额' AS `指标`, \
+    hit(
+        "SELECT '不可计算' AS `数据状态`, '开票金额' AS `指标`, \
                      '当前业务数仓未同步DMS开票事实表，不能安全计算' AS `原因`, \
                      '请切换到含开票申请事实的业务库，或先补齐数仓同步' AS `处理建议` \
               FROM dms_ods.t_dict_value LIMIT 1".into(),
-        route: "direct-doc".into(),
-        prev: None,
-        comparisons: vec![],
-        detail: None,
-        sales_context: None,
-    }
+        "direct-doc",
+    )
 }
 
 fn warehouse_account_bill_unavailable() -> DirectHit {
-    DirectHit {
-        sql: "SELECT '不可计算' AS `数据状态`, '待确认对账单' AS `指标`, \
+    hit(
+        "SELECT '不可计算' AS `数据状态`, '待确认对账单' AS `指标`, \
                      '当前业务数仓未同步DMS对账单事实表，无法安全计算张数与金额' AS `原因`, \
                      '请先补齐对账单事实同步，禁止用费用报销或其他相似表替代' AS `处理建议` \
               FROM dms_ods.t_dict_value LIMIT 1".into(),
-        route: "direct-doc".into(),
-        prev: None,
-        comparisons: vec![],
-        detail: None,
-        sales_context: None,
-    }
+        "direct-doc",
+    )
 }
 
 fn warehouse_finance(question: &str) -> Option<DirectHit> {
@@ -1852,10 +1914,13 @@ fn warehouse_finance(question: &str) -> Option<DirectHit> {
 /// 账户余额排行是滚动快照，必须先按 (客户,余额类型) 取最新再聚合。
 /// 该问法的“客户”维度属于客户主档，不允许经销售订单表绕路造成扇出。
 fn balance_ranking(question: &str) -> Option<DirectHit> {
+    // 裸「前」不是触发词（「之前的账户余额」会误中）：「前+N/前十」由 `detect_top_n`
+    // 带时间单位黑名单判；「top」归一小写后判一次
+    let top_n = detect_top_n(question);
     if !question.contains("账户余额")
-        || !["最高", "最多", "排行", "排名", "前", "top", "TOP"]
-            .iter()
-            .any(|word| question.contains(word))
+        || !(["最高", "最多", "排行", "排名"].iter().any(|word| question.contains(word))
+            || question.to_lowercase().contains("top")
+            || top_n < 200)
         || !question.contains("客户")
     {
         return None;
@@ -1869,9 +1934,8 @@ fn balance_ranking(question: &str) -> Option<DirectHit> {
     {
         return None;
     }
-    let limit = detect_top_n(question);
-    Some(DirectHit {
-        sql: format!(
+    Some(hit(
+        format!(
             "SELECT c.customer_name AS `客户`, SUM(t.balance) AS `账户余额` \
              FROM (SELECT customer_code, balance_type, balance, \
                           ROW_NUMBER() OVER (PARTITION BY customer_code, balance_type \
@@ -1881,14 +1945,10 @@ fn balance_ranking(question: &str) -> Option<DirectHit> {
              JOIN t_customer c ON c.customer_code = t.customer_code AND c.deleted_flag = 0 \
              WHERE t.rn = 1 \
              GROUP BY t.customer_code, c.customer_name \
-             ORDER BY `账户余额` DESC LIMIT {limit}"
+             ORDER BY `账户余额` DESC LIMIT {top_n}"
         ),
-        route: "direct-agg".into(),
-        prev: None,
-        comparisons: vec![],
-        detail: None,
-        sales_context: None,
-    })
+        "direct-agg",
+    ))
 }
 
 /// 当前库存是快照量，必须只取 `product_stock_date` 的全表最大批次。
@@ -1902,15 +1962,16 @@ fn stock_province_predicate(question: &str) -> Result<Option<String>, ()> {
             !before.is_some_and(|c| c.is_ascii_digit())
                 && !after.is_some_and(|c| c.is_ascii_digit())
         });
+        // 先粗筛再拼短语：每个候选短语都含省名本身，问句不含该省时 7 个 format! 全白做
+        if !code_hit && !question.contains(name) {
+            continue;
+        }
         let phrases = [
             format!("{name}壮族自治区"), format!("{name}回族自治区"),
             format!("{name}维吾尔自治区"), format!("{name}自治区"),
             format!("{name}省"), format!("{name}市"), name.to_string(),
         ];
         let phrase = phrases.into_iter().find(|p| question.contains(p));
-        if phrase.is_none() && !code_hit {
-            continue;
-        }
         let phrase = phrase.unwrap_or_else(|| code.to_string());
         let consumed = [
             "库存金额", "库存货值", "库存数量", "库存总额", "库存总量", "库存额", "库存量",
@@ -1947,21 +2008,22 @@ fn stock_snapshot(question: &str) -> Option<DirectHit> {
     let grouped_province = ["各省", "各省份", "按省", "按省份", "省份分别", "省区分别"]
         .iter()
         .any(|word| question.contains(word));
+    // 裸「前」不是触发词（「目前的库存」会误中）：「前+N/前十」由 `detect_top_n`
+    // 带时间单位黑名单判；「top」归一小写后判一次
     let grouped_warehouse = question.contains("仓库")
-        && [
-            "哪个", "最高", "最多", "最大", "最少", "最小", "最低", "排行", "排名", "前", "top",
-            "TOP",
-        ]
+        && (["哪个", "最高", "最多", "最大", "最少", "最小", "最低", "排行", "排名"]
             .iter()
-            .any(|word| question.contains(word));
+            .any(|word| question.contains(word))
+            || question.to_lowercase().contains("top")
+            || detect_top_n(question) < 200);
     let province = if grouped_province { None } else { stock_province_predicate(question).ok()? };
     let where_sql = match province {
         Some(p) => format!("deleted_flag = 0 AND {latest} AND {p}"),
         None => format!("deleted_flag = 0 AND {latest}"),
     };
     if grouped_warehouse {
-        return Some(DirectHit {
-            sql: format!(
+        return Some(hit(
+            format!(
                 "SELECT COALESCE(NULLIF(warehouse_name,''),'未知') AS `仓库`, \
                         SUM({column}) AS `{label}` \
                  FROM t_winc_stock_report WHERE {where_sql} \
@@ -1970,31 +2032,22 @@ fn stock_snapshot(question: &str) -> Option<DirectHit> {
                 rank_direction(question),
                 ranking_limit(question)
             ),
-            route: "direct-agg".into(), prev: None, comparisons: vec![], detail: None,
-            sales_context: None,
-        });
+            "direct-agg",
+        ));
     }
     if grouped_province {
-        return Some(DirectHit {
-            sql: format!(
+        return Some(hit(
+            format!(
                 "SELECT COALESCE(NULLIF(province,''),'未知') AS `省份`, \
                         SUM({column}) AS `{label}` \
                  FROM t_winc_stock_report WHERE {where_sql} \
                  GROUP BY COALESCE(NULLIF(province,''),'未知') \
                  ORDER BY `{label}` DESC"
             ),
-            route: "direct-agg".into(), prev: None, comparisons: vec![], detail: None,
-            sales_context: None,
-        });
+            "direct-agg",
+        ));
     }
     Some(DirectHit {
-        sql: format!(
-            "SELECT COALESCE(SUM({column}),0) AS `{label}` \
-             FROM t_winc_stock_report WHERE {where_sql}"
-        ),
-        route: "direct-agg".into(),
-        prev: None,
-        comparisons: vec![],
         detail: Some(format!(
             "SELECT COALESCE(NULLIF(product_type,''),'未分类') AS `商品类型`, \
                     COALESCE(SUM({column}),0) AS `{label}` \
@@ -2002,7 +2055,13 @@ fn stock_snapshot(question: &str) -> Option<DirectHit> {
              GROUP BY COALESCE(NULLIF(product_type,''),'未分类') \
              ORDER BY `{label}` DESC LIMIT 20"
         )),
-        sales_context: None,
+        ..hit(
+            format!(
+                "SELECT COALESCE(SUM({column}),0) AS `{label}` \
+                 FROM t_winc_stock_report WHERE {where_sql}"
+            ),
+            "direct-agg",
+        )
     })
 }
 
@@ -2011,13 +2070,15 @@ fn sales_order_rows(question: &str) -> Option<DirectHit> {
     let wants_rows = ["订单明细", "订单清单", "销售单明细", "销售订单明细"]
         .iter()
         .any(|w| question.contains(w));
-    let explicit_order_customers = ["下单", "下过单", "有下单", "有过下单"]
+    // contains 语义下的冗余项已删：「有下单/有过下单」都含「下单」；「有那些客户」含「那些客户」。
+    // ⚠️ 「下过单」不是冗余项（「下」与「单」不相连），删了「昨天都有谁下过单啊」会漏接。
+    let explicit_order_customers = ["下单", "下过单"]
         .iter()
         .any(|w| question.contains(w))
         && ["客户", "谁", "哪家", "哪些", "那些"]
             .iter()
             .any(|w| question.contains(w));
-    let temporal_customer_list = ["哪些客户", "那些客户", "有那些客户", "哪几家客户"]
+    let temporal_customer_list = ["哪些客户", "那些客户", "哪几家客户"]
         .iter()
         .any(|w| question.contains(w))
         && time_predicate(question).is_some()
@@ -2031,23 +2092,19 @@ fn sales_order_rows(question: &str) -> Option<DirectHit> {
     let pred = time_predicate(question)?;
     let time = fill_time_col(&pred, "o.order_time");
     if wants_customers {
-        return Some(DirectHit {
-            sql: format!(
+        return Some(hit(
+            format!(
                 "SELECT o.customer_name AS `客户`, COUNT(DISTINCT o.sales_order_code) AS `订单数`, \
                         SUM(o.total_amount) AS `订单金额`, MAX(o.order_time) AS `最近下单时间` \
                  FROM t_sales_order o \
                  WHERE o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND {time} \
                  GROUP BY o.customer_name ORDER BY `订单金额` DESC, `订单数` DESC LIMIT 200"
             ),
-            route: "direct-doc".into(),
-            prev: None,
-            comparisons: vec![],
-            detail: None,
-            sales_context: None,
-        });
+            "direct-doc",
+        ));
     }
-    Some(DirectHit {
-        sql: format!(
+    Some(hit(
+        format!(
             "SELECT o.sales_order_code AS `订单号`, o.order_time AS `下单时间`, \
                     o.customer_name AS `客户`, COALESCE(o.shop_name,'') AS `门店`, \
                     COALESCE(e.actual_name,o.owner_manager) AS `业务员`, \
@@ -2058,14 +2115,10 @@ fn sales_order_rows(question: &str) -> Option<DirectHit> {
              LEFT JOIN t_employee e ON e.employee_id = o.owner_manager AND e.deleted_flag = 0 \
              LEFT JOIN t_dict_value d ON d.dict_key_id = '67' AND d.value_code = o.order_type \
              WHERE o.deleted_flag = 0 AND {time} ORDER BY o.order_time DESC LIMIT 200",
-            sales_status_sql("o")
+            sales_status_sql("o.order_status")
         ),
-        route: "direct-doc".into(),
-        prev: None,
-        comparisons: vec![],
-        detail: None,
-        sales_context: None,
-    })
+        "direct-doc",
+    ))
 }
 
 /// DMS「设备订单」不是泛指设备名称，而是销售订单体系里的 SO04 单据。
@@ -2074,20 +2127,15 @@ fn device_orders(question: &str) -> Option<DirectHit> {
     if !["设备订单", "设备销售单"].iter().any(|w| question.contains(w)) {
         return None;
     }
-    let time = time_predicate(question)
-        .map(|p| format!(" AND {}", fill_time_col(&p, "order_time")))
+    // 时间谓词只解析一次：单表分支填裸列，两个 JOIN 分支各自填 `o.` 限定
+    let time_pred = time_predicate(question);
+    let time = time_pred
+        .as_deref()
+        .map(|p| format!(" AND {}", fill_time_col(p, "order_time")))
         .unwrap_or_default();
     let where_sql = format!("deleted_flag = 0 AND order_type = 'SO04'{time}");
-    let status_sql = "CASE order_status \
-        WHEN '0' THEN '暂存 (0)' WHEN '100' THEN '未支付 (100)' \
-        WHEN '101' THEN '待备货 (101)' WHEN '102' THEN '备货中 (102)' \
-        WHEN '103' THEN '等待配送 (103)' WHEN '104' THEN '交易完成 (104)' \
-        WHEN '105' THEN '待核销 (105)' WHEN '106' THEN '售后中 (106)' \
-        WHEN '107' THEN '已退款 (107)' WHEN '108' THEN '已取消 (108)' \
-        WHEN '109' THEN '部分收货 (109)' WHEN '110' THEN '待收货 (110)' \
-        WHEN '111' THEN '部分发货 (111)' WHEN '150' THEN '取消中 (150)' \
-        WHEN '151' THEN '取消失败-退款失败 (151)' WHEN '199' THEN '已删除 (199)' \
-        ELSE CONCAT('未知状态 (', order_status, ')') END";
+    // 与订单明细/单据卡同一份 16 臂状态映射（`sales_status_sql`）：抄第二份两处文案必漂
+    let status_sql = sales_status_sql("order_status");
     let sql = if question.contains("按设备类型") || question.contains("设备构成") {
         format!("SELECT COALESCE(NULLIF(TRIM(dv.class3), ''), NULLIF(TRIM(dv.class2), ''), \
                         NULLIF(TRIM(dv.class1), ''), x.sku_name) AS `设备类型`, \
@@ -2100,8 +2148,9 @@ fn device_orders(question: &str) -> Option<DirectHit> {
                  WHERE o.deleted_flag = 0 AND o.order_type = 'SO04'{} \
                  GROUP BY COALESCE(NULLIF(TRIM(dv.class3), ''), NULLIF(TRIM(dv.class2), ''), \
                           NULLIF(TRIM(dv.class1), ''), x.sku_name) \
-                 ORDER BY `设备数量` DESC LIMIT 200", time_predicate(question)
-                    .map(|p| format!(" AND {}", fill_time_col(&p, "o.order_time")))
+                 ORDER BY `设备数量` DESC LIMIT 200", time_pred
+                    .as_deref()
+                    .map(|p| format!(" AND {}", fill_time_col(p, "o.order_time")))
                     .unwrap_or_default())
     } else if question.contains("按设备名称") || question.contains("各设备") {
         format!("SELECT x.sku_name AS `设备名称`, SUM(x.box_quantity) AS `设备数量` \
@@ -2110,8 +2159,9 @@ fn device_orders(question: &str) -> Option<DirectHit> {
                        FROM t_sales_order_detail WHERE deleted_flag = 0 AND item_type = '1') x \
                    ON x.sales_order_code = o.sales_order_code \
                  WHERE o.deleted_flag = 0 AND o.order_type = 'SO04'{} \
-                 GROUP BY x.sku_name ORDER BY `设备数量` DESC LIMIT 200", time_predicate(question)
-                    .map(|p| format!(" AND {}", fill_time_col(&p, "o.order_time")))
+                 GROUP BY x.sku_name ORDER BY `设备数量` DESC LIMIT 200", time_pred
+                    .as_deref()
+                    .map(|p| format!(" AND {}", fill_time_col(p, "o.order_time")))
                     .unwrap_or_default())
     } else if question.contains("按客户") || question.contains("各客户") {
         format!("SELECT customer_name AS `客户`, COUNT(DISTINCT sales_order_code) AS `设备订单数` \
@@ -2134,7 +2184,7 @@ fn device_orders(question: &str) -> Option<DirectHit> {
                  total_amount AS `押金金额`, {status_sql} AS `状态` \
                  FROM t_sales_order WHERE {where_sql} ORDER BY order_time DESC LIMIT 200")
     };
-    Some(DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail: None, sales_context: None })
+    Some(hit(sql, "direct-doc"))
 }
 
 /// 默认销售额维度快路径只使用已验证的 DWS 事实合同。
@@ -2143,10 +2193,6 @@ fn device_orders(question: &str) -> Option<DirectHit> {
 /// `dms_semantic::sales_fact` 构造；此处不再维护任何发货/退货 UNION 口径。
 /// 用户行级权限仍由执行层 `gate_on` 注入到事实表 `storecode`，本函数不得复制权限条件。
 fn sales_breakdown(question: &str) -> Option<DirectHit> {
-    sales_breakdown_for(question)
-}
-
-fn sales_breakdown_for(question: &str) -> Option<DirectHit> {
     use dms_semantic::sales_fact::Metric;
 
     let metrics = warehouse_sales_metrics(question);
@@ -2162,6 +2208,10 @@ fn sales_breakdown_for(question: &str) -> Option<DirectHit> {
     warehouse_sales_fact(question)
 }
 
+/// 残留文本/实体名片段共用的标点白名单（`residual_text` 与 `customer_name_fragment` 同一份）——
+/// 各写一份会漂出「带书名号/括号的问句一边算残留、一边不算」。
+const RESIDUAL_PUNCT: &str = "，。？?、,.~～!！:：;；「」『』()（）";
+
 fn residual_text(question: &str, consumed: &[&str]) -> String {
     let mut s = question.to_string();
     let mut words = consumed.to_vec();
@@ -2173,15 +2223,17 @@ fn residual_text(question: &str, consumed: &[&str]) -> String {
         s = s.replace(w, "");
     }
     s.chars()
-        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"，。？?、,.~～!！:：;；".contains(*c))
+        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !RESIDUAL_PUNCT.contains(*c))
         .collect::<String>()
         .trim()
         .to_string()
 }
 
-fn sales_status_sql(alias: &str) -> String {
+/// 16 臂 order_status 中文状态映射。形参是**列引用**（`o.order_status` / 裸 `order_status`），
+/// 订单明细、单据卡、设备订单三处共用 —— 各抄一份，两处状态文案必漂。
+fn sales_status_sql(col: &str) -> String {
     format!(
-        "CASE {alias}.order_status \
+        "CASE {col} \
          WHEN '0' THEN '暂存 (0)' WHEN '100' THEN '未支付 (100)' \
          WHEN '101' THEN '待备货 (101)' WHEN '102' THEN '备货中 (102)' \
          WHEN '103' THEN '等待配送 (103)' WHEN '104' THEN '交易完成 (104)' \
@@ -2190,7 +2242,7 @@ fn sales_status_sql(alias: &str) -> String {
          WHEN '109' THEN '部分收货 (109)' WHEN '110' THEN '待收货 (110)' \
          WHEN '111' THEN '部分发货 (111)' WHEN '150' THEN '取消中 (150)' \
          WHEN '151' THEN '取消失败-退款失败 (151)' WHEN '199' THEN '已删除 (199)' \
-         ELSE CONCAT('未知状态 (', {alias}.order_status, ')') END"
+         ELSE CONCAT('未知状态 (', {col}, ')') END"
     )
 }
 
@@ -2217,7 +2269,7 @@ fn sales_detail_sql(where_sql: &str, joins: &str, dedup_join: bool) -> String {
 }
 
 fn warehouse_order_hit(code: &str) -> DirectHit {
-    let status = sales_status_sql("o");
+    let status = sales_status_sql("o.order_status");
     let sql = format!(
         "SELECT '数仓发货拆单映射' AS `单据类型`, 'sales_dw.dws_fin_shipment_check_dnf' AS `主表`, \
                 'dms_ods.t_sales_order_detail' AS `明细表`, r.ywzt_order AS `中台单号`, r.base_ref_order AS `基础系统单号`, \
@@ -2240,7 +2292,7 @@ fn warehouse_order_hit(code: &str) -> DirectHit {
          JOIN dms_ods.t_sales_order_detail d ON d.sales_order_code = o.sales_order_code",
         true,
     );
-    DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail: Some(detail), sales_context: None }
+    DirectHit { detail: Some(detail), ..hit(sql, "direct-doc") }
 }
 
 fn document_detail_sql(
@@ -2272,7 +2324,7 @@ fn sniff_doc_code(question: &str, warehouse: bool) -> Option<DirectHit> {
         source.header_projection, source.header_table, column, safe, deleted
     );
     let detail = document_detail_sql(source, &safe);
-    Some(DirectHit { sql, route: "direct-doc".into(), prev: None, comparisons: vec![], detail, sales_context: None })
+    Some(DirectHit { detail, ..hit(sql, "direct-doc") })
 }
 
 /// `agg_template` 的剥词表 ＝ 本模板消化的**业务**词 + `kernel::nl::lexicon::STRIP_WORDS`。
@@ -2373,14 +2425,7 @@ fn agg_template(question: &str) -> Option<DirectHit> {
         .map(|(pred, label)| (base(&fill_time_col(pred, "order_time")), label.to_string()))
         .into_iter()
         .collect();
-    Some(DirectHit {
-        sql: base(&time_pred),
-        route: "direct-agg".into(),
-        prev,
-        comparisons,
-        detail: None,
-        sales_context: None,
-    })
+    Some(DirectHit { prev, comparisons, ..hit(base(&time_pred), "direct-agg") })
 }
 
 /// 本文件专用薄包装：规则时间解析（kernel）+ 填本表时间列
@@ -2412,7 +2457,8 @@ pub fn compose_hit<'a>(cx: &'a dms_agent::AskCtx<'a>) -> dms_kernel::BoxFut<'a, 
         //（销售额×维度的硬编码模板）。拿 `try_direct` 当门会让**所有**销售额×维度问句
         // 都让路给硬编码模板，而它们今天走的是注册表装配 —— 那是把一次窄修变成一次
         // 宽的行为变更（两套模板的 SQL 不同）。第一版我就写错成 `try_direct`，被测试③抓到。
-        if agg_template(cx.question).is_some()
+        let agg_template_hit = agg_template(cx.question).is_some();
+        if agg_template_hit
             || device_orders(cx.question).is_some()
             || balance_ranking(cx.question).is_some()
             || warehouse_sales_question(cx.question)
@@ -2422,9 +2468,10 @@ pub fn compose_hit<'a>(cx: &'a dms_agent::AskCtx<'a>) -> dms_kernel::BoxFut<'a, 
         }
         // 顺序即行为：**带维度的先试**。反过来的话「销售额按省份」会被指标 only 接走、
         // 出一个单值 —— 用户要了分组却拿到总数，是答非所问。
+        // 让路判定结果透传给指标 only：它对同一问句刚算过 `agg_template`，别再全句重扫
         match try_compose(cx.pg, cx.ds, cx.question).await {
             Some(h) => Some(h),
-            None => try_compose_metric_only(cx.pg, cx.ds, cx.question).await,
+            None => try_compose_metric_only(cx.pg, cx.ds, cx.question, agg_template_hit).await,
         }
     })
 }
@@ -2832,6 +2879,8 @@ const CORE_SALES_METRIC_WORDS: &[&str] = &[
 ];
 
 /// 度量列判定：列名或注释含度量词元（金额/数量/单价/成本/收入/毛利 或 amount/qty/price/cost/…）。
+/// 知悉：`c.contains("cost")` 会把 `mat_costume`（服装）这类列误判成度量列 —— 通道③的
+/// 放行面比注释写的宽。改成词元切分（`_` 分段判等）属闸语义改动，留待判官回归窗口再收。
 fn is_measure_col(col: &str, cmt: &str) -> bool {
     let c = col.to_lowercase();
     ["amount", "qty", "quantity", "price", "cost", "revenue", "profit"].iter().any(|w| c.contains(w))
@@ -2856,7 +2905,8 @@ fn derive_labels_ungrounded(
                     .map(|(_, cols)| cols.iter().collect::<Vec<_>>())
                     .unwrap_or_default()
             };
-            // ① 列名/列注释出处
+            // ① 列名/列注释出处。`col.contains(label)` 今天恒 false（label 必含 CJK ——
+            // 上面投影筛选保证 —— 而列名全 ASCII）：留着是防「未来出现 CJK 列名」的兜底。
             let by_comment = cols_of().iter().any(|(col, cmt)| {
                 let cmt = cmt.trim();
                 col.contains(label.as_str())
@@ -2916,9 +2966,10 @@ fn derive_joins_unevidenced(
 }
 
 /// 证据边表名归一：去库名限定、去引号、小写（join_edge 存裸名，datamap 可能存限定名）。
+/// 先取最后一段再剥引号 —— 反过来的话 `` `db`.`tbl` `` 会先剥成 `` db`.`tbl ``、
+/// 再切出 `` `tbl `` 这种带残留反引号的串，等值比较永不命中 = 证据全失效。
 fn bare_table(name: &str) -> String {
-    let trimmed = name.trim_matches(['`', '"']);
-    trimmed.rsplit('.').next().unwrap_or(trimmed).to_lowercase()
+    name.rsplit('.').next().unwrap_or(name).trim_matches(['`', '"']).to_lowercase()
 }
 
 /// LLM 组推导 SQL：仅候选 ODS 表的 schema 卡 + 规则时间窗，一次 precise 调用。
@@ -2945,7 +2996,12 @@ async fn derive_compose(cx: &dms_agent::AskCtx<'_>, schema: &str) -> Option<Stri
         }
     };
     (cx.on_usage)(&reply.usage);
-    let sql = dms_agent::extract_sql(reply.content.as_deref()?);
+    // content 为 None 与「有 content 但抽不出 SQL」是两类失败，日志待遇要一致（都吼出来）
+    let Some(content) = reply.content.as_deref() else {
+        tracing::warn!(question = %cx.question, "推导 LLM 未返回内容 → 回落「不可计算」卡");
+        return None;
+    };
+    let sql = dms_agent::extract_sql(content);
     if sql.is_none() {
         tracing::warn!(question = %cx.question, "推导未产出 SQL → 回落「不可计算」卡");
     }
@@ -2972,13 +3028,21 @@ async fn ods_derive(cx: &dms_agent::AskCtx<'_>) -> Option<DirectHit> {
         return None;
     }
     // 注册指标清单（闸 1 的通道②语料）：name + source_table，ds 作用域。
-    let metrics: Vec<(String, String)> = sqlx::query_as(
+    // 与 `reg_load!` 同一条纪律：读失败不许静默吞（静默按空清单走 = 通道②悄悄失效）——
+    // 吼出来后按空清单继续（失败方向是更严：通道②不放行，不是放宽）。
+    let metrics: Vec<(String, String)> = match sqlx::query_as(
         "SELECT name, source_table FROM meta.metric WHERE ds_id IN ($1, '*') AND status='active'",
     )
     .bind(cx.ds)
     .fetch_all(cx.pg)
     .await
-    .unwrap_or_default();
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(err = %e, "闸 1 通道②语料（meta.metric）读失败 —— 通道②本轮按失效走");
+            vec![]
+        }
+    };
     // 空结果换一轮：候选表「有表无数据」（实测：客户 183507 在 t_winc_sale_report 零行、
     // 在 t_sales_order 4950 行）不等于问题答不出。每轮把试过的表剔出候选池，最多两轮
     // （一轮直连 + 一轮换表，推导是降级路，成本到这里为止）。
@@ -3013,14 +3077,7 @@ async fn ods_derive(cx: &dms_agent::AskCtx<'_>) -> Option<DirectHit> {
         match derive_attempt(cx, &schema, &corpus, &metrics, &usable).await {
             DeriveTry::Hit(sql) => {
                 tracing::info!(question = %cx.question, tables = ?usable, "ODS 推导命中（direct-derive）");
-                return Some(DirectHit {
-                    sql,
-                    route: DERIVE_ROUTE.into(),
-                    prev: None,
-                    comparisons: vec![],
-                    detail: None,
-                    sales_context: None,
-                });
+                return Some(hit(sql, DERIVE_ROUTE));
             }
             DeriveTry::Empty(used) => {
                 tracing::info!(question = %cx.question, tables = ?used, "推导 SQL 合法但零行，换候选表再来一轮");
@@ -3060,8 +3117,15 @@ async fn derive_attempt(
             "推导别名在取数表列名/列注释里无出处（虚构指标/码值劫走）→ 回落「不可计算」卡");
         return DeriveTry::Failed;
     }
-    // 闸 2 · JOIN 证据闸：每条跨表等值关联键都要命中合同边或高置信/人工确认的 joinable 边
-    if !shape.join_pairs.is_empty() || shape.unevidenced_joins > 0 {
+    // 闸 2 · JOIN 证据闸：每条跨表等值关联键都要命中合同边或高置信/人工确认的 joinable 边。
+    // 无等值关联键的 JOIN 在 `derive_joins_unevidenced` 第一句就返回固定文案、根本不看证据边
+    // —— 先判它，省一次 PG 查询
+    if shape.unevidenced_joins > 0 {
+        tracing::warn!(question = %cx.question, sql = %sql,
+            "推导存在无等值关联键的 JOIN（USING/NATURAL/CROSS 或两端表解析不出）→ 回落「不可计算」卡");
+        return DeriveTry::Failed;
+    }
+    if !shape.join_pairs.is_empty() {
         let edges = dms_semantic::recall::join_evidence_edges(cx.pg, cx.ds, usable).await;
         if let Some(join) = derive_joins_unevidenced(&shape, &edges) {
             tracing::warn!(question = %cx.question, join = %join, sql = %sql,
@@ -3087,9 +3151,11 @@ async fn derive_attempt(
         Ok(rs) if rs.rows.is_empty() => {
             // 试过的表 = 候选集里名字出现在 SQL 中的那些（table_names_of 会把库名限定
             // 解析成「dms_ods」，排除失效 —— 实测）。候选名足够独特，子串匹配即可。
+            // 整条 SQL 只小写化一次（原来每张候选表都在 filter 闭包里各算一遍）
+            let sql_low = sql.to_lowercase();
             let used: Vec<String> = usable
                 .iter()
-                .filter(|t| sql.to_lowercase().contains(&t.to_lowercase()))
+                .filter(|t| sql_low.contains(&t.to_lowercase()))
                 .map(|t| (*t).to_string())
                 .collect();
             DeriveTry::Empty(used)
@@ -3110,13 +3176,16 @@ fn customer_name_fragment(question: &str) -> Option<String> {
         for alias in metric.aliases() {
             name = name.replace(alias, "");
         }
+        // extras（「销售金额/收入/毛利」）也是同一个指标的说法：不剥的话片段带着指标词
+        // （「恒众本月销售金额」剥出「恒众销售金额」），探库必空 = 漏接
+        for extra in sales_fact_metric_extra_words(metric) {
+            name = name.replace(extra, "");
+        }
     }
     for w in dms_kernel::nl::lexicon::STRIP_WORDS {
         name = name.replace(w, "");
     }
-    let name = name.trim_matches(|c: char| {
-        c.is_whitespace() || "，。？?、,.~～!！:：;；「」『』()（）".contains(c)
-    });
+    let name = name.trim_matches(|c: char| c.is_whitespace() || RESIDUAL_PUNCT.contains(c));
     let hanzi = name.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
     if hanzi < 2 {
         return None;
@@ -3144,12 +3213,27 @@ async fn customer_filtered_sales(cx: &dms_agent::AskCtx<'_>) -> Option<DirectHit
     }
     let fragment = customer_name_fragment(cx.question)?;
     let safe = fragment.replace('\'', "''");
+    // 只判存在性，LIMIT 1 足够（原来 LIMIT 3 多取的两行没人看）
     let probe = format!(
         "SELECT customer_name FROM t_customer \
-         WHERE deleted_flag = 0 AND customer_name LIKE '%{safe}%' LIMIT 3"
+         WHERE deleted_flag = 0 AND customer_name LIKE '%{safe}%' LIMIT 1"
     );
-    let scoped = dms_agent::gate_on(cx.p, &probe, cx.scope, cx.ds_global, cx.source.dialect()).ok()?;
-    let rs = cx.source.fetch(&scoped, dms_agent::MAX_ROWS, dms_agent::EXEC_TIMEOUT).await.ok()?;
+    // 闸门失败/执行失败与「客户不存在」是两种结局：不许 `.ok()?` 静默吞掉 —— 吼出来再回落
+    // （DB 故障与「客户不存在」必须能从日志区分，见 `reg_load!` 头上那段事故笔记的正反对照）
+    let scoped = match dms_agent::gate_on(cx.p, &probe, cx.scope, cx.ds_global, cx.source.dialect()) {
+        Ok(scoped) => scoped,
+        Err(e) => {
+            tracing::warn!(err = %e, question = %cx.question, "客户主档探查未过闸门 → 按未探明回落");
+            return None;
+        }
+    };
+    let rs = match cx.source.fetch(&scoped, dms_agent::MAX_ROWS, dms_agent::EXEC_TIMEOUT).await {
+        Ok(rs) => rs,
+        Err(e) => {
+            tracing::warn!(err = %e, question = %cx.question, "客户主档探查执行失败 → 按未探明回落");
+            return None;
+        }
+    };
     if rs.rows.is_empty() {
         return None;
     }
@@ -3159,6 +3243,17 @@ async fn customer_filtered_sales(cx: &dms_agent::AskCtx<'_>) -> Option<DirectHit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 自扫描断言的函数体切刀：`src` 里 `start` 标记之后、`end` 标记之前的那段。
+    /// 三处接线钉共用 —— 各写一套 split/nth/expect，函数改名/顺序调整时会以难懂的方式红。
+    fn body_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+        src.split(start)
+            .nth(1)
+            .unwrap_or_else(|| panic!("标记不见了：{start}"))
+            .split(end)
+            .next()
+            .unwrap_or_else(|| panic!("边界不见了：{end}"))
+    }
 
     fn policy(name: &str, dims: &[&str]) -> dms_semantic::registry::model::MetricPolicy {
         dms_semantic::registry::model::MetricPolicy {
@@ -3258,13 +3353,7 @@ mod tests {
         }
 
         let src = include_str!("direct.rs");
-        let compose = src
-            .split("pub fn compose_hit")
-            .nth(1)
-            .expect("compose_hit 不见了")
-            .split("pub fn direct_hit")
-            .next()
-            .unwrap();
+        let compose = body_between(src, "pub fn compose_hit", "pub fn direct_hit");
         assert!(
             compose.contains("balance_ranking(cx.question).is_some()"),
             "余额排行必须让路给确定性快照模板，不能先被通用组合器抢走"
@@ -3489,9 +3578,7 @@ mod tests {
                 "物理事实表名只能存在于 dms_semantic::sales_fact");
         assert!(!source.contains(concat!("fn ship_", "sql")), "旧发货 SQL 构造器不得回归");
         assert!(!source.contains(concat!("struct Ship", "Dim")), "旧发货维度类型不得回归");
-        let unavailable = source
-            .split("fn sales_fact_unavailable(").nth(1).expect("默认销售失败关闭入口缺失")
-            .split("fn warehouse_sales_semantics_unavailable").next().expect("失败关闭函数边界缺失");
+        let unavailable = body_between(source, "fn sales_fact_unavailable(", "fn warehouse_sales_semantics_unavailable");
         assert!(!unavailable.contains(" JOIN "),
                 "失败关闭不得 JOIN 任何表：{unavailable}");
         // 纯常量投影过不了闸门的 ConstantProjection 防线；`dms_ods.t_dict_value LIMIT 1`
@@ -4122,9 +4209,9 @@ mod tests {
         ];
         let q = "本月按客户分类的销售额";
         // 两条都命中（"客户分类" 含 "客户"）；长者胜，且换行序结论不变
-        assert_eq!(pick(q, &ds, |d| (&d.name, &d.aliases)).unwrap().name, "客户分类");
+        assert_eq!(pick(q, &ds, |d| (&d.name, &d.aliases)).unwrap().0.name, "客户分类");
         ds.reverse();
-        assert_eq!(pick(q, &ds, |d| (&d.name, &d.aliases)).unwrap().name, "客户分类");
+        assert_eq!(pick(q, &ds, |d| (&d.name, &d.aliases)).unwrap().0.name, "客户分类");
 
         // 别名也参与长度比较：4 字的「区域经理」压过 2 字的「区域」/「经理」（回归 B06）
         let three = vec![
@@ -4132,7 +4219,7 @@ mod tests {
             DimDef { name: "业务员".into(), aliases: vec!["经理".into()], source_table: "t_sales_order o".into(), expr: "o".into() },
             DimDef { name: "大区经理".into(), aliases: vec!["区域经理".into()], source_table: "t_sales_order o".into(), expr: "a".into() },
         ];
-        assert_eq!(pick("各区域经理业绩", &three, |d| (&d.name, &d.aliases)).unwrap().name, "大区经理");
+        assert_eq!(pick("各区域经理业绩", &three, |d| (&d.name, &d.aliases)).unwrap().0.name, "大区经理");
         // 一条都不命中 → None（不许退化成「取第一条」）
         assert!(pick("今天天气", &three, |d| (&d.name, &d.aliases)).is_none());
     }
@@ -4168,7 +4255,7 @@ mod tests {
         // 前提（也正是错答的成因）：不减词的话「客户」会命中维度。这一句是本测试的承重点：
         // 它证明减词那道判据是**承重**的，而不是一句多余的保险。
         assert_eq!(
-            pick(q, &dims, |d| (&d.name, &d.aliases)).map(|d| d.name.as_str()),
+            pick(q, &dims, |d| (&d.name, &d.aliases)).map(|(d, _)| d.name.as_str()),
             Some("客户"),
             "前提没了 —— 本条测的就是这个伪命中"
         );
@@ -5295,13 +5382,7 @@ mod tests {
         let src = include_str!("direct.rs");
         // ①② direct_hit 的两个卡臂：未确认限定（先客户主档合同、再推导）与普通卡（直接推导），
         //    两个臂的回落都是 or(Some(hit)) —— 删掉任一个，推导失败就跌进 LLM 全目录路径
-        let wire = src
-            .split("pub fn direct_hit<")
-            .nth(1)
-            .expect("direct_hit 没了")
-            .split("// ─────────── ODS 推导降级")
-            .next()
-            .expect("direct_hit 函数边界没了");
+        let wire = body_between(src, "pub fn direct_hit<", "// ─────────── ODS 推导降级");
         let contract_pos = wire.find("customer_filtered_sales(cx).await").expect("客户主档合同探查没了");
         let derive_pos = wire.find("ods_derive(cx).await").expect("卡臂没接推导");
         assert!(contract_pos < derive_pos, "合同（客户主档探查）必须先于推导");
@@ -5312,13 +5393,7 @@ mod tests {
         );
         // ③④ 推导本体（ods_derive 两轮壳 + derive_attempt 单轮体）：
         //    候选校验 → 闸门 → 预执行在 derive_attempt 里，顺序即行为
-        let body = src
-            .split("async fn derive_attempt(")
-            .nth(1)
-            .expect("derive_attempt 没了")
-            .split("\nfn customer_name_fragment(")
-            .next()
-            .expect("derive_attempt 函数边界没了");
+        let body = body_between(src, "async fn derive_attempt(", "\nfn customer_name_fragment(");
         let allow = body.find("derive_tables_allowed").expect("用表硬校验没了");
         let gate = body.find("dms_agent::gate_on").expect("推导必须过与直连同一个 gate_on");
         assert!(allow < gate, "用表硬校验必须在闸门之前：{body}");
@@ -5328,14 +5403,8 @@ mod tests {
         let fetch = body.find("cx.source.fetch").expect("预执行没了");
         let hit = body.find("DeriveTry::Hit(candidate)").expect("命中构造没了");
         assert!(fetch < hit, "必须先预执行成功才许产出推导命中：{body}");
-        let shell = src
-            .split("async fn ods_derive(")
-            .nth(1)
-            .expect("ods_derive 没了")
-            .split("async fn derive_attempt(")
-            .next()
-            .expect("ods_derive 函数边界没了");
-        assert!(shell.contains("route: DERIVE_ROUTE.into()"), "命中必须带 direct-derive route：{shell}");
+        let shell = body_between(src, "async fn ods_derive(", "async fn derive_attempt(");
+        assert!(shell.contains("hit(sql, DERIVE_ROUTE)"), "命中必须带 direct-derive route：{shell}");
         assert!(shell.contains("DeriveTry::Empty") && shell.contains("tried.extend"),
                 "空结果必须剔除试过的表再来一轮：{shell}");
         // ⑤ 两道语义闸：用表校验 → 别名对账 → JOIN 证据 → gate_on，顺序即行为；
@@ -5545,13 +5614,218 @@ mod tests {
             .split("\n/// ")
             .next()
             .expect("函数边界没了");
-        assert_eq!(body.matches(".fetch_all(").count(), 1, "证据边必须一次取完：{body}");
+        // 取数已收口到 `fetch_or_empty`（读失败留痕返空集）：函数体里不再有 `.fetch_all(`，
+        // 「一次取完」钉的是「恰好一次取数调用、且走的是留痕收口」
+        assert_eq!(body.matches("fetch_or_empty(").count(), 1, "证据边必须一次取完：{body}");
+        assert!(!body.contains(".fetch_all("), "取数必须走 fetch_or_empty 收口：{body}");
         assert!(body.contains("UNION ALL"), "两源必须合并成一条查询：{body}");
         assert!(body.contains("status = 'active'"), "合同边只认 active：{body}");
         assert!(body.contains("kind = 'joinable'"), "{body}");
-        assert!(body.contains("confidence >= 0.9 OR status = 'accepted'"),
+        // 置信下限提成具名常量：钉常量名的引用（两档缺一不可）+ 钉字面值不许暗降
+        assert!(body.contains("JOIN_MIN_CONFIDENCE") && body.contains("OR status = 'accepted'"),
                 "高置信/人工确认两档缺一不可：{body}");
+        assert!(src.contains("const JOIN_MIN_CONFIDENCE: f64 = 0.9;"), "置信下限 0.9 不许暗降");
         assert!(body.contains("status <> 'rejected'"), "rejected 永远不算证据：{body}");
         assert!(body.contains("ANY($1)"), "证据边必须限定在候选表集合内：{body}");
+    }
+
+    // ── 本轮优化条目的行为钉（OPTIMIZATION-BACKLOG · direct.rs）──
+
+    /// 注册表大小写漂移：路径查找、时间桥接、表级口径都不得因 `==` 失效
+    /// （后者就是「明细表漏 deleted_flag = 0 致销量虚高 41%」的失败面）。
+    #[test]
+    fn table_name_matching_is_case_insensitive_against_registry_drift() {
+        let drifted_edges = vec![JoinEdge {
+            lt: "T_SALES_ORDER".into(), lc: "sales_order_code".into(),
+            rt: "t_sales_order_detail".into(), rc: "sales_order_code".into(), card: "1:N".into(),
+        }];
+        let path = find_path("t_sales_order_detail", "t_sales_order", &drifted_edges)
+            .expect("大小写漂移不该让路径找不到");
+        assert_eq!(path.len(), 1);
+        let drifted_scopes = vec![("T_SALES_ORDER".to_string(), "deleted_flag = 0".to_string())];
+        let sql = compose_sql_with(&qty_metric(), &cat_dim(), "本月销量按商品分类", &drifted_edges, &drifted_scopes)
+            .expect("大小写漂移不该让装配失败");
+        assert!(sql.contains("o_time.deleted_flag = 0"), "表级口径漏挂：{sql}");
+    }
+
+    /// 关键字按词元判：'SELECTED' 字面量不误中（过度拒），UNION 后换行不漏（该拒没拒）。
+    #[test]
+    fn compose_gate_keyword_checks_are_word_bounded() {
+        assert!(sql_has_keyword("PRODUCT_STOCK_DATE = (SELECT MAX(X) FROM T)", "SELECT"));
+        assert!(sql_has_keyword("T_A UNION\nALL T_B", "UNION"));
+        assert!(sql_has_keyword("UNION ALL T_B", "UNION"), "串首的 UNION 也不许漏");
+        assert!(!sql_has_keyword("NOTE = 'SELECTED'", "SELECT"), "'SELECTED' 字面量不是子查询");
+        // 'SELECTED' 字面量口径不再被误拒（原来 contains("SELECT") 过度拒）
+        let mut m = sales_metric();
+        m.scope_filter = "deleted_flag = 0 AND remark = 'SELECTED'".into();
+        let sql = compose_sql(&m, &dim("省份", "cus.province"), "本月销售额按省份", &edges())
+            .expect("'SELECTED' 字面量不是子查询，不该被误拒");
+        assert!(sql.contains("remark = 'SELECTED'"), "{sql}");
+        // UNION 后换行照样拒（原来 " UNION " 要求两侧都是空格）
+        let mut m2 = sales_metric();
+        m2.source_table = "t_invoice_apply_header UNION\nALL t_invoice_new_apply_header".into();
+        assert!(compose_sql(&m2, &dim("省份", "cus.province"), "本月销售额按省份", &edges()).is_none());
+    }
+
+    /// 维度来源与指标侧同规格：剥注解 + 首标识符 + 合并连续空白。
+    #[test]
+    fn dimension_source_annotations_and_double_spaces_are_normalized() {
+        // ① 连续空白：splitn 不合并会把别名错进 rest，FROM 拼出 `o o LEFT JOIN` 坏串
+        let spaced = DimDef {
+            name: "省份".into(),
+            aliases: vec![],
+            source_table: "t_sales_order  o  LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0".into(),
+            expr: "COALESCE(NULLIF(cus.province,''),'未知')".into(),
+        };
+        let sql = compose_sql_with(&qty_metric(), &spaced, "本月销量按省份", &edges(), &scopes())
+            .expect("连续空格的维度声明该装配得了");
+        assert!(sql.contains("LEFT JOIN t_customer cus ON cus.customer_code"), "{sql}");
+        assert!(!sql.contains(" o  LEFT JOIN"), "别名被错拼进 FROM：{sql}");
+        // ② 带人类注解（跨基表）：基表取出 `t_x(JOIN` 这种串 = 路径找不到（修前返 None）
+        let annotated = DimDef {
+            name: "省份".into(),
+            aliases: vec![],
+            source_table: "t_sales_order(登记来源) o LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0".into(),
+            expr: "COALESCE(NULLIF(cus.province,''),'未知')".into(),
+        };
+        let sql2 = compose_sql_with(&qty_metric(), &annotated, "本月销量按省份", &edges(), &scopes())
+            .expect("带注解的维度声明该装配得了");
+        assert!(!sql2.contains("(登记来源)"), "注解原文不该拼进 FROM：{sql2}");
+        assert!(sql2.contains("JOIN t_customer cus ON"), "{sql2}");
+        // ③ 带人类注解（同基表）：FROM 用剥过注解的来源串（修前把注解原文拼进 SQL）
+        let same_base = DimDef {
+            name: "商品分类".into(),
+            aliases: vec![],
+            source_table: "t_sales_order_detail(明细注记) d JOIN t_goods g ON g.goods_code = d.sku_code AND g.deleted_flag = 0".into(),
+            expr: "COALESCE(NULLIF(g.goods_category_name,''),'未分类')".into(),
+        };
+        let sql3 = compose_sql_with(&qty_metric(), &same_base, "本月销量按商品分类", &edges(), &scopes())
+            .expect("同基表带注解也该装配得了");
+        assert!(!sql3.contains("(明细注记)"), "注解原文不该拼进 FROM：{sql3}");
+        assert!(sql3.contains("JOIN t_goods g ON"), "{sql3}");
+    }
+
+    /// 扇出门先 trim 再判 COUNT(DISTINCT)：前导空格不该让这道门误判（SUM 沿 1:N 虚增的防线）。
+    #[test]
+    fn fanout_gate_trims_agg_before_count_distinct_check() {
+        let m = MetricDef {
+            name: "下单单数".into(),
+            aliases: vec![],
+            source_table: "t_sales_order".into(),
+            agg_expr: " COUNT(DISTINCT sales_order_code)".into(), // 前导空格
+            scope_filter: "deleted_flag = 0".into(),
+            dedup_keys: String::new(),
+            time_col: "order_time".into(),
+        };
+        let sql = compose_sql_with(&m, &cat_dim(), "本月下单单数按商品分类", &edges(), &scopes())
+            .expect("COUNT(DISTINCT) 带前导空格不该被扇出门误拒");
+        assert!(sql.contains("COUNT(DISTINCT b0.sales_order_code)"), "{sql}");
+    }
+
+    /// 先定别名再填时间列：模板里另有含 `order_time` 的标识符（如 `prev_order_time`）时，
+    /// 修前的「填裸列再子串替换」会把它改成 `prev_o_time.order_time` 这种坏串。
+    #[test]
+    fn aliased_time_fill_does_not_rewrite_lookalike_identifiers() {
+        let nodim = DimDef {
+            name: String::new(),
+            aliases: vec![],
+            source_table: "t_sales_order_detail b0".into(),
+            expr: String::new(),
+        };
+        let sql = compose_sql_with_snap(
+            &qty_metric(),
+            &nodim,
+            "本月销量",
+            &edges(),
+            &scopes(),
+            None,
+            Some("{} >= DATE(prev_order_time) AND {} < CURDATE()"),
+            &[],
+        )
+        .expect("时间桥接该装得上");
+        assert!(sql.contains("o_time.order_time >= DATE(prev_order_time)"), "形似标识符被改坏：{sql}");
+        assert!(!sql.contains("prev_o_time.order_time"), "子串替换会把 prev_order_time 改坏：{sql}");
+    }
+
+    /// 单字剥词只在边界：实体名里的「的/是/有/都/买」不许吃掉
+    /// （修前「买过美的冰箱的客户」剥完剩「美冰箱」，探库/过滤全错）。
+    #[test]
+    fn relation_entity_names_keep_embedded_single_chars() {
+        assert_eq!(strip_relation_words("买过美的冰箱的客户"), "美的冰箱");
+        assert_eq!(strip_relation_words("买过所有烤肠的客户"), "所有烤肠");
+        assert_eq!(detect_relation("买过美的冰箱的客户"), Some(Relation::BuyersOfGoods("美的冰箱".into())));
+        // 边界形态保持原样
+        assert_eq!(strip_relation_words("买过烤肠的客户有哪些"), "烤肠");
+        assert_eq!(strip_relation_words("买烤肠的还买什么"), "烤肠");
+    }
+
+    /// 关系 SQL 的转义与 `sales_fact::quote` 同规格：`\` 也翻倍 ——
+    /// 修前实体名以 `\` 结尾会吃掉闭引号，兜底 SQL 自己语法错误。
+    #[test]
+    fn relation_sql_escapes_backslash_like_sales_fact_quote() {
+        assert_eq!(rel_quote("烤肠\\"), "烤肠\\\\");
+        assert_eq!(rel_quote("张'记"), "张''记");
+        let buyers = relation_rows("买过烤肠\\的客户").expect("反斜杠实体名也该接得住");
+        assert!(buyers.sql.contains("LIKE '%烤肠\\\\%'"), "{}", buyers.sql);
+    }
+
+    /// 「manger」是拼错的收录；补上正确的「manager」同档拦（多拦一类问句进失败关闭卡）。
+    #[test]
+    fn warehouse_sales_unsupported_covers_manager_spelled_correctly() {
+        assert_eq!(warehouse_sales_unsupported_semantic("本月manager的销售额"), Some("manager"));
+        assert!(warehouse_sales_fact("本月manager的销售额").is_none());
+        assert!(warehouse_sales_fact("本月manger的销售额").is_none(), "拼错形态照旧拦");
+    }
+
+    /// 「最低」全接线：consumed 补词后不再落「未确认限定」卡；TopN 走 `ranking_limit`
+    /// （`detect_top_n` 的极值词表不含「最低」，直接用会丢 N，得 ASC LIMIT 200 而非 5）。
+    #[test]
+    fn lowest_ranking_questions_compose_with_asc_and_requested_n() {
+        let hit = warehouse_sales_fact("本月销售额最低的客户").expect("最低不应再落「未确认限定」卡");
+        assert!(hit.sql.contains("ASC"), "{}", hit.sql);
+        let five = warehouse_sales_fact("本月销售额最低的5个客户").expect("最低 TopN 应命中");
+        assert!(five.sql.contains("LIMIT 5"), "{}", five.sql);
+        assert!(five.sql.contains("ASC"), "{}", five.sql);
+    }
+
+    /// 裸「前」不再误触排行（「目前市场费用」该出总额）；「top」任意大小写都认。
+    #[test]
+    fn market_cost_rank_trigger_ignores_bare_qian_and_accepts_any_top_case() {
+        let total = warehouse_market_cost("目前市场费用");
+        assert!(total.sql.starts_with("SELECT COALESCE(SUM("), "该出总额：{}", total.sql);
+        assert!(total.detail.is_some(), "非排行应附分类明细");
+        let top = warehouse_market_cost("本月市场费用Top5");
+        assert!(top.sql.contains("ORDER BY `市场费用` DESC LIMIT 5"), "{}", top.sql);
+        assert!(top.detail.is_none(), "排行的主结果就是分类明细");
+        assert!(top.prev.is_none(), "排行不出上期");
+    }
+
+    /// 探库片段剥 extras（「销售金额/收入/毛利」）：不剥的话「恒众本月销售金额」
+    /// 剥出「恒众销售金额」，探库必空 = 漏接（与装配路径 `sales_fact_consumed` 的消化面对齐）。
+    #[test]
+    fn customer_fragment_strips_metric_extra_words() {
+        assert_eq!(customer_name_fragment("恒众本月销售金额").as_deref(), Some("恒众"));
+        assert_eq!(customer_name_fragment("恒众本月销售额").as_deref(), Some("恒众"));
+        assert_eq!(customer_name_fragment("恒众本月毛利").as_deref(), Some("恒众"));
+    }
+
+    /// 证据边表名归一：先取末段再剥引号（修前 `` `db`.`tbl` `` 会剩 `` `tbl `` 残段，
+    /// datamap 若以引号限定名存边则证据全失效）。
+    #[test]
+    fn bare_table_normalizes_quoted_and_qualified_names() {
+        assert_eq!(bare_table("t_goods"), "t_goods");
+        assert_eq!(bare_table("dms_ods.t_goods"), "t_goods");
+        assert_eq!(bare_table("`dms_ods`.`t_goods`"), "t_goods");
+        assert_eq!(bare_table("\"DMS_ODS\".\"T_GOODS\""), "t_goods");
+        let s = shape_of(
+            "SELECT g.brand_name AS `品牌`, SUM(w.sale_amount) AS `销售额` \
+             FROM dms_ods.t_winc_sale_report w LEFT JOIN dms_ods.t_goods g \
+             ON w.sku_code = g.goods_code GROUP BY g.brand_name",
+        );
+        assert!(derive_joins_unevidenced(
+            &s,
+            &[edge("`dms_ods`.`t_goods`", "goods_code", "`dms_ods`.`t_winc_sale_report`", "sku_code")]
+        )
+        .is_none());
     }
 }

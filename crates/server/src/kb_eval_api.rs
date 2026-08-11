@@ -61,6 +61,7 @@ use axum::Json;
 use dms_connector::owned::OwnedStore;
 use dms_kernel::{ChatModel, ChatRequest, ModelTier};
 use dms_knowledge::{acl, answer, retrieve, Viewer};
+use futures::FutureExt;
 use std::sync::Arc;
 
 type ApiErr = (StatusCode, Json<serde_json::Value>);
@@ -122,7 +123,10 @@ const REAP_SQL: &str =
      WHERE status='running'";
 
 /// 服务启动收割被重启中断的评估 run。幂等：无 running 行时影响 0 行。返回收割行数。
+/// 自带幂等 migrate（与 `kg_api::reap_interrupted` 对齐）：启动编排把 reap 排在
+/// migrate 前也不会直接报错。
 pub async fn reap_interrupted(store: &OwnedStore) -> anyhow::Result<u64> {
+    migrate(store).await?;
     let n = store.fixed(REAP_SQL).execute().await?;
     if n > 0 {
         tracing::info!(reaped = n, "重启收割：被中断的评估 run 已标 failed");
@@ -258,7 +262,11 @@ async fn eval_viewer(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
     let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
-        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
+        .map_err(|e| {
+            // 底层错误原文只进日志：DB 故障不该被误判成身份问题（403 文案不透出是刻意的）
+            tracing::warn!(login = %login, err = %e, "DMS 身份/角色查询失败");
+            err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用")
+        })?;
     Ok(Viewer::new(p.login_name, vec![p.role_code]))
 }
 
@@ -309,6 +317,7 @@ pub async fn create_run(
         .fetch_optional::<(i64,)>()
         .await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用，请稍后重试"))?
+        // RETURNING 恒有一行：None 分支实际不可达，仅兜底（PgStmt 没有 fetch_one 形态）
         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "评估任务创建失败"))?;
     let body = serde_json::json!({
         "id": id,
@@ -318,7 +327,27 @@ pub async fn create_run(
         "done": 0,
     });
     // 后台跑全量评估；permit 随任务持有，跑完才放。
-    tokio::spawn(run_eval(st.clone(), id, v, space_id, sample_size, permit));
+    // catch_unwind 兜底：run_eval panic 也必须落 failed 终态——收割只在启动时跑，
+    // 不兜底 run 行会永远卡 running（panic 后 future 被 drop，permit 随之释放）。
+    let st2 = st.clone();
+    tokio::spawn(async move {
+        let panicked = std::panic::AssertUnwindSafe(run_eval(st2.clone(), id, v, space_id, sample_size, permit))
+            .catch_unwind()
+            .await
+            .is_err();
+        if panicked {
+            tracing::error!(run_id = id, "评估任务 panic，兜底标 failed");
+            let _ = st2
+                .owned
+                .fixed(
+                    "UPDATE meta.kb_eval_runs SET status='failed', error='评估任务异常中断', \
+                     finished_at=now() WHERE id=$1 AND status='running'",
+                )
+                .bind(id)
+                .execute()
+                .await;
+        }
+    });
     Ok(Json(body))
 }
 
@@ -365,7 +394,8 @@ pub async fn get_run(
     let Some(run) = run else {
         return Err(err(StatusCode::FORBIDDEN, format!("评估任务 {id} 不可见")));
     };
-    let readable = acl::space_readable(&st.owned, &v, &run.1)
+    let (_, run_space, ..) = &run;
+    let readable = acl::space_readable(&st.owned, &v, run_space)
         .await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用，请稍后重试"))?;
     if !readable {
@@ -382,12 +412,10 @@ pub async fn get_run(
         .await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用，请稍后重试"))?;
     let mut body = run_json(&run);
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "items".into(),
-            items.iter().map(item_json).collect::<Vec<_>>().into(),
-        );
-    }
+    // run_json 的产物必为对象（json! 宏字面量），as_object_mut 恒 Some
+    body.as_object_mut()
+        .expect("run_json 产物必为 JSON 对象")
+        .insert("items".into(), items.iter().map(item_json).collect::<Vec<_>>().into());
     Ok(Json(body))
 }
 
@@ -482,7 +510,6 @@ async fn run_eval(
                 .bind(elapsed_ms)
                 .execute()
                 .await
-                .is_ok()
         }
         Err(msg) => {
             st.owned
@@ -495,11 +522,10 @@ async fn run_eval(
                 .bind(elapsed_ms)
                 .execute()
                 .await
-                .is_ok()
         }
     };
-    if !written {
-        tracing::warn!(run_id, "评估终态回写失败（run 行停在 running，明细已落库的不受影响）");
+    if let Err(e) = written {
+        tracing::warn!(run_id, err = %e, "评估终态回写失败（run 行停在 running，明细已落库的不受影响）");
     }
     match &out {
         Ok(m) => tracing::info!(
@@ -533,12 +559,18 @@ async fn run_eval_inner(
     let mut done = 0i32;
     let mut gen_failed = 0i32;
     let mut judge_failed = 0i32;
+    // cfg 快照循环外取一次（原形态每题取两次 ×sample_size 次）
+    let rrf = st.cfg().kb_rrf_weights;
+    let mut last_progress = std::time::Instant::now();
     for (idx, (gold_chunk, gold_doc, gold_ord, doc_name, heading, text)) in chunks.iter().enumerate() {
         let ord = idx as i32 + 1;
         // ① 出题（fast）。失败：计数继续，不整跑中断。
         let Some(question) = gen_question(&st.llm, doc_name, heading, text).await else {
             gen_failed += 1;
-            progress(st, run_id, done, gen_failed, judge_failed).await;
+            if progress_due(done + gen_failed + judge_failed, &last_progress) {
+                progress(st, run_id, done, gen_failed, judge_failed).await;
+                last_progress = std::time::Instant::now();
+            }
             continue;
         };
         let mut item = EvalItem {
@@ -550,7 +582,7 @@ async fn run_eval_inner(
             error: String::new(),
         };
         // ② 真实检索（创建者身份 + 空间限定，ACL 在 search_report 里内联）
-        match retrieve::search_report(&st.owned, &st.embed, v, Some(space_id), &item.question, &st.cfg().kb_rrf_weights).await {
+        match retrieve::search_report(&st.owned, &st.embed, v, Some(space_id), &item.question, &rrf).await {
             Ok(report) => {
                 let shaped: Vec<(i64, &str, i32, u32)> = report
                     .hits
@@ -565,7 +597,7 @@ async fn run_eval_inner(
         }
         // ③ 答案生成：检索已失败就别再烧一次（answer 内部会重检一遍，大概率同样失败）
         if item.error.is_empty() {
-            match answer::answer(&st.owned, &st.embed, &st.llm, v, Some(space_id), &item.question, &st.cfg().kb_rrf_weights).await {
+            match answer::answer(&st.owned, &st.embed, &st.llm, v, Some(space_id), &item.question, &rrf).await {
                 Ok(a) => match a.body {
                     dms_kernel::AnswerBody::Text { markdown, .. } => {
                         item.answer = sanitize(&markdown, ANSWER_STORE_CHARS);
@@ -590,7 +622,10 @@ async fn run_eval_inner(
         // 明细落库失败＝结果存不下，继续跑只是烧 LLM 攒假绿——整跑标 failed。
         insert_item(st, run_id, ord, *gold_chunk, &item).await?;
         done += 1;
-        progress(st, run_id, done, gen_failed, judge_failed).await;
+        if progress_due(done + gen_failed + judge_failed, &last_progress) {
+            progress(st, run_id, done, gen_failed, judge_failed).await;
+            last_progress = std::time::Instant::now();
+        }
     }
     Ok(RunMetrics {
         done,
@@ -618,9 +653,18 @@ async fn sample_chunks(
         .map_err(|e| format!("语料抽样失败：{e}"))
 }
 
+/// 进度回写节流：每 5 题或每 2 秒一次（进度不是强实时需求，终态 UPDATE 兜底覆盖）。
+const PROGRESS_EVERY: i32 = 5;
+const PROGRESS_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 进度节流判定（纯函数好测）：题数到档或距上次够久才回写。
+fn progress_due(processed: i32, last: &std::time::Instant) -> bool {
+    processed % PROGRESS_EVERY == 0 || last.elapsed() >= PROGRESS_MIN_INTERVAL
+}
+
 /// 进度回写失败只 warn：终态 UPDATE 还会覆盖写一次，进度丢了不是数据丢了。
 async fn progress(st: &AppState, run_id: i64, done: i32, gen_failed: i32, judge_failed: i32) {
-    if st
+    if let Err(e) = st
         .owned
         .fixed("UPDATE meta.kb_eval_runs SET done=$2, gen_failed=$3, judge_failed=$4 WHERE id=$1")
         .bind(run_id)
@@ -629,9 +673,8 @@ async fn progress(st: &AppState, run_id: i64, done: i32, gen_failed: i32, judge_
         .bind(judge_failed)
         .execute()
         .await
-        .is_err()
     {
-        tracing::warn!(run_id, "评估进度回写失败（继续跑，终态会覆盖）");
+        tracing::warn!(run_id, err = %e, "评估进度回写失败（继续跑，终态会覆盖）");
     }
 }
 
@@ -660,7 +703,9 @@ async fn insert_item(
         .bind(r.map(|f| f[3]))
         .bind(item.verdict.map_or("", Verdict::as_str))
         .bind(&item.reason)
-        .bind(&item.error)
+        // 错误串落库前过 sanitize：检索/答案错误原文可能含 NUL（PG text 拒收 → 整跑假
+        // failed），且原文会透出给空间任何读者——剥 NUL + 截断双闸
+        .bind(sanitize(&item.error, 500))
         .execute()
         .await
         .map_err(|e| format!("评估明细落库失败：{e}"))?;
@@ -679,7 +724,7 @@ async fn gen_question(
         format!("文档《{doc_name}》「{heading}」")
     };
     let user = format!("{loc}的片段：\n{}", clip(text, GEN_CHUNK_CHARS));
-    let raw = llm_text(llm, GEN_SYSTEM, &user, 0.4).await?;
+    let raw = llm_text(llm, GEN_SYSTEM, &user, 0.4, GEN_LLM_TIMEOUT).await?;
     parse_question(&raw)
 }
 
@@ -694,19 +739,36 @@ async fn judge_answer(
         clip(gold, JUDGE_GOLD_CHARS),
         clip(generated, JUDGE_ANSWER_CHARS),
     );
-    let raw = llm_text(llm, JUDGE_SYSTEM, &user, 0.0).await?;
+    let raw = llm_text(llm, JUDGE_SYSTEM, &user, 0.0, JUDGE_LLM_TIMEOUT).await?;
     parse_judge(&raw)
 }
 
-/// fast 档一次对话；任何失败（传输/无内容/空串）统一 None —— 调用方负责计数继续。
+/// 出题/评审的 LLM 超时（与 `kb_mindmap_api::LLM_LABEL_TIMEOUT` 同档）：
+/// LLM 挂起不许把 run 卡到进程重启。
+const GEN_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const JUDGE_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// fast 档一次对话；任何失败（传输/无内容/空串/超时）统一 None —— 调用方负责计数继续。
+/// 失败原因进 warn：gen_failed/judge_failed 涨了不能查不到原因。
 async fn llm_text(
     llm: &crate::llm::LlmClient,
     system: &str,
     user: &str,
     temperature: f32,
+    timeout: std::time::Duration,
 ) -> Option<String> {
     let req = ChatRequest::text(ModelTier::Fast, system, user, Some(temperature));
-    let reply = llm.chat(req).await.ok()?;
+    let reply = match tokio::time::timeout(timeout, llm.chat(req)).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => {
+            tracing::warn!(err = %e, "eval fast 调用失败");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(timeout_s = timeout.as_secs(), "eval fast 调用超时");
+            return None;
+        }
+    };
     let text = reply.content?.trim().to_string();
     if text.is_empty() { None } else { Some(text) }
 }
@@ -758,11 +820,21 @@ fn extract_json(raw: &str) -> Option<serde_json::Value> {
     if let Some(v) = parse(t) {
         return Some(v);
     }
-    let unfenced = t
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
+    // 剥围栏：json 标签大小写不敏感（```JSON 与 ```json 同认），重复围栏逐层剥
+    let mut unfenced = t;
+    loop {
+        if unfenced.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("```json")) {
+            unfenced = &unfenced[6..];
+        } else if unfenced.get(..3).is_some_and(|p| p == "```") {
+            unfenced = &unfenced[3..];
+        } else {
+            break;
+        }
+    }
+    while let Some(rest) = unfenced.strip_suffix("```") {
+        unfenced = rest;
+    }
+    let unfenced = unfenced.trim();
     if unfenced.len() != t.len() {
         if let Some(v) = parse(unfenced) {
             return Some(v);
@@ -779,7 +851,7 @@ fn extract_json(raw: &str) -> Option<serde_json::Value> {
 /// 判定词归一：英文三值为准，中文/同义词容忍。不在表里的**一律 None**（评审失败计数），
 /// 不许把不认识的说法猜成最近的一档——猜错了指标就在说谎。
 fn parse_verdict(s: &str) -> Option<Verdict> {
-    let t = s.trim().trim_end_matches(['。', '.', '；', ';']).to_lowercase();
+    let t = s.trim().trim_end_matches(['。', '.', '；', ';', '！', '!']).to_lowercase();
     Some(match t.as_str() {
         "correct" | "pass" | "yes" | "true" | "正确" | "对" => Verdict::Correct,
         "partial" | "partially_correct" | "partially correct" | "部分正确" | "部分" => Verdict::Partial,
@@ -817,9 +889,17 @@ fn parse_question(raw: &str) -> Option<String> {
 }
 
 /// 先验长度再收：超长一律不信（截断收下等于把絮叨改成题），窗内原样保留。
+/// 单遍收口：去 NUL + 首尾空白一次完成；引号只剥「成对包裹」的首尾各一个——
+/// 单边引号是合法问题的一部分（如 `"病假怎么请？` 缺尾引号），误剥会改变题意。
 fn clean_question(s: &str) -> Option<String> {
-    let q = s.trim().trim_matches(['"', '\'']).trim().replace('\0', "");
-    let q = q.trim();
+    let stripped: String = s.chars().filter(|c| *c != '\0').collect();
+    let q = stripped.trim();
+    let q = match (q.chars().next(), q.chars().last()) {
+        (Some(a), Some(b)) if a == b && matches!(a, '"' | '\'') && q.len() >= 2 => {
+            q[1..q.len() - 1].trim()
+        }
+        _ => q,
+    };
     let n = q.chars().count();
     if (MIN_QUESTION_CHARS..=MAX_QUESTION_CHARS).contains(&n) {
         Some(q.to_string())
@@ -830,7 +910,8 @@ fn clean_question(s: &str) -> Option<String> {
 
 /// LLM 产物落库/上线前：剥 NUL（PG text 不收 `\0`）+ 去首尾空白 + 按字符截断（Unicode 安全）。
 fn sanitize(s: &str, max: usize) -> String {
-    s.replace('\0', "").trim().chars().take(max).collect()
+    // 单遍：剥 NUL + 截断一次完成（原形态 replace + collect 两次分配）
+    s.trim().chars().filter(|c| *c != '\0').take(max).collect()
 }
 
 /// 按字符截断（`str::truncate` 按字节会切烂多字节字符）。
@@ -1027,5 +1108,51 @@ mod tests {
         assert!(REAP_SQL.contains("finished_at=now()"), "本表无 updated_at，终态时刻落在 finished_at");
         // 收割目标值必须在 CHECK 约束内，否则这条 UPDATE 写不进去
         assert!(DDL[0].contains("'running','done','failed'"), "CHECK 约束变了，收割目标值要重新对");
+    }
+
+    /// 大写 ```JSON 围栏与小写同认；判定词句读含 ！/!（否则误计 judge_failed）
+    #[test]
+    fn judge_tolerates_uppercase_fence_and_exclamation() {
+        let (v, _) = parse_judge("```JSON\n{\"verdict\":\"correct\"}\n```").unwrap();
+        assert_eq!(v, Verdict::Correct);
+        assert_eq!(parse_verdict("correct!"), Some(Verdict::Correct));
+        assert_eq!(parse_verdict("正确！"), Some(Verdict::Correct));
+    }
+
+    /// 引号只剥成对包裹的首尾各一个：单边引号是合法问题的一部分，误剥改变题意
+    #[test]
+    fn clean_question_strips_only_paired_quotes() {
+        assert_eq!(clean_question("\"病假怎么请？\"").as_deref(), Some("病假怎么请？"));
+        assert_eq!(clean_question("\"单边引号问题").as_deref(), Some("\"单边引号问题"), "单边引号不许剥");
+        assert_eq!(clean_question("'成对单引号问题'").as_deref(), Some("成对单引号问题"));
+    }
+
+    /// 进度节流：题数到档或距上次够久才回写（终态 UPDATE 兜底）
+    #[test]
+    fn progress_write_is_throttled() {
+        let now = std::time::Instant::now();
+        assert!(progress_due(5, &now));
+        assert!(progress_due(10, &now));
+        assert!(!progress_due(3, &now));
+        let old = now.checked_sub(std::time::Duration::from_secs(3)).unwrap();
+        assert!(progress_due(3, &old), "距上次超过 2 秒必须回写");
+    }
+
+    /// run_eval panic 必须兜底落 failed（收割只在启动时跑，不兜底就永远卡 running）
+    #[test]
+    fn create_run_spawn_catches_panic_into_failed_state() {
+        let src = include_str!("kb_eval_api.rs");
+        assert!(src.contains("catch_unwind"), "run_eval 必须 catch_unwind 兜底");
+        assert!(src.contains("评估任务异常中断"), "panic 兜底的 error 文案没了");
+        assert!(src.contains("AND status='running'"), "兜底 UPDATE 只许动 running 行（幂等）");
+    }
+
+    /// 明细落库前 error 必须过 sanitize（错误原文可能含 NUL，PG text 拒收 → 整跑假 failed）
+    #[test]
+    fn item_error_is_sanitized_before_insert() {
+        let src = include_str!("kb_eval_api.rs");
+        let body = src.split("async fn insert_item").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("sanitize(&item.error"), "error 落库前必须过 sanitize: {body}");
     }
 }

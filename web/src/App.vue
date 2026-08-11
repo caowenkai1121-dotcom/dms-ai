@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, reactive, onMounted, onBeforeUnmount, nextTick, defineAsyncComponent } from 'vue'
+import { ref, computed, reactive, watch, onMounted, onBeforeUnmount, nextTick, defineAsyncComponent } from 'vue'
 import ResultPanel from './ResultPanel.vue'
 import KbAnswer from './KbAnswer.vue'
 import KbPanel from './KbPanel.vue'
@@ -10,7 +10,7 @@ import DataMapPanel from './DataMapPanel.vue'
 import SqlAuditPanel from './SqlAuditPanel.vue'
 import TracePanel from './TracePanel.vue'
 import { fmt, semanticForLabel, toNum, uuid, type Semantic } from './format'
-import { ANALYSIS_URL } from './api'
+import { ANALYSIS_URL, ANALYSIS_REPORT_URL } from './api'
 
 const BiChart = defineAsyncComponent(() => import('./BiChart.vue'))
 
@@ -172,7 +172,8 @@ interface DeepPage {
   highlights?: { label: string; value: string; note: string }[]
   contributions?: unknown[][]
   insight?: string | null
-  sections: DeepSection[]
+  /** 深度页其他字段全都按可选防御，这个也不能例外：老服务端缺键时整轮崩溃的就是必填声明 */
+  sections?: DeepSection[]
   recent?: { columns: string[]; rows: unknown[][] } | null
   sqls?: { title: string; sql: string }[]
 }
@@ -209,9 +210,9 @@ const llmMsg = ref('')
 const llmSaving = ref(false)
 const llmSwitching = ref('')
 const adminConfirmed = ref(false)
-function hasAdminAccess(): boolean {
-  return sessionValidated.value && !!sessionToken.value && loginName.value === 'admin' && adminConfirmed.value
-}
+// 模板里挂了 5 处：普通函数每次重渲染都重算，改 computed 缓存（脚本侧调用一律 .value）
+const hasAdminAccess = computed(() =>
+  sessionValidated.value && !!sessionToken.value && loginName.value === 'admin' && adminConfirmed.value)
 async function confirmAdminAccess(): Promise<void> {
   adminConfirmed.value = false
   if (!sessionValidated.value || !sessionToken.value || loginName.value !== 'admin') {
@@ -236,12 +237,12 @@ async function confirmAdminAccess(): Promise<void> {
   }
 }
 function loadSettingsPage() {
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   llmMsg.value = ''
   void Promise.all([loadLlmConfig(), loadDbConfig(), loadSettingsCatalog(), loadQuality(), loadExemplars()])
 }
 function goSettings() {
-  if (!hasAdminAccess()) { goChat(); return }
+  if (!hasAdminAccess.value) { goChat(); return }
   if (location.hash !== '#/settings') location.hash = '/settings'
   else { view.value = 'settings'; loadSettingsPage() }
 }
@@ -259,7 +260,7 @@ function handleSettingsDenied(status: number): boolean {
 }
 function handleHashChange() {
   if (location.hash !== '#/settings') { view.value = 'chat'; return }
-  if (!hasAdminAccess()) {
+  if (!hasAdminAccess.value) {
     if (sessionValidated.value && sessionToken.value && loginName.value === 'admin') void confirmAdminAccess()
     else goChat()
     return
@@ -269,7 +270,7 @@ function handleHashChange() {
 }
 window.addEventListener('hashchange', handleHashChange)
 async function loadLlmConfig() {
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   try {
     const r = await fetch(`/api/admin/llm-config${loginQuery()}`, { headers: authHeaders(false) })
     const j = await r.json()
@@ -278,10 +279,10 @@ async function loadLlmConfig() {
   } catch { llmMsg.value = '加载失败（网络）' }
 }
 async function saveProvider(name: string) {
-  if (!hasAdminAccess() || llmSaving.value) return
+  if (!hasAdminAccess.value || llmSaving.value) return
   llmSaving.value = true
   llmSwitching.value = name
-  llmMsg.value = `正在切换到 ${name}…`
+  llmMsg.value = `正在切换到 ${providerLabel(name)}…`
   try {
     const r = await fetch(`/api/admin/llm-provider${loginQuery()}`, {
       method: 'POST', headers: authHeaders(true),
@@ -290,7 +291,7 @@ async function saveProvider(name: string) {
     })
     const j = await r.json()
     if (!r.ok) { handleSettingsDenied(r.status); llmMsg.value = j.error || `保存失败 ${r.status}`; return }
-    llmMsg.value = `已切换到 ${name}，即时生效（无需重启）`
+    llmMsg.value = `已切换到 ${providerLabel(name)}，即时生效（无需重启）`
     await Promise.all([loadLlmConfig(), loadSettingsCatalog()])
   } catch { llmMsg.value = '保存失败（网络）' } finally {
     llmSaving.value = false
@@ -298,7 +299,7 @@ async function saveProvider(name: string) {
   }
 }
 async function saveFallbackVision() {
-  if (!hasAdminAccess() || fallbackVisionSaving.value) return
+  if (!hasAdminAccess.value || fallbackVisionSaving.value) return
   fallbackVisionSaving.value = true
   try {
     const ok = await postSettings('/api/admin/settings/fallback-vision', {
@@ -323,7 +324,7 @@ const dbCfg = ref<DbCfg | null>(null)
 const dbSaving = ref(false)
 const dbSwitching = ref('')
 async function loadDbConfig() {
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   try {
     const r = await fetch(`/api/admin/db-config${loginQuery()}`, { headers: authHeaders(false) })
     const j = await r.json()
@@ -332,7 +333,7 @@ async function loadDbConfig() {
   } catch { /* 业务库段缺席不挡设置页（老服务端没有这个端点） */ }
 }
 async function saveDbTarget(name: string) {
-  if (!hasAdminAccess() || dbSaving.value) return
+  if (!hasAdminAccess.value || dbSaving.value) return
   dbSaving.value = true
   dbSwitching.value = name
   llmMsg.value = `正在切换分析数据库到 ${name}…`
@@ -397,7 +398,7 @@ const exemplarLoading = ref(false)
 const exemplarBusy = ref<number | null>(null)
 const exemplarFilter = ref('')
 async function loadSettingsCatalog() {
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   try {
     const r = await fetch(`/api/admin/settings-catalog${loginQuery()}`, { headers: authHeaders(false) })
     const j = await r.json()
@@ -408,7 +409,7 @@ async function loadSettingsCatalog() {
   } catch { /* 老服务端没有，静默 */ }
 }
 async function postSettings(url: string, body: object | null, okMsg: string, method = 'POST') {
-  if (!hasAdminAccess()) return false
+  if (!hasAdminAccess.value) return false
   llmMsg.value = ''
   try {
     const r = await fetch(`${url}${loginQuery()}`, {
@@ -482,7 +483,7 @@ function editDbTarget(t: { name: string; host: string; type?: 'warehouse' | 'pro
   dbEditor.value = 'edit'
 }
 async function testDbConn() {
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   if (!dbFormValid()) { llmMsg.value = '先把目标名/地址/端口/库名/账号填齐'; return }
   llmMsg.value = `正在测试数据库 ${dbForm.value.name.trim()}…`
   dbTesting.value = true; dbTest.value = null
@@ -504,16 +505,18 @@ async function testDbConn() {
     llmMsg.value = result.ok ? `数据库 ${dbForm.value.name.trim()} 连通正常` : (result.error || '数据库连通性测试未通过')
   } catch {
     dbTest.value = { ok: false, error: '数据库测试失败（网络）' }
-    llmMsg.value = dbTest.value.error
+    llmMsg.value = dbTest.value.error ?? '数据库测试失败（网络）'
   } finally { dbTesting.value = false }
 }
+/** 内建分析目标名（settings 里那个出厂 DMS 数仓连接）—— 魔法字符串只许在这一处。 */
+const BUILTIN_DB_TARGET = 'dms'
 async function addTarget() {
-  if (!hasAdminAccess() || dbSaving.value) return
+  if (!hasAdminAccess.value || dbSaving.value) return
   if (!dbFormValid()) { llmMsg.value = '先把目标名/地址/端口/库名/账号填齐'; return }
   dbSaving.value = true
   const name = dbForm.value.name.trim()
   const keep = dbEditor.value === 'edit' && !dbForm.value.user.trim() && !dbForm.value.pass
-  const effectiveNow = name.toLowerCase() === 'dms' || dbCfg.value?.target === name
+  const effectiveNow = name.toLowerCase() === BUILTIN_DB_TARGET || dbCfg.value?.target === name
   try {
     const ok = await postSettings('/api/admin/settings/mysql-target',
       { name, dsn: composeDsn(), type: dbForm.value.type, keep_secret: keep, login_name: sessionToken.value ? null : loginName.value },
@@ -525,7 +528,7 @@ async function addTarget() {
 }
 async function removeTarget(name: string) {
   const target = dbCfg.value?.targets.find((t) => t.name === name)
-  if (!hasAdminAccess() || !target || !dbTargetRemovable(target)) {
+  if (!hasAdminAccess.value || !target || !dbTargetRemovable(target)) {
     llmMsg.value = target?.current
       ? '当前生效数据库不能删除，请先切换到其他目标'
       : target?.protected ? 'DMS 权限库受保护，不能删除' : '该数据库目标不可删除'
@@ -608,6 +611,11 @@ function llmProviderRemovable(p: LlmProviderRow): boolean {
   return p.custom
 }
 function onPreset() {
+  // custom = OpenAI 兼容手动填写：没有可套的预设，保留已填内容并给占位名，不做静默无操作
+  if (llmForm.value.preset === 'custom') {
+    llmForm.value.name = llmForm.value.name || 'custom'
+    return
+  }
   const p = settingsCat.value?.llm_presets?.find((x) => x.name === llmForm.value.preset)
   if (!p) return
   llmForm.value.name = llmForm.value.name || p.name
@@ -636,7 +644,7 @@ function llmFormValid(): boolean {
   return !!(f.name.trim() && f.base_url.trim() && (f.model_fast.trim() || f.model_precise.trim()) && (f.key.trim() || exists))
 }
 async function testLlmConn() {
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   const f = llmForm.value
   const model = f.model_fast.trim() || f.model_precise.trim()
   if (!f.base_url.trim() || !model || !f.key.trim()) {
@@ -661,11 +669,11 @@ async function testLlmConn() {
     llmMsg.value = result.ok ? `模型 ${model} 连通正常` : (result.error || '模型连通性测试未通过')
   } catch {
     llmTest.value = { ok: false, error: '模型测试失败（网络）' }
-    llmMsg.value = llmTest.value.error
+    llmMsg.value = llmTest.value.error ?? '模型测试失败（网络）'
   } finally { llmTesting.value = false }
 }
 async function addLlmProvider() {
-  if (!hasAdminAccess() || llmSaving.value) return
+  if (!hasAdminAccess.value || llmSaving.value) return
   if (!llmFormValid()) { llmMsg.value = '名字 / url / 模型 / key 都要填'; return }
   llmSaving.value = true
   const f = llmForm.value
@@ -679,14 +687,14 @@ async function addLlmProvider() {
       thinking: f.thinking, vision: f.vision.trim() || null, key: f.key.trim(),
       login_name: sessionToken.value ? null : loginName.value,
     }, editingRuntime
-      ? `供应商 ${f.name} 已保存并即时生效`
-      : `供应商 ${f.name} 已保存；需要启用时请点击“切换”`)
+      ? `供应商 ${providerLabel(f.name)} 已保存并即时生效`
+      : `供应商 ${providerLabel(f.name)} 已保存；需要启用时请点击“切换”`)
     if (ok) cancelLlmEdit()
   } finally { llmSaving.value = false }
 }
 async function removeLlmProvider(name: string) {
   const provider = llmProviderRows.value.find((p) => p.name === name)
-  if (!hasAdminAccess() || !provider || !llmProviderRemovable(provider)) {
+  if (!hasAdminAccess.value || !provider || !llmProviderRemovable(provider)) {
     llmMsg.value = '内建模型供应商不可删除'
     return
   }
@@ -694,8 +702,15 @@ async function removeLlmProvider(name: string) {
   const ok = await postSettings(`/api/admin/settings/llm-provider/${encodeURIComponent(name)}`, null, `供应商 ${name} 已删除`, 'DELETE')
   if (ok && llmEditingName.value === name) cancelLlmEdit()
 }
+/** key 删除钮的禁用原因文案：protected / 主模型占用 / 备用占用 三种各说各的（原来恒写「删除该 Key」）。 */
+function llmKeyDelTitle(k: { name: string; protected?: boolean }): string {
+  if (k.protected) return '基础 llm_api_key 仍在兜底，不能单独删除'
+  if (llmCfg.value?.provider?.toLowerCase() === k.name.toLowerCase()) return '当前生效供应商的 key 不能删除'
+  if (fallbackVisionProvider.value.toLowerCase() === k.name.toLowerCase()) return '备用多模态供应商的 key 不能删除'
+  return '删除该 Key'
+}
 async function removeLlmKey(name: string) {
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   if (settingsCat.value?.llm_keys.find((key) => key.name.toLowerCase() === name.toLowerCase())?.protected) {
     llmMsg.value = '该 Key 仍由基础 llm_api_key 配置兜底，需先迁移基础配置后再删除'
     return
@@ -747,7 +762,7 @@ async function openPreview(url: string, title: string, retryAuth = true, version
   }
 }
 async function loadQuality() {
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   qualityLoading.value = true
   try {
     const r = await fetch(`/api/admin/quality?days=${qualityDays.value}${loginQuery().replace('?', '&')}`, { headers: authHeaders(false) })
@@ -758,7 +773,7 @@ async function loadQuality() {
   finally { qualityLoading.value = false }
 }
 async function loadExemplars() {
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   exemplarLoading.value = true
   try {
     const status = exemplarFilter.value ? `&status=${encodeURIComponent(exemplarFilter.value)}` : ''
@@ -770,7 +785,7 @@ async function loadExemplars() {
   finally { exemplarLoading.value = false }
 }
 async function setExemplarStatus(id: number, status: 'enabled' | 'disabled') {
-  if (!hasAdminAccess() || exemplarBusy.value !== null) return
+  if (!hasAdminAccess.value || exemplarBusy.value !== null) return
   exemplarBusy.value = id
   try {
     const r = await fetch(`/api/admin/exemplars/${id}/status${loginQuery()}`, {
@@ -787,14 +802,20 @@ async function setExemplarStatus(id: number, status: 'enabled' | 'disabled') {
 function validationLabel(s: string): string {
   return ({ valid: '执行已验证', unverified: '待执行验证', invalid: '验证失败', stale: '已失效' } as Record<string,string>)[s] || s
 }
+// 反馈处理/重开的在飞闸：无 busy 态时双击会发两个 POST（同 exemplarBusy 一个手法）
+const feedbackBusy = ref<number | null>(null)
 async function resolveFeedback(id: number, status: 'open' | 'resolved') {
-  if (!hasAdminAccess()) return
-  const r = await fetch(`/api/admin/feedback/${id}/status${loginQuery()}`, {
-    method: 'POST', headers: authHeaders(),
-    body: JSON.stringify({ status, login_name: sessionToken.value ? null : loginName.value, role_code: roleCode.value || null }),
-  })
-  if (r.ok) loadQuality()
-  else showToast('反馈状态更新失败')
+  if (!hasAdminAccess.value || feedbackBusy.value !== null) return
+  feedbackBusy.value = id
+  try {
+    const r = await fetch(`/api/admin/feedback/${id}/status${loginQuery()}`, {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ status, login_name: sessionToken.value ? null : loginName.value, role_code: roleCode.value || null }),
+    })
+    if (r.ok) loadQuality()
+    else showToast('反馈状态更新失败')
+  } catch { showToast('反馈状态更新失败（网络）') }
+  finally { feedbackBusy.value = null }
 }
 function fmtLatency(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`
@@ -825,7 +846,7 @@ async function downloadPreview() {
     const href = URL.createObjectURL(await r.blob())
     const a = document.createElement('a')
     a.href = href; a.download = `${current.title || 'report'}.html`; a.click()
-    setTimeout(() => URL.revokeObjectURL(href), 0)
+    setTimeout(() => URL.revokeObjectURL(href), 1000) // 0ms 回收与下载起动有竞态（大文件/Firefox 会下到空 blob），宽限 1s
   } catch { showToast('下载失败（网络）') }
 }
 function openPreviewWindow() {
@@ -865,7 +886,7 @@ async function shareArtifact(id: number | null) {
     if (!r.ok || !j.share_url) { showToast(j.error || `分享失败 ${r.status}`); return }
     const url = new URL(j.share_url, location.origin).href
     try { await navigator.clipboard.writeText(url) } catch { window.prompt('复制分享链接：', url); return }
-    showToast('🔗 分享链接已复制（免登录只读）')
+    showToast('分享链接已复制（免登录只读）')
   } catch { showToast('分享失败（网络）') }
 }
 // ─────────────────── 【D6】版本历史 / 表格导出 / 引用到会话 ───────────────────
@@ -923,7 +944,7 @@ async function exportPreview(fmt: 'csv' | 'xlsx') {
     const href = URL.createObjectURL(await r.blob())
     const a = document.createElement('a')
     a.href = href; a.download = `${p.title || 'report'}.${fmt}`; a.click()
-    setTimeout(() => URL.revokeObjectURL(href), 0)
+    setTimeout(() => URL.revokeObjectURL(href), 1000) // 0ms 回收与下载起动有竞态（大文件/Firefox 会下到空 blob），宽限 1s
   } catch { showToast('导出失败（网络）') }
 }
 
@@ -949,7 +970,7 @@ async function promoteArtifact(targetConvId: number, targetTitle: string) {
     if (!r.ok) { showToast(j.error || `引用失败 ${r.status}`); return }
     turnsByConv.delete(targetConvId)
     if (targetConvId === curConvId.value) void openConv(targetConvId)
-    showToast(`📌 已引用到「${targetTitle}」`)
+    showToast(`已引用到「${targetTitle}」`)
   } catch { showToast('引用失败（网络）') }
 }
 
@@ -967,6 +988,9 @@ function artifactIdOf(url: string | undefined): number | null {
 }
 // 深链拦截：聊天气泡里渲染出的 /api/artifact/N/view 链接不跳页，开右侧预览面板
 function onChatClick(e: MouseEvent) {
+  // 只拦无修饰键的左键：Ctrl/⌘/中键点击是想新窗口打开的用户，别强行拽进面板；
+  // 已 defaultPrevented 说明内层元素自己处理过了，不重复拦。
+  if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
   const a = (e.target as HTMLElement).closest?.('a[href*="/api/artifact/"]') as HTMLAnchorElement | null
   if (!a) return
   const href = a.getAttribute('href')
@@ -1102,8 +1126,8 @@ async function sendSteer() {
     steerCountByConv.set(convId, typeof r.queued === 'number' ? r.queued : curSteerCount.value + 1)
     steerText.value = ''
     showToast('插话已受理：将在当前计算的下一安全点并入重算')
-  } catch (e) {
-    showToast(`插话失败：${e}`)
+  } catch {
+    showToast('插话失败（网络）')
   } finally {
     steerBusy.value = false
   }
@@ -1162,8 +1186,8 @@ async function branchTurn(t: Turn, ti: number) {
     if (typeof r.conv_id !== 'number') { showToast('分支会话失败：服务端没返回新会话 id'); return }
     await loadConvs()
     await openConv(r.conv_id)
-  } catch (e) {
-    showToast(`分支会话失败：${e}`)
+  } catch {
+    showToast('分支会话失败（网络）')
   } finally {
     branchBusy.value = false
   }
@@ -1230,6 +1254,8 @@ function onTraceEsc(e: KeyboardEvent) {
   if (e.key === 'Escape') closeTrace()
 }
 const loginBusy = ref(false)
+// 角色换签在飞闸：pickRole 里两个连续 await，双击会重复换签（按钮侧 :disabled 同步吃它）
+const rolePicking = ref(false)
 const loginError = ref('')
 const loginPassword = ref('')
 const loginRoles = ref<string[]>([])
@@ -1261,6 +1287,10 @@ async function afterLogin() {
   await Promise.all([loadConvs(), loadSuggest(), confirmAdminAccess(), confirmKbManager()])
   await loadDigests()
 }
+/** 服务端 roles 数组只收字符串（脏数据会渲染成空按钮）—— passwordLogin / validateSession / offerRoles 同一条过滤。 */
+function filterRoles(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((role): role is string => typeof role === 'string') : []
+}
 async function validateSession(): Promise<boolean> {
   if (!sessionToken.value) return false
   try {
@@ -1273,11 +1303,17 @@ async function validateSession(): Promise<boolean> {
     sessionStorage.setItem('dms-login', verifiedLogin)
     sessionValidated.value = true
     roleCode.value = d.active || ''
-    const roles = Array.isArray(d.roles) ? d.roles.filter((role: unknown): role is string => typeof role === 'string') : []
+    const roles = filterRoles(d.roles)
     loginRoles.value = roles.length > 1 && !roleCode.value ? roles : []
     if (!loginRoles.value.length) await afterLogin()
     return true
-  } catch { clearSession(); return false }
+  } catch {
+    // 网络级失败（抖动/后端重启）**不清**本地会话：token 可能仍然有效，清了就是逼用户重登。
+    // 标未校验 + 提示；后续请求真遇 401 仍走 handleSessionExpired 正常清。
+    sessionValidated.value = false
+    showToast('后端暂时不可达，已保留本地会话；请稍后刷新重试')
+    return false
+  }
 }
 
 async function handleSessionExpired() {
@@ -1310,7 +1346,8 @@ async function passwordLogin() {
     if (!r.ok) { loginError.value = d.error || '登录失败'; return }
     loginPassword.value = ''
     rememberSession(d.token, d.login_name)
-    loginRoles.value = d.roles?.length > 1 ? d.roles : []
+    const roles = filterRoles(d.roles)
+    loginRoles.value = roles.length > 1 ? roles : []
     roleCode.value = d.active || ''
     if (!loginRoles.value.length) await afterLogin()
   } catch { loginError.value = '登录服务连接失败' }
@@ -1318,6 +1355,8 @@ async function passwordLogin() {
 }
 function logout() {
   clearSession(); closePreview(); draftTurns.value = []; turnsByConv.clear(); queueByConv.clear(); pendingRefs.value = []; usageOpen.value = false; skillsOpen.value = false; datamapOpen.value = false; auditOpen.value = false; closeTrace(); convs.value = []; curConvId.value = null
+  // 账号级状态一并清：换账号后旧账号的设置缓存/插话计数/质量数据不许滞留在内存里
+  steerText.value = ''; steerCountByConv.clear(); llmCfg.value = null; settingsCat.value = null; quality.value = null; exemplars.value = []
 }
 
 function authHeaders(json = true): Record<string, string> {
@@ -1404,8 +1443,8 @@ async function newSession() {
     question.value = ''
     await loadConvs()
     return true
-  } catch (e) {
-    if (navigationId === conversationNavigationId) showToast(`新建会话失败：${e}`)
+  } catch {
+    if (navigationId === conversationNavigationId) showToast('新建会话失败（网络）')
   }
 }
 
@@ -1461,8 +1500,8 @@ async function openConv(id: number) {
     if (navigationId !== conversationNavigationId) return
     curConvId.value = id
     scrollDown()
-  } catch (e) {
-    if (navigationId === conversationNavigationId) showToast(`打开会话失败：${e}`)
+  } catch {
+    if (navigationId === conversationNavigationId) showToast('打开会话失败（网络）')
   }
 }
 
@@ -1476,7 +1515,7 @@ async function delConv(id: number, ev: Event) {
     queueByConv.delete(id)
     if (id === curConvId.value) { curConvId.value = null; draftTurns.value = [] }
     await loadConvs()
-  } catch (e) { showToast(`删除会话失败：${e}`) }
+  } catch { showToast('删除会话失败（网络）') }
 }
 
 function applyTheme() {
@@ -1493,7 +1532,7 @@ onMounted(async () => {
   // 端#3 企微：/#token=xxx
   const tm = location.hash.match(/token=([^&]+)/)
   if (tm) {
-    rememberSession(tm[1], '企微用户'); embedded.value = true
+    rememberSession(decodeURIComponent(tm[1]), '企微用户'); embedded.value = true
     history.replaceState(null, '', location.pathname)
   }
   checkHealth()
@@ -1544,9 +1583,9 @@ onBeforeUnmount(() => {
 const digests = ref<{ id: number; title: string; preview_url: string }[]>([])
 async function loadDigests() {
   digests.value = []
-  if (!hasAdminAccess()) return
+  if (!hasAdminAccess.value) return
   try {
-    const r = await fetch(`/api/artifact/list?feed=daily&limit=1${loginQuery().replace('?', '&')}`, { headers: authHeaders() })
+    const r = await fetch(`/api/artifact/list?feed=daily&limit=1${loginQuery().replace('?', '&')}`, { headers: authHeaders(false) })
     if (!r.ok) return
     const d = await r.json()
     digests.value = Array.isArray(d.artifacts) ? d.artifacts.slice(0, 1) : []
@@ -1555,7 +1594,7 @@ async function loadDigests() {
 
 let digestTimer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
-  digestTimer = setInterval(() => { if (hasAdminAccess()) void loadDigests() }, 10 * 60_000)
+  digestTimer = setInterval(() => { if (hasAdminAccess.value) void loadDigests() }, 10 * 60_000)
 })
 onBeforeUnmount(() => { if (digestTimer) clearInterval(digestTimer) })
 
@@ -1642,8 +1681,9 @@ async function generateWeeklyReport() {
     weeklyProvinceInput.value?.focus()
     return
   }
-  if (turns.value.some((t) => t.loading)) {
-    weeklyError.value = '当前会话仍在分析，请完成后再生成周报'
+  if (turns.value.some((t) => t.loading) || curQueue.value.length) {
+    // 队列里还有排队问题：周报带参调用不排队，直接跑会插队 —— 提示用户等队列排空
+    weeklyError.value = '当前会话仍有分析中或排队的问题，完成后再生成周报'
     return
   }
   weeklyBusy.value = true
@@ -1677,7 +1717,7 @@ async function reSsoWithRole(role: string | null): Promise<boolean> {
     // 多角色账号先完成角色选择；否则会在无角色会话下白拉会话/推荐/日报，既慢又会让页面半加载。
     if (!loginRoles.value.length) void afterLogin()
     return true
-  } catch (e) { pushError(`SSO 认证失败：${e}`); return false }
+  } catch { pushError('SSO 认证失败（网络）'); return false }
 }
 
 /** 后端 fail-closed 拒绝多角色账号时那句话的标记（`policy/src/principal.rs:67-70`）。
@@ -1689,7 +1729,7 @@ const ROLE_AMBIGUOUS = '请选择登录角色'
 async function offerRoles(turn: Turn) {
   try {
     const r = await (await fetch(`/api/roles${loginQuery()}`, { headers: authHeaders(false) })).json()
-    const roles: string[] = r.roles || []
+    const roles = filterRoles(r.roles)
     // 单角色/空清单不给选择器：单角色账号本来就不会被这条拒绝挡住，弹出来纯属噪音
     if (roles.length > 1) turn.roles = roles
   } catch { /* 拉不到清单 → 什么都不做，后端那句「可选角色 A / B」还在气泡里 */ }
@@ -1697,6 +1737,8 @@ async function offerRoles(turn: Turn) {
 
 /** 选定角色 → 让它生效 → 原题重问一次。 */
 async function pickRole(role: string, question?: string, options: SendOptions = {}, targetConvId?: number) {
+  if (rolePicking.value) return
+  rolePicking.value = true
   roleCode.value = role
   if (sessionToken.value) {
     try {
@@ -1704,13 +1746,14 @@ async function pickRole(role: string, question?: string, options: SendOptions = 
         method: 'POST', headers: authHeaders(), body: JSON.stringify({ role_code: role }),
       })
       const d = await resp.json()
-      if (!resp.ok) { pushError(`切换角色失败：${d.error || ''}`, targetConvId); return }
+      if (!resp.ok) { pushError(`切换角色失败：${d.error || ''}`, targetConvId); rolePicking.value = false; return }
       rememberSession(d.token, d.login_name)
       loginRoles.value = []
       await afterLogin()
-    } catch (e) { pushError(`切换角色失败：${e}`, targetConvId); return }
+    } catch { pushError('切换角色失败（网络）', targetConvId); rolePicking.value = false; return }
   }
   if (question) await send(question, { ...options, targetConvId })
+  rolePicking.value = false
 }
 
 async function checkHealth() {
@@ -1804,6 +1847,8 @@ async function send(q?: string, options: SendOptions = {}) {
     // 【深度模式】单入口：/api/deep/compose 一次返回 {result, artifact}（总值+拆解+趋势+明细+图+AI 全在服务端同管线出）
     // 【引用上轮】chip 区快照随 body 发出；带参调用（含队列出队）用 options 里那份。
     const sendRefs = options.refs ?? (isPlainAsk ? pendingRefs.value.splice(0) : [])
+    // 重试快照补上引用：chip 区在首次发送时已清空，不回填的话失败后点「重试」引用静默丢失
+    if (aiTurn.retryOptions) aiTurn.retryOptions.refs = sendRefs
     const url = isDeep ? '/api/deep/compose' : '/api/ask'
     const resp = await fetch(url, {
       method: 'POST', headers: authHeaders(), signal: ctrl.signal,
@@ -1851,7 +1896,7 @@ async function send(q?: string, options: SendOptions = {}) {
       } else aiTurn.result = body as AskResult
     }
   } catch (e) {
-    aiTurn.error = ctrl.signal.aborted ? '查询超时，请重试或换个问法' : String(e)
+    aiTurn.error = ctrl.signal.aborted ? '查询超时，请重试或换个问法' : '查询失败（网络），请重试'
   } finally {
     clearTimeout(timer)
     clearInterval(tick)
@@ -1870,7 +1915,10 @@ async function send(q?: string, options: SendOptions = {}) {
 
 // 【思维过程】轮询：1.2s 一拍刷阶段清单到 loading 气泡；done/结束/出错即停。
 function startProgress(rid: string, aiTurn: Turn): () => void {
+  let inFlight = false
   const timer = setInterval(async () => {
+    if (inFlight) return // 上一拍还没回来就跳过本拍：一次请求超过 1.2s 不许并发叠
+    inFlight = true
     try {
       const r = await fetch(`/api/deep/progress?rid=${encodeURIComponent(rid)}`, { headers: authHeaders(false) })
       if (!r.ok) return
@@ -1878,7 +1926,7 @@ function startProgress(rid: string, aiTurn: Turn): () => void {
       aiTurn.progress = j.steps ?? []
       if (Array.isArray(j.sections)) aiTurn.tasks = j.sections
       if (j.done) clearInterval(timer)
-    } catch { /* 轮询失败静默（结果才是主路） */ }
+    } catch { /* 轮询失败静默（结果才是主路） */ } finally { inFlight = false }
   }, 1200)
   return () => clearInterval(timer)
 }
@@ -1922,7 +1970,7 @@ async function resumeDeep(t: Turn) {
     const [body, raw] = await readBody(resp)
     if (!resp.ok) {
       t.error = errMsg(resp, body, raw)
-      if (resp.status === 409) checkResumable(rid, t) // 并发闸/状态已变：重新评估入口
+      checkResumable(rid, t) // 续跑失败（含 409 并发闸/状态已变）：重新评估入口，别让气泡只剩语义不同的「重试」
     } else if (!body) {
       t.error = '服务端返回了空响应（HTTP 200 但没有 JSON 结果）'
     } else {
@@ -1934,7 +1982,7 @@ async function resumeDeep(t: Turn) {
       }
     }
   } catch (e) {
-    t.error = ctrl.signal.aborted ? '续跑超时，请重试' : String(e)
+    t.error = ctrl.signal.aborted ? '续跑超时，请重试' : '续跑失败（网络），请重试'
     checkResumable(rid, t)
   } finally {
     clearTimeout(timer)
@@ -1946,10 +1994,7 @@ async function resumeDeep(t: Turn) {
   }
 }
 
-// 【深度页内嵌】列语义（BiChart 要 semantic 才能格式化金额轴）
-function secSemantic(name: string): Semantic {
-  return semanticForLabel(name)
-}
+// 【深度页内嵌】列语义（BiChart 要 semantic 才能格式化金额轴）：直接用 semanticForLabel，不再过一层零价值转发
 function metricSemantic(name: string): Semantic {
   const semantic = semanticForLabel(name)
   return semantic === 'none' ? 'count' : semantic
@@ -1966,7 +2011,7 @@ function formatMetricValue(label: string, value: unknown): string {
 function secCols(sec: DeepSection) {
   return sec.columns.map((name) => ({
     name,
-    semantic: secSemantic(name),
+    semantic: semanticForLabel(name),
   }))
 }
 function secChartKind(sec: DeepSection): 'bar' | 'line' | 'pie' {
@@ -1976,12 +2021,12 @@ function secChartKind(sec: DeepSection): 'bar' | 'line' | 'pie' {
 function secSeries(sec: DeepSection): number | null {
   return sec.kind === 'line' && sec.columns.length === 3 ? 1 : null
 }
-function secY(sec: DeepSection): number[] { return [Math.max(1, sec.columns.length - 1)] }
+function secY(sec: DeepSection): number[] { return [Math.max(0, sec.columns.length - 1)] } // 单列板块钳到下标 0：原来的 max(1,…) 会把越界的 1 传给 BiChart
 function isMetricPeriodCell(sec: DeepSection, ci: number): boolean {
   return sec.columns[0]?.trim() === '指标' && /^(?:本周|上周|去年同期)$/.test(sec.columns[ci]?.trim() ?? '')
 }
 function secCellSemantic(sec: DeepSection, row: unknown[], ci: number): Semantic {
-  return isMetricPeriodCell(sec, ci) ? metricSemantic(String(row[0] ?? '')) : secSemantic(sec.columns[ci] ?? '')
+  return isMetricPeriodCell(sec, ci) ? metricSemantic(String(row[0] ?? '')) : semanticForLabel(sec.columns[ci] ?? '')
 }
 function secCell(sec: DeepSection, row: unknown[], ci: number): string {
   const value = row[ci]
@@ -1991,7 +2036,7 @@ function secCell(sec: DeepSection, row: unknown[], ci: number): string {
 }
 function formatCell(columns: string[], value: unknown, ci: number): string {
   const label = columns[ci] ?? ''
-  return isGrossMarginValueLabel(label) ? formatMetricValue(label, value) : fmt(value, secSemantic(label))
+  return isGrossMarginValueLabel(label) ? formatMetricValue(label, value) : fmt(value, semanticForLabel(label))
 }
 function formatLabeledValue(label: string, value: unknown): string {
   return formatMetricValue(label, value) || '—'
@@ -2044,14 +2089,21 @@ function turnSqls(t: Turn): { title: string; sql: string }[] {
   }
   return sqls
 }
+// 模板对同一 result 一轮渲染会调多遍（folders 判空/列表/溢出计数共 3 处）；
+// result 对象每轮只赋值一次，按引用缓存结果，任意响应式变动引发的重渲染只花一次计算。
+const knowledgeSourcesCache = new WeakMap<AskResult, { documents: number; folders: string[] }>()
 function knowledgeSources(result: AskResult): { documents: number; folders: string[] } {
+  const hit = knowledgeSourcesCache.get(result)
+  if (hit) return hit
   const citations = result.citations ?? []
   const documents = new Set(citations.map((citation) => citation.doc_id).filter(Boolean)).size
   const folders = [...new Set(citations
     .map((citation) => citation.folder_path || citation.directory_path || '')
     .map((path) => path.trim().replace(/^\/+|\/+$/g, ''))
     .filter(Boolean))]
-  return { documents, folders }
+  const value = { documents, folders }
+  knowledgeSourcesCache.set(result, value)
+  return value
 }
 function userFacingMarkdown(text: string): string {
   const visible: string[] = []
@@ -2086,33 +2138,54 @@ function dataOnlyResult(result: AskResult): AskResult {
   if (!result.view?.insight) return result
   return { ...result, view: { ...result.view, insight: undefined } }
 }
-/** 【意图澄清】clarify_options 只过干净项：空 label/question 的脏数据不进 UI。 */
+/** 【意图澄清】clarify_options 只过干净项：空 label/question 的脏数据不进 UI。
+ *  一轮渲染调两遍（v-if + v-for），按 result 引用缓存（同 knowledgeSources）。 */
+const clarifyOptionsCache = new WeakMap<AskResult, { label: string; question: string }[]>()
 function clarifyOptionsOf(result?: AskResult): { label: string; question: string }[] {
   if (!result || !Array.isArray(result.clarify_options)) return []
-  return result.clarify_options.filter((o) =>
+  const hit = clarifyOptionsCache.get(result)
+  if (hit) return hit
+  const value = result.clarify_options.filter((o) =>
     o && typeof o.label === 'string' && typeof o.question === 'string' && o.label.trim() && o.question.trim())
+  clarifyOptionsCache.set(result, value)
+  return value
 }
+// 一轮渲染调两遍（v-if 判空 + KbAnswer 入参），按 result 引用缓存（同 knowledgeSources）
+const compoundAnalysisCache = new WeakMap<AskResult, string>()
 function compoundAnalysis(result: AskResult): string {
+  const hit = compoundAnalysisCache.get(result)
+  if (hit !== undefined) return hit
   const summary = userFacingMarkdown(result.view?.insight ?? '')
-  if (summary) return summary
-  return (result.subs ?? [])
+  const value = summary || (result.subs ?? [])
     .map((sub) => {
       const insight = userFacingMarkdown(sub.result.view?.insight ?? '')
       return insight ? `### ${sub.question}\n${insight}` : ''
     })
     .filter(Boolean)
     .join('\n\n')
+  compoundAnalysisCache.set(result, value)
+  return value
 }
 const biFocus = ref<DeepSection | null>(null)
+// bi-focus 沉浸层：Esc 关闭（与 trace 抽屉同一手法：打开挂 keydown，关闭摘掉）
+function onBiFocusEsc(e: KeyboardEvent) { if (e.key === 'Escape') biFocus.value = null }
+watch(biFocus, (v) => {
+  if (v) window.addEventListener('keydown', onBiFocusEsc)
+  else window.removeEventListener('keydown', onBiFocusEsc)
+})
 function downloadCsv(columns: string[], rows: unknown[][], filename: string) {
-  const cell = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`
+  // 防公式注入：= + - @ 开头的文本进 Excel 会被当公式执行，前置 ' 转义
+  const cell = (value: unknown) => {
+    const text = String(value ?? '')
+    return `"${(/^[=+\-@]/.test(text) ? `'${text}` : text).replace(/"/g, '""')}"`
+  }
   const csv = [columns, ...rows].map((row) => row.map(cell).join(',')).join('\r\n')
   const href = URL.createObjectURL(new Blob(['\ufeff', csv], { type: 'text/csv;charset=utf-8' }))
   const a = document.createElement('a')
   a.href = href
   a.download = `${filename.replace(/[\\/:*?"<>|]/g, '_') || 'dms-export'}.csv`
   a.click()
-  setTimeout(() => URL.revokeObjectURL(href), 0)
+  setTimeout(() => URL.revokeObjectURL(href), 1000) // 0ms 回收与下载起动有竞态（大文件/Firefox 会下到空 blob），宽限 1s
 }
 function exportSection(sec: DeepSection) {
   downloadCsv(sec.columns, sec.rows, sec.title || 'BI数据')
@@ -2129,6 +2202,16 @@ function setMode(deep: boolean) {
   deepMode.value = deep
   localStorage.setItem('dms-mode', deep ? 'deep' : 'lite')
 }
+
+const askInput = ref<HTMLTextAreaElement | null>(null)
+// 输入框随内容自动增高（rows=1 起步，上限 160px 见 CSS）；发送清空后收回一行
+function growAskInput() {
+  const el = askInput.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+}
+watch(question, () => void nextTick(growAskInput))
 
 function onKey(e: KeyboardEvent) {
   if (e.isComposing || e.keyCode === 229) return
@@ -2175,7 +2258,7 @@ async function toggleAnalysis(t: Turn) {
         row_count: r.row_count,             // ← 总行数，不是 rows.length
         caliber_note: r.caliber_note ?? null,
         // 深度模式：Precise 档四段式（结论/关键发现/口径与可信度/建议）；精简 = fast 2-4 句
-        deep: t.mode === 'deep' || null,
+        deep: t.mode === 'deep' ? true : null,
         login_name: sessionToken.value ? null : loginName.value,
         role_code: roleCode.value || null,
       }),
@@ -2201,11 +2284,11 @@ async function toggleAnalysis(t: Turn) {
 async function saveReport(t: Turn) {
   const a = t.analysis, r = t.result
   if (!a || !r || a.saving) return
-  if (!t.convId) { a.error = '该历史消息缺少会话归属，无法生成报表'; return }
+  if (t.convId == null) { a.error = '该历史消息缺少会话归属，无法生成报表'; return }
   a.saving = true
   a.error = undefined
   try {
-    const resp = await fetch('/api/analysis/report', {
+    const resp = await fetch(ANALYSIS_REPORT_URL, {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify({
@@ -2254,7 +2337,7 @@ function exportSupplementalCsv(t: Turn) {
     <aside class="side" :class="{ open: sideOpen }">
       <div class="side-hd">
         <span class="logo">🐯 皇家小虎</span>
-        <button class="btn-icon" @click="toggleTheme" :title="'明暗切换'">{{ theme === 'dark' ? '☀️' : '🌙' }}</button>
+        <button class="btn-icon" @click="toggleTheme" title="明暗切换">{{ theme === 'dark' ? '☀️' : '🌙' }}</button>
       </div>
       <div class="sec">
         <div class="sec-t">会话 <button class="btn-sm" @click="newSession">+ 新建</button></div>
@@ -2263,7 +2346,7 @@ function exportSupplementalCsv(t: Turn) {
         <div class="sec-t">知识库 <button v-if="kbManager" class="btn-sm" @click="openKnowledge">📁 上传/管理</button></div>
       </div>
       <!-- 今日经营日报：服务端 feed=daily 只返回当天生成的一份。 -->
-      <div class="sec" v-if="hasAdminAccess() && digests.length">
+      <div class="sec" v-if="hasAdminAccess && digests.length">
         <div class="sec-t">经营日报</div>
         <button v-for="a in digests" :key="a.id" type="button" class="hist-item" @click="openPreview(a.preview_url, a.title); sideOpen = false">
           <span class="hi-title">📊 {{ a.title }}</span>
@@ -2272,7 +2355,7 @@ function exportSupplementalCsv(t: Turn) {
       <div class="sec weekly-sec">
         <div class="sec-t">
           <span>经营周报</span>
-          <button class="weekly-create" :disabled="weeklyBusy || sending" :title="sending ? '当前会话分析完成后可生成周报' : '生成单省区经营周报'" @click="openWeeklyReport">
+          <button class="weekly-create" :disabled="weeklyBusy || sending || curQueue.length > 0" :title="sending || curQueue.length > 0 ? '当前会话分析完成后可生成周报' : '生成单省区经营周报'" @click="openWeeklyReport">
             <span v-if="weeklyBusy" class="spin"></span>
             {{ weeklyBusy ? '生成中' : '生成周报' }}
           </button>
@@ -2286,12 +2369,12 @@ function exportSupplementalCsv(t: Turn) {
           <span v-if="convRunning(c.id)" class="hi-run" title="该会话仍在分析"><span class="spin"></span></span>
           <span class="hi-title">{{ c.title }}</span>
           <span class="hi-time">{{ c.time }}</span>
-          <button class="hi-trace" title="Trace 时间线：回放该会话的问答过程" @click="openTrace(c.id, $event)">🕓</button>
-          <button class="hi-del" title="删除会话" @click="delConv(c.id, $event)">×</button>
+          <button class="hi-trace" title="Trace 时间线：回放该会话的问答过程" aria-label="Trace 时间线" @click="openTrace(c.id, $event)">🕓</button>
+          <button class="hi-del" title="删除会话" aria-label="删除会话" @click="delConv(c.id, $event)">×</button>
         </div>
       </div>
       <div class="sec side-ft">
-        <div class="health"><span class="dot" :class="{ ok: healthOk, busy: healthBusy }"></span>{{ health }}</div>
+        <div class="health" role="button" tabindex="0" title="点击重新检查后端状态" @click="checkHealth" @keydown.enter="checkHealth"><span class="dot" :class="{ ok: healthOk, busy: healthBusy }"></span>{{ health }}</div>
         <div class="readonly">🔒 纯查询模式（无写操作）</div>
       </div>
     </aside>
@@ -2311,13 +2394,13 @@ function exportSupplementalCsv(t: Turn) {
 
     <!-- 【提示词包】Skills 管理弹窗（列表/启停/编辑/删除；写入口按 admin 显隐） -->
     <SkillsPanel
-      v-if="skillsOpen" :token="sessionToken" :login="loginName" :admin="hasAdminAccess()"
+      v-if="skillsOpen" :token="sessionToken" :login="loginName" :admin="hasAdminAccess"
       @close="skillsOpen = false" @auth-expired="handleSessionExpired"
     />
 
     <!-- 【数据地图】表关系图谱弹窗（力导向图 + 路径高亮；接受/拒绝按钮只对 admin 渲染） -->
     <DataMapPanel
-      v-if="datamapOpen" :token="sessionToken" :login="loginName" :admin="hasAdminAccess()"
+      v-if="datamapOpen" :token="sessionToken" :login="loginName" :admin="hasAdminAccess"
       @close="datamapOpen = false" @auth-expired="handleSessionExpired"
     />
 
@@ -2332,7 +2415,7 @@ function exportSupplementalCsv(t: Turn) {
       <div class="trace-drawer" role="dialog" aria-modal="true" aria-label="Trace 时间线">
         <header class="trace-hd">
           <span class="trace-title">🕓 Trace 时间线 · 会话 #{{ traceConvId }}</span>
-          <button type="button" class="trace-close" title="关闭" @click="closeTrace">✕</button>
+          <button type="button" class="trace-close" title="关闭" aria-label="关闭" @click="closeTrace">✕</button>
         </header>
         <div v-if="traceLoading" class="trace-state"><span class="spin"></span>加载中…</div>
         <div v-else-if="traceError" class="trace-state trace-err">{{ traceError }}</div>
@@ -2343,7 +2426,7 @@ function exportSupplementalCsv(t: Turn) {
     <!-- 主区 -->
     <div class="main">
       <div class="topbar">
-        <button type="button" class="btn-icon mobile-menu" title="会话列表与导航" @click="sideOpen = true">☰</button>
+        <button type="button" class="btn-icon mobile-menu" title="会话列表与导航" aria-label="会话列表与导航" @click="sideOpen = true">☰</button>
         <div class="brand">数据智能<span class="sub">DMS · 自然语言取数</span></div>
         <div class="sp"></div>
         <span v-if="sessionToken" class="dms-user">已登录 <b>{{ loginName || '认证中…' }}</b><template v-if="roleCode"> · {{ roleCode }}</template></span>
@@ -2352,13 +2435,13 @@ function exportSupplementalCsv(t: Turn) {
         <button v-if="sessionToken" class="btn-sm" title="提示词包：注入深度报告规划提示词，admin 可写" @click="skillsOpen = true">🧩 提示词包</button>
         <button v-if="sessionToken" class="btn-sm" title="表关系图谱：节点=表、边=关系，admin 可接受/拒绝推断边" @click="datamapOpen = true">🗺 数据地图</button>
         <button v-if="sessionToken" class="btn-sm" title="SQL 执行审计：状态过滤，点行展开完整 SQL（只读）" @click="auditOpen = true">🧾 SQL 审计</button>
-        <button v-if="hasAdminAccess()" class="btn-sm" title="模型与系统设置" @click="goSettings">⚙ 设置</button>
+        <button v-if="hasAdminAccess" class="btn-sm" title="模型与系统设置" @click="goSettings">⚙ 设置</button>
         <button class="btn-sm" @click="newSession">+ 新会话</button>
         <button v-if="sessionToken && !embedded" class="btn-sm" @click="logout">退出</button>
       </div>
 
       <!-- 设置页（`/#/settings`）：业务库/模型供应商的切换、编辑与连通性测试，保存即生效 -->
-      <div v-if="view === 'settings' && hasAdminAccess()" class="chat set-wrap">
+      <div v-if="view === 'settings' && hasAdminAccess" class="chat set-wrap">
         <div class="set-head">
           <div class="set-title">系统设置</div>
           <button type="button" class="set-back" @click="goChat">← 返回对话</button>
@@ -2393,7 +2476,7 @@ function exportSupplementalCsv(t: Turn) {
             <div v-if="dbEditor !== 'closed'" class="set-editor">
               <div class="set-form-title">
                 <span>{{ dbEditor === 'edit' ? `修改数据库 · ${dbEditingName}` : '新增数据库' }}</span>
-                <span class="set-tip">密码留空时保留原密码，凭据不会回显</span>
+                <span v-if="dbEditor === 'edit'" class="set-tip">密码留空时保留原密码，凭据不会回显</span>
               </div>
               <div class="f-grid">
                 <label class="f-item"><span>目标名</span><input v-model="dbForm.name" :disabled="dbEditor === 'edit'" placeholder="如 zhongtai" /></label>
@@ -2416,11 +2499,11 @@ function exportSupplementalCsv(t: Turn) {
               </div>
               <div class="f-actions">
                 <button class="btn" :disabled="dbTesting" @click="testDbConn">{{ dbTesting ? '测试中…' : '测试连通性' }}</button>
-                <button class="btn primary" @click="addTarget">保存</button>
+                <button class="btn primary" :disabled="dbSaving" @click="addTarget">{{ dbSaving ? '保存中…' : '保存' }}</button>
                 <button class="btn" @click="cancelDbEdit">取消</button>
               </div>
               <div v-if="dbTest" class="f-test" :class="dbTest.ok ? 'ok' : 'bad'">
-                {{ dbTest.ok ? `连通正常（${dbTest.ms}ms · MySQL ${dbTest.version} · 只读已确认）` : dbTest.error }}
+                {{ dbTest.ok ? `连通正常（${dbTest.ms}ms · ${dbForm.type === 'warehouse' ? 'Doris' : 'MySQL'} ${dbTest.version} · 只读已确认）` : dbTest.error }}
               </div>
             </div>
           </template>
@@ -2460,7 +2543,7 @@ function exportSupplementalCsv(t: Turn) {
                 <div class="tgt-ops">
                   <button class="btn-mini" @click="editLlmProvider({ name: p.name, base_url: p.base_url, model_fast: p.model_fast, model_precise: p.model_precise, thinking: p.thinking, vision: p.vision_model })">修改</button>
                   <button v-if="p.custom" class="btn-mini danger" :disabled="!llmProviderRemovable(p)" :title="llmCfg.provider?.toLowerCase() === p.name.toLowerCase() || fallbackVisionProvider.toLowerCase() === p.name.toLowerCase() ? '删除请求将由服务端校验模型占用状态' : '删除模型供应商'" @click="removeLlmProvider(p.name)">删除</button>
-                  <button v-if="llmCfg.provider?.toLowerCase() !== p.name.toLowerCase()" class="btn-mini primary" :disabled="llmSaving || !p.key_ready" @click="saveProvider(p.name)">{{ llmSwitching.toLowerCase() === p.name.toLowerCase() ? '切换中…' : '切换' }}</button>
+                  <button v-if="llmCfg.provider?.toLowerCase() !== p.name.toLowerCase()" class="btn-mini primary" :disabled="llmSaving || !p.key_ready" :title="p.key_ready ? '切换为该供应商' : 'key 未配置，请先配置'" @click="saveProvider(p.name)">{{ llmSwitching.toLowerCase() === p.name.toLowerCase() ? '切换中…' : '切换' }}</button>
                   <span v-else class="tgt-on">生效中</span>
                 </div>
               </div>
@@ -2468,7 +2551,7 @@ function exportSupplementalCsv(t: Turn) {
             <div v-if="llmEditor !== 'closed'" class="set-editor">
               <div class="set-form-title">
                 <span>{{ llmEditor === 'edit' ? `修改供应商 · ${llmEditingName}` : '新增模型供应商' }}</span>
-                <span class="set-tip">可从预设自动填充，Key 留空时保留已存值</span>
+                <span class="set-tip">可从预设自动填充<template v-if="llmEditor === 'edit'">，Key 留空时保留已存值</template></span>
               </div>
               <div class="f-grid">
                 <label class="f-item f-w2"><span>供应商预设</span>
@@ -2492,7 +2575,7 @@ function exportSupplementalCsv(t: Turn) {
               </div>
               <div class="set-keys" v-if="settingsCat?.llm_keys?.length">
                 <span class="set-tip">已配置 Key</span>
-                <span v-for="k in settingsCat.llm_keys" :key="k.name" class="key-chip">{{ k.name }} ✓<button class="key-del" :disabled="k.protected || llmCfg.provider?.toLowerCase() === k.name.toLowerCase() || fallbackVisionProvider.toLowerCase() === k.name.toLowerCase()" :title="k.protected ? '基础 llm_api_key 仍在兜底，不能单独删除' : '删除该 Key'" @click="removeLlmKey(k.name)">×</button></span>
+                <span v-for="k in settingsCat.llm_keys" :key="k.name" class="key-chip">{{ k.name }} ✓<button class="key-del" :disabled="k.protected || llmCfg.provider?.toLowerCase() === k.name.toLowerCase() || fallbackVisionProvider.toLowerCase() === k.name.toLowerCase()" :title="llmKeyDelTitle(k)" @click="removeLlmKey(k.name)">×</button></span>
               </div>
             </div>
           </template>
@@ -2516,15 +2599,15 @@ function exportSupplementalCsv(t: Turn) {
             <div class="q-grid">
               <div>
                 <div class="set-form-title">路由质量</div>
-                <table class="q-table"><tr><th>路由</th><th>次数</th><th>P95</th><th>失败</th></tr>
+                <table class="q-table"><thead><tr><th>路由</th><th>次数</th><th>P95</th><th>失败</th></tr></thead>
                   <tr v-for="r in quality.routes" :key="r.route"><td>{{ routeLabel[r.route] || r.route }}</td><td>{{ r.count }}</td><td>{{ fmtLatency(r.p95_ms) }}</td><td>{{ r.errors }}</td></tr>
                 </table>
               </div>
               <div>
                 <div class="set-form-title">最近反馈</div>
-                <div v-if="!quality.feedback.length" class="set-note">暂无反馈</div>
+                <div v-if="!quality.feedback.length" class="set-note">暂无反馈。</div>
                 <div v-for="f in quality.feedback" :key="f.id" class="q-feedback">
-                  <div><b>{{ f.kind }}</b><span>{{ f.login_name }} · {{ f.route }}</span><button class="btn-mini" @click="resolveFeedback(f.id, f.status === 'open' ? 'resolved' : 'open')">{{ f.status === 'open' ? '处理' : '重开' }}</button></div>
+                  <div><b>{{ f.kind }}</b><span>{{ f.login_name }} · {{ f.route }}</span><button class="btn-mini" :disabled="feedbackBusy !== null" @click="resolveFeedback(f.id, f.status === 'open' ? 'resolved' : 'open')">{{ f.status === 'open' ? '处理' : '重开' }}</button></div>
                   <p>{{ f.question }}</p><small v-if="f.detail">{{ f.detail }}</small>
                 </div>
               </div>
@@ -2589,7 +2672,7 @@ function exportSupplementalCsv(t: Turn) {
                 <div class="think-state">
                   <span class="spin"></span>
                   <div>
-                    <span><b>正在分析</b><strong>{{ t.elapsed ?? 0 }}s</strong></span>
+                    <span><b>分析中…</b><strong>{{ t.elapsed ?? 0 }}s</strong></span>
                     <small>{{ t.progress?.length ? t.progress[t.progress.length - 1] : '理解问题与业务口径' }}</small>
                   </div>
                 </div>
@@ -2610,7 +2693,7 @@ function exportSupplementalCsv(t: Turn) {
                    按钮而不是下拉框：少一次点击，也不存在「空下拉框」这种更糟的形态。 -->
               <div v-if="t.roles?.length" class="role-pick">
                 <span>选择角色后重试（不同角色的数据权限档不同）：</span>
-                <button v-for="r in t.roles" :key="r" class="btn-sm" @click="pickRole(r, t.retryQuestion || turns[ti - 1]?.question, t.retryOptions, t.convId)">{{ r }}</button>
+                <button v-for="r in t.roles" :key="r" class="btn-sm" :disabled="rolePicking" @click="pickRole(r, t.retryQuestion || turns[ti - 1]?.question, t.retryOptions, t.convId)">{{ r }}</button>
               </div>
               <!-- 【D4】断点续跑：服务端账本判定可续跑才显示（已完成板块零重跑） -->
               <button v-if="t.resumable && t.rid" type="button" class="retry" :class="{ disabled: t.resuming }" @click="resumeDeep(t)">↻ 续跑（从断点继续，不重跑已完成板块）</button>
@@ -2619,10 +2702,10 @@ function exportSupplementalCsv(t: Turn) {
             <!-- 【D6】promote 回放：别的会话钉进来的产物引用（点击走深链拦截开预览面板） -->
             <div v-else-if="t.promoted" class="bubble ai">
               <div class="res-meta"><span>📌 引用的产物<template v-if="t.promoted.version"> · v{{ t.promoted.version }}</template></span></div>
-              <a class="art-card" :href="t.promoted.url">
-                📄 <b>{{ t.promoted.title }}</b><span class="art-hint">已钉到本会话 · 点击预览/分享</span>
-                <button type="button" class="art-share" title="发分享链接" @click.prevent.stop="shareArtifact(artifactIdOf(t.promoted.url))">🔗</button>
-              </a>
+              <div class="art-card">
+                <a class="art-link" :href="t.promoted.url">📄 <b>{{ t.promoted.title }}</b><span class="art-hint">已钉到本会话 · 点击预览/分享</span></a>
+                <button type="button" class="art-share" title="发分享链接" @click.stop="shareArtifact(artifactIdOf(t.promoted.url))">🔗</button>
+              </div>
               <p v-if="t.promoted.note" class="promote-note">{{ t.promoted.note }}</p>
             </div>
             <div v-else-if="t.result" class="bubble ai" :class="{ 'knowledge-bubble': t.result.kind === 'text', 'result-bubble': t.result.kind !== 'text' && t.mode !== 'deep' }">
@@ -2636,12 +2719,12 @@ function exportSupplementalCsv(t: Turn) {
                    具体数字与续读参数由后端 `truncation_note` 说全（ResultPanel 渲染它）。 -->
               <span>{{ t.result.row_count }} 行{{ t.result.truncated ? ' · 已截断' : '' }}</span>
                   <!-- 深度模式不出 AI 解读钮：分析默认做（在产物页里），按钮是重复入口 -->
-                  <button v-if="t.mode !== 'deep' && t.result.row_count > 0" type="button" class="sql-toggle" style="margin-left: auto" @click="toggleAnalysis(t)">
+                  <button v-if="t.mode !== 'deep' && t.result.row_count > 0" type="button" class="sql-toggle" @click="toggleAnalysis(t)">
                     {{ t.analysis?.open ? '收起解读' : '🤖 AI 解读' }}
                   </button>
-                  <button v-if="t.result.row_count > 0" type="button" class="sql-toggle" :style="t.page ? 'margin-left: auto' : ''" @click="exportCsv(t)">⬇ 导出 CSV</button>
+                  <button v-if="t.result.row_count > 0" type="button" class="sql-toggle" @click="exportCsv(t)">⬇ 导出 CSV</button>
                   <button v-if="t.result.supplemental" type="button" class="sql-toggle" @click="exportSupplementalCsv(t)">⬇ 导出明细 CSV</button>
-                  <button v-if="turnSqls(t).length" type="button" class="sql-toggle" :style="t.result.row_count > 0 ? '' : 'margin-left: auto'" @click="t.showSql = !t.showSql">{{ t.showSql ? '隐藏' : '查看' }} SQL</button>
+                  <button v-if="turnSqls(t).length" type="button" class="sql-toggle" @click="t.showSql = !t.showSql">{{ t.showSql ? '隐藏' : '查看' }} SQL</button>
                 </template>
                 <!-- 【引用上轮】该轮问题+结论摘要进输入框上方的引用 chip 区，随下一条提问发出 -->
                 <button type="button" class="sql-toggle" title="引用该轮问答作为下一条提问的上下文" @click="quoteTurn(t)">↩ 引用</button>
@@ -2656,10 +2739,12 @@ function exportSupplementalCsv(t: Turn) {
               </div>
               <!-- 【深度模式】产物卡（compose 端点给的富页：总值+拆解+趋势+明细+图+AI 分析）。
                    点击走深链拦截 → 右侧沙箱面板；与 S2 的 .art-card 同形 -->
-              <a v-if="t.artifact" class="art-card" :href="t.artifact.url">
+              <div v-if="t.artifact" class="art-card">
+                <a class="art-link" :href="t.artifact.url">
                 📄 <b>{{ t.artifact.title }}</b><span class="art-hint">深度分析页已生成 · 点击预览/分享</span>
-                <button type="button" class="art-share" title="发分享链接" @click.prevent.stop="shareArtifact(artifactIdOf(t.artifact.url))">🔗</button>
-              </a>
+                </a>
+                <button type="button" class="art-share" title="发分享链接" @click.stop="shareArtifact(artifactIdOf(t.artifact.url))">🔗</button>
+              </div>
                <!-- 【深度页聊天内嵌】问题理解 → KPI → 板块（图+表）→ 明细 → AI 分析收尾。
                     数据全在 page 载荷里，与分享页同源（同一次取数、同一份内容） -->
                <template v-if="t.page">
@@ -2669,7 +2754,7 @@ function exportSupplementalCsv(t: Turn) {
                      <b>{{ t.page.label || t.question || '经营数据分析' }}</b>
                    </div>
                    <div class="deep-page-meta">
-                     <span>{{ t.page.sections.length }} 个分析板块</span>
+                     <span>{{ t.page.sections?.length ?? 0 }} 个分析板块</span>
                      <span v-if="t.page.facts?.length">{{ t.page.facts.length }} 项关键数据</span>
                    </div>
                  </div>
@@ -2732,7 +2817,7 @@ function exportSupplementalCsv(t: Turn) {
                     </table>
                   </div>
                 </div>
-                <div v-for="(sec, si) in t.page.sections" :key="si" class="dsec" :class="{ 'table-sec': sec.kind === 'table' }">
+                <div v-for="(sec, si) in t.page.sections ?? []" :key="si" class="dsec" :class="{ 'table-sec': sec.kind === 'table' }">
                   <div class="dsec-head">
                     <div class="dsec-copy">
                       <div class="dsec-t">{{ sec.title }}</div>
@@ -2744,15 +2829,15 @@ function exportSupplementalCsv(t: Turn) {
                         <button :class="{ on: secView(sec) === 'chart' }" @click="sec.view = 'chart'">图表</button>
                         <button :class="{ on: secView(sec) === 'table' }" @click="sec.view = 'table'">数据</button>
                       </div>
-                      <button class="dsec-icon" @click="exportSection(sec)" title="导出当前板块 CSV">↓</button>
-                      <button class="dsec-icon" @click="biFocus = sec" title="放大查看">⛶</button>
+                      <button class="dsec-icon" @click="exportSection(sec)" title="导出当前板块 CSV" aria-label="导出当前板块 CSV">↓</button>
+                      <button class="dsec-icon" @click="biFocus = sec" title="放大查看" aria-label="放大查看">⛶</button>
                     </div>
                   </div>
                   <BiChart v-if="sec.rows.length && secView(sec) === 'chart'" :kind="secChartKind(sec)" :columns="secCols(sec)" :rows="sec.rows" :x="0" :y="secY(sec)" :series="secSeries(sec)" />
                   <div v-else-if="secView(sec) === 'table'" class="dtable-wrap">
                     <table class="dtable">
-                      <thead><tr><th v-for="c in sec.columns" :key="c" :class="{ num: secSemantic(c) !== 'none' }">{{ c }}</th></tr></thead>
-                      <tbody><tr v-for="(r, ri) in sec.rows.slice(0, DEEP_TABLE_PREVIEW_ROWS)" :key="ri"><td v-for="(_, ci) in r" :key="ci" :class="{ num: secCellSemantic(sec, r, ci) !== 'none' }">{{ secCell(sec, r, ci) }}</td></tr></tbody>
+                      <thead><tr><th v-for="c in sec.columns" :key="c" :class="{ num: semanticForLabel(c) !== 'none' }">{{ c }}</th></tr></thead>
+                      <tbody><tr v-for="(r, ri) in sec.rows.slice(0, DEEP_TABLE_PREVIEW_ROWS)" :key="ri"><td v-for="(_, ci) in sec.columns" :key="ci" :class="{ num: secCellSemantic(sec, r, ci) !== 'none' }">{{ secCell(sec, r, ci) }}</td></tr></tbody>
                     </table>
                   </div>
                   <div v-if="secView(sec) === 'table' && sec.rows.length > DEEP_TABLE_PREVIEW_ROWS" class="dmore">当前显示 {{ DEEP_TABLE_PREVIEW_ROWS }} 行，共 {{ sec.rows.length }} 行 · 可导出完整 CSV</div>
@@ -2761,8 +2846,8 @@ function exportSupplementalCsv(t: Turn) {
                   <div class="dsec-t">最近订单明细</div>
                   <div class="dtable-wrap">
                     <table class="dtable">
-                      <tr><th v-for="c in t.page.recent.columns" :key="c">{{ c }}</th></tr>
-                      <tr v-for="(r, ri) in t.page.recent.rows.slice(0, 6)" :key="ri"><td v-for="(v, ci) in r" :key="ci">{{ formatCell(t.page.recent.columns, v, ci) }}</td></tr>
+                      <thead><tr><th v-for="c in t.page.recent.columns" :key="c">{{ c }}</th></tr></thead>
+                      <tr v-for="(r, ri) in t.page.recent.rows.slice(0, 6)" :key="ri"><td v-for="(_, ci) in t.page.recent.columns" :key="ci">{{ formatCell(t.page.recent.columns, r[ci], ci) }}</td></tr>
                     </table>
                   </div>
                 </div>
@@ -2775,7 +2860,7 @@ function exportSupplementalCsv(t: Turn) {
                    条件带 `subs?.length` 是为了不让单结果显示两遍。 -->
               <template v-if="t.result.subs?.length">
                 <div v-if="t.result.caliber_note" class="caliber-warn">{{ t.result.caliber_note }}</div>
-                <div v-if="t.result.truncation_note" class="trunc-note">数据量较大，当前仅展示已返回的数据；可缩小查询范围获取更完整结果。</div>
+                <div v-if="t.result.truncation_note" class="trunc-note">{{ t.result.truncation_note }}</div>
               </template>
 
               <!-- 复合问题拆解（deepagents）：多子面板 -->
@@ -2816,12 +2901,13 @@ function exportSupplementalCsv(t: Turn) {
               <!-- 普通模式的按需 AI 必须位于全部 KPI、图表、表格、明细和复合子结果之后。 -->
               <div v-if="t.analysis?.open" class="ai-panel analysis-last">
                 <div class="ai-hd"><span class="ai-mark">AI</span> 分析结论<span class="ai-hint">基于上方数据，聚焦变化、异常与行动</span>
-                  <a v-if="t.analysis.caliber && !t.analysis.artifact" class="sql-toggle" style="margin-left: auto"
-                     @click="saveReport(t)">{{ t.analysis.saving ? '生成中…' : '生成报表' }}</a>
+                  <button v-if="t.analysis.caliber && !t.analysis.artifact" type="button" class="sql-toggle"
+                     @click="saveReport(t)">{{ t.analysis.saving ? '生成中…' : '生成报表' }}</button>
                 </div>
-                <a v-if="t.analysis.artifact" class="art-card" :href="t.analysis.artifact.url">
-                  <b>{{ t.analysis.artifact.title }}</b><span class="art-hint">报表已生成 · 点击预览</span>
-                </a>
+                <div v-if="t.analysis.artifact" class="art-card">
+                  <a class="art-link" :href="t.analysis.artifact.url"><b>{{ t.analysis.artifact.title }}</b><span class="art-hint">报表已生成 · 点击预览/分享</span></a>
+                  <button type="button" class="art-share" title="发分享链接" @click.stop="shareArtifact(artifactIdOf(t.analysis.artifact.url))">🔗</button>
+                </div>
                 <div v-if="t.analysis.loading" class="ai-loading"><span class="spin"></span>解读中…</div>
                 <div v-else-if="t.analysis.error" class="ai-err">{{ t.analysis.error }}</div>
                 <KbAnswer v-else-if="t.analysis.insight" :result="{ markdown: userFacingMarkdown(t.analysis.insight) }" />
@@ -2847,7 +2933,7 @@ function exportSupplementalCsv(t: Turn) {
           {{ knowledgeSpaceName }}
         </span>
         <span class="cap-sp"></span>
-        <button type="button" class="pill mobile-weekly" :disabled="weeklyBusy || sending" @click="openWeeklyReport">经营周报</button>
+        <button type="button" class="pill mobile-weekly" :disabled="weeklyBusy || sending || curQueue.length > 0" @click="openWeeklyReport">经营周报</button>
         <button v-for="q in quick" :key="q" type="button" class="pill" @click="send(q)">{{ q }}</button>
       </div>
 
@@ -2865,10 +2951,10 @@ function exportSupplementalCsv(t: Turn) {
       <div class="inputbar">
         <!-- 【深度模式】精简|深度：深度 = AI 深度参与并生成可点击预览的报表卡 -->
         <div class="mode-seg" :class="{ disabled: intent === 'knowledge' }" :title="intent === 'knowledge' ? '知识库模式固定使用引用式回答' : '深度模式：AI 深度参与生成与分析，自动出深度解读与报表（更慢更丰满）'">
-          <button type="button" :class="{ on: !deepMode }" @click="intent !== 'knowledge' && setMode(false)">精简</button>
-          <button type="button" :class="{ on: deepMode }" @click="intent !== 'knowledge' && setMode(true)">深度</button>
+          <button type="button" :class="{ on: !deepMode }" :disabled="intent === 'knowledge'" @click="intent !== 'knowledge' && setMode(false)">精简</button>
+          <button type="button" :class="{ on: deepMode }" :disabled="intent === 'knowledge'" @click="intent !== 'knowledge' && setMode(true)">深度</button>
         </div>
-        <textarea v-model="question" :placeholder="sending ? '当前提问仍在分析，Enter 发送将排队等待…' : '用自然语言提问，Enter 发送，Shift+Enter 换行…'" @keydown="onKey" rows="1"></textarea>
+        <textarea ref="askInput" v-model="question" :placeholder="sending ? '当前提问仍在分析，Enter 发送将排队等待…' : '用自然语言提问，Enter 发送，Shift+Enter 换行…'" @keydown="onKey" @input="growAskInput" rows="1"></textarea>
         <button class="send" :disabled="!question.trim()" @click="send()">{{ sending ? '排队' : '发送' }}</button>
       </div>
 
@@ -2895,7 +2981,7 @@ function exportSupplementalCsv(t: Turn) {
     <DeepTaskPanel v-if="view === 'chat' && deepTaskTurn" :key="deepTaskTurn.turnKey || 'deep-task'" :turn="deepTaskTurn" />
 
     <!-- 轻 toast（操作反馈浮层） -->
-    <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
+    <div v-if="toastMsg" class="toast" role="status" aria-live="polite">{{ toastMsg }}</div>
 
     <div v-if="weeklyOpen" class="weekly-mask" @click.self="closeWeeklyReport" @keydown.esc="closeWeeklyReport">
       <form class="weekly-dialog" role="dialog" aria-modal="true" aria-labelledby="weekly-title" @submit.prevent="generateWeeklyReport">
@@ -2929,7 +3015,7 @@ function exportSupplementalCsv(t: Turn) {
       </form>
     </div>
 
-    <div v-if="loginVisible" class="login-mask">
+    <div v-if="loginVisible" class="login-mask" role="dialog" aria-modal="true" aria-label="登录">
       <form class="login-box" @submit.prevent="passwordLogin">
         <div class="login-brand">皇家小虎</div>
         <h1>DMS 数据智能</h1>
@@ -2942,7 +3028,7 @@ function exportSupplementalCsv(t: Turn) {
         </template>
         <template v-else>
           <div class="login-role-title">选择本次使用的 DMS 角色</div>
-          <button v-for="r in loginRoles" :key="r" type="button" class="login-role" @click="pickRole(r)">{{ r }}<span>›</span></button>
+          <button v-for="r in loginRoles" :key="r" type="button" class="login-role" :disabled="rolePicking" @click="pickRole(r)">{{ r }}<span>›</span></button>
         </template>
       </form>
     </div>
@@ -2968,7 +3054,7 @@ function exportSupplementalCsv(t: Turn) {
         <div v-if="!pvVersions" class="pv-pop-item">加载中…</div>
         <template v-else>
           <button v-for="v in pvVersions" :key="v.version" type="button" class="pv-pop-item" :class="{ on: previewVer ? v.version === previewVer : v.latest }"
-             @click="openVersion(v.version)">v{{ v.version }}<small>{{ (v.created_at || '').slice(5, 16) }}<template v-if="v.latest"> · 最新</template></small></button>
+             @click="openVersion(v.version)">v{{ v.version }}<small>{{ (v.created_at || '').slice(5, 16).replace('T', ' ') }}<template v-if="v.latest"> · 最新</template></small></button>
         </template>
       </div>
       <!-- 【D6】引用到会话浮层：侧栏只列自己的会话，服务端 promote 再核一次属主（fail-closed） -->
@@ -2978,7 +3064,7 @@ function exportSupplementalCsv(t: Turn) {
       </div>
       <div v-if="preview.loading" class="pv-state"><span class="spin"></span>正在加载预览…</div>
       <div v-else-if="preview.error" class="pv-state pv-error">{{ preview.error }}</div>
-      <iframe v-else-if="preview.html" class="pv-frame" :srcdoc="preview.html" sandbox="allow-scripts"></iframe>
+      <iframe v-else-if="preview.html" class="pv-frame" :srcdoc="preview.html" :title="preview.title" sandbox="allow-scripts"></iframe>
     </div>
 
     <!-- 单个 BI 板块的沉浸查看：图表/数据仍共用同一份结果，不重复查询。 -->
@@ -2992,16 +3078,16 @@ function exportSupplementalCsv(t: Turn) {
               <button :class="{ on: secView(biFocus) === 'chart' }" @click="biFocus.view = 'chart'">图表</button>
               <button :class="{ on: secView(biFocus) === 'table' }" @click="biFocus.view = 'table'">数据</button>
             </div>
-            <button class="dsec-icon" @click="exportSection(biFocus)" title="导出 CSV">↓</button>
-            <button class="dsec-icon" @click="biFocus = null" title="关闭">✕</button>
+            <button class="dsec-icon" @click="exportSection(biFocus)" title="导出 CSV" aria-label="导出 CSV">↓</button>
+            <button class="dsec-icon" @click="biFocus = null" title="关闭" aria-label="关闭">✕</button>
           </div>
         </header>
         <div class="bi-focus-body">
           <BiChart v-if="biFocus.rows.length && secView(biFocus) === 'chart'" :kind="secChartKind(biFocus)" :columns="secCols(biFocus)" :rows="biFocus.rows" :x="0" :y="secY(biFocus)" :series="secSeries(biFocus)" :height="520" />
           <div v-else class="dtable-wrap bi-focus-table">
             <table class="dtable">
-              <thead><tr><th v-for="c in biFocus.columns" :key="c" :class="{ num: secSemantic(c) !== 'none' }">{{ c }}</th></tr></thead>
-              <tbody><tr v-for="(r, ri) in biFocus.rows" :key="ri"><td v-for="(_, ci) in r" :key="ci" :class="{ num: secCellSemantic(biFocus, r, ci) !== 'none' }">{{ secCell(biFocus, r, ci) }}</td></tr></tbody>
+              <thead><tr><th v-for="c in biFocus.columns" :key="c" :class="{ num: semanticForLabel(c) !== 'none' }">{{ c }}</th></tr></thead>
+              <tbody><tr v-for="(r, ri) in biFocus.rows" :key="ri"><td v-for="(_, ci) in biFocus.columns" :key="ci" :class="{ num: secCellSemantic(biFocus, r, ci) !== 'none' }">{{ secCell(biFocus, r, ci) }}</td></tr></tbody>
             </table>
           </div>
         </div>
@@ -3148,7 +3234,7 @@ function exportSupplementalCsv(t: Turn) {
 /* 触屏无 hover：行内删除/Trace 按钮常显，否则永远无法点 */
 @media (hover: none) { .hist-item .hi-trace, .hist-item .hi-del { opacity: 1; } }
 .side-ft { margin-top: auto; }
-.health { font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 6px; }
+.health { font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .health .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
 .health .dot.ok { background: var(--success); }
 .health .dot.busy { background: var(--warning-text); }
@@ -3160,8 +3246,6 @@ function exportSupplementalCsv(t: Turn) {
 .topbar .brand .sub { font-size: 12px; color: var(--text-muted); font-weight: 400; }
 .topbar .sp { flex: 1; }
 .dms-user { font-size: 12px; color: var(--text-muted); }
-.mini-inp { height: 30px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-body); color: var(--text-regular); font-size: 13px; }
-.mini-inp:focus { outline: none; border-color: var(--primary); box-shadow: var(--ring); }
 /* 对话流 */
 .chat { flex: 1; overflow-y: auto; padding: 20px 24px; min-height: 0; }
 .turn { margin-bottom: 16px; display: flex; flex-direction: column; }
@@ -3193,7 +3277,10 @@ function exportSupplementalCsv(t: Turn) {
 .res-meta .steps { font-size: 12px; }
 .res-meta .steps summary { display: inline; cursor: pointer; color: var(--primary); }
 .res-meta .steps .step { margin-right: 10px; white-space: nowrap; }
-.res-meta .sql-toggle { margin-left: auto; padding: 0; border: 0; background: none; font: inherit; color: var(--primary); cursor: pointer; }
+.res-meta .sql-toggle { padding: 0; border: 0; background: none; font: inherit; color: var(--primary); cursor: pointer; }
+/* 操作按钮组整体靠右：只有紧跟行数文本的第一个按钮吃 auto 间距，其余按 gap 自然排 ——
+   原来是四个互相咬合的内联 style 三元表达式，深度无 page 的边角下按钮就不再靠右 */
+.res-meta > span + .sql-toggle { margin-left: auto; }
 /* 【分支会话】紧跟「↩ 引用」右排，不瓜分 auto 间距；busy 时只变样不挡其他轮点击（函数内互斥） */
 .res-meta .sql-toggle.branch-toggle { margin-left: 10px; }
 .res-meta .sql-toggle.branch-toggle.disabled { opacity: .5; pointer-events: none; }
@@ -3214,9 +3301,10 @@ function exportSupplementalCsv(t: Turn) {
 .sql-item summary { cursor: pointer; padding: 9px 12px; color: var(--text-regular); font-size: 12px; font-weight: 650; background: var(--bg-main); }
 .sql-item .sql { margin: 0; border-radius: 0; max-height: 280px; }
 .sql { background: var(--bg-main); border: 1px solid var(--divider); border-radius: var(--radius-lg); padding: 10px 12px; overflow-x: auto; margin-bottom: 10px; font-family: var(--font-mono); font-size: 12px; color: var(--text-regular); white-space: pre-wrap; }
-.insight { background: var(--primary-light); border-left: 3px solid var(--primary); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 12px; font-size: 13px; color: var(--text-regular); line-height: 1.6; }
-@media (max-width: 760px) { .q-kpis { grid-template-columns: repeat(2,minmax(0,1fr)); } .q-grid { grid-template-columns: 1fr; } .vqr-row { flex-direction: column; } }
 @media (max-width: 760px) {
+  .q-kpis { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .q-grid { grid-template-columns: 1fr; }
+  .vqr-row { flex-direction: column; }
   .set-wrap { padding: 14px 12px 40px; }
   .set-card { padding: 14px 12px; }
   .set-hd { align-items: flex-start; flex-wrap: wrap; }
@@ -3256,6 +3344,8 @@ function exportSupplementalCsv(t: Turn) {
 /* AI 解读折叠面板 */
 .ai-panel { border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg-main); padding: 10px 12px; margin-bottom: 12px; }
 .ai-hd { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; font-weight: 650; color: var(--text-primary); margin-bottom: 6px; }
+/* 「生成报表」钮（button.sql-toggle）在标题行靠右；按钮复位与 .res-meta 那条同款 */
+.ai-hd .sql-toggle { margin-left: auto; padding: 0; border: 0; background: none; font: inherit; color: var(--primary); cursor: pointer; }
 .ai-hd .ai-hint { font-size: 11px; font-weight: 400; color: var(--text-faint); }
 .ai-loading { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); }
 .ai-err { font-size: 12.5px; color: var(--error-text); line-height: 1.6; word-break: break-word; }
@@ -3400,12 +3490,6 @@ function exportSupplementalCsv(t: Turn) {
 .login-role { width: 100%; min-height: 42px; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text-primary); padding: 0 13px; margin-top: 8px; cursor: pointer; }
 .login-role:hover { border-color: var(--primary); color: var(--primary); }
 /* 【深度页内嵌】聊天框里的 BI 段 */
-.bi-contract { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; color: var(--text-muted); font-size: 11px; }
-.bi-contract span { border: 1px solid var(--primary); border-radius: 4px; padding: 2px 8px; color: var(--primary); font-weight: 700; background: var(--primary-bg); }
-.bi-contract small { color: var(--text-faint); }
-.bi-under { background: var(--bg-main); border-left: 3px solid var(--primary); border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; color: var(--text-regular); }
-.bi-under span { display: block; margin-bottom: 3px; color: var(--text-muted); font-size: 10.5px; font-weight: 700; }
-.bi-under p { margin: 0; font-size: 13px; line-height: 1.65; }
 .df-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(190px,1fr)); gap: 8px; margin-bottom: 14px; }
 .df-card { min-width: 0; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; background: var(--bg-card); }
 .df-card span { display: block; margin-bottom: 4px; color: var(--text-muted); font-size: 10.5px; }
@@ -3420,8 +3504,8 @@ function exportSupplementalCsv(t: Turn) {
 .dk-compare:last-child { border-right: 0; }
 .dk-compare span { color: var(--text-muted); font-size: 11px; }
 .dk-compare b { font-size: 18px; color: var(--text-primary); font-variant-numeric: tabular-nums; }
-.dk-compare.up b { color: #c93b32; }
-.dk-compare.down b { color: #16845b; }
+.dk-compare.up b { color: var(--error-text); }
+.dk-compare.down b { color: var(--success-text); }
 .dk-compare small { grid-column: 1 / -1; color: var(--text-faint); font-size: 10.5px; }
 .dk-compare-detail { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px 12px; padding-top: 5px; border-top: 1px solid var(--divider); }
 .dk-compare-detail span { font-size: 10.5px; font-variant-numeric: tabular-nums; }
@@ -3444,7 +3528,7 @@ function exportSupplementalCsv(t: Turn) {
 .daccept-item { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .daccept-v { flex-shrink: 0; padding: 1px 7px; border-radius: var(--radius-full); font-size: 10px; font-style: normal; font-weight: 700; }
 .daccept-v.met { color: var(--success-text); background: var(--bg-sunken); }
-.daccept-v.partial { color: var(--warn-text, #b45309); background: var(--bg-sunken); }
+.daccept-v.partial { color: var(--warning-text); background: var(--bg-sunken); }
 .daccept-v.unmet { color: var(--error-text); background: var(--bg-sunken); }
 .daccept-v.pending { color: var(--text-faint); background: var(--bg-sunken); }
 .daccept-sec { flex-shrink: 0; color: var(--text-muted); font-size: 10.5px; font-weight: 600; }
@@ -3498,21 +3582,14 @@ function exportSupplementalCsv(t: Turn) {
 .mobile-menu { display: none; }
 .side-mask { display: none; }
 .btn-icon:hover, .btn-sm:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
-/* 移动端侧栏：整栏 display:none 会同时丢掉会话列表/新建/主题入口 —— 改为 ☰ 拉开的抽屉 */
-@media (max-width: 820px) {
-  .mobile-menu { display: inline-flex; }
-  .side { position: fixed; top: 0; left: 0; bottom: 0; z-index: 1150; width: min(300px, 86vw); transform: translateX(-105%); transition: transform .18s ease-out; }
-  .side.open { transform: none; box-shadow: 18px 0 50px rgba(17, 24, 39, .18); }
-  .side-mask { display: block; position: fixed; inset: 0; z-index: 1140; background: rgba(17, 24, 39, .38); backdrop-filter: blur(5px); }
-  .mobile-kb, .mobile-weekly { display: inline-flex; align-items: center; }
-  .bubble { max-width: 94%; }
-}
 @media (max-width: 520px) { .weekly-mask { padding: 10px; align-items: end; } .weekly-dialog { border-radius: 8px 8px 0 0; } .weekly-head, .weekly-intro, .weekly-field, .weekly-actions { padding-inline: 18px; } .weekly-period { margin-inline: 18px; grid-template-columns: 1fr; } .weekly-period small { grid-column: 1; } }
 @media (max-width: 980px) { .dh-grid { grid-template-columns: 1fr; } .dkpi { grid-template-columns: 1fr; } .dk-comparisons { border-left: 0; border-top: 1px solid var(--divider); } }
 /* ≤820px 预览面板是全屏 fixed 浮层，侧栏转为抽屉常驻（见上），本条只约束桌面档 */
 @media (min-width: 821px) and (max-width: 1360px) { .wrap.has-preview .side { display: none; } }
 /* 【S1】artifact 预览面板 */
-.art-card { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 10px; font-size: 13px; color: var(--text-regular); text-decoration: none; cursor: pointer; background: var(--primary-bg); }
+.art-card { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 10px; font-size: 13px; color: var(--text-regular); background: var(--primary-bg); }
+/* 产物卡 = 外壳 div + 锚点 .art-link + 同级分享钮：锚点里不许再嵌 button（非法嵌套交互元素） */
+.art-card .art-link { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; color: inherit; text-decoration: none; cursor: pointer; }
 .art-card:hover { border-color: var(--primary); }
 .art-card .art-hint { margin-left: auto; font-size: 12px; color: var(--text-faint); }
 .art-card .art-share { margin-left: 6px; padding: 0; border: 0; background: none; font-family: inherit; font-size: 14px; cursor: pointer; }
@@ -3534,7 +3611,14 @@ function exportSupplementalCsv(t: Turn) {
 .pv-frame { flex: 1; border: none; min-height: 0; background: #fff; }
 .pv-state { flex: 1; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--text-muted); font-size: 13px; background: var(--bg-main); }
 .pv-error { color: var(--error-text); padding: 24px; text-align: center; line-height: 1.7; }
+/* 移动端侧栏：整栏 display:none 会同时丢掉会话列表/新建/主题入口 —— 改为 ☰ 拉开的抽屉 */
 @media (max-width: 820px) {
+  .mobile-menu { display: inline-flex; }
+  .side { position: fixed; top: 0; left: 0; bottom: 0; z-index: 1150; width: min(300px, 86vw); transform: translateX(-105%); transition: transform .18s ease-out; }
+  .side.open { transform: none; box-shadow: 18px 0 50px rgba(17, 24, 39, .18); }
+  .side-mask { display: block; position: fixed; inset: 0; z-index: 1140; background: rgba(17, 24, 39, .38); backdrop-filter: blur(5px); }
+  .mobile-kb, .mobile-weekly { display: inline-flex; align-items: center; }
+  .bubble { max-width: 94%; }
   .pv { position: fixed; inset: 0; z-index: 1200; display: flex; width: 100%; min-width: 0; max-width: none; flex-basis: auto !important; border-left: 0; }
   .pv-drag { display: none; }
   .pv-hd { padding: 9px 10px; overflow-x: auto; }
@@ -3548,4 +3632,5 @@ function exportSupplementalCsv(t: Turn) {
   .bi-focus-card { width: 100%; height: 96vh; }
   .bi-focus-body { padding: 12px; }
 }
+
 </style>

@@ -16,6 +16,10 @@ use sqlx::{PgPool, Row};
 const GRAPH: &str = "dms_graph";
 const GRAPH_EDGE_LIMIT: usize = 250_000;
 const GRAPH_SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// 图查询 TOP N 的防御上限：limit 直接拼进 Cypher，调用方传多大就查多大可不行
+const GRAPH_QUERY_MAX_LIMIT: usize = 1000;
+// 主边 SQL 字面量写死 LIMIT 250001（raw_all 要 &'static str 不能 format!）—— 与常量钉死 +1 关系
+const _: () = assert!(250001 == GRAPH_EDGE_LIMIT + 1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GraphAvailability {
@@ -98,12 +102,12 @@ fn sync_lock() -> &'static tokio::sync::Mutex<()> {
 
 /// 在连接池真正换入前立即关闭图快路径。目标名不含凭据，可以安全留在进程状态中。
 pub fn invalidate_for_target(target: &str) -> GraphInvalidation {
-    availability().write().expect("graph state 锁中毒").invalidate(target)
+    availability().write().unwrap_or_else(|e| e.into_inner()).invalidate(target)
 }
 
 /// 切库失败时恢复旧状态；若期间已有同步开始，拒绝覆盖并发状态。
 pub fn restore_after_failed_switch(token: GraphInvalidation) -> bool {
-    let mut state = availability().write().expect("graph state 锁中毒");
+    let mut state = availability().write().unwrap_or_else(|e| e.into_inner());
     if state.generation != token.invalidated_generation {
         return false;
     }
@@ -112,13 +116,13 @@ pub fn restore_after_failed_switch(token: GraphInvalidation) -> bool {
 }
 
 pub fn ready_lease(target: &str) -> Option<GraphLease> {
-    availability().read().expect("graph state 锁中毒").lease(target)
+    availability().read().unwrap_or_else(|e| e.into_inner()).lease(target)
 }
 
 pub fn lease_is_current(lease: &GraphLease) -> bool {
     availability()
         .read()
-        .expect("graph state 锁中毒")
+        .unwrap_or_else(|e| e.into_inner())
         .lease(&lease.target)
         .is_some_and(|current| current == *lease)
 }
@@ -144,23 +148,67 @@ pub async fn adopt_if_current(pg: &PgPool, target: &str) -> bool {
     };
     match read.await {
         Ok(marker) if marker == target => {
-            availability().write().expect("graph state 锁中毒").adopt(target);
+            availability().write().unwrap_or_else(|e| e.into_inner()).adopt(target);
             true
         }
-        _ => false,
+        Ok(_) => false, // 标记与目标不符：图是别的目标建的，不可信
+        Err(e) => {
+            // 真实 DB 错误（断网/权限）与「无标记」都落这里：留痕但不放行
+            tracing::debug!(err = %e, "图就绪标记读取失败，按不可信处理");
+            false
+        }
     }
 }
 
 /// AGE 连接准备：每连接需 LOAD age + search_path（放 fetch 前）
 async fn age_conn(pg: &PgPool) -> anyhow::Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
     let mut conn = pg.acquire().await?;
+    // 两条独立 `query()`（两次 RTT）是刻意的：`raw_sql` 合并版（simple protocol 一句多命令）
+    // 的 future 形状会让下游 `JoinSet::spawn`（knowledge 图谱构建流水）过不了 Send 的 HRTB
+    // 证明（实测 rustc 报 "not general enough"，整仓编不过）——别为了省一次 RTT 换回去。
     sqlx::query("LOAD 'age'").execute(&mut *conn).await?;
-    sqlx::query("SET search_path = ag_catalog, public").execute(&mut *conn).await?;
+    sqlx::query("SET search_path = ag_catalog, public")
+        .execute(&mut *conn)
+        .await?;
     Ok(conn)
 }
 
+/// Cypher 单引号字面量清洗，单趟成型：
+/// - 剥 `\`：防 AGE 转义歧义的刻意取舍（实体名里的 `\n` 会变 `n`——数据损毁而非转义，
+///   但图名来自主档业务数据，可接受）；
+/// - 剥控制字符：换行等可撑破 Cypher 单引号字面量；
+/// - `'` → `\'`。
+/// 与 doc_graph.rs 的 esc 必须同文（两侧测试互守）。
 fn esc(s: &str) -> String {
-    s.replace('\\', "").replace('\'', "\\'")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => {}
+            '\'' => out.push_str("\\'"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// 插值进 `=~` 正则前：在 esc 之上再转义正则元字符 —— 业务词里的 `.`/`*`/`[`（"C++"、
+/// "A.B"）不该改变匹配语义。
+fn esc_regex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => {}
+            '\'' => out.push_str("\\'"),
+            c if "^$.*+?()[]{}|".contains(c) => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// 客户 → 省区/省份维度边。省区取统一合同 `region`；省份取客户主档 `t_customer.province`
@@ -217,7 +265,7 @@ pub async fn sync(
     let target = mysql.target_name();
     let generation = availability()
         .write()
-        .expect("graph state 锁中毒")
+        .unwrap_or_else(|e| e.into_inner())
         .begin_sync(&target);
     // DWS 已统一正向销售和负向退货；图上的金额、销量与问数使用同一事实合同。
     // 目录中没有“客户×商品”同粒度且同口径的 ADS，不能拿省区月汇总替代购买关系。
@@ -243,7 +291,8 @@ pub async fn sync(
     .map_err(|_| anyhow::anyhow!("graph source query exceeded 120s budget"))??;
     anyhow::ensure!(
         edges.len() <= GRAPH_EDGE_LIMIT,
-        "graph source exceeded {GRAPH_EDGE_LIMIT} aggregate edges"
+        "graph source exceeded {GRAPH_EDGE_LIMIT} aggregate edges: got {}",
+        edges.len()
     );
     anyhow::ensure!(
         mysql.is_warehouse() && mysql.target_name() == target,
@@ -254,18 +303,25 @@ pub async fn sync(
     let province_pairs: Vec<(String, String)> = tokio::time::timeout(
         GRAPH_SOURCE_TIMEOUT,
         mysql.raw_all(
-             "SELECT /*+ SET_VAR(query_timeout=120) */ c.customer_code, r.region_name              FROM dms_ods.t_customer c              JOIN dms_ods.t_regions r ON r.region_code = c.province AND r.deleted_flag = 0              WHERE c.deleted_flag = 0 AND c.province IS NOT NULL AND TRIM(c.province) <> ''",
+             "SELECT /*+ SET_VAR(query_timeout=120) */ c.customer_code, r.region_name               FROM dms_ods.t_customer c               JOIN dms_ods.t_regions r ON r.region_code = c.province AND r.deleted_flag = 0               WHERE c.deleted_flag = 0 AND c.province IS NOT NULL AND TRIM(c.province) <> ''               LIMIT 250001",
         ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("graph province query exceeded 120s budget"))??;
+    anyhow::ensure!(
+        province_pairs.len() <= GRAPH_EDGE_LIMIT,
+        "graph province query exceeded {GRAPH_EDGE_LIMIT} rows: got {}",
+        province_pairs.len()
+    );
     let dims = DimEdges {
+        // 先借用去重再 clone：≤250k 行不为每个幸存者白付一次 String 分配
         customer_sales_region: edges
             .iter()
             .filter(|(_, _, _, _, region, _, _)| !region.is_empty())
-            .map(|(code, _, _, _, region, _, _)| (code.clone(), region.clone()))
+            .map(|(code, _, _, _, region, _, _)| (code.as_str(), region.as_str()))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
+            .map(|(code, region)| (code.to_string(), region.to_string()))
             .collect(),
         customer_province: province_pairs
             .into_iter()
@@ -275,33 +331,45 @@ pub async fn sync(
             .collect(),
     };
 
-    // 去重节点
+    // 去重节点（25 万行级：命中也白 clone key 的 entry(...).or_insert_with 形态不用）
     use std::collections::HashMap;
     let mut customers: HashMap<String, String> = HashMap::new();
     let mut goods: HashMap<String, String> = HashMap::new();
     for (cc, cn, gc, gn, _, _, _) in &edges {
-        customers.entry(cc.clone()).or_insert_with(|| cn.clone());
-        goods.entry(gc.clone()).or_insert_with(|| gn.clone());
+        if !customers.contains_key(cc) {
+            customers.insert(cc.clone(), cn.clone());
+        }
+        if !goods.contains_key(gc) {
+            goods.insert(gc.clone(), gn.clone());
+        }
     }
 
     let mut conn = age_conn(pg).await?;
     // 重建图
-    let _ = sqlx::query(&format!("SELECT drop_graph('{GRAPH}', true)")).execute(&mut *conn).await;
+    // 首跑「图不存在」是预期；其余错误留痕但不阻断 —— 紧接着 create_graph 会重建
+    if let Err(e) =
+        sqlx::query(&format!("SELECT drop_graph('{GRAPH}', true)")).execute(&mut *conn).await
+    {
+        tracing::debug!(err = %e, "drop_graph 失败（首跑图不存在属预期）");
+    }
     sqlx::query(&format!("SELECT create_graph('{GRAPH}')")).execute(&mut *conn).await?;
 
     // 批量建节点（UNWIND inline）
     batch_nodes(&mut conn, "Customer", &customers).await?;
     batch_nodes(&mut conn, "Goods", &goods).await?;
 
-    // 节点属性索引（建边 MATCH 提速）
+    // 节点属性索引（建边 MATCH 提速）；索引缺失会让每条建边 MATCH 全表扫，失败必须 warn
     for label in ["Customer", "Goods"] {
-        let _ = sqlx::query(&format!(
+        if let Err(e) = sqlx::query(&format!(
             "CREATE INDEX IF NOT EXISTS {}_code_idx ON {GRAPH}.\"{label}\" \
              USING btree (agtype_access_operator(VARIADIC ARRAY[properties, '\"code\"'::agtype]))",
             label.to_lowercase()
         ))
         .execute(&mut *conn)
-        .await;
+        .await
+        {
+            tracing::warn!(err = %e, label, "图节点索引创建失败，建边 MATCH 将退化为全表扫");
+        }
     }
 
     // 批量建边
@@ -309,19 +377,16 @@ pub async fn sync(
 
     // ── 省区节点与边。**建在购买边之后**：它们只挂到已存在的
     //    Customer 上，图里没有的 code 静默跳过（`MATCH` 匹配不到就不建边）。
-    //    这一段失败不该让整次同步失败 —— 购买图（本体）已经建好了，维度边是增强。
-    let (sales_regions, n) = batch_dim_edges(&mut conn, &dims).await?;
-    tracing::info!(
-        sales_regions,
-        provinces = dims
-            .customer_province
-            .iter()
-            .map(|(_, p)| p)
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        dim_edges = n,
-        "图维度边已建（SalesRegion + Province）"
-    );
+    //    这一段失败不让整次同步失败（warn-and-continue）—— 购买图（本体）已经建好，维度边是增强。
+    let (sales_regions, provinces, n) = match batch_dim_edges(&mut conn, &dims).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(err = %e, "图维度边构建失败，购买图本体已建好，继续");
+            (0, 0, 0)
+        }
+    };
+    // 计数口径：dim_edges 是「尝试条数」，MATCH 不到的维度边静默跳过，实际建成可能更少
+    tracing::info!(sales_regions, provinces, dim_edges = n, "图维度边已建（SalesRegion + Province）");
 
     let schema_edges = batch_document_schema(&mut conn, documents).await?;
     tracing::info!(families = documents.len(), schema_edges, "单据族主明细关系已写入图谱");
@@ -337,19 +402,28 @@ pub async fn sync(
         mysql.is_warehouse() && mysql.target_name() == target,
         "graph source target changed during AGE rebuild"
     );
-    let ready = availability()
-        .write()
-        .expect("graph state 锁中毒")
-        .mark_ready(&target, generation);
-    anyhow::ensure!(ready, "graph target generation changed during AGE rebuild");
-    // 持久化就绪标记：只图内容**完整重建成功**后才落。下次重建的 drop_graph 会先抹掉它 ——
-    // 「没有标记」就是「不可信」，CLI/短生命周期进程靠它接管（见 `adopt_if_current`）。
+    // 先落持久化就绪标记再置内存态：标记写失败时进程返回 Err 且内存态未 ready，
+    // 两半不会出现「内存 ready 但标记缺席」的不一致。标记只由完整重建成功写入 ——
+    // 下次重建的 drop_graph 会先抹掉它，「没有标记」就是「不可信」（见 `adopt_if_current`）。
     let cy = format!(
         "SELECT * FROM cypher('{GRAPH}', $$ CREATE (:GraphMeta {{target:'{}'}}) $$) AS (v agtype)",
         esc(&target)
     );
     sqlx::query(&cy).execute(&mut *conn).await?;
+    let ready = availability()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .mark_ready(&target, generation);
+    anyhow::ensure!(ready, "graph target generation changed during AGE rebuild");
     Ok((customers.len(), goods.len(), edges.len()))
+}
+
+/// 零分配的「code == db.table」校验（每资产一次 format! 是纯浪费）
+fn is_qualified_code(code: &str, db: &str, table: &str) -> bool {
+    code.len() == db.len() + 1 + table.len()
+        && code.starts_with(db)
+        && code.as_bytes()[db.len()] == b'.'
+        && code.ends_with(table)
 }
 
 /// 静态目录只投影资产自身、分层、业务域和默认销售合同。
@@ -361,7 +435,7 @@ async fn batch_warehouse_catalog(
     let mut codes = std::collections::HashSet::new();
     for asset in assets {
         anyhow::ensure!(
-            asset.code == format!("{}.{}", asset.database, asset.table),
+            is_qualified_code(&asset.code, &asset.database, &asset.table),
             "warehouse asset code must be fully qualified"
         );
         anyhow::ensure!(
@@ -370,9 +444,8 @@ async fn batch_warehouse_catalog(
         );
         anyhow::ensure!(codes.insert(asset.code.as_str()), "duplicate warehouse asset code");
     }
-    let default_sales = assets.iter().filter(|asset| asset.default_sales).collect::<Vec<_>>();
     anyhow::ensure!(
-        default_sales.len() == 1,
+        assets.iter().filter(|asset| asset.default_sales).count() == 1,
         "warehouse catalog must declare exactly one default-sales asset"
     );
 
@@ -409,26 +482,29 @@ async fn batch_warehouse_catalog(
         sqlx::query(&cy).execute(&mut *conn).await?;
     }
 
-    let mut layers = ["ODS", "DWD", "DWS", "ADS", "OTHER"]
+    // 分层节点就是固定的 5 层（上面已校验 ∈ 5 层，资产侧 insert 永远插不进新值，不收）
+    let layers = ["ODS", "DWD", "DWS", "ADS", "OTHER"]
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
     let mut domains = std::collections::HashSet::new();
     for asset in assets {
-        layers.insert(asset.layer.as_str());
         domains.insert(asset.domain.as_str());
     }
     batch_named_catalog_nodes(conn, "DataLayer", layers).await?;
     batch_named_catalog_nodes(conn, "BusinessDomain", domains).await?;
-    batch_named_catalog_nodes(conn, "MetricContract", ["default_sales"].into_iter().collect()).await?;
+    // MetricContract 节点不在此预建：下面 USES_AS_DEFAULT 的 MERGE + SET name 一次到位
 
     for label in ["WarehouseAsset", "DataLayer", "BusinessDomain", "MetricContract"] {
-        let _ = sqlx::query(&format!(
+        if let Err(e) = sqlx::query(&format!(
             "CREATE INDEX IF NOT EXISTS {}_code_idx ON {GRAPH}.\"{label}\" \
              USING btree (agtype_access_operator(VARIADIC ARRAY[properties, '\"code\"'::agtype]))",
             label.to_lowercase()
         ))
         .execute(&mut *conn)
-        .await;
+        .await
+        {
+            tracing::warn!(err = %e, label, "图目录索引创建失败，MATCH 将退化为全表扫");
+        }
     }
 
     let list = assets
@@ -453,7 +529,8 @@ async fn batch_warehouse_catalog(
     );
     sqlx::query(&cy).execute(&mut *conn).await?;
 
-    let default_code = esc(&default_sales[0].code);
+    let default_code =
+        esc(&assets.iter().find(|asset| asset.default_sales).expect("已 ensure 恰好一个").code);
     let cy = format!(
         "SELECT * FROM cypher('{GRAPH}', $$ \
          MATCH (a:WarehouseAsset {{code:'{default_code}'}}) \
@@ -463,6 +540,7 @@ async fn batch_warehouse_catalog(
     );
     sqlx::query(&cy).execute(&mut *conn).await?;
 
+    // 返回「尝试数」而非实建数（IN_LAYER/IN_DOMAIN/USES_AS_DEFAULT 各一 + 资产数），仅作日志口径
     Ok(assets.len() * 2 + 1)
 }
 
@@ -475,7 +553,10 @@ async fn batch_named_catalog_nodes<'a>(
     for chunk in values.chunks(200) {
         let list = chunk
             .iter()
-            .map(|value| format!("{{code:'{}',name:'{}'}}", esc(value), esc(value)))
+            .map(|value| {
+                let v = esc(value);
+                format!("{{code:'{v}',name:'{v}'}}")
+            })
             .collect::<Vec<_>>()
             .join(",");
         let cy = format!(
@@ -494,15 +575,20 @@ async fn batch_document_schema(
 ) -> anyhow::Result<usize> {
     use std::collections::HashMap;
 
-    let families: HashMap<String, String> = documents
-        .iter()
-        .map(|d| (d.code.clone(), d.name.clone()))
-        .collect();
+    let mut families: HashMap<String, String> = HashMap::new();
+    for d in documents {
+        // 与目录侧（duplicate warehouse asset code）同口径：重复 code 显式拒绝，不静默 last-wins
+        anyhow::ensure!(
+            families.insert(d.code.clone(), d.name.clone()).is_none(),
+            "duplicate document family code"
+        );
+    }
     let mut tables: HashMap<String, String> = HashMap::new();
     for d in documents {
-        tables.entry(d.header_table.clone()).or_insert_with(|| d.header_table.clone());
-        for t in &d.detail_tables {
-            tables.entry(t.clone()).or_insert_with(|| t.clone());
+        for t in std::iter::once(&d.header_table).chain(d.detail_tables.iter()) {
+            if !tables.contains_key(t) {
+                tables.insert(t.clone(), t.clone());
+            }
         }
     }
     batch_nodes(conn, "DocumentFamily", &families).await?;
@@ -537,6 +623,7 @@ async fn batch_document_schema(
                  CREATE (f)-[:{rel}]->(t) $$) AS (v agtype)"
             );
             sqlx::query(&cy).execute(&mut *conn).await?;
+            // 口径：尝试条数（CREATE 全量成功时 == 实建数）；日志 schema_edges 按此解读
             count += chunk.len();
         }
     }
@@ -551,15 +638,16 @@ async fn batch_document_schema(
 async fn batch_dim_edges(
     conn: &mut sqlx::PgConnection,
     dims: &DimEdges,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<(usize, usize, usize)> {
     use std::collections::HashSet;
     let mut n = 0usize;
     for (label, rel, pairs) in [
         ("SalesRegion", "IN_SALES_REGION", &dims.customer_sales_region),
         ("Province", "IN_PROVINCE", &dims.customer_province),
     ] {
-        let names: HashSet<&String> = pairs.iter().map(|(_, name)| name).collect();
-        let items: Vec<&&String> = names.iter().collect();
+        let names: HashSet<&str> = pairs.iter().map(|(_, name)| name.as_str()).collect();
+        let items: Vec<&str> = names.into_iter().collect();
+        // chunk 尺寸（节点 1000 / 目录 200 / 边 500）是按各语句文本长度的经验值，无更深层依据
         for chunk in items.chunks(1000) {
             let list: String = chunk
                 .iter()
@@ -572,13 +660,16 @@ async fn batch_dim_edges(
             );
             sqlx::query(&cy).execute(&mut *conn).await?;
         }
-        let _ = sqlx::query(&format!(
+        if let Err(e) = sqlx::query(&format!(
             "CREATE INDEX IF NOT EXISTS {}_name_idx ON {GRAPH}.\"{}\" \
              USING btree (agtype_access_operator(VARIADIC ARRAY[properties, '\"name\"'::agtype]))",
             label.to_lowercase(), label
         ))
         .execute(&mut *conn)
-        .await;
+        .await
+        {
+            tracing::warn!(err = %e, label, "图维度索引创建失败，MATCH 将退化为全表扫");
+        }
         for chunk in pairs.chunks(500) {
             let list: String = chunk
                 .iter()
@@ -594,13 +685,11 @@ async fn batch_dim_edges(
             n += chunk.len();
         }
     }
-    let sales_regions = dims
-        .customer_sales_region
-        .iter()
-        .map(|(_, r)| r)
-        .collect::<HashSet<_>>()
-        .len();
-    Ok((sales_regions, n))
+    let sales_regions =
+        dims.customer_sales_region.iter().map(|(_, r)| r).collect::<HashSet<_>>().len();
+    let provinces =
+        dims.customer_province.iter().map(|(_, p)| p).collect::<HashSet<_>>().len();
+    Ok((sales_regions, provinces, n))
 }
 
 async fn batch_nodes(
@@ -648,9 +737,14 @@ async fn batch_edges(
     Ok(())
 }
 
-/// agtype 值去引号（AGE 返回 "xxx" 带引号字符串）
+/// agtype 值去引号（AGE 返回 "xxx" 带引号字符串）。
+/// 只剥一层成对外引号：`trim_matches('"')` 会把名字里真·首尾引号全剥掉，读写口径按一层对齐。
 fn unquote(s: &str) -> String {
-    s.trim().trim_matches('"').to_string()
+    let s = s.trim();
+    match s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        Some(inner) => inner.replace("\\\"", "\""),
+        None => s.to_string(),
+    }
 }
 
 pub struct GraphRow {
@@ -661,30 +755,33 @@ pub struct GraphRow {
 
 /// 买过某商品（名称模糊）的客户 TOP N，按购买额降序
 pub async fn buyers_of_goods(pg: &PgPool, goods_name: &str, limit: usize) -> anyhow::Result<Vec<GraphRow>> {
+    let limit = limit.clamp(1, GRAPH_QUERY_MAX_LIMIT);
     let cy = format!(
         "SELECT * FROM cypher('{GRAPH}', $$ \
          MATCH (c:Customer)-[b:BOUGHT]->(g:Goods) WHERE g.name =~ '.*{}.*' \
          RETURN c.code, c.name, sum(b.amount) ORDER BY sum(b.amount) DESC LIMIT {limit} \
          $$) AS (code agtype, name agtype, amount agtype)",
-        esc(goods_name)
+        esc_regex(goods_name)
     );
     fetch_graph_rows(pg, &cy).await
 }
 
 /// 某客户（名称模糊）买过的商品 TOP N，按购买额降序
 pub async fn goods_of_customer(pg: &PgPool, customer_name: &str, limit: usize) -> anyhow::Result<Vec<GraphRow>> {
+    let limit = limit.clamp(1, GRAPH_QUERY_MAX_LIMIT);
     let cy = format!(
         "SELECT * FROM cypher('{GRAPH}', $$ \
          MATCH (c:Customer)-[b:BOUGHT]->(g:Goods) WHERE c.name =~ '.*{}.*' \
          RETURN g.code, g.name, sum(b.amount) ORDER BY sum(b.amount) DESC LIMIT {limit} \
          $$) AS (code agtype, name agtype, amount agtype)",
-        esc(customer_name)
+        esc_regex(customer_name)
     );
     fetch_graph_rows(pg, &cy).await
 }
 
 /// 买过 X 商品的客户还买了什么（共购推荐）：两跳
 pub async fn copurchase(pg: &PgPool, goods_name: &str, limit: usize) -> anyhow::Result<Vec<GraphRow>> {
+    let limit = limit.clamp(1, GRAPH_QUERY_MAX_LIMIT);
     let cy = format!(
         "SELECT * FROM cypher('{GRAPH}', $$ \
          MATCH (c:Customer)-[:BOUGHT]->(g1:Goods) WHERE g1.name =~ '.*{}.*' \
@@ -692,7 +789,7 @@ pub async fn copurchase(pg: &PgPool, goods_name: &str, limit: usize) -> anyhow::
          MATCH (c)-[b2:BOUGHT]->(g2:Goods) WHERE NOT g2.name =~ '.*{}.*' \
          RETURN g2.code, g2.name, sum(b2.amount) ORDER BY sum(b2.amount) DESC LIMIT {limit} \
          $$) AS (code agtype, name agtype, amount agtype)",
-        esc(goods_name), esc(goods_name)
+        esc_regex(goods_name), esc_regex(goods_name)
     );
     fetch_graph_rows(pg, &cy).await
 }
@@ -733,6 +830,8 @@ pub async fn resolve_entities(pg: &PgPool, text: &str) -> anyhow::Result<Vec<Hit
             out.push(Hit { start, window: w, entity });
         }
     }
+    // 必须按 start 排序：candidate_windows 按「长度外层、起点内层」产出，本就不按位置有序；
+    // 重叠占位判据（taken）与输出契约都依赖位置序 —— 这行看着冗余，删不得。
     out.sort_by_key(|h| h.start);
     Ok(out)
 }
@@ -755,28 +854,32 @@ pub struct Hit {
 
 /// 单个词的解析。省区闭集精确匹配优先，商品开集模糊匹配最后。
 async fn resolve_one(pg: &PgPool, word: &str) -> anyhow::Result<Option<Entity>> {
+    // 一次解析复用同一条连接：逐 label 重新 age_conn = 每窗口 3 倍的 acquire+LOAD+SET
+    let mut conn = age_conn(pg).await?;
     for label in RESOLVABLE_LABELS {
         let exact = label != "Goods";
         let cond = if exact {
             format!("x.name = '{}'", esc(word))
         } else {
-            format!("x.name =~ '.*{}.*'", esc(word))
+            format!("x.name =~ '.*{}.*'", esc_regex(word))
         };
         let cy = format!(
             "SELECT * FROM cypher('{GRAPH}', $$ MATCH (x:{label}) WHERE {cond} \
              RETURN x.name LIMIT 1 $$) AS (name agtype)"
         );
-        let mut conn = age_conn(pg).await?;
         let wrapped = format!("SELECT name::text FROM ({cy}) AS sub");
         // 标签还不存在（旧图没跑过新版 sync）时 AGE 会报错 —— 那不是解析失败，是图没建全，
         // 所以 `Err` 一律当「这个标签没有」继续试下一个，而不是让整条问答失败。
         let rows = match sqlx::query(&wrapped).fetch_all(&mut *conn).await {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                // 标签不存在与真实 DB 错误都落这里：留痕后继续试下一个标签
+                tracing::debug!(err = %e, label, "图标签查询失败，按「该标签没有」继续");
+                continue;
+            }
         };
         if let Some(r) = rows.first() {
-            let name: String =
-                unquote(&r.try_get::<Option<String>, _>(0).ok().flatten().unwrap_or_default());
+            let name: String = unquote(&cell_text(r, 0));
             if name.is_empty() {
                 continue;
             }
@@ -826,11 +929,12 @@ fn buyers_cypher(
     if goods.is_none() {
         return None; // 没有商品侧限定 = 「列出所有客户」，不是关系问句
     }
+    let limit = limit.clamp(1, GRAPH_QUERY_MAX_LIMIT);
     let mut matches = vec!["MATCH (c:Customer)-[b:BOUGHT]->(g:Goods)"];
     let mut wheres: Vec<String> = vec![];
-    // 商品名是开集 → 模糊；省区/省份是闭集且解析时已精确命中 → 相等。
+    // 商品名是开集 → 模糊（正则元字符先转义）；省区/省份是闭集且解析时已精确命中 → 相等。
     if let Some(g) = goods {
-        wheres.push(format!("g.name =~ '.*{}.*'", esc(g)));
+        wheres.push(format!("g.name =~ '.*{}.*'", esc_regex(g)));
     }
     if let Some(r) = sales_region {
         wheres.push(format!("b.region = '{}'", esc(r)));
@@ -848,6 +952,17 @@ fn buyers_cypher(
     ))
 }
 
+/// 图行文本列解码：失败留痕（debug）并按空串兜底 —— AGE ::text 形态漂移时不该静默变「空名字」
+fn cell_text(r: &sqlx::postgres::PgRow, i: usize) -> String {
+    match r.try_get::<Option<String>, _>(i) {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => {
+            tracing::debug!(err = %e, col = i, "图行文本列解码失败，按空串兜底");
+            String::new()
+        }
+    }
+}
+
 async fn fetch_graph_rows(pg: &PgPool, cypher: &str) -> anyhow::Result<Vec<GraphRow>> {
     let mut conn = age_conn(pg).await?;
     // agtype 类型 sqlx 不识别，外层包一层 ::text（string→带引号JSON、number→裸数字）
@@ -856,13 +971,17 @@ async fn fetch_graph_rows(pg: &PgPool, cypher: &str) -> anyhow::Result<Vec<Graph
     Ok(rows
         .iter()
         .map(|r| {
-            let code: String = r.try_get::<Option<String>, _>(0).ok().flatten().unwrap_or_default();
-            let name: String = r.try_get::<Option<String>, _>(1).ok().flatten().unwrap_or_default();
-            let amt_s: String = r.try_get::<Option<String>, _>(2).ok().flatten().unwrap_or_default();
+            let amt_s = cell_text(r, 2);
             GraphRow {
-                code: unquote(&code),
-                name: unquote(&name),
-                amount: amt_s.trim().parse().unwrap_or(0.0),
+                code: unquote(&cell_text(r, 0)),
+                name: unquote(&cell_text(r, 1)),
+                amount: amt_s
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        tracing::debug!(raw = %amt_s, "图行金额解析失败，按 0.0 兜底");
+                        0.0
+                    }),
             }
         })
         .collect())
@@ -940,6 +1059,22 @@ mod tests {
     #[test]
     fn esc_quotes() {
         assert_eq!(esc("O'Brien"), "O\\'Brien");
+    }
+
+    #[test]
+    fn esc_strips_backslash_and_control_chars() {
+        assert_eq!(esc("a\\nb"), "anb", "剥除是防 AGE 转义歧义的刻意取舍");
+        assert_eq!(esc("a\nb"), "ab", "控制字符可撑破 Cypher 字面量，必须剥");
+    }
+
+    #[test]
+    fn esc_regex_escapes_metacharacters() {
+        assert_eq!(esc_regex("A.B"), "A\\.B");
+        assert_eq!(esc_regex("C++"), "C\\+\\+");
+        assert_eq!(esc_regex("O'Brien"), "O\\'Brien", "引号仍按字面量转义");
+        assert_eq!(esc_regex("烤肠"), "烤肠");
+        let q = buyers_cypher(Some("A.B"), None, None, 50).unwrap();
+        assert!(q.contains("g.name =~ '.*A\\.B.*'"), "{q}");
     }
 
     #[test]

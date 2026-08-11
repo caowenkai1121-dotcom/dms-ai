@@ -498,6 +498,7 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "sqlx",
+ "tokio",
  "tracing",
 ]
 

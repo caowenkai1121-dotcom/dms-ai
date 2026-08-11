@@ -5,15 +5,28 @@
 #       python tools/regression.py --bless "A01-超管本月销售额" --yes   # 生成/更新 SQL 金文件
 #       python tools/regression.py --bless-all --yes
 # 约定: LLM 路径非确定重试 1 次（旧项目惯例）; embed/graph 依赖缺席自动跳过不计失败。
-import difflib, json, os, re, subprocess, sys, socket
+# 环境变量: DMS_REGRESSION_TIMEOUT=单题秒数（默认 60；公网链路实测 ~100s/题时放宽，超时仍算失败）。
+# 退出码: 0=全绿；1=有题判红；2=门没开（题集坏/参数错/依赖缺/一题没跑成），与题红分开归因。
+import difflib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+# 依赖「脚本直跑时 tools/ 自动进 sys.path」：只能 python tools/regression.py 直跑；
+# 被当模块 import 时这里会撞上 PyPI 的 cli 包。
 from cli import cli
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# stdout 强制 utf-8：本机 locale 是 cp936，一旦输出走管道（文档里的 `| Out-File -Encoding utf8`）
+# stdout/stderr 强制 utf-8：本机 locale 是 cp936，一旦输出走管道（文档里的 `| Out-File -Encoding utf8`）
 # Python 就按 cp936 编码，打到 ✅/❌/题名里的中文之外的任何字符直接 UnicodeEncodeError——
 # 判官会在打印结果那一刻崩掉，看起来像「跑挂了」而不是「有题红了」。实测: '⤷' 当场炸。
+# stderr 同理：sys.exit(中文) 的文案走 stderr，不 reconfigure 照样在 cp936 管道下炸。
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 argv = sys.argv[1:]
 
 
@@ -28,10 +41,32 @@ def opt(name, default=None):
     return argv[i]
 
 
+def _check_argv(args):
+    """未知 `--xxx` 旗标当场报错：`--fliter` 打错若被静默忽略 = 不过滤跑全量，
+    而「filter 打错」预检拦得住打错的**关键词**，拦不住打错的**旗标本**。"""
+    takes_value = {"--cases", "--filter", "--slice", "--bless"}
+    known = takes_value | {"--bless-all", "--selfcheck", "--yes"}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in takes_value:
+            i += 2                      # 取值那一位跳过；缺取值由 opt() 报错
+        elif a in known or not a.startswith("--"):
+            i += 1
+        else:
+            sys.exit(f"未知参数 {a}（旗标打错会静默改变整轮语义）")
+
+
+_check_argv(argv)
+
 # --cases 只为「反向验证判据 / 临时题集」存在：改判据时要能拿一份带故意打错键的副本跑，
 # 而不是去动已提交的 regression_cases.json。
-CASES_PATH = Path(opt("--cases") or ROOT / "tools" / "regression_cases.json")
-CASES = json.loads(CASES_PATH.read_text(encoding="utf-8"))
+# 相对路径按 ROOT 解析而非 CWD：从 tools/ 目录里跑也得找得到题集。
+_cases = opt("--cases")
+CASES_PATH = Path(_cases) if _cases else ROOT / "tools" / "regression_cases.json"
+if not CASES_PATH.is_absolute():
+    CASES_PATH = (ROOT / CASES_PATH).resolve()
+# CASES 的加载在 --selfcheck 分支之后（见下）：自检不读题集，题集坏了不该连自检都跑不了。
 GOLDEN = ROOT / "tools" / "regression_golden"
 
 # 断言键是白名单式消费的（下面 check() 逐键取）。白名单外的键从前被**静默忽略**——
@@ -69,6 +104,14 @@ def key_errors(cases, rules):
         bad = sorted(set(c) - KNOWN)
         if bad:
             errs.append((name, f"未知键 {bad}（拼错的键 = 断言恒过）"))
+        # 必需 meta 键缺失 = run_case/ask_argv/主循环直接 KeyError traceback，门禁先说清楚。
+        # gate 题不经过 ask_argv，login/q 用不到，只对 name 硬要求。
+        if not c.get("name"):
+            errs.append((name, "缺必需键 name（题名缺失连结果都落不了）"))
+        if c.get("type") != "gate":
+            for k in ("login", "q"):
+                if not c.get(k):
+                    errs.append((name, f"缺必需键 {k}（ask_argv 直接 KeyError）"))
         # 两轮题的两个静默陷阱：都让「两轮题」悄悄退化成单轮题，而断言照绿。
         if c.get("prev_sql") and not c.get("prev"):
             errs.append((name, "有 prev_sql 却没有 prev：CLI 的 prev 位空则 SQL 位一起被忽略"))
@@ -98,7 +141,28 @@ def key_errors(cases, rules):
         # 「登记而不消费还是假绿」正是这道 preflight 自己的立意，别在自己身上留一个口子。
         if "lt" not in r:
             errs.append((f"rules[{i}]", "没有 lt，这条 rule 不会被消费（登记而不消费 = 假绿）"))
+        else:
+            # lt 形状/题名不校验的话：非二元组在消费处 ValueError 崩；
+            # 题名打错则恒落「取值缺失跳过」——一条永远不绿也永远不红的关系断言。
+            lt = r["lt"]
+            if not (isinstance(lt, list) and len(lt) == 2):
+                errs.append((f"rules[{i}]", f"lt 必须是二元列表，实际是 {lt!r}"))
+            else:
+                names = {c.get("name") for c in cases}
+                if lt[0] not in names or lt[1] not in names:
+                    errs.append((f"rules[{i}]", f"lt 引用的题名 {lt} 不在题集中（会恒落「取值缺失跳过」）"))
     return errs
+
+
+def norm(s):
+    """去全部空白 + 小写：SQL 片段包含判断的统一归一。"""
+    return "".join(str(s).lower().split())
+
+
+def _golden_path(name):
+    """题名 → 金文件路径。题名直接拼文件名，把能穿出目录的字符（/.. 等）统换成 _：
+    题集是本地可信源，但零成本堵住「写出 GOLDEN 目录外」（现题集无此类字符，纯防御）。"""
+    return GOLDEN / f"{re.sub(r'[\\\\/:*?\"<>| ]', '_', name)}.sql"
 
 
 def _worddiff(want, got):
@@ -121,7 +185,7 @@ def golden_check(name, sql):
     SQL 文本是时间无关的，且正好卡住「口径被改」这个真危险。
     只 strip 首尾空白，中间不做归一：装配器的空白变了也说明装配器变了，值得看一眼再 --bless。
     """
-    p = GOLDEN / f"{name}.sql"
+    p = _golden_path(name)
     hint = f'生成: python tools/regression.py --bless "{name}" --yes'
     if not p.exists():
         return f"金文件缺失 {p.name}（{hint}）"      # 缺席记红，不许静默通过
@@ -131,7 +195,6 @@ def golden_check(name, sql):
     print(f"  ⤷ SQL 金文件不一致 {name}:\n{_worddiff(want, got)}\n    确认是有意改口径再 {hint}")
     return "SQL≠金文件"
 
-norm = lambda s: "".join(str(s).lower().split())
 
 def service_up(port):
     try:
@@ -141,7 +204,12 @@ def service_up(port):
         return False
 
 def graph_up():
-    r = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True)
+    # docker 未装/守护进程卡死时不得让判官崩或挂住：记 graph=DOWN（依赖缺席语义），不是 traceback
+    try:
+        r = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     return "dms-ai-pg" in r.stdout
 
 def ask_argv(c):
@@ -158,11 +226,21 @@ def ask_argv(c):
     return cli("ask", c["login"], c["q"], *tail)
 
 
+def _ask_timeout():
+    """DMS_REGRESSION_TIMEOUT 解析：非数字的环境变量回落 60 并提示，不许 ValueError 崩。"""
+    raw = os.environ.get("DMS_REGRESSION_TIMEOUT", "60")
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"⚠️ DMS_REGRESSION_TIMEOUT={raw!r} 不是数字，按 60s 计", flush=True)
+        return 60
+
+
 def ask(c, retries=1):
     cmd = ask_argv(c)
     # 公网链路 CLI 单次问答实测 ~100s（启动探针 + LLM 往返都在公网）；内网 60s 的
     # 速度门禁照常，公网跑用 DMS_REGRESSION_TIMEOUT 放宽（超时仍是失败，只是阈值适配链路）。
-    timeout = int(os.environ.get("DMS_REGRESSION_TIMEOUT", "60"))
+    timeout = _ask_timeout()
     last = {}
     for _ in range(retries + 1):
         try:
@@ -179,11 +257,16 @@ def ask(c, retries=1):
                     return j
                 last = j
             except json.JSONDecodeError:
-                last = {"error": r.stdout[-300:]}
+                # stdout 不是 JSON 时真错误往往在 stderr（启动 panic 等），一起带上才不瞎猜
+                err = r.stdout[-300:]
+                if r.stderr.strip():
+                    err += f" | stderr 尾部: {r.stderr.strip()[-200:]}"
+                last = {"error": err}
         else:
             # 🔴 标签要说清这是**进程非 0 退出后的 stderr 尾部**，不是「SQL 执行错误」。
             # stderr 上跑的是 tracing 日志，尾部经常正好是一行 `detail=?rules` 的 Debug dump ——
             # 实测有人（我）据此以为「内部结构泄进了用户可见错误」，白查了一轮。
+            # 截 300 字：够装最近几行 tracing；三处截断长度不同是刻意的（详见 gate_verdict/run_case 处注释）。
             last = {"error": f"进程非 0 退出，stderr 尾部：{r.stderr.strip()[-300:]}"}
     return last
 
@@ -245,54 +328,68 @@ def check(c, j):
         g = golden_check(c["name"], sql)
         if g:
             fails.append(g)
-    if c.get("min_rows") and j.get("row_count", len(j.get("rows", []))) < c["min_rows"]:
-        fails.append(f"行数{j.get('row_count')}<{c['min_rows']}")
+    if c.get("min_rows"):
+        # 实际行数先存变量：取值与报错文案都用它，免得 row_count 缺席时打出「行数None<5」
+        actual_rows = j.get("row_count", len(j.get("rows", [])))
+        if actual_rows < c["min_rows"]:
+            fails.append(f"行数{actual_rows}<{c['min_rows']}")
     if c.get("min_cols") and len(j.get("columns", [])) < c["min_cols"]:
         fails.append(f"列数{len(j.get('columns', []))}<{c['min_cols']}")
     blocks = (j.get("view") or {}).get("blocks", [])
+    # 畸形响应（block 不是 dict）不得 AttributeError 崩，按「缺该属性」判红
+    b0 = blocks[0] if blocks and isinstance(blocks[0], dict) else {}
     if c.get("view0"):
-        t0 = blocks[0].get("type") if blocks else None
+        t0 = b0.get("type") if blocks else None
         if t0 != c["view0"]:
             fails.append(f"view0={t0}≠{c['view0']}")
     if c.get("chart_kind"):
-        k0 = blocks[0].get("kind") if blocks else None
+        k0 = b0.get("kind") if blocks else None
         if k0 != c["chart_kind"]:
             fails.append(f"chart={k0}≠{c['chart_kind']}")
     # 多序列（类别列下标）。用 `in c` 而不是 `c.get(...)`：合法期望值含 **0**（第 0 列是类别列）
     # 与 **None**（「必须没有 series」），两个都是 falsy —— `if c.get()` 会把这两档静默跳过，
     # 那正好把本判据变成恒过。`series` 键本身带 `skip_serializing_if` 故缺席即 None。
     if "chart_series" in c:
-        s0 = blocks[0].get("series") if blocks else None
+        s0 = b0.get("series") if blocks else None
         if s0 != c["chart_series"]:
             fails.append(f"series={s0}≠{c['chart_series']}")
-    raw = json.dumps(j, ensure_ascii=False)
-    for frag in c.get("json_contains", []):
-        if frag not in raw:
-            fails.append(f"JSON缺[{frag}]")
-    entity_fields = {
-        str(pair[0])
-        for block in blocks if isinstance(block, dict) and block.get("type") == "entity"
-        for pair in block.get("pairs", []) if isinstance(pair, list) and pair
-    }
-    kpi_labels = {
-        str(item.get("label", ""))
-        for block in blocks if isinstance(block, dict) and block.get("type") == "kpis"
-        for item in block.get("items", []) if isinstance(item, dict)
-    }
-    columns = {str(x) for x in j.get("columns", [])}
-    drills = [str(x) for x in ((j.get("view") or {}).get("interact") or {}).get("drill", [])]
-    for field in c.get("entity_fields", []):
-        if field not in entity_fields:
-            fails.append(f"实体卡缺字段[{field}]")
-    for label in c.get("kpi_labels", []):
-        if not any(label in actual for actual in kpi_labels):
-            fails.append(f"KPI缺[{label}]")
-    for column in c.get("columns_contains", []):
-        if column not in columns:
-            fails.append(f"明细列缺[{column}]")
-    for drill in c.get("drill_contains", []):
-        if not any(drill in actual for actual in drills):
-            fails.append(f"下钻缺[{drill}]")
+    if c.get("json_contains"):
+        raw = json.dumps(j, ensure_ascii=False)     # 只在真用时才序列化整份结果
+        for frag in c["json_contains"]:
+            if frag not in raw:
+                fails.append(f"JSON缺[{frag}]")
+    # 四个合同集合惰性构建：多数题一个都不用，别白遍历 blocks。
+    # 匹配语义刻意分两档：entity_fields/columns_contains **精确**匹配（字段名/列名是离散值，
+    # 子串会把「客户」放进「客户编码」里假绿）；kpi_labels/drill_contains **子串**匹配
+    # （label/下钻标题常带数值等变化后缀，题集只写稳定前缀）。加新键前先想好归哪档。
+    if c.get("entity_fields"):
+        entity_fields = {
+            str(pair[0])
+            for block in blocks if isinstance(block, dict) and block.get("type") == "entity"
+            for pair in block.get("pairs", []) if isinstance(pair, list) and pair
+        }
+        for field in c["entity_fields"]:
+            if field not in entity_fields:
+                fails.append(f"实体卡缺字段[{field}]")
+    if c.get("kpi_labels"):
+        kpi_labels = {
+            str(item.get("label", ""))
+            for block in blocks if isinstance(block, dict) and block.get("type") == "kpis"
+            for item in block.get("items", []) if isinstance(item, dict)
+        }
+        for label in c["kpi_labels"]:
+            if not any(label in actual for actual in kpi_labels):
+                fails.append(f"KPI缺[{label}]")
+    if c.get("columns_contains"):
+        columns = {str(x) for x in j.get("columns", [])}
+        for column in c["columns_contains"]:
+            if column not in columns:
+                fails.append(f"明细列缺[{column}]")
+    if c.get("drill_contains"):
+        drills = [str(x) for x in ((j.get("view") or {}).get("interact") or {}).get("drill", [])]
+        for drill in c["drill_contains"]:
+            if not any(drill in actual for actual in drills):
+                fails.append(f"下钻缺[{drill}]")
     return fails
 
 
@@ -308,11 +405,15 @@ def gate_verdict(sql):
     `exec-sql` 走的是真闸门（实测 `information_schema` 被它拒了），所以喂什么就判什么，
     与 LLM 无关。这是闸门**第一次真的开火**。
     """
-    r = subprocess.run(cli("exec-sql", "admin", sql), capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", cwd=str(ROOT))
+    # gate 题卡死（LLM 无关，但也可能死在启动探针/连接上）不许挂住整轮：超时按红处理
+    try:
+        r = subprocess.run(cli("exec-sql", "admin", sql), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", cwd=str(ROOT), timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, "闸门调用超时（超过 60 秒未返回，按红处理，不许挂住整轮）"
     out = (r.stdout or "") + (r.stderr or "")
     # 显示只取最后一行：启动时的 sqlx notice 有几十行，取前 N 字符只会看到「schema meta already exists」
-    tail = next((l for l in reversed(out.strip().splitlines()) if l.strip()), "")[:110]
+    tail = next((l for l in reversed(out.strip().splitlines()) if l.strip()), "")[:110]  # 110: 闸门文案一行够用
     if r.returncode == 0:
         return False, f"闸门**放过**了 {sql[:40]!r} —— 退出码 0，尾行 {tail!r}"
     # 闸门自己的文案（`kernel/errors.rs::GuardError` 的 Display）。DELETE/TRUNCATE/DROP
@@ -329,6 +430,12 @@ def gate_verdict(sql):
     return True, f"闸门拒绝 · {tail}"
 
 
+def _retries(c):
+    """LLM 路径非确定 → 重试 1 次（旧项目惯例）。run_case 与 bless 两处共用同一口径，
+    别改一处漏一处（redline 题也走 LLM 问句，同样享这一次重试）。"""
+    return 1 if (c.get("llm") or c.get("type") == "redline") else 0
+
+
 def run_case(c, results):
     name = c["name"]
     if c.get("requires_embed") and not EMBED_UP:
@@ -341,7 +448,7 @@ def run_case(c, results):
         results.append((name, ok, detail))
         return
 
-    j = ask(c, retries=1 if (c.get("llm") or c.get("type") == "redline") else 0)
+    j = ask(c, retries=_retries(c))
     sql = j.get("sql", "") or ""
 
     if c.get("type") == "redline":
@@ -350,13 +457,14 @@ def run_case(c, results):
         return
 
     if "error" in j and not j.get("columns"):
+        # detail 只带错误头部 120 字：完整尾部已在 ask() 里截好，这里只是单行摘要
         results.append((name, False, f"执行错误: {j['error'][:120]}")); return
 
     fails = check(c, j)
-    detail = f"route={j.get('route')} {j.get('elapsed_ms')}ms" + (" · " + ";".join(fails) if fails else "")
+    detail = f"route={j.get('route')} {j.get('elapsed_ms', '?')}ms" + (" · " + ";".join(fails) if fails else "")
     results.append((name, not fails, detail))
     # 供关系断言取数
-    if j.get("rows") and j["rows"] and j["rows"][0]:
+    if j.get("rows") and j["rows"][0]:
         try:
             VALUES[name] = float(j["rows"][0][0])
         except (TypeError, ValueError):
@@ -381,6 +489,22 @@ def redline_verdict(sql):
     if toks[0] not in ("select", "with"):
         bad.append(f"首token={toks[0]}")
     return not bad, f"sql_dml={bad or '无'}"
+
+
+def rule_verdict(rule, values):
+    """一条 lt 关系断言 → (名称, ok, detail)（**纯函数**，selfcheck 直接验它）。
+    preflight（key_errors）已保证 lt 是二元列表且两个题名都在题集里。"""
+    a, b = rule["lt"]
+    # rule 的 note 从前登记了却从不打印（登记而不消费 = 假绿）：判红/判过时拼进 detail
+    rnote = f" · note: {rule['note']}" if rule.get("note") else ""
+    if a in values and b in values:
+        # 🔴 受限方为 0 也算「看到的是子集」：月初/冷档期里受限用户合法无单，
+        # 硬要 >0 等于把「没数据」判成「泄露了」（2026-08-01 实测 D01=0 假红）。
+        # 真正的泄露（未注入）会在有数据的期里给出 D01==A01 或 D01>A01，跑不掉。
+        ok = values[a] == 0 or values[a] < values[b]
+        note = "（受限方为 0：本月无单，视为不泄露子集）" if values[a] == 0 else ""
+        return f"R-{a}<{b}", ok, f"{values[a]:,.0f} < {values[b]:,.0f}{note}" + (rnote if not ok else "")
+    return f"R-{a}<{b}", None, f"取值缺失跳过{rnote}"
 
 
 def selfcheck():
@@ -417,7 +541,12 @@ def selfcheck():
     # ④ rules 只写 note 不写 lt → 红（登记而不消费，正是 preflight 自己要堵的洞）
     e = key_errors([], [{"note": "只写了说明"}])
     assert e and "lt" in e[0][1], e
-    assert not key_errors([], [{"lt": ["A", "B"], "note": "ok"}])
+    assert not key_errors([{**base, "name": "A"}, {**base, "name": "B"}], [{"lt": ["A", "B"], "note": "ok"}])
+    # ④b lt 形状/题名也要门禁住：非二元组会在消费处 ValueError 崩；题名打错恒落「取值缺失跳过」
+    e = key_errors([{**base}], [{"lt": ["X"]}])
+    assert e and "二元列表" in e[0][1], e
+    e = key_errors([{**base}], [{"lt": ["X", "不存在的题"]}])
+    assert e and "不在题集中" in e[0][1], e
     # ⑤ 红线 DML 探测器的**正反对照**。原来它结构上恒真：H01-H03 必然不产 SQL，
     # 于是 bad 恒空、恒判「守住」，探测器本身从没被验证过一次。
     assert redline_verdict("delete from t_sales_order")[0] is False
@@ -484,15 +613,53 @@ def selfcheck():
     ]:
         f = check({**base, key: value}, rich)
         assert len(f) == 1 and marker in f[0], (key, f)
-    print("selfcheck 通过: 未知键 / rules 未知键+缺 lt / redline 静默断言 / "
+    # ⑨ 必需 meta 键：缺 name/login/q 从前是 run_case 里 KeyError traceback，现在门禁先说清楚
+    e = key_errors([{"login": "a", "q": "b"}], [])
+    assert e and "缺必需键 name" in e[0][1], e
+    e = key_errors([{"name": "X"}], [])
+    assert e and "缺必需键 login" in e[0][1] and any("缺必需键 q" in m for _, m in e), e
+    assert not key_errors([{"name": "X", "type": "gate", "gate_sql": "DELETE FROM t"}], [])  # gate 题用不到 login/q
+    # ⑩ 未知旗标必须当场报错（`--fliter` 打错 = 不过滤跑全量，静默不得）
+    try:
+        _check_argv(["--fliter", "A01"])
+        raise AssertionError("未知旗标没被拦")
+    except SystemExit:
+        pass
+    _check_argv(["--filter", "A01", "--selfcheck"])              # 已知旗标不许误拦
+    # ⑪ gate 超时 → (False, 超时)，不许挂住整轮（mock 掉 subprocess.run 自证）
+    orig_run = subprocess.run
+    def _boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="x", timeout=60)
+    subprocess.run = _boom
+    try:
+        ok, msg = gate_verdict("SELECT 1")
+    finally:
+        subprocess.run = orig_run
+    assert ok is False and "超时" in msg, (ok, msg)
+    # ⑫ rule 的 note 必须真的进 detail（登记而不消费 = 假绿），且只在判红/判过时拼
+    n, ok, d = rule_verdict({"lt": ["A", "B"], "note": "为什么"}, {"A": 5.0, "B": 3.0})
+    assert ok is False and "为什么" in d, (n, ok, d)
+    n, ok, d = rule_verdict({"lt": ["A", "B"], "note": "为什么"}, {"A": 1.0, "B": 3.0})
+    assert ok is True and "为什么" not in d, (n, ok, d)
+    n, ok, d = rule_verdict({"lt": ["A", "B"], "note": "为什么"}, {})
+    assert ok is None and "取值缺失跳过" in d and "为什么" in d, (n, ok, d)
+    print("selfcheck 通过: 未知键 / rules 未知键+缺 lt+lt 形状与题名校验 / redline 静默断言 / "
           "DML 探测器正反对照 / 无 SQL 第三态 / 金文件缺失 / 金文件不一致 / "
           "两轮题 prev 进 argv + 两个静默退化陷阱 / "
-          "chart_series 的 0 与 None 两档 / 实体详情四层合同 全部会红")
+          "chart_series 的 0 与 None 两档 / 实体详情四层合同 / "
+          "缺必需 meta 键 / 未知旗标拦截 / gate 超时判红 / rule note 进 detail 全部会红")
 
 
 if "--selfcheck" in argv:
     selfcheck()
     sys.exit(0)
+
+# 题集在 --selfcheck 之后才加载：自检不读题集，题集坏了不该连自检都跑不了。
+# 缺文件/JSON 语法错给友好提示（「题集坏了」和「判官坏了」要分得清），不抛 traceback。
+try:
+    CASES = json.loads(CASES_PATH.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as e:
+    sys.exit(f"题集读取失败：{CASES_PATH}（{e}）")
 
 # preflight 故意**不受 --filter 影响**：拼错的键在任何一题里都是一条恒过的假断言，
 # 哪怕这轮没跑到那题也要拦。
@@ -502,16 +669,21 @@ if kerrs:
     for n, msg in kerrs:
         print(f"   {n}: {msg}")
     print("   可用键: " + " ".join(sorted(KNOWN)))
+    print("退出码 2 = 门没开（题集本身有问题），不是题红了")
     sys.exit(2)
 
 if "--bless" in argv or "--bless-all" in argv:
+    if "--bless" in argv and "--bless-all" in argv:
+        sys.exit("--bless 与 --bless-all 只能二选一（同时给谁生效不该靠猜）")
     picked = opt("--bless")
+    if picked is not None and not picked:
+        sys.exit("--bless 题名不能为空（空串会静默退化成 --bless-all 语义，那是写操作）")
     # --bless-all 只碰声明了 sql_golden 的题：否则会给 55 题全都刷出金文件，谁都不看的文件不如没有。
     targets = [c for c in CASES["cases"] if (c["name"] == picked if picked else c.get("sql_golden"))]
     if not targets:
         print("没匹配到题（--bless 要题名精确匹配；--bless-all 只处理声明了 sql_golden 的题）")
         sys.exit(2)
-    exists = [c for c in targets if (GOLDEN / f"{c['name']}.sql").exists()]
+    exists = [c for c in targets if _golden_path(c["name"]).exists()]
     print(f"这会覆盖 {len(exists)} 个金文件，另新建 {len(targets) - len(exists)} 个:")
     for c in targets:
         print(f"   {'覆盖' if c in exists else '新建'} {c['name']}.sql" +
@@ -521,9 +693,10 @@ if "--bless" in argv or "--bless-all" in argv:
         sys.exit(2)
     GOLDEN.mkdir(exist_ok=True)
     for c in targets:
-        j = ask(c, retries=1 if c.get("llm") else 0)
+        j = ask(c, retries=_retries(c))
         if not j.get("sql"):
-            print(f"❌ {c['name']} 没拿到 SQL（{str(j.get('error'))[:100]}）→ 不写，保留旧金文件")
+            err = f"（{str(j.get('error'))[:100]}）" if j.get("error") else ""
+            print(f"❌ {c['name']} 没拿到 SQL{err} → 不写，保留旧金文件")
             continue
         # 🔴 路由不符就不许写金文件。实测翻车：B10 的 route 在 `direct-agg`（硬编码模板，
         # 那条 SQL 本身要 ~28s）与 `llm`（超时降级）之间抖，bless 那一刻它正落在 llm 路，
@@ -535,7 +708,7 @@ if "--bless" in argv or "--bless-all" in argv:
             print(f"❌ {c['name']} 实际 route={j.get('route')} ≠ 声明 {want} → 不写"
                   f"（会抖路由的题不该钉金 SQL；重试或去掉该题的 sql_golden）")
             continue
-        (GOLDEN / f"{c['name']}.sql").write_text(j["sql"].strip() + "\n", encoding="utf-8")
+        _golden_path(c["name"]).write_text(j["sql"].strip() + "\n", encoding="utf-8")
         print(f"✅ 写入 {c['name']}.sql")
     sys.exit(0)
 
@@ -545,10 +718,10 @@ def _embed_port():
         url = json.loads((ROOT / "settings.json").read_text(encoding="utf-8")).get("service_url", "")
         return int(url.rsplit(":", 1)[1].strip("/"))
     except Exception:
+        # 回落本身也是静默的一种：说出来，免得又变成「题被悄悄跳过」
+        print("settings.json 无 service_url，embed 端口按 8077 探测", flush=True)
         return 8077
 
-EMBED_UP = service_up(_embed_port())
-GRAPH_UP = graph_up()
 VALUES = {}
 results = []
 flt = opt("--filter")
@@ -567,7 +740,14 @@ if flt and not any(flt in c["name"] for c in CASES["cases"]):
     sys.exit(2)
 
 selected = CASES["cases"][slice_start - 1:slice_end]
-print(f"embed={'up' if EMBED_UP else 'DOWN'} graph={'up' if GRAPH_UP else 'DOWN'} 题数={len(selected)}")
+# 依赖探测惰性化：本轮真要跑的题没人需要 embed/graph 时，那次 docker ps（~0.3-1s）不白跑。
+# None = 未探测（没有题引用它），run_case 里的跳过判断因此永远不会被误触发。
+torun = [c for c in selected if not flt or flt in c["name"]]
+EMBED_UP = service_up(_embed_port()) if any(c.get("requires_embed") for c in torun) else None
+GRAPH_UP = graph_up() if any(c.get("requires_graph") for c in torun) else None
+_up = lambda flag: "—" if flag is None else ("up" if flag else "DOWN")
+print(f"embed={_up(EMBED_UP)} graph={_up(GRAPH_UP)} 题数={len(selected)}")
+t0 = time.monotonic()
 for c in selected:
     if flt and flt not in c["name"]:
         continue
@@ -580,16 +760,7 @@ for c in selected:
 
 for rule in CASES.get("rules", []):
     if "lt" in rule:
-        a, b = rule["lt"]
-        if a in VALUES and b in VALUES:
-            # 🔴 受限方为 0 也算「看到的是子集」：月初/冷档期里受限用户合法无单，
-            # 硬要 >0 等于把「没数据」判成「泄露了」（2026-08-01 实测 D01=0 假红）。
-            # 真正的泄露（未注入）会在有数据的期里给出 D01==A01 或 D01>A01，跑不掉。
-            ok = VALUES[a] == 0 or VALUES[a] < VALUES[b]
-            note = "（受限方为 0：本月无单，视为不泄露子集）" if VALUES[a] == 0 else ""
-            results.append((f"R-{a}<{b}", ok, f"{VALUES[a]:,.0f} < {VALUES[b]:,.0f}{note}"))
-        else:
-            results.append((f"R-{a}<{b}", None, "取值缺失跳过"))
+        results.append(rule_verdict(rule, VALUES))
 
 print("=" * 60)
 skipped = [x for x in results if x[1] is None]
@@ -606,12 +777,13 @@ for name, ok, detail in results:
     if ok is False and NOTES.get(name):
         print(f"     ↳ note: {NOTES[name]}")
 print("=" * 60)
-print(f"执行 {len(results)} 项 / 通过 {len(passed)} / 失败 {len(fails)} / 跳过 {len(skipped)}")
+print(f"执行 {len(results)} 项 / 通过 {len(passed)} / 失败 {len(fails)} / 跳过 {len(skipped)}"
+      f" · 耗时={time.monotonic() - t0:.0f}s")
 # 🔴 反空转闸（抄 kb_eval.py 的口径，评审抓到这里原先没有）：
 # 实测原行为 `--filter __no_such_case__` → 「通过 0 / 失败 0 / 跳过 1」→ **exit 0**。
 # 「55 题门禁全绿」可以是「命令行打错一个字、一题没跑」；requires_graph/requires_embed
 # 依赖缺席时相关题全跳过也照样给 0。0 题通过一律非 0（2 = 门没开，与 1 = 题红了分开）。
 if not passed:
-    print("❌ 一题都没通过（0 项执行 / 全部跳过 / --filter 打错）—— 这不构成「全绿」")
+    print("❌ 一题都没通过（0 项执行 / 全部跳过）—— 这不构成「全绿」")
     sys.exit(1 if fails else 2)
 sys.exit(1 if fails else 0)

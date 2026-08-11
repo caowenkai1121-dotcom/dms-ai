@@ -40,6 +40,8 @@ fn lock() -> MutexGuard<'static, Map> {
 
 /// `t_role_data_scope` 该 role_id 全部行的指纹（行数 + 全部 `(data_scope_type, view_type)`）。
 /// 先排序再哈希：行序由 MySQL 决定，不排序会让同一份配置算出两个版本号 = 永不命中。
+/// `DefaultHasher::new()` 不保证跨 Rust 版本稳定 —— `ver` 只需进程内一致：
+/// 不得把它持久化、也不得跨进程比较。
 pub fn scope_ver(rows: &[(i32, i32)]) -> u64 {
     let mut sorted = rows.to_vec();
     sorted.sort_unstable();
@@ -60,15 +62,27 @@ pub fn key(p: &Principal, ds: &DsId, rows: &[(i32, i32)]) -> Key {
 /// 命中且未过期才返回；过期条目顺手删掉（惰性清理，没有后台任务）
 pub fn get(k: &Key) -> Option<Scope> {
     let mut m = lock();
-    if matches!(m.get(k), Some((_, at)) if at.elapsed() < TTL) {
-        return m.get(k).map(|(s, _)| s.clone());
+    match m.get(k) {
+        Some((_, at)) if at.elapsed() < TTL => m.get(k).map(|(s, _)| s.clone()),
+        Some(_) => {
+            m.remove(k);
+            None
+        }
+        None => None,
     }
-    m.remove(k);
-    None
 }
 
+/// 每 64 次 put 顺手扫一次过期条目：否则过期项只在同 key 的 get 时惰性删除，
+/// 多用户×多版本下 Map 内存只涨不缩
+const SWEEP_EVERY_PUTS: usize = 64;
+static PUTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub fn put(k: Key, scope: &Scope) {
-    lock().insert(k, (scope.clone(), Instant::now()));
+    let mut m = lock();
+    m.insert(k, (scope.clone(), Instant::now()));
+    if PUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SWEEP_EVERY_PUTS == SWEEP_EVERY_PUTS - 1 {
+        m.retain(|_, (_, at)| at.elapsed() < TTL);
+    }
 }
 
 /// 显式失效（管理面 `scope invalidate <login> [role]`）。`role=None` 清该登录名下全部
@@ -77,7 +91,12 @@ pub fn invalidate(login: &str, role: Option<&str>) -> usize {
     let mut m = lock();
     let before = m.len();
     m.retain(|k, _| !(k.login == login && role.map_or(true, |r| k.role == r)));
-    before - m.len()
+    let n = before - m.len();
+    if n == 0 {
+        // 清 0 条多半是 login 大小写/拼写与管理面输入不符 —— 不吭声会让运维以为清了
+        tracing::warn!(login, "scope invalidate 未清掉任何条目");
+    }
+    n
 }
 
 pub fn invalidate_all() -> usize {

@@ -5,15 +5,31 @@
 //! （见 `resolve_identity_dual` 的接线契约；key 常量时间比较、错 key fail-closed 不降级）。
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
 
 use dms_connector::mysql::ReadOnlyMySql;
 
-const TTL_SECS: u64 = 12 * 3600; // 12h 闲置过期（对齐旧项目）
+// 12h 闲置过期（对齐旧项目）。⚠️ 纯滑动续期、**无绝对上限**：定时探活可让一张 token
+// 永久不过期 —— 这是有意对齐旧项目的取舍（会话可被 revoke，敏感面另有判据兜底）；
+// 要加绝对上限需给 Session 增 issued_at 并迁移存量会话，留给会话体系改造一并做。
+const TTL_SECS: u64 = 12 * 3600;
 const MAX_LOGIN_LEN: usize = 30;
 const MAX_ROLE_LEN: usize = 64;
 const MAX_PASSWORD_LEN: usize = 256;
-const MAX_UPSTREAM_TOKEN_LEN: usize = 4096;
+/// 上游 token 长度闸（ SSO 与 xcx 同一条，xcx 侧作缓存 key 前也用它挡异常体量）
+pub const MAX_UPSTREAM_TOKEN_LEN: usize = 4096;
+/// 上游身份头（getLoginInfo 的 token 载体）：SSO 验真与 xcx 校验共用同一字面量，
+/// 改协议只许改这一处（两处各写一份必漂）
+pub const UPSTREAM_TOKEN_HEADER: &str = "x-access-token";
+/// 无验证码登录的失败窗口：窗口内最大失败次数与窗口长度（秒）
+const LOGIN_FAIL_MAX: u8 = 5;
+const LOGIN_FAIL_WINDOW_SECS: u64 = 300;
+/// 失败计数表容量帽与 key 截断：喷洒唯一/超长账号名不许让这张表无界增长
+///（与 IP_RATE_CAP 同一取舍：满员先清扫过期窗口，仍满则放行不记账 —— 防暴力闸自身不能成为 DoS 面）
+const LOGIN_FAIL_CAP: usize = 4096;
+const MAX_FAIL_KEY_LEN: usize = 64;
+/// 会话表容量帽：满员先清扫过期项，仍满淘汰最早过期者（见 `make_room`）
+const SESSION_CAP: usize = 1000;
 
 #[derive(Clone)]
 pub struct Session {
@@ -39,7 +55,7 @@ pub struct ResolvedSession {
 
 type Sessions = HashMap<String, Session>;
 static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
-static LOGIN_FAILS: OnceLock<Mutex<HashMap<String, (u8, u64)>>> = OnceLock::new();
+static LOGIN_FAILS: OnceLock<Mutex<LoginFailLimiter>> = OnceLock::new();
 
 const DMS_PASSWORD_SQL: &str = "SELECT login_name, administrator_flag FROM t_employee \
     WHERE login_name = ? AND login_pwd = MD5(CONCAT('smart_', ?, '_admin_$^&*')) \
@@ -91,26 +107,69 @@ pub async fn active_identity(
 }
 
 /// 无验证码登录的最小防暴力措施：同一账号 5 分钟内最多失败 5 次；成功即清零。
-pub fn login_allowed(login_name: &str) -> bool {
-    let key = login_name.trim().to_ascii_lowercase();
-    let now = now();
-    let mut fails = LOGIN_FAILS.get_or_init(|| Mutex::new(HashMap::new())).lock().expect("login fail lock");
-    match fails.get(&key) {
-        Some((n, until)) if *until > now => *n < 5,
-        Some(_) => { fails.remove(&key); true }
-        None => true,
+/// 结构体独立出来是为了单测能建私有实例（与 IpRateLimiter 同模子：进程级单例共享会让用例互相污染）。
+#[derive(Default)]
+struct LoginFailLimiter {
+    /// login（小写、截断）→ (窗口内失败次数, 窗口截止 epoch 秒)
+    map: HashMap<String, (u8, u64)>,
+}
+
+impl LoginFailLimiter {
+    /// map key：小写 + 截断 —— 喷洒超长/唯一账号名不许产出无界 key
+    fn key(login_name: &str) -> String {
+        login_name.trim().to_ascii_lowercase().chars().take(MAX_FAIL_KEY_LEN).collect()
+    }
+
+    fn allowed(&mut self, login_name: &str, now: u64) -> bool {
+        let key = Self::key(login_name);
+        match self.map.get(&key) {
+            Some((n, until)) if *until > now => *n < LOGIN_FAIL_MAX,
+            Some(_) => {
+                self.map.remove(&key);
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn record(&mut self, login_name: &str, ok: bool, now: u64) {
+        let key = Self::key(login_name);
+        if ok {
+            self.map.remove(&key);
+            return;
+        }
+        match self.map.get_mut(&key) {
+            // 窗口内：累加
+            Some(e) if e.1 > now => e.0 = e.0.saturating_add(1),
+            // 窗口已过期（或无记录）：整体重开一扇 —— 不许带着过期窗口的旧计数累加，
+            // 否则窗口语义靠「下次 allowed 顺手删除」才自愈，判定先漂移一轮
+            _ => {
+                if self.map.len() >= LOGIN_FAIL_CAP {
+                    self.map.retain(|_, (_, until)| *until > now);
+                    if self.map.len() >= LOGIN_FAIL_CAP {
+                        return; // 容量帽打满：放行不记账（同 IP_RATE_CAP 注释的取舍）
+                    }
+                }
+                self.map.insert(key, (1, now + LOGIN_FAIL_WINDOW_SECS));
+            }
+        }
     }
 }
 
+pub fn login_allowed(login_name: &str) -> bool {
+    LOGIN_FAILS
+        .get_or_init(|| Mutex::new(LoginFailLimiter::default()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) // 锁中毒自愈：一次 panic 不许永久打挂登录
+        .allowed(login_name, now())
+}
+
 pub fn record_login(login_name: &str, ok: bool) {
-    let key = login_name.trim().to_ascii_lowercase();
-    let mut fails = LOGIN_FAILS.get_or_init(|| Mutex::new(HashMap::new())).lock().expect("login fail lock");
-    if ok {
-        fails.remove(&key);
-    } else {
-        let e = fails.entry(key).or_insert((0, now() + 300));
-        e.0 = e.0.saturating_add(1);
-    }
+    LOGIN_FAILS
+        .get_or_init(|| Mutex::new(LoginFailLimiter::default()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .record(login_name, ok, now());
 }
 
 // ─────────────────────── 公开端点 per-IP 限流 ───────────────────────
@@ -168,8 +227,12 @@ static IP_RATE: OnceLock<Mutex<IpRateLimiter>> = OnceLock::new();
 
 /// 公开端点 per-IP 限流：同一 IP 每分钟 20 次，超出 false（调用方回 429）。
 ///
-/// ## 接线契约（编排方在 main.rs 的 api_login / api_sso / api_wework_start /
-/// api_wework_login 首段接线；本包不改 main.rs）
+/// ## 接线契约（编排方在 main.rs 首段接线；本包不改 main.rs）
+///
+/// 已接线：`api_login`、`api_sso` 首段 + xcx 侧 `require_identity`（ask / me 共用）。
+/// ⚠️ `api_wework_start` / `api_wework_login` 两个企微公开端点**至今未接**（企微链路
+/// 有上游 code 换签兜底，喷洒面小于密码端点；本注释早前写「已接」是文档超前于实现）。
+/// 要接就是下面两行：
 ///
 /// ```ignore
 /// let ip = auth::client_ip(&headers); // 各 handler 需补 `headers: HeaderMap` 提取器
@@ -177,12 +240,11 @@ static IP_RATE: OnceLock<Mutex<IpRateLimiter>> = OnceLock::new();
 ///     return Err(err(StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后重试"));
 /// }
 /// ```
-/// xcx 侧已在 `xcx_api::require_identity` 接线（ask / me 两个端点共用）。
 pub fn ip_rate_allow(ip: &str) -> bool {
     IP_RATE
         .get_or_init(|| Mutex::new(IpRateLimiter { map: HashMap::new() }))
         .lock()
-        .expect("ip rate lock")
+        .unwrap_or_else(PoisonError::into_inner)
         .allow(ip, now())
 }
 
@@ -204,31 +266,50 @@ pub fn client_ip(headers: &axum::http::HeaderMap) -> String {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         });
-    // 截断防异常体量当 map key（IPv6 文本也就 45 字符，64 足够）
-    raw.unwrap_or("unknown").chars().take(64).collect()
+    // 截断防异常体量当 map key（IPv6 文本也就 45 字符，64 足够）；
+    // 无头请求的 "unknown" 直接给静态串，不白付一次 collect 分配
+    match raw {
+        Some(ip) => ip.chars().take(64).collect(),
+        None => "unknown".to_string(),
+    }
 }
 
 fn now() -> u64 {
-    std::time::SystemTime::now()
+    // unwrap_or(0)：时钟回拨到 1970 之前时，限流窗口/过期判定会按 epoch 0 失真 —— 接受
+    // 这个取舍（真发生时机器时间已坏到 TLS 都验不过，限流失真不是最紧要的问题）
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    debug_assert!(secs > 0, "系统时钟在 1970 之前？");
+    secs
+}
+
+/// 单遍归一校验：一趟同时计长与查控制字符（原先 count + any 要扫两遍）
+fn normalized_field(value: &str, max: usize) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut n = 0usize;
+    for c in value.chars() {
+        if c.is_control() {
+            return None;
+        }
+        n += 1;
+        if n > max {
+            return None;
+        }
+    }
+    Some(value)
 }
 
 pub fn normalized_login(value: &str) -> Option<&str> {
-    let value = value.trim();
-    (!value.is_empty()
-        && value.chars().count() <= MAX_LOGIN_LEN
-        && !value.chars().any(char::is_control))
-    .then_some(value)
+    normalized_field(value, MAX_LOGIN_LEN)
 }
 
 pub fn normalized_role(value: &str) -> Option<&str> {
-    let value = value.trim();
-    (!value.is_empty()
-        && value.chars().count() <= MAX_ROLE_LEN
-        && !value.chars().any(char::is_control))
-    .then_some(value)
+    normalized_field(value, MAX_ROLE_LEN)
 }
 
 /// 颁发会话 token。锁异常时不得返回未落入会话表的“假成功” token。
@@ -256,9 +337,7 @@ pub fn issue_from(
     let sessions = SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = sessions.lock().map_err(|_| anyhow::anyhow!("会话服务暂不可用"))?;
     let t = now();
-    if map.len() > 1000 {
-        map.retain(|_, s| s.expiry > t);
-    }
+    make_room(&mut map, t);
     map.insert(
         token.clone(),
         Session { login_name, role_code, source, expiry: t + TTL_SECS },
@@ -266,9 +345,29 @@ pub fn issue_from(
     Ok(token)
 }
 
+/// 会话表容量帽：满员先清扫过期项；仍满（全是活会话）淘汰最早过期者 ——
+/// 表无界涨比挤掉一个会话更糟（对照 IP_RATE_CAP 的取舍：登录可用性优先，
+/// 被淘汰者无非是提前重新登录一次）。
+fn make_room(map: &mut Sessions, t: u64) {
+    if map.len() < SESSION_CAP {
+        return;
+    }
+    map.retain(|_, s| s.expiry > t);
+    while map.len() >= SESSION_CAP {
+        let Some(oldest) = map.iter().min_by_key(|(_, s)| s.expiry).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
 /// 角色换签后撤销旧 token，避免旧角色会话继续并行生效。
 pub fn revoke(token: &str) {
-    if let Ok(mut map) = SESSIONS.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+    // 用 get 不用 get_or_init：从未颁发过会话的进程里调 revoke 不该白初始化一张空表
+    let Some(sessions) = SESSIONS.get() else {
+        return;
+    };
+    if let Ok(mut map) = sessions.lock() {
         map.remove(token);
     }
 }
@@ -432,7 +531,7 @@ pub async fn load_principal(
 ) -> anyhow::Result<crate::dms_policy_core::Principal> {
     let (skip_password_expiry, role_code) = match role_code {
         Some(role) if role.starts_with(FEDERATED_ROLE_PREFIX) => {
-            let role = role.strip_prefix(FEDERATED_ROLE_PREFIX).unwrap_or_default();
+            let role = role.strip_prefix(FEDERATED_ROLE_PREFIX).expect("starts_with 已判");
             (true, (!role.is_empty()).then_some(role))
         }
         role => (false, role),
@@ -466,7 +565,6 @@ pub async fn load_principal(
     // == 'admin'` 双入口同权（scope.rs::admin_shortcut 对齐 Java L93-98/L236-243），角色管理
     // 页里「管理员」角色的数据范围本来就是「全部」。之前这道过滤比被对齐的源系统更严，
     // 把合法 admin 角色持有者打成「无可用角色」（云帆案例，2026-08-10）。
-    let roles: Vec<(i64, String)> = roles;
     let (role_id, role_code) = match role_code {
         Some("admin") if administrator_flag && roles.is_empty() => (0, "admin".into()),
         Some(role) => roles
@@ -492,6 +590,15 @@ pub async fn load_principal(
     })
 }
 
+/// SSO 验真专用静态客户端：复用连接池与 TLS 上下文（xcx_api 的 HTTP 单例同款范式；
+/// 每次 SSO 登录新建客户端 = 每次重建 TLS 上下文）
+static DMS_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("DMS HTTP 客户端（仅配超时，构建不可失败）")
+});
+
 /// 验真 DMS token：调 getLoginInfo，返回 login_name（证明该 token 属于谁）
 pub async fn verify_dms_token(dms_base: &str, dms_token: &str) -> anyhow::Result<String> {
     let dms_token = dms_token.trim();
@@ -499,25 +606,29 @@ pub async fn verify_dms_token(dms_base: &str, dms_token: &str) -> anyhow::Result
         !dms_token.is_empty() && dms_token.len() <= MAX_UPSTREAM_TOKEN_LEN,
         "DMS token 无效"
     );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|_| anyhow::anyhow!("DMS 身份服务不可用"))?;
     let url = format!("{}/login/getLoginInfo", dms_base.trim_end_matches('/'));
-    let resp = client
+    // map_err 收敛文案前一律 warn 留真因（对齐 xcx 侧 fetch_identity 每个失败分支都留痕）
+    let resp = DMS_HTTP
         .get(&url)
-        .header("x-access-token", dms_token)
+        .header(UPSTREAM_TOKEN_HEADER, dms_token)
         .send()
         .await
-        .map_err(|_| anyhow::anyhow!("DMS 身份服务不可用"))?;
+        .map_err(|e| {
+            tracing::warn!(reason = %e, "DMS getLoginInfo 请求失败（网络/超时）");
+            anyhow::anyhow!("DMS 身份服务不可用")
+        })?;
     let status = resp.status();
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|_| anyhow::anyhow!("DMS 身份服务响应无效"))?;
+    // 先判状态再解析 body：上游 401 回 HTML/空体时，「验真失败: HTTP 401」比「响应无效」好查
     if !status.is_success() {
         anyhow::bail!("DMS token 验真失败: HTTP {status}");
     }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| {
+            tracing::warn!(reason = %e, "DMS getLoginInfo 响应不是 JSON");
+            anyhow::anyhow!("DMS 身份服务响应无效")
+        })?;
     parse_dms_login_info(&v)
 }
 
@@ -540,36 +651,53 @@ fn parse_dms_login_info(v: &serde_json::Value) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
-        /// 身份加载收口守卫：server 任何文件不许直接调 policy 的 load_principal ——
+    /// 身份加载收口守卫：server 任何文件不许直接调 policy 的 load_principal ——
     /// SSO/企微会话的角色带 `__dms_federated_role__:` 前缀，只有本文件的 `load_principal`
     /// 会剥（深度报告/知识库曾因直调 policy 版而全线 403）。
     #[test]
     fn principal_loading_only_through_auth_module() {
         let mut offenders = Vec::new();
-        for entry in std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
-            .expect("src 目录")
-        {
-            let path = entry.expect("entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-            if name == "auth.rs" {
-                continue; // 本文件是收口本体
-            }
-            let body = std::fs::read_to_string(&path).expect("读源码");
-            // 测试模块里的判据文本/注释里的契约说明不算调用
-            let code = body.split("#[cfg(test)]").next().unwrap_or("");
-            for bad in ["dms_policy::principal::load_principal(", "use dms_policy::principal;"] {
-                if code.contains(bad) {
-                    offenders.push(format!("{}: {}", name, bad));
+        // 递归 walk：src/db/ 等子目录同样受守（非递归 read_dir 会漏掉它们）
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src 子目录") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                if name == "auth.rs" {
+                    continue; // 本文件是收口本体
+                }
+                let body = std::fs::read_to_string(&path).expect("读源码");
+                // 测试模块里的判据文本/注释里的契约说明不算调用
+                let code = body.split("#[cfg(test)]").next().expect("源文件必有前置段");
+                for bad in [
+                    "use dms_policy::principal;",
+                    "use dms_policy_core::principal",
+                    "dms_policy_core::principal::load_principal(",
+                ] {
+                    if code.contains(bad) {
+                        offenders.push(format!("{}: {}", name, bad));
+                    }
+                }
+                // 直调形态要区分 shim：`crate::dms_policy::…` 是 main.rs 的转发（= 本文件版），
+                // 只有不带 crate:: 前缀的 `dms_policy::…`（extern prelude 原名）才是真绕过
+                for (i, _) in code.match_indices("dms_policy::principal::load_principal(") {
+                    if !code[..i].ends_with("crate::") {
+                        offenders.push(format!("{}: dms_policy::principal::load_principal(", name));
+                    }
                 }
             }
         }
         assert!(offenders.is_empty(), "身份加载绕过 auth 收口: {offenders:?}");
     }
 
-#[test]
+    #[test]
     fn issue_resolve_roundtrip() {
         let tok = issue("admin".into(), Some("city_manager".into())).unwrap();
         let (ln, rc) = resolve(&tok).unwrap();
@@ -625,10 +753,73 @@ mod tests {
     #[test]
     fn login_failures_are_limited_and_success_clears_them() {
         let login = format!("limit-{}", uuid::Uuid::new_v4());
-        for _ in 0..5 { record_login(&login, false); }
+        for _ in 0..LOGIN_FAIL_MAX { record_login(&login, false); }
         assert!(!login_allowed(&login));
         record_login(&login, true);
         assert!(login_allowed(&login));
+    }
+
+    /// 失败窗口语义：窗口过期后再失败整体重开（不许带旧计数累加）；常量钉值
+    ///（改数值的人必须读常量上的注释再想一遍）
+    #[test]
+    fn login_fail_window_resets_after_expiry() {
+        assert_eq!(LOGIN_FAIL_MAX, 5);
+        assert_eq!(LOGIN_FAIL_WINDOW_SECS, 300);
+        let mut lim = LoginFailLimiter::default();
+        let t0 = 1_000_000;
+        for _ in 0..LOGIN_FAIL_MAX - 1 { lim.record("alice", false, t0); }
+        assert!(lim.allowed("alice", t0));
+        // 窗口过期后再失败：按新窗口第一次计，而不是在旧尸骸上累加封禁
+        let t1 = t0 + LOGIN_FAIL_WINDOW_SECS + 1;
+        lim.record("alice", false, t1);
+        assert!(lim.allowed("alice", t1), "过期窗口必须整体重置");
+        // 新窗口内打满才拒
+        for _ in 0..LOGIN_FAIL_MAX - 1 { lim.record("alice", false, t1); }
+        assert!(!lim.allowed("alice", t1));
+    }
+
+    /// key 截断 + 容量帽 fail-open：喷洒超长/唯一账号名不许让表无界涨
+    #[test]
+    fn login_fail_limiter_truncates_keys_and_fails_open_at_cap() {
+        let t0 = 1_000_000;
+        let mut lim = LoginFailLimiter::default();
+        // 超过 MAX_FAIL_KEY_LEN 截断：两个仅尾部不同的超长名落同一个桶
+        let long_a = format!("{}-a", "x".repeat(100));
+        let long_b = format!("{}-b", "x".repeat(100));
+        for _ in 0..LOGIN_FAIL_MAX { lim.record(&long_a, false, t0); }
+        assert!(!lim.allowed(&long_b, t0), "截断后同桶（防无界 key）");
+        // 容量帽：灌满全活窗口后新账号不记账（fail-open，同 IP_RATE_CAP 的取舍）
+        let mut lim2 = LoginFailLimiter::default();
+        for i in 0..LOGIN_FAIL_CAP { lim2.record(&format!("u{i}"), false, t0); }
+        assert_eq!(lim2.map.len(), LOGIN_FAIL_CAP);
+        lim2.record("brand-new", false, t0);
+        assert!(!lim2.map.contains_key("brand-new"), "帽满不记账");
+        assert!(lim2.allowed("brand-new", t0), "帽满放行 —— 限流器不许成为 DoS 面");
+    }
+
+    /// 会话容量帽：先清扫过期项；仍满（全活）淘汰最早过期者
+    #[test]
+    fn session_cap_sweeps_expired_then_evicts_earliest() {
+        let t0 = 1_000_000;
+        let mk = |expiry: u64| Session {
+            login_name: "u".into(),
+            role_code: None,
+            source: SessionSource::Password,
+            expiry,
+        };
+        // 全过期：清扫后全部腾出
+        let mut map: Sessions = (0..SESSION_CAP).map(|i| (format!("old-{i}"), mk(t0 - 1))).collect();
+        make_room(&mut map, t0);
+        assert!(map.is_empty(), "过期项应被清扫");
+        // 全活且恰好满员：淘汰最早过期者腾出一个空位，其余保住
+        let mut map: Sessions = (0..SESSION_CAP - 1)
+            .map(|i| (format!("hot-{i}"), mk(t0 + 100 + i as u64)))
+            .collect();
+        map.insert("victim".into(), mk(t0 + 10)); // 最早过期
+        make_room(&mut map, t0 + 5);
+        assert_eq!(map.len(), SESSION_CAP - 1, "淘汰一个最早过期者后回到帽内");
+        assert!(!map.contains_key("victim"), "最早过期者被淘汰");
+        assert!(map.contains_key("hot-0"), "次早的保住");
     }
 
     // ─────────────── 【D10】REST API key 双通道 ───────────────

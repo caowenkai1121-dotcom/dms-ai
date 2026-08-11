@@ -5,8 +5,8 @@
 //! `can only flatten structs and maps` —— 症状是 `/api/ask` 500 + 判官 JSONDecodeError，
 //! 编译期一声不响。
 //!
-//! 三个变体覆盖今天的全部生产者：`Table`（NL2SQL，T9 迁入）、`Text`（知识库回答，K2 首个消费者）、
-//! `Composite`（复合/hybrid 容器，主体是占位键 + `subs`）。
+//! 三个变体覆盖今天的全部生产者：`Table`（NL2SQL 问数）、`Text`（知识库回答——
+//! 知识库问答是它的首个消费者）、`Composite`（复合/hybrid 容器，主体是占位键 + `subs`）。
 //! `Steps` 变体不建 —— 零生产者（ReAct 不做，ARCHITECTURE §8），真做时是 5 行。
 
 use serde::Serialize;
@@ -14,14 +14,17 @@ use serde_json::Value;
 
 use crate::present::ViewSpec;
 
-/// 一次问答的最终产物。顶层键 = `route` + 变体展开的键 + 可选 `view`/`subs` + `elapsed_ms`。
-#[derive(Serialize)]
+/// 一次问答的最终产物。顶层键 = `route` + 变体展开的键 + 可选 `view`/`subs` + `elapsed_ms`
+/// + 可选 `trace_id`。
+#[derive(Debug, Serialize)]
 pub struct Answer {
     /// 命中的路由标签（取 `hit.route`，不是 `Answerer::route()` 的表标签 —— 混用即回归全红）
     pub route: String,
     #[serde(flatten)]
     pub body: AnswerBody,
-    /// Table 路径恒 `Some`；Text/Composite 路径 `None`（前端 `ResultPanel` 早退）
+    /// Table 路径恒 `Some`；Text/Composite 路径 `None`（前端 `ResultPanel` 早退）。
+    /// 「Table 恒 Some」是生产者约定（`view` 是 pub 字段，类型层不强制）——
+    /// 各生产者构造 Table 时都必须给 view，前端按这个约定早退。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub view: Option<ViewSpec>,
     /// 复合问题的子结果；单结果时空数组不上线
@@ -35,42 +38,48 @@ pub struct Answer {
 }
 
 /// 回答主体。`tag = "kind"` + snake_case：`kind` 与主体键同层，前端按 `kind` 分派渲染。
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnswerBody {
-    /// 取数结果集（`sql` 是**注入后**的 wire 串，与今天的 `AskResult.sql` 同义）
+    /// 取数结果集（`sql` 是**注入后**的 wire 串，与迁移前 server 侧 `AskResult.sql` 同义）
     Table {
         sql: String,
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
+        /// wire 内行数 == `rows.len()`（截断时 `truncated=true`；不是总行数）
         row_count: usize,
         truncated: bool,
     },
-    /// 引用式回答：markdown + 角标来源（角标 = `citations` 下标 + 1，不存字段）
+    /// 引用式回答：markdown + 角标来源（角标 = `citations` 下标 + 1，不存字段；
+    /// web 渲染侧按同一句契约实现，改动两处同步）
     Text { markdown: String, citations: Vec<Citation> },
     /// 复合容器：主体空但**继续输出 `sql`/`row_count`/`truncated` 占位键**（前端老字段兼容）
     Composite {
         sql: String,
         row_count: usize,
         truncated: bool,
+        /// 🔴 `None` 时上线 `"summary": null` 是历史兼容（前端按 null 判空），
+        /// 与全文件其它 Option「None 不上线」纪律不一致但**勿顺手加 skip** —— 那是 wire 变更。
         summary: Option<String>,
     },
 }
 
 /// 复合子问题：一句题目 + 完整结果（结构与顶层同形，前端分面板渲染）
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct SubAnswer {
     pub question: String,
     pub result: Answer,
 }
 
-/// 引用来源。字段集是裁决过的（`_DECISIONS.md` 二·C）：前端点开原文要 `chunk_id` + `page`，
-/// 塞进一个字符串 locator 等于让前端解字符串。
-#[derive(Serialize)]
+/// 引用来源。字段集是裁决过的（`docs/superpowers/plans/_DECISIONS.md` 二·C）：
+/// 前端点开原文要 `chunk_id` + `page`，塞进一个字符串 locator 等于让前端解字符串。
+#[derive(Debug, Serialize)]
 pub struct Citation {
     pub doc_id: String,
     pub doc_name: String,
+    /// PG bigint 落 i64
     pub chunk_id: i64,
+    /// PG int4 落 i32
     pub page: Option<i32>,
     pub heading_path: String,
     pub score: f32,
@@ -106,6 +115,7 @@ pub struct Citation {
     /// 实测一条引用合并了 5 块、支撑答案的那句话在第 5 块，而回查窗口只有 ±3，
     /// 读者点进去看不到那句话。引用的全部价值在**可核对**，还原不出等于没有引用。
     /// `None`/`Some(1)` = 单块（不出现在 JSON 里，老前端不改也不崩）。
+    /// 块计数非负，故 u32。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span: Option<u32>,
 }
@@ -152,7 +162,7 @@ mod tests {
             document_family: Some("报销制度".into()),
             document_revision: Some("v2.1".into()),
             source_hash: "abc123".into(),
-            doc_updated_at: "2026-08-06 00:00:00+00".into(),
+            doc_updated_at: "2026-08-06 00:00:00+00".into(), // PG timestamp 输出形态（fixture 按它钉）
             channels: vec!["向量".into(), "元数据".into()],
             span: None,
         }
@@ -237,5 +247,37 @@ mod tests {
         assert_eq!(j["truncated"], false);
         assert_eq!(j["subs"][0]["question"], "子问题");
         assert_eq!(j["subs"][0]["result"]["kind"], "text");
+    }
+
+    /// 🔴 Citation 的「全默认字段」键集合金标：15 个字段逐个手写了 skip 属性，
+    /// 新增字段忘加 skip 就会悄悄改 wire —— 键集合在这里钉死，多一个键当场红。
+    #[test]
+    fn citation_minimal_keys_golden() {
+        let c = Citation {
+            doc_id: "d".into(),
+            doc_name: "n".into(),
+            chunk_id: 1,
+            page: None,
+            heading_path: String::new(),
+            score: 0.5,
+            folder_path: String::new(),
+            relations: vec![],
+            tags: vec![],
+            business_domain: None,
+            effective_from: None,
+            effective_to: None,
+            source_uri: None,
+            document_family: None,
+            document_revision: None,
+            source_hash: String::new(),
+            doc_updated_at: String::new(),
+            channels: vec![],
+            span: None,
+        };
+        let j = serde_json::to_value(&c).unwrap();
+        let mut keys: Vec<&str> = j.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        // page 无 skip 属性（null 也上线，老前端契约）；其余 Option/空集合一律不上线
+        assert_eq!(keys, ["chunk_id", "doc_id", "doc_name", "heading_path", "page", "score"]);
     }
 }

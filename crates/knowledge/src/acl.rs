@@ -1,10 +1,13 @@
 //! **本 crate 唯一越权面**——独立成文件就是为了能被单独 review。变更原因＝谁能看/写哪篇。
 //!
 //! 两条口径：
-//! 1. **可见性 ACL 先行**：`visible_docs_sql()` 是给检索内联进 SQL 的子查询片段，
+//! 1. **可见性 ACL 先行**：内联进检索 SQL 的是宏 `visible_docs!()`（编译期文本）；
+//!    `visible_docs_sql()` 只是同一份文本的运行时视图，只服务单测与文档。
 //!    不做「查完再过滤」（ARCHITECTURE §2 I4）。
-//! 2. **写权限 v1 最小口径**：`space_id == viewer.login` 视为个人空间可写；否则必须有
-//!    `kb.acl(scope='space', target_id=space_id, grantee=login|role, perm='write')`。
+//! 2. **写权限 v1 最小口径**：空间 owner 恒可写；其余一律要显式
+//!    `kb.acl(scope='space', target_id=space_id, grantee=login|role, perm='write')`
+//!    （fail-closed）。**不按 `space_id == viewer.login` 放行**：管理员可创建自定义空间，
+//!    字符串碰撞不能变成权限。
 //!    不设 `perm` 就无法表达「可读不可写」→ 任何认证用户都能往别人空间投毒写，
 //!    而带引用的回答会让同事读到伪造的「制度原文」。
 
@@ -29,6 +32,7 @@ impl AclScope {
         }
     }
 
+    /// 输入须已 trim + 小写（调用方负责归一）；本函数对大小写/空白不做宽容。
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "space" => Some(AclScope::Space),
@@ -60,7 +64,12 @@ impl Grantee {
         }
     }
 
+    /// id 先 trim；trim 后为空返回 `None`——不接受会落出 `grantee=''` 废授权行的输入。
     pub fn parse(kind: &str, id: &str) -> Option<Self> {
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
         match kind {
             "login" => Some(Grantee::Login(id.to_string())),
             "role" => Some(Grantee::Role(id.to_string())),
@@ -119,6 +128,8 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AclRow {
     }
 }
 
+/// 目标存在性由调用方保证：target_id 打错字会落一条永远匹配不上的孤儿授权，本层不前置校验。
+/// `ON CONFLICT DO NOTHING`：「授权已存在」与「新建成功」同返 Ok，影响行数不向上传。
 pub async fn grant(store: &OwnedStore, e: &AclEntry) -> Result<(), KbError> {
     store
         .fixed(
@@ -156,15 +167,32 @@ pub async fn list_target(
     scope: AclScope,
     target_id: &str,
 ) -> Result<Vec<AclRow>, KbError> {
+    // 宽裕上限：单目标授权正常是零星几行，1000 只是防失控的保险丝
     Ok(store
         .fixed(
             "SELECT grantee_kind,grantee,perm FROM kb.acl WHERE scope=$1 AND target_id=$2 \
-             ORDER BY grantee_kind,grantee,perm",
+             ORDER BY grantee_kind,grantee,perm LIMIT 1000",
         )
         .bind(scope.as_str())
         .bind(target_id)
         .fetch_all()
         .await?)
+}
+
+/// 空间读/写判据的公共 SQL：两条语句只差 perm 谓词，grantee/role 谓词逐字共享——
+/// 日后改谓词只能改这一处，改出两份就是越权洞。`$1`=space_id、`$2`=login、`$3`=角色码。
+/// （判据条件本身一字不动，锚点测试 `readable_and_writable_are_separate_contracts` 钉住。）
+macro_rules! space_acl_sql {
+    ($perm:literal) => {
+        concat!(
+            "SELECT count(*) FROM kb.space s WHERE s.space_id=$1 AND (s.owner=$2 OR EXISTS ( \
+               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
+                 AND ",
+            $perm,
+            " AND ((a.grantee_kind='login' AND a.grantee=$2) \
+                   OR (a.grantee_kind='role' AND a.grantee = ANY($3::text[])))))"
+        )
+    };
 }
 
 /// 能否往这个空间写（上传/删除的唯一判据）。
@@ -177,12 +205,7 @@ pub async fn space_writable(
 ) -> Result<bool, KbError> {
     // 空间 owner 恒可写；其他人必须有显式 write 授权。
     let n = store
-        .fixed(
-            "SELECT count(*) FROM kb.space s WHERE s.space_id=$1 AND (s.owner=$2 OR EXISTS ( \
-               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
-                 AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=$2) \
-                   OR (a.grantee_kind='role' AND a.grantee = ANY($3::text[])))))",
-        )
+        .fixed(space_acl_sql!("a.perm='write'"))
         .bind(space_id)
         .bind(&v.login)
         .bind(&v.roles)
@@ -199,12 +222,7 @@ pub async fn space_readable(
     space_id: &str,
 ) -> Result<bool, KbError> {
     let n = store
-        .fixed(
-            "SELECT count(*) FROM kb.space s WHERE s.space_id=$1 AND (s.owner=$2 OR EXISTS ( \
-               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
-                 AND a.perm IN ('read','write') AND ((a.grantee_kind='login' AND a.grantee=$2) \
-                   OR (a.grantee_kind='role' AND a.grantee=ANY($3::text[])))))",
-        )
+        .fixed(space_acl_sql!("a.perm IN ('read','write')"))
         .bind(space_id)
         .bind(&v.login)
         .bind(&v.roles)
@@ -244,6 +262,10 @@ pub async fn doc_for_viewer(
 /// **是宏不是函数**：内联者要在**编译期**把它 `concat!` 进自己的 `&'static str`
 /// （`fixed()` 通道不接受 `format!` 出来的 `String`）。`visible_docs_sql()` 是同一份文本的
 /// 运行时视图，只服务单测与文档 —— 两处永不可能分叉。
+///
+/// ⚠️ 本片段**只管「谁能看」**：`enabled/status/生效期` 等文档生命周期过滤不在里面，
+/// 是每个内联者自己的义务（范例见 `kg.rs` 的 `build_chunks_sql`/`visible_doc_ids_sql`，
+/// 均在片段外自行补齐 `d.enabled=true AND d.status IN ('chunked','embedded') AND 生效期`）。
 macro_rules! visible_docs {
     () => {
         "SELECT d.doc_id FROM kb.doc d \
@@ -292,6 +314,18 @@ mod tests {
         assert_eq!(Grantee::parse("dept", "1"), None);
     }
 
+    /// 空串/纯空白 id 不得落成 `grantee=''` 的废授权行
+    #[test]
+    fn grantee_rejects_blank_id() {
+        assert_eq!(Grantee::parse("login", ""), None);
+        assert_eq!(Grantee::parse("role", "   "), None);
+        // 合法 id 的外围空白被归一
+        assert_eq!(
+            Grantee::parse("login", " zhangsan "),
+            Some(Grantee::Login("zhangsan".into()))
+        );
+    }
+
     /// 片段必须同时按 grantee 与 perm 过滤——少任何一个就是全员可见/可写
     #[test]
     fn visible_fragment_filters_grantee_and_perm() {
@@ -313,5 +347,18 @@ mod tests {
         assert!(writable.contains("perm='write'"));
         assert!(!readable.contains("space_id == v.login"));
         assert!(!writable.contains("space_id == v.login"));
+    }
+
+    /// 「文档不存在」与「无权看」必须共用同一 `Forbidden` 出口——多一个分支就泄露存在性
+    #[test]
+    fn doc_for_viewer_has_single_forbidden_exit() {
+        let src = include_str!("acl.rs");
+        let body = src.split("pub async fn doc_for_viewer").nth(1).unwrap();
+        let body = body.split("/// 可见文档子查询片段").next().unwrap();
+        assert_eq!(
+            body.matches("KbError::Forbidden").count(),
+            1,
+            "不存在与无权必须走同一 Forbidden 文案出口"
+        );
     }
 }

@@ -54,6 +54,38 @@ fn identity_err(login: &str, e: impl std::fmt::Display) -> ApiErr {
     err(StatusCode::FORBIDDEN, "当前账号或角色不可用")
 }
 
+/// 两个 handler 共用的身份核验前段（401 文案逐字保持：前端按文案认「未认证」）。
+fn require_login(
+    st: &AppState,
+    headers: &HeaderMap,
+    login_name: &Option<String>,
+    role_code: &Option<String>,
+) -> Result<(String, Option<String>), ApiErr> {
+    crate::resolve_identity(st, headers, login_name, role_code)
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))
+}
+
+/// `Reading` 的拼装只许有这一处（`analysis` 与 `report` 共用，逐字段各拼一份必漂移）。
+/// `row_count` 不能全信调用方：`row_count < rows.len()` 时下游会说出「共 X 行」却列出
+/// 更多行的自相矛盾文案，故与 `rows.len()` 取大兜底。
+fn reading_of<'a>(
+    question: &'a str,
+    sql: &'a str,
+    columns: &'a [String],
+    rows: &'a [Vec<serde_json::Value>],
+    row_count: Option<usize>,
+    caliber_note: Option<&'a str>,
+) -> dms_agent::Reading<'a> {
+    dms_agent::Reading {
+        question,
+        sql,
+        columns,
+        rows,
+        row_count: row_count.unwrap_or(rows.len()).max(rows.len()),
+        caliber_note,
+    }
+}
+
 /// 请求体 = 前端手上那次 `/api/ask` 结果的四个字段 + 身份。
 /// 全部 `#[serde(default)]`（除 `question`/`sql`）：老前端补字段是渐进的，缺 `rows` 也该能出口径说明。
 #[derive(serde::Deserialize)]
@@ -91,22 +123,21 @@ pub async fn analysis(
     headers: HeaderMap,
     Json(req): Json<AnalysisReq>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
-    let (login, role) = crate::resolve_identity(&st, &headers, &req.login_name, &req.role_code)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
+    let (login, role) = require_login(&st, &headers, &req.login_name, &req.role_code)?;
     // 本端点不读库、不取数（素材全在请求体里），核身份只为一件事：
     // **别让「烧 LLM 额度」比问数更便宜** —— 不核的话任意 login_name 都能白刷 fast 调用。
     // 权限集合与脱敏不在这里判：能进这个 body 的行，是调用方上一次问数时已经过闸门给他的。
     principal::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
         .map_err(|e| identity_err(&login, e))?;
-    let r = dms_agent::Reading {
-        question: &req.question,
-        sql: &req.sql,
-        columns: &req.columns,
-        rows: &req.rows,
-        row_count: req.row_count.unwrap_or(req.rows.len()),
-        caliber_note: req.caliber_note.as_deref(),
-    };
+    let r = reading_of(
+        &req.question,
+        &req.sql,
+        &req.columns,
+        &req.rows,
+        req.row_count,
+        req.caliber_note.as_deref(),
+    );
     let caliber = r.caliber();
     // 开关只挡 LLM 那一半：关了照样返口径说明（那部分零成本），前端不用改。
     // 【深度模式】`deep=true` 走 Precise 档四段式；精简维持 fast 档 2-4 句。
@@ -160,6 +191,9 @@ pub struct ReportReq {
     role_code: Option<String>,
 }
 
+/// 报表数据表的行数上限（文案与表体共用这一个数，不许双写漂移）。
+const REPORT_TABLE_ROWS: usize = 50;
+
 /// 报表 markdown 组装（**纯函数**，判据打在这里）。
 /// 形状：标题 → （可选）口径告警 → 口径说明 → AI 解读 → 数据表（≤50 行）→ SQL。
 fn report_md(req: &ReportReq, caliber: &str) -> String {
@@ -178,9 +212,11 @@ fn report_md(req: &ReportReq, caliber: &str) -> String {
     s.push_str("\n\n## AI 解读\n\n");
     s.push_str(req.insight.as_deref().map(str::trim).filter(|i| !i.is_empty()).unwrap_or("（本次没有模型解读）"));
     s.push_str("\n\n## 数据\n\n");
-    let total = req.row_count.unwrap_or(req.rows.len());
-    if req.rows.len() < total {
-        s.push_str(&format!("共 {total} 行（下表为前 {} 行）\n\n", req.rows.len()));
+    // 与 reading_of 同一兜底：row_count 不许小于实际回传的行数
+    let total = req.row_count.unwrap_or(req.rows.len()).max(req.rows.len());
+    let shown = req.rows.len().min(REPORT_TABLE_ROWS);
+    if shown < total {
+        s.push_str(&format!("共 {total} 行（下表为前 {shown} 行）\n\n"));
     } else {
         s.push_str(&format!("共 {total} 行\n\n"));
     }
@@ -196,13 +232,14 @@ fn report_md(req: &ReportReq, caliber: &str) -> String {
             s.push_str("---|");
         }
         s.push('\n');
-        for r in req.rows.iter().take(50) {
+        for r in req.rows.iter().take(REPORT_TABLE_ROWS) {
             s.push('|');
-            for v in r {
-                let txt = match v {
-                    serde_json::Value::Null => String::new(),
-                    serde_json::Value::String(x) => x.clone(),
-                    other => other.to_string(),
+            // 行长按表头补齐/截断：单元格数与 columns 不一致会歪掉整张 markdown 表
+            for i in 0..req.columns.len() {
+                let txt = match r.get(i) {
+                    Some(serde_json::Value::Null) | None => String::new(),
+                    Some(serde_json::Value::String(x)) => x.clone(),
+                    Some(other) => other.to_string(),
                 };
                 s.push_str(&format!(" {} |", cell(&txt)));
             }
@@ -215,10 +252,20 @@ fn report_md(req: &ReportReq, caliber: &str) -> String {
     for (i, _) in req.charts.iter().enumerate() {
         s.push_str(&format!("{}{i}{}\n\n", crate::chart_svg::CHART_MARK.0, crate::chart_svg::CHART_MARK.1));
     }
-    s.push_str("## SQL\n\n```sql\n");
+    // 围栏升四级：回传的 sql 本身含 ``` 时也不会顶破围栏（sql 是不可信输入）
+    s.push_str("## SQL\n\n````sql\n");
     s.push_str(req.sql.trim());
-    s.push_str("\n```\n");
+    s.push_str("\n````\n");
     s
+}
+
+/// conv_id 解析（纯函数）：合法数字还不够 —— `"-5"`/`"0"` 也合法但不是主键，
+/// 放过去会落 403 而非 400，「必须是会话主键数字」的文案名不副实。
+fn parse_conv_id(raw: &str) -> Result<i64, ApiErr> {
+    raw.parse::<i64>()
+        .ok()
+        .filter(|cid| *cid > 0)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "conv_id 必须是会话主键数字"))
 }
 
 /// `POST /api/analysis/report` → `{ id, title, preview_url, download_url }`
@@ -227,30 +274,30 @@ pub async fn report(
     headers: HeaderMap,
     Json(req): Json<ReportReq>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
-    let (login, _role) = crate::resolve_identity(&st, &headers, &req.login_name, &req.role_code)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
+    // 空问题/空 SQL 不该固化出一张空报表 artifact
+    if req.question.trim().is_empty() || req.sql.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "question 与 sql 不能为空"));
+    }
+    let (login, _role) = require_login(&st, &headers, &req.login_name, &req.role_code)?;
     // 写前校归属：别把报表写进别人的会话（view 那一层也有校验，但脏数据从源头就不该落）
-    let cid: i64 = req
-        .conv_id
-        .parse()
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "conv_id 必须是会话主键数字"))?;
+    let cid = parse_conv_id(&req.conv_id)?;
     let owner = crate::chat::conv_owner(st.owned.pool(), cid)
         .await
-        .map_err(|e| internal_err("insight 服务端读写失败", e))?;
+        .map_err(|e| internal_err("insight 读会话归属失败", e))?;
     if owner.as_deref() != Some(login.as_str()) {
         return Err(err(StatusCode::FORBIDDEN, "无权在该会话下生成报表"));
     }
     // caliber 服务端重算（回传的任何文本都不信——口径说明的素材只能是从 SQL 现读）
-    let caliber = dms_agent::Reading {
-        question: &req.question,
-        sql: &req.sql,
-        columns: &req.columns,
-        rows: &req.rows,
-        row_count: req.row_count.unwrap_or(req.rows.len()),
-        caliber_note: req.caliber_note.as_deref(),
-    }
+    let caliber = reading_of(
+        &req.question,
+        &req.sql,
+        &req.columns,
+        &req.rows,
+        req.row_count,
+        req.caliber_note.as_deref(),
+    )
     .caliber();
-    let title: String = req.question.chars().take(40).collect();
+    let title: String = req.question.trim().chars().take(40).collect();
     let md = report_md(&req, &caliber);
     // 图表回声 → SVG（退化规格 = 空串 = 占位符原样留，报表不塌）；先渲染再替换，
     // 顺序反了 SVG 会被 md_to_html 当文本转义掉。
@@ -258,9 +305,10 @@ pub async fn report(
         req.charts.iter().map(|c| crate::chart_svg::chart_svg(c, &req.columns, &req.rows)).collect();
     let html_body = crate::chart_svg::fill_charts(&crate::artifact_api::md_to_html(&md), &svgs);
     let html = crate::artifact_api::page_shell(&title, &html_body);
-    let id = crate::artifact_api::save_artifact(&st, &req.conv_id, "report", &title, &html, &login)
+    // conv_id 落库用解析校验过的主键（`"012"` 这类写法不该原样进库）
+    let id = crate::artifact_api::save_artifact(&st, &cid.to_string(), "report", &title, &html, &login)
         .await
-        .map_err(|e| internal_err("insight 服务端读写失败", e))?;
+        .map_err(|e| internal_err("insight 保存报表失败", e))?;
     Ok(Json(serde_json::json!({
         "id": id,
         "title": title,
@@ -288,7 +336,8 @@ mod tests {
     #[test]
     fn raw_causes_never_reach_the_client() {
         let src = include_str!("insight_api.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code = src.split("#[cfg(test)]").next().expect("测试模块必然存在");
+        assert!(!code.is_empty(), "切分出空串 = 下面两条断言恒绿");
         for bad in [
             "err(StatusCode::INTERNAL_SERVER_ERROR, e)",
             "err(StatusCode::FORBIDDEN, e)",
@@ -377,8 +426,8 @@ mod tests {
         // 单元格的 | 与换行不许拆表（全角替换 / 空格替换）
         assert!(md.contains("| 省｜份 | 金额 |"), "{md}");
         assert!(md.contains("| 甲 乙 |  |"), "{md}");
-        // SQL 围栏
-        assert!(md.contains("```sql\nSELECT 1\nFROM t\n```"), "{md}");
+        // SQL 围栏（四级反引号：sql 里含 ``` 也顶不破）
+        assert!(md.contains("````sql\nSELECT 1\nFROM t\n````"), "{md}");
         // 无 insight / 无告警的退化形
         let req2: super::ReportReq = serde_json::from_value(serde_json::json!({
             "question": "q", "sql": "SELECT 1", "conv_id": "1",
@@ -388,5 +437,88 @@ mod tests {
         assert!(md2.contains("（本次没有模型解读）"), "{md2}");
         assert!(!md2.contains("口径复核未通过"), "{md2}");
         assert!(md2.contains("共 0 行"), "{md2}");
+    }
+
+    /// 行数说明必须与表体一致：表体恒截 REPORT_TABLE_ROWS 行，文案报的是实际列出的行数；
+    /// rows 多于上限时（即使 row_count == rows.len()）也必须带截断说明。
+    #[test]
+    fn report_md_row_count_text_matches_truncated_table() {
+        let rows: Vec<Vec<serde_json::Value>> =
+            (0..61).map(|i| vec![serde_json::json!(i)]).collect();
+        let req: super::ReportReq = serde_json::from_value(serde_json::json!({
+            "question": "q", "sql": "SELECT 1", "columns": ["n"],
+            "rows": rows, "row_count": 61, "conv_id": "1",
+        }))
+        .unwrap();
+        let md = super::report_md(&req, "口径");
+        assert!(md.contains("共 61 行（下表为前 50 行）"), "{md}");
+        assert!(md.contains("| 49 |") && !md.contains("| 50 |"), "表体只列前 50 行：{md}");
+        // row_count 小于实际行数时不许自相矛盾（取大兜底）
+        let req2: super::ReportReq = serde_json::from_value(serde_json::json!({
+            "question": "q", "sql": "SELECT 1", "columns": ["n"],
+            "rows": [[1], [2]], "row_count": 1, "conv_id": "1",
+        }))
+        .unwrap();
+        let md2 = super::report_md(&req2, "口径");
+        assert!(md2.contains("共 2 行"), "row_count < rows.len() 时按实际行数说：{md2}");
+    }
+
+    /// 行单元格数与 columns 不一致：按表头补齐空单元格/截掉多余单元格，不许出锯齿行
+    #[test]
+    fn report_md_pads_ragged_rows_to_header() {
+        let req: super::ReportReq = serde_json::from_value(serde_json::json!({
+            "question": "q", "sql": "SELECT 1", "columns": ["a", "b", "c"],
+            "rows": [[1], [1, 2, 3, 4]], "conv_id": "1",
+        }))
+        .unwrap();
+        let md = super::report_md(&req, "口径");
+        assert!(md.contains("| 1 |  |  |"), "短行补齐空单元格：{md}");
+        assert!(md.contains("| 1 | 2 | 3 |"), "长行截到表头宽：{md}");
+        assert!(!md.contains("| 4 |"), "{md}");
+    }
+
+    /// sql 里含 ``` 时四级围栏不被顶破
+    #[test]
+    fn report_md_sql_with_backticks_keeps_fence() {
+        let req: super::ReportReq = serde_json::from_value(serde_json::json!({
+            "question": "q", "sql": "SELECT 1 ``` 注释", "conv_id": "1",
+        }))
+        .unwrap();
+        let md = super::report_md(&req, "口径");
+        assert!(md.contains("````sql\nSELECT 1 ``` 注释\n````"), "{md}");
+    }
+
+    /// conv_id 解析：合法数字但非主键（负/零）与解析失败同罪 400
+    #[test]
+    fn conv_id_must_be_positive_key() {
+        assert_eq!(super::parse_conv_id("12").unwrap(), 12);
+        for bad in ["-5", "0", "abc", ""] {
+            let (code, _) = super::parse_conv_id(bad).unwrap_err();
+            assert_eq!(code, axum::http::StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    /// `reading_of` 的 row_count 兜底：与 rows.len() 取大（analysis/report 共用这一处拼装）
+    #[test]
+    fn reading_of_row_count_never_below_rows_len() {
+        let rows = vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]];
+        let r = super::reading_of("q", "SELECT 1", &[], &rows, Some(1), None);
+        assert_eq!(r.row_count, 2);
+        let r = super::reading_of("q", "SELECT 1", &[], &rows, None, None);
+        assert_eq!(r.row_count, 2);
+        let r = super::reading_of("q", "SELECT 1", &[], &rows, Some(120), None);
+        assert_eq!(r.row_count, 120);
+    }
+
+    /// 源码锚点：report 入口的空 question/sql 校验必须排在身份核验之前
+    /// （空请求不该白烧一次身份核验，更不该固化出空报表）。
+    #[test]
+    fn report_rejects_blank_question_or_sql_first() {
+        let src = include_str!("insight_api.rs");
+        let at = src.find("pub async fn report(").expect("report handler 不见了");
+        let body = &src[at..];
+        let check = body.find("question 与 sql 不能为空").expect("report 缺空 question/sql 的 400 校验");
+        let auth = body.find("require_login").expect("report 缺身份核验");
+        assert!(check < auth, "空校验必须在身份核验之前");
     }
 }

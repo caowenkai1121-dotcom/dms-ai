@@ -7,7 +7,7 @@
 
 ```
 settings.json 解析失败（键名打错会在此硬失败，见 docs/CONFIG.md）
-  ⟵ unknown field `mcp_key`, expected one of `mysql_url`, `pg_url`, `listen`, ... , `insight_enabled`
+  ⟵ unknown field `mcp_key`, expected one of `mysql_url`, `pg_url`, `listen`, ... , `kb_manager_grants`
 ```
 
 `expected one of` 后面是**全量已知键清单**，照它改；前半句里的路径就是实际读到的那份
@@ -44,7 +44,7 @@ Python 判官零改动；首次使用需 `pip install cryptography`（仓库 .ve
 
 | 键 | 作用 | 不填的后果 |
 |---|---|---|
-| `mysql_url` | DMS 身份、角色与数据权限源（只读），只供 `auth_mysql` 使用，禁止承载分析查询 | 身份认证与权限计算不可用 |
+| `mysql_url` | DMS 身份、角色与数据权限源（只读），只供 `auth_mysql` 使用，禁止承载分析查询 | 缺键启动即失败（missing field 硬失败，与 `pg_url` 同口径） |
 | `mysql_targets` | 【业务查询源热切换】目标必须显式声明 `url` 与 `type`。Doris/分析库用 `{"url":"mysql://…","type":"warehouse"}`；生产 DMS 轻点查用 `{"url":"mysql://…","type":"production_lookup"}`。DSN 只在 settings.json：kv 只存名字、API 只给脱敏 host | 旧纯字符串目标按 `production_lookup` 失败关闭；没有目标则拒绝启动，绝不回退 `mysql_url` |
 | `pg_url` | 自有 PG 的 **owner 角色**（可写）：`meta.*` / `kb.*` / `chat.*` 都在这里 | 起不来 |
 | `pg_ro_url` | **上传表格源问数时用的只读角色**（见下） | 上传照样入知识库、照样能检索，但那张表**问不了数**（错误文案指回这个键） |
@@ -54,9 +54,9 @@ Python 判官零改动；首次使用需 `pip install cryptography`（仓库 .ve
 `meta.kv['mysql_target']` 优先，其次选 `doris_warehouse`，最后才选目录中的首个非 DMS 目标。
 目标类型不是端口推断：`warehouse` 才允许聚合、趋势、图谱和元数据探针；
 `production_lookup` 只允许物理索引最左列命中的单表等值点查，固定显式投影、`LIMIT <= 50`、
-两秒超时，禁止 JOIN、LIKE、排序、聚合和全库 schema 探针。
-连接不上或只读校验不过的目标**换不进去**（旧池原样保留）。删除当前目标时会先切到
-`fallback_db_target` 选出的其他分析目标；没有其他目标就拒绝删除。`dms` 是受保护权限源，
+两秒超时，禁止 JOIN、LIKE、UNION、子查询、排序、聚合、全库 schema 探针和大扫描。
+连接不上或只读校验不过的目标**换不进去**（旧池原样保留）。删除当前生效目标会被 409
+拒绝——必须先切到其他目标再删，删除端点不会隐式切换。`dms` 是受保护权限源，
 不能选择、不能删除，也不会在 Doris/分析库失败时成为回退。
 ⚠️ 口径声明（指标/维度/码表/权限档案）按 **DMS schema** 登记：切到同构库（中台镜像）
 照常；schema 不同的库会响亮报错，不是静默错答。
@@ -75,9 +75,9 @@ Python 判官零改动；首次使用需 `pip install cryptography`（仓库 .ve
 - 订单数独立读取 `dms_ods.t_sales_order`，按有效订单的 `sales_order_code` 去重，
   不能使用 DWS 行数。
 
-`mysql_url` 指向的生产 DMS MySQL 不承担分析查询。确需业务点查时，只允许单表、索引条件、
-小 `LIMIT`、短超时；禁止 JOIN、UNION、子查询、聚合、无界排序和大扫描。复杂统计必须选择
-Doris 分析目标，连接失败时不得静默回退生产 MySQL。
+`mysql_url` 指向的生产 DMS MySQL 不承担分析查询。确需业务点查时走 `production_lookup`
+目标（可与 `mysql_url` 复用端点），红线就是上文分析库切换段的同一份清单，不再各写一遍。
+复杂统计必须选择 Doris 分析目标，连接失败时不得静默回退生产 MySQL。
 
 ### `pg_ro_url` 必须满足两条
 
@@ -110,11 +110,12 @@ REVOKE ALL ON SCHEMA meta, kb, chat, public FROM dms_ai_ro;
 
 | 键 | 作用 | 不填的后果 |
 |---|---|---|
-| `llm_provider` | 供应商目录选哪家：`qwen`（千问 dashscope）/ `deepseek`。缺省按 `llm_base_url` 推断 | 按 base_url 推断 |
+| `llm_provider` | 供应商目录选哪家：`qwen`（千问 dashscope）/ `deepseek` / `llm_providers` 里的自定义名。缺省按 `llm_base_url` 推断 | 按 base_url 推断 |
 | `fallback_vision_provider` | 主供应商无 vision 模型时使用的备用多模态供应商，只保存供应商名；key 仍从 `llm_keys` 读取 | 主供应商无视觉能力时，图片调用返回明确能力错误 |
 | `llm_keys` | **各家供应商的 key**：`{"qwen": "sk-…", "deepseek": "sk-…"}`。页面切换到哪家取哪家 | 切到没配 key 的那家会拒绝并指回这个键 |
-| `llm_base_url` / `llm_api_key` | **文件供应商**那家的地址与 key（老配置兼容语义，等价于 `llm_keys[llm_provider]`） | 与目录默认合并（目录补缺省字段） |
-| `llm_model_fast` / `llm_model_precise` | 文件供应商的两档模型名（覆盖目录默认） | 用目录默认（qwen3.7-flash / deepseek-chat） |
+| `llm_providers` | 【自定义供应商】内建目录之外的供应商：`{"<名字>": {"base_url": "…", "model_fast": "…", "model_precise": "…", "extra_body": {}, "vision": "…"}}`（完整形状见 `settings.example.json`）；key 仍按名字从 `llm_keys` 取 | 只有内建目录两家 |
+| `llm_base_url` / `llm_api_key` | **文件供应商**那家的地址与 key（老配置兼容语义，等价于 `llm_keys[llm_provider]`） | 缺省用目录默认 |
+| `llm_model_fast` / `llm_model_precise` | 文件供应商的两档模型名（覆盖目录默认） | 用目录默认（qwen3.7-flash / deepseek-v4-flash、deepseek-v4-pro） |
 | `llm_extra_body` | 供应商特有请求参数（千问 `enable_thinking:false` —— **布尔** false，省 21 倍延迟 35 倍 token）。**禁含 `messages`/`model`**（启动即拒） | 目录默认（千问带 enable_thinking:false） |
 
 **运行时切换不需要重启**：设置页（`/#/settings`）保存 → 写 `meta.kv['llm_provider']` +
@@ -125,7 +126,7 @@ REVOKE ALL ON SCHEMA meta, kb, chat, public FROM dms_ai_ro;
 没有 vision（例如 DeepSeek）时，自动解析 `fallback_vision_provider` 对应供应商的 vision 模型
 与 key。备用未配置、缺 key 或也不支持视觉时，返回明确的能力错误，不猜供应商、不复制 key。
 `GET /api/llm/capabilities` 返回最终可用的 `vision_provider`、`vision_model` 与
-`vision_fallback`；`POST /api/vision/chat` 是 Rust 应用侧统一的多模态调用入口。
+`fallback_vision_provider`；`POST /api/vision/chat` 是 Rust 应用侧统一的多模态调用入口。
 
 设置接口：`POST /api/admin/settings/fallback-vision`，请求体中的 `provider` 写供应商名；
 传 `null` 或空字符串即清除。保存前完整解析主/备用配置，失败时旧内存配置保持不变，成功后
@@ -151,7 +152,7 @@ REVOKE ALL ON SCHEMA meta, kb, chat, public FROM dms_ai_ro;
 |---|---|---|
 | `mcp_keys` | `{"<api-key>": "<login_name>"}` | **`/api/mcp` 恒 404，功能关闭** —— 对外面默认关比默认开重要 |
 
-- **一 key 一员工**。key 建议 32 位随机串；轮换＝改配置重启。
+- **一 key 一员工**。key 建议 32 位随机串；**无热更**（与上文 LLM 的运行时切换不同）：改动与轮换＝改配置重启。
 - **数据权限等于所映射员工登录后的权限**：请求经 `load_principal` → `compute_scope` → 同一条闸门，
   没有「MCP 就是超管」的旁路；`kb_search` 的可见文档集也按该员工的 `kb.acl` 判。
 - ⚠️ **明文 key 与 DSN 同级敏感**：只在本文件出现一次，不入库、不进日志（日志只写前 4 位 + 长度）、
@@ -199,6 +200,7 @@ x-access-token: <token>
 - **数据权限等于该员工 Web 登录后的权限**：token 只换成 login/role，随后过 `load_principal`
   （员工禁用 / 多角色未选照样被拒），没有「小程序就是超管」的旁路。
 - 进程内缓存：token → 身份 60s TTL、上限 1000 条（满员淘汰最旧），重复问不重复打外部；
+  上游明确判失效的 token 也进同 TTL 的**负缓存**（坏 token 重放打在缓存上，不逐次穿透上游）；
   代价是 token 失效/切角色最多滞后 60s 生效。
 - 这只是一个 URL、不是凭据：不参与 `enc:v1` 加密，但同样不进任何 API 响应。
 
@@ -208,17 +210,18 @@ x-access-token: <token>
 |---|---|---|
 | `service_url` | `http://127.0.0.1:8077` | Python 侧服务：`/embed` 与 `/parse`、`/chunk` **同进程同端口**（裁决 V1）。一个键，不许拆两个——拆了必然出现「一个填 /embed 一个填根」的配置陷阱 |
 | `kb_root` | `data/kb` | 知识库落盘根目录。原始文件名**不进路径**（恒 `<doc_id>.<ext>`，防路径穿越） |
-| `kb_max_mb` | `20` | 单文件上限（产品口径 ≤20MB）；同时是 `/api/kb/upload` 的 body limit（axum 默认 2MB 会先触发） |
-| `kb_rrf_weights` | `{"metadata":0.2,"relation":0.25,"kg":0.3,"ext_kb":0.2}` | 【Y3】RRF 四路**辅助**召回（元数据/关系扩展/图谱/外部 KB）的融合权重；正文直接命中的四路恒 1.0 不可调。**缺省 = 原编译期常量**（不写或照抄示例都零行为变化）。负值与 NaN/Inf 在启动加载与页面保存两处一律拒绝；`0` = 该路不加权。缺某路 = 该路保留旧值（部分覆盖）。保存即生效（`/api/kb/*` 与 `/api/mcp` 每次请求取配置快照）。⚠️ 例外：`/api/ask` 主链暂用默认值（调用点在 main.rs，Y3 包未接线，见 `agent/src/answerers/knowledge.rs` 注释） |
+| `kb_max_mb` | `20` | 单文件上限（产品口径 ≤20MB）；同时是 `/api/kb/upload` 的 body limit（不显式设置就会被 axum 默认 2MB 截断） |
+| `kb_rrf_weights` | `{"metadata":0.2,"relation":0.25,"kg":0.3,"ext_kb":0.2}` | 【Y3】RRF 四路**辅助**召回（元数据/关系扩展/图谱/外部 KB）的融合权重；正文直接命中的四路恒 1.0 不可调。**缺省 = 原编译期常量**（不写或照抄示例都零行为变化）。负值与 NaN/Inf 在启动加载与页面保存两处一律拒绝；`0` = 该路不加权。缺某路 = 该路保留旧值（部分覆盖）。保存即生效（`/api/kb/*`、`/api/mcp` 与 `/api/ask` 主链每次请求取配置快照） |
 | `kb_manager_grants` | `null`（仅管理员） | 【KB 管理授权】知识库**管理面**（上传/删除/移动/目录/授权/重处理/AI 描述/ingest-url 与空间管理读端点）对哪些角色/人员开放：`{"roles":["角色码"],"logins":["登录名"]}`，两个名单是**或**的关系，精确字符串比对。管理员（`administrator_flag`）恒可管，不配或空名单 = 仅管理员。检索面（ask/search/chunk/下载预览）不过这道闸，普通用户照样能问 KB 问题。前端入口显隐由 `GET /api/kb/spaces` 响应的 `kb_manager` 透出 |
 | `listen` | `127.0.0.1:8100` | —— |
+| `insecure_login_fallback` | `false` | 【安全开关】无会话 token 时是否采信请求自报的 `login_name`。**开着等于没有认证**（任何能连到 listen 端口的人都能冒充任意用户，含管理员），仅供本机判官脚本；开启时启动打 warn 留痕，生产必须保持 false |
 | `insight_enabled` | `true` | 【AI 解读】`POST /api/analysis` 是否真的调 fast 模型。置 `false` = **止血阀**（模型欠费/被限流时只返确定性口径说明，零 LLM 花费），前端不用改。<br>为什么敢默认开：解读是**独立端点**（前端点「AI 解读」才调），取数链路一次 LLM 都不多；评测与回归走 CLI `ask` 与 `/api/ask`，**结构上根本不经过它**，p95 基线不会被污染，也不依赖任何人记得把开关关掉 |
 | `sc_samples` | `1` | 【SC】自一致采样数：LLM 路径整条跑几次、按**结果指纹**（只看值不看列名）投票取多数派。`1` = 关，与本项引入前逐字等价。<br>**为什么会想开**：两轮执行级评测都停在 34/38 而失败集换了两个 —— 同一道题今天与 gold 逐值一致、评测那次却高 30%，误差主要来自模型本身（温度已是 0.1）。<br>**代价是线性的**：`3` 即最多 3 倍 precise LLM 调用 + 3 倍取数（前两次指纹一致会提前收工，故常见情形只多付一次）。单次就 20s+ 的重题（`t_sales_order` 全扫那类）要先算清超时预算。<br>**多数派缺席时不静默挑一个**：返回首次结果 + `caliber_note` 明说数字不可信。<br>⚠️ 判官（CLI `ask` 子命令）用的是同一个配置值，不是写死 1 —— 否则「开了 SC 有没有变好」永远量不出来 |
-| `wework_redirect_url` | 无 | 企业微信 OAuth 精确回调地址，必须与企微后台一致。生产只接受 HTTPS；服务端不会从 Host 或代理头推导，避免开放重定向与 state 绕过 |
+| `wework_redirect_url` | 无 | 企业微信 OAuth 精确回调地址，必须与企微后台一致。只接受 HTTPS（唯一例外：`http://localhost` 本机调试也放行）；服务端不会从 Host 或代理头推导，避免开放重定向与 state 绕过 |
 
 ## 文档解析器依赖（Python 侧，不是配置项但会决定「哪些文件能进知识库」）
 
-`GET /health` 的 `parse_ok` 照实反映装了哪几个 —— **它是唯一真相源，别按「应该装了」推断**。
+`GET /health`（**Python 解析/向量服务** `embed_service.py` 的端点，默认 :8077，不是 Rust API 的 `/api/health` :8100）的 `parse_ok` 照实反映装了哪几个 —— **它是唯一真相源，别按「应该装了」推断**。
 
 | 类型 | 依赖 | 许可 | 现状 |
 |---|---|---|---|
@@ -226,8 +229,8 @@ x-access-token: <token>
 | `.xlsx` / `.xlsm` | `openpyxl` | MIT | **已装可用**（纯 Python） |
 | `.pdf` | `pypdf` | **BSD-3** | **已装可用**；逐页纯文本，无标题层级 |
 | `.pdf`（更好） | `pymupdf4llm` / `PyMuPDF` | **AGPL-3.0** | **刻意未装** —— 见下 |
-| `.docx` | `python-docx` | MIT | 装了但**本机不可用**：见下 |
-| `.pptx` | `python-pptx` | MIT | 同上 |
+| `.docx` | `python-docx` | MIT | **已装可用** |
+| `.pptx` | `python-pptx` | MIT | **已装可用** |
 
 **PDF 的三级降级与许可分层是刻意的**（`embed_service.py::_p_pdf`）：
 `pymupdf4llm`（保标题层级）→ `fitz` → `pypdf`。前两级同源且都是 **AGPL-3.0**，
@@ -235,14 +238,25 @@ x-access-token: <token>
 第三级 `pypdf` 是 BSD-3、纯 Python，于是 **PDF 在零 AGPL 依赖下就能用**，代价是丢标题层级。
 想要层级自行装前两级即可，`parse_ok` 会照实变。
 
-**`.docx` / `.pptx` 在本开发机不可用，原因不是许可也不是代码**：两者都依赖 `lxml`，
-而 `lxml` 的编译扩展被本机的 Smart App Control 拦掉
+**`.docx` / `.pptx` 曾因 `lxml` 被拦而不可用，现已恢复**：两者都依赖 `lxml`，其编译扩展
+曾被本机 Smart App Control 拦掉
 （`DLL load failed while importing etree: 应用程序控制策略已阻止此文件`，与裁决 二·E 同一个拦截器）。
-Linux 部署下正常。**本机因此无法端到端验这两种类型** —— 记在这里免得被当成「装了就好了」。
+当前 `.venv`（lxml 6.1.1）`from lxml import etree`、`import docx, pptx` 均成功，
+`parse_ok` 的 docx/pptx 皆 true，两份二进制夹具已端到端解析通过（2026-08-10 复验）。
+哪天 `parse_ok` 再翻 false，先查 SAC 拦截记录 —— 别当成「装了就好了」。
 
 ## 部署纪律
 
 - **镜像里不装配置**：`docker/server/Dockerfile` 不再 `COPY settings.json`，改运行时挂载
-  （设置页需要热修改时使用可写挂载 `-v ./settings.json:/app/settings.json`；禁用页面编辑时才可加 `:ro`）。
+  （设置页需要热修改时使用可写挂载；`scripts/serve.ps1` 实际挂的是
+  `-v ./settings.docker.json:/app/settings.json`，`scripts/run.ps1` 同样 docker 文件优先、
+  没有才回退 `settings.json`。禁用页面编辑时才可加 `:ro`）。
   已进过镜像层的口令与 API key 建议轮换。
-- 生产 `dev_token` 必须留空（它等于一个「任意 login_name 冒充」的入口，放行时会打 warn 留痕）。
+- 生产 `insecure_login_fallback` 必须保持 `false`（开了等于一个「任意 login_name 冒充」的入口，
+  开启时启动打 warn 留痕；详见上文「其它」表）。
+
+---
+
+**编号出处**：正文括号里的 `D1`/`D10`/`AX73`/`Y3`/`V1`/`F3`/`二·E` 等是内部裁决与迭代条目号，
+仅作回溯线索：`AX73`/`Y3`/`V1`/`F3`/`二·x` 见 `docs/superpowers/plans/_DECISIONS.md`，
+`D*` 见 `docs/PROGRESS.md` 对应轮次。

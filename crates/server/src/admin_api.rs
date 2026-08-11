@@ -21,8 +21,6 @@
 //! `ROUTES` 是本文件测试里自造的字面量，与 wire 侧手写的 `.route(...)` 零编译期连接。
 //! 现在 `no_create_exemplar_route` 改成 `include_str!("main.rs")` 反查真实路由表 ——
 //! 「唯一入口」这件事才第一次真的有判据。
-//!
-//! T10 把 server 拆成 `api/` 目录时本文件整体平移成 `api/admin.rs`。
 
 use crate::AppState;
 use dms_semantic::registry::datasource as ds_reg;
@@ -35,13 +33,15 @@ use dms_knowledge::acl::{self, AclEntry, AclScope, Grantee, Perm};
 use std::sync::Arc;
 
 pub(crate) type ApiErr = (StatusCode, Json<serde_json::Value>);
-type ApiOk = Json<serde_json::Value>;
-type ApiRes = Result<ApiOk, ApiErr>;
+pub(crate) type ApiOk = Json<serde_json::Value>;
+pub(crate) type ApiRes = Result<ApiOk, ApiErr>;
 type St = State<Arc<AppState>>;
 /// 身份字段 `(login_name, role_code)`：各 query/body 都能给出这一对（D4，不连排 6 个 `&str`）
 type Ident<'a> = (&'a Option<String>, &'a Option<String>);
 
-/// 本模块提供的路由清单。**唯一消费者是本文件单测**（`no_create_exemplar_route`）——
+/// exemplar 纪律相关的路由快照（**不是本模块全量端点清单**：terms.csv / exemplars.csv /\r
+/// bulk status / table-enabled / schema-comments / sql-edit / llm-config / db-config 等不在其列）。\r
+/// **唯一消费者是本文件单测**（`no_create_exemplar_route`）——
 /// 所以是 `#[cfg(test)]`：wire 侧那张表（`main.rs` 的 `.route(...)` 逐条）是**手写**的，
 /// 与本表零编译期连接，改路由要人工同步两处。
 ///
@@ -58,24 +58,27 @@ pub const ROUTES: &[(&str, &str)] = &[
 ];
 
 /// 沿用现有 `{"error": msg}` 形状（前端只认这一种）
-fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
+pub(crate) fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
     (code, Json(serde_json::json!({ "error": msg.to_string() })))
 }
 
 /// DB/连接错误一律 500，但绝不把驱动错误链返回浏览器：其中可能包含 host、库名或 SQL。
-fn db_err(_: impl std::fmt::Display) -> ApiErr {
+fn db_err(e: impl std::fmt::Display) -> ApiErr {
+    // 底层错误只进服务端日志：全文件 20+ 处 `.map_err(db_err)` 在此留痕，响应仍是固定文案
+    tracing::warn!(error = %e, reason = "admin_db_failed", "管理面数据库操作失败");
     err(
         StatusCode::INTERNAL_SERVER_ERROR,
         "管理操作失败，请稍后重试；持续失败请联系管理员查看服务状态",
     )
 }
 
-/// 0 行影响即 404（F8「删除假成功」同款口径）
-fn affected(n: u64, what: String) -> Result<(), ApiErr> {
-    if n == 0 { Err(err(StatusCode::NOT_FOUND, what)) } else { Ok(()) }
+/// 0 行影响即 404（F8「删除假成功」同款口径）；文案闭包仅在 404 时构造，成功路径零分配
+fn affected(n: u64, what: impl FnOnce() -> String) -> Result<(), ApiErr> {
+    if n == 0 { Err(err(StatusCode::NOT_FOUND, what())) } else { Ok(()) }
 }
 
-/// admin_only 判据：**只认 `administrator_flag`**（与 `ds_api::is_admin` 同一口径）
+/// admin_only 判据：**只认 `administrator_flag`**（与 `ds_api::is_admin` 同一口径；
+/// `usage_api::is_admin` 多认 `role_code == "admin"` 是其全局块口径，差异属各自语义）
 fn is_admin(p: &principal::Principal) -> bool {
     p.administrator_flag
 }
@@ -84,6 +87,12 @@ fn is_admin(p: &principal::Principal) -> bool {
 /// `administrator_flag` —— 与 `ds_api::is_admin` 同一口径，别开第二份判据。
 pub async fn admin_only(st: &AppState, h: &HeaderMap, id: Ident<'_>) -> Result<principal::Principal, ApiErr> {
     admin(st, h, id).await
+}
+
+/// 剥 `Bearer ` 前缀：RFC 6750 的 scheme **大小写不敏感**（`bearer xxx` 也是合法写法）。
+fn bearer_token(v: &str) -> Option<&str> {
+    let (scheme, token) = v.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
 /// 系统设置比普通管理面更窄：只有 DMS 登录名精确为 `admin` 的管理员可读写配置。
@@ -98,7 +107,7 @@ pub async fn settings_admin_only(
     let (login, _) = h
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(bearer_token)
         .and_then(crate::auth::resolve)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "系统设置需要有效会话 token"))?;
     if login != "admin" {
@@ -183,7 +192,7 @@ pub async fn terms(State(st): St, h: HeaderMap, Query(q): Query<TermQuery>) -> A
     admin(&st, &h, (&q.login_name, &q.role_code)).await?;
     let limit = page_limit(q.limit);
     let rows: Vec<TermRow> = st.owned.fixed(TERM_LIST_SQL)
-        .bind(q.ds_id.clone()).bind(limit).bind(page_offset(q.offset))
+        .bind(q.ds_id).bind(limit).bind(page_offset(q.offset))
         .fetch_all().await.map_err(db_err)?;
     let terms: Vec<serde_json::Value> = rows.iter().map(term_json).collect();
     Ok(Json(serde_json::json!({ "terms": terms, "limit": limit })))
@@ -213,9 +222,9 @@ pub async fn delete_term(State(st): St, h: HeaderMap, Query(q): Query<TermQuery>
     admin(&st, &h, (&q.login_name, &q.role_code)).await?;
     let term = q.term.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let term = term.ok_or_else(|| err(StatusCode::BAD_REQUEST, "缺 term 参数"))?;
-    let ds = q.ds_id.clone().unwrap_or_else(|| ds_reg::DMS_DS_ID.into());
+    let ds = q.ds_id.unwrap_or_else(|| ds_reg::DMS_DS_ID.into());
     let n = st.owned.fixed(TERM_DELETE_SQL).bind(&ds).bind(term).execute().await.map_err(db_err)?;
-    affected(n, format!("术语 {ds}/{term} 不存在"))?;
+    affected(n, || format!("术语 {ds}/{term} 不存在"))?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -232,7 +241,8 @@ fn term_ds_ok(ds_id: &str, known: &[String]) -> bool {
 
 /// 请求 → `meta.term` 行。缺省 `ds_id='dms'`、`status='active'`（与建表默认值一致）。
 fn validate_term(r: &TermUpsertReq, known: &[String]) -> Result<TermRow, String> {
-    let ds_id = r.ds_id.clone().unwrap_or_else(|| ds_reg::DMS_DS_ID.into());
+    // 先 trim 再判白名单："dms " 这类输入不该撞上令人困惑的白名单报错
+    let ds_id = r.ds_id.as_deref().map(str::trim).unwrap_or(ds_reg::DMS_DS_ID).to_string();
     if !term_ds_ok(&ds_id, known) {
         return Err(format!("ds_id 只能是 dms | * | 已登记的数据源：{ds_id}"));
     }
@@ -244,11 +254,13 @@ fn validate_term(r: &TermUpsertReq, known: &[String]) -> Result<TermRow, String>
     if def.is_empty() || def.chars().count() > 2000 {
         return Err("definition 不能为空且 ≤2000 字符".into());
     }
-    let aliases = r.aliases.clone().unwrap_or_default();
-    if aliases.len() > 20 || aliases.iter().any(|a| a.trim().is_empty()) {
+    // 入库的是 trim 后的值：" GMV" 原样落库会让召回匹配落空
+    let aliases: Vec<String> =
+        r.aliases.clone().unwrap_or_default().iter().map(|a| a.trim().to_string()).collect();
+    if aliases.len() > 20 || aliases.iter().any(|a| a.is_empty()) {
         return Err("aliases 最多 20 个且不许有空串（空别名会命中任意问句）".into());
     }
-    let status = r.status.clone().unwrap_or_else(|| "active".into());
+    let status = r.status.as_deref().map(str::trim).unwrap_or("active").to_string();
     if !matches!(status.as_str(), "active" | "disabled") {
         return Err(format!("status 只能是 active | disabled：{status}"));
     }
@@ -319,7 +331,7 @@ pub async fn exemplars(State(st): St, h: HeaderMap, Query(q): Query<ExemplarQuer
     }
     let limit = page_limit(q.limit);
     let rows: Vec<ExRow> = st.owned.fixed(EX_LIST_SQL)
-        .bind(q.status.clone()).bind(limit).bind(page_offset(q.offset))
+        .bind(q.status).bind(limit).bind(page_offset(q.offset))
         .fetch_all().await.map_err(db_err)?;
     let items: Vec<serde_json::Value> = rows.iter().map(ex_json).collect();
     Ok(Json(serde_json::json!({ "exemplars": items, "limit": limit })))
@@ -341,7 +353,7 @@ pub async fn set_exemplar_status(
     if req.status == "disabled" {
         let n = st.owned.fixed(EX_DISABLE_SQL).bind(&p.login_name).bind(id)
             .execute().await.map_err(db_err)?;
-        affected(n, format!("示例 {id} 不存在"))?;
+        affected(n, || format!("示例 {id} 不存在"))?;
         return Ok(Json(serde_json::json!({ "id": id, "status": "disabled" })));
     }
     validate_exemplar(&st, &p, id).await
@@ -414,7 +426,7 @@ async fn validate_exemplar(st: &AppState, p: &principal::Principal, id: i64) -> 
     let n = st.owned.fixed(EX_VALIDATE_OK_SQL)
         .bind(&p.login_name).bind(&target).bind(&fingerprint.0).bind(&versions).bind(id)
         .execute().await.map_err(db_err)?;
-    affected(n, format!("示例 {id} 不存在"))?;
+    affected(n, || format!("示例 {id} 不存在"))?;
     Ok(Json(serde_json::json!({
         "id": id, "status": "enabled", "validation_status": "valid",
         "validated_source": target, "metric_versions": versions,
@@ -436,7 +448,7 @@ pub async fn delete_exemplar(
 ) -> ApiRes {
     admin(&st, &h, (&q.login_name, &q.role_code)).await?;
     let n = st.owned.fixed(EX_DELETE_SQL).bind(id).execute().await.map_err(db_err)?;
-    affected(n, format!("示例 {id} 不存在"))?;
+    affected(n, || format!("示例 {id} 不存在"))?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -448,6 +460,10 @@ pub async fn delete_exemplar(
 /// 导出上限：这两张表是人工维护的口径与沉淀的语料，量级几十到几百；
 /// 上限是防「把导出当全表抽取工具」的闸，不是预期会碰到的数。
 const CSV_MAX_ROWS: i64 = 5000;
+
+/// 导入行数上限：CSV 导入是逐行串行 upsert，无上限时 2MB body 就是数千次串行 INSERT
+///（bulk status 有 500 闸，同一纪律）。超限整体 400，不落半截数据。
+const CSV_IMPORT_MAX_ROWS: usize = 1000;
 
 /// CSV 字段转义（RFC 4180）：含 `"` `,` 或换行就整体加引号、内部引号翻倍。
 fn csv_field(s: &str) -> String {
@@ -508,8 +524,11 @@ pub async fn terms_csv(
 ) -> Result<axum::response::Response, ApiErr> {
     admin(&st, &h, (&q.login_name, &q.role_code)).await?;
     let rows: Vec<TermRow> = st.owned.fixed(TERM_LIST_SQL)
-        .bind(q.ds_id.clone()).bind(CSV_MAX_ROWS).bind(0i64)
+        .bind(q.ds_id).bind(CSV_MAX_ROWS).bind(0i64)
         .fetch_all().await.map_err(db_err)?;
+    if rows.len() as i64 == CSV_MAX_ROWS {
+        tracing::warn!(reason = "terms_csv_truncated", "术语导出达到 CSV_MAX_ROWS 上限，结果已截断");
+    }
     let mut out = String::from("ds_id,term,definition,aliases,status\n");
     for t in &rows {
         out.push_str(&[&t.0, &t.1, &t.2, &t.3.join("|"), &t.4]
@@ -528,12 +547,18 @@ pub async fn import_terms_csv(
 ) -> ApiRes {
     admin(&st, &h, (&q.login_name, &q.role_code)).await?;
     let known = ds_ids(&st).await?;
-    let mut rows = csv_parse(&body);
+    let rows = csv_parse(&body);
     // 表头行（导出文件的 round-trip）：首行五列全等才丢，长得像数据的「表头」按数据走
-    if rows.first().map(|r| r.as_slice())
-        == Some(&["ds_id".into(), "term".into(), "definition".into(), "aliases".into(), "status".into()][..])
-    {
-        rows.remove(0);
+    let header = ["ds_id", "term", "definition", "aliases", "status"];
+    let rows = match rows.first() {
+        Some(r) if r.iter().map(String::as_str).eq(header) => &rows[1..],
+        _ => &rows[..],
+    };
+    if rows.len() > CSV_IMPORT_MAX_ROWS {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("一次最多导入 {CSV_IMPORT_MAX_ROWS} 行，请拆分 CSV 分批导入"),
+        ));
     }
     let mut ok = 0usize;
     let mut failed = vec![];
@@ -557,6 +582,7 @@ pub async fn import_terms_csv(
                     .bind(&t.0).bind(&t.1).bind(&t.2).bind(&t.3).bind(&t.4)
                     .execute().await.is_err()
                 {
+                    tracing::warn!(line, reason = "term_import_row_failed", "术语 CSV 导入行保存失败");
                     failed.push(serde_json::json!({
                         "line": line,
                         "term": t.1,
@@ -581,8 +607,11 @@ pub async fn exemplars_csv(
         return Err(err(StatusCode::BAD_REQUEST, "status 只能是 pending | enabled | disabled"));
     }
     let rows: Vec<ExRow> = st.owned.fixed(EX_LIST_SQL)
-        .bind(q.status.clone()).bind(CSV_MAX_ROWS).bind(0i64)
+        .bind(q.status).bind(CSV_MAX_ROWS).bind(0i64)
         .fetch_all().await.map_err(db_err)?;
+    if rows.len() as i64 == CSV_MAX_ROWS {
+        tracing::warn!(reason = "exemplars_csv_truncated", "示例导出达到 CSV_MAX_ROWS 上限，结果已截断");
+    }
     let mut out = String::from("id,ds_id,question,sql,status,validation_status,ai_review,reviewed_by,reviewed_at,validated_at,validated_source,validated_fingerprint,invalid_reason,metric_versions,created_at\n");
     for e in &rows {
         out.push_str(&[&e.0.to_string(), &e.1, &e.2, &e.3, &e.4, &e.5, &e.6, &e.7, &e.8, &e.9, &e.10, &e.11, &e.12, &e.13, &e.14]
@@ -604,7 +633,7 @@ const EX_BULK_DISABLE_SQL: &str =
 // 只 UPDATE 已登记的行（表/列来自 schema sync，管理面不创造它们）：
 // 拼错的表名按行点名，而不是静默造一行永远渲染不到的文档。
 
-const DOC_TABLE_ROWS_SQL: &str = "SELECT table_name, custom_comment, table_comment, domain \
+const DOC_TABLE_ROWS_SQL: &str = "SELECT table_name, custom_comment, table_comment \
      FROM meta.table_doc WHERE ds_id = $1 ORDER BY table_name";
 const DOC_COL_ROWS_SQL: &str = "SELECT table_name, column_name, custom_comment, col_comment \
      FROM meta.column_doc WHERE ds_id = $1 ORDER BY table_name, ordinal";
@@ -637,11 +666,11 @@ pub async fn set_table_enabled(
     if table.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "table_name 不能为空"));
     }
-    let ds = req.ds_id.clone().unwrap_or_else(|| ds_reg::DMS_DS_ID.into());
+    let ds = req.ds_id.as_deref().map(str::trim).unwrap_or(ds_reg::DMS_DS_ID).to_string();
     let n = st.owned.fixed(SET_TABLE_ENABLED_SQL)
         .bind(req.enabled).bind(table).bind(&ds)
         .execute().await.map_err(db_err)?;
-    affected(n, format!("表 {ds}/{table} 未登记（管理面只改已登记的，不创造）"))?;
+    affected(n, || format!("表 {ds}/{table} 未登记（管理面只改已登记的，不创造）"))?;
     Ok(Json(serde_json::json!({ "ok": true, "table_name": table, "enabled": req.enabled })))
 }
 
@@ -658,8 +687,15 @@ pub(crate) const KV_SET_SQL: &str =
 
 /// 当前生效的供应商：meta.kv 覆盖 settings.json 的文件供应商（文件供应商的解析在 db.rs）
 async fn current_provider(st: &AppState) -> String {
+    // 读取失败留痕再回落：`.ok().flatten()` 会把 DB 故障静默吞成「用文件配置」
     let kv: Option<(String,)> =
-        st.owned.fixed(KV_GET_SQL).bind(KV_LLM_PROVIDER).fetch_optional().await.ok().flatten();
+        match st.owned.fixed(KV_GET_SQL).bind(KV_LLM_PROVIDER).fetch_optional().await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(error = %e, key = KV_LLM_PROVIDER, reason = "kv_read_failed", "meta.kv 读取失败，回落文件配置");
+                None
+            }
+        };
     kv.map(|(v,)| v).filter(|v| !v.is_empty()).unwrap_or_else(|| file_provider(&st.cfg()))
 }
 
@@ -688,6 +724,9 @@ pub async fn apply_runtime_llm_provider(st: &AppState) {
     }
 }
 
+/// 启动回落目标名：与 `settings.example.json` 的默认分析库条目同名，改名要同步示例配置与部署文档。
+const BOOT_FALLBACK_TARGET: &str = "doris_warehouse";
+
 /// 启动分析目标解析：只从 `mysql_targets` 选择非 `dms` 目标。
 /// kv 无效时优先 `doris_warehouse`，再取首个分析目标；没有分析目标就响亮失败，绝不把
 /// `mysql_url`（DMS 身份/权限库）当成问数回退。
@@ -695,22 +734,30 @@ pub async fn db_boot_target(
     owned: &dms_connector::OwnedStore,
     cfg: &crate::db::Settings,
 ) -> anyhow::Result<(String, String)> {
+    // 同 current_provider：读取失败留痕再回落，不静默吞成「无 kv」
     let kv: Option<(String,)> =
-        owned.fixed(KV_GET_SQL).bind(KV_MYSQL_TARGET).fetch_optional().await.ok().flatten();
+        match owned.fixed(KV_GET_SQL).bind(KV_MYSQL_TARGET).fetch_optional().await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(error = %e, key = KV_MYSQL_TARGET, reason = "kv_read_failed", "meta.kv 读取失败，按 settings.json 目录选库");
+                None
+            }
+        };
     let requested = kv
         .map(|(v,)| v)
         .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("dms"));
     let targets = crate::db::db_targets(cfg);
     if let Some(name) = requested.as_deref() {
-        if let Some((_, url)) = targets.iter().find(|(n, _)| n == name) {
-            tracing::info!(target = %name, "分析库目标按 kv 启动（运行时配置）");
-            return Ok((name.to_string(), url.clone()));
+        // 与 settings_api matching_key 同口径：目标名大小写不敏感，沿用目录里的登记名
+        if let Some((registered, url)) = targets.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            tracing::info!(target = %registered, "分析库目标按 kv 启动（运行时配置）");
+            return Ok((registered.clone(), url.clone()));
         }
         tracing::warn!(target = %name, "分析库目标不在 settings.json 目录，改用配置中的分析目标");
     }
     let fallback = targets
         .iter()
-        .find(|(name, _)| name == "doris_warehouse")
+        .find(|(name, _)| name == BOOT_FALLBACK_TARGET)
         .or_else(|| targets.first())
         .ok_or_else(|| anyhow::anyhow!(
             "settings.json 至少要显式配置一个非 dms 的 warehouse 或 production_lookup 查询目标；mysql_url 不会隐式成为查询目标"
@@ -743,7 +790,11 @@ pub async fn llm_config(State(st): St, h: HeaderMap, Query(q): Query<DocQuery>) 
             let (thinking_url, thinking_extra) = if file.eq_ignore_ascii_case(provider) {
                 (cfg.llm_base_url.as_str(), cfg.llm_extra_body.clone())
             } else {
-                (s.base_url, serde_json::from_str(s.extra).unwrap_or_default())
+                (s.base_url, serde_json::from_str(s.extra).unwrap_or_else(|e| {
+                    // 内建预设的 extra 是编译期常量，解析失败是仓库级 bug，要响亮留痕
+                    tracing::warn!(provider = %provider, error = %e, reason = "builtin_provider_extra_invalid", "内建供应商 extra 解析失败");
+                    serde_json::Map::default()
+                }))
             };
             serde_json::json!({
                 "name": provider,
@@ -856,7 +907,7 @@ const KV_MYSQL_TARGET: &str = "mysql_target";
 /// `GET /api/admin/db-config`：目标目录（脱敏 host）+ 当前生效目标。
 pub async fn db_config(State(st): St, h: HeaderMap, Query(q): Query<DocQuery>) -> ApiRes {
     settings_admin_only(&st, &h, (&q.login_name, &q.role_code)).await?;
-    let current = current_db_target(&st).await;
+    let current = current_db_target(&st);
     let cfg = st.cfg();
     let mut targets = vec![serde_json::json!({
         "name": "dms",
@@ -869,24 +920,28 @@ pub async fn db_config(State(st): St, h: HeaderMap, Query(q): Query<DocQuery>) -
     })];
     targets.extend(crate::db::db_targets(&cfg)
         .iter()
-        .map(|(name, url)| serde_json::json!({
-            "name": name,
-            "host": crate::db::mask_dsn(url),   // host:port/db —— 用户/口令永不出响应（红线）
-            "type": match crate::db::db_target_capability(&cfg, name) {
-                dms_connector::mysql::MysqlCapability::Warehouse => "warehouse",
-                dms_connector::mysql::MysqlCapability::ProductionLookup
-                | dms_connector::mysql::MysqlCapability::IdentityPermission => "production_lookup",
-            },
-            "current": *name == current,
-            "purpose": match crate::db::db_target_capability(&cfg, name) {
-                dms_connector::mysql::MysqlCapability::Warehouse => "analytics",
-                dms_connector::mysql::MysqlCapability::ProductionLookup
-                | dms_connector::mysql::MysqlCapability::IdentityPermission => "production_lookup",
-            },
-            "selectable": true,
-            "protected": false,
-            "builtin": false,
-        }))
+        .map(|(name, url)| {
+            let capability = crate::db::db_target_capability(&cfg, name);
+            serde_json::json!({
+                "name": name,
+                "host": crate::db::mask_dsn(url),   // host:port/db —— 用户/口令永不出响应（红线）
+                "type": match capability {
+                    dms_connector::mysql::MysqlCapability::Warehouse => "warehouse",
+                    dms_connector::mysql::MysqlCapability::ProductionLookup
+                    | dms_connector::mysql::MysqlCapability::IdentityPermission => "production_lookup",
+                },
+                // 与 settings_api 同语义判断同一口径：目标名大小写不敏感
+                "current": name.eq_ignore_ascii_case(&current),
+                "purpose": match capability {
+                    dms_connector::mysql::MysqlCapability::Warehouse => "analytics",
+                    dms_connector::mysql::MysqlCapability::ProductionLookup
+                    | dms_connector::mysql::MysqlCapability::IdentityPermission => "production_lookup",
+                },
+                "selectable": true,
+                "protected": false,
+                "builtin": false,
+            })
+        })
     );
     Ok(Json(serde_json::json!({
         "target": current,
@@ -896,13 +951,23 @@ pub async fn db_config(State(st): St, h: HeaderMap, Query(q): Query<DocQuery>) -
 }
 
 /// 当前生效的分析目标名；连接池与名字由 `swap_pool_named` 同锁提交。
-async fn current_db_target(st: &AppState) -> String {
+fn current_db_target(st: &AppState) -> String {
     st.mysql.target_name()
 }
 
 /// `/api/health` 用（名字不是凭据，可上报；host 不走这里，`mask_dsn` 也只给 admin 端点）
 pub async fn current_db_target_pub(st: &AppState) -> String {
-    current_db_target(st).await
+    current_db_target(st)
+}
+
+/// `graph_status` 带时间戳写入的一处收口：形状 `{state} {本地时间} target={name}[ {note}]`，
+/// 锁与时间格式只此一份。恢复旧值是整体回填，不走这里。
+fn set_graph_status(st: &AppState, state: &str, name: &str, note: &str) {
+    let note = if note.is_empty() { String::new() } else { format!(" {note}") };
+    *st.graph_status.lock().expect("graph status 锁中毒") = format!(
+        "{state} {} target={name}{note}",
+        chrono::Local::now().format("%F %T")
+    );
 }
 
 /// 热切换后的持久状态：先提交已验证的新池，再写 kv；kv 失败就恢复旧池。
@@ -918,7 +983,7 @@ pub(crate) async fn persist_db_target(
     let old_capability = crate::db::db_target_capability(&cfg, &old_name);
     let old_url = crate::db::db_targets(&cfg)
         .into_iter()
-        .find(|(target, _)| target == &old_name)
+        .find(|(target, _)| target.eq_ignore_ascii_case(&old_name))
         .map(|(_, url)| url)
         .ok_or_else(|| err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -928,16 +993,13 @@ pub(crate) async fn persist_db_target(
     // 先关图、再换池：从连接池切换开始，任何新问答都不能读取旧目标的 AGE 快照。
     // 失效令牌只在换池本身失败或完整回滚成功时恢复；不确定状态一律保持不可用。
     let graph_invalidation = dms_connector::graph::invalidate_for_target(name);
-    *st.graph_status.lock().expect("graph status 锁中毒") = format!(
-        "switching {} target={name}",
-        chrono::Local::now().format("%F %T")
-    );
+    set_graph_status(st, "switching", name, "");
     if st.mysql.swap_pool_named(url, 10, name, capability).await.is_err() {
         let _ = dms_connector::graph::restore_after_failed_switch(graph_invalidation);
         *st.graph_status.lock().expect("graph status 锁中毒") = previous_graph_status;
         return Err(err(
             StatusCode::BAD_REQUEST,
-            "数据库切换未生效。请先测试连通性，并确认目标账号具备只读查询权限",
+            crate::settings_api::DB_SWITCH_GUIDANCE,
         ));
     }
     if st.owned.fixed(KV_SET_SQL)
@@ -952,10 +1014,7 @@ pub(crate) async fn persist_db_target(
             let _ = dms_connector::graph::restore_after_failed_switch(graph_invalidation);
             *st.graph_status.lock().expect("graph status 锁中毒") = previous_graph_status;
         } else {
-            *st.graph_status.lock().expect("graph status 锁中毒") = format!(
-                "disabled {} target={name} rollback_failed",
-                chrono::Local::now().format("%F %T")
-            );
+            set_graph_status(st, "disabled", name, "rollback_failed");
             tracing::error!(target = %old_name, reason = "runtime_rollback_failed", "分析库切换持久化失败且旧池恢复失败");
         }
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR,
@@ -975,18 +1034,12 @@ pub(crate) async fn after_db_target_switch(st: &Arc<AppState>, name: &str) {
     tracing::info!(target = %name, "分析库已热切换（保存即生效）");
 
     if !st.mysql.is_warehouse() {
-        *st.graph_status.lock().expect("graph status 锁中毒") = format!(
-            "disabled {} target={name} production_lookup",
-            chrono::Local::now().format("%F %T")
-        );
+        set_graph_status(st, "disabled", name, "production_lookup");
         tracing::info!(target = %name, "production_lookup 热切换不执行通用 schema sync");
         return;
     }
 
-    *st.graph_status.lock().expect("graph status 锁中毒") = format!(
-        "pending {} target={name}",
-        chrono::Local::now().format("%F %T")
-    );
+    set_graph_status(st, "pending", name, "");
 
     // 切库后异步刷新 schema 与 AGE 图；切换响应不等全量重建，失败只留固定分类。
     let refresh = Arc::clone(st);
@@ -994,7 +1047,14 @@ pub(crate) async fn after_db_target_switch(st: &Arc<AppState>, name: &str) {
         let assets = dms_semantic::warehouse_catalog::metadata_assets();
         match refresh.mysql.probe_schema_with_warehouse_catalog(&assets).await {
             Ok((mut snap, warehouse_catalog)) => {
-                let warehouse_comments = refresh.mysql.enrich_dms_snapshot(&mut snap).await.unwrap_or(0);
+                // 富化失败按 0 条计但要留痕：紧邻的 seed/sync 失败都有 warn
+                let warehouse_comments = match refresh.mysql.enrich_dms_snapshot(&mut snap).await {
+                    Ok(n) => n,
+                    Err(_) => {
+                        tracing::warn!(reason = "warehouse_comments_enrich_failed", "DMS 注释富化失败，按 0 条计");
+                        0
+                    }
+                };
                 match dms_semantic::ingest::schema_sync::sync_schema(
                     refresh.owned.pool(), ds_reg::DMS_DS_ID, &snap, true,
                 )
@@ -1054,16 +1114,18 @@ pub async fn set_db_target(
             "DMS 权限库只用于身份、角色与数据权限校验，不能作为分析查询目标",
         ));
     }
-    let targets = crate::db::db_targets(&st.cfg());
-    let Some((_, url)) = targets.iter().find(|(n, _)| n == name) else {
+    let cfg = st.cfg();
+    let targets = crate::db::db_targets(&cfg);
+    // 与 settings_api PUT 路径（matching_key）同口径：目标名大小写不敏感，落库用目录登记名
+    let Some((registered, url)) = targets.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) else {
         return Err(err(StatusCode::BAD_REQUEST,
             format!("未知目标 {name}（目录：{}；在 settings.json 的 mysql_targets 里加）",
                     targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(" | "))));
     };
-    let capability = crate::db::db_target_capability(&st.cfg(), name);
-    persist_db_target(&st, name, url, capability).await?;
-    after_db_target_switch(&st, name).await;
-    Ok(Json(serde_json::json!({ "ok": true, "target": name, "hot": true })))
+    let capability = crate::db::db_target_capability(&cfg, registered);
+    persist_db_target(&st, registered, url, capability).await?;
+    after_db_target_switch(&st, registered).await;
+    Ok(Json(serde_json::json!({ "ok": true, "target": registered, "hot": true })))
 }
 
 // ─────────────────────────── 【A23】HITL：人改 SQL 再放行（edit 一档）───────────────────────────
@@ -1080,6 +1142,10 @@ pub struct SqlEditReq {
     role_code: Option<String>,
 }
 
+/// sql-edit 入参上限（字节）：巨型 SQL 不该直接进闸门 + 执行 + 语料沉淀（术语侧有 64/2000 闸，同纪律）
+const SQL_EDIT_MAX_QUESTION: usize = 2000;
+const SQL_EDIT_MAX_SQL: usize = 32 * 1024;
+
 /// `POST /api/admin/sql-edit` —— 改 SQL、过闸、执行、沉淀（admin_only）
 pub async fn sql_edit_exec(
     State(st): St, h: HeaderMap, Json(req): Json<SqlEditReq>,
@@ -1089,6 +1155,12 @@ pub async fn sql_edit_exec(
     let sql = req.sql.trim();
     if question.is_empty() || sql.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "question 与 sql 不能为空"));
+    }
+    if question.len() > SQL_EDIT_MAX_QUESTION || sql.len() > SQL_EDIT_MAX_SQL {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("question 与 sql 超长（上限 {SQL_EDIT_MAX_QUESTION}/{SQL_EDIT_MAX_SQL} 字节）"),
+        ));
     }
     // ① 与线上同一条闸门（`dms_agent::gate`，含只读红线/权限注入/LIMIT），一步没宽
     let scope = dms_policy::scope::compute_scope_cached(&st.auth_mysql, &p).await.map_err(db_err)?;
@@ -1145,12 +1217,15 @@ pub async fn schema_comments_csv(
 ) -> Result<axum::response::Response, ApiErr> {
     admin(&st, &h, (&q.login_name, &q.role_code)).await?;
     let ds = doc_ds(&q);
-    let tables: Vec<(String, String, String, String)> =
-        st.owned.fixed(DOC_TABLE_ROWS_SQL).bind(&ds).fetch_all().await.map_err(db_err)?;
-    let cols: Vec<(String, String, String, String)> =
-        st.owned.fixed(DOC_COL_ROWS_SQL).bind(&ds).fetch_all().await.map_err(db_err)?;
+    // 两条导出查询互不依赖，并发跑
+    let (tables, cols) = tokio::join!(
+        st.owned.fixed(DOC_TABLE_ROWS_SQL).bind(&ds).fetch_all(),
+        st.owned.fixed(DOC_COL_ROWS_SQL).bind(&ds).fetch_all(),
+    );
+    let tables: Vec<(String, String, String)> = tables.map_err(db_err)?;
+    let cols: Vec<(String, String, String, String)> = cols.map_err(db_err)?;
     let mut out = String::from("kind,table_name,column_name,custom_comment,native_comment\n");
-    for (t, cc, nc, _dom) in &tables {
+    for (t, cc, nc) in &tables {
         out.push_str(&["table", t, "", cc, nc].map(csv_field).join(","));
         out.push('\n');
     }
@@ -1168,11 +1243,17 @@ pub async fn import_schema_comments_csv(
 ) -> ApiRes {
     admin(&st, &h, (&q.login_name, &q.role_code)).await?;
     let ds = doc_ds(&q);
-    let mut rows = csv_parse(&body);
-    if rows.first().map(|r| r.as_slice())
-        == Some(&["kind".into(), "table_name".into(), "column_name".into(), "custom_comment".into(), "native_comment".into()][..])
-    {
-        rows.remove(0);
+    let rows = csv_parse(&body);
+    let header = ["kind", "table_name", "column_name", "custom_comment", "native_comment"];
+    let rows = match rows.first() {
+        Some(r) if r.iter().map(String::as_str).eq(header) => &rows[1..],
+        _ => &rows[..],
+    };
+    if rows.len() > CSV_IMPORT_MAX_ROWS {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("一次最多导入 {CSV_IMPORT_MAX_ROWS} 行，请拆分 CSV 分批导入"),
+        ));
     }
     let mut ok = 0usize;
     let mut failed = vec![];
@@ -1193,13 +1274,17 @@ pub async fn import_schema_comments_csv(
             }
         };
         match res {
-            Ok(0) => failed.push(serde_json::json!({ "line": line, "table": table, "error": "表/列未登记（管理面只改已登记的，不创造）" })),
+            Ok(0) => failed.push(serde_json::json!({ "line": line, "table": table, "column": column, "error": "表/列未登记（管理面只改已登记的，不创造）" })),
             Ok(_) => ok += 1,
-            Err(_) => failed.push(serde_json::json!({
-                "line": line,
-                "table": table,
-                "error": "保存失败，请检查表名、列名和注释格式后重试",
-            })),
+            Err(_) => {
+                tracing::warn!(line, reason = "schema_comment_import_row_failed", "注释 CSV 导入行保存失败");
+                failed.push(serde_json::json!({
+                    "line": line,
+                    "table": table,
+                    "column": column,
+                    "error": "保存失败，请检查表名、列名和注释格式后重试",
+                }))
+            }
         }
     }
     Ok(Json(serde_json::json!({ "ok": ok, "failed": failed })))
@@ -1231,14 +1316,20 @@ pub async fn set_exemplars_status(
         let n = st.owned.fixed(EX_BULK_DISABLE_SQL)
             .bind(&p.login_name).bind(&req.ids)
             .execute().await.map_err(db_err)?;
+        // 全不存在的 ids 不许 ok:true 假成功（F8 口径，与单条删除的 affected() 对齐）
+        affected(n, || "没有匹配的示例 id（可能已删除）".to_string())?;
         return Ok(Json(serde_json::json!({ "ok": true, "updated": n })));
     }
     if req.ids.len() > 100 {
         return Err(err(StatusCode::BAD_REQUEST, "批量执行验证一次最多 100 条"));
     }
+    // 去重：同一 id 传两次就真实执行两遍（每次都是全量取数 + 闸门 + 真实执行）
+    let mut ids = req.ids;
+    ids.sort_unstable();
+    ids.dedup();
     let mut ok = 0usize;
     let mut failed = Vec::new();
-    for id in req.ids {
+    for id in ids {
         match validate_exemplar(&st, &p, id).await {
             Ok(_) => ok += 1,
             Err((_, Json(v))) => failed.push(serde_json::json!({ "id": id, "error": v["error"] })),
@@ -1265,10 +1356,14 @@ fn acl_entry(ds_id: &str, r: &GrantReq) -> Result<AclEntry, String> {
     if id.is_empty() || id.chars().count() > 64 {
         return Err("grantee 不能为空且 ≤64 字符".into());
     }
-    let grantee = Grantee::parse(&r.grantee_kind, id)
+    // kind/perm 先归一（trim + 小写）：parse 对大小写/空白不做宽容（`dms_knowledge::acl` 注释自承），
+    // 页面传 `"Login"`/`"READ"` 不该被拒
+    let kind = r.grantee_kind.trim().to_ascii_lowercase();
+    let grantee = Grantee::parse(&kind, id)
         .ok_or_else(|| format!("grantee_kind 只能是 login | role：{}", r.grantee_kind))?;
     let p = r.perm.as_deref().unwrap_or("read");
-    let perm = Perm::parse(p).ok_or_else(|| format!("perm 只能是 read | write：{p}"))?;
+    let perm = Perm::parse(&p.trim().to_ascii_lowercase())
+        .ok_or_else(|| format!("perm 只能是 read | write：{p}"))?;
     Ok(AclEntry { scope: AclScope::Ds, target_id: ds_id.to_string(), grantee, perm })
 }
 
@@ -1304,7 +1399,8 @@ pub async fn revoke(
 ) -> ApiRes {
     admin(&st, &h, (&q.login_name, &q.role_code)).await?;
     let e = acl_entry(&id, &q).map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
-    ensure_ds(&st, &id).await?;
+    // 撤权不验「源必须存在」：源被删后遗留的 kb.acl 行（`target_id` 只是字符串、无外键，见上）
+    // 也必须能收回，否则幽灵授权永远撤不掉。revoke 底层是幂等 DELETE，无行自然 0 影响。
     acl::revoke(&st.owned, &e).await.map_err(db_err)?;
     Ok(Json(grant_json(&id, &e)))
 }
@@ -1370,7 +1466,7 @@ mod tests {
             .split("\n}\n")
             .next()
             .unwrap();
-        assert!(body.contains("AUTHORIZATION") && body.contains("strip_prefix(\"Bearer \""),
+        assert!(body.contains("AUTHORIZATION") && body.contains("bearer_token"),
                 "设置面没有强制 Bearer 会话：{body}");
         assert!(body.contains("crate::auth::resolve"), "设置面没有解析服务端会话：{body}");
         assert!(body.contains("login != \"admin\"")
@@ -1417,7 +1513,10 @@ mod tests {
             .split("\n}")
             .next()
             .unwrap();
-        assert!(db_err.starts_with("_:"), "db_err 仍消费底层错误内容：{db_err}");
+        // 底层错误只进服务端日志（tracing::warn），响应仍是固定文案、不带驱动错误链
+        assert!(db_err.contains("tracing::warn!"), "DB 故障服务端零痕迹（运维全盲）：{db_err}");
+        assert!(db_err.contains("管理操作失败，请稍后重试"), "回浏览器的固定文案变了：{db_err}");
+        assert!(!db_err.contains("format!"), "驱动错误链仍可能拼进响应：{db_err}");
 
         let validate = src
             .split("async fn validate_exemplar(")
@@ -1465,6 +1564,14 @@ mod tests {
         assert_eq!(ok.0, "dms", "缺省 ds_id");
         assert_eq!(ok.4, "active", "缺省 status");
         assert!(ok.3.is_empty());
+        // ds_id/status/aliases 入库前归一（trim）："dms " 不该撞白名单报错，" GMV" 别名不该原样落库
+        let t = validate_term(
+            &term_req(r#"{"term":"GMV","definition":"x","ds_id":" dms ","status":" disabled ","aliases":[" 成交额 "]}"#),
+            &[],
+        ).unwrap();
+        assert_eq!(t.0, "dms");
+        assert_eq!(t.4, "disabled", "status 先 trim 再匹配");
+        assert_eq!(t.3, vec!["成交额".to_string()], "别名存 trim 后的值，原样落库会让召回落空");
         for j in [
             r#"{"term":"GMV","definition":"x","ds_id":"nope"}"#,
             r#"{"term":"  ","definition":"x"}"#,
@@ -1488,6 +1595,11 @@ mod tests {
         assert_eq!(e.target_id, "upload_d1");
         assert_eq!(e.grantee, Grantee::Login("lisi".into()));
         assert_eq!(e.perm, Perm::Read, "缺省只读：让人查数不等于让他改");
+        // kind/perm 归一：trim + 小写（parse 不做宽容，归一是本文件职责）
+        let mixed = grant_req(r#"{"grantee_kind":" Login ","grantee":"lisi","perm":"READ"}"#);
+        let e = acl_entry("d", &mixed).unwrap();
+        assert_eq!(e.grantee, Grantee::Login("lisi".into()));
+        assert_eq!(e.perm, Perm::Read);
         let w = grant_req(r#"{"grantee_kind":"role","grantee":"101","perm":"write"}"#);
         assert_eq!(acl_entry("d", &w).unwrap().perm, Perm::Write);
         for j in [
@@ -1549,8 +1661,8 @@ mod tests {
         assert!(EX_VALIDATE_OK_SQL.contains("WHERE id=$5"));
         assert!(EX_VALIDATE_BAD_SQL.contains("WHERE id=$4"));
         assert!(TERM_UPSERT_SQL.contains("ON CONFLICT (ds_id, term)"), "{TERM_UPSERT_SQL}");
-        assert_eq!(affected(0, "x".into()).unwrap_err().0, StatusCode::NOT_FOUND);
-        assert!(affected(1, "x".into()).is_ok());
+        assert_eq!(affected(0, || "x".into()).unwrap_err().0, StatusCode::NOT_FOUND);
+        assert!(affected(1, || "x".into()).is_ok());
     }
 
     /// 【B6】CSV 往返：逗号/引号/换行/中文全要活过一个来回（示例 SQL 必含前三样）。
@@ -1579,6 +1691,7 @@ mod tests {
         let src = include_str!("admin_api.rs");
         let body = src.split("pub async fn set_exemplars_status(").nth(1).unwrap().split("\n\n// ").next().unwrap();
         assert!(body.contains("validate_exemplar(&st, &p, id).await"), "批量启用绕过了 VQR：{body}");
+        assert!(body.contains("dedup()"), "批量启用不去重：同一 id 传两遍会真实执行两遍：{body}");
         // 逐条与批量共用 `review_status_ok`：pending 不许被「复核」回 pending（反复排队）
         assert!(review_status_ok("enabled") && review_status_ok("disabled"));
         assert!(!review_status_ok("pending") && !review_status_ok("active"));
@@ -1602,5 +1715,131 @@ mod tests {
         assert!(SET_COL_COMMENT_SQL.contains("AND ds_id = $4"), "{SET_COL_COMMENT_SQL}");
         assert!(SET_TABLE_COMMENT_SQL.starts_with("UPDATE meta.table_doc SET custom_comment"),
                 "写原生列就会被下一次 sync 抹掉/污染：{SET_TABLE_COMMENT_SQL}");
+    }
+
+    /// Bearer scheme 大小写不敏感（RFC 6750）：`bearer xxx` 不该被 401
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearer"), None, "没有 token 部分");
+        assert_eq!(bearer_token(""), None);
+    }
+
+    /// 分析目标名匹配大小写不敏感（与 settings_api matching_key 同口径）：
+    /// boot 选库 / db-config 的 current / persist 找旧 url / POST 切换，四处同一纪律。
+    #[test]
+    fn db_target_names_match_case_insensitively() {
+        let src = include_str!("admin_api.rs");
+        let body = |anchor: &str| {
+            src.split(anchor)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{anchor} 不见了"))
+                .split("\n}")
+                .next()
+                .unwrap()
+        };
+        assert!(body("pub async fn db_boot_target(").contains("n.eq_ignore_ascii_case(name)"),
+                "boot 选库仍大小写敏感：kv 与 settings 大小写不一致就静默走 fallback");
+        assert!(body("pub async fn db_config(").contains("name.eq_ignore_ascii_case(&current)"),
+                "db-config 的 current 仍大小写敏感（settings_api 同语义判断用 eq_ignore_ascii_case）");
+        assert!(body("pub(crate) async fn persist_db_target(").contains("target.eq_ignore_ascii_case(&old_name)"),
+                "persist 找旧 url 仍大小写敏感，与 capability 查找自相矛盾");
+        assert!(body("pub async fn set_db_target(").contains("n.eq_ignore_ascii_case(name)"),
+                "POST 切换仍大小写敏感：PUT 用错大小写能存，POST 却报「未知目标」");
+    }
+
+    /// CSV 导入有行数闸：无上限时 2MB body 是数千次串行 INSERT；表头丢弃是切片不是 O(n) 平移
+    #[test]
+    fn csv_import_has_row_cap_and_slice_header() {
+        let src = include_str!("admin_api.rs");
+        for anchor in ["pub async fn import_terms_csv(", "pub async fn import_schema_comments_csv("] {
+            let body = src
+                .split(anchor)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{anchor} 不见了"))
+                .split("\n}")
+                .next()
+                .unwrap();
+            assert!(body.contains("CSV_IMPORT_MAX_ROWS"), "{anchor} 没有行数闸");
+            assert!(body.contains("&rows[1..]"), "{anchor} 表头丢弃仍是 O(n) 的 remove(0)");
+        }
+    }
+
+    /// sql-edit 的 question/sql 有长度上限（术语有 64/2000 闸，这里同纪律）
+    #[test]
+    fn sql_edit_has_length_caps() {
+        let src = include_str!("admin_api.rs");
+        let body = src
+            .split("pub async fn sql_edit_exec(")
+            .nth(1)
+            .expect("sql_edit_exec 不见了")
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(body.contains("SQL_EDIT_MAX_QUESTION") && body.contains("SQL_EDIT_MAX_SQL"),
+                "question/sql 无长度上限：巨型 SQL 直接进闸门+执行+沉淀：{body}");
+    }
+
+    /// revoke 不验源存在：源已删的遗留 kb.acl 行也必须能收回（target_id 无外键）；
+    /// grant 仍须先验源存在（幽灵授权对策）。
+    #[test]
+    fn revoke_works_for_orphan_acl_rows() {
+        let src = include_str!("admin_api.rs");
+        let revoke = src
+            .split("pub async fn revoke(")
+            .nth(1)
+            .expect("revoke 不见了")
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(!revoke.contains("ensure_ds"), "revoke 仍被已删除的源挡住：{revoke}");
+        let grant = src
+            .split("pub async fn grant(")
+            .nth(1)
+            .expect("grant 不见了")
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(grant.contains("ensure_ds"), "grant 仍须先验源存在（幽灵授权对策）：{grant}");
+    }
+
+    /// 批量 disable 全 miss 时不许 `ok:true` 假成功（F8 口径，与单条删除的 affected() 对齐）
+    #[test]
+    fn bulk_disable_all_miss_is_404() {
+        let src = include_str!("admin_api.rs");
+        let body = src
+            .split("pub async fn set_exemplars_status(")
+            .nth(1)
+            .expect("set_exemplars_status 不见了")
+            .split("\n\n// ")
+            .next()
+            .unwrap();
+        let disabled = body
+            .split("if req.status == \"disabled\" {")
+            .nth(1)
+            .expect("disabled 分支不见了")
+            .split("\n    }")
+            .next()
+            .unwrap();
+        assert!(disabled.contains("affected(n,"), "批量 disable 全 miss 仍 ok:true 假成功：{disabled}");
+        assert!(disabled.contains("\"updated\": n"), "成功路径仍回 updated 计数：{disabled}");
+    }
+
+    /// 注释导入的失败行点名到列：column 行只带 table 时定位失败行要靠猜
+    #[test]
+    fn schema_comment_import_failures_name_the_column() {
+        let src = include_str!("admin_api.rs");
+        let body = src
+            .split("pub async fn import_schema_comments_csv(")
+            .nth(1)
+            .expect("导入端点没了")
+            .split("\n/// ")
+            .next()
+            .unwrap();
+        assert!(body.matches("\"column\": column").count() >= 2,
+                "column 行失败记录仍不带 column_name：{body}");
     }
 }

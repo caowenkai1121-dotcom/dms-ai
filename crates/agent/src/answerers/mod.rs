@@ -1,7 +1,7 @@
 //! `Answerer` trait + Router 有序表。变更原因＝「谁有资格出手、按什么顺序」。
 //!
 //! 逐条转写 `server/src/pipeline.rs:643-711`（`ask_single` 里 graph / compose / fastpath /
-//! cache / llm 五支内联 if）。**加一种能力＝加一个 `Answerer`**，不是往那 258 行里再塞一支 if。
+//! cache / llm 五支内联 if）。**加一种能力＝加一个 `Answerer`**，不是往那 258 行（拆分时点行数）里再塞一支 if。
 //!
 //! ## 纪律（全部来自 crate 文档，逐条落实）
 //! - **顺序即行为**：`[graph, compose, fastpath, cache, llm]` 一位都不许换。compose 与 fastpath
@@ -30,7 +30,8 @@ use crate::ctx::{AskCtx, AskResult};
 /// 路由表的一个成员。
 ///
 /// 异步方法手写 `BoxFut` 而非引 `async-trait`（铁律 3 零新增依赖）：原生 `async fn in trait`
-/// 在 1.97 上**不是 dyn 兼容的**（`async_fn_in_dyn_trait` 仍未稳定），而路由表就是
+/// 至今**不是 dyn 兼容的**（lint `async_fn_in_dyn_trait`；toolchain 是浮动 stable，版本论断无法复核），
+/// 而路由表就是
 /// `Vec<Box<dyn Answerer>>`。同一写法已在 `dms_connector::source::SqlSource` 与
 /// `dms_kernel::ChatModel` 用过两次，这里第三次沿用。
 ///
@@ -46,8 +47,8 @@ pub trait Answerer: Send + Sync {
     fn route(&self) -> &'static str;
 
     /// 该成员是否有资格出手。**权限门禁在这里，不在 `answer` 里**。
-/// 同步且不做 IO：graph/cache/entity/business-lookup 等成员只做资格判断，
-/// compose/fastpath 恒真；没有一个门禁需要 await。
+    /// 同步且不做 IO：graph/cache/entity/business-lookup 等成员只做资格判断，
+    /// compose/fastpath 恒真；没有一个门禁需要 await。
     fn accept(&self, cx: &AskCtx<'_>) -> bool;
 
     /// `Ok(None)` = 我没接住，交给下一个；`Err` = **原样上抛**
@@ -86,7 +87,7 @@ pub const ROUTER_ORDER: &[&str] = &[
     "llm",
 ];
 
-// 这里曾有一个 `default_router() -> vec![]`：地基阶段的占位，五个成员落地后**没人再用它**
+// 这里曾有一个 `default_router() -> vec![]`：地基阶段的占位，成员逐个落地后**没人再用它**
 // （真 Router 是 `ask::router()`，它要注入 embed 与三个确定性命中回调，造不出无参版本）。
 // 删掉它是因为 `route_label_map` 当时拿它取标签 —— 空表让那条子序列断言**恒真**，
 // 守着空气比没有守卫更坏。顺序契约现由 `ask::router_is_the_contract_in_full` 逐字守
@@ -99,7 +100,7 @@ mod tests {
     /// `labels` 是否为 `ROUTER_ORDER` 的**子序列**：一次同时守住三件事 ——
     /// 标签在白名单内（不在则不可能出现在 ROUTER_ORDER 里）、无重复（ROUTER_ORDER 无重复项，
     /// 重复标签必然匹配不上第二次）、顺序不变（换位即失配）。
-    /// 成员逐个落地的过程中它也成立，所以这条断言从今天起就有效，不用等五个都到齐。
+    /// 成员逐个落地的过程中它也成立，所以这条断言从今天起就有效，不用等都到齐。
     fn is_subsequence(labels: &[&str]) -> bool {
         let mut it = ROUTER_ORDER.iter();
         labels.iter().all(|l| it.any(|o| o == l))

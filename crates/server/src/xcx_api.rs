@@ -2,7 +2,7 @@
 //!
 //! ## 接线契约（编排方在 main.rs 统一接线，本文件不自己挂路由）
 //!
-//! main.rs 里只需两行路由（模块声明已带 `#[allow(dead_code)]`，接线时一并删掉它）：
+//! main.rs 里只需两行路由（**已在 main.rs 接线**：`mod xcx_api;` + 下面两条路由）：
 //!
 //! ```ignore
 //! .route("/api/xcx/ask", post(xcx_api::ask))
@@ -41,12 +41,12 @@
 //! - 限流：HTTP 429 + `{"code":429,...}` —— 同一 IP 每分钟 20 次（per-IP 固定窗口，
 //!   `auth::ip_rate_allow`），ask/me 共用前段一道闸。
 //! - 入参限长：question / prev_question ≤ 500 字、prev_sql ≤ 2000 字，超出 400
-//!  （与 web 端输入框 maxlength 同口径；超限拒收，不静默截断）。
+//!   （与 web 端输入框 maxlength 同口径；超限拒收，不静默截断）。
 //! - 校验服务本身不可用（超时/网络/上游 5xx）：HTTP 502 + `{"code":500,...}` ——
 //!   重试可能好，**不该**骗用户重新登录。瞬时故障不进缓存（下一次重试必须真能打到上游）。
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
@@ -62,13 +62,17 @@ use dms_semantic::registry::datasource as ds_reg;
 /// 与 mcp_api 同款：(HTTP 状态码, 协议体)。HTTP 码给网关/抓包看，body.code 给小程序拦截器看。
 type ApiErr = (StatusCode, Json<Value>);
 
-/// 鉴权头（小程序与商城后端约定的登录态载体）
-const TOKEN_HEADER: &str = "x-access-token";
+/// 鉴权头（小程序与商城后端约定的登录态载体）：单一事实源在 `auth::UPSTREAM_TOKEN_HEADER`
+///（SSO 验真同一条头，两处各写一份字面量必漂）
+use crate::auth::UPSTREAM_TOKEN_HEADER as TOKEN_HEADER;
 /// 校验通道路径：拼在 `xcx_auth_base`（先剥尾斜杠）之后
 const LOGIN_INFO_PATH: &str = "/login/getLoginInfo";
 /// 上游校验超时：5s。登录态校验卡在问答主链路上 —— 外部抖动不能拖垮整链，
 /// 超时按「暂不可用」（502）拒，让用户重试，而不是无限等。
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// 上游响应体上限：上游被攻破/配错回巨型 body 时，解析阶段不许吃无界内存
+const MAX_IDENTITY_BODY_BYTES: usize = 256 * 1024;
+
 /// 进程内身份缓存 TTL：60s。这是「每问一句都打一次外部校验」与「权限实时性」的取舍：
 /// token 失效/切角色最多滞后 60s 生效，60s 内同一个 token 重复问不重复打外部。
 /// 同 TTL 兼作**负缓存**：上游明确判失效的 token 也记 60s，坏 token 重放打在缓存上，
@@ -110,9 +114,11 @@ fn first_non_empty<'a>(data: &'a Value, keys: &[&str]) -> Option<&'a str> {
 }
 
 /// 防御性解析 getLoginInfo 的 data：
-/// - 登录名：`loginName/userName/username/employeeCode` 取第一个非空；顶层取不到再看
-///   `user/employee/sysUser/userInfo` 嵌套对象的同一组键（上游各端返回结构不一）。
-/// - 角色：`activeRoleCode/currentRoleCode/roleCode` 顶层键优先 → `activeRole.roleCode` →
+/// - 登录名：`loginName/userName/username/employeeCode` 取第一个非空。
+/// - 角色/姓名/登录名同一条「顶层 → 嵌套」回退链：顶层取不到再看
+///   `user/employee/sysUser/userInfo` 嵌套对象（上游各端返回结构不一）。只查顶层会在
+///   上游把完整身份塞进 `user` 时丢 role_code —— 多角色账号随后被 load_principal 误拒 403。
+/// - 角色链：`activeRoleCode/currentRoleCode/roleCode` 键优先 → `activeRole.roleCode` →
 ///   `roleVOList/roleList/roles` 任一数组首元素的 `roleCode`（`roleList` 不是猜的：小程序
 ///   登录页 `pages/login/login.vue` 的令牌登录分支实证读 `data.roleList`）。
 ///   数组缺失/为空/元素缺字段都不硬失败，角色就是 None —— 单角色直通、多角色由
@@ -122,25 +128,31 @@ fn first_non_empty<'a>(data: &'a Value, keys: &[&str]) -> Option<&'a str> {
 /// 返回 None = 拿不到登录名 —— 身份立不起来，调用方按 fail-closed 拒。
 fn parse_identity(data: &Value) -> Option<XcxIdentity> {
     const LOGIN_KEYS: &[&str] = &["loginName", "userName", "username", "employeeCode"];
-    let login = first_non_empty(data, LOGIN_KEYS).or_else(|| {
-        ["user", "employee", "sysUser", "userInfo"]
-            .iter()
-            .filter_map(|k| data.get(k))
-            .find_map(|nested| first_non_empty(nested, LOGIN_KEYS))
-    })?;
-    let role = first_non_empty(data, &["activeRoleCode", "currentRoleCode", "roleCode"])
-        .map(str::to_string)
-        .or_else(|| {
-            first_non_empty(data.get("activeRole")?, &["roleCode"]).map(str::to_string)
-        })
-        .or_else(|| {
-            ["roleVOList", "roleList", "roles"].iter().find_map(|k| {
-                let first = data.get(k)?.as_array()?.first()?;
-                first_non_empty(first, &["roleCode"]).map(str::to_string)
+    const NESTED_KEYS: &[&str] = &["user", "employee", "sysUser", "userInfo"];
+    /// 角色链（在单个对象层内求值）
+    fn role_of(data: &Value) -> Option<String> {
+        first_non_empty(data, &["activeRoleCode", "currentRoleCode", "roleCode"])
+            .map(str::to_string)
+            .or_else(|| {
+                first_non_empty(data.get("activeRole")?, &["roleCode"]).map(str::to_string)
             })
-        });
-    let name =
-        first_non_empty(data, &["actualName", "name", "nickName", "employeeName"]).map(str::to_string);
+            .or_else(|| {
+                ["roleVOList", "roleList", "roles"].iter().find_map(|k| {
+                    let first = data.get(k)?.as_array()?.first()?;
+                    first_non_empty(first, &["roleCode"]).map(str::to_string)
+                })
+            })
+    }
+    fn name_of(data: &Value) -> Option<String> {
+        first_non_empty(data, &["actualName", "name", "nickName", "employeeName"]).map(str::to_string)
+    }
+    // 顶层优先，逐个嵌套对象回退（同一组键、同一条角色链）
+    let scopes: Vec<&Value> = std::iter::once(data)
+        .chain(NESTED_KEYS.iter().filter_map(|k| data.get(k)))
+        .collect();
+    let login = scopes.iter().find_map(|s| first_non_empty(s, LOGIN_KEYS))?;
+    let role = scopes.iter().find_map(|s| role_of(s));
+    let name = scopes.iter().find_map(|s| name_of(s));
     Some(XcxIdentity {
         login_name: login.to_string(),
         role_code: role,
@@ -250,9 +262,14 @@ fn normalize_base(raw: Option<String>) -> Option<String> {
 /// 上游**明确判失效**的 token 同样回填（负缓存）：同一个坏 token 的重复重放打在缓存上，
 /// 不再逐次穿透上游。瞬时故障（Unavailable）不缓存 —— 下一次重试必须真能打到上游。
 /// 失败出路就 `AuthFail` 两种，HTTP/协议码分叉收在 `require_identity`。
+///
+/// ⚠️ 无 single-flight：冷启动/缓存集中过期时，N 个并发同 token 请求会各打一次上游。
+/// 这是接受的取舍 —— 单 token 的并发天然受该用户的操作频率限制，上游又是内网服务；
+/// 引 in-flight 去重 map 会让「锁不跨 await」那条红线（见 TokenCache 注释）变复杂，收益不成比例。
 async fn validate_xcx_token(base: &str, token: &str) -> Result<XcxIdentity, AuthFail> {
     let now = Instant::now();
-    if let Some(hit) = TOKEN_CACHE.lock().expect("xcx 缓存锁中毒").get(token, now) {
+    // 锁中毒自愈（unwrap_or_else(into_inner)）：一次 put 期间 panic 不许让此后所有 xcx 请求 500
+    if let Some(hit) = TOKEN_CACHE.lock().unwrap_or_else(PoisonError::into_inner).get(token, now) {
         return match hit {
             CacheVerdict::Valid(id) => Ok(id),
             // 负缓存命中：与上游亲判同形（调用方无感），只是不再打外部
@@ -264,14 +281,14 @@ async fn validate_xcx_token(base: &str, token: &str) -> Result<XcxIdentity, Auth
         Ok(id) => {
             TOKEN_CACHE
                 .lock()
-                .expect("xcx 缓存锁中毒")
+                .unwrap_or_else(PoisonError::into_inner)
                 .put(token.to_string(), CacheVerdict::Valid(id.clone()), Instant::now());
             Ok(id)
         }
         Err(AuthFail::TokenInvalid) => {
             TOKEN_CACHE
                 .lock()
-                .expect("xcx 缓存锁中毒")
+                .unwrap_or_else(PoisonError::into_inner)
                 .put(token.to_string(), CacheVerdict::Invalid, Instant::now());
             Err(AuthFail::TokenInvalid)
         }
@@ -302,14 +319,36 @@ async fn fetch_identity(base: &str, token: &str) -> Result<XcxIdentity, AuthFail
         tracing::warn!(http_status = %status.as_u16(), "小程序登录态校验上游非 2xx");
         return Err(AuthFail::Unavailable);
     }
-    let body: Value = resp.json().await.map_err(|e| {
+    // Content-Length 预检 + 分块限长读取（chunked 无长度声明也兜得住）
+    if resp.content_length().is_some_and(|n| n > MAX_IDENTITY_BODY_BYTES as u64) {
+        tracing::warn!(len = ?resp.content_length(), "小程序登录态校验响应体超上限");
+        return Err(AuthFail::Unavailable);
+    }
+    let mut resp = resp;
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        tracing::warn!(reason = %e, "小程序登录态校验响应读取失败");
+        AuthFail::Unavailable
+    })? {
+        if buf.len() + chunk.len() > MAX_IDENTITY_BODY_BYTES {
+            tracing::warn!(size = buf.len() + chunk.len(), "小程序登录态校验响应体超上限");
+            return Err(AuthFail::Unavailable);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let body: Value = serde_json::from_slice(&buf).map_err(|e| {
         tracing::warn!(reason = %e, "小程序登录态校验响应不是 JSON");
         AuthFail::Unavailable
     })?;
     // code 缺失/非数字 = 协议不认识：不能默认成 0（那是放行），按失效拒（fail-closed）。
     match body.get("code").and_then(Value::as_i64) {
         Some(code) => map_upstream_code(code).map_err(|f| {
-            tracing::warn!(upstream_code = code, "小程序 token 被上游判定失效/拒绝");
+            // 30007/30012 是 token 生命周期的日常事件（用户重新登录即好），每 token 每 60s
+            // 一条 warn 是噪音；未知码保留 warn —— 那才说明上游协议变了
+            match code {
+                30007 | 30012 => tracing::debug!(upstream_code = code, "小程序 token 失效（日常码）"),
+                _ => tracing::warn!(upstream_code = code, "小程序 token 被上游判定失效/拒绝（非常见码）"),
+            }
             f
         })?,
         None => {
@@ -317,8 +356,8 @@ async fn fetch_identity(base: &str, token: &str) -> Result<XcxIdentity, AuthFail
             return Err(AuthFail::TokenInvalid);
         }
     }
-    let data = body.get("data").cloned().unwrap_or(Value::Null);
-    parse_identity(&data).ok_or_else(|| {
+    // data 子树不克隆（员工信息 payload 可能不小），parse_identity 只要引用
+    parse_identity(body.get("data").unwrap_or(&Value::Null)).ok_or_else(|| {
         // code=0 却取不到登录名：上游 shape 变了。重新登录修不好它 —— 按不可用报，
         // 让运维从日志看到，而不是让小程序用户陷入「弹登录 → 登录 → 再弹」的死循环。
         tracing::warn!("小程序登录态校验 code=0 但 data 取不到登录名（上游字段 shape 变了？）");
@@ -344,15 +383,16 @@ fn invalid_token_err() -> ApiErr {
 
 /// ⑤ 入参限长判据（纯函数，handler 只负责把 Err 映射成 400）：
 /// question / prev_question ≤ 500 字、prev_sql ≤ 2000 字（按字符计，不按字节切 CJK）。
-fn lengths_ok(question: &str, prev_question: Option<&str>, prev_sql: Option<&str>) -> Result<(), &'static str> {
+/// 文案拼常量：改常量不改文案即失真（钉值测试只钉常量，不钉文案里的数字）。
+fn lengths_ok(question: &str, prev_question: Option<&str>, prev_sql: Option<&str>) -> Result<(), String> {
     if question.chars().count() > MAX_QUESTION_CHARS {
-        return Err("question 超长（最多 500 字）");
+        return Err(format!("question 超长（最多 {MAX_QUESTION_CHARS} 字）"));
     }
     if prev_question.is_some_and(|q| q.chars().count() > MAX_QUESTION_CHARS) {
-        return Err("prev_question 超长（最多 500 字）");
+        return Err(format!("prev_question 超长（最多 {MAX_QUESTION_CHARS} 字）"));
     }
     if prev_sql.is_some_and(|s| s.chars().count() > MAX_PREV_SQL_CHARS) {
-        return Err("prev_sql 超长（最多 2000 字）");
+        return Err(format!("prev_sql 超长（最多 {MAX_PREV_SQL_CHARS} 字）"));
     }
     Ok(())
 }
@@ -378,6 +418,11 @@ async fn require_identity(st: &AppState, headers: &HeaderMap) -> Result<XcxIdent
         .map(str::trim)
         .unwrap_or_default();
     if token.is_empty() {
+        return Err(invalid_token_err());
+    }
+    // 长度闸（与 SSO 同一条 MAX_UPSTREAM_TOKEN_LEN）：超长按 token 失效拒 ——
+    // 它随后是缓存 key：无上限的 key 拖慢哈希，还把 1000 条 CAP 撑成 ~8MB/条 量级
+    if token.len() > crate::auth::MAX_UPSTREAM_TOKEN_LEN {
         return Err(invalid_token_err());
     }
     validate_xcx_token(&base, token).await.map_err(|f| match f {
@@ -413,13 +458,15 @@ pub async fn ask(
     if question.is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, 400, "question 不能为空"));
     }
+    // prev_sql 与 prev_question 同口径：先 trim、空串按未传（Some("") 不许直入问答管道），再限长
+    let prev_sql = req.prev_sql.as_deref().map(str::trim).filter(|s| !s.is_empty());
     // ⑤ 限长（与 web 端口径对齐）：超限 400 拒收，不静默截断
     if let Err(msg) = lengths_ok(
         question,
         req.prev_question.as_deref().map(str::trim),
-        req.prev_sql.as_deref(),
+        prev_sql,
     ) {
-        return Err(fail(StatusCode::BAD_REQUEST, 400, msg));
+        return Err(fail(StatusCode::BAD_REQUEST, 400, &msg));
     }
     // 身份 → Principal：员工禁用 / 多角色未选在这里被拒（与 Web 登录同一判据，零旁路）
     let p = principal::load_principal(&st.auth_mysql, &id.login_name, id.role_code.as_deref())
@@ -456,11 +503,11 @@ pub async fn ask(
     //（同 api_ask：取不到按首问处理，不失败，但 warn 留痕 —— 静默丢上下文查不出来）。
     let prev_q = req.prev_question.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let prev: Option<(String, Option<String>)> = match prev_q {
-        Some(q) => Some((q.to_string(), req.prev_sql.clone())),
+        Some(q) => Some((q.to_string(), prev_sql.map(str::to_string))),
         None if req.conv_id.is_some() => chat::last_turn(st.owned.pool(), conv_id)
             .await
-            .inspect_err(|_| {
-                tracing::warn!(conv_id, reason = "chat_context_load_failed", "取上一轮失败，本轮按首问处理")
+            .inspect_err(|e| {
+                tracing::warn!(conv_id, reason = %e, "取上一轮失败，本轮按首问处理")
             })
             .ok()
             .flatten(),
@@ -489,7 +536,9 @@ pub async fn ask(
             .await;
             // 观测写入句柄丢弃（fire-and-forget，同 api_ask / mcp_api）
             let r = r.map_err(|e| {
-                // 「无权访问数据源」是权限拒绝 → 403，同 api_ask 的语义（见那里的注释）
+                // 「无权访问数据源」是权限拒绝 → 403，同 api_ask 的语义（见那里的注释）。
+                // 文案子串匹配是有损分类：上游措辞一改就静默降级成 422 —— 措辞由
+                // `ds_acl_denial_wording_is_pinned_upstream` 钉着，改文案的人当场撞红
                 if e.to_string().contains("无权访问数据源") {
                     fail(StatusCode::FORBIDDEN, 403, "当前账号无权访问该数据源")
                 } else {
@@ -500,7 +549,10 @@ pub async fn ask(
                     )
                 }
             })?;
-            serde_json::to_value(&r).unwrap_or_else(|_| json!({}))
+            serde_json::to_value(&r).unwrap_or_else(|e| {
+                tracing::warn!(conv_id, reason = %e, "AskResult 序列化失败，回空对象（客户端会看到空白答案）");
+                json!({})
+            })
         }
         triage::Intent::Knowledge => {
             let a = crate::kb_answer(&st, &p, None, question).await.map_err(|_| {
@@ -510,18 +562,28 @@ pub async fn ask(
                     "暂时无法完成知识检索，请稍后重试",
                 )
             })?;
-            serde_json::to_value(&a).unwrap_or_else(|_| json!({}))
+            serde_json::to_value(&a).unwrap_or_else(|e| {
+                tracing::warn!(conv_id, reason = %e, "知识检索结果序列化失败，回空对象");
+                json!({})
+            })
         }
     };
-    // 存会话（用户问 + AI 结果），同 api_ask：写库失败只丢历史，不拦响应
-    let _ = chat::save_msg(st.owned.pool(), conv_id, "user", question, None).await;
-    let _ = chat::save_msg(st.owned.pool(), conv_id, "ai", "", Some(&payload)).await;
+    // 存会话（用户问 + AI 结果），同 api_ask：写库失败只丢历史，不拦响应 —— 但不再静默吞错
+    if let Err(e) = chat::save_msg(st.owned.pool(), conv_id, "user", question, None).await {
+        tracing::debug!(conv_id, reason = %e, "会话历史写入失败（user 轮）");
+    }
+    if let Err(e) = chat::save_msg(st.owned.pool(), conv_id, "ai", "", Some(&payload)).await {
+        tracing::debug!(conv_id, reason = %e, "会话历史写入失败（ai 轮）");
+    }
     // data = AskResult/Answer 全字段（前端自己拆）+ conv_id：客户端拿着它追问才能串起多轮。
     // AskResult 自身没有 conv_id 字段，注入不撞键（有撞键那天这个 insert 会静默盖掉它 ——
     // 所以这里断言式说明：注入键是协议增量，不是覆盖）。
     let mut data = payload;
     if let Some(m) = data.as_object_mut() {
         m.insert("conv_id".to_string(), json!(conv_id));
+    } else {
+        // payload 恒为 object（AskResult/Answer 序列化）；真到这儿说明序列化形状变了
+        tracing::debug!(conv_id, "ask 结果非 object，conv_id 未注入（多轮将串不起来）");
     }
     Ok(ok(data))
 }
@@ -620,6 +682,22 @@ mod tests {
         let d = json!({ "loginName": "top", "user": { "loginName": "nested" } });
         assert_eq!(parse_identity(&d).unwrap().login_name, "top");
         assert_eq!(parse_identity(&json!({ "loginName": "a" })).unwrap().name, None);
+    }
+
+    /// 完整身份塞进嵌套对象时，role/name 与登录名同一条回退链（上游各端结构不一）
+    #[test]
+    fn parse_role_and_name_fall_back_to_nested_objects() {
+        let d = json!({ "user": { "loginName": "yunfan", "roleCode": "admin", "actualName": "云帆" } });
+        let id = parse_identity(&d).unwrap();
+        assert_eq!(id.login_name, "yunfan");
+        assert_eq!(id.role_code.as_deref(), Some("admin"), "嵌套 user 里的角色不许丢");
+        assert_eq!(id.name.as_deref(), Some("云帆"));
+        // 顶层角色优先于嵌套
+        let d = json!({ "loginName": "a", "roleCode": "staff",
+                        "user": { "roleCode": "admin", "actualName": "云帆" } });
+        let id = parse_identity(&d).unwrap();
+        assert_eq!(id.role_code.as_deref(), Some("staff"), "顶层优先");
+        assert_eq!(id.name.as_deref(), Some("云帆"), "顶层没有则嵌套兜底");
     }
 
     // ---------- 上游 code 映射：白名单只认 0 ----------
@@ -831,6 +909,22 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1, "失效判定 TTL 内重放不许再打上游");
     }
 
+    /// 上游回巨型 body：解析阶段不许吃无界内存（Content-Length 预检当场拒）
+    #[tokio::test]
+    async fn fetch_rejects_oversized_body() {
+        let big: &'static str = Box::leak("x".repeat(MAX_IDENTITY_BODY_BYTES + 1).into_boxed_str());
+        let (base, _, _) = stub_server("200 OK", big);
+        assert_eq!(fetch_identity(&base, "tok-x").await, Err(AuthFail::Unavailable));
+    }
+
+    /// 「无权访问数据源」是 ask 链 403/422 的分类依据（contains 匹配）：上游措辞一改，
+    /// 权限拒绝就静默降级成 422 —— 钉住上游文案（agent::source 的 bail 文本），改的人当场撞红
+    #[test]
+    fn ds_acl_denial_wording_is_pinned_upstream() {
+        let src = include_str!("../../agent/src/source.rs");
+        assert!(src.contains("无权访问数据源"), "ask 链 ds ACL 拒绝文案变了：xcx 的 403 分类会静默失效");
+    }
+
     /// 瞬时故障（上游 5xx）**不进**负缓存：下一次重试必须真能打到上游
     #[tokio::test]
     async fn validate_never_caches_unavailable() {
@@ -863,5 +957,7 @@ mod tests {
     fn security_tuning_constants_are_pinned() {
         assert_eq!(MAX_QUESTION_CHARS, 500, "与 web 输入框 maxlength 同口径");
         assert_eq!(MAX_PREV_SQL_CHARS, 2000);
+        assert_eq!(crate::auth::MAX_UPSTREAM_TOKEN_LEN, 4096, "与 SSO 验真同一条长度闸");
+        assert_eq!(MAX_IDENTITY_BODY_BYTES, 256 * 1024);
     }
 }

@@ -3,12 +3,12 @@
 //! **唯二**产出点是本文件的 `inject()` 与 `ScopedSql::unrestricted(_, &UnrestrictedProof)`。
 //!
 //! 本文件只做「状态推进 + 编排」：判定算法全在 `sql::guard`/`sql::ast`，注入算法全在
-//! `policy::inject`（一行不改，46 权限断言继续走字符串级 `rewrite()`）。
+//! `policy::inject`（一行不改，既有字符串级断言套件继续走 `rewrite()`）。
 //!
 //! F2 修复点：旧 `rewrite()` 遇 `sets.is_unrestricted()` 原样放行 —— 于是 `ScopeSets::default()`
 //! （= 忘了算权限）就是一把万能 `ScopedSql` 铸造钥匙。这里改成：`inject()` 拒绝无限制集合，
 //! 放行必须显式走 `unrestricted(checked, &proof)`。字符串级 `rewrite()` 的放行分支保持不动
-//! （那是 46 断言的地基），闸门层负责不让它成为默认后果。
+//! （那是那套断言的地基），闸门层负责不让它成为默认后果。
 
 use crate::errors::{GuardError, PolicyError};
 use crate::policy::inject::rewrite;
@@ -41,7 +41,8 @@ impl CheckedSql {
         &self.text
     }
 
-    /// 语句涉及的实表名（去重、字典序、排除 CTE 名）。权限档案登记核对与 trace 用。
+    /// 语句涉及的实表名（去重、字典序、排除 CTE 名；限定名 `db.t` 取**首段**——
+    /// 与 `ast.rs` 的收集语义对齐，见那边的注释）。权限档案登记核对与 trace 用。
     pub fn tables(&self) -> &[String] {
         &self.tables
     }
@@ -57,6 +58,8 @@ impl CheckedSql {
 /// ```compile_fail
 /// let s = dms_kernel::ScopedSql { text: "SELECT 1".into(), unrestricted: true };
 /// ```
+// 注意：上面这段 compile_fail doctest 硬编码了 crate 名 `dms_kernel` —— 与 Cargo package
+// 名耦合，包改名时记得同步（不改则该守卫悄悄失效/报错）。
 pub struct ScopedSql {
     text: String,
     unrestricted: bool,
@@ -120,6 +123,8 @@ pub fn check(
 ) -> Result<CheckedSql, GuardError> {
     is_safe_select_with(&raw.0, d, g.sensitive_cols)?;
     let text = ensure_limit_with(&raw.0, d, g.max_rows);
+    // 这个 `?` 实际不可达：text 已在 is_safe_select_with 里 parse 成功过一次。
+    // 它一旦可达，就说明「能 parse 的串第二关却 parse 失败」——前两关之间有洞，值得知道。
     let tables = table_names_of(&text, d)?;
     Ok(CheckedSql { text, tables, dialect: d })
 }

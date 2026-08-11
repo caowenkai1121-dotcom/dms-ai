@@ -16,11 +16,12 @@ registry_snapshot.json）——它随部署包私下传递。
   python tools/registry_snapshot.py import --pg-url postgres://...  # 显式指定目标库
 """
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-import settings as ts  # noqa: E402  （仓库统一配置入口：凭据只从 settings.json 来）
+import settings as dms_settings  # noqa: E402  （仓库统一配置入口：凭据只从 settings.json 来）
 
 # (表, 去重键)。列清单导出时动态取（剔除 id/embedding/时间戳/计数字段），键在这里钉死。
 TABLES = {
@@ -52,11 +53,20 @@ def connect(pg_url=None):
     if pg_url:
         from urllib.parse import urlparse, parse_qsl
         u = urlparse(pg_url)
-        q = dict(parse_qsl(u.query))
-        return psycopg2.connect(host=u.hostname, port=u.port, user=u.username,
+        try:
+            port = u.port  # 非法端口（abc/超界）在取值时才抛 ValueError，给它一句人话
+        except ValueError:
+            raise SystemExit("--pg-url 端口非法（要 scheme://user:pwd@host:port/db）") from None
+        # 查询串只透传白名单键：拼错的 sslmod= 之类原样传给 psycopg2 是裸 TypeError
+        q = {k: v for k, v in parse_qsl(u.query)
+             if k in ("sslmode", "connect_timeout", "application_name")}
+        q.setdefault("connect_timeout", 10)  # 目标不可达时 10s 内报错，不无限挂起
+        return psycopg2.connect(host=u.hostname, port=port, user=u.username,
                                 password=u.password, dbname=u.path.lstrip('/'), **q)
-    cfg = ts.load()
-    return psycopg2.connect(**ts.pg_kwargs(cfg))
+    cfg = dms_settings.load()
+    kw = dms_settings.pg_kwargs(cfg)
+    kw.setdefault("connect_timeout", 10)
+    return psycopg2.connect(**kw)
 
 
 def columns_of(cur, table):
@@ -68,22 +78,31 @@ def columns_of(cur, table):
 
 def do_export(path):
     conn = connect()
-    out = {"version": 1, "tables": {}, "custom_comments": {}}
-    cur = conn.cursor()
-    for table in TABLES:
-        cols = [c for c in columns_of(cur, table) if c not in DROP_COLS]
-        where = " WHERE ds_id NOT LIKE 'upload\\_%'" if table == "datasource" else ""
-        cur.execute(f"SELECT {', '.join(cols)} FROM meta.{table}{where}")
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        out["tables"][table] = {"key": TABLES[table], "columns": cols, "rows": rows}
-    for table, key in COMMENT_TABLES.items():
-        cols = key + ["custom_comment"]
-        cur.execute(f"SELECT {', '.join(cols)} FROM meta.{table} WHERE custom_comment <> ''")
-        out["custom_comments"][table] = {
-            "key": key, "rows": [dict(zip(cols, r)) for r in cur.fetchall()],
-        }
-    conn.close()
-    Path(path).write_text(json.dumps(out, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    try:
+        out = {"version": 1, "tables": {}, "custom_comments": {}}
+        cur = conn.cursor()
+        for table in TABLES:
+            cols = [c for c in columns_of(cur, table) if c not in DROP_COLS]
+            if not cols:
+                raise SystemExit(f"meta.{table} 不存在或无任何列（库连错了？）")
+            # ds_id 以 upload_ 开头的是上传库登记：上传库元数据不随部署快照走
+            # （新部署里没有那些临时库）。`\_` 是 LIKE 的转义，匹配字面下划线。
+            where = " WHERE ds_id NOT LIKE 'upload\\_%'" if table == "datasource" else ""
+            cur.execute(f"SELECT {', '.join(cols)} FROM meta.{table}{where}")
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            out["tables"][table] = {"key": TABLES[table], "columns": cols, "rows": rows}
+        for table, key in COMMENT_TABLES.items():
+            cols = key + ["custom_comment"]
+            cur.execute(f"SELECT {', '.join(cols)} FROM meta.{table} WHERE custom_comment <> ''")
+            out["custom_comments"][table] = {
+                "key": key, "rows": [dict(zip(cols, r)) for r in cur.fetchall()],
+            }
+    finally:
+        conn.close()  # 导出中途异常也不许挂连接
+    # 先写 .tmp 再原子替换：中途崩溃不留半截 JSON 给导入侧撞 JSONDecodeError
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    os.replace(tmp, path)
     n = sum(len(t["rows"]) for t in out["tables"].values())
     nc = sum(len(t["rows"]) for t in out["custom_comments"].values())
     print(f"导出完成 {path}：注册表 {n} 行 + 人工注释 {nc} 行")
@@ -91,37 +110,59 @@ def do_export(path):
 
 def do_import(path, pg_url=None):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or "tables" not in data:
+        raise SystemExit(f"{path} 不是注册表快照（缺 version/tables 键），拿错文件了？")
+    if data.get("version") != 1:
+        print(f"警告：快照 version={data.get('version')!r}，本工具按 version=1 的格式解读", file=sys.stderr)
     conn = connect(pg_url)
-    conn.autocommit = False
-    cur = conn.cursor()
-    total = 0
-    for table, spec in data["tables"].items():
-        cols, key, rows = spec["columns"], spec["key"], spec["rows"]
-        inserted = 0
-        for row in rows:
-            vals = [row.get(c) for c in cols]
-            # WHERE NOT EXISTS 去重：不依赖表上有没有唯一约束，幂等收敛
-            cond = " AND ".join(f"{k} IS NOT DISTINCT FROM %s" for k in key)
-            sql = (f"INSERT INTO meta.{table} ({', '.join(cols)}) "
-                   f"SELECT {', '.join(['%s'] * len(cols))} "
-                   f"WHERE NOT EXISTS (SELECT 1 FROM meta.{table} WHERE {cond})")
-            cur.execute(sql, vals + [row.get(k) for k in key])
-            inserted += cur.rowcount
-        total += inserted
-        print(f"  meta.{table}: +{inserted}（快照 {len(rows)} 行）")
-    for table, spec in data.get("custom_comments", {}).items():
-        key = spec["key"]
-        updated = 0
-        for row in spec["rows"]:
-            cond = " AND ".join(f"{k}=%s" for k in key)
-            cur.execute(
-                f"UPDATE meta.{table} SET custom_comment=%s WHERE {cond} AND custom_comment = ''",
-                [row["custom_comment"]] + [row[k] for k in key])
-            updated += cur.rowcount
-        print(f"  meta.{table}.custom_comment: 补空白 {updated} 行")
-    conn.commit()
-    conn.close()
-    print(f"导入完成：新增 {total} 行（既有行一律未动）。向量列未带——服务启动后 10 分钟内向量自愈自动回填。")
+    # 显式事务（autocommit=False 本就是 psycopg2 默认，不重复赋值），收尾统一 commit：要么全进要么不进
+    try:
+        cur = conn.cursor()
+        total = 0
+        # 勿并发导入：check-then-insert 没有唯一约束兜底，两个 import 并发会出重复行
+        for table, spec in data["tables"].items():
+            cols, key, rows = spec["columns"], spec["key"], spec["rows"]
+            inserted = 0
+            missing = set()
+            for row in rows:
+                missing |= {c for c in cols if c not in row}  # 快照与代码列漂移时不静默补 None
+                vals = [row.get(c) for c in cols]
+                # WHERE NOT EXISTS 去重：不依赖表上有没有唯一约束，幂等收敛
+                cond = " AND ".join(f"{k} IS NOT DISTINCT FROM %s" for k in key)
+                sql = (f"INSERT INTO meta.{table} ({', '.join(cols)}) "
+                       f"SELECT {', '.join(['%s'] * len(cols))} "
+                       f"WHERE NOT EXISTS (SELECT 1 FROM meta.{table} WHERE {cond})")
+                # 参数是两段：前段 vals 给 INSERT 列值，后段给 NOT EXISTS 的去重条件（不是传重了）
+                try:
+                    cur.execute(sql, vals + [row.get(k) for k in key])
+                except Exception as e:
+                    raise SystemExit(
+                        f"导入 meta.{table} 失败"
+                        f"（去重键 {dict(zip(key, [row.get(k) for k in key]))}）：{e}") from e
+                inserted += cur.rowcount
+            total += inserted
+            print(f"  meta.{table}: +{inserted}（快照 {len(rows)} 行）")
+            if missing:
+                print(f"  警告：meta.{table} 快照缺列 {sorted(missing)}，已按 NULL 插入（快照与代码列漂移）",
+                      file=sys.stderr)
+        for table, spec in data.get("custom_comments", {}).items():
+            key = spec["key"]
+            updated = 0
+            for row in spec["rows"]:
+                # 键列均 NOT NULL，这里用 = 即可（上面注册表去重要兼容可空列才用 IS NOT DISTINCT FROM，别照抄反）
+                cond = " AND ".join(f"{k}=%s" for k in key)
+                cur.execute(
+                    f"UPDATE meta.{table} SET custom_comment=%s WHERE {cond} AND custom_comment = ''",
+                    [row["custom_comment"]] + [row[k] for k in key])
+                updated += cur.rowcount
+            print(f"  meta.{table}.custom_comment: 补空白 {updated} 行")
+        conn.commit()
+    except BaseException:
+        conn.rollback()  # 中途异常不留悬挂事务
+        raise
+    finally:
+        conn.close()
+    print(f"导入完成：新增 {total} 行（既有行一律未动）。向量列未带——服务启动即自愈一轮，最迟 10 分钟内补齐。")
 
 
 if __name__ == "__main__":
@@ -129,8 +170,12 @@ if __name__ == "__main__":
     pg_url = None
     if "--pg-url" in args:
         i = args.index("--pg-url")
+        if i + 1 >= len(args):
+            raise SystemExit("--pg-url 缺值：--pg-url postgres://user:pwd@host:port/db")
         pg_url = args[i + 1]
         del args[i:i + 2]
+    if len(args) > 2:
+        raise SystemExit(f"多余参数 {args[2:]}：用法是 export|import [路径] [--pg-url ...]")
     cmd = args[0] if args else ""
     path = args[1] if len(args) > 1 else str(Path(__file__).parent / "registry_snapshot.json")
     if cmd == "export":
@@ -138,5 +183,5 @@ if __name__ == "__main__":
     elif cmd == "import":
         do_import(path, pg_url)
     else:
-        print(__doc__)
+        print(__doc__, file=sys.stderr)
         sys.exit(2)

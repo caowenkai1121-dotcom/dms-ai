@@ -8,13 +8,45 @@
 //! 调用点保留那两个后缀即零行为变化。
 
 use crate::registry::{
-    catalog_allows_dimension, catalog_allows_metric_dimension, catalog_allows_metric_record,
-    catalog_allows_table,
-    join_asset_live_pred_at, source_asset_live_pred_at, table_asset_live_pred_at,
+    catalog_allows_dimension, catalog_allows_metric_record, catalog_allows_table,
+    join_asset_live_pred_at, scoped_pred_1, source_asset_live_pred_at, table_asset_live_pred_at,
 };
 use sqlx::PgPool;
 
+/// `meta.metric` 装配投影行（11 列）：Vec 标注与 query_as 共用这一份。
+type MetricRow = (
+    String,
+    Vec<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+/// `meta.metric` 治理投影行（13 列）：同上。
+type MetricPolicyRow = (
+    String,
+    String,
+    Vec<String>,
+    String,
+    Vec<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
 /// 指标定义（meta.metric 行）
+#[derive(Debug)]
 pub struct MetricDef {
     pub name: String,
     pub aliases: Vec<String>,
@@ -34,6 +66,7 @@ pub struct MetricDef {
 }
 
 /// 指标治理元数据：版本用于审计，允许维度用于阻止未经验证的指标×维度自动组合。
+#[derive(Debug)]
 pub struct MetricPolicy {
     pub metric_code: String,
     pub name: String,
@@ -43,6 +76,7 @@ pub struct MetricPolicy {
 }
 
 /// 维度定义（meta.dimension 行）
+#[derive(Debug)]
 pub struct DimensionDef {
     pub name: String,
     pub aliases: Vec<String>,
@@ -51,6 +85,7 @@ pub struct DimensionDef {
 }
 
 /// JOIN 边（meta.join_edge 行）
+#[derive(Debug)]
 pub struct JoinEdge {
     pub lt: String,
     pub lc: String,
@@ -60,24 +95,8 @@ pub struct JoinEdge {
 }
 
 pub async fn load_metrics(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<MetricDef>> {
-    let ds_pred = format!(
-        "{}{}",
-        crate::registry::ds_pred(1),
-        source_asset_live_pred_at("", 1)
-    );
-    let rows: Vec<(
-        String,
-        Vec<String>,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )> = sqlx::query_as(
+    let ds_pred = scoped_pred_1(source_asset_live_pred_at);
+    let rows: Vec<MetricRow> = sqlx::query_as(
         &format!(
             "SELECT name, aliases, source_table, agg_expr, scope_filter, dedup_keys, time_col,
                     description, unit, time_cap, version
@@ -124,26 +143,8 @@ pub async fn load_metrics(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<MetricDef
 }
 
 pub async fn load_metric_policies(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<MetricPolicy>> {
-    let ds_pred = format!(
-        "{}{}",
-        crate::registry::ds_pred(1),
-        source_asset_live_pred_at("", 1)
-    );
-    let rows: Vec<(
-        String,
-        String,
-        Vec<String>,
-        String,
-        Vec<String>,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )> = sqlx::query_as(&format!(
+    let ds_pred = scoped_pred_1(source_asset_live_pred_at);
+    let rows: Vec<MetricPolicyRow> = sqlx::query_as(&format!(
         "SELECT metric_code, name, aliases, version, allowed_dimensions, source_table, agg_expr,
                 scope_filter, time_col, dedup_keys, description, unit, time_cap
          FROM meta.metric WHERE status = 'active'{ds_pred} ORDER BY name, metric_code",
@@ -174,28 +175,26 @@ pub async fn load_metric_policies(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<M
                 _,
                 _,
                 _,
-            )| MetricPolicy {
-                metric_code,
-                name,
-                aliases,
-                version,
-                allowed_dimensions: allowed_dimensions
-                    .into_iter()
-                    .filter(|dimension| {
-                        catalog_allows_metric_dimension(ds, &source_table, dimension)
-                    })
-                    .collect(),
+            )| {
+                // source 解析一次，逐维度判定（原来每个维度都重跑一遍 source_refs）
+                let checker = crate::registry::metric_dimension_checker(ds, &source_table);
+                MetricPolicy {
+                    metric_code,
+                    name,
+                    aliases,
+                    version,
+                    allowed_dimensions: allowed_dimensions
+                        .into_iter()
+                        .filter(|dimension| checker(dimension))
+                        .collect(),
+                }
             },
         )
         .collect())
 }
 
 pub async fn load_dimensions(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<DimensionDef>> {
-    let ds_pred = format!(
-        "{}{}",
-        crate::registry::ds_pred(1),
-        source_asset_live_pred_at("", 1)
-    );
+    let ds_pred = scoped_pred_1(source_asset_live_pred_at);
     let rows: Vec<(String, Vec<String>, String, String)> = sqlx::query_as(&format!(
         "SELECT name, aliases, source_table, expr FROM meta.dimension WHERE status = 'active'{ds_pred}
          ORDER BY name",
@@ -218,14 +217,12 @@ pub async fn load_dimensions(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<Dimens
 }
 
 pub async fn load_join_edges(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<JoinEdge>> {
-    let ds_pred = format!(
-        "{}{}",
-        crate::registry::ds_pred(1),
-        join_asset_live_pred_at("", 1)
-    );
+    let ds_pred = scoped_pred_1(join_asset_live_pred_at);
+    // ORDER BY 钉死输出序：下游按序组规则/提示，不随 PG 物理行序漂
     let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(&format!(
         "SELECT left_table, left_col, right_table, right_col, card
-         FROM meta.join_edge WHERE status = 'active'{ds_pred}",
+         FROM meta.join_edge WHERE status = 'active'{ds_pred}
+         ORDER BY left_table, right_table, left_col, right_col",
     ))
     .bind(ds)
     .fetch_all(pg)
@@ -241,6 +238,7 @@ pub async fn load_join_edges(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<JoinEd
 
 /// 表级标准口径（meta.table_scope 行）。`note` 是**人话**那一句（LLM 会逐字读），
 /// 口径校验违规时原样回吐给它，故不能只留 `filter`。
+#[derive(Debug)]
 pub struct TableScope {
     pub table_name: String,
     pub filter: String,
@@ -248,6 +246,7 @@ pub struct TableScope {
 }
 
 /// 快照/流水表声明（meta.table_snapshot 行）：同一分区键有多条历史行，取数须只留最新一条。
+#[derive(Debug)]
 pub struct TableSnapshot {
     pub table_name: String,
     /// 分区键（逗号分隔列）：`(客户, 余额类型)` 这类「一个业务实体一条最新行」的键
@@ -264,6 +263,10 @@ pub struct TableSnapshot {
 /// 与 `registry::caliber::load_code_values` 的区别：那个带 `length(code) >= 3` 早筛
 /// （它服务的是「码写在了哪一列」那条判据，短码没有区分度）；装配侧**不能筛** ——
 /// 「退货 → after_sales_type = 1」正是一位码，筛掉它就等于这条声明对装配器不存在。
+///
+/// （与 `lexicon::ValueMap` 同表同字段的另一份行类型：字段名不同（table/column vs
+/// table_name/column_name），合并要动 server 侧消费点 —— 欠账，两处注释互指。）
+#[derive(Debug)]
 pub struct ValueRef {
     pub table: String,
     pub column: String,
@@ -277,12 +280,11 @@ pub struct ValueRef {
     pub match_kind: String,
 }
 
+/// 装配侧码值全量加载。
+/// 🔴 与 `lexicon::load_value_maps` 同表两份加载：过滤口径（`catalog_allows_table` vs
+/// `catalog_allows_column`）、`ORDER BY` 有无都不同 —— 各自服务不同判据，改一边先看另一边。
 pub async fn load_value_map(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<ValueRef>> {
-    let ds_pred = format!(
-        "{}{}",
-        crate::registry::ds_pred(1),
-        table_asset_live_pred_at("", 1)
-    );
+    let ds_pred = scoped_pred_1(table_asset_live_pred_at);
     let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(&format!(
         "SELECT table_name, column_name, name, code, match_kind FROM meta.value_map
          WHERE 1 = 1{ds_pred} ORDER BY name, table_name, column_name",
@@ -298,7 +300,9 @@ pub async fn load_value_map(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<ValueRe
             column,
             name,
             code,
-            match_kind: match_kind.unwrap_or_default(),
+            // DDL 是 `NOT NULL DEFAULT 'eq'`：NULL 实际不存在；兜底与 DDL 默认值同口径
+            // （下游 `value_filters` 只认 "eq" 精确值，空串会被静默丢弃）
+            match_kind: match_kind.unwrap_or_else(|| "eq".to_string()),
         })
         .collect())
 }
@@ -306,13 +310,12 @@ pub async fn load_value_map(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<ValueRe
 /// 表级标准口径全量行（含 `note`）。`load_table_scopes` 是它的二元组投影——**同一条 SQL**，
 /// 不许各写一份（口径出现第二处真相就是漂移的开始）。
 pub async fn load_table_scope_rows(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<TableScope>> {
-    let ds_pred = format!(
-        "{}{}",
-        crate::registry::ds_pred(1),
-        table_asset_live_pred_at("", 1)
-    );
+    let ds_pred = scoped_pred_1(table_asset_live_pred_at);
+    // ORDER BY 钉死行序：caliber 侧「note 首次登记者胜出」（merge_cols），同表多条 scope
+    // 时人话取哪条不许随 PG 物理行序漂
     let rows: Vec<(String, String, String)> = sqlx::query_as(&format!(
-        "SELECT table_name, filter, note FROM meta.table_scope WHERE 1 = 1{ds_pred}",
+        "SELECT table_name, filter, note FROM meta.table_scope WHERE 1 = 1{ds_pred}
+         ORDER BY table_name, note",
     ))
     .bind(ds)
     .fetch_all(pg)
@@ -331,14 +334,11 @@ pub async fn load_table_scopes(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<(Str
 }
 
 pub async fn load_table_snapshots(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<TableSnapshot>> {
-    let ds_pred = format!(
-        "{}{}",
-        crate::registry::ds_pred(1),
-        table_asset_live_pred_at("", 1)
-    );
+    let ds_pred = scoped_pred_1(table_asset_live_pred_at);
+    // ORDER BY 钉死行序：caliber 侧按序 push RequireLatest，规则序不随物理行序漂
     let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(&format!(
         "SELECT table_name, partition_cols, order_cols, extra_filter, note
-         FROM meta.table_snapshot WHERE 1 = 1{ds_pred}",
+         FROM meta.table_snapshot WHERE 1 = 1{ds_pred} ORDER BY table_name",
     ))
     .bind(ds)
     .fetch_all(pg)

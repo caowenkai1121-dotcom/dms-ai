@@ -23,6 +23,8 @@ pub const DMS_LOOKUP_MAX_IN_ITEMS: usize = 5;
 
 /// 生产点查额外敏感目录。这里覆盖凭据、手机号、邮箱、地址、银行、税务和证件类字段；
 /// 即使上层词表漏项，生产业务库也不会把这些列投影出来。
+/// 判据是**子串匹配**（contains），宁宽勿漏：`tokenizer_ver`（含 token）、`phone_ext`
+/// 这类列名一并拒 —— 多拒方向是刻意的。
 const DMS_SENSITIVE_FRAGMENTS: &[&str] = &[
     "password", "passwd", "login_pwd", "credential", "secret", "token", "phone", "mobile",
     "telephone", "email", "address", "bank_account", "bank_card", "bank_name", "invoice_bank",
@@ -99,8 +101,8 @@ pub struct DmsLookupPolicy {
 }
 
 impl DmsLookupPolicy {
-    pub const fn new(table: &'static str, unique_cols: &'static [&'static str]) -> Self {
-        Self { table, lookup_cols: unique_cols, index_kind: DmsIndexKind::Unique }
+    pub const fn new(table: &'static str, lookup_cols: &'static [&'static str]) -> Self {
+        Self { table, lookup_cols, index_kind: DmsIndexKind::Unique }
     }
 
     pub const fn indexed(table: &'static str, lookup_cols: &'static [&'static str]) -> Self {
@@ -162,6 +164,15 @@ fn reject(reason: impl Into<String>) -> DmsLookupError {
     DmsLookupError::Shape(reason.into())
 }
 
+/// 标识符小写化：本身全小写（DMS 表名常态）零分配借用，含大写才落一份拷贝
+fn lower_ident(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 /// 严格生产点查 gate。`sensitive` 与通用 guard 共用业务侧词表，但查询形状单独判定。
 pub fn gate_dms_lookup_with(
     sql: &str,
@@ -170,8 +181,7 @@ pub fn gate_dms_lookup_with(
     policy: &DmsLookupPolicy,
 ) -> Result<DmsLookupSql, DmsLookupError> {
     let mut query = parse_query(sql, d, sensitive)?;
-    let lookup_cols = validate_query(&query, policy)?;
-    let table = query_table_name(&query)?.to_ascii_lowercase();
+    let (lookup_cols, table) = validate_query(&query, policy)?;
     normalize_limit(&mut query);
     Ok(DmsLookupSql {
         wire: query.to_string(),
@@ -189,12 +199,13 @@ pub fn gate_dms_scoped_with(
     sensitive: &[&str],
 ) -> Result<DmsLookupSql, DmsLookupError> {
     let mut query = parse_query(sql, d, sensitive)?;
-    let table = query_table_name(&query)?.to_ascii_lowercase();
+    let table = lower_ident(query_table_name(&query)?).into_owned();
+    // policy.table 是代码内全小写常量，table 已小写化：`==` 即可，不必 eq_ignore_ascii_case
     let policy = SCOPED_LOOKUP_POLICIES
         .iter()
-        .find(|policy| table.eq_ignore_ascii_case(policy.table))
+        .find(|policy| table == policy.table)
         .ok_or_else(|| reject(format!("表 {table} 未登记为生产 DMS 轻查询表")))?;
-    let lookup_cols = validate_query(&query, policy)?;
+    let (lookup_cols, _) = validate_query(&query, policy)?;
     normalize_limit(&mut query);
     Ok(DmsLookupSql {
         wire: query.to_string(),
@@ -226,20 +237,29 @@ fn safe_guard_error(err: GuardError) -> DmsLookupError {
     }
 }
 
+/// LIMIT 常量 → usize（validate 的校验与 normalize_limit 的 clamp 共用一份）
+fn const_limit_usize(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Value(Value::Number(n, false)) => n.parse::<usize>().ok(),
+        _ => None,
+    }
+}
+
 fn normalize_limit(query: &mut Query) {
+    // validate 已保证 limit ≤ 50，这里的 min 是纵深第二道（双保险，别删）
     let limit = query
         .limit
         .as_ref()
-        .and_then(|e| match e {
-            Expr::Value(Value::Number(n, false)) => n.parse::<usize>().ok(),
-            _ => None,
-        })
+        .and_then(|e| const_limit_usize(e))
         .unwrap_or(DMS_LOOKUP_MAX_ROWS)
         .min(DMS_LOOKUP_MAX_ROWS);
     query.limit = Some(Expr::Value(Value::Number(limit.to_string(), false)));
 }
 
-fn validate_query(query: &Query, policy: &DmsLookupPolicy) -> Result<Vec<String>, DmsLookupError> {
+fn validate_query(
+    query: &Query,
+    policy: &DmsLookupPolicy,
+) -> Result<(Vec<String>, String), DmsLookupError> {
     // ── 查询级附加子句（与表形/投影无关，最先判）──
     if query.with.is_some() {
         return Err(reject("禁止 CTE"));
@@ -257,12 +277,18 @@ fn validate_query(query: &Query, policy: &DmsLookupPolicy) -> Result<Vec<String>
         return Err(reject("禁止非 MySQL 点查附加子句"));
     }
     if let Some(limit) = &query.limit {
-        let Expr::Value(Value::Number(n, false)) = limit else {
-            return Err(reject("LIMIT 必须是整数常量"));
-        };
-        let limit = n.parse::<usize>().map_err(|_| reject("LIMIT 必须是整数常量"))?;
-        if limit > DMS_LOOKUP_MAX_ROWS {
-            return Err(reject(format!("LIMIT 不得超过 {DMS_LOOKUP_MAX_ROWS}")));
+        match const_limit_usize(limit) {
+            Some(v) if v <= DMS_LOOKUP_MAX_ROWS => {}
+            Some(_) => return Err(reject(format!("LIMIT 不得超过 {DMS_LOOKUP_MAX_ROWS}"))),
+            None => {
+                // 「不是整数常量」与「整数超出可表示范围」（如 20 位 9 溢出）是两种事故
+                let overflow = matches!(limit, Expr::Value(Value::Number(_, false)));
+                return Err(reject(if overflow {
+                    "LIMIT 整数超出可表示范围"
+                } else {
+                    "LIMIT 必须是整数常量"
+                }));
+            }
         }
     }
 
@@ -351,7 +377,8 @@ fn validate_query(query: &Query, policy: &DmsLookupPolicy) -> Result<Vec<String>
     }) {
         return Err(reject("生产业务库投影只允许显式字段，不允许表达式或别名"));
     }
-    Ok(lookup_cols.into_iter().collect())
+    // 顺带返回实际表名（小写）：调用方不必再走一遍 query_table_name
+    Ok((lookup_cols.into_iter().collect(), lower_ident(actual_table).into_owned()))
 }
 
 fn query_table_name(query: &Query) -> Result<&str, DmsLookupError> {
@@ -366,8 +393,7 @@ fn query_table_ref(query: &Query) -> Result<(&str, Option<&str>), DmsLookupError
         return Err(reject("必须且只能查询一张物理表，禁止 JOIN"));
     }
     let relation = &select.from[0].relation;
-    if !matches!(
-        relation,
+    let (name, alias) = match relation {
         TableFactor::Table {
             args: None,
             with_hints,
@@ -375,12 +401,12 @@ fn query_table_ref(query: &Query) -> Result<(&str, Option<&str>), DmsLookupError
             with_ordinality: false,
             partitions,
             json_path: None,
+            name,
+            alias,
             ..
-        } if with_hints.is_empty() && partitions.is_empty()
-    ) {
-        return Err(reject("FROM 只能是物理表，禁止派生表和表函数"));
-    }
-    let TableFactor::Table { name, alias, .. } = relation else { unreachable!() };
+        } if with_hints.is_empty() && partitions.is_empty() => (name, alias),
+        _ => return Err(reject("FROM 只能是物理表，禁止派生表和表函数")),
+    };
     if name.0.len() != 1 {
         return Err(reject("禁止跨库/跨 schema 点查"));
     }
@@ -456,7 +482,9 @@ impl Visitor for Shape<'_> {
         }
         if let Expr::Function(fun) = expr {
             self.has_window |= fun.over.is_some();
-            let name = fun.name.to_string().to_ascii_lowercase();
+            // to_string + 原地小写化：一次分配（不是 to_string().to_ascii_lowercase() 两次）
+            let mut name = fun.name.to_string();
+            name.make_ascii_lowercase();
             if is_aggregate(&name) {
                 self.aggregate.get_or_insert_with(|| name.clone());
             }
@@ -468,7 +496,8 @@ impl Visitor for Shape<'_> {
 
 fn is_aggregate(name: &str) -> bool {
     matches!(
-        name.rsplit('.').next().unwrap_or(name),
+        // rsplit 恒产出至少一段，无 fallback 分支
+        name.rsplit('.').next().expect("rsplit 恒非空"),
         "avg"
             | "bit_and"
             | "bit_or"
@@ -517,7 +546,7 @@ fn validate_lookup_predicate(
             if is_soft_delete_predicate(left, right) {
                 return Ok(());
             }
-            Err(reject("WHERE 条件列必须是登记的索引键；仅额外允许 deleted_flag = 0"))
+            Err(reject("WHERE 条件列必须是登记的索引键；仅额外允许 deleted_flag = 0（数值 0）"))
         }
         Expr::InList { expr, list, negated: false }
             if is_column(expr)
@@ -543,6 +572,8 @@ fn validate_lookup_predicate(
 
 /// 已登记的生产业务键均为字符编码。若允许 `code = 123`，MySQL 可能把字符列转换为
 /// 数值再比较，已有 BTREE 也会退化为扫描；未登记的本地测试策略不承担该合同。
+/// 只认**单引号**字符串字面量：MySQL 默认下 `"SO-1"` 也是字符串，但这里不放行
+/// DoubleQuotedString（安全方向，双引号形态按拒绝处理，未见真实需求）。
 fn require_registered_key_literal(
     table: &str,
     column: &str,
@@ -783,5 +814,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checked.index_kind(), DmsIndexKind::Leading);
+    }
+
+    /// 策略表与登记键表是两份平行常量：漂移防线 = 策略里每个 (表,键) 必在登记键表里
+    #[test]
+    fn every_scoped_policy_key_is_a_registered_lookup_key() {
+        for policy in SCOPED_LOOKUP_POLICIES {
+            for col in policy.lookup_cols {
+                assert!(
+                    registered_lookup_kind(policy.table, col).is_some(),
+                    "SCOPED_LOOKUP_POLICIES 的 ({}, {}) 未在 REGISTERED_LOOKUP_KEYS 登记",
+                    policy.table,
+                    col
+                );
+            }
+        }
     }
 }

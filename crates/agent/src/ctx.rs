@@ -5,21 +5,16 @@
 //! 字段声明顺序即 JSON 键顺序，新字段一律 `skip_serializing_if`——前端、`tools/regression.py`、
 //! `tools/evaluation.py` 三处都在解析这份 JSON，多一个恒在的字段就是一次形状破坏。
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sqlx::PgPool;
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
-
-use dms_connector::source::{RowSet, SqlSource};
 use dms_connector::mysql::ReadOnlyMySql;
-use dms_kernel::{ChatRequest, ModelTier};
-use dms_kernel::llm::Usage;
-use dms_kernel::{ChatModel, ScopedSql};
+use dms_connector::source::{RowSet, SqlSource};
+use dms_kernel::{llm::Usage, ChatModel, ChatRequest, ModelTier, ScopedSql};
 use dms_policy::{scope::Scope, Principal};
 
 use crate::gate::MAX_ROWS;
@@ -278,11 +273,13 @@ pub fn table_answer(
 ) -> AskResult {
     // `rs.redacted` 曾长期无消费者（裁决 二·D T4-5 记的那笔债），于是被脱敏的列在界面上
     // 只是一片空值 —— 用户把它当故障。现在带出去，前端按列名打「已脱敏」角标。
-    let RowSet { columns, rows, redacted, .. } = rs;
+    let RowSet { columns, rows, redacted } = rs; // 列全字段不写 `..`：RowSet 再加字段时编译期强制决策
     let row_count = rows.len();
     let view = dms_semantic::present::build(&columns, &rows);
+    // wire() 取一次复用：sql 字段与 truncation_note 各要一份
+    let wire = scoped.wire();
     AskResult {
-        sql: scoped.wire().to_string(),
+        sql: wire.to_string(),
         columns,
         truncated: row_count >= MAX_ROWS,
         row_count,
@@ -294,7 +291,7 @@ pub fn table_answer(
         comparisons: vec![],
         subs: vec![],
         caliber_note: None,
-        truncation_note: truncation_note(scoped.wire(), row_count),
+        truncation_note: truncation_note(wire, row_count),
         redacted,
         scope_note: (!scoped.is_unrestricted())
             .then(|| "结果已按你的数据权限过滤：看到的是你有权访问的那部分，不是全量".to_string()),
@@ -307,6 +304,9 @@ pub fn table_answer(
         sales_context: None,
     }
 }
+
+/// 「单据类型」列名：columns 与 Entity pairs 两处判据共用，改名只动这里。
+const DOC_TYPE_COL: &str = "单据类型";
 
 /// 可信级别判级（纯函数，可单测）：direct-derive 恒为 review —— 推导口径未经合同验证，
 /// 与「口径复核未通过/截断」同一档；它既不是确定性路径（不进 verified），也不是普通
@@ -326,9 +326,10 @@ pub(crate) fn attach_trust(cx: &AskCtx<'_>, r: &mut AskResult) {
     if r.sql.trim().is_empty() || matches!(r.route.as_str(), "need-intent" | "compound") {
         return;
     }
-    let risk = r.caliber_note.is_some()
-        || r.truncated
-        || r.supplemental.as_ref().is_some_and(|detail| detail.truncated);
+    // 主查询与补充明细任一截断都算风险（checks 文案用同一个 bit，等级与凭证不自相矛盾）
+    let any_truncated =
+        r.truncated || r.supplemental.as_ref().is_some_and(|detail| detail.truncated);
+    let risk = r.caliber_note.is_some() || any_truncated;
     let deterministic = matches!(
         r.route.as_str(),
         "direct-agg"
@@ -376,7 +377,7 @@ pub(crate) fn attach_trust(cx: &AskCtx<'_>, r: &mut AskResult) {
     } else {
         "存在口径复核提醒，请人工确认".to_string()
     });
-    checks.push(if r.truncated {
+    checks.push(if any_truncated {
         "结果已截断，不能视为完整明细".to_string()
     } else {
         "结果未触发行数截断".to_string()
@@ -384,10 +385,10 @@ pub(crate) fn attach_trust(cx: &AskCtx<'_>, r: &mut AskResult) {
     if !r.redacted.is_empty() {
         checks.push("敏感列已按策略脱敏".to_string());
     }
-    let has_document_evidence = r.columns.iter().any(|c| c == "单据类型")
+    let has_document_evidence = r.columns.iter().any(|c| c == DOC_TYPE_COL)
         || r.view.blocks.iter().any(|b| match b {
             dms_kernel::present::Block::Entity { pairs } =>
-                pairs.iter().any(|(key, _)| key == "单据类型"),
+                pairs.iter().any(|(key, _)| key == DOC_TYPE_COL),
             _ => false,
         });
     if matches!(r.route.as_str(), "direct-doc" | "business-lookup") && has_document_evidence {
@@ -409,14 +410,15 @@ pub(crate) fn attach_trust(cx: &AskCtx<'_>, r: &mut AskResult) {
     });
 }
 
+/// FNV-1a 64 位偏移基（`sql_fingerprint` 与 `summary_cache_key` 共用同一算法起点）。
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+
 /// FNV-1a 64 位：零依赖、跨进程稳定，足够作为复核短指纹；它不是安全哈希，也不承担签名。
 fn sql_fingerprint(sql: &str) -> String {
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = FNV_OFFSET;
     for token in sql.split_whitespace() {
-        for b in token.bytes().chain(std::iter::once(b' ')) {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x100000001b3);
-        }
+        fnv1a_feed(&mut h, token.as_bytes());
+        fnv1a_feed(&mut h, b" ");
     }
     format!("{h:016x}")
 }
@@ -466,8 +468,13 @@ const EXTERNAL_HEAD_ROWS: usize = 5;
 const EXTERNAL_SQL_HEAD_CHARS: usize = 300;
 /// 外置单元格渲染上限：指针形态要的是「看得出是什么」，不是把附件搬进上下文。
 const EXTERNAL_CELL_CHARS: usize = 40;
+
+// 指针分支隐含不变量：上限必须大于头部行数，否则「前 5 行 / 其余 N-5 行」对不上
+const _: () = assert!(TABLE_EXTERNAL_ROWS > EXTERNAL_HEAD_ROWS);
 /// 喂给 fast 的早期轮材料总量上限（字符）：早期轮可以很多，摘要是压缩不是逐字搬家。
 const SUMMARY_INPUT_CAP_CHARS: usize = 6000;
+/// 摘要材料里单轮问句的截断长度（字符）：一句两万字符的历史问句不该独吞输入预算。
+const SUMMARY_TURN_QUESTION_CHARS: usize = 200;
 /// 摘要正文自身上限（字符）：它是要进预算的上下文，不是第二份历史。
 const SUMMARY_MAX_CHARS: usize = 800;
 /// fast 摘要的等待上限：超时 = 失败 = 回退硬截（与 `triage`/`ask` 的 fast 调用同族降级）。
@@ -492,7 +499,7 @@ pub fn split_turns(turns: &[Turn]) -> (&[Turn], &[Turn]) {
 /// 不存在「摘要漏了新消息」的窗口。长度前缀防拼接歧义（("ab","c") 与 ("a","bc") 必须不同键）；
 /// `None` 的行数与 `Some(0)` 必须可分（「那轮没出数」≠「那轮出了 0 行」）。
 pub fn summary_cache_key(conv_id: &str, early: &[Turn]) -> String {
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = FNV_OFFSET;
     fnv1a_feed(&mut h, &(early.len() as u64).to_le_bytes());
     for t in early {
         fnv1a_feed(&mut h, &(t.question.len() as u64).to_le_bytes());
@@ -516,7 +523,8 @@ fn fnv1a_feed(h: &mut u64, bytes: &[u8]) {
 /// 长 SQL 外置（纯函数）：≤ K 字符原样返回；超过则压成单行指针形态
 /// （空白含换行归一成单个空格 —— 附件区只留头部，多行原文不进上下文）。
 pub fn externalize_sql(sql: &str) -> String {
-    if sql.chars().count() <= SQL_EXTERNAL_CHARS {
+    let total = sql.chars().count();
+    if total <= SQL_EXTERNAL_CHARS {
         return sql.to_string();
     }
     let head = sql
@@ -527,8 +535,7 @@ pub fn externalize_sql(sql: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "[SQL 共 {} 字符，仅前 {EXTERNAL_SQL_HEAD_CHARS} 字符进上下文：{head}…]",
-        sql.chars().count()
+        "[SQL 共 {total} 字符，仅前 {EXTERNAL_SQL_HEAD_CHARS} 字符进上下文：{head}…]"
     )
 }
 
@@ -536,7 +543,17 @@ pub fn externalize_sql(sql: &str) -> String {
 /// 超过则指针形态「[表格 N 行，前 5 行：…]」—— 表头行 + 前 `EXTERNAL_HEAD_ROWS` 行
 /// 进上下文，其余明说去结果区看。单元格按字符截 `EXTERNAL_CELL_CHARS`。
 pub fn externalize_table(columns: &[String], rows: &[Vec<serde_json::Value>]) -> String {
-    let header = if columns.is_empty() { String::new() } else { format!("{}\n", columns.join(" | ")) };
+    // 列名与单元格同口径按字符截：100 列长列名的小表会把整个表头灌进上下文
+    let header = if columns.is_empty() {
+        String::new()
+    } else {
+        let names = columns
+            .iter()
+            .map(|c| c.chars().take(EXTERNAL_CELL_CHARS).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("{names}\n")
+    };
     if rows.len() <= TABLE_EXTERNAL_ROWS {
         let mut s = header;
         for r in rows {
@@ -560,13 +577,14 @@ pub fn externalize_table(columns: &[String], rows: &[Vec<serde_json::Value>]) ->
 
 fn render_external_row(row: &[serde_json::Value]) -> String {
     row.iter()
-        .map(|v| {
-            let s = match v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Null => "NULL".to_string(),
-                other => other.to_string(),
-            };
-            s.chars().take(EXTERNAL_CELL_CHARS).collect::<String>()
+        .map(|v| match v {
+            // 字符串单元格直接截断收集：先整串克隆再 take，长单元格白拷贝一份
+            serde_json::Value::String(s) => s.chars().take(EXTERNAL_CELL_CHARS).collect::<String>(),
+            serde_json::Value::Null => "NULL".to_string(),
+            other => {
+                let s = other.to_string();
+                s.chars().take(EXTERNAL_CELL_CHARS).collect::<String>()
+            }
         })
         .collect::<Vec<_>>()
         .join(" | ")
@@ -590,7 +608,9 @@ pub fn render_history_block(early_summary: Option<&str>, early_count: usize, rec
             s.push_str("## 最近对话（原文）\n");
         }
         for (i, t) in recent.iter().enumerate() {
-            s.push_str(&format!("{}. 问：{}\n", i + 1, t.question));
+            // 编号从 early_count + 1 起：有早期轮被省略/摘要时，「最近对话」的第 1 轮
+            // 实际是全历史的第 K+1 轮，从 1 编会让模型引用轮号时歧义
+            s.push_str(&format!("{}. 问：{}\n", early_count + i + 1, t.question));
             if let Some(sql) = t.sql.as_deref().filter(|s| !s.trim().is_empty()) {
                 s.push_str(&format!("   SQL：{}\n", externalize_sql(sql)));
             }
@@ -619,7 +639,7 @@ async fn summarize_with_timeout(llm: &dyn ChatModel, early: &[Turn], budget: Dur
     let mut user = String::from("#早期对话：\n");
     for (i, t) in early.iter().enumerate() {
         // 单轮问句也截：一句两万字符的历史问句不该独吞摘要输入预算
-        user.push_str(&format!("{}. 问：{}\n", i + 1, t.question.chars().take(200).collect::<String>()));
+        user.push_str(&format!("{}. 问：{}\n", i + 1, t.question.chars().take(SUMMARY_TURN_QUESTION_CHARS).collect::<String>()));
         if let Some(sql) = t.sql.as_deref().filter(|s| !s.trim().is_empty()) {
             user.push_str(&format!("   SQL：{}\n", externalize_sql(sql)));
         }
@@ -627,7 +647,8 @@ async fn summarize_with_timeout(llm: &dyn ChatModel, early: &[Turn], budget: Dur
             user.push_str(&format!("   结果：{n} 行\n"));
         }
     }
-    if user.chars().count() > SUMMARY_INPUT_CAP_CHARS {
+    let user_chars = user.chars().count();
+    if user_chars > SUMMARY_INPUT_CAP_CHARS {
         user = user.chars().take(SUMMARY_INPUT_CAP_CHARS).collect();
         user.push_str("\n（材料过长，尾部已截）");
     }
@@ -700,20 +721,23 @@ pub struct TrimNote {
 /// server 的 `query_log::finish` 在同一个 fire-and-forget 任务里取走落库，主链一个 `.await` 都不多。
 /// 正常路径每 stash 必随一次 finish 的 take；`STASH_CAP` 只防「装配后崩在半途」的孤儿条目。
 const STASH_CAP: usize = 256;
-static CONTEXT_SUMMARIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static CONTEXT_SUMMARIES: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn context_summaries() -> &'static Mutex<HashMap<String, String>> {
-    CONTEXT_SUMMARIES.get_or_init(|| Mutex::new(HashMap::new()))
+    &CONTEXT_SUMMARIES
 }
 
 /// `pub(crate)`：写口只有 gather.rs 一个；读口在 server（跨 crate，故 `take` 是 pub）。
 pub(crate) fn stash_context_summary(trace_id: &str, json: String) {
     if trace_id.is_empty() {
+        tracing::debug!("空 trace_id，跳过摘要暂存");
         return;
     }
     let mut map = context_summaries().lock().unwrap_or_else(|p| p.into_inner());
     // 爆帽 = 前面有孤儿（finish 没跑到）。观测件宁可丢一条也不涨内存：HashMap 无序，
-    // 丢任意一条已有条目腾位 —— 正常路径（stash 后必有 take）根本到不了帽。
+    // `keys().next()` 丢的是**任意一条** —— 可能踢掉刚 stash、finish 还没 take 的新条目；
+    // 正常路径（stash 后必有 take）根本到不了帽，故维持「丢任意一条」不换 FIFO。
     if map.len() >= STASH_CAP && !map.contains_key(trace_id) {
         if let Some(k) = map.keys().next().cloned() {
             map.remove(&k);
@@ -735,10 +759,10 @@ pub fn take_context_summary(trace_id: &str) -> Option<String> {
 /// 在这之前是**静默截断**：用户看到 200 行却不知道后面还有，「各分类销量」被截成前 200 个分类
 /// 而毫无提示（同类事故在 `kernel::nl::time.rs` 的 `detect_top_n` 注释里记过一次）。
 ///
-/// 判据只用 `row_count == MAX_ROWS`：这会有假阳（结果恰好 200 行时多提示一句），
+/// 判据是 `row_count >= MAX_ROWS`：这会有假阳（结果恰好 200 行时多提示一句），
 /// **假阳的代价是多一句提示，假阴的代价是静默少数据** —— 所以取假阳一侧。
 pub fn truncation_note(sql: &str, row_count: usize) -> Option<String> {
-    if row_count != MAX_ROWS {
+    if row_count < MAX_ROWS {
         return None;
     }
     Some(format!(
@@ -761,7 +785,7 @@ fn strip_trailing_limit(sql: &str) -> &str {
     // 字符串里取偏移，遇到会变长的字符（如 `İ`）就会拿着错位的下标切原串 —— 非字符边界当场 panic。
     // `limit` 全是 ASCII，而 ASCII 字节不可能出现在多字节 UTF-8 序列内部，故这里的下标一定是字符边界。
     let b = sql.as_bytes();
-    let Some(pos) = (0..b.len().saturating_sub(4)).rev().find(|&i| b[i..i + 5].eq_ignore_ascii_case(b"limit"))
+    let Some(pos) = (0..b.len().saturating_sub(b"limit".len() - 1)).rev().find(|&i| b[i..i + 5].eq_ignore_ascii_case(b"limit"))
     else {
         return sql;
     };
@@ -769,10 +793,20 @@ fn strip_trailing_limit(sql: &str) -> &str {
     if !sql[..pos].ends_with(|c: char| c.is_whitespace()) {
         return sql;
     }
-    let tail_is_pure_limit = sql[pos + 5..]
+    // 尾部形态：数字 | 数字,数字（MySQL `LIMIT m, n`）| 数字 OFFSET 数字 —— 成对消费：
+    // 孤 `offset`（`LIMIT 200 OFFSET` 没有第二个数字）不算纯 limit 子句，不剥，原样追加。
+    let tokens: Vec<&str> = sql[pos + 5..]
         .split(|c: char| c.is_whitespace() || c == ',')
         .filter(|t| !t.is_empty())
-        .all(|t| t.eq_ignore_ascii_case("offset") || t.chars().all(|c| c.is_ascii_digit()));
+        .collect();
+    let is_num = |t: &str| t.chars().all(|c| c.is_ascii_digit());
+    let tail_is_pure_limit = match tokens.as_slice() {
+        [] => true, // 裸 `LIMIT`（check() 补的 limit 必带数字，这只是防御分支）
+        [n] => is_num(n),
+        [a, b] => is_num(a) && is_num(b),
+        [n, off, m] => is_num(n) && off.eq_ignore_ascii_case("offset") && is_num(m),
+        _ => false,
+    };
     if tail_is_pure_limit {
         sql[..pos].trim_end()
     } else {
@@ -1007,6 +1041,8 @@ mod tests {
         // ① 未截断（含 0 行）→ 没有提示
         assert!(truncation_note("SELECT a FROM t LIMIT 200", MAX_ROWS - 1).is_none());
         assert!(truncation_note("SELECT a FROM t LIMIT 200", 0).is_none());
+        // 超过上限（connector 某天返回 >MAX_ROWS）：truncated 与 note 判据同为 >=，不许互相矛盾
+        assert!(truncation_note("SELECT a FROM t LIMIT 200", MAX_ROWS + 1).is_some());
         // ② 命中上限 → 原因 + 范围 + 续读 SQL（尾部的 LIMIT 200 被换成 LIMIT 200 OFFSET 200）
         let n = truncation_note("SELECT a FROM t ORDER BY a DESC LIMIT 200", MAX_ROWS).unwrap();
         assert!(n.contains("命中 200 行上限"), "缺原因：{n}");
@@ -1018,6 +1054,8 @@ mod tests {
         // ③ MySQL 的 `LIMIT m, n` 与已有 OFFSET 同样只保留一份 limit 子句
         assert!(next_page_sql("SELECT a FROM t LIMIT 0, 200").ends_with("t LIMIT 200 OFFSET 200"));
         assert!(next_page_sql("SELECT a FROM t LIMIT 200 OFFSET 0").ends_with("t LIMIT 200 OFFSET 200"));
+        // 孤 OFFSET（没有第二个数字）不是纯 limit 子句：不剥，原样追加
+        assert!(next_page_sql("SELECT a FROM t LIMIT 200 OFFSET").contains("OFFSET LIMIT 200 OFFSET 200"));
         // ④ 尾部不是纯 limit 子句就不乱剥（提示串宁可多一段，也不能把 SQL 切坏）
         assert_eq!(
             next_page_sql("SELECT a FROM t WHERE b = 'limit 3'"),
@@ -1041,6 +1079,12 @@ mod tests {
         assert_eq!((r2.row_count, r2.truncated), (3, false));
         assert!(r2.truncation_note.is_none());
         assert!(serde_json::to_value(&r2).unwrap().get("truncation_note").is_none());
+    }
+
+    /// `semantic::present::ROW_CAP` 复刻本常量（agent→semantic 单向依赖只能复刻），两侧不许漂。
+    #[test]
+    fn row_cap_matches_agent_max_rows() {
+        assert_eq!(dms_semantic::present::ROW_CAP, MAX_ROWS);
     }
 }
 
@@ -1190,6 +1234,9 @@ mod y10_tests {
             with.contains(&format!("问：第{}轮问句", SUMMARY_KEEP_RECENT + 3)),
             "最近一轮原文必须逐字在：{with}"
         );
+        // 轮号从 early_count + 1 起：「最近对话」的第 1 轮是全历史的第 4 轮，不许从 1 编
+        assert!(with.contains("4. 问：第4轮问句"), "{with}");
+        assert!(!with.contains("1. 问："), "{with}");
         // 降级 = 原硬截：早期轮一个不进上下文，但留一行明说
         // （静默省略会让模型把「没有更早轮次」当事实）
         let without = render_history_block(None, early.len(), recent);

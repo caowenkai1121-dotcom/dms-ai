@@ -75,6 +75,9 @@ fn collect(sql: &str) -> anyhow::Result<(HashMap<String, String>, Vec<(String, S
     dms_kernel::sql::ast::collect(sql, &dms_kernel::MysqlDialect).map_err(anyhow::Error::from)
 }
 
+/// 自修提示里候选表清单的截断上限（提示是给模型看的，全量表名会淹没关键行）
+const TABLE_HINT_CAP: usize = 20;
+
 /// 执行前字段校验。返回 Some(自修提示) 表示发现幻觉列，None 表示通过。
 pub async fn schema_check(pg: &PgPool, ds: &str, sql: &str) -> anyhow::Result<Option<String>> {
     let (amap, cols) = collect(sql)?;
@@ -84,6 +87,11 @@ pub async fn schema_check(pg: &PgPool, ds: &str, sql: &str) -> anyhow::Result<Op
     )?
     .into_iter()
     .collect();
+
+    // 无实表（`SELECT 1` 这类）：后面两个分支必然走到 Ok(None)，不白跑 table_doc 查询
+    if real_tables.is_empty() {
+        return Ok(None);
+    }
 
     // 先校验物理表。`table_doc` 为空表示该源尚未完成 schema 采集，保持原有 fail-open；
     // 一旦有当前源 schema，SQL 里的每张实表都必须在启用清单中。
@@ -96,9 +104,12 @@ pub async fn schema_check(pg: &PgPool, ds: &str, sql: &str) -> anyhow::Result<Op
     .await?;
     let known_tables: Vec<String> = known_tables.into_iter().map(|(t,)| t).collect();
     if !known_tables.is_empty() {
+        // 两侧都已小写（known 来自 `SELECT lower(table_name)`，real_tables 出自 AST 收集），
+        // 一次建集直接查，不再逐对 `eq_ignore_ascii_case` 双重扫描
+        let known_set: HashSet<&str> = known_tables.iter().map(String::as_str).collect();
         let missing: Vec<&String> = real_tables
             .iter()
-            .filter(|t| !known_tables.iter().any(|known| known.eq_ignore_ascii_case(t)))
+            .filter(|t| !known_set.contains(t.as_str()))
             .collect();
         if !missing.is_empty() {
             let mut hint = String::from(
@@ -110,18 +121,18 @@ pub async fn schema_check(pg: &PgPool, ds: &str, sql: &str) -> anyhow::Result<Op
             let mut ranked: Vec<String> = known_tables
                 .iter()
                 .filter(|t| {
-                    let hay = t.to_ascii_lowercase();
+                    let hay = t.as_str();
                     real_tables.iter().any(|bad| {
                         bad.split('_')
                             .filter(|part| part.len() >= 4)
-                            .any(|part| hay.contains(&part.to_ascii_lowercase()))
+                            .any(|part| hay.contains(part))
                     })
                 })
-                .take(20)
+                .take(TABLE_HINT_CAP)
                 .cloned()
                 .collect();
             if ranked.is_empty() {
-                ranked.extend(known_tables.iter().take(20).cloned());
+                ranked.extend(known_tables.iter().take(TABLE_HINT_CAP).cloned());
             }
             hint.push_str(&format!("当前源可用表候选：{}\n", ranked.join(", ")));
             return Ok(Some(hint));
@@ -148,8 +159,9 @@ pub async fn schema_check(pg: &PgPool, ds: &str, sql: &str) -> anyhow::Result<Op
     }
     let mut table_cols: HashMap<String, HashSet<String>> = HashMap::new();
     for t in &real_tables {
-        if let Some(cols) = grouped.get(t) {
-            table_cols.insert(t.clone(), cols.clone());
+        // remove 移动语义：`grouped` 之后不再使用，不整份克隆 HashSet
+        if let Some(cols) = grouped.remove(t) {
+            table_cols.insert(t.clone(), cols);
         }
     }
     if table_cols.is_empty() {
@@ -162,8 +174,11 @@ pub async fn schema_check(pg: &PgPool, ds: &str, sql: &str) -> anyhow::Result<Op
     for (prefix, col) in &cols {
         if let Some(table) = amap.get(prefix) {
             if let Some(known) = table_cols.get(table) {
-                if !known.contains(col) && seen.insert((table.clone(), col.clone())) {
-                    bad.push((table.clone(), col.clone()));
+                if !known.contains(col) {
+                    let pair = (table.clone(), col.clone());
+                    if seen.insert(pair.clone()) {
+                        bad.push(pair);
+                    }
                 }
             }
         }
@@ -210,9 +225,13 @@ impl<'a> Linker<'a> {
         if parts.len() < 2 {
             return None;
         }
-        let prefix = parts[parts.len() - 2].value.to_lowercase();
+        // 别名表键本就小写：先按原值查（多数命中，零分配），不中再 lower 查一次
+        let raw = &parts[parts.len() - 2].value;
+        let table = match self.aliases.get(raw) {
+            Some(t) => t,
+            None => self.aliases.get(&raw.to_lowercase())?,
+        };
         let col = parts[parts.len() - 1].value.to_lowercase();
-        let table = self.aliases.get(&prefix)?;
         Some((table.clone(), col))
     }
 
@@ -234,18 +253,17 @@ impl<'a> VisitorMut for Linker<'a> {
             // col = '中文名'（及镜像 '中文名' = col）→ 换码；like 列改 LIKE '%码%'
             Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } => {
                 // 找出哪一侧是列、哪一侧是字符串字面量
-                let (col_side, lit_side_is_right) = if matches!(left.as_ref(), Expr::CompoundIdentifier(_))
+                let lit_side_is_right = if matches!(left.as_ref(), Expr::CompoundIdentifier(_))
                     && matches!(right.as_ref(), Expr::Value(sqlparser::ast::Value::SingleQuotedString(_)))
                 {
-                    (true, true)
+                    true
                 } else if matches!(right.as_ref(), Expr::CompoundIdentifier(_))
                     && matches!(left.as_ref(), Expr::Value(sqlparser::ast::Value::SingleQuotedString(_)))
                 {
-                    (false, false)
+                    false
                 } else {
                     return ControlFlow::Continue(());
                 };
-                let _ = col_side;
                 let (col_expr, lit_expr) = if lit_side_is_right {
                     (left.as_ref(), right.as_ref())
                 } else {
@@ -307,10 +325,11 @@ pub fn link_values_with(
     aliases: &HashMap<String, String>,
     maps: &ValueMaps,
 ) -> Option<String> {
-    let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
+    // 码表为空时换码必然无命中，不白解析一次
     if maps.is_empty() {
         return None;
     }
+    let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
     let mut linker = Linker { aliases, maps, changed: false };
     for s in &mut stmts {
         // VisitMut 节点 trait 方法名同为 visit；Linker 只实现 VisitorMut，解析唯一
@@ -368,6 +387,8 @@ pub async fn correct_agg(
     // 只删 `max|min` 那两个白名单项不够：`AVG` 同形（「本月**平均**销售额」被改成 SUM），
     // 而且反过来「问句问最高、LLM 写了 SUM」时校正器出手也救不了（SQL 本身就错了）。
     // 所以在**入口**整体退出：宁可少改一条，不许把一条正确的 SQL 改错（裁决 二·G 同族）。
+    // ⚠️ 本名单与 `correct_caliber` 里的 `OPT_OUT` 是两份同构词表（各自语义不同，不能合并），
+    // 今后加词时两边都要看一眼。
     const OPT_OUT: &[&str] =
         &["最高", "最低", "最大", "最小", "最多", "最少", "平均", "均值", "中位"];
     if OPT_OUT.iter().any(|w| question.contains(w)) {
@@ -396,7 +417,7 @@ pub async fn correct_agg(
         // （客单价那类此前整体跳过；单形态指标与旧路径逐字等价）
         for (func, col, distinct) in parse_agg_rules(agg) {
             match by_col.get(&col) {
-                Some(prev) if *prev != (func.clone(), distinct) => {
+                Some(prev) if prev.0 != func || prev.1 != distinct => {
                     by_col.remove(&col);
                     ambiguous.insert(col);
                 }
@@ -430,7 +451,10 @@ fn locate_target(
     for twj in &sel.from {
         for r in std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation)) {
             if let TableFactor::Table { name, alias, .. } = r {
-                let t = name.0.last()?.value.trim_matches('`').to_lowercase();
+                // 空表名实际不可达，但用 `?` 会把整函数提前返回 —— 显式跳过该项
+                let Some(t) = name.0.last().map(|p| p.value.trim_matches('`').to_lowercase()) else {
+                    continue;
+                };
                 chain.push((t, alias.as_ref().map(|a| a.name.value.trim_matches('`').to_string())));
             }
         }
@@ -463,6 +487,14 @@ fn locate_target(
     Some((prefix, present))
 }
 
+/// scope_filter 含子查询的判定：按独立词元找 `SELECT`（大小写不敏感）。
+/// 原来是 `to_uppercase().contains("SELECT")`：列名含 `selected` 之类会被误伤，
+/// 整条口径静默不补 —— 子串不是词。
+fn has_select_token(s: &str) -> bool {
+    s.split(|c: char| !c.is_ascii_alphabetic())
+        .any(|w| w.eq_ignore_ascii_case("select"))
+}
+
 /// 口径过滤补全（移植 SuperSonic 语义层「指标 filter 恒生效」）：问句命中指标、
 /// SQL 里就有该指标来源表，却漏了注册表的 scope_filter 条件 → AND 补上。
 /// 直击评测抓到的真缺陷：问「本月有多少个订单」LLM 漏 order_status 有效订单过滤，数字虚高 17%。
@@ -477,7 +509,7 @@ fn locate_target(
 /// 也会被补上它自己的口径——那正是「口径恒生效」的意思，但它确实会收窄结果集。
 pub fn add_scope_filter(sql: &str, source_table: &str, scope_filter: &str) -> Option<String> {
     use sqlparser::ast::{Query, SetExpr, Statement};
-    if scope_filter.trim().is_empty() || scope_filter.to_uppercase().contains("SELECT") {
+    if scope_filter.trim().is_empty() || has_select_token(scope_filter) {
         return None;
     }
     let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
@@ -543,6 +575,7 @@ pub async fn correct_caliber(
     sql: &str,
 ) -> anyhow::Result<Option<String>> {
     // 反向问法：用户明确要全量/含无效状态 → 整体不补
+    // ⚠️ 与 `correct_agg` 的 `OPT_OUT` 是两份同构词表，加词时两边都要看一眼。
     const OPT_OUT: &[&str] = &["全部状态", "所有状态", "包括已取消", "含已取消", "包含作废", "含作废", "不限状态"];
     if OPT_OUT.iter().any(|w| question.contains(w)) {
         return Ok(None);
@@ -559,6 +592,8 @@ pub async fn correct_caliber(
     let hits = dms_semantic::recall::recall_metric_hits(pg, &cx).await?;
     let mut cur = sql.to_string();
     let mut changed = false;
+    // 每个命中都全量重 parse 一次（N 命中 = N 次解析）：命中数是个位数的指标量级、
+    // SQL 是 KB 级，无害；「循环外解析一次、循环内累积改同一 AST」是结构性改动，真有成百命中再做。
     for m in &hits {
         if let Some(next) = add_scope_filter(&cur, base_table(&m.source_table), &m.scope_filter) {
             cur = next;
@@ -607,9 +642,8 @@ fn base_table(src: &str) -> &str {
 /// GroupByCorrector（移植 SuperSonic）：select 同时含聚合列和裸维度列却漏 GROUP BY 时，
 /// 用裸维度列补上 GROUP BY（MySQL only_full_group_by 下漏 group by 直接报错）。纯 AST，确定性。
 /// 保守门控：单表非复杂 SQL、已有 group by 不动、无聚合或无裸列不动。
-pub fn fix_group_by(sql: &str) -> Option<String> {    use sqlparser::ast::{
-        GroupByExpr, Query, Select, SelectItem, SetExpr, Statement,
-    };
+pub fn fix_group_by(sql: &str) -> Option<String> {
+    use sqlparser::ast::{GroupByExpr, Query, Select, SelectItem, SetExpr, Statement};
     let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
     if stmts.len() != 1 {
         return None;
@@ -635,17 +669,15 @@ pub fn fix_group_by(sql: &str) -> Option<String> {    use sqlparser::ast::{
     let mut has_agg = false;
     let mut dims: Vec<sqlparser::ast::Expr> = vec![];
     for item in &sel.projection {
-        let expr = match item {
-            SelectItem::UnnamedExpr(e) => Some(e),
-            SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+        let e = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
             _ => return None, // 有 * 通配等，不处理
         };
-        if let Some(e) = expr {
-            if expr_has_agg(e) {
-                has_agg = true;
-            } else {
-                dims.push(e.clone());
-            }
+        if expr_has_agg(e) {
+            has_agg = true;
+        } else {
+            dims.push(e.clone());
         }
     }
     // 需同时有聚合和裸维度才补
@@ -662,6 +694,14 @@ pub fn fix_group_by(sql: &str) -> Option<String> {    use sqlparser::ast::{
 /// 与 `kernel::caliber` 的「比列不比字节」同一条纪律。
 fn expr_key(e: &sqlparser::ast::Expr) -> String {
     e.to_string().replace('`', "").to_lowercase()
+}
+
+/// 投影项是可枚举的表达式（`*` 通配/qualified wildcard 不可枚举）
+fn is_expr_item(i: &sqlparser::ast::SelectItem) -> bool {
+    matches!(
+        i,
+        sqlparser::ast::SelectItem::UnnamedExpr(_) | sqlparser::ast::SelectItem::ExprWithAlias { .. }
+    )
 }
 
 /// 顶层单 Select 的共用门控（三个校正器与 `fix_group_by` 同一条）：子查询/UNION/多语句
@@ -682,7 +722,7 @@ fn top_select<'s>(
     };
     let sel: &mut Select = sel.as_mut();
     // 有 * 通配不处理（投影不可枚举）
-    if sel.projection.iter().any(|i| !matches!(i, sqlparser::ast::SelectItem::UnnamedExpr(_) | sqlparser::ast::SelectItem::ExprWithAlias { .. })) {
+    if sel.projection.iter().any(|i| !is_expr_item(i)) {
         return None;
     }
     Some(sel)
@@ -774,10 +814,14 @@ pub fn fix_time_lower_bound(sql: &str) -> Option<String> {
     use sqlparser::ast::{BinaryOperator as B, Expr, Value};
     let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
     let sel = top_select(&mut stmts)?;
+    // 已知假阳：子串匹配，`menddate` 这类含 date 的列名也会被当时间列。
+    // 谓词与 caliber `time_ish_conds` 同一条，单边收紧会让两处口径漂移，故保持子串并在此记账。
     let ish = |c: &str| c.contains("time") || c.contains("date") || c.contains("_at");
-    // (列名, 有上界, 有下界/等值) —— 沿 WHERE 的 AND 链与比较表达式收集
-    let mut cols: Vec<(String, bool, bool)> = vec![];
-    fn walk<'e>(e: &'e Expr, ish: &impl Fn(&str) -> bool, cols: &mut Vec<(String, bool, bool)>) {
+    // (列键(末段小写), 列引用原文(留限定符，补下界时带回), 有上界, 有下界/等值)。
+    // 只沿 WHERE 的 AND 链收集：OR 分支里的时间约束是条件性的，不能当顶层约束
+    // （`A OR B` 下 B 分支的上界若算数，补出的下界会把 A 分支也收窄）。
+    let mut cols: Vec<(String, Expr, bool, bool)> = vec![];
+    fn walk<'e>(e: &'e Expr, ish: &impl Fn(&str) -> bool, cols: &mut Vec<(String, Expr, bool, bool)>) {
         if let Expr::BinaryOp { left, op, right } = e {
             let col = match left.as_ref() {
                 Expr::Identifier(i) => Some(i.value.trim_matches('`').to_lowercase()),
@@ -787,17 +831,30 @@ pub fn fix_time_lower_bound(sql: &str) -> Option<String> {
                 _ => None,
             };
             match (col, op) {
-                (Some(c), B::Lt | B::LtEq) if ish(&c) => cols.push((c, true, false)),
-                (Some(c), B::Gt | B::GtEq | B::Eq) if ish(&c) => cols.push((c, false, true)),
+                (Some(c), B::Lt | B::LtEq) if ish(&c) => {
+                    cols.push((c, left.as_ref().clone(), true, false))
+                }
+                (Some(c), B::Gt | B::GtEq | B::Eq) if ish(&c) => {
+                    cols.push((c, left.as_ref().clone(), false, true))
+                }
                 _ => {}
             }
-            walk(left, ish, cols);
-            walk(right, ish, cols);
+            if matches!(op, B::And) {
+                walk(left, ish, cols);
+                walk(right, ish, cols);
+            }
         } else if let Expr::Between { expr, .. } | Expr::InList { expr, .. } = e {
-            if let Expr::Identifier(i) = expr.as_ref() {
-                let c = i.value.trim_matches('`').to_lowercase();
+            // 与比较分支同形：裸列与限定列（取末段做键）都认
+            let c = match expr.as_ref() {
+                Expr::Identifier(i) => Some(i.value.trim_matches('`').to_lowercase()),
+                Expr::CompoundIdentifier(p) => {
+                    p.last().map(|i| i.value.trim_matches('`').to_lowercase())
+                }
+                _ => None,
+            };
+            if let Some(c) = c {
                 if ish(&c) {
-                    cols.push((c, false, true));
+                    cols.push((c, expr.as_ref().clone(), false, true));
                 }
             }
         }
@@ -805,26 +862,29 @@ pub fn fix_time_lower_bound(sql: &str) -> Option<String> {
     let selection = sel.selection.as_ref()?;
     walk(selection, &ish, &mut cols);
     // 有上界且无下界的时间列（去重、稳定序 —— 日志文案逐次一致）
-    let mut targets: Vec<String> = cols
+    let mut targets: Vec<(String, Expr)> = cols
         .iter()
-        .filter(|(c, up, _low)| *up && !cols.iter().any(|(c2, _, low2)| c2 == c && *low2))
-        .map(|(c, _, _)| c.clone())
+        .filter(|(c, _, up, _low)| *up && !cols.iter().any(|(c2, _, _, low2)| c2 == c && *low2))
+        .map(|(c, e, _, _)| (c.clone(), e.clone()))
         .collect();
-    targets.sort();
-    targets.dedup();
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    targets.dedup_by(|a, b| a.0 == b.0);
     if targets.is_empty() {
         return None;
     }
+    // 补回时保留原限定符（`o.order_time >= …`）：多表 JOIN 下裸列是 MySQL 1052 歧义
     let extra: Vec<Expr> = targets
         .iter()
-        .map(|c| Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(sqlparser::ast::Ident::new(c.clone()))),
+        .map(|(_, e)| Expr::BinaryOp {
+            left: Box::new(e.clone()),
             op: B::GtEq,
             right: Box::new(Expr::Value(Value::SingleQuotedString("1970-01-01".into()))),
         })
         .collect();
     let mut cond = selection.clone();
     for e in extra {
+        // 左操作数不包 `Nested` 是安全的：`walk` 只沿 AND 链收集（见上），顶层若是 `Or`
+        // 则 cols 必空、走不到这里 —— AND 链上续接 AND 结合律同形，不需要括号保护。
         cond = Expr::BinaryOp { left: Box::new(cond), op: B::And, right: Box::new(e) };
     }
     sel.selection = Some(cond);
@@ -832,7 +892,10 @@ pub fn fix_time_lower_bound(sql: &str) -> Option<String> {
 }
 
 /// 表达式是否含聚合函数
-fn expr_has_agg(e: &sqlparser::ast::Expr) -> bool {    use sqlparser::ast::Expr;
+fn expr_has_agg(e: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    // 判定用名单 ≠ 归一用名单：这里判「含不含聚合」要收 group_concat（它也是聚合）；
+    // `collect_agg_rules` 只收五函数，是因为 group_concat 映射不了「单列默认聚合」的归一形态。
     const AGG: &[&str] = &["sum", "count", "avg", "max", "min", "group_concat"];
     match e {
         Expr::Function(f) => f
@@ -902,7 +965,7 @@ fn collect_agg_rules(e: &Expr, out: &mut Vec<AggRule>) {
                     if let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) = &l.args[0] {
                         if let Some(col) = last_ident(arg) {
                             out.push((
-                                name.clone(),
+                                name,
                                 col,
                                 matches!(l.duplicate_treatment, Some(DuplicateTreatment::Distinct)),
                             ));
@@ -958,7 +1021,8 @@ pub fn normalize_agg(sql: &str, rules: &[AggRule]) -> Option<String> {
     let sel = sel.as_mut();
 
     // 占用集：同列已被目标函数占用（如 SELECT SUM(x), AVG(x) 对比问法），改名会撞出重复列 → 该规则停用改名
-    let occupied: HashSet<(String, String)> = rules
+    // 存规则引用而不是克隆出的 String 对（占用集只读）
+    let occupied: HashSet<(&str, &str)> = rules
         .iter()
         .filter(|r| {
             sel.projection.iter().any(|item| {
@@ -969,7 +1033,7 @@ pub fn normalize_agg(sql: &str, rules: &[AggRule]) -> Option<String> {
                 proj_has_func_over(e, &r.0, &r.1)
             })
         })
-        .map(|r| (r.0.clone(), r.1.clone()))
+        .map(|r| (r.0.as_str(), r.1.as_str()))
         .collect();
     let mut changed = false;
     for item in &mut sel.projection {
@@ -1000,7 +1064,7 @@ fn proj_has_func_over(e: &Expr, func: &str, col: &str) -> bool {
             let col_ok = match &f.args {
                 FunctionArguments::List(l) if l.args.len() == 1 => match &l.args[0] {
                     sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(a)) => {
-                        last_ident(a).map(|c| c == col).unwrap_or(false)
+                        last_ident(a).is_some_and(|c| c == col)
                     }
                     _ => false,
                 },
@@ -1028,7 +1092,7 @@ fn proj_has_func_over(e: &Expr, func: &str, col: &str) -> bool {
 fn rewrite_agg(
     e: &mut Expr,
     rules: &[AggRule],
-    occupied: &HashSet<(String, String)>,
+    occupied: &HashSet<(&str, &str)>,
     changed: &mut bool,
 ) {
     use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
@@ -1052,9 +1116,8 @@ fn rewrite_agg(
                 sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)
                     if node_name == "count" =>
                 {
-                    let cnt: Vec<&AggRule> =
-                        rules.iter().filter(|r| r.0 == "count" && r.2).collect();
-                    if let [rule] = cnt[..] {
+                    let mut cnt = rules.iter().filter(|r| r.0 == "count" && r.2);
+                    if let (Some(rule), None) = (cnt.next(), cnt.next()) {
                         l.args[0] = sqlparser::ast::FunctionArg::Unnamed(
                             sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(
                                 sqlparser::ast::Ident::new(rule.1.clone()),
@@ -1068,14 +1131,8 @@ fn rewrite_agg(
                 _ => return,
             };
             let Some(rule) = rules.iter().find(|r| r.1 == col) else { return };
-            let node_func = f
-                .name
-                .0
-                .last()
-                .map(|p| p.value.to_lowercase())
-                .unwrap_or_default();
             let node_distinct = matches!(l.duplicate_treatment, Some(DuplicateTreatment::Distinct));
-            if node_func == rule.0 {
+            if node_name == rule.0 {
                 // 函数已对，补 DISTINCT（COUNT(code)→COUNT(DISTINCT code)）
                 if rule.2 && !node_distinct {
                     l.duplicate_treatment = Some(DuplicateTreatment::Distinct);
@@ -1086,8 +1143,8 @@ fn rewrite_agg(
             // 「问句没写、但 LLM 自己写了 `MAX`」—— 那种情况归一同样把语义换掉了。
             // `avg` 保留：它确实是 LLM 对「销售额」误写默认聚合的高频形态，
             // 而「平均」那一族已被入口的 `OPT_OUT` 拦在外面。
-            } else if matches!(node_func.as_str(), "sum" | "count" | "avg")
-                && !occupied.contains(&(rule.0.clone(), rule.1.clone()))
+            } else if matches!(node_name.as_str(), "sum" | "count" | "avg")
+                && !occupied.contains(&(rule.0.as_str(), rule.1.as_str()))
             {
                 // 函数名归一到指标默认聚合（目标形态未占用才改），并采用规则的 DISTINCT 形态
                 if let Some(p) = f.name.0.last_mut() {
@@ -1253,6 +1310,36 @@ mod tests {
         ] {
             assert!(fix_time_lower_bound(skip).is_none(), "不该动：{skip}");
         }
+    }
+
+    /// OR 分支里的时间上界不算顶层约束：不许补下界（补了会把 OR 另一支也收窄）
+    #[test]
+    fn time_lower_bound_ignores_bounds_inside_or_branches() {
+        assert!(fix_time_lower_bound(
+            "SELECT SUM(o.x) FROM t_sales_order o WHERE o.amount > 100 OR o.order_time < '2026-08-01'"
+        )
+        .is_none());
+    }
+
+    /// 多表 JOIN 下补下界必须保留原限定符：裸列是 MySQL 1052 歧义
+    #[test]
+    fn time_lower_bound_keeps_qualifier_in_joins() {
+        let out = fix_time_lower_bound(
+            "SELECT SUM(d.box_quantity) FROM t_sales_order_detail d \
+             JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code \
+             WHERE o.order_time < '2026-08-01'",
+        )
+        .unwrap();
+        assert!(norm(&out).contains("o.order_time>='1970-01-01'"), "{out}");
+    }
+
+    /// 子查询闸门按独立词元认 `SELECT`：列名含 select 子串（user_selected）不再被误伤
+    #[test]
+    fn caliber_select_gate_matches_word_token_not_substring() {
+        let out = add_scope_filter("SELECT 1 FROM t_sales_order", "t_sales_order", "user_selected = 0")
+            .expect("列名含 select 子串不该被当成子查询");
+        assert!(out.to_lowercase().replace(' ', "").contains("user_selected=0"), "{out}");
+        // 真子查询仍跳过（`caliber_skips_subquery_filter_and_empty` 守着）
     }
 
     #[test]

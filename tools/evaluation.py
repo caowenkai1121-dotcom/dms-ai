@@ -14,7 +14,9 @@
 #   python tools/evaluation.py --selfcheck    # 只验多趟聚合，不连库
 #
 # 🔴 为什么判据是 `--runs N` 的**失败集交集**、而不是单轮总分：
-# LLM 路径实测抖动池 ≥9/38 ≈ 24%，所以单轮 38 题总分**分辨不出 ±2 的差异**。
+# LLM 路径实测抖动池 ≥9/38 ≈ 24%（2026-07-28/29 三轮实测、时题库 38 题，出处见
+# docs/PROGRESS.md；题集扩容后这两个数字会过期，用前先重测），所以单轮总分
+# **分辨不出 ±2 的差异**。
 # 实测两例：E05 有一趟走 `llm+repair 97.9s` 答错，事后连跑 5 次全部 `direct-agg` 且对数；
 # B10 连跑两趟拿到 `llm 93.5s` / `direct-agg 27.9s`（那条 SQL 本身要 28s，超预算就静默降级）。
 # 拿单轮 34/38 对比 36/38 下结论 = 在读噪声。今天这活是人工跑三趟再手工比，故收进脚本。
@@ -38,7 +40,17 @@
 # ⚠️ 多趟的 `exit 0` **不等于本趟无失败**：按实测 24% 抖动率，「每趟 9 题红但交集为空」是常态，
 #   那正是「这些红是噪声」的意思。所以接门禁时必须**同时**断言逐趟的「第N趟 通过 X/Y」行，
 #   否则会把一道比单趟更宽的门当成更严的门用（评审实测指出过这一点）。
-import io, json, queue, re, subprocess, sys, tempfile, threading, time, csv
+import csv
+import io
+import json
+import math
+import queue
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 from contextlib import redirect_stdout
 from cli import cli, cli_stdin
 from pathlib import Path
@@ -51,13 +63,38 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).resolve().parent.parent
-CASES = json.loads((ROOT / "tools" / "eval_cases.json").read_text(encoding="utf-8"))["cases"]
+
+# 🔴 未知参数**硬失败**（同 kb_eval.py 那道闸：「打错参数 → 跑了别的东西 → 报绿」
+# 与「跑绿但什么都没测」是同一种坏）。本文件原来静默忽略，正是那一族的漏网者。
+_KNOWN_FLAGS = {
+    "--help", "-h", "--selfcheck", "--filter", "--runs", "--timeout-seconds",
+    "--throttle-seconds", "--legacy-cli", "--baseline", "--progress",
+}
+_bad_flags = [a for a in sys.argv[1:] if a.startswith("-") and a not in _KNOWN_FLAGS]
+if _bad_flags:
+    sys.exit(f"未知参数 {_bad_flags}；可用：{' '.join(sorted(_KNOWN_FLAGS))}")
+
+# 题库缺失/缺 cases 键：干净退出（对齐 main 里「0 题执行」的 exit 2 口径），不许裸 traceback
+_CASES_PATH = ROOT / "tools" / "eval_cases.json"
+if not _CASES_PATH.exists():
+    print(f"❌ 题库不存在：{_CASES_PATH}")
+    sys.exit(2)
+_CASES_DOC = json.loads(_CASES_PATH.read_text(encoding="utf-8"))
+if not isinstance(_CASES_DOC, dict) or not isinstance(_CASES_DOC.get("cases"), list):
+    print(f"❌ 题库缺 cases 数组：{_CASES_PATH}")
+    sys.exit(2)
+CASES = _CASES_DOC["cases"]
 FLOAT_TOL = 0.005  # 相对容差 0.5%：DECIMAL 舍入与 ROUND 位数差异不算错
+_ERR_TAIL = 160  # 错误摘要统一截断长度（batch/legacy 原来 160/100 两处漂移）
 PROCESS_TIMEOUT_SECONDS = 180.0
 
 
 TRANSIENT = ("error communicating with database", "os error 10054", "os error 10060",
              "pool timed out", "Connection reset")
+
+
+def elapsed_ms(start):
+    return int((time.perf_counter() - start) * 1000)
 
 
 class BatchError(RuntimeError):
@@ -139,6 +176,8 @@ class EvalBatch:
             out = json.loads(item)
         except json.JSONDecodeError as e:
             raise BatchError(f"eval-batch 返回非 JSON: {item[-300:]}") from e
+        if not isinstance(out, dict):
+            raise BatchError(f"eval-batch 返回非 JSON 对象: {item[-300:]}")
         if out.get("id") != payload["id"]:
             raise BatchError(f"eval-batch 响应串题: 请求 {payload['id']!r}，收到 {out.get('id')!r}")
         return out, roundtrip_ms
@@ -197,16 +236,22 @@ def _run_once(args):
         # stderr 混有 sqlx 慢查询日志，尾部截断会挤掉真实错误——优先抓 Error: 行
         err = next((ln for ln in reversed((r.stderr or "").splitlines()) if "Error:" in ln),
                    (r.stderr or r.stdout).strip()[-300:])
-        return {"error": err.strip()[:300]}
+        err = err.strip()[:300]
+        # rc 非 0 却什么输出都没有：空 error 是 falsy，会被读成「无错误」
+        return {"error": err or f"rc={r.returncode}，无错误输出"}
     try:
-        return json.loads(r.stdout)
+        parsed = json.loads(r.stdout)
     except json.JSONDecodeError:
         return {"error": r.stdout[-300:]}
+    # 响应不一定是对象（list/标量）：调用方一律 .get，先归一
+    return parsed if isinstance(parsed, dict) else {"data": parsed}
 
 
-def ask(c, retries=1):
+def ask(c):
+    # 重试叠加是有意的：run() 内部已对瞬时错误退避（tries=3），
+    # 这里再对「不可展示响应」整体重问 1 次（冷启动首题常见空响应）。
     args = ["ask", c["login"], c["q"]] + ([c["role"]] if c.get("role") else [])
-    for _ in range(retries + 1):
+    for _ in range(2):
         j = run(args)
         if j.get("columns") or j.get("rows") or j.get("markdown") or j.get("kind") == "text":
             return j
@@ -256,6 +301,9 @@ def case_protocol_errors(cases):
         if name in seen:
             errors.append(f"{name}: 题名重复")
         seen.add(name)
+        for key in ("login", "q"):
+            if not str(c.get(key) or "").strip():
+                errors.append(f"{name}: {key} 必填（batch_payload 直接下标消费，缺了是运行期 KeyError）")
         has_gold = bool(str(c.get("gold_sql") or "").strip())
         unavailable = c.get("expected_unavailable")
         if has_gold == bool(unavailable):
@@ -269,10 +317,6 @@ def case_protocol_errors(cases):
             if not isinstance(all_words, list) or not all(isinstance(x, str) and x for x in all_words):
                 errors.append(f"{name}: expected_unavailable.contains_all 必须是字符串数组")
     return errors
-
-
-def elapsed_ms(start):
-    return int((time.perf_counter() - start) * 1000)
 
 
 def product_elapsed_ms(got):
@@ -326,9 +370,13 @@ def cell(v):
     if v is None:
         return None
     s = str(v).strip()
+    # 货币符号只剥行首的 ¥/$（仓库数据实测只有这两种前缀形态）；符号不在行首的
+    # （「-¥5」）或其它币种故意不扩 —— 落到字符串比对。
     body = s.rstrip("%").replace(",", "").lstrip("¥$")
     try:
-        return float(body)
+        f = float(body)
+        # nan/inf 字面量不是可比的数字：nan≠nan 会让双 NaN 单元格永假红，非有限浮点按字符串比
+        return f if math.isfinite(f) else s
     except ValueError:
         return s
 
@@ -365,12 +413,15 @@ def compare(got, gold):
         return None, "gold 返 0 行（题目待修，不构成结论）"
     if len(g_rows) != len(d_rows):
         return False, f"行数 {len(g_rows)}≠{len(d_rows)}"
-    if g_rows and len(g_rows[0]) != len(d_rows[0]):
-        return False, f"列数 {len(g_rows[0])}≠{len(d_rows[0])}"
+    # 逐行宽度都校验：只查首行时，后续参差不齐的行会被 zip 静默截断（多余单元格不参与比对＝假绿）
+    widths = {len(r) for r in g_rows} | {len(r) for r in d_rows}
+    if len(widths) != 1:
+        return False, f"列数不一致：行宽 {sorted(widths)}"
     for i, (ra, rb) in enumerate(zip(rows_key(g_rows), rows_key(d_rows))):
         for j, (a, b) in enumerate(zip(ra, rb)):
             if not close(a, b):
-                return False, f"第{i+1}行第{j+1}列 {a!r}≠{b!r}"
+                # 行号是排序后的序号（结果集语义无序），不是原始行号
+                return False, f"第{i+1}行第{j+1}列（排序后序号）{a!r}≠{b!r}"
     return True, f"{len(g_rows)}行一致"
 
 
@@ -392,7 +443,8 @@ def sql_parts(sql):
     select = between("select", [" from "])
     where = between(" where ", [" group by ", " order by ", " limit "])
     group = between(" group by ", [" order by ", " limit "])
-    aggs = sorted(set(re.findall(r"(?:sum|count|avg|min|max)\s*\([^)]*\)", s)))
+    # \b 边界：否则 checksum(/account( 里的 sum(/count( 会被误收入 agg 集
+    aggs = sorted(set(re.findall(r"\b(?:sum|count|avg|min|max)\s*\([^)]*\)", s)))
     conds = set(
         re.findall(r"[\w.`]+\s*(?:!=|>=|<=|=|>|<|not in|in|like)\s*(?:'[^']*'|\([^)]*\)|[\w.()]+)", where)
     ) if where else set()
@@ -406,7 +458,10 @@ def diff_class(got_sql, gold_sql):
     for k in ("where", "group", "agg"):
         if g[k] != d[k]:
             return k
-    return "select"
+    if g["select"] != d["select"]:
+        return "select"
+    # 组件全同：差异在行数/数据而不在 SQL 结构，返回 "-" 而不是误导成 select 差异
+    return "-"
 
 
 MARK = {True: "✅", False: "❌", None: "⏭️"}
@@ -481,7 +536,7 @@ def judge_batch_response(c, out, roundtrip_ms):
     timing = batch_timing(out, roundtrip_ms)
     got, gold = out.get("got") or {}, out.get("gold") or {}
     if out.get("error"):
-        return c, False, f"batch 执行失败: {str(out['error'])[:160]}", timing, got.get("route", "")
+        return c, False, f"batch 执行失败: {str(out['error'])[:_ERR_TAIL]}", timing, got.get("route", "")
     usable = got.get("columns") or got.get("rows") or got.get("markdown") or got.get("kind") == "text"
     if not usable:
         return c, False, "生成失败: batch 响应缺少可展示结果", timing, got.get("route", "")
@@ -527,10 +582,11 @@ def run_pass_batch(cases, tick, throttle_seconds=0.0):
                     if any(token in message for token in TRANSIENT) and attempt < 2:
                         time.sleep(5 * (attempt + 1))
                         continue
-                    clocks = {"product_ms": 0, "ask_wall_ms": 0, "gold_ms": 0, "harness_ms": 0}
+                    clocks = timing_of()   # 与 timing_of() 输出同形，零时钟不手工另维护一份
                     row = (c, False, f"batch 通道失败: {message[:180]}", clocks, "")
                     break
-            assert row is not None
+            if row is None:  # 不用 assert：python -O 会剥掉它，这道闸必须一直在
+                raise RuntimeError("batch 重试循环结束但未产出结果行")
             results.append(row)
             tick(row)
     finally:
@@ -553,7 +609,7 @@ def run_pass_legacy(cases, tick, throttle_seconds=0.0):
             gold_ms = elapsed_ms(t0)
             if gold.get("error"):
                 timing = timing_of(gold_ms=gold_ms)
-                row = (c, False, f"gold 预检失败: {gold['error'][:100]}", timing, "")
+                row = (c, False, f"gold 预检失败: {gold['error'][:_ERR_TAIL]}", timing, "")
                 results.append(row)
                 tick(row)
                 continue
@@ -563,8 +619,10 @@ def run_pass_legacy(cases, tick, throttle_seconds=0.0):
         ask_wall_ms = elapsed_ms(t0)
         timing = timing_of(got, ask_wall_ms, gold_ms)
         usable = got.get("columns") or got.get("rows") or got.get("markdown") or got.get("kind") == "text"
-        if got.get("error") or not usable:
-            row = (c, False, f"生成失败: {str(got.get('error'))[:100]}", timing, "")
+        if got.get("error"):
+            row = (c, False, f"生成失败: {str(got.get('error'))[:_ERR_TAIL]}", timing, "")
+        elif not usable:
+            row = (c, False, "生成失败: 响应缺少可展示结果", timing, "")
         elif c.get("expected_unavailable"):
             ok, detail = compare_unavailable(got, c["expected_unavailable"])
             row = (c, ok, detail, timing, got.get("route", ""))
@@ -593,7 +651,8 @@ def summarize(results, archive, runs, i):
     graded = len(passed) + len(failed)
     rate = len(passed) / graded * 100 if graded else 0.0
     def pct(key, q):
-        values = sorted(r[3][key] for r in results)
+        # 只统计真测过的时钟：跳过行与失败行的零时钟（batch 通道失败）会把延迟基线拉到 0
+        values = sorted(r[3][key] for r in results if r[1] is not None and r[3][key])
         return values[min(len(values) - 1, int(len(values) * q))] if values else 0
 
     p50, p95 = pct("product_ms", .5), pct("product_ms", .95)
@@ -606,9 +665,9 @@ def summarize(results, archive, runs, i):
           f"  · ask_wall p50={wall_p50}ms p95={wall_p95}ms"
           f"  · gold p50={gold_p50}ms p95={gold_p95}ms"
           f"  · harness p50={harness_p50}ms p95={harness_p95}ms")
-    if runs > 1:
-        # 实测：有一趟评测被并发工作流污染，AS01 42s vs 上一趟 21s。拿那趟当基线会得出假结论。
-        print("⚠️ 延迟只在无并发时有意义（实测被并发工作流污染时 AS01 21s→42s）")
+    # 实测：有一趟评测被并发工作流污染，AS01 42s vs 上一趟 21s。拿那趟当基线会得出假结论。
+    # 单趟同样会被污染（没有第二趟对照更看不出来），所以无条件提醒。
+    print("⚠️ 延迟只在无并发时有意义（实测被并发工作流污染时 AS01 21s→42s）")
 
     # tags 分层
     tag_stat = {}
@@ -618,7 +677,8 @@ def summarize(results, archive, runs, i):
         for t in c.get("tags", []):
             a, b = tag_stat.get(t, (0, 0))
             tag_stat[t] = (a + (1 if ok else 0), b + 1)
-    print("分层：" + "  ".join(f"{t} {a}/{b}" for t, (a, b) in sorted(tag_stat.items())))
+    if tag_stat:   # 无 tags 时别打裸「分层：」前缀
+        print("分层：" + "  ".join(f"{t} {a}/{b}" for t, (a, b) in sorted(tag_stat.items())))
 
     if failed:
         # 多趟时这份文件是**最后一趟**的失败明细（供 triage）；判据看上面的交集，别拿它下结论。
@@ -628,8 +688,13 @@ def summarize(results, archive, runs, i):
         print(f"失败明细 → tools/eval_error_case.json（{len(failed)} 例）")
 
     if archive:
-        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
-                                text=True, cwd=str(ROOT)).stdout.strip()
+        try:
+            git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                                 text=True, cwd=str(ROOT))
+            # git 缺席/非仓库都不许把空 commit 静默写进基线
+            commit = git.stdout.strip() if git.returncode == 0 and git.stdout.strip() else "unknown"
+        except OSError:
+            commit = "unknown"
         row = [time.strftime("%F %T"), commit, graded, len(passed), f"{rate:.1f}",
                p50, p95, wall_p50, wall_p95, gold_p50, gold_p95, harness_p50, harness_p95]
         f = ROOT / "tools" / "eval_baseline.csv"
@@ -643,12 +708,16 @@ def summarize(results, archive, runs, i):
                 old_rows = list(csv.reader(fh))
             if old_rows and old_rows[0] != header:
                 # 旧 p50/p95 本来量的是 ask 墙钟，迁移后落在 ask_wall 两列；其余未知留空。
-                migrated = [header]
+                migrated, dropped = [header], 0
                 for old in old_rows[1:]:
                     if len(old) >= 7:
                         migrated.append(old[:5] + ["", "", old[5], old[6], "", "", "", ""])
+                    else:
+                        dropped += 1
                 with f.open("w", newline="", encoding="utf-8") as fh:
                     csv.writer(fh).writerows(migrated)
+                # 迁移会丢弃列数 <7 的旧行：数据丢了必须看得见
+                print(f"基线格式迁移：保留 {len(migrated) - 1} 行 / 丢弃 {dropped} 行（列数 <7 的旧行）")
         new = not f.exists() or f.stat().st_size == 0
         with f.open("a", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
@@ -707,12 +776,25 @@ def selfcheck():
     assert not compare_unavailable({"rows": [["开票金额为 0"]]}, unavailable)[0], \
         "缺事实时输出猜测值必须红"
     assert case_protocol_errors([
-        {"name": "gold", "gold_sql": "SELECT 1"},
-        {"name": "missing", "expected_unavailable": unavailable},
+        {"name": "gold", "login": "admin", "q": "销售额", "gold_sql": "SELECT 1"},
+        {"name": "missing", "login": "admin", "q": "开票", "expected_unavailable": unavailable},
     ]) == []
+    # login/q 必填：batch_payload 直接下标消费，缺了是运行期 KeyError
+    assert any("login" in e for e in case_protocol_errors(
+        [{"name": "n", "q": "x", "gold_sql": "SELECT 1"}]))
+    assert any("q 必填" in e for e in case_protocol_errors(
+        [{"name": "n", "login": "a", "gold_sql": "SELECT 1"}]))
     assert case_protocol_errors([{"name": "bad"}])
     assert case_protocol_errors([{"name": "bad", "gold_sql": "SELECT 1",
                                   "expected_unavailable": unavailable}])
+    # nan/inf 字面量按字符串比：nan≠nan 不许让双 NaN 单元格永假红
+    assert close(cell("nan"), cell("nan")) is True
+    assert compare({"rows": [["nan"]]}, {"rows": [["nan"]]}) == (True, "1行一致")
+    assert compare({"rows": [["inf"]]}, {"rows": [["-inf"]]})[0] is False
+    # 逐行宽度校验：首行对齐但后续行参差不齐时，zip 截断不许假绿
+    assert compare({"rows": [[1], [2, 3]]}, {"rows": [[1], [2, 3]]})[0] is False
+    assert compare({"rows": [[1], [2, 3]]}, {"rows": [[1], [2, 3]]})[1].startswith("列数")
+    assert compare({"rows": [[1, 2], [3, 4]]}, {"rows": [[1, 2], [3, 4]]})[0] is True
     assert product_elapsed_ms({"elapsed_ms": "123"}) == 123
     assert timing_of({"elapsed_ms": 80}, 120, 30) == {
         "product_ms": 80, "ask_wall_ms": 120, "gold_ms": 30, "harness_ms": 40,
@@ -733,19 +815,26 @@ def selfcheck():
     assert judge_batch_response({"name": "E01", "gold_sql": "SELECT 1"}, batch_out, 170)[1]
     batch_src = Path(__file__).read_text(encoding="utf-8")
     batch_body = batch_src.split("def run_pass_batch", 1)[1].split("def run_pass_legacy", 1)[0]
-    assert "for attempt in range(3)" in batch_body
-    assert "any(token in error for token in TRANSIENT)" in batch_body
-    assert "time.sleep(5 * (attempt + 1))" in batch_body
-    # 【A22】组件分类：where 条件集不同 → where；group 不同 → group；全同 → select。
+    # 钉行为（3 次尝试 / 瞬时错误判定 / 5s 起步退避）而不是字面量：正则容忍改名与格式化
+    assert re.search(r"for\s+\w+\s+in\s+range\(\s*3\s*\)", batch_body)
+    assert "TRANSIENT" in batch_body
+    assert re.search(r"time\.sleep\(\s*5\s*\*\s*\(", batch_body)
+    # 【A22】组件分类：where 条件集不同 → where；group 不同 → group；全同 → "-"（不许误报 select）。
     # 判据钉「顺序报」与「不误报」，不是钉启发式的完备性（那是提示不是判据）。
     assert diff_class("SELECT a FROM t WHERE x = '1'", "SELECT a FROM t WHERE x = '2'") == "where"
     assert diff_class("SELECT a FROM t WHERE x = '1' GROUP BY a",
                       "SELECT a FROM t WHERE x = '1' GROUP BY b") == "group"
     assert diff_class("SELECT SUM(a) FROM t WHERE x = '1' GROUP BY c",
                       "SELECT COUNT(a) FROM t WHERE x = '1' GROUP BY c") == "agg"
+    assert diff_class("SELECT a FROM t WHERE x = '1'",
+                      "SELECT b FROM t WHERE x = '1'") == "select"
     assert diff_class("SELECT a, SUM(b) FROM t WHERE x = '1' GROUP BY c",
-                      "SELECT a, SUM(b) FROM t WHERE x = '1' GROUP BY c") == "select"
+                      "SELECT a, SUM(b) FROM t WHERE x = '1' GROUP BY c") == "-", \
+        "组件全同不许误报 select"
     assert diff_class("SELECT SUM(a) FROM t", "SELECT SUM(a) FROM t WHERE y = '2'") == "where"
+    # \b 边界：checksum( 里的 sum( 不许进 agg 集（无边界时这会误报 agg 差异）
+    assert diff_class("SELECT checksum(a) FROM t WHERE x = '1'",
+                      "SELECT a FROM t WHERE x = '1'") == "select"
     assert jitter_report([{"A": None}, {"A": None}])[0] == []   # 也不许把 ⏭️ 算进交集
     # 🔴 「⏭️ 不计入通过率分母」这条口径**只**写在 `summarize` 里（graded = passed + failed），
     # 上面那些 assert 一条都够不着它 —— 而 ③ 的修法完全押在它身上：把 skipped 并进 graded
@@ -758,6 +847,25 @@ def selfcheck():
         assert summarize([({"name": "A"}, True, "1行一致", clocks, "d"),
                           ({"name": "B"}, None, "gold 返 0 行", clocks, "")], False, 1, 1) is False
     assert "通过 1/1 = 100.0%  跳过 1" in buf.getvalue(), buf.getvalue()
+    # p50/p95 只统计真测过的时钟：失败行的零时钟不许把延迟基线拉到 0。
+    # summarize 遇失败会覆盖写共享的 eval_error_case.json（文件头副作用警告），
+    # 所以 ROOT 临时换到临时目录 —— 自检不许有副作用。
+    zero = {"product_ms": 0, "ask_wall_ms": 0, "gold_ms": 0, "harness_ms": 0}
+    fast = {"product_ms": 100, "ask_wall_ms": 200, "gold_ms": 10, "harness_ms": 90}
+    slow = {"product_ms": 200, "ask_wall_ms": 400, "gold_ms": 20, "harness_ms": 180}
+    real_root = ROOT
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "tools").mkdir()
+        globals()["ROOT"] = Path(td)
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                summarize([({"name": "F", "q": "x"}, False, "红", zero, ""),
+                           ({"name": "A"}, True, "1行一致", fast, "d"),
+                           ({"name": "C"}, True, "1行一致", slow, "d")], False, 1, 1)
+            assert "product p50=200ms" in buf.getvalue(), buf.getvalue()
+        finally:
+            globals()["ROOT"] = real_root
     print("evaluation.py 自检通过")
     return 0
 
@@ -776,18 +884,32 @@ def arg(name, default=None):
     return sys.argv[i]
 
 
+def help_text():
+    """帮助＝本文件顶部的注释块（单一事实源，别复述；同 kb_eval.py）"""
+    out = []
+    for ln in Path(__file__).read_text(encoding="utf-8").splitlines():
+        if not ln.startswith("#"):
+            break
+        out.append(ln[1:].strip())
+    return "\n".join(out)
+
+
 def main():
     global PROCESS_TIMEOUT_SECONDS
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(help_text())
+        return
     if "--selfcheck" in sys.argv:
         sys.exit(selfcheck())
     flt = arg("--filter")
-    runs = max(1, int(arg("--runs", 1)))
-    PROCESS_TIMEOUT_SECONDS = max(1.0, float(arg("--timeout-seconds", PROCESS_TIMEOUT_SECONDS)))
-    throttle_seconds = max(0.0, float(arg("--throttle-seconds", 0)))
+    try:
+        runs = max(1, int(arg("--runs", 1)))
+        PROCESS_TIMEOUT_SECONDS = max(1.0, float(arg("--timeout-seconds", PROCESS_TIMEOUT_SECONDS)))
+        throttle_seconds = max(0.0, float(arg("--throttle-seconds", 0)))
+    except ValueError as e:
+        sys.exit(f"数值参数解析失败（--runs/--timeout-seconds/--throttle-seconds）：{e}")
     legacy_cli = "--legacy-cli" in sys.argv
     prog = Path(arg("--progress")) if "--progress" in sys.argv else None
-    if prog:
-        prog.write_text("", encoding="utf-8")   # 只清一次：多趟往同一个文件追加，靠行首趟次区分
     cases = [c for c in CASES if not flt or flt in c["name"]]
     # 反空转闸（与 kb_eval.py 同口径）：筛空一律 exit 2。
     # 实测原行为：`--filter __no_such_case__` → 「通过 0/0 = 0.0%」→ **exit 0**。
@@ -802,9 +924,14 @@ def main():
             print(f"  - {error}")
         sys.exit(2)
 
+    if prog:
+        # 清空必须发生在筛题/协议预检**之后**：打错 --filter 不该丢上一趟的进度证据
+        prog.write_text("", encoding="utf-8")   # 只清一次：多趟往同一个文件追加，靠行首趟次区分
+
     def tick_of(i):
         def tick(row):
-            """一题一落盘。`flush` 不可省：不 flush 就等于没有进度文件。"""
+            """一题一落盘。with 关闭本就 flush——这行 flush 防的是未来有人把 with
+            改成句柄复用：那时不 flush 就等于没有进度文件（缓冲到进程结束才落盘）。"""
             if not prog:
                 return
             with prog.open("a", encoding="utf-8") as f:
@@ -813,10 +940,10 @@ def main():
         return tick
 
     passes = []
+    runner = run_pass_legacy if legacy_cli else run_pass_batch   # 与趟次无关，别在循环里重复选
     for i in range(1, runs + 1):
         if runs > 1:
             print(f"—— 第 {i}/{runs} 趟（{len(cases)} 题）——", flush=True)
-        runner = run_pass_legacy if legacy_cli else run_pass_batch
         results = runner(cases, tick_of(i), throttle_seconds)
         failed = summarize(results, "--baseline" in sys.argv, runs, i)
         passes.append({c["name"]: ok for c, ok, *_ in results})
@@ -830,4 +957,5 @@ def main():
     sys.exit(1 if failed else 0)
 
 
-main()
+if __name__ == "__main__":
+    main()

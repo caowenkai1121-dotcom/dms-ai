@@ -45,19 +45,23 @@ pub struct TabularSource {
 /// 通道①：sheet → markdown 表格块。实现复用 `ingest::sheet_block`（行上限与降级文案
 /// 在那里有既存单测钉住），本函数只是 §4.5 契约里的入口名。
 pub fn sheet_blocks(sheets: &[Sheet]) -> Vec<Block> {
-    // 全空的 sheet 跳过：`sheet_block` 对它产出的是 `"# 名字\n\n"`——一个只有标题的垃圾块，
+    // 表头全空白的 sheet 跳过：`sheet_block` 对它产出的是没有列名的垃圾块，
     // 会进 `kb.chunk` 并参与检索。它不该被丢在 Python 侧（那样 `plan` 就没法把它计入
-    // `skipped`，见 `embed_service::_sheet` 的红字），而该在这里、在**文本通道**跳过。
-    sheets
-        .iter()
-        .filter(|s| !(s.header.is_empty() && s.rows.is_empty()))
-        .map(crate::ingest::sheet_block)
-        .collect()
+    // `skipped`，见 `tools/embed_service.py::_sheet` 的红字），而该在这里、在**文本通道**跳过。
+    // 谓词与通道②（`plan`）同一个 `header_blank`：两通道对「哪些 sheet 算空」不许有口径差。
+    sheets.iter().filter(|s| !header_blank(s)).map(crate::ingest::sheet_block).collect()
+}
+
+/// 表头全空白（含「连表头行都没有」——空 Vec 的 `all` 恒真）：无表头就无从命名列，
+/// `c0..cn` 那种表对 NL2SQL 也没有意义。通道①②共用这同一个谓词。
+fn header_blank(s: &Sheet) -> bool {
+    s.header.iter().all(|h| h.trim().is_empty())
 }
 
 /// 上传源的 `ds_id` —— **唯一真相源**：删文档时 server 要拼同一个串去注销
 /// （`meta::delete_datasource`），两处各拼一次就会漂成「删不掉的活数据源」。
 /// `server::ds_api::valid_ds_id` 放行字母数字与 `_-`，uuid 原样即可。
+/// 调用方保证 `doc_id` 是系统生成的 uuid（36 字符）——`valid_ds_id` 的 ≤64 上限靠它满足。
 pub fn upload_ds_id(doc_id: &str) -> String {
     format!("upload_{doc_id}")
 }
@@ -73,6 +77,10 @@ pub fn upload_ds_id(doc_id: &str) -> String {
 /// 那份副本漂了之后表现为「问数查了个不存在的 schema」。
 pub fn upload_schema_of_ds(ds_id: &str) -> Option<String> {
     let doc_id = ds_id.strip_prefix("upload_")?;
+    // 裸前缀（"upload_"）剥完是空串，不应派生出退化 schema 名
+    if doc_id.is_empty() {
+        return None;
+    }
     Some(schema_ident(doc_id).as_str().to_string())
 }
 
@@ -96,14 +104,21 @@ pub async fn materialize(
     let plan = plan(&schema, sheets)?;
     store.create_upload_schema(&schema).await?;
     let mut tables = Vec::with_capacity(plan.specs.len());
+    // sheet 间无依赖但刻意顺序执行（不流水线化）：失败时能定位到单个 sheet。
+    // 半途失败必须清场——上传失败的文档不登记，`drop_source` 永远不会被调，
+    // 不清场则前几张表 + schema 成孤儿。
     for (i, spec) in &plan.specs {
-        store.create_upload_table(spec).await?;
-        let rows = store.insert_upload_rows(spec, &sheets[*i].rows).await?;
-        tables.push(TabularTable {
-            sheet: sheets[*i].name.clone(),
-            table: spec.table.as_str().to_string(),
-            rows,
-        });
+        if let Err(e) = store.create_upload_table(spec).await {
+            return Err(cleanup_failed(store, &schema, e).await);
+        }
+        match store.insert_upload_rows(spec, &sheets[*i].rows).await {
+            Ok(rows) => tables.push(TabularTable {
+                sheet: sheets[*i].name.clone(),
+                table: spec.table.as_str().to_string(),
+                rows,
+            }),
+            Err(e) => return Err(cleanup_failed(store, &schema, e).await),
+        }
     }
     Ok(TabularSource {
         ds_id: upload_ds_id(doc_id),
@@ -111,6 +126,19 @@ pub async fn materialize(
         tables,
         skipped: plan.skipped,
     })
+}
+
+/// 半途失败的 best-effort 清场：drop 整个上传 schema（含已建的前几张表）。
+/// 清场本身失败只 warn（孤儿 schema 留给运维），原始错误照抛。
+async fn cleanup_failed(
+    store: &OwnedStore,
+    schema: &SafeIdent,
+    e: dms_connector::ConnectorError,
+) -> KbError {
+    if let Err(d) = store.drop_upload_schema(schema).await {
+        tracing::warn!("上传表建到一半失败，清场也没成功（残留 schema {schema:?}）: {d}");
+    }
+    e.into()
 }
 
 /// 删文档时连带清理：`DROP SCHEMA up_<doc_id> CASCADE`。
@@ -132,7 +160,7 @@ fn plan(schema: &SafeIdent, sheets: &[Sheet]) -> Result<Plan, KbError> {
     let mut out = Plan { specs: Vec::new(), skipped: Vec::new() };
     for (i, s) in sheets.iter().enumerate() {
         // 无表头就无从命名列（`c0..cn` 那种表对 NL2SQL 也没有意义）→ 跳过，不建零列表
-        if s.header.iter().all(|h| h.trim().is_empty()) {
+        if header_blank(s) {
             out.skipped.push(s.name.clone());
             continue;
         }
@@ -140,7 +168,12 @@ fn plan(schema: &SafeIdent, sheets: &[Sheet]) -> Result<Plan, KbError> {
         out.specs.push((i, spec_of(schema, i, s)));
     }
     if out.specs.is_empty() {
-        return Err(KbError::BadInput("表格里没有可建表的 sheet（空表或无表头）".into()));
+        let mut msg = "表格里没有可建表的 sheet（空表或无表头）".to_string();
+        if !out.skipped.is_empty() {
+            // 带上被跳过的 sheet 名——否则用户不知道是哪些 sheet 空
+            msg.push_str(&format!("；被跳过：{}", out.skipped.join("、")));
+        }
+        return Err(KbError::BadInput(msg));
     }
     Ok(out)
 }
@@ -156,7 +189,7 @@ fn check_limits(s: &Sheet) -> Result<(), KbError> {
     }
     if s.header.len() > MAX_COLS {
         return Err(KbError::BadInput(format!(
-            "sheet「{}」有 {} 列，超过上限 {MAX_COLS} 列",
+            "sheet「{}」有 {} 列，超过上限 {MAX_COLS} 列，请拆分后重传（不做截断）",
             s.name,
             s.header.len()
         )));
@@ -167,11 +200,12 @@ fn check_limits(s: &Sheet) -> Result<(), KbError> {
 /// 表名 `t<序号>_<清洗后的 sheet 名>`：序号前缀保证两个 sheet 绝不塌成一张表
 /// （中文 sheet 名清洗后都退化成同一串）。原名进 `TabularTable.sheet` 与数据源描述。
 fn spec_of(schema: &SafeIdent, ord: usize, s: &Sheet) -> UploadTableSpec {
+    let sampling = column_samples(s);
     let cols: Vec<(&str, ColType)> = s
         .header
         .iter()
         .enumerate()
-        .map(|(i, h)| (h.as_str(), infer_col_type(&samples(s, i))))
+        .map(|(i, h)| (h.as_str(), infer_col_type(&sampling[i])))
         .collect();
     UploadTableSpec {
         schema: schema.clone(),
@@ -180,10 +214,19 @@ fn spec_of(schema: &SafeIdent, ord: usize, s: &Sheet) -> UploadTableSpec {
     }
 }
 
-/// 第 `i` 列的取样值。行比表头短时 `get` 返 `None`（缺格不参与推断），空白值由
-/// `infer_col_type` 自己滤。
-fn samples(s: &Sheet, i: usize) -> Vec<&str> {
-    s.rows.iter().take(SAMPLE_ROWS).filter_map(|r| r.get(i).map(String::as_str)).collect()
+/// 前 `SAMPLE_ROWS` 行转置成列向量（一次扫描）。逐列取样会让每列都重扫一遍行
+/// （200 列 × 200 行 = 4 万次迭代）。行比表头短时该格不入样（`get` 返 `None`，
+/// 缺格不参与推断）；空白值由 `infer_col_type` 自己滤。
+fn column_samples(s: &Sheet) -> Vec<Vec<&str>> {
+    let mut cols: Vec<Vec<&str>> = vec![Vec::new(); s.header.len()];
+    for r in s.rows.iter().take(SAMPLE_ROWS) {
+        for (i, col) in cols.iter_mut().enumerate() {
+            if let Some(v) = r.get(i) {
+                col.push(v.as_str());
+            }
+        }
+    }
+    cols
 }
 
 #[cfg(test)]
@@ -303,7 +346,7 @@ mod tests {
         assert_eq!(p.specs[0].1.columns[1].ty, ColType::Numeric);
     }
 
-    /// `Plan` 不实现 Debug（`UploadTableSpec` 也不），故错误分支用 let-else 取而不是 `unwrap_err`
+    /// 取错误分支；不用 `unwrap_err`（它要求 Ok 侧实现 Debug，徒增约束）
     fn plan_err(sheets: &[Sheet]) -> KbError {
         match plan(&schema(), sheets) {
             Err(e) => e,
@@ -345,6 +388,52 @@ mod tests {
 
         let e = plan_err(&[sheet("空", &[], &[])]);
         assert!(matches!(&e, KbError::BadInput(m) if m.contains("没有可建表的 sheet")), "{e}");
+        // 全被跳过时错误文案要带名单——否则用户不知道是哪些 sheet 空
+        let e = plan_err(&[sheet("甲空", &[], &[]), sheet("乙空", &[""], &[&["1"]])]);
+        assert!(
+            matches!(&e, KbError::BadInput(m) if m.contains("甲空") && m.contains("乙空")),
+            "{e}"
+        );
+    }
+
+    /// 「无表头但有 500 行」的 sheet：通道①②同一谓词——都不收（通道①不产块，通道②进 skipped）
+    #[test]
+    fn headerless_sheet_with_rows_is_skipped_by_both_channels() {
+        let s = sheet("无表头", &["", " "], &[&["1", "2"]]);
+        assert!(sheet_blocks(std::slice::from_ref(&s)).is_empty(), "通道①不许产块");
+        let e = plan_err(std::slice::from_ref(&s));
+        assert!(e.to_string().contains("无表头"), "{e}");
+    }
+
+    /// 裸前缀 ds_id 不派生退化 schema
+    #[test]
+    fn bare_upload_prefix_maps_to_none() {
+        assert_eq!(upload_schema_of_ds("upload_"), None);
+    }
+
+    /// 全空白列 → Text（空白值由 `infer_col_type` 滤这条纪律的接线测试：
+    /// connector 那边行为若变，这里先红）
+    #[test]
+    fn blank_only_column_infers_text() {
+        let s = sheet("s", &["a", "b"], &[&["1", ""], &["2", "  "]]);
+        let p = plan(&schema(), &[s]).unwrap();
+        assert_eq!(p.specs[0].1.columns[0].ty, ColType::Numeric);
+        assert_eq!(p.specs[0].1.columns[1].ty, ColType::Text, "全空白列 → Text");
+    }
+
+    /// 半途失败必须清场（锚点）：materialize 的错误分支要过 `cleanup_failed` → drop schema，
+    /// 否则上传失败文档不登记、孤儿表永远没人收
+    #[test]
+    fn materialize_cleans_up_on_partial_failure() {
+        let src = include_str!("tabular.rs");
+        let body = src.split("pub async fn materialize").nth(1).unwrap();
+        let body = body.split("/// 删文档时连带清理").next().unwrap();
+        assert_eq!(
+            body.matches("cleanup_failed(store, &schema, e).await").count(),
+            2,
+            "建表与灌数两个失败分支都要清场（若是改名请同步改本锚点）"
+        );
+        assert!(body.contains("drop_upload_schema"));
     }
 
     /// 有表头没数据的 sheet 照样建表（空的台账模板，之后可以问「有哪些列」）

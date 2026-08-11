@@ -57,6 +57,18 @@ impl ConnectorError {
     pub fn decode(at: &str, detail: impl fmt::Display) -> Self {
         Self::Decode(tag(at, detail))
     }
+
+    /// 附加上下文（哪一步 / 哪张表）：错误链没有 backtrace，上下文要手工串进去。
+    pub fn context(self, ctx: &str) -> Self {
+        let wrap = |m: String| format!("{m}（{ctx}）");
+        match self {
+            Self::Config(m) => Self::Config(wrap(m)),
+            Self::Connect(m) => Self::Connect(wrap(m)),
+            Self::Query(m) => Self::Query(wrap(m)),
+            Self::Timeout(m) => Self::Timeout(wrap(m)),
+            Self::Decode(m) => Self::Decode(wrap(m)),
+        }
+    }
 }
 
 impl fmt::Display for ConnectorError {

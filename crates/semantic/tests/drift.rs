@@ -152,6 +152,21 @@ const ALLOW: &[(&str, &str)] = &[
     // seed_defs 的 {sales_denominator} 是 `sales_fact::metric_subquery` 按共享合同现场生成的
     // 固定 SQL 片段（退款占比的分母），内容由 sales_fact 常量决定，无外部输入入口。
     ("seed_defs.rs", "sales_denominator"),
+    // ops_caliber 的 {OPS_EPOCH} 是本文件的 &'static 编译期常量（运营看板口径起算日），
+    // 无外部输入入口；与上面 ops_caliber 的公式构造器条目同理。
+    ("ops_caliber.rs", "OPS_EPOCH"),
+    // ops_caliber 的 {normalized} 是 `activity_region` 内由常量REPLACE片段拼出的归一链
+    // （输入只有硬编码别名），无外部输入入口。
+    ("ops_caliber.rs", "normalized"),
+    // recall/ods.rs 的 {JOIN_MIN_CONFIDENCE} 是本文件的 f64 编译期常量（证据边置信下限），
+    // 无外部输入入口。
+    ("ods.rs", "JOIN_MIN_CONFIDENCE"),
+    // probe.rs 的 {live} 是 `registry::table_asset_live_pred_at` 按常量模板生成的谓词骨架
+    // （内容与 ds bind 序号固定），无外部输入入口。
+    ("probe.rs", "live"),
+    // recall/pitfall.rs 的 {kinds} 由本文件 RECALLED_KINDS 常量数组现场拼成（固定字面量清单），
+    // 无外部输入入口。
+    ("pitfall.rs", "kinds"),
 ];
 
 /// 🔴 SQL 拼接守卫：semantic 是 `meta.*` 的唯一读写口，门禁不再对它守 `sqlx::query`

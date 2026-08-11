@@ -29,10 +29,14 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 ANALYSIS_TARGET_ENV = "DMSAI_ANALYSIS_TARGET"
 ANALYSIS_TARGET_TYPES = frozenset({"doris", "warehouse"})
+# 首选目标名（历史约定的数仓名）：显式/旧字符串两个池子都先挑它，都没有才按名字序兜底
+_PREFERRED_TARGET = "doris_warehouse"
 
 # 【D1】密文前缀（镜像 Rust `crypto::ENC_PREFIX`）
 ENC_PREFIX = "enc:v1:"
-# 【D1】敏感字段清单（镜像 Rust `db.rs` 的 SECRET_SCALARS / SECRET_MAP_VALUES + 两个特例）
+# 【D1】敏感字段清单（镜像 Rust `db.rs` 的 SECRET_SCALARS / SECRET_MAP_VALUES + 两个特例：
+# 特例即 `mysql_targets`（字符串整条、或对象的 url 字段）与 `mcp_keys`（键名本身是凭据），
+# 遍历逻辑见 `_decrypt_secrets`）
 _SECRET_SCALARS = ("mysql_url", "pg_url", "pg_ro_url", "llm_api_key", "wework_secret")
 _SECRET_MAP_VALUES = ("llm_keys", "datasources")
 
@@ -53,11 +57,16 @@ def _settings_key():
     """进程级 32B 钥匙（只存内存，不落盘不打印）。镜像 Rust `crypto::default_key`。"""
     global _KEY
     if _KEY is None:
+        # 与 Rust `crypto.rs` 对齐刻意不 trim：文件挂载 secret 常带尾换行，两侧同语义；
+        # 任何一侧「好心」加 .strip() 都会让两边派出不同的钥
         raw = os.environ.get("DMS_SECRET_KEY") or ""
         if raw:
             _KEY = hashlib.sha256(raw.encode("utf-8")).digest()
         else:
-            # 机器指纹兜底：跨机不可迁移（换机/换用户/容器重建后解不开，重填明文凭据）
+            # 机器指纹兜底：跨机不可迁移（换机/换用户/容器重建后解不开，重填明文凭据）；
+            # host/user 双缺时两台裸容器会派出同一把固定钥 —— 裸容器务必配 DMS_SECRET_KEY。
+            # 此处刻意静默（Rust 侧 db.rs 对短钥匙/指纹兜底会 warn）：指纹派钥是正常路径
+            # 而非降级，工具链 stderr 保持干净，免得每次跑都刷提示
             host = _first_env(("HOSTNAME", "COMPUTERNAME")) or "unknown-host"
             user = _first_env(("USER", "USERNAME")) or "unknown-user"
             _KEY = hashlib.sha256(
@@ -103,7 +112,7 @@ def _decrypt_secrets(cfg):
             cfg[f] = {k: _decrypt(v) for k, v in m.items()}
     targets = cfg.get("mysql_targets")
     if isinstance(targets, dict):
-        for name, t in list(targets.items()):
+        for name, t in targets.items():  # 只改值、不增删键，不必 list 拷贝
             if isinstance(t, str):
                 targets[name] = _decrypt(t)
             elif isinstance(t, dict) and "url" in t:
@@ -122,42 +131,63 @@ def settings_path():
     默认仍是仓库根的 settings.json；Docker 判官通过 DMSAI_SETTINGS 指向
     settings.docker.json，避免 Python 从一套 DMS 身份库挑人、容器去另一套库验人。
     """
-    raw = os.environ.get("DMSAI_SETTINGS", "settings.json")
+    raw = os.environ.get("DMSAI_SETTINGS", "").strip() or "settings.json"
+    # ^ 空串/空白按默认值处理：否则 ROOT/"." 是目录，read_text 会抛 IsADirectoryError 裸栈
     p = Path(raw)
     return p if p.is_absolute() else ROOT / p
 
 
 def load():
-    """读 settings.json（敏感字段 enc:v1: 密文在此透明解密）。缺文件就明确说清怎么办。"""
+    """读 settings.json（敏感字段 enc:v1: 密文在此透明解密）。缺文件就明确说清怎么办。
+
+    无缓存：一条链路要读多次时请透传 ``cfg``（``dsn``/``*_kwargs`` 都收），
+    避免每次重复读盘 + 解密。
+    """
     settings = settings_path()
     if not settings.exists():
         raise SystemExit(
             f"缺 {settings} —— 复制 settings.example.json 改成真值（明文凭据只许住在这里）"
         )
-    return _decrypt_secrets(json.loads(settings.read_text(encoding="utf-8")))
+    try:
+        return _decrypt_secrets(json.loads(settings.read_text(encoding="utf-8")))
+    except json.JSONDecodeError:
+        # 错误不回显内容片段：settings.json 正是凭据所在，回显即泄漏面（对齐 Rust db.rs）
+        raise SystemExit(f"{settings} 不是合法 JSON") from None
 
 
-def _dsn(raw, label):
-    """一个数据库 URL → DB 驱动的连接 kwargs，不在错误里回显 URL。"""
+def _dsn(raw, label, require_scheme=None):
+    """一个数据库 URL → DB 驱动的连接 kwargs，不在错误里回显 URL。
+
+    ``require_scheme`` 顺带在同一处校验 scheme（复用这一次 urlsplit，调用方不必再解析）。
+    """
     try:
         u = urlsplit(raw)
         host = u.hostname
         port = u.port
     except (TypeError, ValueError):
         raise SystemExit(f"settings.json 的 {label} 不是可解析的数据库 URL") from None
+    # startswith 而非 ==：放行 postgresql://、mysql+pymysql:// 等合法变体；
+    # 代价是 mysqlfoo:// 这类也过关 —— 可接受：host/库名缺失仍会拦，配置面本就只认这两系
+    if require_scheme is not None and not u.scheme.startswith(require_scheme):
+        raise SystemExit(f"settings.json 的 {label} 必须使用 {require_scheme}://")
     if not host:
         raise SystemExit(f"settings.json 的 {label} 不是可解析的 URL（要 scheme://user:pwd@host:port/db）")
+    dbname = u.path.lstrip("/")
+    if not dbname:
+        raise SystemExit(f"settings.json 的 {label} 缺少库名（URL 路径 /db 部分为空）")
     return {
         "host": host,
         # 端口缺省按 scheme 给：mysql 3306 / postgres 5432。本仓自有 PG 是 15433，URL 里都写着。
+        # 其他 scheme（如 doris://）不带端口时也落 5432 —— 本函数只服务 mysql/postgres 系
+        #（doris 走 mysql 协议，配置里写 mysql://）。
         "port": port or (3306 if u.scheme.startswith("mysql") else 5432),
         "user": unquote(u.username or ""),
         "password": unquote(u.password or ""),
-        "dbname": u.path.lstrip("/"),
+        "dbname": dbname,
     }
 
 
-def dsn(key, cfg=None):
+def dsn(key, cfg=None, require_scheme=None):
     """`settings.json` 里某个顶层 URL 键 → DB 驱动的连接 kwargs。
 
     返回 `{host, port, user, password, dbname}`。**用 host/port 而不是原样传 URL**：
@@ -166,15 +196,18 @@ def dsn(key, cfg=None):
     """
     cfg = cfg if cfg is not None else load()
     raw = cfg.get(key)
-    if not raw:
+    if raw is None:
         raise SystemExit(f"settings.json 里没有 {key}（参照 settings.example.json 补上）")
-    return _dsn(raw, key)
+    if not raw:
+        raise SystemExit(f"settings.json 的 {key} 值为空（参照 settings.example.json 填上）")
+    return _dsn(raw, key, require_scheme=require_scheme)
 
 
 def _analysis_target_entry(raw):
     """规范化一个 mysql_targets 条目；错误文本绝不包含连接 URL。"""
     if isinstance(raw, str):
-        return (raw.strip(), False, None) if raw.strip() else (None, False, "旧字符串 URL 为空")
+        s = raw.strip()  # 只 strip 一次，判断与返回值共用
+        return (s, False, None) if s else (None, False, "旧字符串 URL 为空")
     if not isinstance(raw, dict):
         return None, False, "必须是旧 URL 字符串或 {url,type} 对象"
 
@@ -194,16 +227,18 @@ def _analysis_target_entry(raw):
 
 
 def analysis_target(cfg=None):
-    """选择离线事实探针使用的非 DMS 分析目标，返回 ``(name, url)``。
+    """选择离线事实探针使用的非 DMS 分析目标，返回 ``(name, url, kwargs)``。
 
     新对象只接受显式 ``type=doris|warehouse``；旧字符串仅为兼容保留，并排除
     与身份库相同的 host:port。绝不回退 ``mysql_url``。
+    scheme 校验（必须 mysql://）在选择阶段一并做掉，``kwargs`` 是解析好的连接参数，
+    调用方不必再解析同一 URL。
     """
     cfg = cfg if cfg is not None else load()
     raw_targets = cfg.get("mysql_targets") or {}
     if not isinstance(raw_targets, dict):
         raise SystemExit("settings.json 的 mysql_targets 必须是对象")
-    auth = _dsn(cfg.get("mysql_url", ""), "mysql_url")
+    auth = dsn("mysql_url", cfg)  # dsn 先判缺失：缺 mysql_url 报「没有」而非「不可解析」
     auth_endpoint = (str(auth["host"]).lower(), auth["port"])
     targets = {}
     rejected = {}
@@ -214,15 +249,16 @@ def analysis_target(cfg=None):
             rejected[name] = reason
             continue
         try:
-            parsed = _dsn(url, f"mysql_targets.{name}")
+            parsed = _dsn(url, f"mysql_targets.{name}", require_scheme="mysql")
         except SystemExit as exc:
             rejected[name] = str(exc)
             continue
         endpoint = (str(parsed["host"]).lower(), parsed["port"])
+        # 判同只比 host 字符串：主机别名 / IP 指向同机判不出（已知局限，靠配置侧避免别名）
         if endpoint == auth_endpoint:
             rejected[name] = "与身份库使用同一 endpoint，已拒绝"
             continue
-        targets[name] = (url, explicit)
+        targets[name] = (url, explicit, parsed)
 
     requested = os.environ.get(ANALYSIS_TARGET_ENV, "").strip()
     if requested:
@@ -233,53 +269,61 @@ def analysis_target(cfg=None):
                 )
             names = ", ".join(sorted(targets)) or "无"
             raise SystemExit(f"{ANALYSIS_TARGET_ENV}={requested} 未配置（可选：{names}）")
-        return requested, targets[requested][0]
+        return requested, targets[requested][0], targets[requested][2]
 
     explicit = {name: value for name, value in targets.items() if value[1]}
     legacy = {name: value for name, value in targets.items() if not value[1]}
     for pool in (explicit, legacy):
-        if "doris_warehouse" in pool:
-            return "doris_warehouse", pool["doris_warehouse"][0]
+        if _PREFERRED_TARGET in pool:
+            return _PREFERRED_TARGET, pool[_PREFERRED_TARGET][0], pool[_PREFERRED_TARGET][2]
         if pool:
             name = sorted(pool, key=str.lower)[0]
-            return name, pool[name][0]
+            return name, pool[name][0], pool[name][2]
 
     reasons = "；".join(f"{name}（{rejected[name]}）" for name in sorted(rejected)) or "未配置目标"
     raise SystemExit(f"settings.json 没有可用离线分析数仓目标：{reasons}")
 
 
-def mysql_kwargs(cfg=None):
-    """DMS 身份/角色/权限库；禁止用于业务事实、实体值域或基数探测。"""
-    cfg = cfg if cfg is not None else load()
-    if not urlsplit(cfg.get("mysql_url", "")).scheme.startswith("mysql"):
-        raise SystemExit("settings.json 的 mysql_url 必须使用 mysql://")
-    d = dsn("mysql_url", cfg)
+def _pymysql_kwargs(d):
+    """``_dsn`` kwargs → pymysql kwargs：库名参数叫 database，统一 utf8mb4。"""
     d["database"] = d.pop("dbname")
     d["charset"] = "utf8mb4"
     return d
+
+
+def mysql_kwargs(cfg=None):
+    """DMS 身份/角色/权限库；禁止用于业务事实、实体值域或基数探测。"""
+    return _pymysql_kwargs(dsn("mysql_url", cfg, require_scheme="mysql"))
 
 
 def analysis_mysql_kwargs(cfg=None):
     """非 DMS 的只读 MySQL/Doris 分析目标，供离线事实探针使用。"""
-    name, raw = analysis_target(cfg)
-    if not urlsplit(raw).scheme.startswith("mysql"):
-        raise SystemExit(f"settings.json 的 mysql_targets.{name} 必须使用 mysql://")
-    d = _dsn(raw, f"mysql_targets.{name}")
-    d["database"] = d.pop("dbname")
-    d["charset"] = "utf8mb4"
-    return d
+    # URL 在 analysis_target 里已解析校验过（含 scheme 必须 mysql://），直接用解析好的 kwargs
+    _name, _raw, d = analysis_target(cfg)
+    return _pymysql_kwargs(d)
 
 
 def pg_kwargs(cfg=None):
     """自有 PG（元数据 / 知识库 / 向量）。psycopg2 的 db 参数就叫 `dbname`。"""
-    cfg = cfg if cfg is not None else load()
-    if not urlsplit(cfg.get("pg_url", "")).scheme.startswith("postgres"):
-        raise SystemExit("settings.json 的 pg_url 必须使用 postgres://")
-    return dsn("pg_url", cfg)
+    return dsn("pg_url", cfg, require_scheme="postgres")
 
 
 if __name__ == "__main__":  # python tools/settings.py —— 自检，不读真 settings.json
-    assert settings_path() == ROOT / os.environ.get("DMSAI_SETTINGS", "settings.json")
+    old_settings_env = os.environ.pop("DMSAI_SETTINGS", None)
+    try:
+        assert settings_path() == ROOT / "settings.json"
+        os.environ["DMSAI_SETTINGS"] = "settings.docker.json"
+        assert settings_path() == ROOT / "settings.docker.json"  # 相对路径拼仓库根
+        abs_p = str(ROOT / "elsewhere.json")
+        os.environ["DMSAI_SETTINGS"] = abs_p
+        assert settings_path() == Path(abs_p)  # 绝对路径原样使用
+        os.environ["DMSAI_SETTINGS"] = ""
+        assert settings_path() == ROOT / "settings.json"  # 空串按默认值处理
+    finally:
+        if old_settings_env is None:
+            os.environ.pop("DMSAI_SETTINGS", None)
+        else:
+            os.environ["DMSAI_SETTINGS"] = old_settings_env
     old_requested = os.environ.pop(ANALYSIS_TARGET_ENV, None)
     fake = {
         # 口令里带 `@` 与 `:`，正是手写正则会解析错的那两个字符
@@ -349,6 +393,16 @@ if __name__ == "__main__":  # python tools/settings.py —— 自检，不读真
             raise AssertionError("非 warehouse 对象不应成为默认离线分析目标")
         except SystemExit as exc:
             assert "没有可用离线分析数仓目标" in str(exc) and "mysql://" not in str(exc)
+
+        # mysql_targets 混进非 mysql scheme：选择阶段即拒绝，且理由不带 URL
+        pg_only = dict(fake, mysql_targets={
+            "pg_target": "postgres://reader:hidden@6.7.8.9:5432/other",
+        })
+        try:
+            analysis_target(pg_only)
+            raise AssertionError("非 mysql scheme 目标不应成为离线分析目标")
+        except SystemExit as exc:
+            assert "必须使用 mysql://" in str(exc) and "postgres://" not in str(exc)
     finally:
         if old_requested is None:
             os.environ.pop(ANALYSIS_TARGET_ENV, None)
@@ -359,8 +413,8 @@ if __name__ == "__main__":  # python tools/settings.py —— 自检，不读真
                  "password": "p:w@rd", "dbname": "dms_ai"}, p
     # 端口缺省按 scheme
     assert dsn("no_port", fake)["port"] == 5432
-    # 缺键 / 不是 URL 一律当场退出，不许返半个配置让调用方拿去连
-    for bad in [{}, {"pg_url": ""}, {"pg_url": "不是URL"}]:
+    # 缺键 / 值为空 / 不是 URL / 缺库名 一律当场退出，不许返半个配置让调用方拿去连
+    for bad in [{}, {"pg_url": ""}, {"pg_url": "不是URL"}, {"pg_url": "postgres://u:p@h"}]:
         try:
             dsn("pg_url", bad)
             raise AssertionError(f"没拦住 {bad}")
@@ -422,20 +476,23 @@ if __name__ == "__main__":  # python tools/settings.py —— 自检，不读真
     # 连注释里引用口令原文也算泄漏）。
     # 本文件用的是 `"password": unquote(...)`（dict 键 + 变量值），不匹配这个形状。
     import re as _re
-    lit = _re.compile(r"""password\s*[=:]\s*['"][^'"]""")
+    # 大小写不敏感 + 覆盖 passwd/pwd 变体：PASSWORD='x'、pwd: 'x' 同样算字面量口令
+    lit = _re.compile(r"""(?:password|passwd|pwd)\s*[=:]\s*['"][^'"]""", _re.IGNORECASE)
     # 扫描**跳过本文件**：它是这条判据的实现，里面必然有 `password='x'` 形状的
     # 反向验证样本（就在下面两行）。判据不扫自己是常规做法，但得写明白 ——
     # 代价是「有人把真口令写进 settings.py」这一种情况扫不到，
     # 而那也是这个文件唯一被允许碰凭据的地方（它只从 settings.json 读，不存）。
+    # 子目录一并扫（__pycache__ 除外）；非 UTF-8 的 .py 按替换字符读，不让自检崩
     hits = [
-        f"{p.name}:{i}"
-        for p in ROOT.joinpath("tools").glob("*.py")
-        if p.name != "settings.py"
-        for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
+        f"{p.relative_to(ROOT).as_posix()}:{i}"
+        for p in ROOT.joinpath("tools").rglob("*.py")
+        if p.name != "settings.py" and "__pycache__" not in p.parts
+        for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1)
         if lit.search(line)
     ]
     assert not hits, f"tools/ 里有字面量口令赋值：{hits}"
     # 反向验证：这条断言真的抓得住（不然它就是又一个恒真断言）
     assert lit.search("password='x'") and lit.search('password = "y"')
+    assert lit.search("PASSWORD='x'") and lit.search("passwd='x'") and lit.search("pwd: 'x'")
     assert not lit.search("password=cfg['pw']") and not lit.search('"password": unquote(u.password)')
     print("settings.py 自检通过（含「tools/ 无字面量口令赋值」那条纪律断言 + 它自己的反向验证）")

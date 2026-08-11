@@ -20,7 +20,7 @@
 //! 空响应时在 `parse_req` 的缺 id 分支加两行。`inputSchema` 手写 `json!`，不引 schemars（§7 已定）。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -64,13 +64,22 @@ const EXEC_RETRYABLE: i64 = -32001;
 /// 把不可重试的错判成可重试，对接方会拿同一个必然失败的问句反复打库；
 /// 反过来只是少了一次自动重试，用户重问一次就是了。宁少不多。
 fn fail_code(msg: &str) -> i64 {
-    // 中文串按子串匹配（本仓错误文案是中文）；英文串先小写化再匹配（sqlx/reqwest 的原文）
-    const RETRYABLE_CN: &[&str] = &["超时", "连接", "熔断", "限流", "请稍后", "暂时不可用"];
-    const RETRYABLE_EN: &[&str] =
-        &["timeout", "timed out", "connection", "connect", "429", "502", "503", "504",
-          "too many requests", "temporarily"];
+    // 中文串按子串匹配（本仓错误文案是中文）；英文串先小写化再匹配（sqlx/reqwest 的原文）。
+    // 连接类只收瞬时形态：「连接失败」对应 connector::Connect（建池/握手/被拒，瞬时倾向），
+    // 裸「连接」/「connect」会误吞「连接配置缺失」「connection string invalid」这类永久错误
+    //（与上方「宁少不多」的偏向一致）。
+    const RETRYABLE_CN: &[&str] = &["超时", "连接失败", "连接重置", "连接中断", "熔断", "限流", "请稍后", "暂时不可用"];
+    const RETRYABLE_EN: &[&str] = &[
+        "timeout", "timed out", "connection refused", "connection reset", "connection closed",
+        "connection terminated", "broken pipe", "429", "502", "503", "504",
+        "too many requests", "temporarily",
+    ];
+    // 先判 CN：中文文案命中时，全文小写化那次分配是白付
+    if RETRYABLE_CN.iter().any(|w| msg.contains(w)) {
+        return EXEC_RETRYABLE;
+    }
     let low = msg.to_ascii_lowercase();
-    if RETRYABLE_CN.iter().any(|w| msg.contains(w)) || RETRYABLE_EN.iter().any(|w| low.contains(w)) {
+    if RETRYABLE_EN.iter().any(|w| low.contains(w)) {
         EXEC_RETRYABLE
     } else {
         EXEC_FAILED
@@ -90,11 +99,12 @@ struct RpcReq {
     params: Value,
 }
 
-/// 请求 id：只认字符串与数字。缺失 / null / 其它类型 → `Null`
+/// 请求 id：只认字符串与**整数**（JSON-RPC 明确 SHOULD NOT 带小数部分）。
+/// 缺失 / null / 小数 / 布尔等非法类型 → `Null`
 /// （JSON-RPC 要求无法判定 id 的错误响应带 `id: null`）。
 fn req_id(v: &Value) -> Value {
     match v.get("id") {
-        Some(i) if i.is_string() || i.is_number() => i.clone(),
+        Some(i) if i.is_string() || i.is_i64() || i.is_u64() => i.clone(),
         _ => Value::Null,
     }
 }
@@ -104,7 +114,7 @@ fn req_id(v: &Value) -> Value {
 fn parse_req(v: &Value) -> Result<RpcReq, RpcFail> {
     let id = req_id(v);
     if id.is_null() {
-        return Err((INVALID_REQUEST, "缺 id（本端点不受理通知式请求）".into()));
+        return Err((INVALID_REQUEST, "缺 id 或 id 类型非法（仅收字符串/整数；本端点不受理通知式请求）".into()));
     }
     let method = v
         .get("method")
@@ -127,15 +137,23 @@ fn err_resp(id: &Value, (code, message): RpcFail) -> Value {
 }
 
 fn server_info() -> Value {
-    json!({
-        "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "tools": {} },
-        "serverInfo": { "name": "dms-ai", "version": env!("CARGO_PKG_VERSION") },
+    // 内容全静态：缓存一份克隆出去（每次请求重建整棵 JSON 是白付）
+    static V: OnceLock<Value> = OnceLock::new();
+    V.get_or_init(|| {
+        json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "dms-ai", "version": env!("CARGO_PKG_VERSION") },
+        })
     })
+    .clone()
 }
 
 fn tools() -> Value {
-    json!({ "tools": [
+    // 同 server_info：全静态清单缓存一份、克隆出去（每次请求重建整棵 JSON 是白付）
+    static V: OnceLock<Value> = OnceLock::new();
+    V.get_or_init(|| {
+        json!({ "tools": [
         {
             "name": "ask",
             "description": format!(
@@ -153,7 +171,7 @@ fn tools() -> Value {
         {
             "name": "kb_search",
             "description": format!(
-                "知识库检索：返回命中的文档块与引用信息（doc_id / doc_name / page / heading_path / score），不调用大模型。{PERM_NOTE}"
+                "知识库检索：返回命中的文档块与引用信息（chunk_id / doc_id / doc_name / ord / page / heading_path / score / text），不调用大模型。{PERM_NOTE}"
             ),
             "inputSchema": {
                 "type": "object",
@@ -210,6 +228,8 @@ fn tools() -> Value {
             },
         },
     ] })
+    })
+    .clone()
 }
 
 /// `tools/call` 的 `{name, arguments}`。`arguments` 缺省按空对象（无参工具的合法形态）。
@@ -235,6 +255,11 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 用户输入回显进错误文案的上限（未知 method/工具名可被塞超长串撑大响应）
+fn clipped(s: &str) -> String {
+    s.chars().take(64).collect()
+}
+
 /// 工具返回体。**不产 `isError`**：执行失败一律走 JSON-RPC 的 -32000（零生产者的字段不建）。
 fn text_content(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }] })
@@ -255,8 +280,8 @@ fn authorize(keys: &HashMap<String, String>, headers: &HeaderMap) -> Result<Stri
     match crate::auth::api_key_login(keys, raw) {
         Some(login) => Ok(login.to_string()),
         None => {
-            // 日志只记长度不回显任何前缀（前 4 位也是 key 的一部分）
-            tracing::warn!(key_len = raw.len(), "MCP 鉴权失败：X-API-Key 不匹配");
+            // 日志只记长度与客户端地址，不回显任何前缀（前 4 位也是 key 的一部分）
+            tracing::warn!(key_len = raw.len(), ip = %crate::auth::client_ip(headers), "MCP 鉴权失败：X-API-Key 不匹配");
             Err(deny(StatusCode::UNAUTHORIZED, "X-API-Key 无效"))
         }
     }
@@ -285,9 +310,10 @@ pub async fn mcp(
     };
     let out = match req.method.as_str() {
         "initialize" => Ok(server_info()),
+        "ping" => Ok(json!({})), // MCP 规范的保活探测：空 result（保活型客户端不该拿 -32601）
         "tools/list" => Ok(tools()),
         "tools/call" => call(&st, &login, &req.params).await,
-        other => Err((METHOD_NOT_FOUND, format!("未知方法 {other}"))),
+        other => Err((METHOD_NOT_FOUND, format!("未知方法 {}", clipped(other)))),
     };
     Ok(Json(match out {
         Ok(result) => ok_resp(&req.id, result),
@@ -295,10 +321,20 @@ pub async fn mcp(
     }))
 }
 
+/// 工具闭集（与 tools() 清单同源 —— dispatch_covers_every_listed_tool 钉着一致性）。
+/// 先验名再加载身份：乱填工具名的请求不许白打一次身份库。
+const TOOL_NAMES: &[&str] = &[
+    "ask", "kb_search", "datamap_search_nodes", "datamap_find_paths", "datamap_list_pending_edges",
+];
+
 /// 工具分派。**身份换算在这里发生且只发生一次**：login_name → `Principal`
 /// （员工不存在 / 无角色 / 多角色未选 一律失败，与该员工登录同一套判据）。
 async fn call(st: &AppState, login: &str, params: &Value) -> Result<Value, RpcFail> {
     let (name, args) = call_args(params)?;
+    if !TOOL_NAMES.contains(&name.as_str()) {
+        // 工具名不认识与方法名不认识同性质，共用 -32601
+        return Err((METHOD_NOT_FOUND, format!("未知工具 {}", clipped(&name))));
+    }
     let p = principal::load_principal(&st.auth_mysql, login, None)
         .await
         .map_err(|e| {
@@ -313,8 +349,8 @@ async fn call(st: &AppState, login: &str, params: &Value) -> Result<Value, RpcFa
         "datamap_search_nodes" => tool_datamap_search_nodes(st, &p, &args).await?,
         "datamap_find_paths" => tool_datamap_find_paths(st, &p, &args).await?,
         "datamap_list_pending_edges" => tool_datamap_list_pending_edges(st, &p, &args).await?,
-        // 工具名不认识与方法名不认识同性质，共用 -32601
-        other => return Err((METHOD_NOT_FOUND, format!("未知工具 {other}"))),
+        // 上方已按 TOOL_NAMES 闭集校验，此臂理论不可达（双保险，不 panic）
+        other => return Err((METHOD_NOT_FOUND, format!("未知工具 {}", clipped(other)))),
     };
     Ok(text_content(text))
 }
@@ -324,7 +360,8 @@ async fn call(st: &AppState, login: &str, params: &Value) -> Result<Value, RpcFa
 async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, RpcFail> {
     let question = req_str(args, "question")?;
     let ds = opt_str(args, "ds");
-    let fail = |e: String| (fail_code(&e), e);
+    // 分诊 ds 恒 DMS_DS_ID，即便调用方显式传 ds —— 与主通路 `api_ask`（main.rs）逐字对齐：
+    // 分诊判据是判官金标钉着的红线，MCP 不另搞一套（显式选源只进下方 crate::ask）
     let out = match triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &question, None).await
     {
         triage::Intent::Data => {
@@ -344,18 +381,23 @@ async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, 
             )
             .await;
             // 长驻进程，写入句柄直接丢弃（fire-and-forget，同 `/api/ask`）
-            let r = r.map_err(|e| fail(e.to_string()))?;
+            let r = r.map_err(|e| internal_fail("问数执行", &e))?;
             serde_json::to_value(&r)
         }
         triage::Intent::Knowledge => {
             let a =
                 dms_knowledge::answer::answer(&st.owned, &st.embed, &st.llm, &viewer(p), None, &question, &st.cfg().kb_rrf_weights)
                     .await
-                    .map_err(|e| fail(e.to_string()))?;
+                    .map_err(|e| internal_fail("知识问答", &e))?;
             serde_json::to_value(&a)
         }
     };
-    Ok(json_text(&out.unwrap_or_default()))
+    // 序列化失败不能吞：吞了客户端会收到「成功」响应体却是 "null"
+    let out = out.map_err(|e| {
+        tracing::warn!(err = %e, "MCP ask 结果序列化失败");
+        (EXEC_FAILED, "结果序列化失败".to_string())
+    })?;
+    Ok(json_text(&out))
 }
 
 /// 检索命中直出（不调 LLM）：对接方要的是块正文 + 引用信息，好自己拼提示词。
@@ -365,12 +407,9 @@ async fn tool_kb_search(st: &AppState, p: &Principal, args: &Value) -> Result<St
     let hits =
         dms_knowledge::retrieve::search(&st.owned, &st.embed, &viewer(p), space.as_deref(), &query, &st.cfg().kb_rrf_weights)
             .await
-            .map_err(|e| {
-                let m = e.to_string();
-                (fail_code(&m), m)
-            })?;
+            .map_err(|e| internal_fail("知识库检索", &e))?;
     let hits: Vec<Value> = hits
-        .iter()
+        .into_iter()
         .map(|h| {
             json!({ "chunk_id": h.chunk_id, "doc_id": h.doc_id, "doc_name": h.doc_name,
                 "ord": h.ord, "page": h.page, "heading_path": h.heading_path,
@@ -396,7 +435,8 @@ async fn require_ds(st: &AppState, p: &Principal, args: &Value) -> Result<String
         (fail_code(&m), m)
     })?;
     if !visible {
-        return Err((EXEC_FAILED, format!("无权访问数据源 {ds}")));
+        // 与 REST 侧同一文案口径：「不存在」与「无权」不分写（分开 = 证实存在性，枚举 oracle）
+        return Err((EXEC_FAILED, format!("数据源不存在或无权访问：{ds}")));
     }
     Ok(ds)
 }
@@ -428,8 +468,8 @@ async fn tool_datamap_search_nodes(st: &AppState, p: &Principal, args: &Value) -
         let m = format!("数据地图节点加载失败：{e}");
         (fail_code(&m), m)
     })?;
-    let kw = keyword.to_lowercase();
-    let hits: Vec<&Value> = nodes.iter().filter(|n| node_matches(n, &kw)).take(limit).collect();
+    // 大小写归一化收在 node_matches 内部，调用方不再先 lower 一遍
+    let hits: Vec<&Value> = nodes.iter().filter(|n| node_matches(n, &keyword)).take(limit).collect();
     Ok(json_text(&json!({
         "ds": ds, "keyword": keyword, "count": hits.len(), "nodes": hits,
     })))
@@ -477,9 +517,10 @@ async fn tool_datamap_list_pending_edges(st: &AppState, p: &Principal, args: &Va
                 ))
             }
         },
+        // 空串 = 「全部 kind」的隐式契约（edge_kind_filter 的 "" 臂，七值全收）
         None => crate::datamap_api::edge_kind_filter("").map(|(_, k)| k).unwrap_or_default(),
     };
-    let mut edges = crate::datamap_api::load_inferred_edges(st, &ds, &["pending".to_string()], &kinds)
+    let mut edges = crate::datamap_api::load_inferred_edges(st, &ds, &["pending"], kinds)
         .await
         .map_err(|e| {
             let m = format!("推断边加载失败：{e}");
@@ -495,9 +536,21 @@ fn viewer(p: &Principal) -> dms_knowledge::Viewer {
     dms_knowledge::Viewer::new(&p.login_name, roles)
 }
 
+/// 内部错误对外固定文案：anyhow 原文可含库名/SQL 片段，外泄 = 内部结构白送 —— 原文只进
+/// 服务端日志（对齐 artifact_api::db_err 的口径）；但可重试码仍按原文分类（-32001/-32000 语义不动）。
+fn internal_fail(what: &str, e: impl std::fmt::Display) -> RpcFail {
+    let m = e.to_string();
+    tracing::warn!(err = %m, "MCP {what}失败");
+    (fail_code(&m), format!("{what}失败，请稍后重试"))
+}
+
 /// content 只有文本一种载体，故结构化结果整体序列化成 JSON 文本（对端一个 JSON.parse 就能用）。
 fn json_text(v: &Value) -> String {
-    serde_json::to_string(v).unwrap_or_else(|_| "{}".into())
+    serde_json::to_string(v).unwrap_or_else(|e| {
+        // json! 产物序列化本不可失败；真失败也必须留信号，不能静默兜底 "{}"
+        tracing::error!(err = %e, "MCP 结果 JSON 序列化失败（理论不可达）");
+        "{}".into()
+    })
 }
 
 #[cfg(test)]
@@ -536,6 +589,20 @@ mod tests {
         let e = parse_req(&json!({ "jsonrpc": "2.0", "id": 1 })).unwrap_err();
         assert_eq!(e.0, INVALID_REQUEST);
         assert!(e.1.contains("method"), "{}", e.1);
+    }
+
+    /// id 类型契约：字符串/整数收；小数（JSON-RPC SHOULD NOT）、布尔、null、缺失一律拒
+    #[test]
+    fn req_id_accepts_only_strings_and_integers() {
+        assert_eq!(req_id(&json!({"id": "abc"})), json!("abc"));
+        assert_eq!(req_id(&json!({"id": 7})), json!(7));
+        assert_eq!(req_id(&json!({"id": -3})), json!(-3), "负整数是合法 id");
+        for bad in [json!({"id": 1.5}), json!({"id": true}), json!({"id": null}), json!({})] {
+            assert_eq!(req_id(&bad), Value::Null, "{bad}");
+            let e = parse_req(&json!({"id": bad.get("id").cloned().unwrap_or(Value::Null), "method": "m"})).unwrap_err();
+            assert_eq!(e.0, INVALID_REQUEST, "{bad}");
+            assert!(e.1.contains("id 类型非法"), "文案要分清缺失与类型非法：{}", e.1);
+        }
     }
 
     /// 缺 id / id=null 都不受理（通知式请求）；且此时错误响应必须带 `id: null`
@@ -588,8 +655,13 @@ mod tests {
         ] {
             assert_eq!(fail_code(m), EXEC_RETRYABLE, "该判可重试：{m}");
         }
+        // 瞬时（连接类收窄后的瞬时形态仍要认）
+        assert_eq!(fail_code("连接失败 [owned-pg] connection refused"), EXEC_RETRYABLE);
+        assert_eq!(fail_code("连接重置，请重试"), EXEC_RETRYABLE);
         // 永久：重试一万次也还是这个结果，重试就是纯浪费
         for m in [
+            "连接配置缺失",
+            "connection string invalid",
             "身份加载失败：员工不存在",
             "身份加载失败：该账号有多个角色，请指定 role_code",
             "生成失败（自修后仍不可用）",
@@ -641,6 +713,7 @@ mod tests {
             let name = tool["name"].as_str().unwrap();
             assert!(src.contains(&format!("\"{name}\" =>")), "call() 缺 {name} 的派发臂");
         }
+        assert!(src.contains("\"ping\" =>"), "MCP 规范的 ping 保活臂不许丢");
     }
 
     #[test]
@@ -727,8 +800,8 @@ mod tests {
         assert!(c.get("isError").is_none());
     }
 
-    /// 节点关键字匹配：表名/列名/注释/域任一命中；字段值侧大小写不敏感
-    /// （关键字侧由调用方 `to_lowercase`，纯函数约定入参已小写 —— 契约钉在这里）
+    /// 节点关键字匹配：表名/列名/注释/域任一命中；大小写归一化收在 `node_matches` 内部
+    ///（关键字与字段值两侧都不敏感，调用方不必记得先 lower —— 契约钉在这里）
     #[test]
     fn node_matches_any_metadata_field_case_insensitively() {
         let table = json!({"kind": "table", "table": "DWS_Sale", "comment": "销售汇总", "domain": "销售"});

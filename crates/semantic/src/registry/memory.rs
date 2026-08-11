@@ -24,7 +24,8 @@ pub struct MemoryHit {
     pub sim: f64,
 }
 
-/// 蒸馏写入。`content` 截 400 字（经验是提示不是教材全文）。
+/// 蒸馏写入。`content` 截 400 字、`question` 截 200 字（与日志表同口径：经验是提示不是
+/// 教材全文，截断同时是去重键的一部分）。
 /// 同 `(ds_id, kind, question)` 已存在则不重复沉（`NOT EXISTS`，与 `exemplar::save` 同形）：
 /// 同一问句再次回炉成功不产生孪生行 —— 旧条的 hit_count 还在涨， rerank 自然把它顶上来。
 pub async fn save_memory(
@@ -36,6 +37,7 @@ pub async fn save_memory(
     content: &str,
 ) -> anyhow::Result<bool> {
     let content: String = content.chars().take(400).collect();
+    let question: String = question.chars().take(200).collect();
     let row: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO meta.memory(ds_id, conv_id, kind, question, content) \
          SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS( \
@@ -45,14 +47,16 @@ pub async fn save_memory(
     .bind(ds)
     .bind(conv_id)
     .bind(kind)
-    .bind(question)
+    .bind(&question)
     .bind(&content)
     .fetch_optional(pg)
     .await?;
     Ok(row.is_some())
 }
 
-/// 向量近邻召回 + 重排。`qvec=None`（embed 缺席）→ 空，与六路召回同一降级语义。
+/// 向量近邻召回 + 重排。`qvec=None`（embed 缺席）→ 空，与各路召回同一降级语义。
+/// 🔴 硬上限：近邻粗排固定取 10 条再 rerank —— `limit > 10` 的调用者静默只得 10 条
+/// （钉在这里：上限不是 limit 形参能放宽的）。
 pub async fn recall_memories(
     pg: &PgPool,
     ds: &str,
@@ -83,11 +87,14 @@ pub async fn recall_memories(
     Ok(hits)
 }
 
-/// 重排分（纯函数，判据打这里）：相似度是主词，命中次数对数加权，按 30 天半衰衰减。
+/// 重排分（纯函数，判据打这里）：相似度是主词，命中次数对数加权，按 30 天 1/e 衰减
+/// （exp(-age/30)：30 天剩 1/e，半衰期实为 20.8 天）。
 /// datanote 的 `vector + hitCount + recency` 同构 —— 高分新条与屡验旧条都能赢，
 /// 纯按向量排会被「一次都没被印证过的新条」刷屏。
+/// `sim` 可为负/略>1（浮点余弦）：负分参与排序无害（相对序不变），刻意不 clamp。
+/// `age_days < 0`（时钟回拨/未来 created_at）按 0 计（负年龄会给 exp 正增益）。
 pub fn score(h: &MemoryHit) -> f64 {
-    h.sim * (1.0 + 0.1 * (1.0 + h.hit_count as f64).ln()) * (-h.age_days / 30.0).exp()
+    h.sim * (1.0 + 0.1 * (1.0 + h.hit_count as f64).ln()) * (-h.age_days.max(0.0) / 30.0).exp()
 }
 
 pub fn rerank(hits: &mut [MemoryHit]) {
@@ -95,6 +102,7 @@ pub fn rerank(hits: &mut [MemoryHit]) {
 }
 
 /// 命中计数 +1（召回侧 fire-and-forget；失败最多让 rerank 少点依据，不值得拖慢问答）。
+/// ds 谓词豁免：id 来自本轮 `recall_memories` 的召回结果（本可信主键），不是外部输入。
 pub async fn bump_hits(pg: &PgPool, ids: &[i64]) -> anyhow::Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -131,6 +139,8 @@ mod tests {
         assert!(score(&hit(0, 0.80, 20, 0.0)) > score(&hit(0, 0.80, 0, 0.0)));
         // 全零安全（不 NaN）
         assert!(score(&hit(0, 0.0, 0, 0.0)) == 0.0);
+        // 负年龄（时钟回拨/未来 created_at）按 0 计，不给 exp 正增益
+        assert_eq!(score(&hit(0, 0.8, 0, -5.0)), score(&hit(0, 0.8, 0, 0.0)));
     }
 
     /// bump 空清单不许发 SQL（无谓往返）+ SQL 形状锚点

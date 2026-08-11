@@ -42,21 +42,29 @@ const TYPO_PAIRS: &[(&str, &str)] = &[
     ("对帐", "对账"),
 ];
 
-/// 错别字归一（纯函数）：命中词表才改写，逐对全量替换（词表内各对互不重叠，顺序无关）。
-/// 无命中返回 `Cow::Borrowed`（干净问句零分配）。幂等：归一结果再归一一次逐字不变。
+/// 错别字归一（纯函数）：命中词表才改写，逐对全量替换（词表内各对互不重叠，顺序无关；
+/// 所以「哪些对命中」在原文上过滤与在改写途中过滤等价）。无命中返回 `Cow::Borrowed`
+/// （干净问句零分配）。幂等：归一结果再归一一次逐字不变。
 ///
 /// 两个调用点：`triage()` 入口（归一只影响分诊判定，路由出去的原问句不动）与
 /// `ask()` 的多轮改写之后（真正送去选源/召回/生成的那份）。
 pub fn normalize_typos(q: &str) -> Cow<'_, str> {
-    if !TYPO_PAIRS.iter().any(|(wrong, _)| q.contains(wrong)) {
+    // 命中路径只替换**命中的**那几对，不再 6 对全量各扫一遍
+    let hits: Vec<(&str, &str)> =
+        TYPO_PAIRS.iter().filter(|(wrong, _)| q.contains(wrong)).copied().collect();
+    if hits.is_empty() {
         return Cow::Borrowed(q);
     }
     let mut s = q.to_string();
-    for (wrong, right) in TYPO_PAIRS {
+    for (wrong, right) in hits {
         s = s.replace(wrong, right);
     }
     Cow::Owned(s)
 }
+
+/// 相对时间词表（模块级）：`time_tokens` 与 `time_hit` 共用这一份 —— 抄第二份必漂。
+const TIME_WORDS: &[&str] =
+    &["今天", "昨天", "前天", "本月", "上月", "上个月", "这个月", "本周", "上周", "今年", "去年", "本季度"];
 
 /// 时间词集合（护栏：命中缓存的问题时间词必须与本问全等，"上月"≠"本月"）。
 /// 搬运源 `server/src/pipeline.rs:953`，逻辑一字未改。
@@ -67,10 +75,7 @@ pub fn normalize_typos(q: &str) -> Cow<'_, str> {
 /// 同时落地，最终收敛到「住在 triage.rs、cache.rs `use` 它」（cache.rs 侧已写明同一句）。
 /// 要归位就是两个文件各改一行的收尾动作，不影响行为。
 pub fn time_tokens(q: &str) -> std::collections::BTreeSet<&'static str> {
-    ["今天", "昨天", "前天", "本月", "上月", "上个月", "这个月", "本周", "上周", "今年", "去年", "本季度"]
-        .into_iter()
-        .filter(|t| q.contains(t))
-        .collect()
+    TIME_WORDS.iter().copied().filter(|t| q.contains(t)).collect()
 }
 
 /// 分诊结果。两个变体 = 今天真实存在的两条链路（`ask::ask` / `knowledge::answer::answer`）。
@@ -105,7 +110,7 @@ pub async fn triage(
     let normalized = normalize_typos(question);
     let question = normalized.as_ref();
     // ① 前端 chip 显式指定：一次 IO 都不许发生（`auto` / 未知值解析成 None，继续往下）
-    if let Some(i) = forced.and_then(parse_intent) {
+    if let Some(i) = forced.and_then(parse_forced) {
         return i;
     }
     let kb = kb_hit(question);
@@ -115,38 +120,51 @@ pub async fn triage(
     if !kb && crate::answerers::entity::entity_form_hit(question) {
         return Intent::Data;
     }
-    // ② 规则。kb 侧没命中且纯信号已判 Data → 连注册表都不查：存量问数链路（多数带时间词或
-    //    指标名）不该为分诊多付三条查询。kb 命中时必须查库，否则拿不到「两侧都命中 → Data」。
-    if !kb && rule_intent(question, false, false).is_some() {
+    // ② 规则。问句内部的四组问数信号（时间词/完整问句/表名/单号）在这里算一次 ——
+    // 原来「纯信号快判」与「带注册表结果的裁决」两行各算一遍（纯函数同输入同输出，纯浪费）。
+    // kb 侧没命中且纯信号已判 Data → 连注册表都不查：存量问数链路（多数带时间词或
+    // 指标名）不该为分诊多付三条查询。kb 命中时必须查库，否则拿不到「两侧都命中 → Data」。
+    let own = question_data_hit(question);
+    if !kb && own {
         return Intent::Data;
     }
     let data = match registry_hit(pg, ds, question).await {
         Ok(h) => h,
         Err(e) => {
-            tracing::warn!("triage: 注册表召回失败（{e}）→ data");
+            tracing::warn!(err = %e, "triage: 注册表召回失败 → data");
             return Intent::Data;
         }
     };
-    if let Some(i) = rule_intent(question, data, kb) {
+    if let Some(i) = rule_decide(own || data, kb, question) {
         return i;
     }
-    // ③ fast LLM 一次二分类
+    // ③ fast LLM 一次二分类（见的同样是归一后的问句 —— 与上面所有判据同一份，不是用户原文）
     llm_intent(llm, question).await.unwrap_or(Intent::Data)
 }
 
 /// 规则判据（**纯函数**，无库无网可单测）。`data_hit` 由注册表召回给（指标/维度/术语），
-/// `kb_hit` 由 `kb_hit()` 给；问句内部的信号（时间词/表名/单号）在这里算。
+/// `kb_hit` 由 `kb_hit()` 给；问句内部的信号（时间词/表名/单号）在 `question_data_hit` 里算。
 ///
 /// 两侧都命中 → Data（v1 不做 hybrid）；都不命中 → `None` 交 LLM。
 pub fn rule_intent(question: &str, data_hit: bool, kb_hit: bool) -> Option<Intent> {
-    let data = data_hit
-        || time_hit(question)
+    rule_decide(question_data_hit(question) || data_hit, kb_hit, question)
+}
+
+/// 问句内部的四组问数信号（时间词/完整业务问句/表名/单号）：`triage()` 预计算与
+/// `rule_intent` 共用这一份，判据两份必漂。
+fn question_data_hit(question: &str) -> bool {
+    time_hit(question)
         || analytical_question_hit(question)
         || table_hit(question)
-        || doc_code_hit(question);
+        || doc_code_hit(question)
+}
+
+/// 命中合成 → 路由裁决。`question` 只用于 both-hit 的排障日志（「哪句话两侧都命中」
+/// 是分诊排障最需要的信息），不参与判定。
+fn rule_decide(data: bool, kb_hit: bool, question: &str) -> Option<Intent> {
     match (data, kb_hit) {
         (true, true) => {
-            tracing::info!("triage: both-hit → data（hybrid 待真实样本）");
+            tracing::info!(question, "triage: both-hit → data（hybrid 待真实样本）");
             Some(Intent::Data)
         }
         (true, false) => Some(Intent::Data),
@@ -158,33 +176,43 @@ pub fn rule_intent(question: &str, data_hit: bool, kb_hit: bool) -> Option<Inten
 /// 完整业务分析问句的零 IO 判据。它只确认“对象 + 查询目标”已经齐全，不替代指标召回，
 /// 也不负责生成 SQL；`ask::need_intent_reply` 与分诊共用，避免两处对同一句话作出相反判断。
 pub fn analytical_question_hit(question: &str) -> bool {
+    // 词表只留小写：判定前统一 `to_ascii_lowercase` 一次（与 `kb_hit` 同一套大小写策略）——
+    // 原来 OBJECTS 收 "SKU"/"sku" 不收 "Sku"、TARGETS 收 "top"/"TOP" 不收 "Top"，两套策略并存。
     const OBJECTS: &[&str] = &[
         "销售额", "销量", "销售量", "毛利", "成本", "收入", "订单", "客户", "商品",
-        "产品", "SKU", "sku", "设备", "单据", "发货", "退款", "售后", "开票", "对账",
+        "产品", "sku", "设备", "单据", "发货", "退款", "售后", "开票", "对账",
         "库存",
     ];
     const TARGETS: &[&str] = &[
         "多少", "几", "哪些", "那些", "哪几", "哪家", "谁", "哪个", "最高", "最低",
         "最多", "最少", "排行", "排名", "趋势", "占比", "比例", "对比", "明细", "清单",
-        "分布", "汇总", "合计", "top", "TOP", "前十", "前20", "前二十",
+        "分布", "汇总", "合计", "top", "前十", "前20", "前二十",
     ];
-    const RELATIONS: &[&str] = RELATION_WORDS;
     const TIME_SCOPED: &[&str] = &[
         "销售额", "销量", "销售量", "毛利", "成本", "收入", "订单", "单据", "发货",
         "退款", "售后", "开票", "对账", "库存",
     ];
 
-    let has_object = OBJECTS.iter().any(|word| question.contains(word));
+    let q = question.to_ascii_lowercase();
+    let has_object = OBJECTS.iter().any(|word| q.contains(word));
     (has_object
-        && (TARGETS.iter().any(|word| question.contains(word))
-            || RELATIONS.iter().any(|word| question.contains(word))))
-        || (time_hit(question) && TIME_SCOPED.iter().any(|word| question.contains(word)))
+        && (TARGETS.iter().any(|word| q.contains(word))
+            || RELATION_WORDS.iter().any(|word| q.contains(word))))
+        || (time_hit(question) && TIME_SCOPED.iter().any(|word| q.contains(word)))
 }
 
 /// 知识库侧命中：纯 substring，零正则依赖（`.pdf` 这类点号在正则里还得转义）。
 pub fn kb_hit(question: &str) -> bool {
-    let q = question.to_lowercase(); // 扩展名可能是大写 .PDF
-    KB_WORDS.iter().any(|w| q.contains(w))
+    // 词表里需要小写化的只有三个 ASCII 扩展名（用户贴的可能是大写 .PDF）；中文词对大小写
+    // 不敏感 —— 纯中文问句不为它们付一次整串堆分配（惰性：只在遇到 ASCII 词时小写化一次）。
+    let mut lower: Option<String> = None;
+    KB_WORDS.iter().any(|w| {
+        if w.is_ascii() {
+            lower.get_or_insert_with(|| question.to_ascii_lowercase()).contains(w)
+        } else {
+            question.contains(w)
+        }
+    })
 }
 
 /// 业务关系/事件词表（下单/退货/审核…）。两个消费者：`analytical_question_hit`（完整问句判据）
@@ -212,11 +240,12 @@ pub(crate) async fn registry_hit(pg: &PgPool, ds: &str, q: &str) -> anyhow::Resu
         || !recall::recall_terms(pg, &cx).await?.is_empty())
 }
 
-/// 时间词命中：相对词表**复用** `time_tokens`（同一张表，少一处会漂的词表），
+/// 时间词命中：相对词表**复用** `TIME_WORDS`（与 `time_tokens` 同一张表，少一处会漂的词表），
 /// 外加「数字 + 年/月/日/号/季」的绝对日期形（"2024年1月"）。
 /// 要求前面是数字才算：否则「年假制度」「月度须知」会被判成问数。
+/// 已知边界（刻意）：数字必须**紧邻**单位，「2024 年」这种带空格的不算 —— 别当 bug 修。
 fn time_hit(q: &str) -> bool {
-    if !time_tokens(q).is_empty() {
+    if TIME_WORDS.iter().any(|t| q.contains(t)) {
         return true;
     }
     let mut prev_digit = false;
@@ -233,7 +262,8 @@ fn time_hit(q: &str) -> bool {
 /// 要求 `t_` 后跟至少 3 个小写字母，免得「t_」这两个字符本身成为触发器。
 /// `pub(crate)` 的第二个消费者：`ask::hold_back_uncovered`（单据/表名形 = 意图明确，不拦）。
 pub(crate) fn table_hit(q: &str) -> bool {
-    let low = q.to_lowercase();
+    // 判据只看 ASCII（`t_` + 小写字母）：`to_ascii_lowercase` 更便宜且语义等价
+    let low = q.to_ascii_lowercase();
     low.match_indices("t_").any(|(i, _)| {
         low[i + 2..].chars().take(3).filter(|c| c.is_ascii_lowercase()).count() == 3
     })
@@ -242,14 +272,15 @@ pub(crate) fn table_hit(q: &str) -> bool {
 /// 单号命中：DMS 单据号形如 `HJXH-DXO2025…` / `SPC-20250101-001`。
 /// **只判形不判前缀**——判前缀要复述 `fastpath::doc_binding` 的映射表，那是第二份真相源；
 /// 判错的代价也不对称：这里判宽只是多走一次问数（快路径自己会不命中并回落）。
-/// 纯数字串（"20250101"）刻意不算：那是日期，由 `time_hit` 管。
+/// 必须含 ASCII 字母：纯数字串（"20250101"）与带杠日期（"2025-01-01"）都不是单号，
+/// 那是日期，由 `time_hit` 管 —— 否则含日期的制度类问句会被抢成 Data。
 /// `pub(crate)` 的第二个消费者：`ask::hold_back_uncovered`（同上）。
 pub(crate) fn doc_code_hit(q: &str) -> bool {
     q.contains("单号")
         || q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).any(|t| {
             t.len() >= 6
                 && t.chars().any(|c| c.is_ascii_digit())
-                && t.chars().any(|c| c.is_ascii_alphabetic() || c == '-')
+                && t.chars().any(|c| c.is_ascii_alphabetic())
         })
 }
 
@@ -258,18 +289,32 @@ async fn llm_intent(llm: &dyn ChatModel, question: &str) -> Option<Intent> {
     let system = "你给用户问题做路由二分类。查业务数据库（销售、订单、客户、库存等结构化数据）\
                   答 data；查企业文档（制度、流程、合同、手册等文本）答 knowledge。只输出一个词。";
     let user = format!("问题：{question}\n答：");
+    // 温度 0.1：与 ask.rs 三词门的 0.0 不同档 —— 本判定答错的代价只是路由差一点（兜底恒 Data），
+    // 与 fast 族其余调用（追问改写/反问候选）同档；三词门的输出是协议单词，温度抖动是纯噪音，压到 0。
     let req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
     let reply = tokio::time::timeout(LLM_TIMEOUT, llm.chat(req))
         .await
         .inspect_err(|_| tracing::warn!("triage: fast LLM 超时 → data"))
         .ok()?
+        // 传输/调用错误同样留痕：「模型挂了」与「超时」在日志里必须分得开
+        .inspect_err(|e| tracing::warn!(err = %e, "triage: fast LLM 调用失败 → data"))
         .ok()?;
     parse_intent(&reply.content?)
 }
 
-/// 字符串 → Intent，**forced（前端 chip）与 LLM 回复共用**：两边的合法值就是同两个词，
-/// 分两份解析＝有一天 chip 传 `knowledge` 而这边只认 `kb`。
-/// `auto` 与任何其它值 → `None`（继续往下判，绝不报错）。
+/// forced（前端能力 chip）的解析：**精确等值匹配** —— chip 的合法值就 `data`/`knowledge`
+/// 两个（web/src/App.vue 的 CAPS），`auto` 与任何其它值 → `None`（继续往下判，绝不报错）。
+/// 与 LLM 回复的容错解析（`parse_intent`）分开：「database」「metadata」这类词含 "data"，
+/// 走 chip 通道会被抢成 Data。
+fn parse_forced(s: &str) -> Option<Intent> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "data" => Some(Intent::Data),
+        "knowledge" => Some(Intent::Knowledge),
+        _ => None,
+    }
+}
+
+/// LLM 回复 → Intent（**容错**，只服务 `llm_intent`；chip 通道走 `parse_forced` 的精确匹配）。
 /// knowledge 先判：回复常是「knowledge，不是 data」，先判 data 会判反。
 /// 只认这两个词 + 两个中文别名（模型偶尔用中文回）：`kb` 之类的缩写没有生产者，
 /// 加进来只是让任何含 "kb" 的句子被抢成知识库。
@@ -288,6 +333,17 @@ fn parse_intent(s: &str) -> Option<Intent> {
 mod tests {
     use super::*;
 
+    /// 切出 `triage()` 的函数体（到 `/// 规则判据` 注释为止）—— 两个源码扫描判据共用，
+    /// 各自手撕同一串锚点 = 两处会漂的切片逻辑。
+    fn triage_body(src: &str) -> &str {
+        src.split("pub async fn triage")
+            .nth(1)
+            .expect("triage 没了")
+            .split("/// 规则判据")
+            .next()
+            .unwrap()
+    }
+
     #[test]
     fn registry_hit_routes_to_data() {
         assert_eq!(rule_intent("销售额", true, false), Some(Intent::Data));
@@ -299,14 +355,7 @@ mod tests {
     /// 闸门带 `!kb` 前提：名字里撞了制度类词（「标准」「合同」）时维持原判，不抢知识库。
     #[test]
     fn bare_entity_forms_never_reach_the_llm_coin_flip() {
-        let src = include_str!("triage.rs");
-        let body = src
-            .split("pub async fn triage")
-            .nth(1)
-            .expect("triage missing")
-            .split("/// 规则判据")
-            .next()
-            .unwrap();
+        let body = triage_body(include_str!("triage.rs"));
         let gate = body.find("entity_form_hit").expect("triage 缺裸实体名闸门");
         let llm = body.find("llm_intent").expect("triage 缺 LLM 兜底");
         assert!(gate < llm, "裸实体名闸门必须在 LLM 二分类之前：{body}");
@@ -327,6 +376,8 @@ mod tests {
         // 「年假」「月度」前面没有数字 → 不是时间词（否则制度类问句全被抢成问数）
         assert!(!time_hit("年假规定"));
         assert!(!time_hit("月度须知"));
+        // 已知边界（刻意）：数字必须紧邻单位，「2024 年」带空格不算
+        assert!(!time_hit("2024 年的制度"));
     }
 
     #[test]
@@ -346,6 +397,16 @@ mod tests {
         assert!(!analytical_question_hit("设备保温柜 DHT150-6，昨天"));
     }
 
+    /// 大小写策略与 `kb_hit` 统一（词表只留小写，判定前整串小写化一次）：
+    /// 「Sku」「Top」这类混排写法不许漏判。
+    #[test]
+    fn analytical_hit_is_ascii_case_insensitive() {
+        assert!(analytical_question_hit("本月Sku销量的Top榜"), "混排写法漏判：Sku/Top");
+        assert!(analytical_question_hit("各门店的 SKU 占比"));
+        // 反向（防恒真）：混排救不了的句子依旧不命中
+        assert!(!analytical_question_hit("可颂香肠卷"));
+    }
+
     #[test]
     fn table_name_routes_to_data() {
         assert_eq!(rule_intent("t_sales_order 有多少行", false, false), Some(Intent::Data));
@@ -357,8 +418,12 @@ mod tests {
     fn doc_code_routes_to_data() {
         assert_eq!(rule_intent("HJXH-DXO2025010100123", false, false), Some(Intent::Data));
         assert!(doc_code_hit("这个单号查一下"));
+        assert!(doc_code_hit("SPC-20250101-001"), "字母前缀 + 带杠数字是单号");
         assert!(!doc_code_hit("报销制度2024版"), "纯数字是日期不是单号");
         assert!(!doc_code_hit("本月销售额"), "无 ASCII 串不算单号");
+        // 带杠日期不是单号：含日期的制度类问句不许被抢成 Data
+        assert!(!doc_code_hit("2025-01-01 的报销制度"), "带杠日期族漏网会抢知识库的问句");
+        assert!(!doc_code_hit("2025-01-01 到 2025-12-31 的情况"));
     }
 
     #[test]
@@ -383,20 +448,26 @@ mod tests {
         assert_eq!(rule_intent("帮我看看那个东西", false, false), None);
     }
 
-    /// forced 覆盖规则：前端 chip 选了知识库，问句再像问数也走知识库
+    /// forced 覆盖规则：前端 chip 选了知识库，问句再像问数也走知识库。
+    /// chip 通道是**精确匹配**：「database」「metadata」这类含 "data" 的词不许被吞成 Data。
     #[test]
     fn forced_overrides_rules() {
         let q = "本月销售额是多少"; // 规则会判 Data
         assert_eq!(rule_intent(q, true, false), Some(Intent::Data));
-        assert_eq!(parse_intent("knowledge"), Some(Intent::Knowledge));
-        assert_eq!(parse_intent("data"), Some(Intent::Data));
+        assert_eq!(parse_forced("knowledge"), Some(Intent::Knowledge));
+        assert_eq!(parse_forced("data"), Some(Intent::Data));
         // `auto`（前端「自动」chip 实际传 null，但传字面量也不许被当成强制）与未知值都不决
-        assert_eq!(parse_intent("auto"), None);
-        assert_eq!(parse_intent(""), None);
-        assert_eq!(parse_intent("hybrid"), None);
+        assert_eq!(parse_forced("auto"), None);
+        assert_eq!(parse_forced(""), None);
+        assert_eq!(parse_forced("hybrid"), None);
+        // 精确匹配：含 "data"/"knowledge" 的更长词不是 chip 值（容错是 LLM 通道的事）
+        assert_eq!(parse_forced("database"), None);
+        assert_eq!(parse_forced("metadata"), None);
+        assert_eq!(parse_forced("knowledge base"), None);
     }
 
     /// LLM 回复容错：带解释、带标点、大小写都要认；knowledge 必须先判
+    ///（tolerant 只在这条通道：模型回复常是「knowledge，不是 data」）。
     #[test]
     fn llm_reply_parsing_is_tolerant() {
         assert_eq!(parse_intent("Knowledge"), Some(Intent::Knowledge));
@@ -459,14 +530,7 @@ mod tests {
     /// 归一等于没归一（判据读的还是错形）。锚点 `concat!` 拼（自匹配家族，本仓惯例）。
     #[test]
     fn typo_normalization_precedes_every_triage_rule() {
-        let src = include_str!("triage.rs");
-        let body = src
-            .split("pub async fn triage")
-            .nth(1)
-            .expect("triage 没了")
-            .split("/// 规则判据")
-            .next()
-            .unwrap();
+        let body = triage_body(include_str!("triage.rs"));
         let norm = body
             .find(concat!("normalize_", "typos(question)"))
             .expect("triage 入口没做错别字归一");
@@ -475,7 +539,7 @@ mod tests {
         let registry = body.find("registry_hit(pg, ds, question)").expect("注册表召回没了");
         assert!(norm < kb && norm < entity && norm < registry, "归一必须在一切判据之前：{body}");
         // 归一也先于 forced 判读（统一入口语义：分诊全程只见归一后的问句）
-        let forced = body.find("forced.and_then(parse_intent)").expect("forced 判读没了");
+        let forced = body.find("forced.and_then(parse_forced)").expect("forced 判读没了");
         assert!(norm < forced, "{body}");
     }
 }

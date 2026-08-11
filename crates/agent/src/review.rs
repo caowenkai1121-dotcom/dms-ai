@@ -33,10 +33,21 @@ const EXEMPLAR_SYSTEM: &str = "你是资深数据工程师，审核一条 SQL �
                   日期过滤是否精确不必挑剔。只输出一行：opinion=POSITIVE 或 opinion=NEGATIVE。";
 
 /// 三类复核共用的一次 fast 调用。`None` = 挂了/超时/没回内容，各调用方按自己的兜底处理。
-/// 温度 0.1 = 搬运前 `LlmClient::chat` 写死的那个值（`server/src/llm.rs:53`）。
+/// 失败分支各留一条 debug：复核回路停转时不能零日志。温度 0.1 的出处见 `insight::LLM_TEMP`。
 async fn fast(llm: &dyn ChatModel, system: &str, user: &str) -> Option<String> {
-    let req = ChatRequest::text(ModelTier::Fast, system, user, Some(0.1));
-    llm.chat(req).await.ok()?.content
+    let req = ChatRequest::text(ModelTier::Fast, system, user, Some(crate::insight::LLM_TEMP));
+    match llm.chat(req).await {
+        Ok(r) => {
+            if r.content.is_none() {
+                tracing::debug!("复核 fast 调用回空 content");
+            }
+            r.content
+        }
+        Err(e) => {
+            tracing::debug!(err = %e, "复核 fast 调用失败");
+            None
+        }
+    }
 }
 
 /// 失败复盘（引擎 C）：fast LLM 分析「问题+SQL+MySQL 错误」的根因，产出候选教训。
@@ -49,12 +60,19 @@ pub async fn review_failure(
     sql: &str,
     error: &str,
 ) {
+    // 不包 wrap_untrusted：这是离线复核回路，输入是本方已执行的 SQL 与引擎错误原文，
+    // 不是外部文本；且 prompt 逐字保留是自进化口径（模块头），加包裹要过口径评审。
     let user = format!("问题：{question}\nSQL：\n{sql}\n执行错误：{error}");
-    let Some(resp) = fast(llm, FAILURE_SYSTEM, &user).await else { return };
-    let Some(lesson) = parse_lesson(&resp) else { return };
+    let Some(resp) = fast(llm, FAILURE_SYSTEM, &user).await else { return }; // fast 内已留痕
+    let Some(lesson) = parse_lesson(&resp) else {
+        tracing::debug!("复盘回复无有效 lesson（无前缀 / NO_LESSON / 空 / 过长）→ 不落");
+        return;
+    };
     let tables = extract_tables(sql);
-    if !tables.is_empty() {
-        exemplar::save_lesson_candidate(pg, ds, &tables, lesson).await;
+    if !tables.is_empty()
+        && !exemplar::save_lesson_candidate(pg, ds, &tables, lesson).await
+    {
+        tracing::warn!("候选教训落库失败（save_lesson_candidate 返回 false）");
     }
 }
 
@@ -63,9 +81,23 @@ pub async fn review_lessons(llm: &dyn ChatModel, pg: &PgPool, limit: i64) -> any
     // 跨源管理批处理（复核所有源的候选教训），按 id 逐条更新，不需要 ds 谓词（判据在 exemplar 侧）
     let rows = exemplar::candidate_lessons(pg, limit).await?;
     let mut n = 0;
-    for (id, trig, lesson) in rows {
-        let user = format!("锚定：{trig}\n教训：{lesson}");
-        let Some(resp) = fast(llm, LESSON_SYSTEM, &user).await else { continue };
+    let mut misses = 0;
+    for (id, tables, lesson) in rows {
+        let user = format!("锚定：{tables}\n教训：{lesson}");
+        let Some(resp) = fast(llm, LESSON_SYSTEM, &user).await else {
+            // LLM 挂掉时逐条继续 = 每条各烧一次必败的 fast 调用（各付一次超时）：
+            // 连续 3 次失败即熔断，本轮剩余的下批再议
+            misses += 1;
+            if misses >= 3 {
+                tracing::warn!("候选教训复核连续 {misses} 次失败（疑似 LLM 挂掉）→ 本轮剩余下批再议");
+                break;
+            }
+            continue;
+        };
+        misses = 0;
+        // 落库失败整批上抛是**有意的**（与 `review_all_pending` 的逐条容错不同）：
+        // 复核结论只有写进库才有意义，PG 写不进时逐条继续也是各烧一次必败写，
+        // 不如整批报错让人看见；已成功的计数 n 随 Err 丢弃可接受（下批会重扫）。
         exemplar::set_lesson_status(pg, id, parse_verdict(&resp)).await?;
         n += 1;
     }
@@ -86,12 +118,15 @@ pub async fn review_exemplar(
     question: &str,
     sql: &str,
 ) -> bool {
+    // 不包 wrap_untrusted（立场同 `review_failure` 的注释）：离线批处理，输入非外部文本
     let user = format!("问题：{question}\nSQL：\n{sql}\n审核结论：");
     // 复核失败保持 pending，下次再议
     let Some(resp) = fast(llm, EXEMPLAR_SYSTEM, &user).await else { return false };
     if let Err(e) = exemplar::set_ai_review(pg, ds, question, parse_opinion(&resp)).await {
         // 带问句：批量复核一次扫 100 条，不带问句就查不出是哪条卡住
-        tracing::warn!(question, error = %e, "语料复核结论落库失败，保持 pending 下次再议");
+        // （问句截定长：整句塞结构化字段会让日志行膨胀到 KB 级）
+        let q: String = question.chars().take(120).collect();
+        tracing::warn!(question = %q, error = %e, "语料复核结论落库失败，保持 pending 下次再议");
         return false;
     }
     true
@@ -136,33 +171,36 @@ where
     n
 }
 
-/// 复盘回复 → 候选教训（**纯函数**）。必须以 `lesson=` 开头；空 / `NO_LESSON` / 过长一律不落。
-/// 长度判据用字节（`str::len`，与搬运前一字不差）：这里只是防「把整段错误原文当教训」，
-/// 不是显示宽度。
+/// 复盘回复 → 候选教训（**纯函数**）。取第一个 `lesson=` 前缀行（模型多印一行前言不该整篇丢弃）；
+/// 空 / `NO_LESSON` / 过长一律不落。长度判据用**字符数**，与 prompt 的「≤80字」对齐
+/// （原先按字节 200：80 个汉字 = 240 字节，按 prompt 合规的教训会被闸门丢掉 —— 两处阈值矛盾）。
 fn parse_lesson(resp: &str) -> Option<&str> {
-    let lesson = resp.trim().strip_prefix("lesson=")?.trim();
-    if lesson.is_empty() || lesson == "NO_LESSON" || lesson.len() > 200 {
+    let lesson = resp.lines().find_map(|line| line.trim().strip_prefix("lesson="))?.trim();
+    if lesson.is_empty() || lesson == "NO_LESSON" || lesson.chars().count() > 80 {
         return None;
     }
     Some(lesson)
 }
 
-/// 教训复核回复 → 状态（**纯函数**）。只有明确 `verdict=enabled` 才启用：
-/// 判不出一律 disabled —— 教训会进后续所有 prompt，宁可漏启用不许误启用。
+/// 教训复核回复 → 状态（**纯函数**）。定位**最后一个** `verdict=` 取其值精确比较：
+/// `contains("verdict=enabled")` 会命中否定语境（「不应判 verdict=enabled，应判 verdict=disabled」
+/// —— 结论在最后），而 enabled 是宽松侧（坏教训进后续所有 prompt），方向判反代价大。
+/// 判不出一律 disabled —— 宁可漏启用不许误启用。
 fn parse_verdict(resp: &str) -> &'static str {
-    if resp.contains("verdict=enabled") {
-        "active"
-    } else {
-        "disabled"
+    match resp.rfind("verdict=") {
+        Some(i) if resp[i + "verdict=".len()..].starts_with("enabled") => "active",
+        _ => "disabled",
     }
 }
 
-/// 语料初筛回复 → 意见。只有明确 NEGATIVE 才剔除，其余保留 pending 等人工验证。
+/// 语料初筛回复 → 意见。定位 `opinion=`（最后一个 = 结论位）取其值与 NEGATIVE 做 ASCII
+/// 大小写无关比较：`to_uppercase().contains("NEGATIVE")` 会命中「not NEGATIVE」
+/// 「opinion=POSITIVE 而非 NEGATIVE」这类否定语境。只有明确 NEGATIVE 才剔除，其余保留 pending。
 fn parse_opinion(resp: &str) -> &'static str {
-    if resp.to_uppercase().contains("NEGATIVE") {
-        "negative"
-    } else {
-        "positive"
+    match resp.rfind("opinion=").map(|i| &resp[i + "opinion=".len()..]) {
+        // `get(..8)` 而不是硬切片：值以非 ASCII 开头时切片会切在多字节字符内部当场 panic
+        Some(v) if v.get(..8).is_some_and(|head| head.eq_ignore_ascii_case("NEGATIVE")) => "negative",
+        _ => "positive",
     }
 }
 
@@ -182,13 +220,11 @@ mod tests {
         }
     }
 
-    /// 「PG 抖一下」的假件：lazy 池指到没人监听的 127.0.0.1:1（同 `connector/src/fixed.rs`
-    /// 那几条测试的手法，无库无网）。取连接超时压到 200ms —— sqlx 默认 30s，
-    /// 不压这条判据要跑半分钟。
-    /// 「PG 写不进去」的假件。**造池的那一行必须住在 connector** ——
+    /// 「PG 抖一下 / 写不进去」的假件：lazy 池指到没人监听的 127.0.0.1:1（同 `connector/src/fixed.rs`
+    /// 那几条测试的手法，无库无网）。**造池的那一行必须住在 connector** ——
     /// 架构门禁第①条「agent 不得造连接池」按 `PgPoolOptions` 判，本文件写它会当场 FAIL
     /// （实测 `[FAIL] agent 不得造连接池 → review.rs:191`）；改写类型路径绕 grep 是拿门禁换绿。
-    ///
+    /// 取连接超时压到 200ms —— sqlx 默认 30s，不压这条判据要跑半分钟。
     /// 200ms 那个值不是洁癖：我先试过不压超时的 `PgPool::connect_lazy`，
     /// 以为 ECONNREFUSED 会立刻返错 —— **实测 sqlx 会重连到默认的 30s**，
     /// 两条判据各等一轮 ⇒ `finished in 60.01s`。这条推断是被我自己加的耗时断言当场抓住的。
@@ -280,9 +316,17 @@ mod tests {
         assert!(parse_lesson("lesson=NO_LESSON").is_none(), "判无教训不许落库");
         assert!(parse_lesson("lesson=").is_none());
         assert!(parse_lesson("这条 SQL 用错了表").is_none(), "没有 lesson= 前缀一律不落");
-        // 过长 = 大概率是把错误原文整段复述回来了
-        assert!(parse_lesson(&format!("lesson={}", "x".repeat(201))).is_none());
-        assert!(parse_lesson(&format!("lesson={}", "x".repeat(200))).is_some());
+        // 过长 = 大概率是把错误原文整段复述回来了（字符数判据，与 prompt 的「≤80字」对齐）
+        assert!(parse_lesson(&format!("lesson={}", "x".repeat(81))).is_none());
+        assert!(parse_lesson(&format!("lesson={}", "x".repeat(80))).is_some());
+        // 80 个汉字合规：旧字节闸（>200）会把它误丢掉
+        assert!(parse_lesson(&format!("lesson={}", "汉".repeat(80))).is_some());
+        assert!(parse_lesson(&format!("lesson={}", "汉".repeat(81))).is_none());
+        // 模型多印一行前言不该整篇丢弃：取第一个 lesson= 前缀行
+        assert_eq!(
+            parse_lesson("我来分析一下。\nlesson=表t_x.列y是含税额").unwrap(),
+            "表t_x.列y是含税额"
+        );
     }
 
     /// 教训复核：默认 disabled（判不出就别放进后续所有 prompt）
@@ -293,6 +337,12 @@ mod tests {
         assert_eq!(parse_verdict("verdict=disabled"), "disabled");
         assert_eq!(parse_verdict("说不清"), "disabled", "判不出一律 disabled");
         assert_eq!(parse_verdict(""), "disabled");
+        // 否定语境：结论在最后（contains("verdict=enabled") 会在这里判反方向）
+        assert_eq!(
+            parse_verdict("不应判 verdict=enabled，应判 verdict=disabled"),
+            "disabled",
+            "否定语境不许判反方向"
+        );
     }
 
     /// 语料复核：默认 enabled，只有明确 NEGATIVE 才剔除（方向与教训相反，刻意的）
@@ -302,5 +352,10 @@ mod tests {
         assert_eq!(parse_opinion("opinion=negative"), "negative", "大小写不敏感");
         assert_eq!(parse_opinion("opinion=POSITIVE"), "positive");
         assert_eq!(parse_opinion("看不出问题"), "positive");
+        // 否定语境不许误剔：取值位是 POSITIVE，后面提到 NEGATIVE 只是行文
+        assert_eq!(parse_opinion("opinion=POSITIVE 而非 NEGATIVE"), "positive");
+        assert_eq!(parse_opinion("not NEGATIVE"), "positive", "没有 opinion= 取值不参与判定");
+        // 值以非 ASCII 开头不许 panic（`get(..8)` 守的就是这个）
+        assert_eq!(parse_opinion("opinion=无法判断"), "positive");
     }
 }

@@ -23,7 +23,9 @@ pub struct DsSpecRow {
 /// 【A8】数据源级查询策略 —— ds 配置 JSON 的可选字段。两个字段都缺省 = 不收紧：
 /// connector 的 `fetch` 在入口与调用方值取 min，缺省即与全局两档（200 行 / 30s）恒等；
 /// 配得比全局更松也不会放宽任何东西（min 语义由 `DsPolicy::clamp` 守着）。
+/// `deny_unknown_fields`：settings 里键名打错必须报错，不许静默按缺省生效。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DsPolicyConfig {
     /// 单次取数行上限（超出截断）。`0` 是合法的最紧档（恒空结果），不做下限校验。
     #[serde(default)]
@@ -43,9 +45,8 @@ impl DsPolicyConfig {
     }
 }
 
-const DS_COLS: &str = "ds_id, name, kind, dialect, dsn_ref, policy_kind, description, status";
-
-/// 8 列元组 → `DsSpecRow`（workspace 的 sqlx 没开 `derive` feature，故不 `#[derive(FromRow)]`）
+/// 8 列元组 → `DsSpecRow`（workspace 的 sqlx 没开 `derive` feature，故不 `#[derive(FromRow)]`）。
+/// 列清单由 `DS_LIST_SQL`/`DS_GET_SQL` 两处逐字同序，单测钉着一致性。
 type DsTuple = (String, String, String, String, String, String, String, String);
 
 fn ds_row(t: DsTuple) -> DsSpecRow {
@@ -70,40 +71,41 @@ pub const DMS_DS_ID: &str = "dms";
 /// 上传表格建出的数据源统一用这个 `dsn_ref`：指向**无 meta/kb/chat 权限**的 PG 只读角色（F3）。
 /// settings.json 里要有同名键，否则 `probe`/建池会在发起连接前就报「dsn_ref 未配置」。
 ///
-/// 消费者（三处，都在 server）：`kb_api.rs:137`（上传源的 `DsSpecRow.dsn_ref`）、
-/// 本文件 `register_upload_datasource`、`db.rs:95`（把 `pg_ro_url` 塞进 dsn 映射表）。
+/// 消费者（三处，都在 server）：`kb_api` 的上传源装配（`DsSpecRow.dsn_ref`）、
+/// 本文件 `register_upload_datasource`、`db` 的 dsn 映射装配（把 `pg_ro_url` 塞进映射表）。
 /// 原来这里挂着 `#[allow(dead_code)] // 消费者＝K4 的 tabular 落库`：K4 早落了，
 /// 而 `pub` 项在 lib crate 里本来就不触发 dead_code —— 那个 allow 是空操作 + 假注释
 /// （读的人会以为这东西还没人用）。
 pub const UPLOAD_DSN_REF: &str = "pg_ro_url";
 
+/// 列表/详情两条 SQL（列清单两处逐字同序，单测钉着一致性）。
+const DS_LIST_SQL: &str = "SELECT ds_id, name, kind, dialect, dsn_ref, policy_kind, description, status FROM meta.datasource ORDER BY ds_id";
+const DS_GET_SQL: &str = "SELECT ds_id, name, kind, dialect, dsn_ref, policy_kind, description, status FROM meta.datasource WHERE ds_id = $1";
+
 /// 全量列表（管理端用；`GET /api/ds` 必须再与 `visible_datasources` 取交集）
 pub async fn list_datasources(pg: &PgPool) -> anyhow::Result<Vec<DsSpecRow>> {
-    let rows: Vec<DsTuple> =
-        sqlx::query_as(&format!("SELECT {DS_COLS} FROM meta.datasource ORDER BY ds_id"))
-            .fetch_all(pg)
-            .await?;
+    let rows: Vec<DsTuple> = sqlx::query_as(DS_LIST_SQL).fetch_all(pg).await?;
     Ok(rows.into_iter().map(ds_row).collect())
 }
 
 pub async fn get_datasource(pg: &PgPool, ds_id: &str) -> anyhow::Result<Option<DsSpecRow>> {
-    let row: Option<DsTuple> =
-        sqlx::query_as(&format!("SELECT {DS_COLS} FROM meta.datasource WHERE ds_id = $1"))
-            .bind(ds_id)
-            .fetch_optional(pg)
-            .await?;
+    let row: Option<DsTuple> = sqlx::query_as(DS_GET_SQL)
+        .bind(ds_id)
+        .fetch_optional(pg)
+        .await?;
     Ok(row.map(ds_row))
 }
 
-/// 登记/更新。`description` 变了就清 embedding（等 K3-B 的 embed build 重建）——
-/// 否则选源会一直按旧描述命中。
+/// 登记/更新。向量文本配方是 `name || '。' || description`（embed_fill 的 select_sql），
+/// 任一变了就清 embedding（等 A9 自愈/embed build 重建）——否则选源会一直按旧文本命中。
 pub async fn upsert_datasource(pg: &PgPool, d: &DsSpecRow) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO meta.datasource(ds_id, name, kind, dialect, dsn_ref, policy_kind, description, status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
          ON CONFLICT (ds_id) DO UPDATE SET
            name=$2, kind=$3, dialect=$4, dsn_ref=$5, policy_kind=$6, description=$7, status=$8,
-           embedding = CASE WHEN meta.datasource.description = $7 THEN meta.datasource.embedding END",
+           embedding = CASE WHEN meta.datasource.name = $2 AND meta.datasource.description = $7
+                            THEN meta.datasource.embedding END",
     )
     .bind(&d.ds_id)
     .bind(&d.name)
@@ -119,12 +121,15 @@ pub async fn upsert_datasource(pg: &PgPool, d: &DsSpecRow) -> anyhow::Result<()>
 }
 
 /// 注销。ds 级授权一并删除（留着就是「重建同名 ds_id 时旧授权复活」的越权面）。
+/// 两条 DELETE 包一个事务：第二条失败不留 `kb.acl` 孤儿。
 pub async fn delete_datasource(pg: &PgPool, ds_id: &str) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM meta.datasource WHERE ds_id = $1").bind(ds_id).execute(pg).await?;
+    let mut tx = pg.begin().await?;
+    sqlx::query("DELETE FROM meta.datasource WHERE ds_id = $1").bind(ds_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM kb.acl WHERE scope = 'ds' AND target_id = $1")
         .bind(ds_id)
-        .execute(pg)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -149,6 +154,7 @@ pub async fn set_upload_datasource_active(
 /// 向量选源：按 description 的 embedding 取最近邻 `(ds_id, 余弦距离)`。
 /// 没有一行有 embedding（embed 服务缺席 / 还没跑过 build）→ 返回空，
 /// 调用方（`pipeline::select_source`）降级到主源。
+/// 🔴 本函数**不做可见性过滤**：结果须由调用方与 `visible_datasources` 取交集后才可用。
 pub async fn nearest_datasources(
     pg: &PgPool,
     qvec: &str,
@@ -160,7 +166,7 @@ pub async fn nearest_datasources(
          ORDER BY embedding <=> $1::vector LIMIT $2",
     )
     .bind(qvec)
-    .bind(k)
+    .bind(k.max(0)) // 负 k 会被 PG 拒，夹紧
     .fetch_all(pg)
     .await?)
 }
@@ -171,6 +177,9 @@ pub async fn nearest_datasources(
 /// 「必须是本函数一个调用」）。原来挂的 `#[allow(dead_code)] // 消费者＝K4 的 tabular 落库`
 /// 与上面 `UPLOAD_DSN_REF` 那个同一批，都是空操作＋假注释，已删（实测删掉后
 /// `-p dms-semantic` 一条警告都没冒）。
+/// 🔴 `ON CONFLICT` 强制 `status='active'` 是刻意的：重登记只发生在文档重新物化之后，
+/// 文档重新生效 ⇒ 源同步复活（停用态的收敛口在 `set_upload_datasource_active`，随文档
+/// 生命周期走，不在这里）。description/name 变了清 embedding（与 `upsert_datasource` 同判据）。
 pub async fn register_upload_datasource(
     pg: &PgPool,
     ds_id: &str,
@@ -180,7 +189,9 @@ pub async fn register_upload_datasource(
     sqlx::query(
         "INSERT INTO meta.datasource(ds_id, name, kind, dialect, dsn_ref, policy_kind, description)
          VALUES ($1,$2,'postgres','postgres',$3,'global',$4)
-         ON CONFLICT (ds_id) DO UPDATE SET name=$2, description=$4, status='active'",
+         ON CONFLICT (ds_id) DO UPDATE SET name=$2, description=$4, status='active',
+           embedding = CASE WHEN meta.datasource.name = $2 AND meta.datasource.description = $4
+                            THEN meta.datasource.embedding END",
     )
     .bind(ds_id)
     .bind(name)
@@ -313,5 +324,18 @@ mod tests {
         let c: DsPolicyConfig = serde_json::from_str(r#"{"timeout_ms":900}"#).unwrap();
         assert_eq!(c.max_rows, None);
         assert_eq!(c.to_ds_policy().clamp(global.0, global.1), (200, Duration::from_millis(900)));
+        // 键名打错必须报错（deny_unknown_fields），不许静默按缺省生效
+        assert!(serde_json::from_str::<DsPolicyConfig>(r#"{"max_row":50}"#).is_err());
+    }
+
+    /// 两条数据源 SQL 的列清单逐字一致（静态化后防两份拷贝漂移）。
+    #[test]
+    fn ds_sql_columns_match_ds_cols() {
+        fn cols_of(sql: &str) -> &str {
+            sql.strip_prefix("SELECT ")
+                .and_then(|rest| rest.split(" FROM ").next())
+                .expect("SELECT … FROM 形态")
+        }
+        assert_eq!(cols_of(DS_LIST_SQL), cols_of(DS_GET_SQL));
     }
 }

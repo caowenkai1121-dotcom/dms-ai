@@ -23,29 +23,27 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 
+use crate::admin_api::{err, ApiErr, ApiRes};
 use crate::AppState;
 
-type ApiErr = (StatusCode, Json<serde_json::Value>);
-type ApiRes = Result<Json<serde_json::Value>, ApiErr>;
-
-fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
-    (code, Json(serde_json::json!({ "error": msg.to_string() })))
-}
-
-const DB_CONNECT_GUIDANCE: &str =
+// 指引文案常量是设置面唯一口径：admin_api 的 persist_db_target 等路径也引用（防两处漂移）。
+pub(crate) const DB_CONNECT_GUIDANCE: &str =
     "数据库连接失败。请检查类型、地址、端口、数据库名、账号密码及只读权限后重试";
-const DB_SWITCH_GUIDANCE: &str =
+pub(crate) const DB_SWITCH_GUIDANCE: &str =
     "数据库切换未生效。请先测试连通性，并确认目标账号具备只读查询权限";
-const DB_SECRET_GUIDANCE: &str =
+pub(crate) const DB_SECRET_GUIDANCE: &str =
     "无法保留原数据库凭据，请重新填写账号和密码后重试";
-const LLM_CONNECT_GUIDANCE: &str =
+pub(crate) const LLM_CONNECT_GUIDANCE: &str =
     "模型连接失败。请检查 URL、模型名称、Key 及 OpenAI 兼容接口后重试";
-const LLM_CONFIG_GUIDANCE: &str =
+pub(crate) const LLM_CONFIG_GUIDANCE: &str =
     "模型配置未生效。请检查供应商、模型名称、Key、思考参数及多模态能力配置";
-const LLM_THINKING_GUIDANCE: &str =
+pub(crate) const LLM_THINKING_GUIDANCE: &str =
     "思考级别与该供应商不兼容，请改用“关”或选择供应商支持的档位";
-const SETTINGS_WRITE_GUIDANCE: &str =
+pub(crate) const SETTINGS_WRITE_GUIDANCE: &str =
     "配置保存失败。请检查正式 settings 文件是否可写，修正后重试";
+
+/// DMS 身份/权限连接池大小（热换与回滚同一口径）。
+const AUTH_POOL_SIZE: u32 = 5;
 
 /// 改文件 + 同步内存 cfg（本文件全部端点的共用落地）。
 /// `patch` 负责改 `serde_json::Value` 与 `Settings`（两个是同一个 JSON 的两种形态 ——
@@ -65,8 +63,10 @@ fn prepare_settings(
         serde_json::from_str(&raw).map_err(|_| "正式 settings 文件不是合法 JSON".to_string())?;
     patch(&mut v)?;
     // 完整校验：deny_unknown_fields + 类型全检 —— 写坏的文件不许落盘
+    // 借用反序列化做校验（与 from_value 同一拒绝口径），不深克隆整份 Value
     let checked: crate::db::Settings =
-        serde_json::from_value(v.clone()).map_err(|_| "配置字段校验失败（未落盘）".to_string())?;
+        <crate::db::Settings as serde::Deserialize>::deserialize(&v)
+            .map_err(|_| "配置字段校验失败（未落盘）".to_string())?;
     checked
         .validate_named_catalogs()
         .map_err(|_| "配置目录存在仅大小写不同的重复名称（未落盘）".to_string())?;
@@ -93,12 +93,13 @@ fn persist_settings(st: &AppState, prepared: &PreparedSettings) -> Result<(), St
     // 正式挂载文件原地单次写入；不生成任何含凭据的副本。
     if std::fs::write(&prepared.path, &prepared.out).is_err() {
         if std::fs::write(&prepared.path, &prepared.raw).is_err() {
-            tracing::error!(reason = "settings_file_restore_failed", "配置写入失败且正式文件原内容恢复失败");
+            tracing::error!(reason = "settings_file_restore_failed", path = %prepared.path, "配置写入失败且正式文件原内容恢复失败");
         }
         return Err("正式 settings 文件写入失败".to_string());
     }
-    // 内存热更新（校验过的那份 —— 与落盘内容逐字节同源）
-    *st.cfg.write().expect("cfg 锁中毒") = prepared.checked.clone();
+    // 内存热更新（校验过的那份 —— 与落盘内容逐字节同源）；
+    // 锁中毒不影响此处语义（整体覆盖写，不读中毒值），取回守卫继续写
+    *st.cfg.write().unwrap_or_else(std::sync::PoisonError::into_inner) = prepared.checked.clone();
     Ok(())
 }
 
@@ -111,14 +112,51 @@ fn patch_settings(
 }
 
 fn valid_name(name: &str) -> bool {
+    // 单遍同时计长与校验字符。
+    // `is_alphanumeric` 收 Unicode —— 中文也过！目标名要进 URL 与 kv，只收 ASCII
+    let mut len = 0usize;
     !name.is_empty()
-        && name.chars().count() <= 32
-        // `is_alphanumeric` 收 Unicode —— 中文也过！目标名要进 URL 与 kv，只收 ASCII
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && name.chars().all(|c| {
+            len += 1;
+            len <= 32 && (c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        })
 }
 
 fn matching_key<V>(map: &std::collections::HashMap<String, V>, name: &str) -> Option<String> {
     map.keys().find(|key| key.eq_ignore_ascii_case(name)).cloned()
+}
+
+/// key 形状闸：长度 8..4096 且不含控制字符（put_llm_key 与 put_llm_provider 同一口径）。
+fn valid_key(key: &str) -> bool {
+    key.len() >= 8 && key.len() <= 4096 && !key.chars().any(char::is_control)
+}
+
+/// 预设思考档 extra_body 的解析缓存：预设是编译期静态表，JSON 只解析一次，
+/// catalog / llm_config 按供应商逐个调用时不再重复 `serde_json::from_str`。
+/// 元素形态：（预设 base_url 去尾斜杠, 级别, 解析后的 extra_body）。
+fn preset_thinking_bodies(
+) -> &'static [(&'static str, &'static str, serde_json::Map<String, serde_json::Value>)] {
+    static CACHE: std::sync::OnceLock<
+        Vec<(&'static str, &'static str, serde_json::Map<String, serde_json::Value>)>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        crate::db::llm_presets()
+            .iter()
+            .flat_map(|(_, preset)| {
+                [
+                    ("off", preset.thinking_off),
+                    ("low", preset.thinking_low),
+                    ("high", preset.thinking_high),
+                ]
+                .into_iter()
+                .filter_map(|(level, raw)| {
+                    raw.and_then(|raw| serde_json::from_str(raw).ok())
+                        .map(|body| (preset.base_url.trim_end_matches('/'), level, body))
+                })
+                .collect::<Vec<_>>()
+            })
+            .collect()
+    })
 }
 
 pub(crate) fn configured_thinking_level(
@@ -128,22 +166,10 @@ pub(crate) fn configured_thinking_level(
     if extra.is_empty() {
         return "none";
     }
-    let preset = crate::db::llm_presets().iter().find(|(_, preset)| {
-        preset.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
-    });
-    if let Some((_, preset)) = preset {
-        for (level, raw) in [
-            ("off", preset.thinking_off),
-            ("low", preset.thinking_low),
-            ("high", preset.thinking_high),
-        ] {
-            if raw
-                .and_then(|value| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value).ok())
-                .as_ref()
-                == Some(extra)
-            {
-                return level;
-            }
+    let base_url = base_url.trim_end_matches('/');
+    for &(preset_url, level, ref body) in preset_thinking_bodies() {
+        if preset_url == base_url && body == extra {
+            return level;
         }
     }
     // 页面不懂的手写 extra_body 必须原样保留，不能在一次普通“修改”中静默清空。
@@ -168,8 +194,17 @@ fn commit_llm_settings(
     st: &AppState,
     patch: impl FnOnce(&mut serde_json::Value) -> Result<(), String>,
 ) -> Result<(), ApiErr> {
-    let prepared = prepare_settings(patch)
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, SETTINGS_WRITE_GUIDANCE))?;
+    let prepared = prepare_settings(patch).map_err(|e| {
+        // 请求内容导致的校验类失败是 400 且带具体原因；
+        // 文件读写/加解密/序列化等服务端故障仍是 500 笼统指引（细节不进响应）
+        let validation =
+            e.contains("校验失败") || e.contains("重复名称") || e.contains("kb_rrf_weights 无效");
+        if validation {
+            err(StatusCode::BAD_REQUEST, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, SETTINGS_WRITE_GUIDANCE)
+        }
+    })?;
     let configs = runtime_configs(st, &prepared.checked)
         .map_err(|_| err(StatusCode::BAD_REQUEST, LLM_CONFIG_GUIDANCE))?;
     crate::llm::validate_conf(&configs.0, false)
@@ -185,7 +220,9 @@ fn commit_llm_settings(
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, SETTINGS_WRITE_GUIDANCE))
 }
 
-/// GET/DELETE 的身份字段（`login_name`/`role_code` 从 query 给 —— DELETE 不带 body）
+/// GET/DELETE 的身份字段（`login_name`/`role_code` 从 query 给 —— DELETE 不带 body）。
+/// 注意：这两个字段只为与 POST 端点的签名对称而收，**校验只认 Bearer 会话 token** ——
+/// `settings_admin_only` 完全忽略它们（见 admin_api.rs），传与不传都不影响鉴权结果。
 #[derive(serde::Deserialize, Default)]
 pub struct IdentQuery {
     login_name: Option<String>,
@@ -269,7 +306,6 @@ pub async fn catalog(State(st): State<Arc<AppState>>, h: HeaderMap, Query(q): Qu
     // 自定义供应商（页面/手工加的）
     let primary_provider = st.llm.primary_provider();
     let fallback_provider = st.llm.fallback_vision_provider();
-    let file_provider_for_delete = crate::db::file_provider_name(&cfg);
     let mut custom: Vec<serde_json::Value> = cfg
         .llm_providers
         .iter()
@@ -283,7 +319,7 @@ pub async fn catalog(State(st): State<Arc<AppState>>, h: HeaderMap, Query(q): Qu
                 || fallback_used
                 // 纯自定义文件供应商删掉目录项后仍会由旧式 llm_* 字段“复活”，所以受保护；
                 // 内建同名条目只是覆盖层，删除后由文件值/内建预设接管，允许恢复。
-                || (file_provider_for_delete.eq_ignore_ascii_case(n) && !builtin);
+                || (file_provider.eq_ignore_ascii_case(n) && !builtin);
             serde_json::json!({
                 "name": n, "base_url": crate::db::public_service_url(&c.base_url),
                 "model_fast": c.model_fast, "model_precise": c.model_precise,
@@ -295,7 +331,8 @@ pub async fn catalog(State(st): State<Arc<AppState>>, h: HeaderMap, Query(q): Qu
             })
         })
         .collect();
-    custom.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    // 与 candidate_names 同一口径按小写排序：两个列表的排序规则保持一致
+    custom.sort_by_key(|v| v["name"].as_str().unwrap_or_default().to_ascii_lowercase());
     let mut candidate_names: Vec<String> = crate::db::provider_catalog()
         .iter()
         .map(|(name, _)| (*name).to_string())
@@ -415,6 +452,9 @@ pub async fn put_mysql_target(
 ) -> ApiRes {
     crate::admin_api::settings_admin_only(&st, &h, (&req.login_name, &req.role_code)).await?;
     let _settings_write = st.settings_write.lock().await;
+    // 整函数复用同一份快照（写锁已挡住其他 settings 写端点的并发变更），
+    // 不为读几个字段反复克隆整份 Settings（含解密后的明文 DSN/key）
+    let cfg = st.cfg();
     let requested_name = req.name.trim().to_string();
     if !valid_name(&requested_name) {
         return Err(err(StatusCode::BAD_REQUEST, "名字只能含 ASCII 字母数字._-（≤32）"));
@@ -422,7 +462,7 @@ pub async fn put_mysql_target(
     let name = if requested_name.eq_ignore_ascii_case("dms") {
         "dms".to_string()
     } else {
-        matching_key(&st.cfg().mysql_targets, &requested_name).unwrap_or(requested_name)
+        matching_key(&cfg.mysql_targets, &requested_name).unwrap_or(requested_name)
     };
     let mut dsn = req.dsn.trim().to_string();
     // 形状闸；保存前统一做一次只读连通性验证，避免目录出现不可用目标。
@@ -433,12 +473,12 @@ pub async fn put_mysql_target(
         return Err(err(StatusCode::BAD_REQUEST, "DSN 形状不对（需要 用户:口令@主机:端口/库名）"));
     }
     if name.eq_ignore_ascii_case("dms") {
-        let old_dsn = st.cfg().mysql_url;
+        let old_dsn = cfg.mysql_url.clone();
         if req.keep_secret {
             dsn = splice_userinfo(&dsn, &old_dsn)
                 .map_err(|_| err(StatusCode::BAD_REQUEST, DB_SECRET_GUIDANCE))?;
         }
-        if st.cfg().mysql_targets.iter().any(|(target_name, target)| {
+        if cfg.mysql_targets.iter().any(|(target_name, target)| {
             !target_name.eq_ignore_ascii_case("dms")
                 && crate::db::same_db_endpoint(&dsn, target.url())
                 && !target.is_explicit_production_lookup()
@@ -483,7 +523,7 @@ pub async fn put_mysql_target(
         st.auth_mysql
             .swap_pool(
                 &dsn,
-                5,
+                AUTH_POOL_SIZE,
                 dms_connector::mysql::MysqlCapability::IdentityPermission,
             )
             .await
@@ -499,7 +539,7 @@ pub async fn put_mysql_target(
                 .auth_mysql
                 .swap_pool(
                     &old_dsn,
-                    5,
+                    AUTH_POOL_SIZE,
                     dms_connector::mysql::MysqlCapability::IdentityPermission,
                 )
                 .await
@@ -517,14 +557,17 @@ pub async fn put_mysql_target(
         })));
     }
     if req.keep_secret {
-        let Some((_, old)) = crate::db::db_targets(&st.cfg()).into_iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)) else {
+        // 直查 mysql_targets 而不是 db_targets 过滤目录：后者会过滤「与 DMS 同端点但非显式
+        // production_lookup」的目标（db.rs:725-731），那些目标会被误报「不存在」。
+        // 内存态 cfg 已是解密后的明文（D1 红线不变 —— 明文不出服务端）。
+        let Some((_, old_target)) = cfg.mysql_targets.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)) else {
             return Err(err(StatusCode::BAD_REQUEST, format!("目标 {name} 不存在，密码留空保留不了")));
         };
-        dsn = splice_userinfo(&dsn, &old)
+        dsn = splice_userinfo(&dsn, old_target.url())
             .map_err(|_| err(StatusCode::BAD_REQUEST, DB_SECRET_GUIDANCE))?;
     }
     let capability = capability_from_type(&req.r#type)?;
-    if crate::db::same_db_endpoint(&dsn, &st.cfg().mysql_url)
+    if crate::db::same_db_endpoint(&dsn, &cfg.mysql_url)
         && capability != dms_connector::mysql::MysqlCapability::ProductionLookup
     {
         return Err(err(
@@ -536,13 +579,15 @@ pub async fn put_mysql_target(
         .await
         .map_err(|_| err(StatusCode::BAD_REQUEST, DB_CONNECT_GUIDANCE))?;
     let hot = st.mysql.target_name().eq_ignore_ascii_case(&name);
-    let old_hot_url = hot.then(|| {
-        crate::db::db_targets(&st.cfg())
+    let old_hot_url = if hot {
+        crate::db::db_targets(&cfg)
             .into_iter()
             .find(|(target, _)| target.eq_ignore_ascii_case(&name))
             .map(|(_, url)| url)
-    }).flatten();
-    let old_hot_capability = crate::db::db_target_capability(&st.cfg(), &name);
+    } else {
+        None
+    };
+    let old_hot_capability = crate::db::db_target_capability(&cfg, &name);
     if hot {
         crate::admin_api::persist_db_target(&st, &name, &dsn, capability).await?;
     }
@@ -602,7 +647,7 @@ pub async fn del_mysql_target(
             "当前生效数据库不能删除，请先切换到其他目标",
         ));
     }
-    if patch_settings(&st, |v| {
+    if let Err(e) = patch_settings(&st, |v| {
         let obj = v.as_object_mut().ok_or("settings.json 顶层不是对象")?;
         let Some(t) = obj.get_mut("mysql_targets").and_then(|t| t.as_object_mut()) else {
             return Err("settings.json 里没有 mysql_targets".into());
@@ -611,8 +656,12 @@ pub async fn del_mysql_target(
             return Err(format!("目标 {name} 不存在"));
         }
         Ok(())
-    })
-    .is_err() {
+    }) {
+        // 读写之间目标消失（文件被手工改过）：给 400 + 具体原因；
+        // 其他落盘故障仍是 500 笼统指引
+        if e.contains("不存在") {
+            return Err(err(StatusCode::BAD_REQUEST, e));
+        }
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, SETTINGS_WRITE_GUIDANCE));
     }
     tracing::info!(target = %name, "分析目标已删除");
@@ -636,14 +685,14 @@ pub async fn put_llm_key(
     let requested_name = req.name.trim().to_string();
     let key = req.key.trim().to_string();
     if !valid_name(&requested_name) {
-        return Err(err(StatusCode::BAD_REQUEST, "供应商名只能含字母数字._-（≤32）"));
+        return Err(err(StatusCode::BAD_REQUEST, "供应商名只能含 ASCII 字母数字._-（≤32）"));
     }
-    if key.len() < 8 || key.len() > 4096 || key.chars().any(char::is_control) {
+    if !valid_key(&key) {
         return Err(err(StatusCode::BAD_REQUEST, "key 格式不合法（长度需为 8..4096 且不能含控制字符）"));
     }
-    let next = st.cfg();
-    let name = matching_key(&next.llm_keys, &requested_name)
-        .or_else(|| matching_key(&next.llm_providers, &requested_name))
+    let current_cfg = st.cfg();
+    let name = matching_key(&current_cfg.llm_keys, &requested_name)
+        .or_else(|| matching_key(&current_cfg.llm_providers, &requested_name))
         .or_else(|| crate::db::provider_catalog().iter()
             .find(|(provider, _)| (*provider).eq_ignore_ascii_case(&requested_name))
             .map(|(provider, _)| (*provider).to_string()))
@@ -683,16 +732,16 @@ pub async fn del_llm_key(
             "备用多模态模型正在使用该 Key，请先清除或切换备用模型",
         ));
     }
-    let next = st.cfg();
-    if crate::db::file_provider_name(&next).eq_ignore_ascii_case(&name)
-        && !next.llm_api_key.is_empty()
+    let current_cfg = st.cfg();
+    if crate::db::file_provider_name(&current_cfg).eq_ignore_ascii_case(&name)
+        && !current_cfg.llm_api_key.is_empty()
     {
         return Err(err(
             StatusCode::CONFLICT,
             "该供应商仍由旧式 llm_api_key 提供凭据，不能单独删除；请先迁移基础配置",
         ));
     }
-    let name = matching_key(&next.llm_keys, &name)
+    let name = matching_key(&current_cfg.llm_keys, &name)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("key {name} 不存在")))?;
     commit_llm_settings(&st, |v| {
         let obj = v.as_object_mut().ok_or("settings.json 顶层不是对象")?;
@@ -731,12 +780,14 @@ pub async fn test_db(
 ) -> ApiRes {
     crate::admin_api::settings_admin_only(&st, &h, (&req.login_name, &req.role_code)).await?;
     let mut dsn = req.dsn.trim().to_string();
+    let name = req.name.trim();
     if req.keep_secret {
-        let name = req.name.trim();
+        // keep_secret 两次读取共用一份快照，不各克隆整份 Settings
+        let cfg = st.cfg();
         let old = if name.eq_ignore_ascii_case("dms") {
-            Some(st.cfg().mysql_url)
+            Some(cfg.mysql_url.clone())
         } else {
-            crate::db::db_targets(&st.cfg())
+            crate::db::db_targets(&cfg)
                 .into_iter()
                 .find(|(target, _)| target.eq_ignore_ascii_case(name))
                 .map(|(_, url)| url)
@@ -745,8 +796,15 @@ pub async fn test_db(
         dsn = splice_userinfo(&dsn, &old)
             .map_err(|_| err(StatusCode::BAD_REQUEST, DB_SECRET_GUIDANCE))?;
     }
-    let capability = if req.name.trim().eq_ignore_ascii_case("dms") {
+    let capability = if name.eq_ignore_ascii_case("dms") {
         dms_connector::mysql::MysqlCapability::IdentityPermission
+    } else if req.r#type.trim().is_empty() {
+        // type 留空且目标已配置：回落到该目标当前的能力类型（页面编辑已有目标不用重复选类型）；
+        // 目标未配置则仍走类型闸，报「能力类型只允许…」
+        match st.cfg().mysql_targets.iter().find(|(target_name, _)| target_name.eq_ignore_ascii_case(name)) {
+            Some((_, target)) => target.capability(),
+            None => capability_from_type(&req.r#type)?,
+        }
     } else {
         capability_from_type(&req.r#type)?
     };
@@ -787,9 +845,16 @@ pub async fn test_llm(
     if req.base_url.trim().is_empty() || model.is_empty() || req.key.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "base_url / model / key 都要填"));
     }
+    let base_url = req.base_url.trim().trim_end_matches('/').to_string();
+    // 与 put_llm_provider 同一道出站闸：非 http(s)、带 userinfo/query 的地址不许探 ——
+    // test_llm 同为 admin 触发的出站请求，信任面保持一致
+    let public_url = crate::db::public_service_url(&base_url);
+    if public_url != base_url || !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err(err(StatusCode::BAD_REQUEST, "base_url 必须 http(s) 开头"));
+    }
     let conf = crate::llm::Conf {
         provider: "probe".into(),
-        base_url: req.base_url.trim().trim_end_matches('/').to_string(),
+        base_url,
         api_key: req.key.trim().to_string(),
         model_fast: model.clone(),
         model_precise: model.clone(),
@@ -822,7 +887,9 @@ pub struct LlmProviderUpsertReq {
     model_fast: Option<String>,
     model_precise: Option<String>,
     /// 思考级别：off | low | high | none（原样 extra_body 不在这里 —— 级别才是人能懂的形态，
-    /// raw JSON 是「高级」，页面只发级别；要 raw 走手写文件）
+    /// raw JSON 是「高级」，页面只发级别；要 raw 走手写文件）。
+    /// **缺省 = "off"**：页面外的客户端漏传会把已配置思考档静默重置为关；
+    /// 要保留现状必须显式传 "keep"。
     thinking: Option<String>,
     /// 多模态模型名（空 = 无视觉能力）
     vision: Option<String>,
@@ -910,9 +977,12 @@ pub async fn put_llm_provider(
     if mf.is_empty() && mp.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "model_fast / model_precise 至少填一个"));
     }
+    // 落盘归一化：只填 precise 时 fast 回填同一模型 —— 下面的形状校验本就按回填口径过，
+    // 存空串会让 catalog 显示空、llm_config 再回填一次，两端表示不一致
+    let mf = if mf.is_empty() { mp.clone() } else { mf };
     let vision = req.vision.clone().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let key = req.key.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-    if key.as_ref().is_some_and(|key| key.len() < 8 || key.len() > 4096 || key.chars().any(char::is_control)) {
+    if key.as_ref().is_some_and(|key| !valid_key(key)) {
         return Err(err(StatusCode::BAD_REQUEST, "key 格式不合法（长度需为 8..4096 且不能含控制字符）"));
     }
     let provider = crate::db::CustomProvider {
@@ -989,8 +1059,8 @@ pub async fn del_llm_provider(
             "该供应商正在作为备用多模态模型，请先清除或切换备用模型",
         ));
     }
-    let next = st.cfg();
-    let Some(name) = matching_key(&next.llm_providers, &name) else {
+    let current_cfg = st.cfg();
+    let Some(name) = matching_key(&current_cfg.llm_providers, &name) else {
         if crate::db::provider_catalog()
             .iter()
             .any(|(provider, _)| provider.eq_ignore_ascii_case(&name))
@@ -1002,15 +1072,18 @@ pub async fn del_llm_provider(
     let restores_builtin = crate::db::provider_catalog()
         .iter()
         .any(|(provider, _)| provider.eq_ignore_ascii_case(&name));
-    if crate::db::file_provider_name(&next).eq_ignore_ascii_case(&name) && !restores_builtin {
+    if crate::db::file_provider_name(&current_cfg).eq_ignore_ascii_case(&name) && !restores_builtin {
         return Err(err(
             StatusCode::CONFLICT,
             "该供应商仍是 settings 文件的基础供应商，不能从目录删除；请先迁移基础配置",
         ));
     }
-    let related_key = (!restores_builtin)
-        .then(|| matching_key(&next.llm_keys, &name))
-        .flatten();
+    // 内建覆盖删除只还原预设，可复用的 key 留着；纯自定义删除才清理孤立 key
+    let related_key = if restores_builtin {
+        None
+    } else {
+        matching_key(&current_cfg.llm_keys, &name)
+    };
     commit_llm_settings(&st, |v| {
         let obj = v.as_object_mut().ok_or("settings.json 顶层不是对象")?;
         let removed = obj
@@ -1061,6 +1134,28 @@ pub async fn set_fallback_vision(
                 .map(|(provider, _)| (*provider).to_string()))
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, "备用多模态供应商不存在"))?
     };
+    if !provider.is_empty() {
+        // 提交前预检：备用多模态必须有视觉能力且 key 就绪（与 catalog 的 vision_candidates
+        // 同一口径 —— 自定义同名条目完整覆盖内建能力，`vision: null` 是明确关闭）。
+        // 不预检的话失败会延迟到 commit 里变成笼统的 LLM_CONFIG_GUIDANCE。
+        let vision = match current_cfg
+            .llm_providers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&provider))
+        {
+            Some((_, custom)) => custom.vision.clone(),
+            None => crate::db::provider_catalog()
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&provider))
+                .and_then(|(_, p)| p.vision.map(str::to_string)),
+        };
+        if vision.is_none() || !crate::db::provider_key_ready(&current_cfg, &provider) {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "该供应商未配置多模态能力或 Key，不能作为备用多模态模型",
+            ));
+        }
+    }
     commit_llm_settings(&st, |v| {
         let obj = v.as_object_mut().ok_or("settings.json 顶层不是对象")?;
         if provider.is_empty() {
@@ -1101,7 +1196,8 @@ pub struct KbRrfWeightsReq {
 /// .route("/api/admin/settings/kb-rrf-weights", post(settings_api::put_kb_rrf_weights))
 /// ```
 /// - body：`{"metadata":0.2,"relation":0.25,"kg":0.3,"ext_kb":0.2}`（四路均可缺省，
-///   缺省的路保留现值）+ 身份字段（login_name/role_code 或会话 token，同其他 settings 端点）。
+///   缺省的路保留现值；四路全缺省 = 只回报现值，不落盘不热更）
+///   + 身份字段（login_name/role_code 或会话 token，同其他 settings 端点）。
 /// - 200 `{"ok":true,"kb_rrf_weights":{...四路生效值...},"hot":true}`：
 ///   落盘 + `st.cfg()` 热更新，检索/问答链下次请求即取新快照。
 /// - 400：任一路为负（`RrfWeights::validate`，与启动加载同一拒绝口径）；
@@ -1114,7 +1210,28 @@ pub async fn put_kb_rrf_weights(
 ) -> ApiRes {
     crate::admin_api::settings_admin_only(&st, &h, (&req.login_name, &req.role_code)).await?;
     let _settings_write = st.settings_write.lock().await;
-    let current = st.cfg().kb_rrf_weights;
+    // 只读 4 个权重：读锁内 Copy 出来（RrfWeights 是 Copy），不克隆整份 Settings
+    let current = st
+        .cfg
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .kb_rrf_weights;
+    // 四路全 None = 只想读现值：直接按现值回报成功，跳过无操作的文件写与热更
+    if [&req.metadata, &req.relation, &req.kg, &req.ext_kb]
+        .iter()
+        .all(|v| v.is_none())
+    {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "kb_rrf_weights": {
+                "metadata": current.metadata,
+                "relation": current.relation,
+                "kg": current.kg,
+                "ext_kb": current.ext_kb,
+            },
+            "hot": true,
+        })));
+    }
     let next = dms_knowledge::retrieve::RrfWeights {
         metadata: req.metadata.unwrap_or(current.metadata),
         relation: req.relation.unwrap_or(current.relation),
@@ -1140,7 +1257,7 @@ pub async fn put_kb_rrf_weights(
         Ok(())
     })
     .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, SETTINGS_WRITE_GUIDANCE))?;
-    tracing::info!(kg = next.kg, ext_kb = next.ext_kb, "RRF 召回权重已热更新");
+    tracing::info!(metadata = next.metadata, relation = next.relation, kg = next.kg, ext_kb = next.ext_kb, "RRF 召回权重已热更新");
     Ok(Json(serde_json::json!({
         "ok": true,
         "kb_rrf_weights": {
@@ -1161,14 +1278,16 @@ mod tests {
         let src = include_str!("settings_api.rs");
         let body = src.split("struct PreparedSettings").nth(1).expect("配置准备/持久化链不见了");
         let body = body.split("\nfn valid_name").next().unwrap();
-        assert!(body.contains("serde_json::from_value(v.clone())"), "回读校验没了：{body}");
+        assert!(body.contains("Settings as serde::Deserialize>::deserialize(&v)"), "回读校验没了：{body}");
         assert!(body.contains("std::fs::write(&prepared.path, &prepared.out)"), "必须原地写（rename 会写到容器层）：{body}");
         // 锚点拆开拼，避免判据自己成为命中项。
         assert!(!body.contains(concat!("re", "name(")), "bind mount 单文件挂载点不许 rename：{body}");
         assert!(!body.contains(concat!(".", "bak")), "不许生成第二份明文配置：{body}");
         assert!(!body.contains(concat!("std::fs::", "copy")), "不许复制含凭据的配置：{body}");
         assert!(body.contains("st.cfg.write()"), "内存热更新没了：{body}");
+        assert!(body.contains("unwrap_or_else(std::sync::PoisonError::into_inner)"), "cfg 锁中毒不该 panic 请求任务（整体覆盖写）：{body}");
         assert!(body.contains("std::fs::write(&prepared.path, &prepared.raw)"), "写失败没有在同一正式文件恢复旧内容：{body}");
+        assert!(body.contains("path = %prepared.path"), "恢复失败日志必须带文件路径：{body}");
         // 内存进的是校验过的那份（与落盘同源），不是 patch 前的旧 cfg
         let write = body.find("st.cfg.write()").unwrap();
         let check = body.find("let checked").unwrap();
@@ -1266,17 +1385,17 @@ mod tests {
         let src = include_str!("settings_api.rs");
         let body = src.split("pub async fn del_llm_provider").nth(1).expect("del_llm_provider 没了");
         let body = body.split("\npub async fn ").next().unwrap_or(body);
-        let custom_lookup = body.find("matching_key(&next.llm_providers, &name)").expect("删除前未区分自定义覆盖项");
+        let custom_lookup = body.find("matching_key(&current_cfg.llm_providers, &name)").expect("删除前未区分自定义覆盖项");
         let builtin_guard = body.find("内建供应商受保护，不能删除").expect("内建预设本体没有删除保护");
         let restore = body.find("let restores_builtin =").expect("同名覆盖删除后没有恢复内建预设");
         let mutation = body.find(".get_mut(\"llm_providers\")").expect("自定义删除动作不见了");
         assert!(custom_lookup < builtin_guard && builtin_guard < restore && restore < mutation, "删除分支顺序不对：{body}");
         assert!(
-            body.contains("file_provider_name(&next).eq_ignore_ascii_case(&name) && !restores_builtin"),
+            body.contains("file_provider_name(&current_cfg).eq_ignore_ascii_case(&name) && !restores_builtin"),
             "纯自定义文件供应商要保护，但内建同名覆盖必须允许删除：{body}",
         );
         assert!(body.contains(".and_then(|t| t.remove(&name))"), "没有真正移除自定义覆盖项：{body}");
-        assert!(body.contains("let related_key = (!restores_builtin)"), "内建覆盖删除不应清理可复用 key：{body}");
+        assert!(body.contains("let related_key = if restores_builtin"), "内建覆盖删除不应清理可复用 key：{body}");
         assert!(body.contains("keys.remove(key)"), "纯自定义删除后应清理孤立 key：{body}");
         assert!(body.contains("\"restored_builtin\": restores_builtin"), "响应没有说明是否恢复内建预设：{body}");
     }
@@ -1355,7 +1474,7 @@ mod tests {
             .split("\n/// `DELETE /api/admin/settings/mysql-target")
             .next()
             .unwrap();
-        assert!(body.contains("same_db_endpoint(&dsn, &st.cfg().mysql_url)"));
+        assert!(body.contains("same_db_endpoint(&dsn, &cfg.mysql_url)"));
         assert!(body.contains("capability != dms_connector::mysql::MysqlCapability::ProductionLookup"));
         assert!(body.contains("target_type_name(capability)"), "保存后没有固化能力类型：{body}");
     }
@@ -1467,5 +1586,195 @@ mod tests {
             assert!(p.vision.is_some(), "{want} 应有视觉模型名");
         }
         assert!(ps.iter().find(|(n, _)| *n == "deepseek").unwrap().1.vision.is_none(), "DeepSeek 无视觉");
+    }
+
+    /// key 形状闸（纯函数）：长度 8..4096 且不含控制字符。
+    #[test]
+    fn key_gate() {
+        assert!(super::valid_key(&"k".repeat(8)));
+        assert!(super::valid_key(&"k".repeat(4096)));
+        assert!(!super::valid_key(""));
+        assert!(!super::valid_key(&"k".repeat(7)));
+        assert!(!super::valid_key(&"k".repeat(4097)));
+        assert!(!super::valid_key("abc12345\n"));
+    }
+
+    /// 思考级别识别（纯函数，走预设缓存）：已知厂商命中档位（尾斜杠差异不影响），
+    /// 手写未知 extra_body 标 keep，空 extra 是 none。
+    #[test]
+    fn configured_thinking_level_matches_cached_presets() {
+        let qwen = &crate::db::llm_presets().iter().find(|(n, _)| *n == "qwen").unwrap().1;
+        let off: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(qwen.thinking_off.unwrap()).unwrap();
+        assert_eq!(super::configured_thinking_level(qwen.base_url, &off), "off");
+        let with_slash = format!("{}/", qwen.base_url);
+        assert_eq!(super::configured_thinking_level(&with_slash, &off), "off");
+        let high: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(qwen.thinking_high.unwrap()).unwrap();
+        assert_eq!(super::configured_thinking_level(qwen.base_url, &high), "high");
+        let mut handwritten = serde_json::Map::new();
+        handwritten.insert("custom_flag".into(), serde_json::json!(true));
+        assert_eq!(super::configured_thinking_level(qwen.base_url, &handwritten), "keep");
+        assert_eq!(super::configured_thinking_level(qwen.base_url, &serde_json::Map::new()), "none");
+    }
+
+    /// put_mysql_target 全程只快照一次 cfg（读多个字段不再反复克隆整份 Settings）；
+    /// auth 池大小走常量；keep_secret 直查 mysql_targets（db_targets 的过滤目录会误报不存在）。
+    #[test]
+    fn put_mysql_target_snapshots_cfg_once_and_looks_up_secret_directly() {
+        let src = include_str!("settings_api.rs");
+        let body = src
+            .split("pub async fn put_mysql_target(")
+            .nth(1)
+            .expect("put_mysql_target 没了")
+            .split("\n/// `DELETE /api/admin/settings/mysql-target")
+            .next()
+            .unwrap();
+        assert_eq!(body.matches("st.cfg()").count(), 1, "cfg 快照应只取一次：{body}");
+        assert_eq!(body.matches("AUTH_POOL_SIZE").count(), 2, "auth 池大小热换/回滚应共用常量：{body}");
+        // 第二个 keep_secret 分支是非 dms 目标的凭据保留
+        let non_dms = body
+            .split("if req.keep_secret {")
+            .nth(2)
+            .expect("非 dms 分支 keep_secret 没了");
+        let lookup = non_dms.split("splice_userinfo").next().unwrap();
+        assert!(lookup.contains("cfg.mysql_targets.iter().find"), "keep_secret 应直查 mysql_targets：{lookup}");
+        // 锚点拆开拼，避免命中实现注释里的函数名。
+        assert!(!lookup.contains(concat!("db_", "targets(")), "keep_secret 走过滤目录会误报目标不存在：{lookup}");
+    }
+
+    /// 删除目标的 patch 失败按内容分派：读写之间目标消失是 400 + 具体原因，落盘故障仍是 500。
+    #[test]
+    fn del_mysql_target_maps_patch_errors_by_content() {
+        let src = include_str!("settings_api.rs");
+        let body = src
+            .split("pub async fn del_mysql_target(")
+            .nth(1)
+            .expect("del_mysql_target 没了")
+            .split("\n#[derive(serde::Deserialize)]")
+            .next()
+            .unwrap();
+        assert!(body.contains("if let Err(e) = patch_settings(&st"), "删除端点吞掉了 patch 具体错误：{body}");
+        assert!(body.contains("StatusCode::BAD_REQUEST, e"), "目标消失应给 400 + 具体原因：{body}");
+        assert!(body.contains("SETTINGS_WRITE_GUIDANCE"), "落盘故障仍是 500 笼统指引：{body}");
+    }
+
+    /// LLM 统一提交链：校验类失败（字段校验/重复名/RRF 权重）透传 400 + 原文案，服务端故障仍是 500。
+    #[test]
+    fn llm_commit_maps_validation_errors_to_400() {
+        let src = include_str!("settings_api.rs");
+        let body = src
+            .split("fn commit_llm_settings(")
+            .nth(1)
+            .expect("统一 LLM 设置提交函数不见了")
+            .split("\n/// GET/DELETE")
+            .next()
+            .unwrap();
+        assert!(body.contains("StatusCode::BAD_REQUEST, e"), "校验类失败必须透传 400 + 原文案：{body}");
+        assert!(body.contains("校验失败"), "校验类判据丢了字段校验：{body}");
+        assert!(
+            body.contains("StatusCode::INTERNAL_SERVER_ERROR, SETTINGS_WRITE_GUIDANCE"),
+            "服务端故障仍是 500 笼统指引：{body}"
+        );
+    }
+
+    /// test_db 的 type 留空且目标已配置时回落到已配置能力；未配置目标仍走类型闸。
+    #[test]
+    fn test_db_empty_type_falls_back_to_configured_capability() {
+        let src = include_str!("settings_api.rs");
+        let body = src
+            .split("pub async fn test_db(")
+            .nth(1)
+            .expect("test_db 没了")
+            .split("\n#[derive(serde::Deserialize)]")
+            .next()
+            .unwrap();
+        let fallback = body
+            .find("req.r#type.trim().is_empty()")
+            .expect("type 留空回落分支没了");
+        let typed = body
+            .find("capability_from_type(&req.r#type)?")
+            .expect("类型闸没了");
+        assert!(fallback < typed, "留空回落必须优先于类型闸：{body}");
+        assert!(body.contains("target.capability()"), "没有回落到已配置能力：{body}");
+    }
+
+    /// test_llm 与 put_llm_provider 同一道出站闸：非 http(s)/带 userinfo 的地址不许探。
+    #[test]
+    fn test_llm_shares_the_provider_url_gate() {
+        let src = include_str!("settings_api.rs");
+        let body = src
+            .split("pub async fn test_llm(")
+            .nth(1)
+            .expect("test_llm 没了")
+            .split("\n// ─")
+            .next()
+            .unwrap();
+        let gate = body
+            .find("public_service_url(&base_url)")
+            .expect("test_llm 缺出站地址闸");
+        let probe = body.find("chat_with_usage").expect("探针调用不见了");
+        assert!(gate < probe, "地址闸必须先于出站请求：{body}");
+    }
+
+    /// 供应商落盘归一化：只填 model_precise 时 model_fast 回填同值（catalog 与 llm_config 两端一致）。
+    #[test]
+    fn llm_provider_persist_normalizes_empty_fast_model() {
+        let src = include_str!("settings_api.rs");
+        let body = src
+            .split("pub async fn put_llm_provider(")
+            .nth(1)
+            .expect("put_llm_provider 没了")
+            .split("\n/// `DELETE /api/admin/settings/llm-provider")
+            .next()
+            .unwrap();
+        assert!(body.contains("if mf.is_empty() && mp.is_empty()"), "双空校验没了：{body}");
+        let normalize = body
+            .find("let mf = if mf.is_empty() { mp.clone() } else { mf };")
+            .expect("model_fast 落盘归一化没了");
+        let persist = body
+            .find("commit_llm_settings(&st")
+            .expect("供应商保存没有走统一提交");
+        assert!(normalize < persist, "必须先归一化再落盘：{body}");
+        assert!(body.contains("!valid_key(key)"), "key 形状闸应共用 valid_key：{body}");
+    }
+
+    /// 备用多模态提交前预检视觉能力与 key 就绪，精确 400 而不是笼统的 commit 失败。
+    #[test]
+    fn fallback_vision_prechecks_capability_and_key() {
+        let src = include_str!("settings_api.rs");
+        let body = src
+            .split("pub async fn set_fallback_vision(")
+            .nth(1)
+            .expect("set_fallback_vision 没了")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap();
+        let candidate = body.find("let provider =").expect("备用供应商候选没生成");
+        let precheck = body
+            .find("provider_key_ready(&current_cfg, &provider)")
+            .expect("备用多模态缺 key 就绪/视觉能力预检");
+        let commit = body.find("commit_llm_settings(&st").expect("没有统一热提交");
+        assert!(candidate < precheck && precheck < commit, "预检必须在候选之后、提交之前：{body}");
+        assert!(body.contains("StatusCode::BAD_REQUEST"), "预检失败必须 400：{body}");
+    }
+
+    /// 四路全 None 的 RRF 请求只回报现值，不做无操作的落盘与热更；读现值不克隆整份 Settings。
+    #[test]
+    fn kb_rrf_weights_all_none_short_circuits_before_persist() {
+        let src = include_str!("settings_api.rs");
+        let body = src
+            .split("pub async fn put_kb_rrf_weights(")
+            .nth(1)
+            .expect("put_kb_rrf_weights 没了")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap();
+        let short_circuit = body
+            .find(".all(|v| v.is_none())")
+            .expect("四路全 None 短路没了");
+        let write = body.find("patch_settings(&st").expect("权重端点没有走统一落盘链");
+        assert!(short_circuit < write, "全 None 短路必须在落盘之前：{body}");
+        assert!(!body.contains("st.cfg().kb_rrf_weights"), "读 4 个权重不该克隆整份 Settings：{body}");
     }
 }

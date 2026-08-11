@@ -22,7 +22,8 @@
 //! `entities_of_chunks` / `entities_named_like` / `relation_edges_touching` /
 //! `mentioned_chunks` / `mention_pairs` / `space_has_chunks`，全部沿用同一条 doc 内联纪律。
 //! 唯一的例外是 `entities_named_like` 的问句：它走外层 SQL 的**绑定参数**（`$1`/`$2`），
-//! 一个字节都不进字符串拼接 —— 比 esc 内联更硬，也是本文件第一个带 bind 的查询。
+//! 一个字节都不进字符串拼接 —— 比 esc 内联更硬，也是本文件第一个把**用户输入**走 bind
+//! 的查询（`labels_ready` 的图名/标签 bind 得更早，但那些是代码内常量）。
 //!
 //! 邻居展开读侧（前端双击/按钮拉下一跳子图）：`neighborhood`，同样 doc 内联；
 //! 零可见提及的对端实体 weight=0 也返回，防前端悬空边。
@@ -38,7 +39,8 @@ use sqlx::{PgPool, Row};
 /// 与 `dms_graph`（销售关系图）物理隔离：两张图的重建/清库互不影响。
 const GRAPH: &str = "kb_graph";
 
-/// 子图返回规模的硬上限（双保险；HTTP 侧另有 500 的钳制）。
+/// 子图返回规模的硬上限（双保险；HTTP 侧另有 500 的钳制，见 server kg_api.rs 的
+/// `clamp_limit` —— 一侧改了另一侧同步评估）。
 const MAX_LIMIT: usize = 1000;
 
 /// 一个实体节点。`id` 由调用方给（确定性散列），本层不感知散列算法。
@@ -99,24 +101,58 @@ pub struct GraphStats {
     pub docs: i64,
 }
 
-/// agtype 文本转义（与 `graph.rs::esc` 逐字同款）：先剥反斜杠，再转义单引号。
+/// agtype 文本转义（与 `graph.rs::esc` 逐字同款，两侧测试互守同文）：剥反斜杠
+/// （防 AGE 转义歧义的刻意取舍）与控制字符，`'` → `\'`。
 fn esc(s: &str) -> String {
-    s.replace('\\', "").replace('\'', "\\'")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => {}
+            '\'' => out.push_str("\\'"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// agtype 值去引号（AGE 返回 `"xxx"` 带引号字符串）。同 `graph.rs::unquote`。
+/// 只剥一层成对外引号并反转义 `\"`：`trim_matches('"')` 会剥掉名字里真·首尾引号。
 fn unquote(s: &str) -> String {
-    s.trim().trim_matches('"').to_string()
+    let s = s.trim();
+    match s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        Some(inner) => inner.replace("\\\"", "\""),
+        None => s.to_string(),
+    }
 }
 
 /// AGE 连接准备：每连接需 LOAD age + search_path（同 `graph.rs::age_conn`）。
 async fn age_conn(pg: &PgPool) -> anyhow::Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
     let mut conn = pg.acquire().await?;
+    // 两条独立 `query()`（两次 RTT）是刻意的：`raw_sql` 合并版（simple protocol 一句多命令）
+    // 的 future 形状会让下游 `JoinSet::spawn`（knowledge 图谱构建流水）过不了 Send 的 HRTB
+    // 证明（实测 rustc 报 "not general enough"，整仓编不过）——别为了省一次 RTT 换回去。
     sqlx::query("LOAD 'age'").execute(&mut *conn).await?;
     sqlx::query("SET search_path = ag_catalog, public")
         .execute(&mut *conn)
         .await?;
     Ok(conn)
+}
+
+/// 该图当前的全部标签名：一次查回进 HashSet，调用方 Rust 侧判断，
+/// 不在每个判定点多发一次 catalog 全量查。
+async fn graph_labels(
+    conn: &mut sqlx::PgConnection,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT l.name FROM ag_catalog.ag_label l \
+         JOIN ag_catalog.ag_graph g ON l.graph = g.graphid \
+         WHERE g.name = $1",
+    )
+    .bind(GRAPH)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(names.into_iter().collect())
 }
 
 /// 图与所需标签是否都已存在。没构建过（图/标签缺席）按空图处理，不是错误 ——
@@ -125,16 +161,8 @@ async fn labels_ready(
     conn: &mut sqlx::PgConnection,
     labels: &[&str],
 ) -> anyhow::Result<bool> {
-    let n: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM ag_catalog.ag_label l \
-         JOIN ag_catalog.ag_graph g ON l.graph = g.graphid \
-         WHERE g.name = $1 AND l.name = ANY($2::text[])",
-    )
-    .bind(GRAPH)
-    .bind(labels)
-    .fetch_one(&mut *conn)
-    .await?;
-    Ok(n as usize == labels.len())
+    let existing = graph_labels(conn).await?;
+    Ok(labels.iter().all(|l| existing.contains(*l)))
 }
 
 /// 建图（幂等）。`create_graph` 没有 IF NOT EXISTS 形态，先查 ag_catalog 目录。
@@ -146,7 +174,7 @@ pub async fn ensure_graph(pg: &PgPool) -> anyhow::Result<()> {
             .fetch_one(&mut *conn)
             .await?;
     if !exists {
-        sqlx::query(&format!("SELECT create_graph('{GRAPH}')"))
+        sqlx::query("SELECT create_graph('kb_graph')")
             .execute(&mut *conn)
             .await?;
     }
@@ -154,30 +182,76 @@ pub async fn ensure_graph(pg: &PgPool) -> anyhow::Result<()> {
 }
 
 /// 重建前的空间级清库：Chunk 先（DETACH 带走 MENTIONS），Entity 后（带走 RELATION）。
-/// 图或标签还没建过时是空操作（见 `labels_ready`）。
+/// 图或标签还没建过时是空操作（见 `labels_ready`）。两次 DETACH 包在一个事务里：
+/// 不留「Chunk 删完、Entity 失败」的孤实体窗口。
 pub async fn clear_space(pg: &PgPool, space_id: &str) -> anyhow::Result<()> {
+    // 显式 BEGIN/COMMIT 而非 `Transaction`：`&mut *tx` 的 Executor 泛化在调用方的
+    // JoinSet::spawn 下过不了编译（sqlx 0.8 的已知形态），裸连接 + 手动事务没有这个问题。
+    // 纪律：BEGIN 与 COMMIT/ROLLBACK 之间不许 `?` 早退，错误先收口再收尾。
+    // ⚠️ 事务语句必须走 `query()` 而非 `raw_sql`：raw_sql 的 future 形状会让下游
+    // `JoinSet::spawn`（knowledge 图谱构建流水）过不了 Send 的 HRTB 证明（实测整仓编不过）。
     let mut conn = age_conn(pg).await?;
+    sqlx::query("BEGIN").execute(&mut *conn).await?;
+    let mut first_err: Option<anyhow::Error> = None;
     for label in ["Chunk", "Entity"] {
-        if !labels_ready(&mut conn, &[label]).await? {
-            continue;
+        let step: anyhow::Result<()> = async {
+            if !labels_ready(&mut conn, &[label]).await? {
+                return Ok(());
+            }
+            let cy = cypher_sql(
+                &format!("MATCH (n:{label} {{space_id:'{}'}}) DETACH DELETE n", esc(space_id)),
+                "v agtype",
+            );
+            sqlx::query(&cy).execute(&mut *conn).await?;
+            Ok(())
         }
-        let cy = cypher_sql(
-            &format!("MATCH (n:{label} {{space_id:'{}'}}) DETACH DELETE n", esc(space_id)),
-            "v agtype",
-        );
-        sqlx::query(&cy).execute(&mut *conn).await?;
+        .await;
+        if let Err(e) = step {
+            first_err = Some(e);
+            break;
+        }
     }
-    Ok(())
+    finish_tx(conn, first_err).await
 }
 
 /// 写一个 chunk 的图投影。语句顺序：Chunk 节点 → 实体 MERGE → MENTIONS → RELATION
-/// （后两条 MATCH 依赖前面的节点，顺序不能换）。
+/// （后两条 MATCH 依赖前面的节点，顺序不能换）。四条包在一个事务里：中途失败
+/// 不留「有 Chunk 节点、无 MENTIONS/RELATION」的半成品（查询侧依赖「关系端点必登
+/// MENTIONS」不变量）。
 pub async fn write_chunk(pg: &PgPool, chunk: &ChunkGraph) -> anyhow::Result<()> {
     let mut conn = age_conn(pg).await?;
+    sqlx::query("BEGIN").execute(&mut *conn).await?; // 走 query 不走 raw_sql，见 clear_space 注释
+    let mut first_err: Option<anyhow::Error> = None;
     for stmt in chunk_statements(chunk) {
-        sqlx::query(&stmt).execute(&mut *conn).await?;
+        if let Err(e) = sqlx::query(&stmt).execute(&mut *conn).await {
+            first_err = Some(e.into());
+            break;
+        }
     }
-    Ok(())
+    finish_tx(conn, first_err).await
+}
+
+/// 事务收尾：全成 COMMIT；有错 ROLLBACK。收尾再失败的连接状态不可信，显式关闭
+/// （绝不把一个可能开着事务的连接还回池）。
+async fn finish_tx(
+    mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    first_err: Option<anyhow::Error>,
+) -> anyhow::Result<()> {
+    match first_err {
+        None => match sqlx::query("COMMIT").execute(&mut *conn).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = conn.close().await;
+                Err(e.into())
+            }
+        },
+        Some(e) => {
+            if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
+                let _ = conn.close().await;
+            }
+            Err(e)
+        }
+    }
 }
 
 /// 一个 chunk 的全部写入语句。抽成纯函数是为了让「每个值都过了 esc」可单测。
@@ -196,11 +270,15 @@ fn chunk_statements(chunk: &ChunkGraph) -> Vec<String> {
 }
 
 /// cypher 调用的外层包装（写语句无 RETURN，沿用 graph.rs 的 `AS (v agtype)` 形态）。
+/// 美元引号用 `$kb$` 唯一 tag 而非常见的 `$$`：实体名/关系文本来自 LLM 输出（不可信），
+/// 含 `$$` 就会提前终结 dollar-quoting；要破 `$kb$` 得先猜中这个 tag。
 fn cypher_sql(body: &str, cols: &str) -> String {
-    format!("SELECT * FROM cypher('{GRAPH}', $$ {body} $$) AS ({cols})")
+    format!("SELECT * FROM cypher('{GRAPH}', $kb$ {body} $kb$) AS ({cols})")
 }
 
 fn chunk_cypher(chunk: &ChunkGraph) -> String {
+    // MERGE 键 (doc_id, chunk_id) 不含 space_id、space 靠 SET 后补：前提是调用方契约
+    // 「doc_id 全局唯一」（一个 doc 只属于一个空间），跨空间撞 doc_id 会串空间。
     cypher_sql(
         &format!(
             "MERGE (c:Chunk {{doc_id:'{}', chunk_id:{}}}) SET c.space_id='{}'",
@@ -278,9 +356,10 @@ fn relations_cypher(chunk: &ChunkGraph) -> Option<String> {
     ))
 }
 
-/// 可见文档 id 列表内联成 Cypher 列表字面量。调用方保证非空（空集在入口处短路）。
-fn doc_list(doc_ids: &[String]) -> String {
-    doc_ids
+/// 字符串清单内联成 Cypher 列表字面量（通用件：doc_id/frontier/centers/entity_ids 都走它）。
+/// 调用方保证非空（空集在入口处短路）。
+fn str_list(values: &[String]) -> String {
+    values
         .iter()
         .map(|d| format!("'{}'", esc(d)))
         .collect::<Vec<_>>()
@@ -293,9 +372,9 @@ fn nodes_cypher(space_id: &str, doc_ids: &[String], limit: usize) -> String {
         &format!(
             "MATCH (c:Chunk)-[:MENTIONS]->(e:Entity) \
              WHERE c.space_id='{}' AND c.doc_id IN [{}] \
-             RETURN e.id, e.name, e.label, count(*) AS w ORDER BY count(*) DESC LIMIT {limit}",
+             RETURN e.id, e.name, e.label, count(*) AS w ORDER BY count(*) DESC, e.id LIMIT {limit}",
             esc(space_id),
-            doc_list(doc_ids)
+            str_list(doc_ids)
         ),
         "id agtype, name agtype, label agtype, w agtype",
     )
@@ -312,14 +391,42 @@ fn edges_cypher(
         &format!(
             "MATCH (a:Entity)-[r:RELATION]->(b:Entity) \
              WHERE r.space_id='{}' AND r.doc_id IN [{}] AND a.id IN [{}] AND b.id IN [{}] \
-             RETURN a.id, b.id, r.relation, count(*) AS w ORDER BY count(*) DESC LIMIT {limit}",
+             RETURN a.id, b.id, r.relation, count(*) AS w ORDER BY count(*) DESC, a.id, b.id LIMIT {limit}",
             esc(space_id),
-            doc_list(doc_ids),
-            doc_list(node_ids),
-            doc_list(node_ids)
+            str_list(doc_ids),
+            str_list(node_ids),
+            str_list(node_ids)
         ),
         "src agtype, dst agtype, relation agtype, w agtype",
     )
+}
+
+/// 读 agtype 行的公共取值：解码失败留痕（debug）按空串兜底 —— AGE ::text 形态漂移时
+/// 不该静默变「空名字实体」混进召回原料。
+fn text_cell(r: &sqlx::postgres::PgRow, i: usize) -> String {
+    match r.try_get::<Option<String>, _>(i) {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => {
+            tracing::debug!(err = %e, col = i, "doc_graph 行解码失败，按空串兜底");
+            String::new()
+        }
+    }
+}
+
+/// 数值列解析：失败留痕返 None（chunk_id 等关键列的调用方据此跳过整行，不许伪造 0）
+fn parse_i64(raw: &str, what: &str) -> Option<i64> {
+    match raw.trim().parse() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::debug!(raw, what, "doc_graph 数值解析失败");
+            None
+        }
+    }
+}
+
+/// 权重列：失败按 0 兜底但留痕（权重是排序信号，0 不伪造数据行）
+fn weight_or_zero(raw: &str) -> i64 {
+    parse_i64(raw, "weight").unwrap_or(0)
 }
 
 /// 读 agtype 四元组的公共形态：`SELECT * FROM cypher(...) AS (...)` 外层再包 `::text`
@@ -329,6 +436,7 @@ async fn fetch_text_rows(
     cypher: &str,
     cols: &str,
 ) -> anyhow::Result<Vec<Vec<String>>> {
+    let ncol = cols.split(',').count();
     let wrapped = format!(
         "SELECT {} FROM ({cypher}) AS sub",
         cols.split(',')
@@ -339,11 +447,7 @@ async fn fetch_text_rows(
     let rows = sqlx::query(&wrapped).fetch_all(&mut *conn).await?;
     Ok(rows
         .iter()
-        .map(|r| {
-            (0..cols.split(',').count())
-                .map(|i| r.try_get::<Option<String>, _>(i).ok().flatten().unwrap_or_default())
-                .collect()
-        })
+        .map(|r| (0..ncol).map(|i| text_cell(r, i)).collect())
         .collect())
 }
 
@@ -360,7 +464,8 @@ pub async fn subgraph(
         return Ok(Subgraph::default());
     }
     let mut conn = age_conn(pg).await?;
-    if !labels_ready(&mut conn, &["Chunk", "Entity", "MENTIONS"]).await? {
+    let labels = graph_labels(&mut conn).await?;
+    if !["Chunk", "Entity", "MENTIONS"].iter().all(|l| labels.contains(*l)) {
         return Ok(Subgraph::default());
     }
     let nodes = fetch_text_rows(&mut conn, &nodes_cypher(space_id, doc_ids, limit), "id,name,label,w")
@@ -370,11 +475,11 @@ pub async fn subgraph(
             id: unquote(&r[0]),
             name: unquote(&r[1]),
             label: unquote(&r[2]),
-            weight: r[3].trim().parse().unwrap_or(0),
+            weight: weight_or_zero(&r[3]),
         })
         .collect::<Vec<_>>();
     let node_ids = nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
-    if node_ids.is_empty() || !labels_ready(&mut conn, &["RELATION"]).await? {
+    if node_ids.is_empty() || !labels.contains("RELATION") {
         return Ok(Subgraph { nodes, edges: vec![] });
     }
     let edges =
@@ -385,7 +490,7 @@ pub async fn subgraph(
                 src: unquote(&r[0]),
                 dst: unquote(&r[1]),
                 relation: unquote(&r[2]),
-                weight: r[3].trim().parse().unwrap_or(0),
+                weight: weight_or_zero(&r[3]),
             })
             .collect();
     Ok(Subgraph { nodes, edges })
@@ -397,7 +502,8 @@ pub async fn stats(pg: &PgPool, space_id: &str, doc_ids: &[String]) -> anyhow::R
         return Ok(GraphStats::default());
     }
     let mut conn = age_conn(pg).await?;
-    if !labels_ready(&mut conn, &["Chunk"]).await? {
+    let labels = graph_labels(&mut conn).await?;
+    if !labels.contains("Chunk") {
         return Ok(GraphStats::default());
     }
     // 去重计数在 Rust 侧做（RETURN DISTINCT 的行数就是答案），不依赖 AGE 对
@@ -408,7 +514,7 @@ pub async fn stats(pg: &PgPool, space_id: &str, doc_ids: &[String]) -> anyhow::R
             &format!(
                 "MATCH (c:Chunk) WHERE c.space_id='{}' AND c.doc_id IN [{}] RETURN DISTINCT c.doc_id",
                 esc(space_id),
-                doc_list(doc_ids)
+                str_list(doc_ids)
             ),
             "doc_id agtype",
         ),
@@ -417,7 +523,7 @@ pub async fn stats(pg: &PgPool, space_id: &str, doc_ids: &[String]) -> anyhow::R
     .await?
     .len() as i64;
     let mut out = GraphStats { docs, ..GraphStats::default() };
-    if labels_ready(&mut conn, &["Chunk", "Entity", "MENTIONS"]).await? {
+    if ["Chunk", "Entity", "MENTIONS"].iter().all(|l| labels.contains(*l)) {
         out.entities = fetch_text_rows(
             &mut conn,
             &cypher_sql(
@@ -425,7 +531,7 @@ pub async fn stats(pg: &PgPool, space_id: &str, doc_ids: &[String]) -> anyhow::R
                     "MATCH (c:Chunk)-[:MENTIONS]->(e:Entity) \
                      WHERE c.space_id='{}' AND c.doc_id IN [{}] RETURN DISTINCT e.id",
                     esc(space_id),
-                    doc_list(doc_ids)
+                    str_list(doc_ids)
                 ),
                 "id agtype",
             ),
@@ -434,7 +540,7 @@ pub async fn stats(pg: &PgPool, space_id: &str, doc_ids: &[String]) -> anyhow::R
         .await?
         .len() as i64;
     }
-    if labels_ready(&mut conn, &["RELATION"]).await? {
+    if labels.contains("RELATION") {
         out.relations = fetch_text_rows(
             &mut conn,
             &cypher_sql(
@@ -443,7 +549,7 @@ pub async fn stats(pg: &PgPool, space_id: &str, doc_ids: &[String]) -> anyhow::R
                      WHERE r.space_id='{}' AND r.doc_id IN [{}] \
                      RETURN DISTINCT a.id, b.id, r.relation",
                     esc(space_id),
-                    doc_list(doc_ids)
+                    str_list(doc_ids)
                 ),
                 "src agtype, dst agtype, relation agtype",
             ),
@@ -487,7 +593,7 @@ fn entities_of_chunks_cypher(
              WHERE c.space_id='{}' AND c.doc_id IN [{}] AND c.chunk_id IN [{}] \
              RETURN e.id, count(*) AS w ORDER BY count(*) DESC, e.id LIMIT {limit}",
             esc(space_id),
-            doc_list(doc_ids),
+            str_list(doc_ids),
             int_list(chunk_ids)
         ),
         "id agtype, w agtype",
@@ -504,13 +610,14 @@ pub async fn entities_of_chunks(
     if doc_ids.is_empty() || chunk_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let limit = limit.clamp(1, MAX_LIMIT);
     let mut conn = age_conn(pg).await?;
     if !labels_ready(&mut conn, &["Chunk", "Entity", "MENTIONS"]).await? {
         return Ok(Vec::new());
     }
     let rows = fetch_text_rows(
         &mut conn,
-        &entities_of_chunks_cypher(space_id, doc_ids, chunk_ids, limit.clamp(1, MAX_LIMIT)),
+        &entities_of_chunks_cypher(space_id, doc_ids, chunk_ids, limit),
         "id,w",
     )
     .await?;
@@ -527,12 +634,14 @@ fn entities_named_like_sql(space_id: &str, doc_ids: &[String], candidate_limit: 
              WHERE c.space_id='{}' AND c.doc_id IN [{}] \
              RETURN e.id, e.name, count(*) AS w ORDER BY count(*) DESC LIMIT {candidate_limit}",
             esc(space_id),
-            doc_list(doc_ids)
+            str_list(doc_ids)
         ),
         "id agtype, name agtype, w agtype",
     );
     // agtype 字符串的 ::text 形态带 JSON 引号，外层 trim 掉再匹配；`$1`=问句、`$2`=相似度下限。
     // 短实体名（2 字）几乎攒不出 trgm 分，包含分支（position）是它们唯一现实的命中形态。
+    // 大小写口径的刻意不对称：position 分支两侧 lower（包含判断不区分大小写），
+    // word_similarity 不 lower（trgm 相似度保留原始形态，中文实体名下两者等价）。
     format!(
         "SELECT id FROM ( \
            SELECT trim(both '\"' from id::text) AS id, \
@@ -557,17 +666,15 @@ pub async fn entities_named_like(
     if doc_ids.is_empty() || query.trim().is_empty() {
         return Ok(Vec::new());
     }
+    let candidate_limit = candidate_limit.clamp(1, MAX_LIMIT);
+    let limit = limit.clamp(1, MAX_LIMIT);
     let mut conn = age_conn(pg).await?;
     if !labels_ready(&mut conn, &["Chunk", "Entity", "MENTIONS"]).await? {
         return Ok(Vec::new());
     }
-    let sql = entities_named_like_sql(
-        space_id,
-        doc_ids,
-        candidate_limit.clamp(1, MAX_LIMIT),
-        limit.clamp(1, MAX_LIMIT),
-    );
-    let rows = sqlx::query(&sql).bind(query).bind(sim_min).fetch_all(&mut *conn).await?;
+    let sql = entities_named_like_sql(space_id, doc_ids, candidate_limit, limit);
+    // 问句 trim 后再 bind：首尾空白不该带进 similarity/position 匹配
+    let rows = sqlx::query(&sql).bind(query.trim()).bind(sim_min).fetch_all(&mut *conn).await?;
     Ok(rows.iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect())
 }
 
@@ -585,9 +692,9 @@ fn relation_edges_touching_cypher(
              WHERE r.space_id='{}' AND r.doc_id IN [{}] AND (a.id IN [{}] OR b.id IN [{}]) \
              RETURN a.id, b.id, count(*) AS w ORDER BY count(*) DESC, a.id, b.id LIMIT {limit}",
             esc(space_id),
-            doc_list(doc_ids),
-            doc_list(frontier),
-            doc_list(frontier)
+            str_list(doc_ids),
+            str_list(frontier),
+            str_list(frontier)
         ),
         "src agtype, dst agtype, w agtype",
     )
@@ -603,13 +710,14 @@ pub async fn relation_edges_touching(
     if doc_ids.is_empty() || frontier.is_empty() {
         return Ok(Vec::new());
     }
+    let limit = limit.clamp(1, MAX_LIMIT);
     let mut conn = age_conn(pg).await?;
     if !labels_ready(&mut conn, &["Entity", "RELATION"]).await? {
         return Ok(Vec::new());
     }
     Ok(fetch_text_rows(
         &mut conn,
-        &relation_edges_touching_cypher(space_id, doc_ids, frontier, limit.clamp(1, MAX_LIMIT)),
+        &relation_edges_touching_cypher(space_id, doc_ids, frontier, limit),
         "src,dst,w",
     )
     .await?
@@ -617,7 +725,7 @@ pub async fn relation_edges_touching(
     .map(|r| RelEdge {
         src: unquote(&r[0]),
         dst: unquote(&r[1]),
-        weight: r[2].trim().parse().unwrap_or(0),
+        weight: weight_or_zero(&r[2]),
     })
     .collect())
 }
@@ -631,8 +739,8 @@ fn mentioned_chunks_cypher(space_id: &str, doc_ids: &[String], entity_ids: &[Str
              WHERE c.space_id='{}' AND c.doc_id IN [{}] AND e.id IN [{}] \
              RETURN c.chunk_id, count(*) AS w ORDER BY count(*) DESC, c.chunk_id LIMIT {limit}",
             esc(space_id),
-            doc_list(doc_ids),
-            doc_list(entity_ids)
+            str_list(doc_ids),
+            str_list(entity_ids)
         ),
         "chunk_id agtype, w agtype",
     )
@@ -648,18 +756,20 @@ pub async fn mentioned_chunks(
     if doc_ids.is_empty() || entity_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let limit = limit.clamp(1, MAX_LIMIT);
     let mut conn = age_conn(pg).await?;
     if !labels_ready(&mut conn, &["Chunk", "Entity", "MENTIONS"]).await? {
         return Ok(Vec::new());
     }
     Ok(fetch_text_rows(
         &mut conn,
-        &mentioned_chunks_cypher(space_id, doc_ids, entity_ids, limit.clamp(1, MAX_LIMIT)),
+        &mentioned_chunks_cypher(space_id, doc_ids, entity_ids, limit),
         "chunk_id,w",
     )
     .await?
     .into_iter()
-    .map(|r| (r[0].trim().parse().unwrap_or(0), r[1].trim().parse().unwrap_or(0)))
+    // chunk_id 解析失败不许伪造 0 混进召回原料：跳过该行（留痕在 parse_i64 内）
+    .filter_map(|r| parse_i64(&r[0], "chunk_id").map(|id| (id, weight_or_zero(&r[1]))))
     .collect())
 }
 
@@ -677,8 +787,8 @@ fn mention_pairs_cypher(
              WHERE c.space_id='{}' AND c.doc_id IN [{}] AND e.id IN [{}] AND c.chunk_id IN [{}] \
              RETURN c.chunk_id, e.id ORDER BY c.chunk_id, e.id LIMIT {limit}",
             esc(space_id),
-            doc_list(doc_ids),
-            doc_list(entity_ids),
+            str_list(doc_ids),
+            str_list(entity_ids),
             int_list(chunk_ids)
         ),
         "chunk_id agtype, entity_id agtype",
@@ -696,18 +806,19 @@ pub async fn mention_pairs(
     if doc_ids.is_empty() || entity_ids.is_empty() || chunk_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let limit = limit.clamp(1, MAX_LIMIT);
     let mut conn = age_conn(pg).await?;
     if !labels_ready(&mut conn, &["Chunk", "Entity", "MENTIONS"]).await? {
         return Ok(Vec::new());
     }
     Ok(fetch_text_rows(
         &mut conn,
-        &mention_pairs_cypher(space_id, doc_ids, entity_ids, chunk_ids, limit.clamp(1, MAX_LIMIT)),
+        &mention_pairs_cypher(space_id, doc_ids, entity_ids, chunk_ids, limit),
         "chunk_id,entity_id",
     )
     .await?
     .into_iter()
-    .map(|r| (r[0].trim().parse().unwrap_or(0), unquote(&r[1])))
+    .filter_map(|r| parse_i64(&r[0], "chunk_id").map(|id| (id, unquote(&r[1]))))
     .collect())
 }
 
@@ -721,11 +832,11 @@ fn neighborhood_edges_cypher(space_id: &str, doc_ids: &[String], centers: &[Stri
         &format!(
             "MATCH (a:Entity)-[r:RELATION]->(b:Entity) \
              WHERE r.space_id='{}' AND r.doc_id IN [{}] AND (a.id IN [{}] OR b.id IN [{}]) \
-             RETURN a.id, b.id, r.relation, count(*) AS w ORDER BY count(*) DESC LIMIT {limit}",
+             RETURN a.id, b.id, r.relation, count(*) AS w ORDER BY count(*) DESC, a.id, b.id LIMIT {limit}",
             esc(space_id),
-            doc_list(doc_ids),
-            doc_list(centers),
-            doc_list(centers)
+            str_list(doc_ids),
+            str_list(centers),
+            str_list(centers)
         ),
         "src agtype, dst agtype, relation agtype, w agtype",
     )
@@ -738,7 +849,7 @@ fn entities_by_ids_cypher(space_id: &str, ids: &[String]) -> String {
         &format!(
             "MATCH (e:Entity) WHERE e.space_id='{}' AND e.id IN [{}] RETURN e.id, e.name, e.label",
             esc(space_id),
-            doc_list(ids)
+            str_list(ids)
         ),
         "id agtype, name agtype, label agtype",
     )
@@ -752,8 +863,8 @@ fn mention_weights_cypher(space_id: &str, doc_ids: &[String], ids: &[String]) ->
              WHERE c.space_id='{}' AND c.doc_id IN [{}] AND e.id IN [{}] \
              RETURN e.id, count(*) AS w",
             esc(space_id),
-            doc_list(doc_ids),
-            doc_list(ids)
+            str_list(doc_ids),
+            str_list(ids)
         ),
         "id agtype, w agtype",
     )
@@ -771,13 +882,15 @@ pub async fn neighborhood(
     if doc_ids.is_empty() || centers.is_empty() {
         return Ok(Subgraph::default());
     }
+    let limit = limit.clamp(1, MAX_LIMIT);
     let mut conn = age_conn(pg).await?;
-    if !labels_ready(&mut conn, &["Entity", "RELATION"]).await? {
+    let labels = graph_labels(&mut conn).await?;
+    if !["Entity", "RELATION"].iter().all(|l| labels.contains(*l)) {
         return Ok(Subgraph::default());
     }
     let edges = fetch_text_rows(
         &mut conn,
-        &neighborhood_edges_cypher(space_id, doc_ids, centers, limit.clamp(1, MAX_LIMIT)),
+        &neighborhood_edges_cypher(space_id, doc_ids, centers, limit),
         "src,dst,relation,w",
     )
     .await?
@@ -786,7 +899,7 @@ pub async fn neighborhood(
         src: unquote(&r[0]),
         dst: unquote(&r[1]),
         relation: unquote(&r[2]),
-        weight: r[3].trim().parse().unwrap_or(0),
+        weight: weight_or_zero(&r[3]),
     })
     .collect::<Vec<_>>();
     // 节点集 = centers ∪ 边两端（保序去重）；孤立的 center 也能回（名片在就有节点）
@@ -797,9 +910,8 @@ pub async fn neighborhood(
             ids.push(id.clone());
         }
     }
-    if ids.is_empty() {
-        return Ok(Subgraph { nodes: vec![], edges });
-    }
+    // centers 非空（入口已短路）⇒ ids 必非空，空分支不可达
+    debug_assert!(!ids.is_empty());
     let mut nodes = fetch_text_rows(&mut conn, &entities_by_ids_cypher(space_id, &ids), "id,name,label")
         .await?
         .into_iter()
@@ -810,12 +922,15 @@ pub async fn neighborhood(
             weight: 0,
         })
         .collect::<Vec<_>>();
-    if !nodes.is_empty() && labels_ready(&mut conn, &["Chunk", "MENTIONS"]).await? {
+    if !nodes.is_empty() && labels.contains("Chunk") && labels.contains("MENTIONS") {
+        // 权重回填按 id 建索引（mention_weights 行数与 nodes 同量级，逐行 find 是 O(n²)）
+        let pos: std::collections::HashMap<String, usize> =
+            nodes.iter().enumerate().map(|(i, n)| (n.id.clone(), i)).collect();
         for row in fetch_text_rows(&mut conn, &mention_weights_cypher(space_id, doc_ids, &ids), "id,w").await? {
             let id = unquote(&row[0]);
-            let w = row[1].trim().parse().unwrap_or(0);
-            if let Some(n) = nodes.iter_mut().find(|n| n.id == id) {
-                n.weight = w;
+            let w = weight_or_zero(&row[1]);
+            if let Some(&i) = pos.get(id.as_str()) {
+                nodes[i].weight = w;
             }
         }
     }
@@ -829,7 +944,7 @@ fn space_chunks_probe_cypher(space_id: &str, doc_ids: &[String]) -> String {
         &format!(
             "MATCH (c:Chunk) WHERE c.space_id='{}' AND c.doc_id IN [{}] RETURN c.chunk_id LIMIT 1",
             esc(space_id),
-            doc_list(doc_ids)
+            str_list(doc_ids)
         ),
         "chunk_id agtype",
     )
@@ -862,6 +977,8 @@ const GRAPH_SCAN_ROWS: usize = 100_000;
 /// 空间内全部 Chunk 节点（doc_id, chunk_id），按 chunk_id 升序。
 /// 两个用途：reconcile 的孤儿检测输入（与「活着的文档」做集合差）；
 /// failed-chunks 端点的在图集合（构建口径 − 在图 = 未入图）。图/标签未建 = 空。
+/// 截断判据：`len() == GRAPH_SCAN_ROWS` 即可能截断（本层不带 truncated 标记，
+/// 调用方按此判；858 行注释承诺的「截断看得见」就靠它）。
 pub async fn chunk_nodes(pg: &PgPool, space_id: &str) -> anyhow::Result<Vec<(String, i64)>> {
     let mut conn = age_conn(pg).await?;
     if !labels_ready(&mut conn, &["Chunk"]).await? {
@@ -881,13 +998,15 @@ pub async fn chunk_nodes(pg: &PgPool, space_id: &str) -> anyhow::Result<Vec<(Str
     )
     .await?
     .into_iter()
-    .map(|r| (unquote(&r[0]), r[1].trim().parse().unwrap_or(0)))
+    .filter_map(|r| parse_i64(&r[1], "chunk_id").map(|id| (unquote(&r[0]), id)))
     .collect())
 }
 
 /// 悬空实体检测：MENTIONS 全量聚合在图内做完（`om = tm` ⇔ 该实体的每一条提及都来自孤儿
 /// chunk），只回传悬空者 id。AGE 子集内写法（WITH / CASE / sum / count）。
 /// `orphan_chunk_ids` 为空时调用方必须短路（`IN []` 是语法错，且没有孤儿就不可能有悬空）。
+/// 前提：过滤只带 `e.space_id`、MENTIONS 的 c 不带 space 谓词 —— 跨空间提及「实际不可能」
+/// 全靠写侧纪律（实体 id 含空间散列，见文件头图模型），这里不再重复校验。
 fn dangling_entities_cypher(space_id: &str, orphan_chunk_ids: &[i64]) -> String {
     cypher_sql(
         &format!(
@@ -949,7 +1068,7 @@ pub async fn relation_count_of_chunks(
         "w",
     )
     .await?;
-    Ok(rows.first().and_then(|r| r[0].trim().parse().ok()).unwrap_or(0))
+    Ok(rows.first().and_then(|r| parse_i64(&r[0], "relation_count")).unwrap_or(0))
 }
 
 /// reconcile 真删第 ① 步：按出处删 RELATION 边（先于节点删 —— 统计口径与删除对象一致，
@@ -1015,7 +1134,7 @@ pub async fn delete_entities(pg: &PgPool, space_id: &str, entity_ids: &[String])
         &format!(
             "MATCH (e:Entity) WHERE e.space_id='{}' AND e.id IN [{}] DETACH DELETE e",
             esc(space_id),
-            doc_list(entity_ids)
+            str_list(entity_ids)
         ),
         "v agtype",
     );
@@ -1052,6 +1171,20 @@ mod tests {
         assert_eq!(esc("正常名"), "正常名");
         assert_eq!(unquote("\"恒众\""), "恒众");
         assert_eq!(unquote("恒众"), "恒众");
+    }
+
+    /// 同文不靠自觉：改了 graph.rs::esc/unquote/age_conn 而没改这里，本测试当场红
+    /// （只断言固定期望值的测试守不住跨文件漂移）。
+    #[test]
+    fn esc_unquote_age_conn_are_byte_identical_with_graph_rs() {
+        let mine = include_str!("doc_graph.rs");
+        let theirs = include_str!("graph.rs");
+        fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+            src.split(sig).nth(1).and_then(|x| x.split("\n}\n").next()).unwrap_or("")
+        }
+        for sig in ["fn esc(s: &str) -> String {", "fn unquote(s: &str) -> String {", "async fn age_conn("] {
+            assert_eq!(body_of(mine, sig), body_of(theirs, sig), "{sig} 两侧不同文");
+        }
     }
 
     /// 写语句的顺序与形状：Chunk 节点永远第一条；空实体/空关系不出语句。
@@ -1198,7 +1331,7 @@ mod tests {
         assert!(sql.contains("word_similarity(nm, $1) > $2"), "{sql}");
         assert!(sql.contains("position(lower(nm) in lower($1)) > 0"), "{sql}");
         assert!(sql.contains("length(nm) >= 2"), "单字符实体名不许靠包含命中一切：{sql}");
-        let body = sql.split("$$").nth(1).expect("cypher 体不见了");
+        let body = sql.split("$kb$").nth(1).expect("cypher 体不见了");
         assert!(!body.contains('$'), "Cypher 体内不许出现绑定参数：{body}");
     }
 
@@ -1239,7 +1372,8 @@ mod tests {
         let src = include_str!("doc_graph.rs");
         for f in ["pub async fn delete_relations_of_chunks", "pub async fn delete_chunks"] {
             let body = src.split(f).nth(1).unwrap_or_else(|| panic!("{f} 不见了"));
-            let body = body.split("\n}\n").next().unwrap();
+            // 锚到下一个 pub async fn（函数结尾的排版抖动不再影响切片）
+            let body = body.split("\npub async fn ").next().unwrap();
             assert!(body.contains("r.space_id='{}'") || body.contains("c.space_id='{}'"), "{f} 丢了空间过滤");
             assert!(body.contains("int_list(chunk_ids)"), "{f} 的清单没过 int_list");
             assert!(body.contains("if chunk_ids.is_empty()"), "{f} 丢了空清单短路");
@@ -1248,7 +1382,7 @@ mod tests {
         assert!(chunks.contains("DETACH DELETE c"), "Chunk 删除必须 DETACH（带走 MENTIONS）");
         let entities = src.split("pub async fn delete_entities").nth(1).unwrap();
         assert!(entities.contains("DETACH DELETE e"), "Entity 删除必须 DETACH");
-        assert!(entities.contains("doc_list(entity_ids)"), "实体 id 清单没过 esc 内联");
+        assert!(entities.contains("str_list(entity_ids)"), "实体 id 清单没过 esc 内联");
         let rel = src.split("pub async fn delete_relations_of_chunks").nth(1).unwrap();
         assert!(rel.contains("r.chunk_id IN"), "RELATION 必须按 chunk 出处删");
         // 统计与删除同一口径：count 也用 r.chunk_id

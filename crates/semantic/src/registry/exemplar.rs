@@ -26,6 +26,7 @@ pub async fn fewshot(pg: &PgPool, ds: &str, question: &str) -> Vec<(String, Stri
     .bind(ds)
     .fetch_all(pg)
     .await
+    .map_err(|e| tracing::warn!(err = %e, "few-shot 语料读取失败 → 本轮无 few-shot"))
     .unwrap_or_default();
     let live = live_warehouse_tables(pg, ds).await;
     rows.into_iter()
@@ -47,6 +48,8 @@ async fn live_warehouse_tables(pg: &PgPool, ds: &str) -> HashSet<String> {
     .bind(ds)
     .fetch_all(pg)
     .await
+    // 读失败 → 空集 → DMS 语料全被过滤光（静默 fail-closed）：必须留痕
+    .map_err(|e| tracing::warn!(err = %e, "活性表清单读取失败 → DMS 语料过滤按空集（全过滤光）"))
     .unwrap_or_default()
     .into_iter()
     .map(|(table,)| table.to_ascii_lowercase())
@@ -65,12 +68,9 @@ fn asked_default_sales_metrics(question: &str) -> Vec<crate::sales_fact::Metric>
 }
 
 fn default_sales_sql_allowed(sql: &str, metrics: &[crate::sales_fact::Metric]) -> bool {
-    let compact = sql
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace() && *c != '`')
-        .flat_map(char::to_lowercase)
-        .collect::<String>()
-        .replace("sf.", "");
+    // compact 规范化与 `registry::compact_contract_expr` 同一份（不开第二份拷贝）；
+    // `sf.` 别名只剥前缀位置（`asf.` 子串不误伤）
+    let compact = crate::registry::strip_sf_alias(&crate::registry::compact_contract_expr(sql));
     let contains_forbidden_column = sql
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|token| !token.is_empty())
@@ -81,15 +81,25 @@ fn default_sales_sql_allowed(sql: &str, metrics: &[crate::sales_fact::Metric]) -
             !compact.contains("sum(")
         } else {
             metrics.iter().all(|metric| {
-                let expression = metric
-                    .expression()
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace() && *c != '`')
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
-                compact.contains(&expression)
+                compact.contains(compact_metric_expression(*metric))
             })
         }
+}
+
+/// 各默认销售指标表达式的 compact 形态：METRICS 是静态表，进程内只算一次
+/// （原来每次调用对每个指标重算一遍 compact）。
+fn compact_metric_expression(metric: crate::sales_fact::Metric) -> &'static str {
+    static EXPRS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        crate::sales_fact::METRICS
+            .iter()
+            .map(|m| crate::registry::compact_contract_expr(m.expression()))
+            .collect()
+    });
+    let i = crate::sales_fact::METRICS
+        .iter()
+        .position(|m| *m == metric)
+        .expect("metric 出自 METRICS");
+    &EXPRS[i]
 }
 
 fn exemplar_assets_allowed(
@@ -107,21 +117,23 @@ fn exemplar_assets_allowed(
     if refs.is_empty() {
         return false;
     }
-    let tables: Vec<&str> = refs
-        .iter()
-        .filter_map(|parts| parts.last().map(String::as_str))
-        .collect();
+    // 单趟完成「收集末段表名 + 逐条校验」（原来 tables 先收集一遍、valid 又逐条重算 parts.last()）
+    let mut tables: Vec<&str> = Vec::with_capacity(refs.len());
     let valid = refs.iter().all(|parts| {
-        let Some(table) = parts.last() else {
+        let Some(table) = parts.last().map(String::as_str) else {
             return false;
         };
         let Some(asset) = warehouse_asset(table) else {
             return false;
         };
-        parts.len() >= 2
+        let ok = parts.len() >= 2
             && parts[parts.len() - 2]
                 .eq_ignore_ascii_case(crate::warehouse_catalog::database_of(asset))
-            && live.contains(&table.to_ascii_lowercase())
+            && live.contains(&table.to_ascii_lowercase());
+        if ok {
+            tables.push(table);
+        }
+        ok
     });
     if !valid {
         return false;
@@ -154,6 +166,7 @@ pub async fn suggest_questions(pg: &PgPool, ds: &str, limit: i64) -> Vec<String>
     .bind(limit.max(0).saturating_mul(4))
     .fetch_all(pg)
     .await
+    .map_err(|e| tracing::warn!(err = %e, "推荐问句语料读取失败 → 本轮无推荐"))
     .unwrap_or_default();
     let live = live_warehouse_tables(pg, ds).await;
     rows.into_iter()
@@ -193,12 +206,18 @@ pub async fn save_with_context(
     .execute(pg)
     .await
     .map(|r| r.rows_affected() > 0)
-    .unwrap_or(false)
+    .unwrap_or_else(|e| {
+        // PG 错误被当「已存在」会丢掉一次沉淀还零留痕（调用方据此跳过存向量）：warn 后再 false
+        tracing::warn!(err = %e, "语料沉淀失败（按未插入处理）");
+        false
+    })
 }
 
 /// 存问句向量（供语义缓存召回）。`qvec` 是 pgvector 字面量。
 pub async fn set_embedding(pg: &PgPool, ds: &str, question: &str, qvec: &str) {
-    let _ = sqlx::query(
+    // 刻意不传播（纯观测写入，见 set_status 的 doc 对比），但失败要留痕：
+    // 非法 qvec（`$1::vector` 解析错）/连接抖动，debug 一次
+    if let Err(e) = sqlx::query(
         "UPDATE meta.sql_exemplar SET embedding = $1::vector
          WHERE question = $2 AND ds_id = $3",
     )
@@ -206,7 +225,10 @@ pub async fn set_embedding(pg: &PgPool, ds: &str, question: &str, qvec: &str) {
     .bind(question)
     .bind(ds)
     .execute(pg)
-    .await;
+    .await
+    {
+        tracing::debug!(err = %e, "语料向量写回失败（观测写入，不传播）");
+    }
 }
 
 /// 复核结论落库（enabled 进 few-shot / disabled 剔除，不当范例传播）。
@@ -226,12 +248,17 @@ pub async fn set_status(
     question: &str,
     status: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query("UPDATE meta.sql_exemplar SET status = $1 WHERE question = $2 AND ds_id = $3")
+    let affected = sqlx::query("UPDATE meta.sql_exemplar SET status = $1 WHERE question = $2 AND ds_id = $3")
         .bind(status)
         .bind(question)
         .bind(ds)
         .execute(pg)
-        .await?;
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        // question 打错/已被删时静默 no-op 仍 Ok：留痕（复核回路空转的排查依据）
+        tracing::warn!("语料复核落库 0 行（question 未命中）：{question:?}");
+    }
     Ok(())
 }
 
@@ -243,6 +270,8 @@ pub async fn set_ai_review(
     question: &str,
     opinion: &str,
 ) -> anyhow::Result<()> {
+    // 入参白名单：`"negativ"` 这类 typo 不许静默归 positive 侧（按 pending 放行）
+    anyhow::ensure!(matches!(opinion, "positive" | "negative"), "未知 AI 复核意见 {opinion:?}");
     let negative = opinion == "negative";
     sqlx::query(
         "UPDATE meta.sql_exemplar
@@ -267,7 +296,7 @@ pub async fn pending(pg: &PgPool, limit: i64) -> anyhow::Result<Vec<(String, Str
     Ok(sqlx::query_as(
         "SELECT ds_id, question, sql FROM meta.sql_exemplar WHERE status = 'pending' LIMIT $1",
     )
-    .bind(limit)
+    .bind(limit.max(0)) // 负 limit PG 直接报错，夹紧
     .fetch_all(pg)
     .await?)
 }
@@ -292,6 +321,7 @@ pub async fn nearest(
     .bind(ds)
     .fetch_all(pg)
     .await
+    .map_err(|e| tracing::warn!(err = %e, "语义缓存最近邻读取失败 → 本轮缓存 miss"))
     .unwrap_or_default();
     let live = live_warehouse_tables(pg, ds).await;
     rows.into_iter().find(|(sample_question, sql, _)| {
@@ -318,7 +348,11 @@ pub async fn save_lesson_candidate(
     .execute(pg)
     .await
     .map(|r| r.rows_affected() > 0)
-    .unwrap_or(false)
+    .unwrap_or_else(|e| {
+        // 错误谎报「已存在」会丢教训还零留痕（与 save_with_context 同一修法）
+        tracing::warn!(err = %e, "候选教训落库失败（按未插入处理）");
+        false
+    })
 }
 
 /// 待复核的候选教训 `(id, trigger_words, lesson)`。
@@ -331,20 +365,58 @@ pub async fn candidate_lessons(
     Ok(sqlx::query_as(
         "SELECT id, trigger_words, lesson FROM meta.pitfall WHERE status = 'candidate' ORDER BY id LIMIT $1",
     )
-    .bind(limit)
+    .bind(limit.max(0)) // 负 limit PG 直接报错，夹紧
     .fetch_all(pg)
     .await?)
 }
 
 /// 候选教训的复核结论：`active`（进召回）/ `disabled`
 pub async fn set_lesson_status(pg: &PgPool, id: i64, status: &str) -> anyhow::Result<()> {
-    sqlx::query("UPDATE meta.pitfall SET status = $1 WHERE id = $2")
+    let affected = sqlx::query("UPDATE meta.pitfall SET status = $1 WHERE id = $2")
         .bind(status)
         .bind(id)
         .execute(pg)
-        .await?;
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        tracing::warn!("候选教训复核落库 0 行（id={id} 未命中）");
+    }
     Ok(())
 }
+
+/// 纠错反哺日志（引擎 B+）：校正器出手即记录，供同错累计升格 pitfall（自进化，不静默修）
+///
+/// `trace_id` 是本轮新增（AX29）：`correction_log` / `failure_log` / `query_log` 三张表
+/// 原来各记一段、拼不回同一次问答 —— 「数字错了是模型写错还是校正器改坏」查不出来。
+/// 写入失败不许让问答失败（`query_log.rs` 的纪律 1）。
+/// （原不带 trace_id 的 `log_correction` 包装已删：全仓调用点全走 `_traced` 版。）
+pub async fn log_correction_traced(pg: &PgPool, kind: &str, question: &str, detail: &str, trace_id: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO meta.correction_log(kind, question, detail, trace_id) VALUES ($1,$2,$3,$4)",
+    )
+    .bind(kind)
+    .bind(question.chars().take(200).collect::<String>())
+    .bind(detail.chars().take(500).collect::<String>())
+    .bind(if trace_id.is_empty() { None } else { Some(trace_id) })
+    .execute(pg)
+    .await;
+}
+
+/// 失败记录（引擎 C）：执行报错/0 行落日志，报错类供 LLM 复盘产出候选教训。
+/// （原不带 trace_id 的 `log_failure` 包装已删：全仓调用点全走 `_traced` 版。）
+pub async fn log_failure_traced(pg: &PgPool, kind: &str, question: &str, sql: &str, error: &str, trace_id: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO meta.failure_log(kind, question, sql, error, trace_id) VALUES ($1,$2,$3,$4,$5)",
+    )
+    .bind(kind)
+    .bind(question.chars().take(200).collect::<String>())
+    .bind(sql.chars().take(2000).collect::<String>())
+    .bind(error.chars().take(500).collect::<String>())
+    .bind(if trace_id.is_empty() { None } else { Some(trace_id) })
+    .execute(pg)
+    .await;
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -400,45 +472,4 @@ mod tests {
             &HashSet::new()
         ));
     }
-}
-
-/// 纠错反哺日志（引擎 B+）：校正器出手即记录，供同错累计升格 pitfall（自进化，不静默修）
-///
-/// `trace_id` 是本轮新增（AX29）：`correction_log` / `failure_log` / `query_log` 三张表
-/// 原来各记一段、拼不回同一次问答 —— 「数字错了是模型写错还是校正器改坏」查不出来。
-/// 写入失败不许让问答失败（`query_log.rs` 的纪律 1）。
-pub async fn log_correction(pg: &PgPool, kind: &str, question: &str, detail: &str) {
-    log_correction_traced(pg, kind, question, detail, "").await;
-}
-
-/// `log_correction` 的带 `trace_id` 版。空 `trace_id` 时与上面逐字等价（老调用点不受影响）。
-pub async fn log_correction_traced(pg: &PgPool, kind: &str, question: &str, detail: &str, trace_id: &str) {
-    let _ = sqlx::query(
-        "INSERT INTO meta.correction_log(kind, question, detail, trace_id) VALUES ($1,$2,$3,$4)",
-    )
-    .bind(kind)
-    .bind(question.chars().take(200).collect::<String>())
-    .bind(detail.chars().take(500).collect::<String>())
-    .bind(if trace_id.is_empty() { None } else { Some(trace_id) })
-    .execute(pg)
-    .await;
-}
-
-/// 失败记录（引擎 C）：执行报错/0 行落日志，报错类供 LLM 复盘产出候选教训
-pub async fn log_failure(pg: &PgPool, kind: &str, question: &str, sql: &str, error: &str) {
-    log_failure_traced(pg, kind, question, sql, error, "").await;
-}
-
-/// `log_failure` 的带 `trace_id` 版。空 `trace_id` 时与上面逐字等价。
-pub async fn log_failure_traced(pg: &PgPool, kind: &str, question: &str, sql: &str, error: &str, trace_id: &str) {
-    let _ = sqlx::query(
-        "INSERT INTO meta.failure_log(kind, question, sql, error, trace_id) VALUES ($1,$2,$3,$4,$5)",
-    )
-    .bind(kind)
-    .bind(question.chars().take(200).collect::<String>())
-    .bind(sql.chars().take(2000).collect::<String>())
-    .bind(error.chars().take(500).collect::<String>())
-    .bind(if trace_id.is_empty() { None } else { Some(trace_id) })
-    .execute(pg)
-    .await;
 }

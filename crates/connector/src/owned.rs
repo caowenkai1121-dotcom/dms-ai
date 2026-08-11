@@ -8,7 +8,8 @@
 //! - **没有 `From<ScopedSql>` / `From<RawSql>` / 任何吃 `String` 的语句入口**：
 //!   LLM 产物在**类型上**到不了这里，不依赖任何人记得「别把生成的 SQL 往自有库送」。
 //!
-//! 唯一的例外是 `pool()`，它是迁移期过渡口，见其文档注释。
+//! 唯二的例外是 `pool()` 与 `dead_pg_pool_for_tests()`：前者是迁移期过渡口，后者对外交出
+//! 裸 `PgPool` 但只给单测用（见其文档注释与 `#[doc(hidden)]`）。
 
 use crate::ddl::{SafeIdent, UploadTableSpec};
 use crate::error::ConnectorError;
@@ -41,6 +42,7 @@ const RO_ROLE: &str = "dms_ai_ro";
 /// 而慢测试最后总会被人 `#[ignore]` 掉。
 ///
 /// 只给上层 crate 的**单测**用。生产路径一律 `OwnedStore::connect`。
+#[doc(hidden)] // 非生产 API：不进文档，新代码不该发现它
 pub fn dead_pg_pool_for_tests(acquire: std::time::Duration) -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(acquire)
@@ -57,9 +59,13 @@ pub struct OwnedStore {
 
 impl OwnedStore {
     pub async fn connect(url: &str, max_conn: u32) -> Result<Self, ConnectorError> {
+        // max_conn=0 与 MySQL 侧（effective_max_connections）对齐钳到 ≥1；
+        // application_name 让 pg_stat_activity 能把写通道连接与其他客户端区分开
+        let options: sqlx::postgres::PgConnectOptions = std::str::FromStr::from_str(url)
+            .map_err(|e| ConnectorError::connect(AT, e))?;
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(max_conn)
-            .connect(url)
+            .max_connections(max_conn.max(1))
+            .connect_with(options.application_name("dms-ai-owned"))
             .await
             .map_err(|e| ConnectorError::connect(AT, e))?;
         Ok(Self { pool })
@@ -83,12 +89,22 @@ impl OwnedStore {
     /// 「空表 / 缺注释」，重跑幂等（`IF NOT EXISTS` + `COMMENT ON` 覆盖写）。
     /// 真需要原子性时把这里换成 `BEGIN`/`COMMIT`。
     pub async fn create_upload_table(&self, spec: &UploadTableSpec) -> Result<(), ConnectorError> {
-        self.create_upload_schema(&spec.schema).await?;
-        self.ddl(&crate::ddl::render_create_table(spec)).await?;
-        for stmt in crate::ddl::render_column_comments(spec) {
-            self.ddl(&stmt).await?;
+        let what = || format!("上传表 {}.{}", spec.schema.as_str(), spec.table.as_str());
+        self.create_upload_schema(&spec.schema).await.map_err(|e| e.context(&what()))?;
+        self.ddl(&crate::ddl::render_create_table(spec))
+            .await
+            .map_err(|e| e.context(&what()))?;
+        let comments = crate::ddl::render_column_comments(spec);
+        if !comments.is_empty() {
+            // 逐列一条 COMMENT ON = 每列一次 RTT（百列上传表被 RT 放大）；拼成一条
+            // multi-statement 走 simple protocol 一次往返。语句全由 ddl.rs 从 SafeIdent 渲染。
+            let joined = comments.join(";");
+            sqlx::raw_sql(&joined)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| sqlx_err(AT, e).context(&what()))?;
         }
-        self.grant_readonly(&spec.schema).await
+        self.grant_readonly(&spec.schema).await.map_err(|e| e.context(&what()))
     }
 
     /// 把上传 schema 授权给只读组角色（角色不存在 = no-op）。
@@ -109,6 +125,8 @@ impl OwnedStore {
             return Ok(());
         }
         let s = schema.as_str();
+        // GRANT 的角色名不加双引号：RO_ROLE 常量因此必须保持全小写形态
+        // （哪天改常量引入大写，这里会静默失配 —— 要么引号要么 SafeIdent 渲染）
         self.ddl(&format!("GRANT USAGE ON SCHEMA \"{s}\" TO {RO_ROLE}")).await?;
         self.ddl(&format!("GRANT SELECT ON ALL TABLES IN SCHEMA \"{s}\" TO {RO_ROLE}")).await
     }
@@ -120,6 +138,7 @@ impl OwnedStore {
 
     /// 批量灌上传表：每列一个 `text[]`，一条 `INSERT … SELECT … FROM unnest(…)` 写一批
     /// （≤500 行）。**值全走 bind**，SQL 里不出现任何字面量；返回真正写入的行数。
+    /// 批间无事务：中途失败留下前 N 批残留，由调用方（kb_api 作废即 drop schema）清理。
     ///
     /// 空串按 `NULL` 灌：缺格与空单元格在 numeric/timestamptz 列上是 `''::numeric` 语法错，
     /// 而「这一格没填」正是 NULL 的语义。脏值（numeric 列里的 `abc`）不猜不丢，让 PG 报错。
@@ -128,7 +147,10 @@ impl OwnedStore {
         spec: &UploadTableSpec,
         rows: &[Vec<String>],
     ) -> Result<usize, ConnectorError> {
-        if spec.columns.is_empty() || rows.is_empty() {
+        if spec.columns.is_empty() {
+            return Err(ConnectorError::config(AT, "零列上传表 spec 是编程错误，不是正常输入"));
+        }
+        if rows.is_empty() {
             return Ok(0);
         }
         let sql = render_insert_unnest(spec);
@@ -144,7 +166,7 @@ impl OwnedStore {
             let done = q.execute(&self.pool).await.map_err(|e| sqlx_err(AT, e))?;
             written += done.rows_affected();
         }
-        Ok(written as usize)
+        Ok(usize::try_from(written).unwrap_or(usize::MAX))
     }
 
     /// 删整个上传 schema（上传作废/租户清理）。`CASCADE`：schema 里只有我们建的上传表。
@@ -156,18 +178,24 @@ impl OwnedStore {
     /// **私有**：唯一执行渲染后 DDL 的地方。入参虽是 `&str`，但两个调用点的串
     /// 全部由 `ddl.rs` 的纯函数从 `SafeIdent` 渲染而来 —— 这是它不能变 `pub` 的全部理由。
     async fn ddl(&self, stmt: &str) -> Result<(), ConnectorError> {
-        sqlx::query(stmt)
+        // DDL 全静态无业务值，可以安全记日志；成功路径留 debug 痕（建表/授权/删 schema 不再全静默）
+        let r = sqlx::query(stmt)
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|e| sqlx_err(AT, e))
+            .map_err(|e| sqlx_err(AT, e));
+        if r.is_ok() {
+            tracing::debug!(stmt = &stmt[..stmt.len().min(80)], "owned DDL 执行成功");
+        }
+        r
     }
 }
 
-/// 第 `i` 格的值：行比表头短时 `get` 返 `None`；空串也当 `NULL`（见 `insert_upload_rows`）。
+/// 第 `i` 格的值：行比表头短时 `get` 返 `None`；空串与全空白串都当 `NULL`
+/// （见 `insert_upload_rows`；与 ddl.rs `infer_col_type` 先 trim 再判空的口径一致）。
 /// 行比表头长时多出来的格直接丢 —— 表头是列数的唯一真相源。
 fn cell(row: &[String], i: usize) -> Option<&str> {
-    row.get(i).map(String::as_str).filter(|s| !s.is_empty())
+    row.get(i).map(String::as_str).filter(|s| !s.trim().is_empty())
 }
 
 /// `INSERT INTO "s"."t" ("a","b") SELECT u.c1::numeric,u.c2::text FROM unnest($1::text[],$2::text[]) AS u(c1,c2)`
@@ -183,25 +211,27 @@ fn cell(row: &[String], i: usize) -> Option<&str> {
 /// ponytail: 这个渲染器该住在 `ddl.rs`（与另两个渲染器同处一个 review 面）；本轮 ddl.rs 不在
 /// 改动范围，下次动它时把它和无消费者的 `render_insert` 一起收拢过去。
 fn render_insert_unnest(spec: &UploadTableSpec) -> String {
-    let mut names = Vec::with_capacity(spec.columns.len());
-    let mut casts = Vec::with_capacity(spec.columns.len());
-    let mut arrays = Vec::with_capacity(spec.columns.len());
-    let mut alias = Vec::with_capacity(spec.columns.len());
+    use std::fmt::Write as _;
+    let mut names = String::new();
+    let mut casts = String::new();
+    let mut arrays = String::new();
+    let mut alias = String::new();
     for (i, c) in spec.columns.iter().enumerate() {
         let n = i + 1;
-        names.push(format!("\"{}\"", c.name.as_str()));
-        casts.push(format!("u.c{n}::{}", c.ty.pg_type()));
-        arrays.push(format!("${n}::text[]"));
-        alias.push(format!("c{n}"));
+        let sep = if i > 0 { "," } else { "" };
+        write!(names, "{sep}\"{}\"", c.name.as_str()).expect("写 String 不会失败");
+        write!(casts, "{sep}u.c{n}::{}", c.ty.pg_type()).expect("写 String 不会失败");
+        write!(arrays, "{sep}${n}::text[]").expect("写 String 不会失败");
+        write!(alias, "{sep}c{n}").expect("写 String 不会失败");
     }
     format!(
         "INSERT INTO \"{}\".\"{}\" ({}) SELECT {} FROM unnest({}) AS u({})",
         spec.schema.as_str(),
         spec.table.as_str(),
-        names.join(","),
-        casts.join(","),
-        arrays.join(","),
-        alias.join(",")
+        names,
+        casts,
+        arrays,
+        alias
     )
 }
 
@@ -235,5 +265,43 @@ mod tests {
         assert_eq!(cell(&row, 0), Some("1"));
         assert_eq!(cell(&row, 1), None, "空串当 NULL");
         assert_eq!(cell(&row, 2), None, "缺格当 NULL");
+        let blank = vec!["   ".to_string()];
+        assert_eq!(cell(&blank, 0), None, "全空白串当 NULL（与 infer_col_type 口径一致）");
+    }
+
+    /// 三列（含 Text）：casts 与 alias 编号必须一一对齐，列错位无断言守会静默写错列
+    #[test]
+    fn insert_aligns_casts_and_aliases_for_three_columns() {
+        let spec = UploadTableSpec {
+            schema: SafeIdent::parse("up_1").unwrap(),
+            table: SafeIdent::parse("t1").unwrap(),
+            columns: build_columns(&[
+                ("金额", ColType::Numeric),
+                ("名称", ColType::Text),
+                ("日期", ColType::Timestamptz),
+            ]),
+        };
+        assert_eq!(
+            render_insert_unnest(&spec),
+            "INSERT INTO \"up_1\".\"t1\" (\"c0\",\"c1\",\"c2\") \
+             SELECT u.c1::numeric,u.c2::text,u.c3::timestamptz \
+             FROM unnest($1::text[],$2::text[],$3::text[]) AS u(c1,c2,c3)"
+        );
+    }
+
+    /// 零列 spec 是编程错误：发请求之前就该 Config 报错（死池证明没碰 DB）
+    #[tokio::test]
+    async fn zero_column_spec_is_config_error_before_touching_db() {
+        let store = OwnedStore {
+            pool: crate::owned::dead_pg_pool_for_tests(std::time::Duration::from_millis(50)),
+        };
+        let spec = UploadTableSpec {
+            schema: SafeIdent::parse("up_1").unwrap(),
+            table: SafeIdent::parse("t0").unwrap(),
+            columns: vec![],
+        };
+        let rows = vec![vec!["1".to_string()]];
+        let err = store.insert_upload_rows(&spec, &rows).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::Config(_)), "{err}");
     }
 }

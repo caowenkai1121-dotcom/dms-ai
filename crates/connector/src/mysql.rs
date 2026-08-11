@@ -38,6 +38,8 @@ const LOOKUP_INDEX_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 // 10s 在内网够用、公网必超时 —— 探针失败是启动硬失败，超时要按链路预算给。
 const WAREHOUSE_CATALOG_TIMEOUT: Duration = Duration::from_secs(60);
 
+// 进程级全局信号量是有意的：今天全进程只有一个生产源，2 槽阀门对所有点查统一生效。
+// 若未来多生产源共存，必须改成按源各一把，否则多源共享 2 槽会互相饿死。
 fn production_lookup_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| tokio::sync::Semaphore::new(DMS_LOOKUP_MAX_CONCURRENCY as usize))
@@ -55,6 +57,15 @@ pub enum MysqlCapability {
 impl MysqlCapability {
     pub fn is_warehouse(self) -> bool {
         matches!(self, Self::Warehouse)
+    }
+
+    /// 错误文案里的能力名：拒绝原因写出实际能力，不再硬编码 "production_lookup"
+    fn label(self) -> &'static str {
+        match self {
+            Self::ProductionLookup => "production_lookup",
+            Self::IdentityPermission => "identity_permission",
+            Self::Warehouse => "warehouse",
+        }
     }
 }
 
@@ -125,12 +136,12 @@ impl ReadOnlyMySql {
 
     /// 当前池的克隆（Arc 廉价拷贝 —— 拿着它查完这次，换池不影响在飞查询）
     fn pool(&self) -> sqlx::MySqlPool {
-        self.pool.read().expect("mysql pool 锁中毒").pool.clone()
+        self.pool.read().unwrap_or_else(|e| e.into_inner()).pool.clone()
     }
 
     /// 【A8】策略快照（`Mutex` 不跨 await：拷贝完即放锁）。
     fn ds_policy(&self) -> DsPolicy {
-        *self.ds_policy.lock().expect("mysql 策略锁中毒")
+        *self.ds_policy.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 查询池和目标类型必须在同一把锁内取快照：避免刚判定为 Doris，热切换后却从生产
@@ -138,7 +149,7 @@ impl ReadOnlyMySql {
     fn execution_target(
         &self,
     ) -> (sqlx::MySqlPool, MysqlCapability, Option<std::sync::Arc<LookupIndexes>>) {
-        let state = self.pool.read().expect("mysql pool 锁中毒");
+        let state = self.pool.read().unwrap_or_else(|e| e.into_inner());
         (state.pool.clone(), state.capability, state.lookup_indexes.clone())
     }
 
@@ -165,13 +176,15 @@ impl ReadOnlyMySql {
     ) -> Result<(), ConnectorError> {
         let (new, lookup_indexes) =
             connect_read_only(&self.ds, url, max_conn, capability).await?;
-        if !pool_read_only(&new, capability).await {
+        // 生产能力在 connect_read_only 内已逐连接核验会话只读，这里只补数仓的账号三级
+        // 权限核验 —— 生产路径不再多付一次重复核验 RTT。
+        if capability.is_warehouse() && !pool_read_only(&new, capability).await {
             return Err(ConnectorError::config(
                 self.ds.as_str(),
                 "目标库不是只读会话或只读授权账号 —— 拒绝换入可写库",
             ));
         }
-        *self.pool.write().expect("mysql pool 锁中毒") = PoolState {
+        *self.pool.write().unwrap_or_else(|e| e.into_inner()) = PoolState {
             pool: new,
             capability,
             lookup_indexes,
@@ -186,13 +199,13 @@ impl ReadOnlyMySql {
 
     /// 目标名与能力必须原子读取，供深度报告在热切换期间做 fail-closed 判断。
     pub fn target_snapshot(&self) -> (String, bool) {
-        let state = self.pool.read().expect("mysql pool 锁中毒");
+        let state = self.pool.read().unwrap_or_else(|e| e.into_inner());
         (state.target.clone(), state.capability.is_warehouse())
     }
 
     /// 仅用于启动时：连接已按运行时配置建立，补上该配置在目录中的名字。
     pub fn set_target_name(&self, target: &str) {
-        self.pool.write().expect("mysql pool 锁中毒").target = target.to_string();
+        self.pool.write().unwrap_or_else(|e| e.into_inner()).target = target.to_string();
     }
 
     /// 框架自查语句通道（裁决 C1）：SQL 只能是 `&'static str`，数据全走 bind。
@@ -216,14 +229,23 @@ impl ReadOnlyMySql {
             return Err(ConnectorError::config(at, "生产业务点查不能在数仓能力连接上执行"));
         }
         ensure_verified_lookup(sql, indexes.as_deref(), at)?;
-        let deadline = tokio::time::Instant::now() + DMS_LOOKUP_TIMEOUT;
-        let _slot = self.acquire_lookup_slot(deadline, DMS_LOOKUP_TIMEOUT).await?;
+        // 【A8】与 fetch 同口径：ds 级策略只许进一步收紧点查红线
+        let (max, t) =
+            effective_limits(false, self.ds_policy(), DMS_LOOKUP_MAX_ROWS, DMS_LOOKUP_TIMEOUT);
+        let deadline = tokio::time::Instant::now() + t;
+        let _slot = self.acquire_lookup_slot(deadline).await?;
+        let started = std::time::Instant::now();
         tokio::time::timeout_at(deadline, async {
             let rows = sqlx::raw_sql(sql.wire())
                 .fetch_all(&pool)
                 .await
                 .map_err(|e| sqlx_err(at, e))?;
-            let (columns, mut data) = to_table(&rows, DMS_LOOKUP_MAX_ROWS);
+            // 生产点查慢查询留痕（与 fixed.rs 的 500ms 慢日志同档，只加日志）
+            let elapsed = started.elapsed();
+            if elapsed > Duration::from_millis(500) {
+                tracing::warn!(ds = at, elapsed_ms = elapsed.as_millis(), "生产业务点查偏慢");
+            }
+            let (columns, mut data) = to_table(&rows, max);
             let redacted = redact(self.sensitive, &columns, &mut data);
             Ok(RowSet { columns, rows: data, redacted })
         })
@@ -234,11 +256,17 @@ impl ReadOnlyMySql {
     async fn acquire_lookup_slot(
         &self,
         deadline: tokio::time::Instant,
-        timeout: Duration,
     ) -> Result<tokio::sync::SemaphorePermit<'static>, ConnectorError> {
         tokio::time::timeout_at(deadline, production_lookup_slots().acquire())
             .await
-            .map_err(|_| ConnectorError::timeout(self.ds.as_str(), timeout))?
+            // 报「实际愿意等多久」（deadline 剩余量），不是满额预算
+            .map_err(|_| {
+                ConnectorError::timeout(
+                    self.ds.as_str(),
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+            })?
+            // 防御分支：进程级信号量从不 close，正常不可达
             .map_err(|_| ConnectorError::config(self.ds.as_str(), "生产业务点查并发阀门已关闭"))
     }
 
@@ -253,10 +281,17 @@ impl ReadOnlyMySql {
         if !capability.is_warehouse() {
             return Err(ConnectorError::config(
                 at,
-                "production_lookup 禁止 raw 静态分析查询",
+                format!("{} 禁止 raw 静态分析查询", capability.label()),
             ));
         }
-        let rows = sqlx::raw_sql(sql).fetch_all(&pool).await.map_err(|e| sqlx_err(at, e))?;
+        // 数仓静态查询也必须有上限：公网链路挂住不能等到 TCP 层才死
+        let rows = tokio::time::timeout(
+            WAREHOUSE_CATALOG_TIMEOUT,
+            sqlx::raw_sql(sql).fetch_all(&pool),
+        )
+        .await
+        .map_err(|_| ConnectorError::timeout(at, WAREHOUSE_CATALOG_TIMEOUT))?
+        .map_err(|e| sqlx_err(at, e))?;
         rows.iter().map(|row| T::from_row(row).map_err(|e| sqlx_err(at, e))).collect()
     }
 
@@ -273,7 +308,7 @@ impl ReadOnlyMySql {
         if !capability.is_warehouse() {
             return Err(ConnectorError::config(
                 at,
-                "production_lookup 禁止全库 schema 探针；仅允许静态业务键索引核验",
+                format!("{} 禁止全库 schema 探针；仅允许静态业务键索引核验", capability.label()),
             ));
         }
         let mut snap = probe_mysql_schema(&pool, at, self.dialect()).await?;
@@ -293,19 +328,19 @@ impl ReadOnlyMySql {
         let rows = rows
             .iter()
             .map(|row| {
-                let decoded: WarehouseCatalogRow =
+                let (database, table, comment, row_estimate, name, data_type, col_comment, ordinal_text): WarehouseCatalogRow =
                     FromRow::from_row(row).map_err(|e| sqlx_err(at, e))?;
-                let ordinal = decoded.7.parse::<i64>().map_err(|e| {
+                let ordinal = ordinal_text.parse::<i64>().map_err(|e| {
                     sqlx_err(at, sqlx::Error::Decode(Box::new(e)))
                 })?;
                 Ok((
-                    decoded.0,
-                    decoded.1,
-                    decoded.2,
-                    decoded.3.and_then(|v| v.parse::<i64>().ok()),
-                    decoded.4,
-                    decoded.5,
-                    decoded.6,
+                    database,
+                    table,
+                    comment,
+                    row_estimate.and_then(|v| v.parse::<i64>().ok()),
+                    name,
+                    data_type,
+                    col_comment,
                     ordinal,
                 ))
             })
@@ -321,7 +356,7 @@ impl ReadOnlyMySql {
         if !capability.is_warehouse() {
             return Err(ConnectorError::config(
                 self.ds.as_str(),
-                "production_lookup 禁止读取数仓字段映射",
+                format!("{} 禁止读取数仓字段映射", capability.label()),
             ));
         }
         let rows: Vec<(String, String, String)> = match self
@@ -333,14 +368,14 @@ impl ReadOnlyMySql {
             .await
         {
             Ok(rows) => rows,
-            Err(_) => {
-                tracing::info!(reason = "warehouse_mapping_unavailable", "DMS 数仓字段映射不可用，保留原生 schema 注释");
+            Err(e) => {
+                tracing::info!(reason = "warehouse_mapping_unavailable", err = %e, "DMS 数仓字段映射不可用，保留原生 schema 注释");
                 return Ok(0);
             }
         };
         let mapped: std::collections::HashMap<(String, String), String> = rows
             .into_iter()
-            .map(|(table, column, comment)| ((table.to_lowercase(), column.to_lowercase()), comment))
+            .map(|(table, column, comment)| ((table.to_ascii_lowercase(), column.to_ascii_lowercase()), comment))
             .collect();
         Ok(fill_blank_comments(snap, &mapped))
     }
@@ -363,17 +398,24 @@ impl ReadOnlyMySql {
         if !capability.is_warehouse() {
             return Err(ConnectorError::config(
                 at,
-                "production_lookup 禁止日期模板分析查询",
+                format!("{} 禁止日期模板分析查询", capability.label()),
             ));
         }
-        let rows = sqlx::raw_sql(&sql).fetch_all(&pool).await.map_err(|e| sqlx_err(at, e))?;
+        // 与 raw_all 同理：数仓日期模板查询也要包上限
+        let rows = tokio::time::timeout(
+            WAREHOUSE_CATALOG_TIMEOUT,
+            sqlx::raw_sql(&sql).fetch_all(&pool),
+        )
+        .await
+        .map_err(|_| ConnectorError::timeout(at, WAREHOUSE_CATALOG_TIMEOUT))?
+        .map_err(|e| sqlx_err(at, e))?;
         rows.iter().map(|row| T::from_row(row).map_err(|e| sqlx_err(at, e))).collect()
     }
 
     pub async fn ping(&self) -> bool {
         tokio::time::timeout(
             DMS_LOOKUP_TIMEOUT,
-            sqlx::raw_sql("SELECT 1").fetch_all(&self.pool()),
+            sqlx::raw_sql("SELECT 1").fetch_one(&self.pool()),
         )
         .await
         .is_ok_and(|result| result.is_ok())
@@ -400,7 +442,13 @@ async fn connect_read_only(
     // Doris 分析维持调用方配置，不进入生产限流。
     let max_conn = effective_max_connections(max_conn, capability);
     let pool = sqlx::mysql::MySqlPoolOptions::new().max_connections(max_conn);
-    tracing::info!(backend = if capability.is_warehouse() { "warehouse" } else { "production_lookup" }, "创建只读业务连接池");
+    tracing::info!(
+        backend = if capability.is_warehouse() { "warehouse" } else { "production_lookup" },
+        ds = ds.as_str(),
+        max_conn,
+        "{}",
+        if capability.is_warehouse() { "创建数仓只读连接池" } else { "创建只读业务连接池" }
+    );
     let out = if capability.is_warehouse() {
         let opts = MySqlConnectOptions::from_str(url)
             .map_err(|_| ConnectorError::config(ds.as_str(), "数据库连接地址格式无效"))?
@@ -421,7 +469,11 @@ async fn connect_read_only(
         .connect(url)
         .await
     };
-    let pool = out.map_err(|_| connection_unavailable(ds.as_str()))?;
+    let pool = out.map_err(|e| {
+        // 建池失败保留底层错误留痕（认证失败 vs 网络不可达要能分清），对外仍归一为连接不可用
+        tracing::warn!(reason = "mysql_pool_connect_failed", ds = ds.as_str(), err = %e, "建只读池失败");
+        connection_unavailable(ds.as_str())
+    })?;
     if !capability.is_warehouse() && !mysql_session_read_only(&pool).await {
         pool.close().await;
         return Err(ConnectorError::config(
@@ -468,27 +520,29 @@ struct PoolState {
 
 type LookupIndexes = HashMap<(String, String), DmsIndexKind>;
 
+/// 静态日期模板的 `?` 替换。**约束**：`?` 计数包含模板字符串字面量内的 `?`
+/// （`'a?b'` 这类字面量会吃掉一个槽位）——静态模板由代码评审保证不把 `?` 写进字面量。
 fn render_date_template(template: &str, dates: &[chrono::NaiveDate]) -> Option<String> {
     if template.matches('?').count() != dates.len() {
         return None;
     }
     let mut sql = String::with_capacity(template.len() + dates.len() * 12);
-    let mut rest = template;
-    for date in dates {
-        let (head, tail) = rest.split_once('?')?;
-        sql.push_str(head);
+    // 计数已校验：split 段数恒 == dates.len() + 1，zip 不会提前耗尽
+    let mut parts = template.split('?');
+    sql.push_str(parts.next().expect("split 恒产出首段"));
+    for (date, head) in dates.iter().zip(parts) {
         sql.push('\'');
         sql.push_str(&date.format("%F").to_string());
         sql.push('\'');
-        rest = tail;
+        sql.push_str(head);
     }
-    sql.push_str(rest);
     Some(sql)
 }
 
 /// 【测试连通性】建一次性池验证 DSN：连得上 + 会话只读 + `SELECT 1`。
 /// 返回 (延迟毫秒, 服务端版本)。**不产生** `SqlSource`（它只用于页面「测试」按钮 ——
 /// 与 `swap_pool` 的验证同构但不换任何东西）。
+/// 注意：生产能力下延迟包含完整索引核验（30s 预算），页面按钮的等待远超一次 ping 是预期。
 pub async fn test_pool(
     ds: &DsId,
     url: &str,
@@ -497,18 +551,22 @@ pub async fn test_pool(
     let t0 = std::time::Instant::now();
     let (pool, _) = connect_read_only(ds, url, 1, capability).await?;
     if !pool_read_only(&pool, capability).await {
+        pool.close().await;
         return Err(ConnectorError::config(
             ds.as_str(),
             "目标库不是只读会话或只读授权账号 —— 可写库不进本系统",
         ));
     }
+    // 数仓走公网链路（单条探针实测 ~27s），版本探测不能套生产点查的 2s 预算
+    let budget =
+        if capability.is_warehouse() { WAREHOUSE_CATALOG_TIMEOUT } else { DMS_LOOKUP_TIMEOUT };
     let rows = tokio::time::timeout(
-        DMS_LOOKUP_TIMEOUT,
+        budget,
         sqlx::raw_sql("SELECT CAST(VERSION() AS CHAR)").fetch_all(&pool),
     )
         .await
-        .map_err(|_| ConnectorError::timeout(ds.as_str(), DMS_LOOKUP_TIMEOUT))?
-        .map_err(|_| connection_unavailable(ds.as_str()))?;
+        .map_err(|_| ConnectorError::timeout(ds.as_str(), budget))?
+        .map_err(|e| sqlx_err(ds.as_str(), e))?;
     let ver = rows
         .first()
         .and_then(|row| row.try_get::<String, _>(0).ok())
@@ -520,34 +578,38 @@ async fn verify_lookup_indexes(
     pool: &sqlx::MySqlPool,
     at: &str,
 ) -> Result<LookupIndexes, ConnectorError> {
-    let registered: HashMap<(String, String), DmsIndexKind> = registered_lookup_keys()
-        .map(|(table, column, kind)| {
-            ((table.to_ascii_lowercase(), column.to_ascii_lowercase()), kind)
-        })
-        .collect();
-    let tables = registered_lookup_keys()
-        .map(|(table, _, _)| table)
-        .collect::<std::collections::BTreeSet<_>>();
-    // 启动/热切换时的一次性核验（逐表 SHOW INDEX）。不是用户查询：2s 的用户点查预算
-    // 在公网链路上连十几张表的 RTT 都不够（2026-08-08 实测公网核验必超时 → 点查整关）。
+    // 一次迭代同时收 registered 映射与 tables 集合（不调两遍 registered_lookup_keys）
+    let mut registered: HashMap<(String, String), DmsIndexKind> = HashMap::new();
+    let mut tables = std::collections::BTreeSet::new();
+    for (table, column, kind) in registered_lookup_keys() {
+        registered.insert((table.to_ascii_lowercase(), column.to_ascii_lowercase()), kind);
+        tables.insert(table);
+    }
+    // 启动/热切换时的一次性核验（逐表查 information_schema.STATISTICS，不是逐表 SHOW INDEX）。
+    // 不是用户查询：2s 的用户点查预算在公网链路上连十几张表的 RTT 都不够
+    // （2026-08-08 实测公网核验必超时 → 点查整关）。
     let deadline = tokio::time::Instant::now() + LOOKUP_INDEX_VERIFY_TIMEOUT;
     let mut verified: LookupIndexes = HashMap::new();
     for table in tables {
         if !table.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
-            return Err(ConnectorError::config(at, "生产点查索引登记表名不合法"));
+            return Err(ConnectorError::config(
+                at,
+                format!("生产点查索引登记表名不合法: {table}"),
+            ));
         }
+        let table_lc = table.to_ascii_lowercase();
         // 全列 CAST AS CHAR：SHOW INDEX 的列型随 MySQL 版本漂移（8.0.28 实测按名解码
         // 直接失败），information_schema + 全文本投影是唯一可移植形态（探针同款）。
         // IS_VISIBLE 只存在 8.0+，不查它：不可见索引是 DBA 的显式动作，按可见处理
         // （与旧代码 Visible 解码失败时 unwrap_or(true) 同语义）。
         let stmt = format!(
-            "SELECT CAST(INDEX_NAME AS CHAR), CAST(SEQ_IN_INDEX AS CHAR),                     CAST(COLUMN_NAME AS CHAR), CAST(NON_UNIQUE AS CHAR),                     CAST(SUB_PART AS CHAR), CAST(INDEX_TYPE AS CHAR)              FROM information_schema.STATISTICS              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{table}'"
+            "SELECT CAST(INDEX_NAME AS CHAR), CAST(SEQ_IN_INDEX AS CHAR),                     CAST(COLUMN_NAME AS CHAR), CAST(NON_UNIQUE AS CHAR),                     CAST(SUB_PART AS CHAR), CAST(INDEX_TYPE AS CHAR)             FROM information_schema.STATISTICS             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{table}'"
         );
         let rows = tokio::time::timeout_at(deadline, sqlx::raw_sql(&stmt).fetch_all(pool))
             .await
             .map_err(|_| ConnectorError::timeout(at, LOOKUP_INDEX_VERIFY_TIMEOUT))?
             .map_err(|e| sqlx_err(at, e))?;
-        let mut indexes: BTreeMap<String, Vec<(i64, String, i64, Option<i64>, String, bool)>> =
+        let mut indexes: BTreeMap<String, Vec<(i64, String, i64, Option<i64>, String)>> =
             BTreeMap::new();
         for row in rows {
             let index: String = row.try_get(0).map_err(|e| sqlx_err(at, e))?;
@@ -565,30 +627,21 @@ async fn verify_lookup_indexes(
                 .map_err(|e| sqlx_err(at, e))?
                 .and_then(|value| value.parse().ok());
             let index_type: String = row.try_get(5).map_err(|e| sqlx_err(at, e))?;
-            let visible = true;
-            indexes.entry(index).or_default().push((
-                seq,
-                column,
-                non_unique,
-                sub_part,
-                index_type,
-                visible,
-            ));
+            // IS_VISIBLE 不查（见上注释）：不可见索引按可见处理，故元组不带 visible 字段
+            indexes.entry(index).or_default().push((seq, column, non_unique, sub_part, index_type));
         }
         for columns in indexes.values_mut() {
-            columns.sort_by_key(|column| column.0);
-            let Some((seq, column, non_unique, sub_part, index_type, visible)) = columns.first()
-            else {
-                continue;
-            };
+            // or_default 只产出非空 Vec：first 的 None 分支不可达；只要 SEQ 最小者，用
+            // min_by_key 免全排序（稳定排序的首元素 == 首个最小值，语义同）
+            let (seq, column, non_unique, sub_part, index_type) =
+                columns.iter().min_by_key(|column| column.0).expect("or_default 保证非空");
             if *seq != 1
                 || sub_part.is_some()
-                || !*visible
-                || !matches!(index_type.to_ascii_uppercase().as_str(), "BTREE" | "HASH")
+                || !(index_type.eq_ignore_ascii_case("BTREE") || index_type.eq_ignore_ascii_case("HASH"))
             {
                 continue;
             }
-            let key = (table.to_ascii_lowercase(), column.to_ascii_lowercase());
+            let key = (table_lc.clone(), column.to_ascii_lowercase());
             if registered.contains_key(&key) {
                 let found = if *non_unique == 0 && columns.len() == 1 {
                     DmsIndexKind::Unique
@@ -617,13 +670,18 @@ fn ensure_verified_lookup(
     let verified = verified.ok_or_else(|| {
         ConnectorError::config(at, "生产业务点查索引尚未完成核验，按 fail-closed 拒绝")
     })?;
-    if !sql.lookup_cols().is_empty()
-        && sql.lookup_cols().iter().all(|column| {
-            let required = registered_lookup_kind(sql.table(), column);
-            let found = verified.get(&(
-                sql.table().to_ascii_lowercase(),
-                column.to_ascii_lowercase(),
-            )).copied();
+    if sql.lookup_cols().is_empty() {
+        return Err(ConnectorError::config(
+            at,
+            "生产业务点查缺少业务键条件（空键集），拒绝生产点查",
+        ));
+    }
+    let table_lc = sql.table().to_ascii_lowercase();
+    if sql.lookup_cols().iter().all(|column| {
+        let required = registered_lookup_kind(sql.table(), column);
+        let found = verified
+            .get(&(table_lc.clone(), column.to_ascii_lowercase()))
+            .copied();
             matches!(
                 (required, sql.index_kind(), found),
                 (
@@ -677,8 +735,9 @@ async fn pool_read_only(pool: &sqlx::MySqlPool, capability: MysqlCapability) -> 
          UNION ALL SELECT PRIVILEGE_TYPE FROM information_schema.SCHEMA_PRIVILEGES WHERE GRANTEE = CURRENT_USER() \
          UNION ALL SELECT PRIVILEGE_TYPE FROM information_schema.TABLE_PRIVILEGES WHERE GRANTEE = CURRENT_USER()\
          ) p";
+    // 数仓走公网链路（单条探针实测 ~27s）：账号权限核验不能用生产点查的 2s 预算
     let rows = match tokio::time::timeout(
-        DMS_LOOKUP_TIMEOUT,
+        WAREHOUSE_CATALOG_TIMEOUT,
         sqlx::raw_sql(sql).fetch_all(pool),
     )
     .await
@@ -711,7 +770,7 @@ impl SqlSource for ReadOnlyMySql {
     }
 
     fn is_warehouse(&self) -> bool {
-        self.pool.read().expect("mysql pool 锁中毒").capability.is_warehouse()
+        self.pool.read().unwrap_or_else(|e| e.into_inner()).capability.is_warehouse()
     }
 
     fn dialect(&self) -> &'static dyn Dialect {
@@ -719,7 +778,7 @@ impl SqlSource for ReadOnlyMySql {
     }
 
     fn set_ds_policy(&self, policy: DsPolicy) {
-        *self.ds_policy.lock().expect("mysql 策略锁中毒") = policy;
+        *self.ds_policy.lock().unwrap_or_else(|e| e.into_inner()) = policy;
     }
 
     fn fetch<'a>(
@@ -746,16 +805,22 @@ impl SqlSource for ReadOnlyMySql {
             let _slot = if warehouse {
                 None
             } else {
-                Some(self.acquire_lookup_slot(deadline, t).await?)
+                Some(self.acquire_lookup_slot(deadline).await?)
             };
+            let started = std::time::Instant::now();
             let rows = tokio::time::timeout_at(deadline, sqlx::raw_sql(wire).fetch_all(&pool))
                 .await
                 .map_err(|_| ConnectorError::timeout(at, t))?
                 .map_err(|e| sqlx_err(at, e))?;
+            // scoped fetch 慢查询留痕（与 fixed.rs 的 500ms 慢日志同档，只加日志）
+            let elapsed = started.elapsed();
+            if elapsed > Duration::from_millis(500) {
+                tracing::warn!(ds = at, elapsed_ms = elapsed.as_millis(), warehouse, "scoped fetch 偏慢");
+            }
             let (columns, mut data) = to_table(&rows, max);
             // Doris 的 0 行结果补列名；生产点查禁止额外 DESCRIBE 往返。
             let columns = match columns.is_empty() {
-                true if warehouse => describe_columns(&pool, wire, at).await?,
+                true if warehouse => describe_columns(&pool, wire, at, t).await?,
                 true => vec![],
                 false => columns,
             };
@@ -786,9 +851,9 @@ impl SqlSource for ReadOnlyMySql {
                 Err(err) => return Ok(Some(err.to_string())),
             };
             let wire = checked.wire();
-            let warehouse = capability.is_warehouse();
-            let t = if warehouse { t } else { t.min(DMS_LOOKUP_TIMEOUT) };
-            // 生产 MySQL 到这里已经过单表业务键点查闸门；Doris 仍保留通用分析 EXPLAIN。
+            // 【A8】与 fetch 同口径：ds 级策略只许收紧 explain 预算（行上限无意义，给满）
+            let (_, t) = effective_limits(true, self.ds_policy(), usize::MAX, t);
+            // 非数仓已在上面早退（Ok(None)），这里只剩 Doris 的通用分析 EXPLAIN。
             let stmt = format!("EXPLAIN {wire}");
             match tokio::time::timeout(t, sqlx::raw_sql(&stmt).fetch_all(&pool)).await {
                 Ok(Ok(_)) => Ok(None),
@@ -807,7 +872,7 @@ impl SqlSource for ReadOnlyMySql {
             if !capability.is_warehouse() {
                 return Err(ConnectorError::config(
                     at,
-                    "production_lookup 禁止全库 schema autodiscover",
+                    format!("{} 禁止全库 schema autodiscover", capability.label()),
                 ));
             }
             probe_mysql_schema(&pool, at, self.dialect()).await
@@ -843,10 +908,14 @@ async fn probe_mysql_schema(
     dialect: &'static dyn Dialect,
 ) -> Result<SchemaSnapshot, ConnectorError> {
     // 两条探针来自 `Dialect`（kernel 已逐字收录 meta.rs 的形态，含 CAST 两个坑）。
-    let table_rows = sqlx::raw_sql(dialect.table_probe())
-        .fetch_all(pool)
-        .await
-        .map_err(|e| sqlx_err(at, e))?;
+    // 包超时：公网链路挂住时不能一路等到 TCP 层（目录探针的 60s 同款预算）。
+    let table_rows = tokio::time::timeout(
+        WAREHOUSE_CATALOG_TIMEOUT,
+        sqlx::raw_sql(dialect.table_probe()).fetch_all(pool),
+    )
+    .await
+    .map_err(|_| ConnectorError::timeout(at, WAREHOUSE_CATALOG_TIMEOUT))?
+    .map_err(|e| sqlx_err(at, e))?;
     let tables = table_rows
         .iter()
         .map(|row| {
@@ -855,10 +924,13 @@ async fn probe_mysql_schema(
             Ok((name, comment, rows.and_then(|v| v.parse::<i64>().ok())))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
-    let column_rows = sqlx::raw_sql(dialect.column_probe())
-        .fetch_all(pool)
-        .await
-        .map_err(|e| sqlx_err(at, e))?;
+    let column_rows = tokio::time::timeout(
+        WAREHOUSE_CATALOG_TIMEOUT,
+        sqlx::raw_sql(dialect.column_probe()).fetch_all(pool),
+    )
+    .await
+    .map_err(|_| ConnectorError::timeout(at, WAREHOUSE_CATALOG_TIMEOUT))?
+    .map_err(|e| sqlx_err(at, e))?;
     let cols = column_rows
         .iter()
         .map(|row| {
@@ -953,6 +1025,7 @@ fn merge_warehouse_catalog_rows(
             columns: Vec::new(),
         });
         if !entry.columns.iter().any(|column| column.name.eq_ignore_ascii_case(&name)) {
+            // 列去重是 O(n²)：单表列数十级，规模假设成立，不值得上 HashSet
             entry.columns.push(ColumnInfo { name, data_type, comment: col_comment, ordinal });
         }
     }
@@ -972,7 +1045,7 @@ fn merge_warehouse_catalog_rows(
         missing: expected_names.len().saturating_sub(found.len()),
         ..WarehouseCatalogStats::default()
     };
-    for (_, mut table) in found {
+    for mut table in found.into_values() {
         table.columns.sort_by_key(|column| column.ordinal);
         stats.tables += 1;
         stats.columns += table.columns.len();
@@ -1050,8 +1123,9 @@ pub(crate) fn snapshot(
     }
 }
 
-/// sqlx 错误 → `ConnectorError`，与 `fixed::classify` 同口径（只有 `Database` 归 `Query`，
-/// 因为只有它是「数据库明确判定语句有问题」= 可拿去 repair）。`postgres.rs`/`owned.rs` 共用。
+/// sqlx 错误 → `ConnectorError`，与 `fixed::classify` **变体**同口径（只有 `Database` 归 `Query`，
+/// 因为只有它是「数据库明确判定语句有问题」= 可拿去 repair；文案分工见 classify 注释）。
+/// `postgres.rs`/`owned.rs` 共用。
 pub(crate) fn sqlx_err(at: &str, e: sqlx::Error) -> ConnectorError {
     match e {
         sqlx::Error::Database(db) => {
@@ -1096,7 +1170,7 @@ pub(crate) fn redact(
         return vec![];
     }
     let names: Vec<String> = hit.iter().map(|i| columns[*i].clone()).collect();
-    tracing::warn!("结果集敏感列已置空: {names:?}");
+    tracing::warn!(reason = "sensitive_columns_redacted", columns = ?names, "结果集敏感列已置空");
     for row in data.iter_mut() {
         for i in &hit {
             if let Some(cell) = row.get_mut(*i) {
@@ -1109,26 +1183,53 @@ pub(crate) fn redact(
 
 /// 0 行结果的列名回填：`DESCRIBE SELECT` 只解析不取数（只读会话允许，见 fetch 调用点）。
 /// describe 失败**降级为空列**（warn 留痕）—— 元数据拿不到不是让取数失败的理由。
+/// 整段包在 `budget` 内：数仓链路挂住时 fetch 不能因回填失去上限。
 async fn describe_columns(
     pool: &sqlx::MySqlPool,
     sql: &str,
     at: &str,
+    budget: Duration,
 ) -> Result<Vec<String>, ConnectorError> {
     use sqlx::Executor as _;
-    let mut conn = pool.acquire().await.map_err(|e| sqlx_err(at, e))?;
-    match conn.describe(sql).await {
-        Ok(d) => Ok(d.columns().iter().map(|c| c.name().to_string()).collect()),
+    async fn inner(
+        pool: &sqlx::MySqlPool,
+        sql: &str,
+        at: &str,
+    ) -> Result<Vec<String>, ConnectorError> {
+        // acquire 失败同样降级空列（与 describe 失败同口径，不让回填步骤有两种失败口径）
+        let mut conn = match pool.acquire().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(reason = "describe_acquire_failed", ds = at, err = %e, "DESCRIBE 取连接失败（空列返回）");
+                return Ok(vec![]);
+            }
+        };
+        match conn.describe(sql).await {
+            Ok(d) => Ok(d.columns().iter().map(|c| c.name().to_string()).collect()),
+            Err(_) => {
+                tracing::warn!(reason = "describe_columns_failed", ds = at, "DESCRIBE 回填列名失败（空列返回）");
+                Ok(vec![])
+            }
+        }
+    }
+    match tokio::time::timeout(budget, inner(pool, sql, at)).await {
+        Ok(res) => res,
         Err(_) => {
-            tracing::warn!(reason = "describe_columns_failed", "DESCRIBE 回填列名失败（空列返回）");
+            tracing::warn!(reason = "describe_columns_timeout", ds = at, "DESCRIBE 回填列名超时（空列返回）");
             Ok(vec![])
         }
     }
 }
 
 /// 行集 → (列名, JSON 行)。列名取自首行（无行则空列，与拆分前逐行等价）；`max` 行即截断不报错。
-fn to_table(rows: &[sqlx::mysql::MySqlRow], max: usize) -> (Vec<String>, Vec<Vec<Value>>) {    let mut columns: Vec<String> = vec![];
+fn to_table(rows: &[sqlx::mysql::MySqlRow], max: usize) -> (Vec<String>, Vec<Vec<Value>>) {
+    let mut columns: Vec<String> = vec![];
     let mut data: Vec<Vec<Value>> = vec![];
     for (i, row) in rows.iter().enumerate() {
+        // 先判后收：max=0（DsPolicy 最紧档，source.rs 契约「恒空结果」）一行都不能返
+        if data.len() >= max {
+            break;
+        }
         if i == 0 {
             columns = row.columns().iter().map(|c| c.name().to_string()).collect();
         }
@@ -1139,9 +1240,6 @@ fn to_table(rows: &[sqlx::mysql::MySqlRow], max: usize) -> (Vec<String>, Vec<Vec
                 .map(|(ci, col)| cell_to_json(row, ci, col.type_info().name()))
                 .collect(),
         );
-        if data.len() >= max {
-            break;
-        }
     }
     (columns, data)
 }
@@ -1161,7 +1259,8 @@ pub(crate) enum Cell {
 pub(crate) fn cell_kind(ty: &str) -> Cell {
     match ty {
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "TINYINT UNSIGNED"
-        | "SMALLINT UNSIGNED" | "INT UNSIGNED" | "BIGINT UNSIGNED" | "YEAR" => Cell::Int,
+        | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" | "BIGINT UNSIGNED"
+        | "YEAR" => Cell::Int,
         "FLOAT" | "DOUBLE" => Cell::Float,
         "DECIMAL" => Cell::Dec,
         "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" => Cell::Time,
@@ -1190,6 +1289,13 @@ fn cell_to_json(row: &sqlx::mysql::MySqlRow, i: usize, ty: &str) -> Value {
                     .ok()
                     .flatten()
                     .map(|d| Value::from(d.format("%Y-%m-%d").to_string()))
+            })
+            // MySQL TIME 型 sqlx 解为 NaiveTime（按 sqlx 类型名表补的第三回落，未经带库验证）
+            .or_else(|| {
+                row.try_get::<Option<sqlx::types::chrono::NaiveTime>, _>(i)
+                    .ok()
+                    .flatten()
+                    .map(|t| Value::from(t.format("%H:%M:%S").to_string()))
             })),
         Cell::Text => get(row.try_get::<Option<String>, _>(i).ok().flatten().map(Value::from)),
     }
@@ -1225,6 +1331,7 @@ mod tests {
     #[test]
     fn cell_kind_maps_every_family() {
         assert_eq!(cell_kind("BIGINT UNSIGNED"), Cell::Int);
+        assert_eq!(cell_kind("MEDIUMINT UNSIGNED"), Cell::Int, "sqlx 类型名表里的无符号中整型");
         assert_eq!(cell_kind("YEAR"), Cell::Int);
         assert_eq!(cell_kind("DOUBLE"), Cell::Float);
         // 🔴 DECIMAL 必须走字符串保精度，不能落进 Float
@@ -1471,8 +1578,12 @@ fn fill_blank_comments(
 ) -> usize {
     let mut filled = 0;
     for (table, col) in &mut snap.columns {
+        // mapped 的键已全小写（enrich_dms_snapshot 建表时统一过小写化）；
+        // 每空白列一次 (table, col) 小写分配做查找 —— 空白列数量有限，不为省分配换键类型
         if col.comment.trim().is_empty() {
-            if let Some(comment) = mapped.get(&(table.to_lowercase(), col.name.to_lowercase())) {
+            if let Some(comment) =
+                mapped.get(&(table.to_ascii_lowercase(), col.name.to_ascii_lowercase()))
+            {
                 col.comment = comment.clone();
                 filled += 1;
             }

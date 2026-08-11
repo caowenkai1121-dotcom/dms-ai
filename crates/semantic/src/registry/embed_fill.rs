@@ -16,7 +16,8 @@ use sqlx::PgPool;
 use crate::registry::ds_pred;
 
 /// 单轮每类最多补多少行：攒了几千行时一轮全补会把本轮拖成几分钟 —— 分批，
-/// 剩下的下一轮（调度每 10 分钟叫一次），每轮有界。
+/// 剩下的下一轮（调度间隔定义在 server 侧 `server/src/embed_fill.rs`，本文件不抄数字），
+/// 每轮有界。
 pub const FILL_BATCH: i64 = 256;
 
 /// 五类 meta 向量目标。`Datasource` 没有 ds 谓词：它是 ds 注册表本身
@@ -46,38 +47,42 @@ impl MetaVecTarget {
         !matches!(self, Self::Datasource)
     }
 
-    fn select_sql(&self) -> String {
-        match self {
-            // 文本配方四连，与离线 build 逐字一致（判据钉在下方）
-            Self::TableDoc => format!(
-                "SELECT table_name, coalesce(nullif(search_doc, ''), table_name) \
-                 FROM meta.table_doc WHERE embedding IS NULL{ds_pred} LIMIT $2",
-                ds_pred = ds_pred(1)
-            ),
-            Self::Element => format!(
-                "SELECT element_id, search_text FROM meta.element \
-                 WHERE status = 'active' AND embedding IS NULL{ds_pred} LIMIT $2",
-                ds_pred = ds_pred(1)
-            ),
-            Self::Datasource =>
+    /// 五条 SQL 的进程内成品（`ds_pred(1)` 对固定入参是确定串，不每次调用 format! 重建）。
+    /// 下标 = 枚举声明序（与 `ALL` 同序）。
+    fn select_sql(&self) -> &'static str {
+        static SQLS: std::sync::LazyLock<[String; 5]> = std::sync::LazyLock::new(|| {
+            [
+                // 文本配方四连，与离线 build 逐字一致（判据钉在下方）
+                format!(
+                    "SELECT table_name, coalesce(nullif(search_doc, ''), table_name) \
+                     FROM meta.table_doc WHERE embedding IS NULL{ds_pred} LIMIT $2",
+                    ds_pred = ds_pred(1)
+                ),
+                format!(
+                    "SELECT element_id, search_text FROM meta.element \
+                     WHERE status = 'active' AND embedding IS NULL{ds_pred} LIMIT $2",
+                    ds_pred = ds_pred(1)
+                ),
                 "SELECT ds_id, name || '。' || description FROM meta.datasource \
                  WHERE status = 'active' AND embedding IS NULL LIMIT $1"
                     .to_string(),
-            Self::SqlExemplar => format!(
-                "SELECT id::text, question FROM meta.sql_exemplar \
-                 WHERE status = 'enabled' AND embedding IS NULL{ds_pred} LIMIT $2",
-                ds_pred = ds_pred(1)
-            ),
-            // 经验的向量化文本 = content 原文（蒸馏时已截 400 字，无需再加工）
-            Self::Memory => format!(
-                "SELECT id::text, content FROM meta.memory \
-                 WHERE embedding IS NULL{ds_pred} LIMIT $2",
-                ds_pred = ds_pred(1)
-            ),
-        }
+                format!(
+                    "SELECT id::text, question FROM meta.sql_exemplar \
+                     WHERE status = 'enabled' AND embedding IS NULL{ds_pred} LIMIT $2",
+                    ds_pred = ds_pred(1)
+                ),
+                // 经验的向量化文本 = content 原文（蒸馏时已截 400 字，无需再加工）
+                format!(
+                    "SELECT id::text, content FROM meta.memory \
+                     WHERE embedding IS NULL{ds_pred} LIMIT $2",
+                    ds_pred = ds_pred(1)
+                ),
+            ]
+        });
+        &SQLS[*self as usize]
     }
 
-    fn update_sql(&self) -> String {
+    fn update_sql(&self) -> &'static str {
         match self {
             Self::TableDoc =>
                 "UPDATE meta.table_doc SET embedding = $1::vector WHERE table_name = $2 AND ds_id = $3",
@@ -90,7 +95,6 @@ impl MetaVecTarget {
             Self::Memory =>
                 "UPDATE meta.memory SET embedding = $1::vector WHERE id = $2::bigint AND ds_id = $3",
         }
-        .to_string()
     }
 }
 
@@ -101,8 +105,9 @@ pub async fn null_vec_rows(
     t: MetaVecTarget,
     limit: i64,
 ) -> anyhow::Result<Vec<(String, String)>> {
+    let limit = limit.max(0); // 负值 PG 直接报错，夹紧
     let sel = t.select_sql();
-    let q = sqlx::query_as::<_, (String, String)>(&sel);
+    let q = sqlx::query_as::<_, (String, String)>(sel);
     let rows = if t.ds_scoped() {
         q.bind(ds).bind(limit).fetch_all(pg).await?
     } else {
@@ -119,8 +124,7 @@ pub async fn write_vec(
     id: &str,
     lit: &str,
 ) -> anyhow::Result<()> {
-    let upd = t.update_sql();
-    let q = sqlx::query(&upd).bind(lit).bind(id);
+    let q = sqlx::query(t.update_sql()).bind(lit).bind(id);
     if t.ds_scoped() {
         q.bind(ds).execute(pg).await?;
     } else {
@@ -151,11 +155,14 @@ mod tests {
         // 锚点 `concat!` 拼（自匹配家族，本仓第七次）：漂移守卫扫全文件找 `FROM meta.<表>`，
         // 裸写会被它当成一条缺 ds 谓词的召回 SQL —— 注释里也不许出现那三个字连表名。
         assert!(m.contains(concat!("id::text, content FROM meta.", "memory")), "{m}");
-        // 问句侧只有语料问句一类（离线 `_revec(.., is_query=True)` 只传了它）
-        assert!(MetaVecTarget::SqlExemplar.is_query_side());
-        for t in [MetaVecTarget::TableDoc, MetaVecTarget::Element, MetaVecTarget::Datasource,
-                  MetaVecTarget::Memory] {
-            assert!(!t.is_query_side(), "{t:?} 该是文档侧");
+        // 问句侧只有语料问句一类（离线 `_revec(.., is_query=True)` 只传了它）；
+        // 遍历 ALL 而不是手抄清单：新增目标漏加会当场红
+        for t in MetaVecTarget::ALL {
+            assert_eq!(
+                t.is_query_side(),
+                matches!(t, MetaVecTarget::SqlExemplar),
+                "{t:?} 的问句侧标记"
+            );
         }
     }
 

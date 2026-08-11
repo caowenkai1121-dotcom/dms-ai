@@ -33,6 +33,68 @@ pub mod registry;
 pub mod rerank;
 pub mod source;
 
+/// UNIX 秒（熔断/冷却计时共用）：时钟异常返 0 → `now() < cooldown_until` 恒真 = 永久冷却，
+/// fail-closed 是刻意取舍（服务在烧时不该继续打）。
+pub(crate) fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 面向用户的外呼统一超时（3s：用户在等）。embed/rerank/external_kb 共用一档。
+pub(crate) const HTTP_CALL_TIMEOUT_SECS: u64 = 3;
+/// 外呼服务熔断冷却期（300s）：服务挂时每问白等一个超时才是事故。各客户端共用一档。
+pub(crate) const COOLDOWN_SECS: u64 = 300;
+
+/// embed / rerank / external_kb 测试共用的最小 HTTP 桩件（不引新依赖）。
+#[cfg(test)]
+pub(crate) mod test_stub {
+    pub fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    pub fn content_len(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .to_lowercase()
+            .split("content-length:")
+            .nth(1)
+            .and_then(|t| t.split("\r\n").next())
+            .and_then(|t| t.trim().parse().ok())
+            .expect("stub 需要 Content-Length，缺头会提前 break 喂空 body")
+    }
+
+    /// 按 Content-Length 读满一个请求（半个 body 喂 serde_json 会 panic 在桩里，
+    /// 看起来像「客户端没发全」）。返回 (head 小写文本, body)；对端断开 → None。
+    pub async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let head = loop {
+            if let Some(h) = find(&buf, b"\r\n\r\n") {
+                if buf.len() >= h + 4 + content_len(&buf[..h]) {
+                    break h;
+                }
+            }
+            let mut b = [0u8; 8192];
+            match sock.read(&mut b).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buf.extend_from_slice(&b[..n]),
+            }
+        };
+        Some((String::from_utf8_lossy(&buf[..head]).to_lowercase(), buf[head + 4..].to_vec()))
+    }
+
+    /// 200 JSON 响应（Connection: close）
+    pub fn json_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+}
+
 // 路径一次性钉死（同 kernel 的做法）：同一个类型只有一条 use 路径。
 // ARCHITECTURE §5 与后续计划写的都是 `dms_connector::OwnedStore`，照文档写不能撞 E0433。
 pub use error::ConnectorError;
@@ -44,3 +106,4 @@ pub use owned::OwnedStore;
 pub use postgres::PostgresSource;
 pub use registry::{DsSpec, SourceRegistry};
 pub use source::{DsPolicy, RowSet, SchemaSnapshot, SourceKind, SqlSource};
+

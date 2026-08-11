@@ -18,13 +18,13 @@ use crate::registry::datasource::DMS_DS_ID;
 use crate::registry::element::sync_elements;
 use crate::registry::lexicon::load_value_domains;
 use crate::registry::{is_backup_table, is_sensitive_col};
-use match_dict::best_dict_match;
+use match_dict::best_dict_match_ix;
 use probe::{ColRef, ProbeGate};
 use register::DictHit;
 
 /// A1 自动发现引擎：字典码列自动对码（数据驱动注册——字典变了重跑即自适应，不再需要手工播种）。
-/// 候选=码型后缀列(*_code/_type/_status/_class/_mode/_way/_level)+小表(row_estimate<100万)；
-/// 只读 DISTINCT 抽样(≤61 值)；值集 ⊆ 某 dict key 码集(覆盖≥80% 且 ≥2 值)→
+/// 候选=码型后缀列（后缀清单以 `probe::candidate_columns` 的正则为准，这里不复制）+小表
+/// (row_estimate<100万)；只读 DISTINCT 抽样(≤61 值)；值集 ⊆ 某 dict key 码集(覆盖≥80% 且 ≥2 值)→
 /// 自动注册 value_map(eq 换码,字典全码)+dimension(CASE 翻名)。人工种子优先：已覆盖 (表,列) 跳过。
 /// 收尾再跑 `discover_domain_values`（名称型值域取值 → 同一张 value_map，见该函数）。
 pub async fn autodiscover_dict_columns(
@@ -32,19 +32,38 @@ pub async fn autodiscover_dict_columns(
     pg: &PgPool,
     gate: &ProbeGate<'_>,
 ) -> anyhow::Result<serde_json::Value> {
-    // 只吃 `&ReadOnlyMySql`（= DMS 主源）→ 读写都固定在 'dms' 那一格（与 `sync_schema` 同）
+    // 只吃 `&ReadOnlyMySql`（= DMS 主源）→ 读写都固定在 'dms' 那一格
     let ds = DMS_DS_ID;
-    let dicts = probe::load_dicts(mysql).await?;
-    let cands = probe::candidate_columns(pg, ds).await?;
-    let manual = probe::manual_covered(pg, ds).await?;
-    let del_tables = probe::del_flag_tables(pg, ds).await?;
+    // 四条加载互不依赖（1×MySQL + 3×PG），一次并发取齐（原来串行白加四段启动延迟）
+    let (dicts, cands, manual, del_tables) = tokio::try_join!(
+        probe::load_dicts(mysql),
+        probe::candidate_columns(pg, ds),
+        probe::manual_covered(pg, ds),
+        probe::del_flag_tables(pg, ds),
+    )?;
 
     let mut probed = 0usize;
+    let mut probe_failed = 0usize;
     let mut skipped_manual = 0usize;
+    let mut skipped_backup = 0usize;
+    let mut skipped_sensitive = 0usize;
+    let mut failed = 0usize;
     let mut registered: Vec<serde_json::Value> = vec![];
+    // 一轮对码的预建视图（小写键/码集只建一次，全部候选列复用；key 排序 → 跨轮可复现）
+    let dict_index = match_dict::DictIndex::build(&dicts);
 
-    for (table, col, comment) in &cands {
-        if is_backup_table(table) || is_sensitive_col(col) {
+    for (i, cand) in cands.iter().enumerate() {
+        let (table, col, comment) = (&cand.table, &cand.col, &cand.comment);
+        // 进度留痕：单探针最坏 10s × N 候选，跑半小时外面不能一动不动
+        if i > 0 && i % 50 == 0 {
+            tracing::info!(done = i, total = cands.len(), registered = registered.len(), "自动发现进度");
+        }
+        if is_backup_table(table) {
+            skipped_backup += 1;
+            continue;
+        }
+        if is_sensitive_col(col) {
+            skipped_sensitive += 1;
             continue;
         }
         if manual.covers(table, col) {
@@ -53,11 +72,17 @@ pub async fn autodiscover_dict_columns(
         }
         let c = ColRef { table, col, has_del: del_tables.contains(table) };
         let Some(values) = probe::sample_values(mysql, gate, &c).await else {
+            // 闸门拒/抽样失败两种原因已在 warn 日志里，这里计数进输出
+            probe_failed += 1;
             continue;
         };
+        // 空抽样（空表/全 NULL 列）不算探到（probed 口径 = 拿到非空抽样）
+        if values.is_empty() {
+            continue;
+        }
         probed += 1;
         let Some((dict_key, dict_name, pairs, coverage)) =
-            best_dict_match(&values, &dicts, comment)
+            best_dict_match_ix(&values, &dict_index, comment)
         else {
             continue;
         };
@@ -69,23 +94,44 @@ pub async fn autodiscover_dict_columns(
             dict_name,
             pairs,
             coverage,
-            distinct: values.len(),
+            // 不同值个数（trim 后去重；不是抽样行数）
+            distinct: values.iter().collect::<HashSet<_>>().len(),
         };
-        registered.push(register::register_match(pg, ds, &hit).await?);
+        match register::register_match(pg, ds, &hit).await {
+            Ok(v) => registered.push(v),
+            Err(e) => {
+                // 单次注册失败不中止整轮：前面已注册的保留、后面候选继续
+                failed += 1;
+                tracing::warn!(err = %e, "注册失败（继续后续候选）：{table}.{col}");
+            }
+        }
     }
 
-    let domains = discover_domain_values(mysql, pg, gate, &del_tables).await?;
+    // 收尾分段容错：字典段已落库的注册成果不因值域/元素同步失败而整轮 Err（部分成果可见）
+    let domains = match discover_domain_values(mysql, pg, gate, &del_tables, ds).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(err = %e, "值域取值入库失败（字典段成果保留）");
+            vec![]
+        }
+    };
 
     // 新注册的维度/码值同步进元素注册表（向量化召回原子单位）
-    sync_elements(pg).await?;
+    if let Err(e) = sync_elements(pg).await {
+        tracing::warn!(err = %e, "元素注册表同步失败（下轮启动补齐）");
+    }
 
     Ok(serde_json::json!({
         "dict_keys": dicts.len(),
         "candidates": cands.len(),
         "probed": probed,
+        "probe_failed": probe_failed,
         "skipped_manual": skipped_manual,
+        "skipped_backup": skipped_backup,
+        "skipped_sensitive": skipped_sensitive,
         "registered_count": registered.len(),
         "registered": registered,
+        "failed": failed,
         "domain_values": domains,
     }))
 }
@@ -104,9 +150,10 @@ async fn discover_domain_values(
     pg: &PgPool,
     gate: &ProbeGate<'_>,
     del_tables: &HashSet<String>,
+    ds: &str, // 与外层同一事实源（原来内部两处直接写 DMS_DS_ID，改 ds 语义只改一半）
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut out = vec![];
-    for d in load_value_domains(pg, DMS_DS_ID).await? {
+    for d in load_value_domains(pg, ds).await? {
         let (table, col) = (&d.table_name, &d.column_name);
         let c = ColRef { table, col, has_del: del_tables.contains(table) };
         let Some(values) = probe::sample_domain_values(mysql, gate, &c).await else {
@@ -117,7 +164,7 @@ async fn discover_domain_values(
             tracing::warn!("值域探针零取值，保留旧词典 {table}.{col}");
             continue;
         }
-        let n = register::register_domain_values(pg, DMS_DS_ID, table, col, &values).await?;
+        let n = register::register_domain_values(pg, ds, table, col, &values).await?;
         out.push(serde_json::json!({ "table": table, "column": col, "values": n }));
     }
     Ok(out)

@@ -31,8 +31,23 @@ pub struct LlmClient {
 
 #[derive(Clone)]
 struct RuntimeConf {
-    primary: Conf,
-    fallback_vision: Option<Conf>,
+    /// Arc 化：每次调用只付一次引用计数；整份克隆会把 `extra` 整个 Map 带上。
+    primary: std::sync::Arc<Conf>,
+    fallback_vision: Option<std::sync::Arc<Conf>>,
+}
+
+/// 锁毒化恢复：锁只会被「持锁期间 panic」（如 persist 闭包）毒化，那时运行时配置仍是
+/// 完整快照。恢复警卫继续服务，而不是让此后**所有** LLM 调用连锁 panic。
+fn unpoison<T>(r: std::sync::LockResult<T>) -> T {
+    r.unwrap_or_else(|e| e.into_inner())
+}
+
+/// 写入前的归一化：剥掉 `base_url` 首尾空白与尾斜杠。校验（`validate_base_url`）与使用
+/// （拼 `{base_url}/chat/completions`）从此看同一份值 —— settings.json 里带尾斜杠
+/// 不会再打出 `//chat/completions`，首尾空白也不会校验过了却原样存进去。
+fn normalized(mut conf: Conf) -> Conf {
+    conf.base_url = conf.base_url.trim().trim_end_matches('/').to_string();
+    conf
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +58,13 @@ pub struct VisionCapability {
 }
 
 pub(crate) const MAX_VISION_IMAGE_URL_BYTES: usize = 16 * 1024 * 1024;
+
+/// 单次 LLM 请求总超时。Precise 档长生成实测十几秒（思考全开 ~17s），
+/// 90s 给长生成留足余量，又不让挂死的连接无限占着。
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// LLM 响应体上限。正常补全响应是 KB 级，这只为拦「异常上游/代理回超大 body」。
+const MAX_LLM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// 视觉调用只向协议层暴露固定错误类别。上游 URL、响应正文和供应商名称都不能进入错误链，
 /// 避免未来新增日志或调用方直接返回错误时泄漏配置细节。
@@ -58,7 +80,7 @@ impl std::fmt::Display for VisionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             Self::InvalidImage => "图片仅支持 HTTPS 地址或受支持的 data:image Base64 数据",
-            Self::ImageTooLarge => "图片大小不能超过 16MB",
+            Self::ImageTooLarge => "图片数据（base64 后）不能超过 16MB",
             Self::Unavailable => "当前未配置可用的多模态模型",
             Self::Upstream => "图片解析服务暂时不可用",
         };
@@ -90,7 +112,7 @@ struct Msg<'a> {
 }
 
 impl LlmClient {
-        /// 带供应商特有参数的构造。**空 map 时与 `new` 逐字节等价**（判据 `empty_extra_is_byte_identical`）。
+    /// 带供应商特有参数的构造。**空 map 时与 `new` 逐字节等价**（判据 `empty_extra_is_byte_identical`）。
     ///
     /// # Panics
     /// `extra` 含 `messages`/`model` 时 panic —— 那是启动期的配置错误，必须响亮失败。
@@ -121,6 +143,8 @@ impl LlmClient {
 
     /// 启动时一次装入主供应商与备用视觉供应商。备用只在主供应商无 vision 时消费。
     pub fn with_conf_and_fallback(conf: Conf, fallback: Option<Conf>) -> Self {
+        let conf = normalized(conf);
+        let fallback = fallback.map(normalized);
         validate_conf(&conf, false).unwrap_or_else(|e| panic!("settings 的 LLM 配置无效: {e}"));
         if let Some(c) = fallback.as_ref() {
             validate_conf(c, true)
@@ -128,11 +152,11 @@ impl LlmClient {
         }
         Self {
             runtime: std::sync::Arc::new(std::sync::RwLock::new(RuntimeConf {
-                primary: conf,
-                fallback_vision: fallback,
+                primary: std::sync::Arc::new(conf),
+                fallback_vision: fallback.map(std::sync::Arc::new),
             })),
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(90))
+                .timeout(HTTP_TIMEOUT)
                 .build()
                 .expect("http client"),
         }
@@ -142,31 +166,35 @@ impl LlmClient {
     /// 这是运行时路径，不是启动路径，拒绝切换就是了。
     #[cfg(test)]
     pub fn set_conf(&self, conf: Conf) -> anyhow::Result<()> {
+        let conf = normalized(conf);
         validate_conf(&conf, false)?;
-        self.runtime.write().expect("llm runtime lock").primary = conf;
+        unpoison(self.runtime.write()).primary = std::sync::Arc::new(conf);
         Ok(())
     }
 
     /// 保存/清除备用视觉供应商。先完整校验再换锁，拒绝时旧配置原样保留。
     #[cfg(test)]
     pub fn set_fallback_vision(&self, conf: Option<Conf>) -> anyhow::Result<()> {
+        let conf = conf.map(normalized);
         if let Some(c) = conf.as_ref() {
             validate_conf(c, true)?;
         }
-        self.runtime.write().expect("llm runtime lock").fallback_vision = conf;
+        unpoison(self.runtime.write()).fallback_vision = conf.map(std::sync::Arc::new);
         Ok(())
     }
 
     /// 设置页同时改供应商形状/key/备用模型时，用一次校验后的临界区提交整份运行时快照。
     /// 任一配置不合法时快照不动；调用期间不会出现主配置更新而备用仍是旧值。
     pub fn set_runtime_configs(&self, primary: Conf, fallback: Option<Conf>) -> anyhow::Result<()> {
+        let primary = normalized(primary);
+        let fallback = fallback.map(normalized);
         validate_conf(&primary, false)?;
         if let Some(c) = fallback.as_ref() {
             validate_conf(c, true)?;
         }
-        *self.runtime.write().expect("llm runtime lock") = RuntimeConf {
-            primary,
-            fallback_vision: fallback,
+        *unpoison(self.runtime.write()) = RuntimeConf {
+            primary: std::sync::Arc::new(primary),
+            fallback_vision: fallback.map(std::sync::Arc::new),
         };
         Ok(())
     }
@@ -179,15 +207,17 @@ impl LlmClient {
         fallback: Option<Conf>,
         persist: impl FnOnce() -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let primary = normalized(primary);
+        let fallback = fallback.map(normalized);
         validate_conf(&primary, false)?;
         if let Some(c) = fallback.as_ref() {
             validate_conf(c, true)?;
         }
-        let mut runtime = self.runtime.write().expect("llm runtime lock");
+        let mut runtime = unpoison(self.runtime.write());
         let old = runtime.clone();
         *runtime = RuntimeConf {
-            primary,
-            fallback_vision: fallback,
+            primary: std::sync::Arc::new(primary),
+            fallback_vision: fallback.map(std::sync::Arc::new),
         };
         if let Err(error) = persist() {
             *runtime = old;
@@ -198,8 +228,8 @@ impl LlmClient {
 
     /// 当前 Conf 的快照（调用一次的读取点：base_url/key/模型/extra 全从快照出，
     /// 切换半途不会出现「base_url 是新的、模型是旧的」的混搭）。
-    fn conf(&self) -> Conf {
-        self.runtime.read().expect("llm runtime lock").primary.clone()
+    fn conf(&self) -> std::sync::Arc<Conf> {
+        unpoison(self.runtime.read()).primary.clone()
     }
 
     /// 当前供应商的视觉能力：`Some(模型名)` = 支持图片识别，`None` = 没有（DeepSeek）。
@@ -210,18 +240,11 @@ impl LlmClient {
     }
 
     pub fn primary_provider(&self) -> String {
-        self.runtime
-            .read()
-            .expect("llm runtime lock")
-            .primary
-            .provider
-            .clone()
+        unpoison(self.runtime.read()).primary.provider.clone()
     }
 
     pub fn fallback_vision_provider(&self) -> Option<String> {
-        self.runtime
-            .read()
-            .expect("llm runtime lock")
+        unpoison(self.runtime.read())
             .fallback_vision
             .as_ref()
             .map(|c| c.provider.clone())
@@ -236,7 +259,13 @@ impl LlmClient {
     /// key 只经 settings.json 进来，永不出现在任何响应里）。
     pub fn public_conf(&self) -> (String, String, String, Option<String>, serde_json::Map<String, serde_json::Value>) {
         let c = self.conf();
-        (c.base_url, c.model_fast, c.model_precise, c.vision, c.extra)
+        (
+            c.base_url.clone(),
+            c.model_fast.clone(),
+            c.model_precise.clone(),
+            c.vision.clone(),
+            c.extra.clone(),
+        )
     }
 
     /// 【K6-B】带 token 用量的一次调用。**全仓唯一的 LLM 出口**：拆分前那个丢弃 usage 的
@@ -260,6 +289,8 @@ impl LlmClient {
         user: &str,
     ) -> anyhow::Result<(String, dms_kernel::llm::Usage)> {
         let body = build_body(model, system, user, &c.extra);
+        // 吞错纪律：reqwest/serde 真因只进服务端 tracing 日志，错误链保持笼统文案
+        // （上游细节不回浏览器 —— 红线），排障去日志里查。
         let resp = self
             .http
             .post(format!("{}/chat/completions", c.base_url))
@@ -267,19 +298,32 @@ impl LlmClient {
             .json(&body)
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("LLM 请求失败"))?;
+            .map_err(|e| {
+                tracing::warn!(err = %e, "LLM 请求发送失败");
+                anyhow::anyhow!("LLM 请求失败")
+            })?;
         let status = resp.status();
         if !status.is_success() {
+            // 供应商侧错误详情（限流原因、模型名下线）截断留痕，不进错误链
+            let detail = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, body = %detail.chars().take(512).collect::<String>(), "LLM 非 2xx 响应");
             anyhow::bail!("LLM 请求失败（HTTP {status}）");
         }
-        let v: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|_| anyhow::anyhow!("LLM 响应格式无效"))?;
-        let text = v["choices"][0]["message"]["content"]
-            .as_str()
-            .map(strip_thinking)
-            .ok_or_else(|| anyhow::anyhow!("LLM 响应缺 content"))?;
+        if resp.content_length().is_some_and(|n| n > MAX_LLM_RESPONSE_BYTES as u64) {
+            anyhow::bail!("LLM 响应格式无效");
+        }
+        let raw = resp.bytes().await.map_err(|e| {
+            tracing::warn!(err = %e, "LLM 响应读取失败");
+            anyhow::anyhow!("LLM 响应格式无效")
+        })?;
+        if raw.len() > MAX_LLM_RESPONSE_BYTES {
+            anyhow::bail!("LLM 响应格式无效");
+        }
+        let v: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
+            tracing::warn!(err = %e, "LLM 响应解析失败");
+            anyhow::anyhow!("LLM 响应格式无效")
+        })?;
+        let text = content_text(&v).ok_or_else(|| anyhow::anyhow!("LLM 响应缺 content"))?;
         Ok((text, read_usage(&v["usage"])))
     }
 
@@ -322,16 +366,13 @@ impl LlmClient {
             return Err(VisionError::Upstream);
         }
         let v: serde_json::Value = resp.json().await.map_err(|_| VisionError::Upstream)?;
-        let text = v["choices"][0]["message"]["content"]
-            .as_str()
-            .map(strip_thinking)
-            .filter(|text| !text.trim().is_empty())
-            .ok_or(VisionError::Upstream)?;
+        let text = content_text(&v).ok_or(VisionError::Upstream)?;
         Ok((text, read_usage(&v["usage"]), route))
     }
 
-    fn vision_route(&self) -> Result<(Conf, VisionCapability), VisionError> {
-        let runtime = self.runtime.read().expect("llm runtime lock").clone();
+    fn vision_route(&self) -> Result<(std::sync::Arc<Conf>, VisionCapability), VisionError> {
+        // 快照是 Arc 克隆（两次引用计数），不再整份克隆两份 Conf
+        let runtime = unpoison(self.runtime.read()).clone();
         let primary = runtime.primary;
         if let Some(model) = primary.vision.clone().filter(|m| !m.trim().is_empty()) {
             let route = VisionCapability {
@@ -358,20 +399,31 @@ impl LlmClient {
 
 fn validate_vision_image(image_url: &str) -> Result<(), VisionError> {
     validate_vision_image_len(image_url.len())?;
-    if image_url.starts_with("https://") {
-        let url = reqwest::Url::parse(image_url).map_err(|_| VisionError::InvalidImage)?;
-        if url.host().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(VisionError::InvalidImage);
+    // `Url::parse` 把 scheme 归一小写（WHATWG URL）：`HTTPS://…` 这类合法写法不再被误拒
+    if let Ok(url) = reqwest::Url::parse(image_url) {
+        if url.scheme() == "https" {
+            if url.host().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(VisionError::InvalidImage);
+            }
+            return Ok(());
         }
-        return Ok(());
+    } else if image_url
+        .get(.."https://".len())
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        // 形如 https 但不是合法 URL（如无 host）：直接拒，别掉进下面的 data URL 分支
+        //（用 `get` 而不是直接切片：多字节字符的位边界处切片会 panic）
+        return Err(VisionError::InvalidImage);
     }
     let (header, payload) = image_url.split_once(',').ok_or(VisionError::InvalidImage)?;
+    // RFC 2397 mediatype 大小写不敏感：统一转小写再比
+    let header = header.to_ascii_lowercase();
     if !matches!(
-        header,
+        header.as_str(),
         "data:image/png;base64"
             | "data:image/jpeg;base64"
             | "data:image/jpg;base64"
@@ -439,15 +491,21 @@ pub fn validate_conf(conf: &Conf, require_vision: bool) -> anyhow::Result<()> {
 
 /// 校验可保存但尚未启用的供应商形状；Key 可稍后填写，其他字段不能先存坏再等切换时报错。
 pub fn validate_provider_shape(conf: &Conf) -> anyhow::Result<()> {
-    if conf.extra.iter().any(|(key, value)| {
-        forbidden_extra_key(key)
-            || forbidden_extra_field(value).is_some()
-    }) {
-        anyhow::bail!("extra_body 不许含保留或敏感字段");
+    // 报错带上命中的键名（键名本身不敏感，值才是）——配置排障不该靠猜
+    let offender = conf.extra.iter().find_map(|(key, value)| {
+        if forbidden_extra_key(key) {
+            Some(key.as_str())
+        } else {
+            forbidden_extra_field(value)
+        }
+    });
+    if let Some(key) = offender {
+        anyhow::bail!("extra_body 不许含保留或敏感字段（命中键 `{key}`）");
     }
     validate_base_url(&conf.base_url)?;
     if conf.model_fast.trim().is_empty() || conf.model_precise.trim().is_empty() {
-        anyhow::bail!("供应商地址与 fast/precise 模型不能为空");
+        // 地址问题已在上面 `validate_base_url` 返回，走到这里只是模型为空
+        anyhow::bail!("fast/precise 模型不能为空");
     }
     for value in [Some(conf.model_fast.as_str()), Some(conf.model_precise.as_str()), conf.vision.as_deref()]
         .into_iter()
@@ -510,11 +568,17 @@ fn validate_base_url(base_url: &str) -> anyhow::Result<()> {
 /// 只剥**成对**的标签：单独一个 `</think>` 说明思考段被截断了，那时 content 里
 /// 剩下的是结论那一半，剥掉开头反而对（见判据 `strip_thinking_handles_truncation`）。
 fn strip_thinking(s: &str) -> String {
+    // 只钉小写形态：`<THINK>`/`<Think>` 变体剥不掉是已知缝隙（现用供应商实测都是小写输出；
+    // 真要堵需小写化扫描后按原串切片，未见到真实样本前不为假设付扫描成本）。
     const PAIRS: &[(&str, &str)] = &[
         ("<think>", "</think>"),
         ("<thinking>", "</thinking>"),
         ("<reasoning>", "</reasoning>"),
     ];
+    // 快速路径：没有 '<' 就不可能命中任何标签，直接省掉两次全量克隆
+    if !s.contains('<') {
+        return s.trim().to_string();
+    }
     let mut out = s.to_string();
     for (open, close) in PAIRS {
         loop {
@@ -560,6 +624,15 @@ fn build_body(
         }
     }
     body
+}
+
+/// 从 OpenAI 兼容响应里取正文：缺 content、或剥完思考段只剩空白，都按「无内容」处理。
+/// 文本与视觉两条出口同一判据 —— 空串不该一路流到 `extract_sql` 才变成「无 SQL」。
+fn content_text(v: &serde_json::Value) -> Option<String> {
+    v["choices"][0]["message"]["content"]
+        .as_str()
+        .map(strip_thinking)
+        .filter(|text| !text.trim().is_empty())
 }
 
 /// OpenAI 兼容响应的 `usage` 段 → `Usage`。缺段/缺字段（供应商不回用量）一律记 0，
@@ -609,9 +682,13 @@ impl dms_kernel::ChatModel for LlmClient {
 /// `ChatRequest::text` 产的正是「一条 system + 一条 user」，多轮形态先原样落平（v1 无多轮 LLM 调用）。
 fn split_roles(msgs: &[dms_kernel::Message]) -> (String, String) {
     let mut system = String::new();
+    // 显式标志而不是 `system.is_empty()`：首条 system 内容为空串时，
+    // 第二条 system 不许静默顶位（顶位等于把一条系统提示混进 user）
+    let mut seen_system = false;
     let mut user: Vec<&str> = Vec::new();
     for m in msgs {
-        if m.role == "system" && system.is_empty() {
+        if m.role == "system" && !seen_system {
+            seen_system = true;
             system = m.content.clone();
         } else {
             user.push(&m.content);
@@ -983,7 +1060,8 @@ mod tests {
     /// 也没有任何运行时断言能碰到（真 usage 只有连上供应商才拿得到）。故用源码守。
     #[test]
     fn chat_model_never_drops_usage() {
-        let src = include_str!("llm.rs");
+        // CRLF 检出的工作树上 `include_str!` 带 \r：先剥掉再切分，判据不对行尾敏感
+        let src = include_str!("llm.rs").replace('\r', "");
         // 只扫非测试段（否则本测试写的 needle 会让自己恒绿——哑测试，裁决 二·F F2）。
         // 锚点是测试模块声明而不是第一个 #[cfg(test)]：单测辅助构造器也带这个属性，
         // 咬属性会把生产段切没（实测：usage 断言因此假红）
@@ -994,7 +1072,12 @@ mod tests {
             !code.iter().any(|l| l.contains("Default::default()")),
             "usage 被丢成全 0 了：查询日志的 token 列会静默变空"
         );
-        assert!(code.iter().any(|l| l.contains("usage }")), "真 usage 必须原样进 ChatReply");
+        // 分两个锚：单行 `"usage }"` 绑死在 rustfmt 输出形状上，字段一重排/换行就假红
+        assert!(
+            code.iter().any(|l| l.contains("ChatReply {")),
+            "ChatReply 构造点没了 —— 锚要跟着实现一起改"
+        );
+        assert!(code.iter().any(|l| l.contains("usage")), "真 usage 必须原样进 ChatReply");
     }
 
     /// ChatModel 适配：system 必须落到 system 位，别把它拼进 user（提示词顺序是契约）
@@ -1003,5 +1086,102 @@ mod tests {
         let r = dms_kernel::ChatRequest::text(dms_kernel::ModelTier::Fast, "你是内核", "问句", None);
         assert_eq!(split_roles(&r.messages), ("你是内核".into(), "问句".into()));
         assert_eq!(split_roles(&[]), (String::new(), String::new()));
+    }
+
+    /// 首条 system 内容为空串时，第二条 system 不许静默顶位（显式 `seen_system` 标志）
+    #[test]
+    fn split_roles_first_system_wins_even_when_empty() {
+        let msgs = vec![
+            dms_kernel::Message { role: "system".into(), content: String::new() },
+            dms_kernel::Message { role: "system".into(), content: "S2".into() },
+            dms_kernel::Message { role: "user".into(), content: "U".into() },
+        ];
+        let (system, user) = split_roles(&msgs);
+        assert_eq!(system, "");
+        assert!(user.contains("S2") && user.contains("U"), "{user}");
+    }
+
+    /// base_url 带尾斜杠/首尾空白：写入时归一化（请求不会打到 `//chat/completions`），
+    /// 且校验看到的就是使用的那份（校验与使用同源）。
+    #[test]
+    fn base_url_is_normalized_on_store() {
+        let conf = |url: &str| Conf {
+            provider: "test".into(),
+            base_url: url.into(),
+            api_key: "k".into(),
+            model_fast: "f".into(),
+            model_precise: "p".into(),
+            extra: serde_json::Map::new(),
+            vision: None,
+        };
+        let c = LlmClient::with_conf(conf("https://example.invalid/v1/"));
+        assert_eq!(c.public_conf().0, "https://example.invalid/v1");
+        c.set_conf(conf(" https://example.invalid/v2// ")).unwrap();
+        assert_eq!(c.public_conf().0, "https://example.invalid/v2");
+    }
+
+    /// persist 闭包 panic 会毒化锁：恢复警卫继续服务，不许此后所有 LLM 调用连锁 panic。
+    #[test]
+    fn poisoned_runtime_lock_recovers() {
+        let conf = |p: &str| Conf {
+            provider: p.into(),
+            base_url: "https://example.invalid/v1".into(),
+            api_key: "k".into(),
+            model_fast: "f".into(),
+            model_precise: "p".into(),
+            extra: serde_json::Map::new(),
+            vision: None,
+        };
+        let client = LlmClient::with_conf(conf("old"));
+        let c2 = client.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c2.commit_runtime_configs(conf("new"), None, || panic!("persist boom"));
+        }));
+        assert!(r.is_err());
+        // panic 发生在回滚之前：接受「新配置在内存、落库未成」的半截状态，换服务不挂
+        assert_eq!(client.primary_provider(), "new");
+        client.set_conf(conf("next")).unwrap();
+        assert_eq!(client.primary_provider(), "next");
+    }
+
+    /// 空 content（或剥完思考段只剩空白）按「无内容」：不再以空串流到 `extract_sql`。
+    #[test]
+    fn empty_content_counts_as_missing() {
+        let empty = serde_json::json!({"choices": [{"message": {"content": ""}}]});
+        assert!(content_text(&empty).is_none());
+        let thinking_only = serde_json::json!({"choices": [{"message": {"content": "<think>想</think>  "}}]});
+        assert!(content_text(&thinking_only).is_none());
+        let ok = serde_json::json!({"choices": [{"message": {"content": " SELECT 1 "}}]});
+        assert_eq!(content_text(&ok).as_deref(), Some("SELECT 1"));
+    }
+
+    /// scheme 与 data mediatype 都大小写不敏感（WHATWG URL / RFC 2397）
+    #[test]
+    fn vision_image_schemes_are_case_insensitive() {
+        assert_eq!(validate_vision_image("HTTPS://images.example.com/a.png"), Ok(()));
+        assert_eq!(validate_vision_image("DATA:IMAGE/PNG;BASE64,TQ=="), Ok(()));
+        // 大写 scheme 同样不放行带认证的 URL
+        assert_eq!(
+            validate_vision_image("HTTPS://user:secret@images.example.com/a.png"),
+            Err(VisionError::InvalidImage)
+        );
+    }
+
+    /// 配置形状报错必须带命中键名（键名不敏感，排障不该靠猜）
+    #[test]
+    fn provider_shape_error_names_the_offending_key() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("api_key".into(), serde_json::json!("x"));
+        let conf = Conf {
+            provider: "t".into(),
+            base_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+            model_fast: "f".into(),
+            model_precise: "p".into(),
+            extra,
+            vision: None,
+        };
+        let err = validate_provider_shape(&conf).unwrap_err().to_string();
+        assert!(err.contains("api_key"), "报错没带命中键名：{err}");
     }
 }

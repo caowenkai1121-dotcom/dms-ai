@@ -13,7 +13,7 @@
 //! 零消费者（全仓 grep：`web/src` 无 fetch、`tools/*.py` 无一处调它），且本表没有
 //! `conv_id`，统计维度本来就窄。一起带走的是 `stats()`/`clamp_days`/两条统计 SQL/
 //! `StatsQuery`/`is_admin`，以及只断言这些已删对象的 4 条单测
-//! （被判对象没了还留着断言 = 恒真判据；本 crate 单测 145 → 141）。
+//! （被判对象没了还留着断言 = 恒真判据）。
 //! 要重开：直接连 PG 查 `meta.query_log`（p50/p95 用 `percentile_cont(...) WITHIN GROUP`
 //! 在 SQL 里算，**别把全量 elapsed_ms 拉进内存排序** —— 百万行 = OOM + 拖死 PG），
 //! 端点必须 admin_only 且判据只认 `administrator_flag`（表里是**别人的问句**）。
@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS meta.query_log(
 CREATE INDEX IF NOT EXISTS idx_query_log_at ON meta.query_log(at DESC);
 CREATE INDEX IF NOT EXISTS idx_query_log_route_at ON meta.query_log(route, at DESC);
 CREATE INDEX IF NOT EXISTS idx_query_trace ON meta.query_log(trace_id);
+-- trace_api 的失败 SQL 面板按 conv_id 过滤（FAILED_SQL）：只增表没索引 = 每开一次 trace 页全表扫
+CREATE INDEX IF NOT EXISTS idx_query_log_conv ON meta.query_log(conv_id);
 -- 老库三列兜底（新库建表已含；IF EXISTS 幂等）
 ALTER TABLE meta.query_log ADD COLUMN IF NOT EXISTS trace_id text;
 ALTER TABLE meta.query_log ADD COLUMN IF NOT EXISTS conv_id text;
@@ -71,18 +73,15 @@ ALTER TABLE meta.query_log ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT
 ALTER TABLE meta.query_log ADD COLUMN IF NOT EXISTS context_summary text NOT NULL DEFAULT '';
 "#;
 
-/// 建表。与 `dms_semantic::ddl::migrate` 同风格（按分号逐句切，故 DDL 里不许出现 `DO $$` 与注释内分号）。
+/// 建表。走 `crate::run_ddl`（按分号逐句切 + 单事务；split 纪律见该函数文档）。
 pub async fn migrate(pg: &PgPool) -> anyhow::Result<()> {
-    for stmt in DDL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        sqlx::query(stmt).execute(pg).await?;
-    }
-    Ok(())
+    crate::run_ddl(pg, DDL).await
 }
 
 /// 本轮问答的观测累加器。`&Trace` 往下传（`Send + Sync`，复合问题的并行子问句共用一个）。
 ///
 /// 只有**最贵的那两次** precise 调用（`generate_sql` / `repair`）往里加用量：
-/// 便宜的 fast 调用（改写/拆解/分诊/复核）占比小，接它们要动 8 处签名，本轮不接。
+/// 便宜的 fast 调用（改写/拆解/分诊/复核）占比小，接它们要动 8 处签名，暂不接（成本/占比权衡）。
 #[derive(Default)]
 pub struct Trace {
     prompt: AtomicU32,
@@ -117,9 +116,16 @@ impl Trace {
     }
 
     fn tokens(&self) -> (i32, i32) {
-        let get = |a: &AtomicU32| a.load(Ordering::Relaxed).min(i32::MAX as u32) as i32;
+        // 两次 Relaxed load 不是原子快照：并发 `add` 时两值可能各差一代。观测口径可接受
+        // （计数本来就是「到读数时为止」的近似），不值得为它上锁。
+        let get = |a: &AtomicU32| clamp_u32_i32(a.load(Ordering::Relaxed));
         (get(&self.prompt), get(&self.completion))
     }
+}
+
+/// u32 → i32 饱和钳位（PG int 上限；用量到不了这个数，但钳位写法全文件只许有一种）
+fn clamp_u32_i32(v: u32) -> i32 {
+    v.min(i32::MAX as u32) as i32
 }
 
 /// 待写入的一行。字段顺序 = `INSERT` 的列顺序。
@@ -180,7 +186,8 @@ fn entry(
 ) -> Entry {
     let (route, sql, rows, error) = match out {
         Ok(r) => (r.route.clone(), clip(&r.sql), r.row_count, String::new()),
-        Err(e) => (String::new(), String::new(), 0, clip(&sanitize(&e.to_string()))),
+        // `{e:#}` 保 context 链（connector 原始根因不外丢）；单链形态与 `to_string` 逐字相同
+        Err(e) => (String::new(), String::new(), 0, clip(&sanitize(&format!("{e:#}")))),
     };
     let (prompt_tokens, completion_tokens) = trace.tokens();
     let trace_id = trace.trace_id.get().cloned().unwrap_or_default();
@@ -193,7 +200,7 @@ fn entry(
         question: clip(question),
         sql,
         row_count: rows.min(i32::MAX as usize) as i32,
-        elapsed_ms: elapsed_ms.min(i64::MAX as u128) as i64,
+        elapsed_ms: i64::try_from(elapsed_ms).unwrap_or(i64::MAX),
         prompt_tokens,
         completion_tokens,
         error,
@@ -201,7 +208,7 @@ fn entry(
         conv_id,
         // `add` 只在 precise 调用（`generate_sql`/`repair`）后触发，所以计数即「本轮打了
         // 几发 precise」。采样提前收工的效果（1 发而非 `sc_samples` 发）直接读得出来。
-        llm_calls: trace.calls.load(Ordering::Relaxed).min(i32::MAX as u32) as i32,
+        llm_calls: clamp_u32_i32(trace.calls.load(Ordering::Relaxed)),
         status: status_of(out),
         // D7：纯函数不碰进程内暂存 —— 摘要由 `finish` 补（这样 `entry` 的既有判据一条不动）
         context_summary: None,
@@ -218,20 +225,25 @@ fn status_of(out: &anyhow::Result<AskResult>) -> &'static str {
     {
         return STATUS_BLOCKED;
     }
+    // 取数超时的 typed 主判据（ConnectorError 原样上抛时类型还在）——放在分配 msg 之前
+    if matches!(
+        e.downcast_ref::<dms_connector::ConnectorError>(),
+        Some(dms_connector::ConnectorError::Timeout(_))
+    ) {
+        return STATUS_TIMEOUT;
+    }
     let msg = e.to_string();
     // 两处类型被折成文案的拒绝，按契约文案认（两处文案都有冻结单测钉着）：
     // llm 路径自修后仍过不了红线（agent run 折成「SQL 安全校验未通过: …」）、
     // 选源层 ds 级 ACL 拒绝（「无权访问数据源 …」，HTTP 侧同文案映 403）。
-    if msg.starts_with("SQL 安全校验未通过") || msg.contains("无权访问数据源") {
+    // ACL 文案用 starts_with 锚定：该句由 source.rs 原样上抛、全程无包装；contains 会把
+    // 「短语混在报错中段」（如问句原文被回显进 connector 报错）误判成 blocked。
+    if msg.starts_with("SQL 安全校验未通过") || msg.starts_with("无权访问数据源") {
         return STATUS_BLOCKED;
     }
-    // 取数超时：typed 是主判据；文案兜底给丢了类型的上游超时（reqwest 的
-    // 「operation timed out」、中文「超时」），判据与 KB 落账共用 `qalog::timeout_marked`。
-    if matches!(
-        e.downcast_ref::<dms_connector::ConnectorError>(),
-        Some(dms_connector::ConnectorError::Timeout(_))
-    ) || timeout_marked(&msg)
-    {
+    // 文案兜底给丢了类型的上游超时（reqwest 的「operation timed out」、中文「超时」），
+    // 判据与 KB 落账共用 `qalog::timeout_marked`。
+    if timeout_marked(&msg) {
         return STATUS_TIMEOUT;
     }
     STATUS_FAILED
@@ -248,42 +260,68 @@ fn spawn_write(pg: &PgPool, e: Entry) -> tokio::task::JoinHandle<()> {
     let pg = pg.clone();
     tokio::spawn(async move {
         if let Err(err) = insert(&pg, &e).await {
-            tracing::warn!("查询日志写入失败（观测降级，不影响取数）: {err}");
+            tracing::warn!(
+                trace_id = %e.trace_id,
+                login = %e.login_name,
+                route = %e.route,
+                "查询日志写入失败（观测降级，不影响取数）: {err:#}"
+            );
         }
     })
+}
+
+/// 空串落 NULL：与「没设关联键」（老行）同形，与「设了但为空」区分开
+fn non_empty(s: &str) -> Option<&str> {
+    if s.is_empty() { None } else { Some(s) }
 }
 
 async fn insert(pg: &PgPool, e: &Entry) -> anyhow::Result<()> {
     // 列清单常量与 KB 落账共用（`qalog::INSERT_SQL`）：改列只许改那一处
     sqlx::query(INSERT_SQL)
-    .bind(&e.login_name)
-    .bind(&e.ds_id)
-    .bind(&e.route)
-    .bind(&e.question)
-    .bind(&e.sql)
-    .bind(e.row_count)
-    .bind(e.elapsed_ms)
-    .bind(e.cache_hit)
-    .bind(e.prompt_tokens)
-    .bind(e.completion_tokens)
-    .bind(&e.error)
-    // 空串落 NULL：与「没设关联键」（老行）同形，与「设了但为空」区分开
-    .bind(if e.trace_id.is_empty() { None } else { Some(&e.trace_id) })
-    .bind(if e.conv_id.is_empty() { None } else { Some(&e.conv_id) })
-    .bind(e.llm_calls)
-    .bind(e.status)
-    .execute(pg)
-    .await?;
+        .bind(&e.login_name)
+        .bind(&e.ds_id)
+        .bind(&e.route)
+        .bind(&e.question)
+        .bind(&e.sql)
+        .bind(e.row_count)
+        .bind(e.elapsed_ms)
+        .bind(e.cache_hit)
+        .bind(e.prompt_tokens)
+        .bind(e.completion_tokens)
+        .bind(&e.error)
+        .bind(non_empty(&e.trace_id))
+        .bind(non_empty(&e.conv_id))
+        .bind(e.llm_calls)
+        .bind(e.status)
+        .execute(pg)
+        .await?;
     // 【D7】context_summary 不进 INSERT（共享 15 列契约，见 DDL 注释）：主语句一字未动，
     // 摘要按 trace_id 贴回本行。同一 spawn 内顺序执行 —— 主链依旧零额外 await（纪律 1）。
     // trace_id 为空（老行/未设关联键）时没有可贴的行，那一档本来也不会有暂存摘要。
     if let Some(cs) = &e.context_summary {
         if !e.trace_id.is_empty() {
-            sqlx::query("UPDATE meta.query_log SET context_summary = $1 WHERE trace_id = $2")
-                .bind(cs)
-                .bind(&e.trace_id)
-                .execute(pg)
-                .await?;
+            // `context_summary = ''` 幂等守卫：trace_id 撞键（重试复用）时不许覆盖先到的摘要。
+            // 贴回失败单独留痕 —— 主行其实已经落库，文案再把人引向「写入失败」就是误导。
+            match sqlx::query(
+                "UPDATE meta.query_log SET context_summary = $1 WHERE trace_id = $2 AND context_summary = ''",
+            )
+            .bind(cs)
+            .bind(&e.trace_id)
+            .execute(pg)
+            .await
+            {
+                Ok(done) if done.rows_affected() != 1 => {
+                    tracing::warn!(
+                        trace_id = %e.trace_id,
+                        rows = done.rows_affected(),
+                        "上下文摘要贴回行数异常（主行已落库；trace_id 撞键或重复贴回）"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(trace_id = %e.trace_id, "上下文摘要贴回失败（主行已落库）: {err:#}");
+                }
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -322,7 +360,6 @@ mod tests {
             assert!(!is_cache_hit(r), "{r} 不该算缓存命中");
         }
     }
-
 
     /// 失败也写一行：`error` 有值、route/sql 空、token 用量照记（那次 LLM 钱已经花了）
     #[test]
@@ -411,6 +448,27 @@ mod tests {
         assert_eq!(status(anyhow::anyhow!("无权访问数据源 ds-9")), STATUS_BLOCKED);
     }
 
+    /// 🔴 「无权访问数据源」是 starts_with 锚定（该句由 source.rs 原样上抛无包装）：
+    /// 短语混在报错**中段**（如问句原文被回显进 connector 报错）不得误判 blocked。
+    #[test]
+    fn ds_acl_phrase_mid_text_is_not_blocked() {
+        let s = status(anyhow::anyhow!("查询失败 [dms] 语法错误 near '无权访问数据源 ds-9'"));
+        assert_eq!(s, STATUS_FAILED, "短语出现在句中是报错回显，不是 ACL 拒绝");
+    }
+
+    /// 错误链保留：`{e:#}` 把 anyhow 的 context 链逐层留下（单链形态逐字不变）
+    #[test]
+    fn error_reason_keeps_context_chain() {
+        // `anyhow::Error::context` 是 inherent 方法，不需要 trait 导入
+        let out: anyhow::Result<AskResult> = Err(anyhow::anyhow!("底层连接被拒").context("取数失败"));
+        let e = entry(&Trace::default(), "u", "q", &out, 1);
+        assert!(
+            e.error.contains("取数失败") && e.error.contains("底层连接被拒"),
+            "context 链丢了: {}",
+            e.error
+        );
+    }
+
     /// 执行超时 → timeout：typed（ConnectorError::Timeout）与丢类型的文案形态都认
     #[test]
     fn timeout_status_is_timeout() {
@@ -446,14 +504,28 @@ mod tests {
         assert_eq!(sanitize("查询失败 [dms] Unknown column 'x'"), "查询失败 [dms] Unknown column 'x'");
     }
 
-    /// migrate 幂等纪律：DDL 每句都必须可重复执行（启动路径每次全跑）
+    /// migrate 幂等纪律：DDL 每句都必须可重复执行（启动路径每次全跑）；
+    /// 首行代码必须 CREATE/ALTER 开头 —— 注释内混入 ASCII 分号会切出碎句，启动期才炸，提前到这里。
     #[test]
     fn ddl_statements_are_idempotent() {
         for stmt in DDL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             assert!(stmt.contains("IF NOT EXISTS"), "非幂等语句: {stmt}");
+            let first_code = stmt
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with("--"))
+                .unwrap_or("");
+            assert!(
+                first_code.starts_with("CREATE") || first_code.starts_with("ALTER"),
+                "split 切出的碎句（注释内 ASCII 分号？）: {stmt}"
+            );
         }
         assert!(DDL.contains("ADD COLUMN IF NOT EXISTS status"), "status 列的迁移丢了");
         assert!(DDL.contains("ADD COLUMN IF NOT EXISTS context_summary"), "context_summary 列的迁移丢了");
+        // 索引被误删会静默退成全表扫，名字钉在这里
+        for idx in ["idx_query_log_at", "idx_query_log_route_at", "idx_query_trace", "idx_query_log_conv"] {
+            assert!(DDL.contains(idx), "索引 {idx} 的建句丢了");
+        }
     }
 
     /// 【D7】`entry` 是纯函数：不碰进程内暂存，`context_summary` 恒 None 起步（由 `finish` 补）——

@@ -20,9 +20,9 @@
 cp settings.example.json settings.docker.json   # 容器部署；裸机用 settings.json
 ```
 
-必填：`pg_url`（自有 PG）、`mysql_targets`（数仓目标 `type: warehouse`）、`mysql_url`（DMS 身份源）、`llm_providers`（模型供应商 key）、`service_url`（embed/parser 服务地址）。
+必填：`pg_url`（自有 PG）、`mysql_targets`（数仓目标 `type: warehouse`）、`mysql_url`（DMS 身份源）、`llm_keys`（各家模型供应商 key）。`service_url`（embed/parser 服务地址）默认 `http://127.0.0.1:8077`，裸机同机部署不必填，容器/跨机时才需改。
 
-**必须设置环境变量 `DMS_SECRET_KEY`（≥32 字节随机串）**：settings 里的凭据落盘即 AES-GCM 加密（enc:v1）。不配则密钥由机器指纹派生——容器重建/换机后密文解不开，需重填明文凭据。
+**必须设置环境变量 `DMS_SECRET_KEY`（≥32 字节随机串）**：settings 里的凭据落盘即 AES-256-GCM 加密（enc:v1）。不配则密钥由机器指纹派生——容器重建/换机后密文解不开，需重填明文凭据。
 
 ### 2. 起依赖
 
@@ -31,13 +31,13 @@ cp settings.example.json settings.docker.json   # 容器部署；裸机用 setti
 .\scripts\run.ps1
 ```
 
-裸机 Linux：`docker compose -f docker/age/docker-compose.yml up -d`；embed 服务 `python tools/embed_service.py serve 8078`（模型自动下载，离线环境先备 `BAAI/bge-small-zh-v1.5`）。
+裸机 Linux（PG 仍走容器）：`docker compose -f docker/age/docker-compose.yml up -d`；embed 服务 `python tools/embed_service.py serve 8077`（模型自动下载，离线环境先备 `BAAI/bge-small-zh-v1.5`）。
 
-⚠️ 若元数据库不是 compose 默认库（另建的库）：`psql -d <库> -c "CREATE EXTENSION IF NOT EXISTS age"`——AGE 只由初始化脚本建在默认库上，图谱功能缺它不可用。
+⚠️ 若元数据库不是 compose 默认库（另建的库）：age/vector/pg_trgm 三个扩展都只由初始化脚本建在默认库上，需手动补齐：`psql -d <库> -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm"`。缺 age 图谱功能不可用，缺 vector/pg_trgm 向量与模糊召回不可用。
 
 ### 3. 初始数据加载（决定问数准确性的关键一步）
 
-服务**启动时自动**完成：全量 DDL 迁移 → 代码种子（指标/维度/术语/JOIN 合同/码值/权限档案）→ 数仓目录探针同步。但还有一半是**数据驱动登记与人工沉淀**（码值字典 938 行、auto 维度 70 条、软删表过滤 35 条、SQL 样例 172 条、教训 18 条……），代码种子里没有，必须从现网快照导入：
+服务**启动时自动**完成：全量 DDL 迁移 → 代码种子（指标/维度/术语/JOIN 合同/码值/权限档案）→ 数仓目录探针同步。但还有一半是**数据驱动登记与人工沉淀**（码值字典 938 行、auto 维度 70 条、软删表过滤 35 条、SQL 样例 172 条、教训 18 条……数字为撰写时口径，随现网漂移，以现网导出为准），代码种子里没有，必须从现网快照导入：
 
 ```bash
 # 现网导出一次（随部署包私下传递，勿进公开仓库——含业务字典值）
@@ -46,7 +46,7 @@ python tools/registry_snapshot.py export registry_snapshot.json
 python tools/registry_snapshot.py import registry_snapshot.json
 ```
 
-导入后 10 分钟内，服务的「向量自愈」自动回填 embedding（embed 服务需先就绪；`/api/health` 的 `vector_ready` 三个 true 即完成）。
+导入后由服务的「向量自愈」自动回填 embedding：启动即跑一轮，之后每 10 分钟一轮（embed 服务需先就绪；`/api/health` 的 `vector_ready` 三个 true 即完成）。
 
 可选刷新（都幂等，建议初次部署后各跑一次）：
 
@@ -61,10 +61,10 @@ dms-ai-server meta datamap-calibrate   # 使用轨迹校准（query_log → co_o
 
 ```bash
 curl http://127.0.0.1:8100/api/health
-# ok:true；mysql.connected:true；vector_ready 三个 true；pg.extensions 含 age/vector/pg_trgm
+# ok:true；mysql.connected:true 且 mysql.session_read_only:true；vector_ready 三个 true；pg.extensions 含 age/vector/pg_trgm
 ```
 
-判官回归（问数正确性的验收尺，77 题）：
+判官回归（问数正确性的验收尺，76 题）：
 
 ```bash
 DMS_REGRESSION_TIMEOUT=240 python tools/regression.py

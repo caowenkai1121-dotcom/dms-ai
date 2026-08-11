@@ -2,7 +2,7 @@
 //!
 //! 数据源是 `meta.query_log` 近 N 天 `status='succeeded'` 的行：从 SQL 提取
 //! **表级 JOIN 对**（`JOIN ... ON a.x=b.y` 两侧表；逗号 FROM 各项两两）与
-//! **同现列对**（同一句 SELECT/WHERE 共同出现的列，别名解析成 `table.col`），
+//! **同现列对**（同一句 SELECT/WHERE/HAVING 共同出现的列，别名解析成 `table.col`），
 //! 聚合成 `co_occurs` 证据 upsert 进 `meta.datamap_edge`。
 //!
 //! ## 表形约定（🔴 裁决已落地：三处 DDL 逐字一致）
@@ -22,6 +22,8 @@
 //!
 //! ## 边界（刻意从简：校准信号，不是事实判定）
 //! - 语句级作用域：子查询的表/列并入所属语句；同名别名跨子查询后者覆盖前者。
+//! - 列提取覆盖 SELECT/WHERE/HAVING 与 CASE 表达式；GROUP BY/ORDER BY 不收
+//!   （分组/排序键不是取值共现信号，收了只会稀释列对）。
 //! - 方言双试：先 MySQL 后 PG（kernel 方言实例，单一事实源）；都失败记 `ParseFailure`
 //!   进报告（失败留痕），一条脏 SQL 不许炸掉整轮。
 //! - 单语句列数 > `MAX_COLS_PER_STATEMENT` 只记 JOIN 对（宽 SELECT 的列对是 O(n²) 噪声）。
@@ -42,14 +44,15 @@ use sqlx::PgPool;
 /// 合并公式权重（`UPSERT_SQL` 字面量必须与之同步，单测钉着）
 const STATIC_WEIGHT: f64 = 0.6;
 const USAGE_WEIGHT: f64 = 0.4;
-const MAX_EDGES_PER_RUN: usize = 500; // 单轮回写上限（命中数降序截断，防爆）
+const MAX_EDGES_PER_RUN: usize = 500; // 每数据源回写上限（命中数降序截断，防爆；per-ds 各自截断）
 const MAX_COLS_PER_STATEMENT: usize = 24; // 单语句参与配对的列数上限
 const ROW_SCAN_CAP: i64 = 20_000; // 单轮扫描行上限（取最近 —— 频次偏向近期，刻意的）
 const FAILURE_KEEP: usize = 50; // 报告留存的失败样本数（total 照计全量）
 const ERR_CLIP: usize = 200; // 失败原因截断上限（字符，非字节）
 
 /// 边表 DDL（唯一键约定见头注）。幂等：`ensure_edge_table` 每次入口都跑。
-const DDL: &str = r#"
+/// pub(crate)：`datamap.rs` 的 `datamap_ddl_matches_usage_ddl` 测试钉两份逐字一致。
+pub(crate) const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta.datamap_edge(
   id bigserial PRIMARY KEY,
   ds_id text NOT NULL DEFAULT 'dms',
@@ -76,15 +79,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_datamap_edge_uniq ON meta.datamap_edge(ds_
 /// `merged_confidence` 的 SQL 镜像：$6 = `0.4 × 归一化频次`（= 新边值）。命中既有行
 /// （上轮校准的同对边）→ `0.6×旧 + $6`；evidence 记本轮观测，seen_count 累加历史命中。
 /// status 不进 SET：人工复核（accepted/rejected）的结论不被下一轮校准冲掉。
+/// `last_seen`/`seen_count` 是「被真实查询观测到」的口径，独归本写口维护（静态推断与
+/// 血缘写口都不刷 —— 三处写口的分工钉在这里）；`updated_at` 与另两处写口同款照刷。
 const UPSERT_SQL: &str = "INSERT INTO meta.datamap_edge(ds_id, kind, left_table, left_col, right_table, right_col, confidence, evidence, seen_count, status)
   VALUES ($1, 'co_occurs', $2, $3, $4, $5, $6, $7, $8, 'pending')
   ON CONFLICT (ds_id, kind, left_table, left_col, right_table, right_col) DO UPDATE SET
     confidence = LEAST(1.0, GREATEST(0.0, 0.6 * meta.datamap_edge.confidence + EXCLUDED.confidence)),
     evidence = EXCLUDED.evidence,
     seen_count = meta.datamap_edge.seen_count + EXCLUDED.seen_count,
-    last_seen = now()";
+    last_seen = now(),
+    updated_at = now()";
 
 /// 一轮校准的落点报告（失败留痕在这里；调用方打日志/落审计自取）。
+#[derive(Debug)]
 pub struct UsageReport {
     pub window_days: u32,
     pub rows_scanned: usize,
@@ -99,7 +106,7 @@ pub struct UsageReport {
 }
 
 /// 一条解析失败的留痕（哪行日志、什么原因）。
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ParseFailure {
     pub log_id: i64,
     pub error: String,
@@ -122,10 +129,18 @@ pub async fn calibrate_from_query_log(pg: &PgPool, days: u32) -> anyhow::Result<
     let by_ds = aggregate(&rows);
     let failure_total: usize = by_ds.values().map(|a| a.failure_total).sum();
     if failure_total > 0 {
-        tracing::warn!("使用轨迹校准：{failure_total} 条成功行解析失败（样本已留痕于报告）");
+        // per-ds 分布一并透出：多数据源部署时定位是哪条源的日志脏
+        let mut per_ds: Vec<(&str, usize)> = by_ds
+            .iter()
+            .filter(|(_, a)| a.failure_total > 0)
+            .map(|(ds, a)| (ds.as_str(), a.failure_total))
+            .collect();
+        per_ds.sort();
+        tracing::warn!(total = failure_total, by_ds = ?per_ds, "使用轨迹校准：有成功行解析失败（样本已留痕于报告）");
     }
     let edges = edges_of(&by_ds, days);
-    let mut edges_upserted = 0usize;
+    // 整轮回写包一个事务：中途失败整体回滚，重跑即收敛（与静态推断写口同形态）。
+    let mut tx = pg.begin().await?;
     for e in &edges {
         sqlx::query(UPSERT_SQL)
             .bind(&e.ds)
@@ -136,10 +151,11 @@ pub async fn calibrate_from_query_log(pg: &PgPool, days: u32) -> anyhow::Result<
             .bind(e.usage)
             .bind(&e.evidence)
             .bind(i64::from(e.freq))
-            .execute(pg)
+            .execute(&mut *tx)
             .await?;
-        edges_upserted += 1;
     }
+    tx.commit().await?;
+    tracing::info!(rows = rows.len(), edges = edges.len(), "使用轨迹校准完成");
     Ok(UsageReport {
         window_days: days,
         rows_scanned: rows.len(),
@@ -152,7 +168,7 @@ pub async fn calibrate_from_query_log(pg: &PgPool, days: u32) -> anyhow::Result<
             .collect(),
         join_edges: by_ds.values().map(|a| a.join_counts.len()).sum(),
         col_edges: by_ds.values().map(|a| a.col_counts.len()).sum(),
-        edges_upserted,
+        edges_upserted: edges.len(),
     })
 }
 
@@ -166,16 +182,17 @@ async fn ensure_edge_table(pg: &PgPool) -> anyhow::Result<()> {
 
 /// 方言双试（kernel 的方言实例）：先 MySQL 后 PG，都挂 → Err（调用方留痕）。
 fn parse(sql: &str) -> Result<Vec<Statement>, String> {
+    // 方言对象在函数入口各取一次（注册表查找 + expect 不随每行日志重复）
     let mysql = dms_kernel::by_name("mysql").expect("mysql 方言常驻");
+    let pg = dms_kernel::by_name("pg").expect("pg 方言常驻");
     match Parser::parse_sql(mysql.parser(), sql) {
         Ok(stmts) => Ok(stmts),
-        Err(_) => Parser::parse_sql(dms_kernel::by_name("pg").expect("pg 方言常驻").parser(), sql)
-            .map_err(|e| e.to_string()),
+        Err(_) => Parser::parse_sql(pg.parser(), sql).map_err(|e| e.to_string()),
     }
 }
 
 /// 一轮校准的内存聚合（纯函数，单测全在这里打）。
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Aggregate {
     join_counts: HashMap<(String, String), u32>,
     col_counts: HashMap<(String, String), u32>,
@@ -184,12 +201,17 @@ struct Aggregate {
     failure_total: usize,
 }
 
-/// 按行自带的 ds_id 分源聚合：不同数据源的查询日志不混进同一张地图
-/// （空 ds_id 归 'dms' —— 与 DDL 默认值同口径）。
+/// 按行自带的 ds_id 分源聚合：不同数据源的查询日志不混进同一张地图。
+/// ds 先 trim + 小写归一（'DMS' 与 'dms' 不裂成两组），空串归 'dms'（与 DDL 默认值同口径）；
+/// 全空白 SQL 进 parse 必然失败，只会虚增 parse_failure_total —— 直接跳过不计。
 fn aggregate(rows: &[(i64, String, String)]) -> HashMap<String, Aggregate> {
     let mut by_ds: HashMap<String, Aggregate> = HashMap::new();
     for (id, sql, ds) in rows {
-        let key = if ds.is_empty() { "dms".to_string() } else { ds.clone() };
+        if sql.trim().is_empty() {
+            continue;
+        }
+        let ds = ds.trim().to_ascii_lowercase();
+        let key = if ds.is_empty() { "dms".to_string() } else { ds };
         let agg = by_ds.entry(key).or_default();
         match parse(sql) {
             Ok(stmts) => {
@@ -240,28 +262,28 @@ fn edges_of(by_ds: &HashMap<String, Aggregate>, days: u32) -> Vec<Edge> {
     dss.sort();
     for ds in dss {
         let agg = &by_ds[ds];
-        let max = agg
-            .join_counts
-            .values()
-            .chain(agg.col_counts.values())
-            .copied()
-            .max()
-            .unwrap_or(0);
-        // (freq, 排序键, 落库四元组)；列对里带裸列的丢弃（无法归属到表）
-        let mut all: Vec<(u32, (String, String), (String, String, String, String))> = Vec::new();
+        // 先收敛「可落库」集合：带裸列的列对无法归属到表，丢弃；被丢弃对的频次也不再
+        // 计入归一化分母（原来 max 在过滤前算，会把可落库边的 norm 系统性压小）。
+        let mut all: Vec<(u32, String, String)> = Vec::new();
         for ((a, b), &freq) in &agg.join_counts {
-            all.push((freq, (a.clone(), b.clone()), (a.clone(), String::new(), b.clone(), String::new())));
+            all.push((freq, a.clone(), b.clone()));
         }
         for ((a, b), &freq) in &agg.col_counts {
-            if let (Some((ta, ca)), Some((tb, cb))) = (split_col_ref(a), split_col_ref(b)) {
-                all.push((freq, (a.clone(), b.clone()), (ta, ca, tb, cb)));
+            if split_col_ref(a).is_some() && split_col_ref(b).is_some() {
+                all.push((freq, a.clone(), b.clone()));
             }
         }
+        let max = all.iter().map(|e| e.0).max().unwrap_or(0);
         // 命中数降序、对名升序：截断边界确定性（同分不因迭代序漂移）
-        all.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+        all.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| (&x.1, &x.2).cmp(&(&y.1, &y.2))));
         all.truncate(MAX_EDGES_PER_RUN);
-        out.extend(all.into_iter().map(|(freq, _, (lt, lc, rt, rc))| {
+        out.extend(all.into_iter().map(|(freq, a, b)| {
             let norm = normalized(freq, max);
+            // 落库四元组在收敛后拆解：列对拆 table.col，JOIN 表对（键里无点）列留空
+            let (lt, lc, rt, rc) = match (split_col_ref(&a), split_col_ref(&b)) {
+                (Some((ta, ca)), Some((tb, cb))) => (ta, ca, tb, cb),
+                _ => (a, String::new(), b, String::new()),
+            };
             Edge {
                 ds: ds.clone(),
                 left_table: lt,
@@ -416,7 +438,8 @@ impl Raw {
             for j in &twj.joins {
                 let right = self.register(&j.relation);
                 let before = self.join_pairs.len();
-                // USING/NATURAL/CROSS 没有 ON 等值 → None，走结构性兜底
+                // 只认 Inner/Left/Right/Full 的 ON 等值；Semi/Anti/CrossApply 等其余 JOIN
+                // 类型一律 None → 走下面的结构性兜底（刻意的近似，见头注边界节）
                 let on = match &j.join_operator {
                     JoinOperator::Inner(JoinConstraint::On(e))
                     | JoinOperator::LeftOuter(JoinConstraint::On(e))
@@ -455,6 +478,10 @@ impl Raw {
         }
         if let Some(sel) = &s.selection {
             collect_cols(sel, &mut self.cols);
+        }
+        // HAVING 与 SELECT/WHERE 同一口径照收（GROUP BY/ORDER BY 刻意不收，见头注边界节）
+        if let Some(having) = &s.having {
+            collect_cols(having, &mut self.cols);
         }
     }
 }
@@ -499,6 +526,18 @@ fn collect_cols(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
         }
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
             collect_cols(expr, out);
+        }
+        // CASE WHEN 在 SELECT 里极常见：操作数/条件/结果/ELSE 全遍历
+        Expr::Case { operand, conditions, results, else_result } => {
+            if let Some(operand) = operand {
+                collect_cols(operand, out);
+            }
+            for e in conditions.iter().chain(results) {
+                collect_cols(e, out);
+            }
+            if let Some(else_result) = else_result {
+                collect_cols(else_result, out);
+            }
         }
         Expr::InList { expr, list, .. } => {
             collect_cols(expr, out);
@@ -655,8 +694,41 @@ mod tests {
         assert_eq!(edges.len(), 3, "3 个带前缀列两两配对: {edges:?}");
     }
 
+    /// ds 归一与空白行：' DMS '/'dms' 不裂成两组；全空白 SQL 跳过不计（不虚增失败数）。
+    #[test]
+    fn aggregate_normalizes_ds_and_skips_blank_sql() {
+        let rows = vec![
+            (1i64, "SELECT * FROM t_a".to_string(), " DMS ".to_string()),
+            (2, "SELECT * FROM t_b".to_string(), "dms".to_string()),
+            (3, "   ".to_string(), "upload_9".to_string()),
+        ];
+        let by_ds = aggregate(&rows);
+        assert_eq!(by_ds.len(), 1, "大小写/空白 ds 必须归并：{by_ds:?}");
+        let agg = by_ds.get("dms").expect("归一到 dms");
+        assert_eq!(agg.parsed, 2, "两条有效行都解析：{agg:?}");
+        assert_eq!(agg.failure_total, 0, "全空白行不计入解析失败");
+    }
+
+    /// 列提取覆盖：CASE WHEN 里的列、HAVING 里的列都进同现列对；max 在过滤裸列后算。
+    #[test]
+    fn case_and_having_columns_are_collected() {
+        let rows = vec![(
+            1i64,
+            "SELECT CASE WHEN o.status = '1' THEN o.amount ELSE 0 END AS amt FROM t_order o \
+             GROUP BY o.status, o.amount HAVING sum(o.qty) > 0"
+                .to_string(),
+            "dms".to_string(),
+        )];
+        let by_ds = aggregate(&rows);
+        let agg = by_ds.get("dms").unwrap();
+        let cols: Vec<&String> = agg.col_counts.keys().flat_map(|(a, b)| [a, b]).collect();
+        for want in ["t_order.status", "t_order.amount", "t_order.qty"] {
+            assert!(cols.iter().any(|c| c.as_str() == want), "CASE/HAVING 列 {want} 必须收进：{cols:?}");
+        }
+    }
+
     /// 建表 DDL 幂等纪律（与 query_log::migrate 同一判据）：每句都可重复执行；
-    /// 唯一键 (src,dst,kind) 约定钉死、upsert 与之一致。
+    /// 唯一键六元组 (ds_id,kind,left_table,left_col,right_table,right_col) 约定钉死、upsert 与之一致。
     #[test]
     fn ddl_statements_are_idempotent() {
         for stmt in DDL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -671,5 +743,9 @@ mod tests {
             "upsert 与唯一键不一致"
         );
         assert!(UPSERT_SQL.contains("'co_occurs'"), "usage 来源的边 kind='co_occurs' 钉死");
+        assert!(
+            UPSERT_SQL.contains("updated_at = now()"),
+            "updated_at 与另两处写口同款照刷（last_seen/seen_count 独归本写口）"
+        );
     }
 }

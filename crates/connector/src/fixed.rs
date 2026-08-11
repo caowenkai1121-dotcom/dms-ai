@@ -10,7 +10,7 @@
 //! `OwnedStore::fixed()` 产出（T4-A2），故两个 `new` 是 `pub(crate)` —— 别人拿不到池，也就造不出语句。
 //!
 //! MySQL 与 PG 两份实现刻意不抽泛型：sqlx 的 `Database` 泛型要拖一串 `for<'r> FromRow` /
-//! `Executor` 边界，读起来比两份 50 行的具体实现难得多，而这里只有两个数据库、永远也就两个。
+//! `Executor` 边界，读起来比两份具体实现难得多，而这里只有两个数据库、永远也就两个。
 
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
@@ -30,6 +30,25 @@ const PG_PH: &str = "$";
 // （DMS_LOOKUP_TIMEOUT / fetch_dms_lookup）不动。
 const MYSQL_FIXED_TIMEOUT: Duration = Duration::from_secs(8);
 const MYSQL_FIXED_SLOW: Duration = Duration::from_millis(500);
+/// 自有 PG 静态语句与 MySQL 侧同档（8s 超时 + 500ms 慢日志）：本地 PG 挂死时
+/// handler 的 await 不能没有上限。
+const PG_FIXED_TIMEOUT: Duration = Duration::from_secs(8);
+const PG_FIXED_SLOW: Duration = Duration::from_millis(500);
+/// `expand(n)` 的上界：n 极大时拼出超长 SQL 顶爆 max_allowed_packet，错误在远端才暴露
+const MAX_EXPAND: usize = 10_000;
+
+/// 慢查询 warn：静态 SQL 本身无数据（值全在 bind 里），可安全记前 80 字节指纹
+fn warn_if_slow(at: &str, sql: &str, started: Instant, slow: Duration) {
+    let elapsed = started.elapsed();
+    if elapsed >= slow {
+        tracing::warn!(
+            source = at,
+            sql = &sql[..sql.len().min(80)],
+            elapsed_ms = elapsed.as_millis(),
+            "静态语句偏慢"
+        );
+    }
+}
 
 /// `{in}` → n 个占位符（逗号分隔）。纯函数，本文件的可单测核心。
 ///
@@ -38,6 +57,13 @@ const MYSQL_FIXED_SLOW: Duration = Duration::from_millis(500);
 ///   否则 bind 顺序与占位符编号错位 —— 这是本文件最容易错的一处。
 ///   前提：模板里的固定 `$k` 都写在 `{in}` 之前（按最大值接续，位置颠倒会撞号）。
 pub(crate) fn render_in(tpl: &str, n: usize, ph: &str) -> String {
+    if !tpl.contains(MARK) {
+        return tpl.to_string(); // 无标记：原样返回（expand 侧已记 config 错，这里仍保持纯函数全定义）
+    }
+    // doc 约定（本函数上方）：固定 `$k` 都写在 `{in}` 之前，违反会撞号 —— debug 构建当场炸
+    if let Some(d) = tpl.rfind('$') {
+        debug_assert!(d < tpl.find(MARK).expect("已短路"), "固定 $k 必须写在 {{in}} 之前: {tpl}");
+    }
     let numbered = ph == PG_PH;
     let mut next = if numbered { max_dollar(tpl) + 1 } else { 0 };
     let mut out = String::with_capacity(tpl.len() + n * 4);
@@ -49,7 +75,8 @@ pub(crate) fn render_in(tpl: &str, n: usize, ph: &str) -> String {
                 out.push(',');
             }
             if numbered {
-                out.push_str(&format!("${next}"));
+                use std::fmt::Write as _;
+                write!(out, "${next}").expect("写 String 不会失败");
                 next += 1;
             } else {
                 out.push_str(ph);
@@ -61,7 +88,8 @@ pub(crate) fn render_in(tpl: &str, n: usize, ph: &str) -> String {
     out
 }
 
-/// 模板里已有的最大 `$k`（没有则 0）
+/// 模板里已有的最大 `$k`（没有则 0）。约束：模板**字符串字面量**里的 `$k`（如 `'US$5'`）
+/// 也会被计入最大值 —— 静态模板由评审保证不在字面量里玩 `$`。
 fn max_dollar(tpl: &str) -> usize {
     tpl.match_indices('$')
         .filter_map(|(i, _)| {
@@ -75,6 +103,8 @@ fn max_dollar(tpl: &str) -> usize {
 
 /// sqlx 错误 → `ConnectorError`。分类依据是**调用方要做的决定**：
 /// 只有「数据库明确判定语句有问题」才是 `Query`（可拿去 repair），其余都不该触发改写。
+/// 与 mysql.rs 的 `sqlx_err` **变体同口径、文案不同**：这里保留 sqlx 原始文案，
+/// 那边把 access-denied/decode 归一为固定话术（点查面向用户，文案要稳）。
 fn classify(at: &str, e: sqlx::Error) -> ConnectorError {
     let msg = e.to_string();
     match e {
@@ -119,10 +149,26 @@ impl<'a> FixedStmt<'a> {
 
     /// 把模板里**每个** `{in}` 展开成 n 个 `?`（多个 `{in}` 用同一个 n —— `scope.rs` 的双 IN 场景）。
     /// `n == 0` 记错：空 `IN ()` 是语法错，调用方本该先判空集短路。
+    /// 模板没有 `{in}` 或 n 超上限同样记错：那是调用方误用，不该到数据库才报 bind 数不匹配。
     pub fn expand(mut self, n: usize) -> Self {
         if n == 0 {
             self.err.get_or_insert_with(|| {
                 ConnectorError::config(self.at, "expand(0)：空 IN 列表，调用方应先判空集短路")
+            });
+            return self;
+        }
+        if n > MAX_EXPAND {
+            self.err.get_or_insert_with(|| {
+                ConnectorError::config(
+                    self.at,
+                    format!("expand({n}) 超上限 {MAX_EXPAND}：调用方应先分批"),
+                )
+            });
+            return self;
+        }
+        if !self.sql.contains(MARK) {
+            self.err.get_or_insert_with(|| {
+                ConnectorError::config(self.at, "模板没有 {in} 标记，expand 是调用方误用")
             });
             return self;
         }
@@ -135,6 +181,9 @@ impl<'a> FixedStmt<'a> {
     where
         T: 'v + sqlx::Encode<'v, sqlx::MySql> + sqlx::Type<sqlx::MySql>,
     {
+        if self.err.is_some() {
+            return self; // 已置错：结果必然丢弃，不再白编码后续参数
+        }
         if let Err(e) = self.args.add(v) {
             let at = self.at;
             self.err.get_or_insert_with(|| ConnectorError::decode(at, e));
@@ -142,14 +191,22 @@ impl<'a> FixedStmt<'a> {
         self
     }
 
+    fn into_parts(
+        self,
+    ) -> Result<(sqlx::MySqlPool, &'a str, Cow<'static, str>, sqlx::mysql::MySqlArguments), ConnectorError>
+    {
+        let Self { pool, at, sql, args, err } = self;
+        match err {
+            Some(e) => Err(e),
+            None => Ok((pool, at, sql, args)),
+        }
+    }
+
     pub async fn fetch_all<T>(self) -> Result<Vec<T>, ConnectorError>
     where
         T: for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow> + Send + Unpin,
     {
-        let Self { pool, at, sql, args, err } = self;
-        if let Some(e) = err {
-            return Err(e);
-        }
+        let (pool, at, sql, args) = self.into_parts()?;
         let started = Instant::now();
         let out = tokio::time::timeout(
             MYSQL_FIXED_TIMEOUT,
@@ -158,9 +215,7 @@ impl<'a> FixedStmt<'a> {
         .await
         .map_err(|_| ConnectorError::timeout(at, MYSQL_FIXED_TIMEOUT))?
         .map_err(|e| classify(at, e));
-        if started.elapsed() >= MYSQL_FIXED_SLOW {
-            tracing::warn!(source = at, elapsed_ms = started.elapsed().as_millis(), "MySQL 静态只读查询偏慢");
-        }
+        warn_if_slow(at, &sql, started, MYSQL_FIXED_SLOW);
         out
     }
 
@@ -168,10 +223,7 @@ impl<'a> FixedStmt<'a> {
     where
         T: for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow> + Send + Unpin,
     {
-        let Self { pool, at, sql, args, err } = self;
-        if let Some(e) = err {
-            return Err(e);
-        }
+        let (pool, at, sql, args) = self.into_parts()?;
         let started = Instant::now();
         let out = tokio::time::timeout(
             MYSQL_FIXED_TIMEOUT,
@@ -180,9 +232,7 @@ impl<'a> FixedStmt<'a> {
         .await
         .map_err(|_| ConnectorError::timeout(at, MYSQL_FIXED_TIMEOUT))?
         .map_err(|e| classify(at, e));
-        if started.elapsed() >= MYSQL_FIXED_SLOW {
-            tracing::warn!(source = at, elapsed_ms = started.elapsed().as_millis(), "MySQL 静态只读查询偏慢");
-        }
+        warn_if_slow(at, &sql, started, MYSQL_FIXED_SLOW);
         out
     }
 }
@@ -210,6 +260,21 @@ impl<'a> PgStmt<'a> {
             });
             return self;
         }
+        if n > MAX_EXPAND {
+            self.err.get_or_insert_with(|| {
+                ConnectorError::config(
+                    self.at,
+                    format!("expand({n}) 超上限 {MAX_EXPAND}：调用方应先分批"),
+                )
+            });
+            return self;
+        }
+        if !self.sql.contains(MARK) {
+            self.err.get_or_insert_with(|| {
+                ConnectorError::config(self.at, "模板没有 {in} 标记，expand 是调用方误用")
+            });
+            return self;
+        }
         self.sql = Cow::Owned(render_in(&self.sql, n, PG_PH));
         self
     }
@@ -218,6 +283,9 @@ impl<'a> PgStmt<'a> {
     where
         T: 'v + sqlx::Encode<'v, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
     {
+        if self.err.is_some() {
+            return self; // 已置错：结果必然丢弃，不再白编码后续参数
+        }
         if let Err(e) = self.args.add(v) {
             let at = self.at;
             self.err.get_or_insert_with(|| ConnectorError::decode(at, e));
@@ -225,45 +293,65 @@ impl<'a> PgStmt<'a> {
         self
     }
 
+    fn into_parts(
+        self,
+    ) -> Result<(&'a sqlx::PgPool, &'a str, Cow<'static, str>, sqlx::postgres::PgArguments), ConnectorError>
+    {
+        let Self { pool, at, sql, args, err } = self;
+        match err {
+            Some(e) => Err(e),
+            None => Ok((pool, at, sql, args)),
+        }
+    }
+
     pub async fn fetch_all<T>(self) -> Result<Vec<T>, ConnectorError>
     where
         T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
     {
-        let Self { pool, at, sql, args, err } = self;
-        if let Some(e) = err {
-            return Err(e);
-        }
-        sqlx::query_as_with::<sqlx::Postgres, T, _>(&sql, args)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| classify(at, e))
+        let (pool, at, sql, args) = self.into_parts()?;
+        let started = Instant::now();
+        let out = tokio::time::timeout(
+            PG_FIXED_TIMEOUT,
+            sqlx::query_as_with::<sqlx::Postgres, T, _>(&sql, args).fetch_all(pool),
+        )
+        .await
+        .map_err(|_| ConnectorError::timeout(at, PG_FIXED_TIMEOUT))?
+        .map_err(|e| classify(at, e));
+        warn_if_slow(at, &sql, started, PG_FIXED_SLOW);
+        out
     }
 
     pub async fn fetch_optional<T>(self) -> Result<Option<T>, ConnectorError>
     where
         T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
     {
-        let Self { pool, at, sql, args, err } = self;
-        if let Some(e) = err {
-            return Err(e);
-        }
-        sqlx::query_as_with::<sqlx::Postgres, T, _>(&sql, args)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| classify(at, e))
+        let (pool, at, sql, args) = self.into_parts()?;
+        let started = Instant::now();
+        let out = tokio::time::timeout(
+            PG_FIXED_TIMEOUT,
+            sqlx::query_as_with::<sqlx::Postgres, T, _>(&sql, args).fetch_optional(pool),
+        )
+        .await
+        .map_err(|_| ConnectorError::timeout(at, PG_FIXED_TIMEOUT))?
+        .map_err(|e| classify(at, e));
+        warn_if_slow(at, &sql, started, PG_FIXED_SLOW);
+        out
     }
 
     /// 写入（INSERT/UPDATE/DELETE），返回受影响行数 —— F8 的「越权删返回假成功」要靠它判 403。
     pub async fn execute(self) -> Result<u64, ConnectorError> {
-        let Self { pool, at, sql, args, err } = self;
-        if let Some(e) = err {
-            return Err(e);
-        }
-        sqlx::query_with::<sqlx::Postgres, _>(&sql, args)
-            .execute(pool)
-            .await
-            .map(|r| r.rows_affected())
-            .map_err(|e| classify(at, e))
+        let (pool, at, sql, args) = self.into_parts()?;
+        let started = Instant::now();
+        let out = tokio::time::timeout(
+            PG_FIXED_TIMEOUT,
+            sqlx::query_with::<sqlx::Postgres, _>(&sql, args).execute(pool),
+        )
+        .await
+        .map_err(|_| ConnectorError::timeout(at, PG_FIXED_TIMEOUT))?
+        .map(|r| r.rows_affected())
+        .map_err(|e| classify(at, e));
+        warn_if_slow(at, &sql, started, PG_FIXED_SLOW);
+        out
     }
 }
 
@@ -275,6 +363,14 @@ mod tests {
     /// `scope.rs` 的双 IN 形态（表名泛化：DMS 语料归 policy/semantic）
     const DOUBLE_IN: &str = "SELECT DISTINCT t.id FROM staff t
          WHERE t.dept_id IN ({in}) OR td.dept_id IN ({in})";
+
+    fn lazy_mysql() -> sqlx::MySqlPool {
+        sqlx::MySqlPool::connect_lazy("mysql://u:p@127.0.0.1:1/db").unwrap()
+    }
+
+    fn lazy_pg() -> sqlx::PgPool {
+        sqlx::PgPool::connect_lazy("postgres://u:p@127.0.0.1:1/db").unwrap()
+    }
 
     #[test]
     fn mysql_expands_every_mark_with_same_n() {
@@ -310,7 +406,7 @@ mod tests {
     /// `#[tokio::test]`：`connect_lazy` 自己要 spawn 池的维护任务（不建连接，但要 runtime）
     #[tokio::test]
     async fn expand_swaps_template_in_place() {
-        let pool = sqlx::MySqlPool::connect_lazy("mysql://u:p@127.0.0.1:1/db").unwrap();
+        let pool = lazy_mysql();
         let s = FixedStmt::new_owned(pool.clone(), "dms", "x IN ({in})", true).expand(2);
         assert_eq!(s.sql, "x IN (?,?)");
         assert!(s.err.is_none());
@@ -319,7 +415,7 @@ mod tests {
     /// `expand(0)` 必须在发请求**之前**短路（否则拼出 `IN ()` 让生产库报语法错）
     #[tokio::test]
     async fn expand_zero_fails_before_touching_db() {
-        let pool = sqlx::MySqlPool::connect_lazy("mysql://u:p@127.0.0.1:1/db").unwrap();
+        let pool = lazy_mysql();
         let err = FixedStmt::new_owned(pool.clone(), "dms", "x IN ({in})", true)
             .expand(0)
             .bind(1i64)
@@ -333,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn mysql_fixed_rejects_non_identity_sources_before_touching_db() {
-        let pool = sqlx::MySqlPool::connect_lazy("mysql://u:p@127.0.0.1:1/db").unwrap();
+        let pool = lazy_mysql();
         let err = FixedStmt::new_owned(pool, "analysis", "SELECT 1", false)
             .fetch_all::<(i64,)>()
             .await
@@ -346,7 +442,7 @@ mod tests {
     /// 固定参数写在 `{in}` 之前，bind 顺序 = 占位符编号顺序。
     #[tokio::test]
     async fn bind_accepts_borrowed_and_owned() {
-        let pool = sqlx::PgPool::connect_lazy("postgres://u:p@127.0.0.1:1/db").unwrap();
+        let pool = lazy_pg();
         let ids = vec![7i64, 8];
         let name = String::from("tanlibo");
         let mut s = PgStmt::new(&pool, "owned-pg", "b = $1 AND a IN ({in})").expand(2);
@@ -356,5 +452,26 @@ mod tests {
             s = s.bind(id);
         }
         assert!(s.err.is_none(), "bind 不该报错");
+    }
+
+    /// 无 `{in}` 标记 / n 超上限：都是调用方误用，必须在发请求前记 config 错
+    /// （否则到数据库才报 bind 数不匹配 / 顶爆 max_allowed_packet，错误归类全错）。
+    #[tokio::test]
+    async fn expand_misuse_is_config_error_before_touching_db() {
+        let pool = lazy_mysql();
+        let err = FixedStmt::new_owned(pool.clone(), "dms", "SELECT 1", true)
+            .expand(2)
+            .fetch_all::<(i64,)>()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Config(_)), "{err}");
+        assert!(err.to_string().contains("{in}"), "{err}");
+        let err = FixedStmt::new_owned(pool.clone(), "dms", "x IN ({in})", true)
+            .expand(20_000)
+            .fetch_all::<(i64,)>()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Config(_)), "{err}");
+        assert!(err.to_string().contains("超上限"), "{err}");
     }
 }

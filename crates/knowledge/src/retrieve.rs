@@ -119,6 +119,7 @@ const KG_MAX_NODES: usize = 200;
 /// 二跳实体 0.0 —— 参与拓扑但不回传个性化质量，质量只压在「问句直接相关的实体及其紧邻」上。
 const KG_SEED_DIRECT: f64 = 1.0;
 const KG_SEED_NEIGHBOR: f64 = 0.8;
+const KG_SEED_HOP2: f64 = 0.0;
 /// 实体名 trgm 种子的相似度下限（问句包含命中不看这个分）：种子阶段宁宽勿严（扩散与 PPR 会
 /// 重排），但「毫不相干」的泛名种子会把个性化质量洒进无关邻域。与 TITLE/METADATA 辅助路同档。
 const KG_SEED_SIM_MIN: f32 = 0.3;
@@ -233,7 +234,9 @@ fn normalize_query(input: &str) -> String {
         }
         out.extend(ch.to_lowercase());
     }
-    let mut q = out.trim().to_string();
+    // gap 逻辑保证 out 无首尾空白（前导分隔符不会写入、尾随分隔符只置旗不推字符），
+    // 不需要再 trim（白分配一次 String）
+    let mut q = out;
     for prefix in ["麻烦帮我查询一下", "麻烦帮我查一下", "帮我查询一下", "帮我查一下", "请问一下", "请问"] {
         if let Some(rest) = q.strip_prefix(prefix) {
             let rest = rest.trim();
@@ -377,7 +380,8 @@ pub async fn search_with_status(
     Ok((report.hits, report.vector_degraded))
 }
 
-/// 与 `search_with_status` 相同的检索，只额外返回各召回路线的候选数量。
+/// 与 `search_with_status` 相同的检索，额外返回 `normalized_query`、`vector_degraded`
+/// 与各路召回的候选数量（`SearchStats`，只观测、不参与阈值判定）。
 pub async fn search_report(
     store: &OwnedStore,
     embed: &EmbedClient,
@@ -396,17 +400,19 @@ pub async fn search_report(
         });
     }
     let docs = visible_docs(store, v, space).await?;
-    let visible_docs = docs.len();
+    let visible_n = docs.len();
     // 可见集合为空 → 一条检索查询都不发（`scan_mode` 返 None）。
     // 这里不算降级：一篇可见文档都没有时「没有相关内容」是实话。
-    let Some(scan) = scan_mode(visible_docs) else {
+    let Some(scan) = scan_mode(visible_n) else {
         return Ok(SearchReport {
             normalized_query: query,
             hits: Vec::new(),
             vector_degraded: false,
-            stats: SearchStats { visible_docs, ..SearchStats::default() },
+            stats: SearchStats { visible_docs: visible_n, ..SearchStats::default() },
         });
     };
+    // 权重数组取一次（两个融合点共享同一份快照，不重复构造）
+    let routes = weights.route_array();
     // 五路彼此独立：向量 HTTP 与四条 PG 查询并行，保持原阈值/排序不变，只去掉固定串行等待。
     let vector = async {
         match embed.embed_query(&query).await {
@@ -414,6 +420,7 @@ pub async fn search_report(
             // 🔴 静默跳过这一路是本文件最贵的一处沉默。剩下路线仍可答，但必须显式降级。
             None => {
                 tracing::warn!(
+                    space = space.unwrap_or("<all>"),
                     "向量检索不可用（embed 服务挂或熔断中）→ 本次只剩精确匹配/正文相似/标题/元数据路，可能漏检"
                 );
                 Ok::<_, KbError>((Vec::new(), true))
@@ -434,9 +441,12 @@ pub async fn search_report(
     let (vec_ids, vec_down) = vector?;
     // 固定五个槽位，向量降级时也保留空 vec：诊断日志不会把精确路数量误记成向量数量。
     let mut lists = vec![vec_ids, exact?, trgm?, title?, metadata?];
+    // 槽位序 = 「向量/精确/正文/标题 | 元数据」：push 序就是语义序，`auxiliary[0]` 恒为
+    // 元数据路——在 metadata 前插一路会静默指错，先钉死
+    debug_assert_eq!(lists.len(), 5, "lists 槽位序变了，auxiliary[0] 不再是元数据路");
     let (direct, auxiliary) = lists.split_at_mut(4);
     keep_auxiliary_votes_on_direct_hits(direct, &mut auxiliary[0]);
-    let direct_ranked = rrf_weighted(&lists, &weights.route_array()[..5]);
+    let direct_ranked = rrf_weighted(&lists, &routes[..5]);
     let direct_ids: Vec<i64> = direct_ranked.iter().take(CANDIDATE_K).map(|(id, _)| *id).collect();
     // 第 6/7 路互不依赖（关系扩展吃直接命中，图谱吃向量路种子），并行发出。
     // 图谱路永不返 Err：图没建 / 查询失败 / env 关闭都是「这一路缺席」—— 降级 warn 留痕走原路，
@@ -464,9 +474,10 @@ pub async fn search_report(
         .collect();
     lists.push(ext_kb_map.iter().map(|(id, _)| *id).collect());
 
-    let ranked = rrf_weighted(&lists, &weights.route_array());
+    let ranked = rrf_weighted(&lists, &routes);
+    debug_assert_eq!(lists.len(), 8, "lists 槽位序变了，下方 stats/通道名按硬下标取数会错位");
     let stats = SearchStats {
-        visible_docs,
+        visible_docs: visible_n,
         vector_candidates: lists[0].len(),
         fts_candidates: lists[1].len(),
         trgm_candidates: lists[2].len(),
@@ -500,28 +511,22 @@ pub async fn search_report(
         //   ② 各路都执行但 RRF 后一条不剩（阈值过滤掉的）：相关度下限把它们挡住了，
         //      处置是**降阈值**（而①不该动阈值）；
         //   ③ 各路都空（`lists` 里每条都是空）：真没有，处置是告诉用户补文档。
-        // 没有这一条，「明明上传了却搜不到」只能靠猜：是 embed 挂了、是阈值挡了、还是真没有。
-        // 三题诊断（wf_c921b918）把这处列为「观测最粗的一处」 —— 今天三者全归成同一行「没有相关内容」。
-        let (vec_n, exact_n, trgm_n, title_n, metadata_n) = (
-            lists.first().map_or(0, Vec::len),
-            lists.get(1).map_or(0, Vec::len),
-            lists.get(2).map_or(0, Vec::len),
-            lists.get(3).map_or(0, Vec::len),
-            lists.get(4).map_or(0, Vec::len),
-        );
-        let kg_n = lists.get(6).map_or(0, Vec::len);
-        let ext_kb_n = lists.get(7).map_or(0, Vec::len);
+        // ⚠️ 本分支里②与③同形态、无法区分：能进这里 ⇒ ranked 空 ⇒ 八路 list 全空
+        // （RRF 不过滤候选，阈值过滤发生在各路 SQL 内），所以②在这份日志里永远观测不到，
+        // 各路计数结构性恒零——stats 字段照记（含 relation 路），只为形状完整。
         tracing::info!(
+            space = space.unwrap_or("<all>"),
             vec_down,
-            vec = vec_n,
-            exact = exact_n,
-            trgm = trgm_n,
-            title = title_n,
-            metadata = metadata_n,
-            kg = kg_n,
-            ext_kb = ext_kb_n,
-            merged = ranked.len(),
-            "检索零命中：各路召回数（vec=向量 exact=单号/型号精确 trgm=正文相似 title=标题/文件名 metadata=元数据 kg=图谱 ext_kb=外部知识库 merged=RRF 后）"
+            vec = stats.vector_candidates,
+            exact = stats.fts_candidates,
+            trgm = stats.trgm_candidates,
+            title = stats.title_candidates,
+            metadata = stats.metadata_candidates,
+            relation = stats.relation_candidates,
+            kg = stats.kg_candidates,
+            ext_kb = stats.ext_kb_candidates,
+            merged = stats.fused_candidates,
+            "检索零命中：各路召回数（vec=向量 exact=单号/型号精确 trgm=正文相似 title=标题/文件名 metadata=元数据 relation=结构关联 kg=图谱 ext_kb=外部知识库 merged=RRF 后）"
         );
         return Ok(SearchReport {
             normalized_query: query,
@@ -538,9 +543,21 @@ pub async fn search_report(
             hits.push(ext_kb_hit(*synthetic_id, ord as i32, record));
         }
     }
+    // 每 hit 一次 `ranked.iter().find` / 8 路 `contains` 是 O(hits×fused) 的重复扫：
+    // 融合分与通道名各离线建一次映射，循环内查表
+    let score_of: HashMap<i64, f32> = ranked.iter().map(|(id, s)| (*id, *s)).collect();
+    let mut channel_map: HashMap<i64, Vec<&'static str>> = HashMap::new();
+    for (route, name) in lists.iter().zip(CHANNEL_NAMES) {
+        for id in route {
+            channel_map.entry(*id).or_default().push(name);
+        }
+    }
     for h in &mut hits {
-        h.score = ranked.iter().find(|(id, _)| *id == h.chunk_id).map_or(0.0, |(_, s)| *s);
-        h.channels = match_channels(h.chunk_id, &lists);
+        h.score = score_of.get(&h.chunk_id).copied().unwrap_or(0.0);
+        h.channels = channel_map
+            .get(&h.chunk_id)
+            .map(|names| names.iter().map(|n| n.to_string()).collect())
+            .unwrap_or_default();
         h.relations = related
             .iter()
             .filter(|r| r.chunk_id == h.chunk_id)
@@ -561,6 +578,9 @@ pub async fn search_report(
     })
 }
 
+/// `window()` 上下文窗口的硬上限（±块）：人工浏览用，±3 够了
+const CITATION_WINDOW_MAX: i32 = 3;
+
 /// 引用原文回查：`chunk_id` 前后各 `w` 块（同文档内）。
 /// 锚点查询本身内联 ACL、启用状态，正文加载时再重放一次；历史版本也必须可核对。
 /// 不存在与不可见统一报 `Forbidden`，不给他人文档的存在性做探针。
@@ -570,16 +590,8 @@ pub async fn window(
     chunk_id: i64,
     w: i32,
 ) -> Result<Vec<Hit>, KbError> {
-    let anchor = store
-        .fixed(citation_anchor_sql())
-        .bind(&v.login)
-        .bind(&v.roles)
-        .bind(chunk_id)
-        .fetch_optional::<(String, i32)>()
-        .await?;
-    let (doc_id, ord) = anchor
-        .ok_or_else(|| KbError::Forbidden("引用当前不可见".into()))?;
-    let w = w.clamp(0, 3);
+    let (doc_id, ord) = citation_anchor(store, v, chunk_id).await?;
+    let w = w.clamp(0, CITATION_WINDOW_MAX);
     citation_hits_for_anchor(store, v, chunk_id, &doc_id, ord - w, ord + w).await
 }
 
@@ -589,24 +601,28 @@ pub async fn window(
 /// 本函数是「把模型看到的那一条命中原样取回」（核对用，长度由检索时的合并决定）。
 /// 用 `window` 冒充它会漏 —— 合并跨度可以是 5 块，而 `window` 被 `clamp(0,3)` 钉死。
 ///
-/// `span` 上限 16：检索合并同样受 `MAX_MERGE_SPAN` 约束，而无上限的取数口是个 DoS 面。
+/// `span` 上限 = `MAX_MERGE_SPAN`：检索合并同样受它约束，而无上限的取数口是个 DoS 面。
 pub async fn span(
     store: &OwnedStore,
     v: &Viewer,
     chunk_id: i64,
     span: u32,
 ) -> Result<Vec<Hit>, KbError> {
-    let anchor = store
+    let (doc_id, ord) = citation_anchor(store, v, chunk_id).await?;
+    let n = span.clamp(1, MAX_MERGE_SPAN) as i32;
+    citation_hits_for_anchor(store, v, chunk_id, &doc_id, ord, ord + n - 1).await
+}
+
+/// 锚点查询（`window`/`span` 共用）：返回 (doc_id, ord)；不存在与不可见统一 `Forbidden`。
+async fn citation_anchor(store: &OwnedStore, v: &Viewer, chunk_id: i64) -> Result<(String, i32), KbError> {
+    store
         .fixed(citation_anchor_sql())
         .bind(&v.login)
         .bind(&v.roles)
         .bind(chunk_id)
         .fetch_optional::<(String, i32)>()
-        .await?;
-    let (doc_id, ord) = anchor
-        .ok_or_else(|| KbError::Forbidden("引用当前不可见".into()))?;
-    let n = span.clamp(1, 16) as i32;
-    citation_hits_for_anchor(store, v, chunk_id, &doc_id, ord, ord + n - 1).await
+        .await?
+        .ok_or_else(|| KbError::Forbidden("引用当前不可见".into()))
 }
 
 fn citation_anchor_sql() -> &'static str {
@@ -765,15 +781,17 @@ const EXACT_SQL: &str = "SELECT chunk_id FROM kb.chunk c \
 
 /// 精确路一次参与的 token 上限（防爆闸；正常问句一两个）。
 const EXACT_MAX_TOKENS: usize = 8;
+/// 精确路 token 的长度门槛（`{6,}`）：短于它的 ASCII 串不是单号/型号，扫了也是噪声
+const EXACT_TOKEN_MIN: usize = 6;
 
 /// 精确路的 token 抽取：`[A-Za-z0-9-]{6,}`（单号/型号/编号）。全仓无 regex 依赖，手写扫描。
-/// 调用方传入的是归一化问句（已小写化、按空白/标点切段）；token 字符集不含 `%`/`_`，
+/// 调用方传入的是归一化问句（已小写化、按空白/切段）；token 字符集不含 `%`/`_`，
 /// 拼 ILIKE 模式串无需转义。去重保序，超闸截断。
 fn exact_tokens(q: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     let flush = |cur: &mut String, out: &mut Vec<String>| {
-        if cur.len() >= 6 && !out.contains(cur) {
+        if cur.len() >= EXACT_TOKEN_MIN && !out.contains(cur) {
             out.push(std::mem::take(cur));
         } else {
             cur.clear();
@@ -1075,6 +1093,9 @@ async fn kg_route_inner(
             seeds.push(id);
         }
     }
+    // 并集再按 KG_SEED_MAX 收口：by_chunk/by_name 各自 ≤20，并集可达 40——
+    // 「个性化压在少数实体上」的口径不许被并集突破
+    seeds.truncate(KG_SEED_MAX);
     if seeds.is_empty() {
         // 「没命中实体」与「图里没数据」长得一样，处置不同：后者是降级，必须留痕。
         if !doc_graph::space_has_chunks(pg, space_id, docs).await? {
@@ -1104,6 +1125,10 @@ async fn kg_route_inner(
     };
     let mut rel_edges = hop1_edges;
     rel_edges.extend(hop2_edges);
+    // ⚠️ hop1 边被计入两次（frontier 含 seeds，hop2 查询覆盖 hop1 的边）：`assemble_subgraph`
+    // 的 `+= e.weight` 让 hop1 关系边权重翻倍、hop1-hop1/hop1-hop2 边不翻倍。
+    // 这是现有行为，当作「hop1 关系更强」的隐式加权保留——改动会漂 PPR 排序（判官面），
+    // 要去重先过评测。
     let sg = assemble_subgraph(&entities, &rel_edges, &chunks, &pairs, KG_MAX_NODES);
     let (rank, _) = personalized_pagerank(sg.teleport.len(), &sg.edges, &sg.teleport);
     Ok(kg_top_chunks(&sg, &rank))
@@ -1111,10 +1136,13 @@ async fn kg_route_inner(
 
 /// 邻边查询带回来的新端点（不在已知集合内的），保持边序（支持次数降序，高支持邻域先进）。
 fn new_endpoints(known: &[String], edges: &[RelEdge]) -> Vec<String> {
+    // 旁挂 HashSet 判重（Vec 保序）：双重线性查找在 known≤200、端点≤2000 时是数十万次比较
+    let known: std::collections::HashSet<&str> = known.iter().map(String::as_str).collect();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
     for edge in edges {
         for endpoint in [&edge.src, &edge.dst] {
-            if !known.contains(endpoint) && !out.contains(endpoint) {
+            if !known.contains(endpoint.as_str()) && seen.insert(endpoint.as_str()) {
                 out.push(endpoint.clone());
             }
         }
@@ -1132,19 +1160,23 @@ fn diffuse_entities(
     max_nodes: usize,
 ) -> Vec<(String, f64)> {
     let mut out: Vec<(String, f64)> = Vec::new();
+    // 旁挂判重集（上限 200 时线性 any 约 2 万次比较）
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for seed in seeds {
         if out.len() >= max_nodes {
             return out;
         }
-        out.push((seed.clone(), KG_SEED_DIRECT));
+        if seen.insert(seed.as_str()) {
+            out.push((seed.clone(), KG_SEED_DIRECT));
+        }
     }
-    for (edges, weight) in [(hop1_edges, KG_SEED_NEIGHBOR), (hop2_edges, 0.0)] {
+    for (edges, weight) in [(hop1_edges, KG_SEED_NEIGHBOR), (hop2_edges, KG_SEED_HOP2)] {
         for edge in edges {
             for endpoint in [&edge.src, &edge.dst] {
                 if out.len() >= max_nodes {
                     return out;
                 }
-                if !out.iter().any(|(id, _)| id == endpoint) {
+                if seen.insert(endpoint.as_str()) {
                     out.push((endpoint.clone(), weight));
                 }
             }
@@ -1226,19 +1258,23 @@ fn personalized_pagerank(
         return (vec![0.0; n], 0);
     }
     let tele: Vec<f64> = teleport.iter().map(|t| t / tsum).collect();
+    // dangling 节点集合由 out_w 决定、迭代期间不变——下标集合循环外算一次复用
+    let dangling_idx: Vec<usize> = (0..n).filter(|&i| out_w[i] == 0.0).collect();
     let mut rank = vec![1.0 / n as f64; n];
+    // 双 buffer 轮换（每轮 collect 重新分配 ×100 轮不值）；逐元素运算保持原样，逐位等价
+    let mut next = vec![0.0f64; n];
     let mut iter = 0;
     while iter < KG_PPR_MAX_ITER {
-        let dangling: f64 = (0..n).filter(|&i| out_w[i] == 0.0).map(|i| rank[i]).sum();
-        let mut next: Vec<f64> = (0..n)
-            .map(|i| (1.0 - KG_PPR_DAMPING) * tele[i] + KG_PPR_DAMPING * dangling / n as f64)
-            .collect();
+        let dangling: f64 = dangling_idx.iter().map(|&i| rank[i]).sum();
+        for i in 0..n {
+            next[i] = (1.0 - KG_PPR_DAMPING) * tele[i] + KG_PPR_DAMPING * dangling / n as f64;
+        }
         for &(a, b, w) in edges {
             next[b] += KG_PPR_DAMPING * rank[a] * w / out_w[a];
             next[a] += KG_PPR_DAMPING * rank[b] * w / out_w[b];
         }
         let diff: f64 = next.iter().zip(&rank).map(|(x, y)| (x - y).abs()).sum();
-        rank = next;
+        std::mem::swap(&mut rank, &mut next);
         iter += 1;
         if diff < KG_PPR_TOL {
             break;
@@ -1306,7 +1342,7 @@ fn ext_kb_hit(chunk_id: i64, ord: i32, record: &ExtKbRecord) -> Hit {
         business_domain: None,
         effective_from: None,
         effective_to: None,
-        source_uri: Some(record.source_uri.clone()),
+        source_uri: Some(record.source_uri.clone()).filter(|s| !s.is_empty()), // 空串不落 Some("")：「来源可辨」不能变成空链接
         // 远程版本/族不可核对：留空 → 不进治理版本与文本版本两套保全逻辑。
         document_family: None,
         document_revision: None,
@@ -1319,17 +1355,25 @@ fn ext_kb_hit(chunk_id: i64, ord: i32, record: &ExtKbRecord) -> Hit {
     }
 }
 
+/// 八路召回的通道名，顺序 = `lists` 槽位序（`search_report` 里 `debug_assert_eq!(lists.len(), 8)`
+/// 钉住对齐）。`match_channels` 的 zip 对更短的输入静默截断——测试只给 6 路是刻意的。
+const CHANNEL_NAMES: [&str; 8] =
+    ["向量", "精确匹配", "正文相似", "标题", "元数据", "结构关联", "图谱", "外部知识库"];
+
+/// 测试专用的通道名查询（生产路径在 `search_report` 里用离线建好的 `channel_map` 查表）。
+/// zip 对更短的输入静默截断——测试只给 6 路是刻意的。
+#[cfg(test)]
 fn match_channels(chunk_id: i64, lists: &[Vec<i64>]) -> Vec<String> {
-    const NAMES: [&str; 8] = ["向量", "精确匹配", "正文相似", "标题", "元数据", "结构关联", "图谱", "外部知识库"];
     lists
         .iter()
-        .zip(NAMES)
+        .zip(CHANNEL_NAMES)
         .filter(|(ids, _)| ids.contains(&chunk_id))
         .map(|(_, name)| name.to_string())
         .collect()
 }
 
-/// 元数据只能增强已由正文/标题召回的块，不能凭标签或业务域单独制造答案候选。
+/// 元数据只能增强已由四路直接命中（向量/精确/正文/标题）召回的块，
+/// 不能凭标签或业务域单独制造答案候选。
 fn keep_auxiliary_votes_on_direct_hits(direct: &[Vec<i64>], auxiliary: &mut Vec<i64>) {
     auxiliary.retain(|id| direct.iter().any(|route| route.contains(id)));
 }
@@ -1368,15 +1412,18 @@ async fn load_hits(
         .await?)
 }
 
-/// RRF 融合：`score = Σ 1/(60 + rank)`，rank 从 1 起。
-/// 并列按 `chunk_id` 升序 —— 检索结果必须可复现，否则「同一问句两次不同答案」无法排查。
-///
-/// `ponytail:` O(路数 × top × 结果集) 的线性查找，n ≤ 50，建 HashMap 不划算。
+/// 等权 RRF 的测试壳（`score = Σ 1/(60 + rank)`，权重全 1.0）——生产路径走 `rrf_weighted`，
+/// 公式与权重语义见它的文档。
 #[cfg(test)]
 fn rrf(lists: &[Vec<i64>]) -> Vec<(i64, f32)> {
     rrf_weighted(lists, &[])
 }
 
+/// RRF 融合：`score = Σ w_route/(60 + rank)`，rank 从 1 起；`weights` 缺省的路按 1.0、负值钳 0
+/// （钳制是防御性保险丝，配置侧的拒绝闸在 `RrfWeights::validate`）。
+/// 并列按 `chunk_id` 升序 —— 检索结果必须可复现，否则「同一问句两次不同答案」无法排查。
+///
+/// `ponytail:` O(路数 × top × 结果集) 的线性查找，n ≤ 50，建 HashMap 不划算。
 fn rrf_weighted(lists: &[Vec<i64>], weights: &[f32]) -> Vec<(i64, f32)> {
     let mut acc: Vec<(i64, f32)> = Vec::new();
     for (route, list) in lists.iter().enumerate() {
@@ -1412,7 +1459,7 @@ fn rank_hits(hits: Vec<Hit>) -> Vec<Hit> {
 
 /// 从候选全序里截最终进 prompt 的 `TOP_K`（来源多样化 + 版本/显式关系保全）。
 fn finalize_ranked(ranked: Vec<Hit>) -> Vec<Hit> {
-    let selected = diversify(ranked.clone(), TOP_K);
+    let selected = diversify(&ranked, TOP_K);
     let selected = preserve_governed_versions(&ranked, selected, TOP_K);
     let selected = preserve_textual_versions(&ranked, selected, TOP_K);
     append_explicit_context(&ranked, selected)
@@ -1480,16 +1527,29 @@ fn governed_versions_conflict(left: &Hit, right: &Hit) -> bool {
     })
 }
 
+/// 文本版版本标记词表（`textual_version_class` 与 `opposite_version_sections` 共用——
+/// 各硬编码一份，改一处漏一处就是行为分叉）
+const TEXT_OLD_MARKERS: [&str; 4] = ["旧版", "历史版", "历史口径", "废止"];
+const TEXT_CURRENT_MARKERS: [&str; 4] = ["新版", "现行版", "现行口径", "修订版"];
+
+/// 版本保全最多追加的候选条数（两个 `preserve_*` 共用）：新旧两版并排核对足够，
+/// 再多就挤掉正文命中了
+const PRESERVE_APPEND_MAX: usize = 2;
+
 /// 已召回的同族多版本必须一起进入最终上下文，但它们只是补充核对资料：
 /// 先保留正文直接命中的 `selected`，再在末尾追加最多两个版本候选，不能反过来挤掉正文命中。
 fn preserve_governed_versions(ranked: &[Hit], selected: Vec<Hit>, limit: usize) -> Vec<Hit> {
-    let mut required = Vec::new();
-    for hit in ranked {
-        let Some(key) = governed_version_key(hit) else { continue };
+    // 预算各 hit 的版本键：去重比较里反复重算（`governed_version_key` 每次比较都分配 String）
+    let keys: Vec<Option<(String, String)>> = ranked.iter().map(governed_version_key).collect();
+    let mut required: Vec<Hit> = Vec::new();
+    let mut required_keys: Vec<&(String, String)> = Vec::new();
+    for (i, hit) in ranked.iter().enumerate() {
+        let Some(key) = &keys[i] else { continue };
         let conflicts = ranked.iter().any(|other| {
             other.doc_id != hit.doc_id && governed_versions_conflict(hit, other)
         });
-        if conflicts && !required.iter().any(|existing: &Hit| governed_version_key(existing) == Some(key.clone())) {
+        if conflicts && !required_keys.contains(&key) {
+            required_keys.push(key);
             required.push(hit.clone());
         }
     }
@@ -1499,7 +1559,7 @@ fn preserve_governed_versions(ranked: &[Hit], selected: Vec<Hit>, limit: usize) 
     let mut out = selected;
     let mut added = 0usize;
     for hit in required {
-        if added >= 2 || out.len() >= limit + 2 {
+        if added >= PRESERVE_APPEND_MAX || out.len() >= limit + PRESERVE_APPEND_MAX {
             break;
         }
         if !out.iter().any(|existing| existing.chunk_id == hit.chunk_id) {
@@ -1511,20 +1571,18 @@ fn preserve_governed_versions(ranked: &[Hit], selected: Vec<Hit>, limit: usize) 
 }
 
 fn textual_version_class(hit: &Hit) -> Option<i8> {
-    let old_markers = ["旧版", "历史版", "历史口径", "废止"];
-    let current_markers = ["新版", "现行版", "现行口径", "修订版"];
-    let old = old_markers
+    let old = TEXT_OLD_MARKERS
         .iter()
         .any(|marker| hit.heading_path.contains(marker) || hit.text.contains(marker));
-    let current = current_markers
+    let current = TEXT_CURRENT_MARKERS
         .iter()
         .any(|marker| hit.heading_path.contains(marker) || hit.text.contains(marker));
     match (old, current) {
         (true, false) => Some(-1),
         (false, true) => Some(1),
         _ => {
-            let old = old_markers.iter().any(|marker| hit.doc_name.contains(marker));
-            let current = current_markers.iter().any(|marker| hit.doc_name.contains(marker));
+            let old = TEXT_OLD_MARKERS.iter().any(|marker| hit.doc_name.contains(marker));
+            let current = TEXT_CURRENT_MARKERS.iter().any(|marker| hit.doc_name.contains(marker));
             match (old, current) {
                 (true, false) => Some(-1),
                 (false, true) => Some(1),
@@ -1552,19 +1610,19 @@ fn textual_version_group(hit: &Hit) -> String {
 }
 
 fn preserve_textual_versions(ranked: &[Hit], selected: Vec<Hit>, limit: usize) -> Vec<Hit> {
-    let mut required = Vec::new();
-    for hit in ranked {
-        let Some(class) = textual_version_class(hit) else { continue };
-        let group = textual_version_group(hit);
-        let conflicts = ranked.iter().any(|other| {
-            textual_version_group(other) == group
-                && textual_version_class(other).is_some_and(|other_class| other_class != class)
-        });
-        if conflicts
-            && !required.iter().any(|existing: &Hit| {
-                textual_version_group(existing) == group && textual_version_class(existing) == Some(class)
-            })
-        {
+    // 预算 (class, group)：class 要对合并后长正文跑 8 个 marker contains、group 有
+    // lowercase+多次 replace 分配——O(n²) 双重循环里反复重算不值
+    let meta: Vec<(Option<i8>, String)> =
+        ranked.iter().map(|h| (textual_version_class(h), textual_version_group(h))).collect();
+    let mut required: Vec<Hit> = Vec::new();
+    let mut required_keys: Vec<(&str, i8)> = Vec::new();
+    for (i, hit) in ranked.iter().enumerate() {
+        let (Some(class), group) = (meta[i].0, &meta[i].1) else { continue };
+        let conflicts = meta
+            .iter()
+            .any(|(other_class, g)| g == group && other_class.is_some_and(|oc| oc != class));
+        if conflicts && !required_keys.contains(&(group.as_str(), class)) {
+            required_keys.push((group.as_str(), class));
             required.push(hit.clone());
         }
     }
@@ -1574,7 +1632,7 @@ fn preserve_textual_versions(ranked: &[Hit], selected: Vec<Hit>, limit: usize) -
     let mut out = selected;
     let mut added = 0usize;
     for hit in required {
-        if added >= 2 || out.len() >= limit + 2 {
+        if added >= PRESERVE_APPEND_MAX || out.len() >= limit + PRESERVE_APPEND_MAX {
             break;
         }
         if !out.iter().any(|existing| existing.chunk_id == hit.chunk_id) {
@@ -1624,22 +1682,28 @@ fn dedup_sources(hits: Vec<Hit>) -> Vec<Hit> {
     out
 }
 
+/// 正文级去重：只在**同 doc_id 内**按归一化正文去重（跨文档同正文是「同一原件重复上传」，
+/// 归 `dedup_sources` 按 source_hash 管，两份各管一段不重叠）。
+/// 归一化后为空的块（纯空白正文）豁免去重：空键互相撞会误杀，原样放行。
 fn dedup_text(hits: Vec<Hit>) -> Vec<Hit> {
     let mut out: Vec<Hit> = Vec::with_capacity(hits.len());
+    // (doc_id, 归一化键) 旁挂缓存：内层 any 对每个已收条目重算归一化是 O(n²) 的字符串分配
+    let mut keys: Vec<(String, String)> = Vec::with_capacity(hits.len());
     for h in hits {
         let key = normalized_text(&h.text);
-        if key.is_empty()
-            || !out.iter().any(|p| p.doc_id == h.doc_id && normalized_text(&p.text) == key)
-        {
+        if key.is_empty() || !keys.iter().any(|(doc, k)| *doc == h.doc_id && *k == key) {
+            keys.push((h.doc_id.clone(), key));
             out.push(h);
         }
     }
     out
 }
 
-fn diversify(hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
+/// 多文档时先保证来源覆盖（每篇最多 `DOC_FIRST_PASS` 条）；候选不足时第二轮用同文档结果补满。
+/// 收 `&[Hit]`（调用方只有一份全序要保给后续 preserve 步骤），入选条目逐条 clone。
+fn diversify(hits: &[Hit], limit: usize) -> Vec<Hit> {
     let mut out: Vec<Hit> = Vec::with_capacity(limit.min(hits.len()));
-    for h in &hits {
+    for h in hits {
         let n = out.iter().filter(|p| p.doc_id == h.doc_id).count();
         if n < DOC_FIRST_PASS {
             out.push(h.clone());
@@ -1652,7 +1716,7 @@ fn diversify(hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
         if out.iter().any(|p| p.chunk_id == h.chunk_id) {
             continue;
         }
-        out.push(h);
+        out.push(h.clone());
         if out.len() == limit {
             break;
         }
@@ -1660,8 +1724,8 @@ fn diversify(hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
     out
 }
 
-/// 同文档 `ord` 连续的块拼成一条（减少碎片）：`chunk_id`/`ord`/`heading_path` 取首块，
-/// 分数取组内最大，`page` 取第一个非空。输出按分数降序。
+/// 同文档 `ord` 连续的块拼成一条（减少碎片）：`chunk_id`/`ord` 取首块，
+/// `heading_path` 取组内第一个非空，分数取组内最大，`page` 取第一个非空。输出按分数降序。
 fn merge_adjacent(mut hits: Vec<Hit>) -> Vec<Hit> {
     hits.sort_by(|a, b| a.doc_id.cmp(&b.doc_id).then(a.ord.cmp(&b.ord)));
     let mut out: Vec<Hit> = Vec::new();
@@ -1705,10 +1769,10 @@ fn merge_adjacent(mut hits: Vec<Hit>) -> Vec<Hit> {
 
 fn opposite_version_sections(left: &Hit, right: &Hit) -> bool {
     fn class(hit: &Hit) -> Option<i8> {
-        let old = ["旧版", "历史版", "历史口径", "废止"]
+        let old = TEXT_OLD_MARKERS
             .iter()
             .any(|marker| hit.heading_path.contains(marker) || hit.text.contains(marker));
-        let current = ["新版", "现行版", "现行口径", "修订版"]
+        let current = TEXT_CURRENT_MARKERS
             .iter()
             .any(|marker| hit.heading_path.contains(marker) || hit.text.contains(marker));
         match (old, current) {

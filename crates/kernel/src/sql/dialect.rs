@@ -40,18 +40,23 @@ impl Dialect for MysqlDialect {
     fn parser(&self) -> &'static (dyn sqlparser::dialect::Dialect + Send + Sync) {
         &MYSQL_PARSER
     }
-    /// 逐字取自 `meta.rs:215-218`（连库验证过的形态）
+    /// 逐字取自旧 server `meta.rs` 的表探针（连库验证过的形态）。
+    /// ORDER BY 给采集结果定序（快照/审计 diff 不再随库漂）。
+    /// `TABLE_ROWS` 对未 ANALYZE/特殊引擎可为 NULL：`IFNULL` 与 PG 侧 coalesce 对齐。
     fn table_probe(&self) -> &'static str {
-        "SELECT CAST(TABLE_NAME AS CHAR), CAST(TABLE_COMMENT AS CHAR), CAST(TABLE_ROWS AS CHAR)
+        "SELECT CAST(TABLE_NAME AS CHAR), CAST(TABLE_COMMENT AS CHAR), CAST(IFNULL(TABLE_ROWS, 0) AS CHAR)
          FROM information_schema.TABLES
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'"
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'
+         ORDER BY TABLE_NAME"
     }
-    /// 逐字取自 `meta.rs:222-226`。**`CAST(... AS CHAR)` 一个都不能省**：
+    /// 逐字取自旧 server `meta.rs` 的列探针。**`CAST(... AS CHAR)` 一个都不能省**：
     /// information_schema 的注释列是 LONGBLOB，不 CAST 会被 sqlx 解成 `Vec<u8>` 直接类型不匹配报错。
+    /// 按 `ORDINAL_POSITION` 排序（查了它却不按它排等于白查）。
     fn column_probe(&self) -> &'static str {
         "SELECT CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR), CAST(DATA_TYPE AS CHAR),
                 CAST(COLUMN_COMMENT AS CHAR), CAST(ORDINAL_POSITION AS CHAR)
-         FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()"
+         FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+         ORDER BY TABLE_NAME, ORDINAL_POSITION"
     }
 }
 
@@ -67,13 +72,16 @@ impl Dialect for PostgresDialect {
     }
     /// PG 侧两条探针**已连库实测**（2026-07-28，上传源首次问数；见 `connector/src/postgres.rs` 头注）。
     /// `reltuples` 是 ANALYZE 的估算值（未 ANALYZE 的新表为 -1），与 MySQL 的 `TABLE_ROWS` 同为估算。
+    /// `relkind IN ('r','p')` 含分区表：与 connector 建连白名单的 relkind 集合同口径。
+    /// ORDER BY 给采集结果定序。
     ///
     /// `n.nspname = current_schema()` 是**上传源必须带 `search_path` 的原因**：多份上传共用一条
     /// `pg_ro_url`、schema 一份一个，不置 search_path 则这里恒查 `public`、一张表都采不到。
     fn table_probe(&self) -> &'static str {
         "SELECT c.relname, coalesce(obj_description(c.oid, 'pg_class'), ''), c.reltuples::bigint
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE c.relkind = 'r' AND n.nspname = current_schema()"
+         WHERE c.relkind IN ('r','p') AND n.nspname = current_schema()
+         ORDER BY c.relname"
     }
     /// 同上已实测。走 pg_catalog 而非 information_schema：后者拿列注释要把
     /// `table_schema.table_name` 拼成 regclass 再取 oid，pg_attribute 直接有 attrelid/attnum。
@@ -82,17 +90,25 @@ impl Dialect for PostgresDialect {
                 coalesce(col_description(c.oid, a.attnum), ''), a.attnum
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
          JOIN pg_attribute a ON a.attrelid = c.oid
-         WHERE c.relkind = 'r' AND n.nspname = current_schema()
-           AND a.attnum > 0 AND NOT a.attisdropped"
+         WHERE c.relkind IN ('r','p') AND n.nspname = current_schema()
+           AND a.attnum > 0 AND NOT a.attisdropped
+         ORDER BY c.relname, a.attnum"
     }
 }
 
 /// 配置里的方言名 → 方言实例。认不出返回 `None`（调用方 fail-closed，不猜默认值）。
+/// 入参先 trim（`"mysql "`、`" pg"` 这类带空白配置按认不出处理太费解）。
 pub fn by_name(name: &str) -> Option<&'static dyn Dialect> {
-    match name.to_ascii_lowercase().as_str() {
-        "mysql" => Some(&MYSQL),
-        "postgres" | "postgresql" | "pg" => Some(&POSTGRES),
-        _ => None,
+    let name = name.trim();
+    if name.eq_ignore_ascii_case("mysql") {
+        Some(&MYSQL)
+    } else if name.eq_ignore_ascii_case("postgres")
+        || name.eq_ignore_ascii_case("postgresql")
+        || name.eq_ignore_ascii_case("pg")
+    {
+        Some(&POSTGRES)
+    } else {
+        None
     }
 }
 
@@ -105,7 +121,19 @@ mod tests {
         assert_eq!(by_name("MySQL").map(|d| d.name()), Some("MySQL"));
         assert_eq!(by_name("pg").map(|d| d.name()), Some("PostgreSQL"));
         assert_eq!(by_name("postgresql").map(|d| d.name()), Some("PostgreSQL"));
+        assert_eq!(by_name(" mysql ").map(|d| d.name()), Some("MySQL"), "入参 trim");
         assert!(by_name("oracle").is_none());
+    }
+
+    /// 四条探针 SQL 必须能被各自方言 parse（从来没人验证过这条）
+    #[test]
+    fn probes_parse_with_their_own_dialect() {
+        for d in [&MYSQL as &dyn Dialect, &POSTGRES as &dyn Dialect] {
+            for probe in [d.table_probe(), d.column_probe()] {
+                sqlparser::parser::Parser::parse_sql(d.parser(), probe)
+                    .unwrap_or_else(|e| panic!("{} 探针不能被自方言解析: {e}\n{probe}", d.name()));
+            }
+        }
     }
 
     /// 🔴 两个方言的引号**必须不同**：相同就说明有人把 PG 那支复制成了反引号，

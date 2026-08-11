@@ -31,59 +31,80 @@ pub async fn load_principal(
     login_name: &str,
     role_code: Option<&str>,
 ) -> anyhow::Result<Principal> {
+    // (employee_id, login_name, actual_name, administrator_flag, department_id)
     let emp: Option<(i64, String, String, Option<i8>, Option<i64>)> = mysql
         .fixed(
             "SELECT employee_id, login_name, actual_name, administrator_flag, department_id
-         FROM t_employee WHERE login_name = ? AND deleted_flag = 0 AND disabled_flag = 0
-           AND (passwd_expire_time IS NULL OR passwd_expire_time >= CURRENT_TIMESTAMP)",
+             FROM t_employee WHERE login_name = ? AND deleted_flag = 0 AND disabled_flag = 0
+               AND (passwd_expire_time IS NULL OR passwd_expire_time >= CURRENT_TIMESTAMP)",
         )
         .bind(login_name)
         .fetch_optional()
         .await?;
     let (employee_id, login_name, actual_name, admin_flag, department_id) =
-        emp.ok_or_else(|| anyhow::anyhow!("员工不存在: {login_name}"))?;
+        // 文案覆盖三种情形：不存在 / disabled/deleted / 密码过期（同一个查询谓词集）
+        emp.ok_or_else(|| anyhow::anyhow!("员工不存在或已停用/过期: {login_name}"))?;
 
     let roles: Vec<(i64, String)> = mysql
         .fixed(
             "SELECT r.role_id, r.role_code FROM t_role_employee re
-         JOIN t_role r ON r.role_id = re.role_id
-         WHERE re.employee_id = ? ORDER BY r.role_id",
+             JOIN t_role r ON r.role_id = re.role_id
+             WHERE re.employee_id = ? ORDER BY r.role_id",
         )
         .bind(employee_id)
         .fetch_all()
         .await?;
 
-    let administrator_flag = admin_flag.unwrap_or(0) == 1;
     // 超管可以无角色（短路放行）；普通员工无角色 = fail-closed 拒绝
-    let (role_id, role_code) = match role_code {
-        Some(rc) => roles
-            .iter()
-            .find(|(_, c)| c.trim() == rc)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("该账号无角色 {rc}"))?,
-        None => match roles.len() {
-            1 => roles[0].clone(),
-            0 if administrator_flag => (0, "admin".into()),
-            0 => anyhow::bail!("该账号无任何角色（fail-closed 拒绝）"),
-            _ => anyhow::bail!(
-                "请选择登录角色（该账号有多个角色，权限档不同，不能替你默认选）：{}",
-                roles.iter().map(|(_, c)| c.trim()).collect::<Vec<_>>().join(" / ")
-            ),
-        },
-    };
+    let (role_id, role_code) = resolve_role(&roles, admin_flag == Some(1), role_code)?;
 
     Ok(Principal {
         employee_id,
         login_name,
         actual_name,
-        administrator_flag,
+        administrator_flag: admin_flag == Some(1),
         department_id,
         role_id,
         role_code: role_code.trim().to_string(),
     })
 }
 
-/// 该账号的可选角色列表（多角色时前端/三端据此让用户选，对齐 DMS 登录选角色）
+/// 角色裁决（从 load_principal 提出：None 分支原本是四层嵌套 match）。
+/// `want` 先 trim：三端传带空白的角色码不该误报「无角色」。
+fn resolve_role(
+    roles: &[(i64, String)],
+    administrator_flag: bool,
+    want: Option<&str>,
+) -> anyhow::Result<(i64, String)> {
+    match want {
+        Some(rc) => {
+            let rc = rc.trim();
+            roles
+                .iter()
+                .find(|(_, c)| c.trim() == rc)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("该账号无角色 {rc}"))
+        }
+        None => match roles.len() {
+            1 => Ok(roles[0].clone()),
+            // 合成 role_id=0：靠「admin 短路放行所以 0 永不进查询」这一约定才安全
+            0 if administrator_flag => Ok((0, "admin".into())),
+            0 => anyhow::bail!("该账号无任何角色（fail-closed 拒绝）"),
+            _ => anyhow::bail!(
+                "请选择登录角色（该账号有多个角色，权限档不同，不能替你默认选）：{}",
+                roles
+                    .iter()
+                    .map(|(_, c)| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            ),
+        },
+    }
+}
+
+/// 该账号的可选角色列表（多角色时前端/三端据此让用户选，对齐 DMS 登录选角色）。
+/// 谓词与 `load_principal` 同口径（含密码过期：过期账号能列出角色却登不了是误导）。
 pub async fn list_roles(mysql: &ReadOnlyMySql, login_name: &str) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> = mysql
         .fixed(
@@ -91,12 +112,17 @@ pub async fn list_roles(mysql: &ReadOnlyMySql, login_name: &str) -> anyhow::Resu
          JOIN t_role_employee re ON re.employee_id = e.employee_id
          JOIN t_role r ON r.role_id = re.role_id
          WHERE e.login_name = ? AND e.deleted_flag = 0 AND e.disabled_flag = 0
+           AND (e.passwd_expire_time IS NULL OR e.passwd_expire_time >= CURRENT_TIMESTAMP)
          ORDER BY r.role_id",
         )
         .bind(login_name)
         .fetch_all()
         .await?;
-    Ok(rows.into_iter().map(|(c,)| c.trim().to_string()).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(c,)| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect())
 }
 
 #[cfg(test)]

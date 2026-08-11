@@ -109,17 +109,20 @@ pub fn classify(file_name: &str, len: u64, max_bytes: u64) -> Result<FileKind, K
         return Err(KbError::BadInput("文件为空".into()));
     }
     if len > max_bytes {
+        // 一位小数：整除 MB 在非对齐/不足 1MB 时会打出「文件 0 MB 超过上限 0 MB」式误导
         return Err(KbError::BadInput(format!(
-            "文件 {} MB 超过上限 {} MB",
-            len / 1_048_576,
-            max_bytes / 1_048_576
+            "文件 {:.1} MB 超过上限 {:.1} MB",
+            len as f64 / 1_048_576.0,
+            max_bytes as f64 / 1_048_576.0
         )));
     }
     match lookup(file_name) {
         Some((_, kind)) => Ok(kind),
+        // 支持清单从 EXTS 生成：手抄清单曾与表白名单漂移（markdown 在表里、文案里没有）
         None => Err(KbError::BadInput(format!(
-            "不支持的文件类型 .{}（支持 pdf/doc/docx/xls/xlsx/xlsm/csv/ppt/pptx/txt/md/json/log/html 与 png/jpg/jpeg/webp/gif/bmp/tif/tiff 图片）",
-            ext_of(file_name)
+            "不支持的文件类型 .{}（支持：{}）",
+            ext_of(file_name),
+            EXTS.iter().map(|(e, _)| *e).collect::<Vec<_>>().join("/")
         ))),
     }
 }
@@ -132,8 +135,9 @@ fn ext_of(name: &str) -> String {
 }
 
 fn lookup(file_name: &str) -> Option<(&'static str, FileKind)> {
-    let ext = ext_of(file_name);
-    EXTS.iter().find(|(e, _)| *e == ext).map(|(e, k)| (*e, *k))
+    // 零分配比较：白名单全小写，`eq_ignore_ascii_case` 省一次小写 String
+    let (_, ext) = file_name.rsplit_once('.')?;
+    EXTS.iter().find(|(e, _)| e.eq_ignore_ascii_case(ext)).map(|(e, k)| (*e, *k))
 }
 
 /// 磁盘路径 `<root>/<doc_id>.<白名单扩展名>`。
@@ -156,21 +160,30 @@ struct InferredDocVersion {
     revision: String,
 }
 
+/// 推断出的文档族/版本号长度上限（字符）：防把整段长文件名当版本尾缀吞进来
+const MAX_FAMILY_CHARS: usize = 120;
+const MAX_REVISION_CHARS: usize = 60;
+
 /// 只识别明确版本尾缀；普通数字、名称中的字母 v 或“最新版”等模糊词一律不猜。
 fn infer_doc_version(file_name: &str) -> Option<InferredDocVersion> {
     let stem = file_name.rsplit_once('.').map_or(file_name, |(stem, _)| stem).trim();
     let mut found = None;
     for (index, _) in stem.char_indices() {
         let raw = stem[index..].trim();
+        // 候选位置快筛（等价收敛，省长文件名的近 O(n²)）：只有「前一字符是分隔符 /
+        // 以『第』开头 / 以括号开头」的位置才可能命中，其余位置跑了也白跑
+        let preceded = stem[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|c| matches!(c, '_' | '-' | ' ' | '(' | '（' | '[' | '【'));
+        if !preceded && !raw.starts_with('第') && !raw.starts_with(['(', '（', '[', '【']) {
+            continue;
+        }
         let token = unwrap_version_token(raw);
         if !is_version_token(token) {
             continue;
         }
         let direct_edition = token.starts_with('第');
-        let preceded = stem[..index]
-            .chars()
-            .next_back()
-            .is_some_and(|c| matches!(c, '_' | '-' | ' ' | '(' | '（' | '[' | '【'));
         let wrapped = raw.len() != token.len();
         if !direct_edition && !preceded && !wrapped {
             continue;
@@ -178,7 +191,10 @@ fn infer_doc_version(file_name: &str) -> Option<InferredDocVersion> {
         let family = stem[..index]
             .trim_end_matches(|c: char| matches!(c, '_' | '-' | '.' | ' ' | '(' | '（' | '[' | '【'))
             .trim();
-        if family.is_empty() || family.chars().count() > 120 || token.chars().count() > 60 {
+        if family.is_empty()
+            || family.chars().count() > MAX_FAMILY_CHARS
+            || token.chars().count() > MAX_REVISION_CHARS
+        {
             continue;
         }
         found = Some(InferredDocVersion {
@@ -202,14 +218,15 @@ fn unwrap_version_token(raw: &str) -> &str {
 }
 
 fn is_version_token(token: &str) -> bool {
-    let chars: Vec<char> = token.chars().collect();
-    if chars.len() >= 2 && matches!(chars[0], 'v' | 'V') {
-        return chars[1].is_ascii_digit()
-            && chars[1..].iter().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
-            && chars.last().is_some_and(|c| c.is_ascii_digit());
+    // 迭代器/切片写法，不分配 Vec<char>（'v'/'V' 是 ASCII，strip 后下标安全）
+    if let Some(rest) = token.strip_prefix(['v', 'V']) {
+        return rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && rest.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
+            && rest.ends_with(|c: char| c.is_ascii_digit());
     }
     if token.starts_with('第') && token.ends_with('版') {
-        let middle = token.trim_start_matches('第').trim_end_matches('版');
+        // 各剥一次：`trim_start_matches('第')` 会把「第第3版」误剥成合法版本尾缀
+        let middle = token.strip_prefix('第').and_then(|t| t.strip_suffix('版')).unwrap_or("");
         return !middle.is_empty()
             && middle.chars().all(|c| c.is_ascii_digit() || "一二三四五六七八九十百".contains(c));
     }
@@ -233,8 +250,10 @@ pub async fn ingest(
     image_ocr: Option<&dyn ImageOcr>,
 ) -> Result<Ingested, KbError> {
     // kind 只用于校验：通道②的分派按**解析结果**（`parsed.sheets` 非空）走，不按扩展名——
-    // 文档服务才知道一个 .csv 里到底有没有表格
-    classify(req.file_name, req.bytes.len() as u64, cfg.max_bytes)?;
+    // 文档服务才知道一个 .csv 里到底有没有表格。kind 随调用链下传，parse_input 不再二次查表。
+    let kind = classify(req.file_name, req.bytes.len() as u64, cfg.max_bytes)?;
+    // 落盘根目录在入口统一建一次（run/build_shadow 内不再各建一遍）
+    tokio::fs::create_dir_all(&cfg.root).await.map_err(io_err)?;
     // 个人空间首次上传时尚不存在，先幂等创建；若同名空间已由别人持有，ON CONFLICT
     // 不会改 owner，下面的真实 owner/ACL 判定仍会拒绝，不能靠字符串碰撞越权。
     if req.space_id == v.login {
@@ -266,26 +285,27 @@ pub async fn ingest(
             return dedup_or_reprocess(st, doc, embed, v, cfg, req, existing, image_ocr).await;
         }
     };
-    if let Some(version) = infer_doc_version(req.file_name) {
-        if store::apply_inferred_doc_version(
-            st,
-            v,
-            &doc_id,
-            &version.family,
-            &version.revision,
-        )
-            .await
-            .is_err()
-        {
-            tracing::warn!(doc_id, reason = "inferred_version_write_failed", "文档版本元数据自动补全失败");
-        }
-    }
-    match run(st, doc, embed, v, cfg, &req, &doc_id, image_ocr).await {
+    try_apply_inferred_version(st, v, &doc_id, req.file_name).await;
+    match run(st, doc, embed, v, cfg, &req, &doc_id, image_ocr, kind).await {
         Ok(source) => Ok(Ingested { doc_id, source }),
         Err(e) => {
             // 不许静默成功：失败文案落库，用户在文档列表里看得见
-            let _ = store::set_status(st, v, &doc_id, DocStatus::Failed, &e.to_string()).await;
+            if let Err(se) = store::set_status(st, v, &doc_id, DocStatus::Failed, &e.to_string()).await {
+                tracing::warn!(doc_id, error = %se, "失败文案落库也失败（用户在列表里看不到原因）");
+            }
             Err(e)
+        }
+    }
+}
+
+/// 版本元数据自动补全（推断 + 落库）：ingest 与 reprocess 同一形态，只此一份。
+/// 失败只 warn（元数据不挡主链），但 warn 必须带 error——吞掉错误本体排障拿不到原因。
+async fn try_apply_inferred_version(st: &OwnedStore, v: &Viewer, doc_id: &str, file_name: &str) {
+    if let Some(version) = infer_doc_version(file_name) {
+        if let Err(e) =
+            store::apply_inferred_doc_version(st, v, doc_id, &version.family, &version.revision).await
+        {
+            tracing::warn!(doc_id, error = %e, "文档版本元数据自动补全失败");
         }
     }
 }
@@ -305,7 +325,12 @@ async fn dedup_or_reprocess(
     image_ocr: Option<&dyn ImageOcr>,
 ) -> Result<Ingested, KbError> {
     let row = store::get_doc(st, &existing).await?;
-    match dedup_action(row.as_ref().map(|d| d.status.as_str())) {
+    // 并发删除：find_by_sha 命中后文档没了——直接 NotFound；走 Reprocess 最终会报
+    // 「写权限已失效」，语义误导
+    let Some(row) = row else {
+        return Err(KbError::NotFound(format!("文档 {existing} 已不存在")));
+    };
+    match dedup_action(Some(row.status.as_str())) {
         // `source` 为空——那次上传已登记过物理表数据源
         DedupAction::Reuse => Ok(Ingested { doc_id: existing, source: None }),
         DedupAction::Reprocess => reprocess(st, doc, embed, v, cfg, req, &existing, image_ocr).await,
@@ -337,11 +362,23 @@ pub async fn reprocess(
     doc_id: &str,
     image_ocr: Option<&dyn ImageOcr>,
 ) -> Result<Ingested, KbError> {
-    classify(req.file_name, req.bytes.len() as u64, cfg.max_bytes)?;
-    let (_, folder_path) = store::resolve_folder(st, req.space_id, req.folder_id).await?;
+    let kind = classify(req.file_name, req.bytes.len() as u64, cfg.max_bytes)?;
+    // 落盘根目录在入口统一建一次（build_shadow 内不再重建）
+    tokio::fs::create_dir_all(&cfg.root).await.map_err(io_err)?;
+    // CAS 的 expected 文本必须按**库内** name/folder_path 生成（`replace_chunks` 用库内值复核）：
+    // 用请求侧值时，改名/换目录后重传同内容文件会让 expected 全部失配、向量被迫补算
+    let current = store::get_doc(st, doc_id)
+        .await?
+        .ok_or_else(|| KbError::NotFound(format!("文档 {doc_id} 不存在")))?;
     let stage_id = uuid::Uuid::new_v4().to_string();
-    let staged = build_shadow(doc, embed, cfg, &req, &folder_path, &stage_id, image_ocr).await;
-    let _ = tokio::fs::remove_file(doc_path(cfg, &stage_id, req.file_name)).await;
+    let staged_path = doc_path(cfg, &stage_id, req.file_name);
+    let staged = build_shadow(doc, embed, &req, &current, &staged_path, image_ocr, kind).await;
+    if let Err(e) = tokio::fs::remove_file(&staged_path).await {
+        // 文件可能根本没写出来（build_shadow 在写盘前就失败）：NotFound 不算事，其余留诊断
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(doc_id, error = %e, "staged 临时文件删除失败（会遗留 stage 文件）");
+        }
+    }
     let built = match staged {
         Ok(v) => v,
         Err(e) => return Err(e),
@@ -360,20 +397,7 @@ pub async fn reprocess(
         &built.notice,
     )
     .await?;
-    if let Some(version) = infer_doc_version(req.file_name) {
-        if store::apply_inferred_doc_version(
-            st,
-            viewer,
-            doc_id,
-            &version.family,
-            &version.revision,
-        )
-            .await
-            .is_err()
-        {
-            tracing::warn!(doc_id, reason = "inferred_version_write_failed", "文档版本元数据自动补全失败");
-        }
-    }
+    try_apply_inferred_version(st, viewer, doc_id, req.file_name).await;
     // 表格物理表属于同一原文件，不在索引重建时重复灌数；已登记的数据源原样保留。
     Ok(Ingested { doc_id: doc_id.to_string(), source: None })
 }
@@ -390,36 +414,47 @@ struct ShadowBuild {
 }
 
 /// 重处理的影子构建：不改 `kb.doc/kb.chunk`，失败时线上版本完全不动。
+/// `current` 是库内文档行：embedding_text 的 expected 口径（文档名/目录）必须按库内值生成
+/// （`replace_chunks` 的 CAS 复核用库内 name/folder_path），`path` 由调用方算好传入（只算一次）。
 async fn build_shadow(
     doc: &DocService,
     embed: &EmbedClient,
-    cfg: &IngestCfg,
     req: &UploadReq<'_>,
-    folder_path: &str,
-    stage_id: &str,
+    current: &store::DocRow,
+    path: &std::path::Path,
     image_ocr: Option<&dyn ImageOcr>,
+    kind: FileKind,
 ) -> Result<ShadowBuild, KbError> {
-    let path = doc_path(cfg, stage_id, req.file_name);
-    tokio::fs::create_dir_all(&cfg.root).await.map_err(io_err)?;
-    tokio::fs::write(&path, req.bytes).await.map_err(io_err)?;
-    let parsed = parse_input(doc, &path, req, image_ocr).await?;
+    tokio::fs::write(path, req.bytes).await.map_err(io_err)?;
+    let parsed = parse_input(doc, path, req, image_ocr, kind).await?;
     let notice = parsed.notes.join("；");
     let mut blocks = parsed.blocks;
     blocks.extend(tabular::sheet_blocks(&parsed.sheets));
-    let spanned = chunk_with_preset(doc, resolve_preset(requested_preset(req)), &blocks).await?;
+    let spanned = chunk_with_preset(doc, resolve_preset(req.preset), &blocks).await?;
     if spanned.chunks.is_empty() {
         return Err(KbError::BadInput("文档里没有可索引的文本".into()));
     }
     let embedding_texts: Vec<String> = spanned
         .chunks
         .iter()
-        .map(|c| store::chunk_embedding_text(req.file_name, folder_path, &c.heading_path, &c.text))
+        .map(|c| store::chunk_embedding_text(&current.name, &current.folder_path, &c.heading_path, &c.text))
         .collect();
-    let vecs = embed
-        .embed_passages(&embedding_texts)
-        .await
-        .filter(|v| v.len() == spanned.chunks.len())
-        .ok_or_else(|| KbError::Upstream("向量服务不可用，保留原版本未切换".into()))?;
+    let vecs = match embed.embed_passages(&embedding_texts).await {
+        Some(v) if v.len() == spanned.chunks.len() => v,
+        got => {
+            // 计数日志与 run 的同款 warn 对齐；两类失败文案分开（服务不可用 / 条数不符）
+            tracing::warn!(
+                chunks = spanned.chunks.len(),
+                got_vecs = got.as_ref().map_or(0, |v| v.len()),
+                "影子构建向量路失败，保留原版本未切换"
+            );
+            let msg = match got {
+                Some(_) => "向量条数与块数不符，保留原版本未切换",
+                None => "向量服务不可用，保留原版本未切换",
+            };
+            return Err(KbError::Upstream(msg.into()));
+        }
+    };
     let embeddings = vecs.iter().map(|v| Some(to_pgvector(v))).collect();
     Ok(ShadowBuild {
         chunks: spanned.chunks,
@@ -444,20 +479,21 @@ async fn run(
     req: &UploadReq<'_>,
     doc_id: &str,
     image_ocr: Option<&dyn ImageOcr>,
+    kind: FileKind,
 ) -> Result<Option<TabularSource>, KbError> {
     let path = doc_path(cfg, doc_id, req.file_name);
     store::set_status(st, viewer, doc_id, DocStatus::Parsing, "").await?;
-    tokio::fs::create_dir_all(&cfg.root).await.map_err(io_err)?;
     tokio::fs::write(&path, req.bytes).await.map_err(io_err)?;
 
-    let parsed = parse_input(doc, &path, req, image_ocr).await?;
+    let parsed = parse_input(doc, &path, req, image_ocr, kind).await?;
     if !parsed.notes.is_empty() {
         store::set_notice(st, viewer, doc_id, &parsed.notes.join("；")).await?;
     }
     let mut blocks = parsed.blocks;
     // 通道①：每个 sheet 先渲染成 markdown 走同一条文本链（通道②在本函数末尾）
     blocks.extend(tabular::sheet_blocks(&parsed.sheets));
-    let spanned = chunk_with_preset(doc, resolve_preset(requested_preset(req)), &blocks).await?;
+    // preset 通道：server 表单 `preset` 字段原样传入（kb_api 上传入口）
+    let spanned = chunk_with_preset(doc, resolve_preset(req.preset), &blocks).await?;
     if spanned.chunks.is_empty() {
         return Err(KbError::BadInput("文档里没有可索引的文本".into()));
     }
@@ -479,8 +515,8 @@ async fn run(
         Some(v) if v.len() == jobs.len() => v,
         got => {
             if let Some(v) = &got {
-                let (chunks, vecs) = (jobs.len(), v.len());
-                tracing::warn!(doc_id, chunks, vecs, "向量条数与块数不符，本次不回写");
+                let (chunks, got_vecs) = (jobs.len(), v.len());
+                tracing::warn!(doc_id, chunks, got_vecs, "向量条数与块数不符，本次不回写");
             }
             // 可接受降级：文本检索（tsvector/trgm）仍可用，向量由 `embed_service.py revec` 后补。
             // ⚠️ 这句文案是 revec 清 error 时的匹配串（那边的 DOWNGRADE_MSG），改字要一起改。
@@ -499,7 +535,12 @@ async fn run(
     if !acl::space_writable(st, viewer, req.space_id).await? {
         return Err(KbError::Forbidden(format!("上传发布前已失去知识空间 {} 的写权限", req.space_id)));
     }
-    store::set_embeddings(st, doc_id, &rows, viewer).await?;
+    let written = store::set_embeddings(st, doc_id, &rows, viewer).await?;
+    if written == 0 {
+        // CAS 全失配：并发重建把 embedding_text/配方改了——一行没写，留痕（文档不毕业，
+        // 等 A9/embed_fill 按新文本补算）
+        tracing::warn!(doc_id, "向量回写 0 行（CAS 全失配，疑似并发重建）");
+    }
     // CAS 可能因目录并发移动而写入 0 行；只按库内实际缺口推进，不能无条件毕业。
     store::promote_doc_if_ready(st, doc_id, viewer).await?;
     tabular_channel(st, viewer, req.space_id, doc_id, &parsed.sheets).await
@@ -507,13 +548,15 @@ async fn run(
 
 /// 图片可由运行时视觉模型提供文字，其余文件和视觉降级仍复用原解析器。
 /// 这里只改变 ParsedDoc 的来源，后面的 chunk/embed/状态机保持同一条链。
+/// `kind` 来自入口的 `classify`（同一张白名单查一次，这里不二次查表）。
 async fn parse_input(
     doc: &DocService,
     path: &std::path::Path,
     req: &UploadReq<'_>,
     image_ocr: Option<&dyn ImageOcr>,
+    kind: FileKind,
 ) -> Result<ParsedDoc, KbError> {
-    let is_image = matches!(lookup(req.file_name), Some((_, FileKind::Image)));
+    let is_image = kind == FileKind::Image;
     if is_image {
         let recognized = match image_ocr {
             Some(ocr) => ocr.recognize(req.file_name, req.mime, req.bytes).await,
@@ -527,7 +570,7 @@ async fn parse_input(
     let mut parsed = doc
         .parse(&path.to_string_lossy(), Some(req.mime))
         .await
-        .map_err(sanitize_doc_error)?;
+        .map_err(|e| sanitize_doc_error(e, path))?;
     if is_image && image_ocr.is_some() {
         mark_image_ocr_fallback(&mut parsed);
     }
@@ -536,14 +579,19 @@ async fn parse_input(
 
 /// 文档服务的确定性错误变体会携带上游响应正文；知识库只保留可操作分类，
 /// 防止正文经 `KbError::Display` 进入文档状态或 HTTP 响应。
-fn sanitize_doc_error(error: dms_connector::doc::DocError) -> KbError {
+/// `path` 只用于 NotFound 文案（运维定位），是我们自己落盘的路径，不是上游正文。
+fn sanitize_doc_error(error: dms_connector::doc::DocError, path: &std::path::Path) -> KbError {
     use dms_connector::doc::DocError;
     match error {
         DocError::NoTextLayer => KbError::BadInput("该 PDF 没有文本层（扫描版），需先 OCR".into()),
         DocError::Unsupported(_) => KbError::BadInput("文档服务不支持该文件类型".into()),
         DocError::TooLarge(_) => KbError::BadInput("表格超出上限（20 万行 / 200 列）".into()),
-        DocError::NotFound(_) => KbError::NotFound("待解析文件".into()),
-        _ => KbError::Upstream("文档处理失败".into()),
+        DocError::NotFound(_) => KbError::NotFound(format!("待解析文件不存在：{}", path.display())),
+        other => {
+            // 未分类变体：错误本体先落服务端日志（用户侧文案保持净化后的分类）
+            tracing::warn!(error = %other, "文档服务错误未分类，按上游失败处理");
+            KbError::Upstream("文档处理失败".into())
+        }
     }
 }
 
@@ -553,8 +601,11 @@ fn mark_image_ocr_fallback(parsed: &mut ParsedDoc) {
     }
 }
 
+/// 「无法辨认」的归一化判定：去标点/空白/括号后等于「无法辨认」即失败信号——
+/// `[无法辨认]。`、全角括号等变体同样不是有效 OCR 正文
 fn usable_image_ocr(text: &str) -> bool {
-    !text.is_empty() && text != "[无法辨认]" && text != "无法辨认"
+    let normalized: String = text.chars().filter(|c| c.is_alphanumeric()).collect();
+    !normalized.is_empty() && normalized != "无法辨认"
 }
 
 fn image_parsed_doc(text: &str) -> ParsedDoc {
@@ -591,7 +642,9 @@ async fn tabular_channel(
     match tabular::materialize(st, doc_id, sheets).await {
         Ok(src) => {
             if !acl::space_writable(st, viewer, space_id).await? {
-                let _ = tabular::drop_source(st, doc_id).await;
+                if let Err(e) = tabular::drop_source(st, doc_id).await {
+                    tracing::warn!(doc_id, error = %e, "失权回滚的物理表清理失败（孤儿表）");
+                }
                 return Err(KbError::Forbidden(format!(
                     "表格发布期间已失去知识空间 {space_id} 的写权限"
                 )));
@@ -599,9 +652,14 @@ async fn tabular_channel(
             Ok(Some(src))
         }
         Err(e) => {
-            let _ = tabular::drop_source(st, doc_id).await;
-            let msg = format!("表格已入知识库，建表失败：{e}");
-            let _ = store::append_notice(st, viewer, doc_id, &msg).await;
+            if let Err(de) = tabular::drop_source(st, doc_id).await {
+                tracing::warn!(doc_id, error = %de, "建表失败后的物理表清理也失败（孤儿表）");
+            }
+            // 错误文案进 notice 前过 sanitize：与「上游正文不进用户字段」同一纪律
+            let msg = format!("表格已入知识库，建表失败：{}", dms_kernel::qalog::sanitize(&e.to_string()));
+            if let Err(ne) = store::append_notice(st, viewer, doc_id, &msg).await {
+                tracing::warn!(doc_id, error = %ne, "建表失败的降级提示落库失败");
+            }
             Ok(None)
         }
     }
@@ -645,17 +703,14 @@ impl ChunkPreset {
 }
 
 /// 解析上传参数里的 preset 名（yuxi `normalize_chunk_preset_id` 同款：未知值回退 general）。
+/// preset 通道：server 表单 `preset` 字段原样传入 `UploadReq.preset`（kb_api 上传入口）。
 pub fn resolve_preset(explicit: Option<&str>) -> ChunkPreset {
     explicit.and_then(ChunkPreset::parse).unwrap_or(ChunkPreset::General)
 }
 
-/// 上传请求里的 preset 参数通道：server 表单 `preset` 字段原样传入（kb_api 上传入口）。
-fn requested_preset<'a>(req: &UploadReq<'a>) -> Option<&'a str> {
-    req.preset
-}
-
 /// 与 `tools/embed_service.py::est_tokens` 同口径：`ceil(chars / 1.6)` 的整数写法。
-fn est_tokens(chars: usize) -> i32 {
+/// **全 crate 只此一份**（store 的 tokens 估算也用它，两处各写一份迟早漂移）。
+pub(crate) fn est_tokens(chars: usize) -> i32 {
     ((chars * 5 + 7) / 8) as i32
 }
 
@@ -745,9 +800,10 @@ struct MergedChunk {
     end: usize,
 }
 
-/// `_fill::one_page`：贡献页集合去重后只剩一个真实页才显示；跨页宁可 None（「不知道」比「说错」好）
-fn one_page(pages: &[Option<i32>]) -> Option<i32> {
-    let mut real = pages.iter().flatten().copied();
+/// `_fill::one_page`：贡献页集合去重后只剩一个真实页才显示；跨页宁可 None（「不知道」比「说错」好）。
+/// **全 crate 只此一份**（store 的合并页码也用它）。收迭代器：切片/映射链都能直接喂。
+pub(crate) fn one_page(pages: impl Iterator<Item = Option<i32>>) -> Option<i32> {
+    let mut real = pages.flatten();
     let first = real.next()?;
     if real.all(|p| p == first) {
         Some(first)
@@ -868,7 +924,7 @@ fn flush_merged(
     }
     // 首单元的前导空白/尾单元的尾部空白不算入覆盖范围
     let (a, b) = trim_range(s, a, b).unwrap_or((a, b));
-    out.push(MergedChunk { text: text.to_string(), heading: heading.to_string(), page: one_page(pages), start: a, end: b });
+    out.push(MergedChunk { text: text.to_string(), heading: heading.to_string(), page: one_page(pages.iter().copied()), start: a, end: b });
 }
 
 /// 按连续相同分组键切段，段内 `_fill` 合并（semantic/book/laws 共用的合并驱动）
@@ -916,22 +972,24 @@ struct StreamLine {
     start: usize,
     end: usize,
     page: Option<i32>,
-    heading: String,
+    /// 所属 block 下标（heading 用时再取，不逐行 clone 标题串）
+    block: usize,
+}
+
+impl StreamLine {
+    fn heading<'a>(&self, s: &'a SourceStream) -> &'a str {
+        &s.blocks[self.block].heading
+    }
 }
 
 fn stream_lines(s: &SourceStream) -> Vec<StreamLine> {
     let mut lines = Vec::new();
-    for b in &s.blocks {
+    for (bi, b) in s.blocks.iter().enumerate() {
         let mut pos = b.start;
         for piece in s.slice(b.start, b.end).split('\n') {
             let len = piece.chars().count();
             if !piece.trim().is_empty() {
-                lines.push(StreamLine {
-                    start: pos,
-                    end: pos + len,
-                    page: b.page,
-                    heading: b.heading.clone(),
-                });
+                lines.push(StreamLine { start: pos, end: pos + len, page: b.page, block: bi });
             }
             pos += len + 1; // 跳过 '\n'；每 block 循环重置 pos，末尾多算无影响
         }
@@ -950,7 +1008,11 @@ fn law_marker(t: &str, suffixes: &[&str]) -> bool {
     if digits == 0 {
         return false;
     }
-    let after: String = rest.chars().skip(digits).collect();
+    // char_indices 取第 digits 个字符的字节偏移后切片（中文数字 3 字节，digits 不是字节下标）
+    let after = match rest.char_indices().nth(digits) {
+        Some((i, _)) => &rest[i..],
+        None => "",
+    };
     suffixes.iter().any(|suf| after.starts_with(suf))
 }
 
@@ -1024,12 +1086,17 @@ fn parse_md_row(t: &str) -> Vec<String> {
     if !(t.starts_with('|') && t.ends_with('|') && t.matches('|').count() >= 2) {
         return Vec::new();
     }
-    t.trim_start_matches('|').trim_end_matches('|').split('|').map(|c| c.trim().to_string()).collect()
+    let cells: Vec<String> =
+        t.trim_start_matches('|').trim_end_matches('|').split('|').map(|c| c.trim().to_string()).collect();
+    // `| | ` 这类全空单元行不是表格行（防被 qa 主循环当表格素材）
+    if cells.iter().all(|c| c.is_empty()) {
+        return Vec::new();
+    }
+    cells
 }
 
-/// `| --- | :-: |` 形分隔行
-fn is_md_separator_row(t: &str) -> bool {
-    let cells = parse_md_row(t);
+/// `| --- | :-: |` 形分隔行（收已解析的 cells，不重复解析同一行）
+fn is_md_separator_cells(cells: &[String]) -> bool {
     !cells.is_empty()
         && cells.iter().all(|c| {
             let c: String = c.chars().filter(|ch| !ch.is_whitespace()).collect();
@@ -1037,11 +1104,14 @@ fn is_md_separator_row(t: &str) -> bool {
         })
 }
 
-/// `问：/Q:/Question：` 式前缀剥离（大小写不敏感；词后必须跟冒号才算命中）
+/// `问：/Q:/Question：` 式前缀剥离（大小写不敏感；词后必须跟冒号才算命中）。
+/// 零分配比较：`get(..w.len())` 在非字符边界返回 None，天然安全。
 fn strip_prefix_ci(t: &str, words: &[&str]) -> Option<String> {
-    let lower = t.to_ascii_lowercase();
     for w in words {
-        let Some(rest) = lower.strip_prefix(w) else { continue };
+        let Some(rest) = t.get(..w.len()).filter(|p| p.eq_ignore_ascii_case(w)).map(|_| &t[w.len()..])
+        else {
+            continue;
+        };
         let rest = rest.trim_start();
         let mut chars = rest.chars();
         if matches!(chars.next(), Some(':') | Some('：')) {
@@ -1051,13 +1121,18 @@ fn strip_prefix_ci(t: &str, words: &[&str]) -> Option<String> {
     None
 }
 
+/// 大小写不敏感的词表命中（零分配，替代表头识别里的逐 cell `to_ascii_lowercase`）
+fn eq_any_ci(s: &str, words: &[&str]) -> bool {
+    words.iter().any(|w| s.eq_ignore_ascii_case(w))
+}
+
 const Q_PREFIXES: [&str; 4] = ["question", "问题", "问", "q"];
 const A_PREFIXES: [&str; 5] = ["answer", "回答", "答案", "答", "a"];
 
 #[allow(clippy::too_many_arguments)]
 fn push_qa_pair(
     pairs: &mut Vec<MergedChunk>,
-    seen: &mut Vec<(String, String)>,
+    seen: &mut std::collections::HashSet<(String, String)>,
     q: &str,
     a: &str,
     start: usize,
@@ -1070,10 +1145,10 @@ fn push_qa_pair(
     if q.is_empty() || a.is_empty() {
         return;
     }
-    if seen.iter().any(|(sq, sa)| sq == q && sa == a) {
+    // QA 对多时是 O(n²) 线性去重的热面 → HashSet
+    if !seen.insert((q.to_string(), a.to_string())) {
         return;
     }
-    seen.push((q.to_string(), a.to_string()));
     pairs.push(MergedChunk {
         text: format!("问题：{q}\n回答：{a}"),
         heading: heading.to_string(),
@@ -1092,7 +1167,7 @@ fn push_qa_pair(
 fn qa_chunks(s: &SourceStream) -> Option<Vec<MergedChunk>> {
     let lines = stream_lines(s);
     let mut pairs: Vec<MergedChunk> = Vec::new();
-    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     // 前缀配对状态：问题行区间 + 答案累积（答案可能跨多行，span 覆盖到最后一行答案）
     let mut cur_q: Option<(String, usize, Option<i32>, String)> = None;
     let mut cur_a: Vec<String> = Vec::new();
@@ -1113,24 +1188,23 @@ fn qa_chunks(s: &SourceStream) -> Option<Vec<MergedChunk>> {
     let mut i = 0usize;
     while i < lines.len() {
         let line = &lines[i];
-        let text = s.slice(line.start, line.end).trim().to_string();
-        let cells = parse_md_row(&text);
+        let text = s.slice(line.start, line.end).trim();
+        let cells = parse_md_row(text);
         if !cells.is_empty() {
             flush_prefix!(); // 表格结构打断前缀配对
-            if is_md_separator_row(&text) {
+            if is_md_separator_cells(&cells) {
                 i += 1;
                 continue;
             }
             // 表头＝表格行且下一行是分隔行：定列位，本身不产对
             if i + 1 < lines.len()
-                && is_md_separator_row(s.slice(lines[i + 1].start, lines[i + 1].end).trim())
+                && is_md_separator_cells(&parse_md_row(
+                    s.slice(lines[i + 1].start, lines[i + 1].end).trim(),
+                ))
             {
-                let qi = cells
-                    .iter()
-                    .position(|c| matches!(c.to_ascii_lowercase().as_str(), "问" | "问题" | "q" | "question"));
-                let ai = cells.iter().position(|c| {
-                    matches!(c.to_ascii_lowercase().as_str(), "答" | "回答" | "答案" | "a" | "answer")
-                });
+                let qi = cells.iter().position(|c| eq_any_ci(c, &["问", "问题", "q", "question"]));
+                let ai =
+                    cells.iter().position(|c| eq_any_ci(c, &["答", "回答", "答案", "a", "answer"]));
                 cols = Some(match (qi, ai) {
                     (Some(qi), Some(ai)) if qi != ai => (qi, Some(ai)),
                     _ => (0, None),
@@ -1152,23 +1226,32 @@ fn qa_chunks(s: &SourceStream) -> Option<Vec<MergedChunk>> {
                         .collect::<Vec<_>>()
                         .join("；"),
                 };
-                push_qa_pair(&mut pairs, &mut seen, q, &a, line.start, line.end, line.page, &line.heading);
+                push_qa_pair(
+                    &mut pairs,
+                    &mut seen,
+                    q,
+                    &a,
+                    line.start,
+                    line.end,
+                    line.page,
+                    line.heading(s),
+                );
             }
             i += 1;
             continue;
         }
         cols = None; // 表格结束
-        if let Some(q) = strip_prefix_ci(&text, &Q_PREFIXES) {
+        if let Some(q) = strip_prefix_ci(text, &Q_PREFIXES) {
             flush_prefix!();
-            cur_q = Some((q, line.start, line.page, line.heading.clone()));
+            cur_q = Some((q, line.start, line.page, line.heading(s).to_string()));
             a_end = line.end;
-        } else if let Some(a) = strip_prefix_ci(&text, &A_PREFIXES) {
+        } else if let Some(a) = strip_prefix_ci(text, &A_PREFIXES) {
             if cur_q.is_some() {
                 cur_a.push(a);
                 a_end = line.end;
             }
         } else if cur_q.is_some() {
-            cur_a.push(text);
+            cur_a.push(text.to_string());
             a_end = line.end;
         }
         i += 1;
@@ -1211,7 +1294,8 @@ fn find_from(s: &SourceStream, needle: &str, from_char: usize) -> Option<(usize,
     let byte_from = s.char_to_byte[from_char];
     let rel = s.text[byte_from..].find(needle)?;
     let start = s.char_of_byte(byte_from + rel);
-    Some((start, start + needle.chars().count()))
+    // end 用字节偏移换算（needle 起止都在字符边界上），不再 `needle.chars().count()` 全串重扫
+    Some((start, s.char_of_byte(byte_from + rel + needle.len())))
 }
 
 /// 一条分块链路的产物：`chunks` 与等长平行的字符偏移（`insert_chunks`/`replace_chunks` 的入参形状）
@@ -1263,23 +1347,35 @@ async fn chunk_with_preset(
 /// sheet → markdown 表格块（通道①的唯一实现）。
 /// `tabular::sheet_blocks` 是它的契约入口，留在这里是因为行上限与降级文案的单测在本文件。
 pub(crate) fn sheet_block(s: &Sheet) -> Block {
+    use std::fmt::Write as _;
     let mut text = format!("# {}\n\n", s.name);
     if !s.header.is_empty() {
-        text.push_str(&format!("| {} |\n", s.header.join(" | ")));
-        text.push_str(&format!("|{}|\n", vec!["---"; s.header.len()].join("|")));
+        let _ = writeln!(text, "| {} |", s.header.iter().map(|h| md_cell(h)).collect::<Vec<_>>().join(" | "));
+        let _ = writeln!(text, "|{}|", vec!["---"; s.header.len()].join("|"));
     }
     for row in s.rows.iter().take(SHEET_ROWS) {
-        text.push_str(&format!("| {} |\n", row.join(" | ")));
+        let _ = writeln!(text, "| {} |", row.iter().map(|c| md_cell(c)).collect::<Vec<_>>().join(" | "));
     }
     if s.rows.len() > SHEET_ROWS {
-        // ponytail: 超长表只索引前 500 行，且把这句写进正文——降级要让读者看见。
+        // ponytail: 超长表只索引前 SHEET_ROWS 行，且把这句写进正文——降级要让读者看见。
         // 完整数据走 K4 的物理表通道。
-        text.push_str(&format!(
-            "\n（本表共 {} 行，仅前 {SHEET_ROWS} 行进入文本索引）\n",
+        let _ = writeln!(
+            text,
+            "\n（本表共 {} 行，仅前 {SHEET_ROWS} 行进入文本索引）",
             s.rows.len()
-        ));
+        );
     }
     Block { text, page: None, heading_path: s.name.clone() }
+}
+
+/// 单元格渲染进 markdown 前的中和：`|`/换行会破坏表结构并干扰 qa 表格抽取
+/// （与 answer 的 `table_cell` 同纪律：全角化/空格化，不丢内容）。无特殊字符零分配。
+fn md_cell(c: &str) -> std::borrow::Cow<'_, str> {
+    if c.contains(['|', '\n', '\r']) {
+        std::borrow::Cow::Owned(c.replace('|', "｜").replace(['\n', '\r'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(c)
+    }
 }
 
 #[cfg(test)]
@@ -1373,7 +1469,35 @@ mod tests {
         assert!(!usable_image_ocr(""));
         assert!(!usable_image_ocr("[无法辨认]"));
         assert!(!usable_image_ocr("无法辨认"));
+        // 变体同判：带句号/全角括号的失败信号也不是有效正文
+        assert!(!usable_image_ocr("[无法辨认]。"));
+        assert!(!usable_image_ocr("（无法辨认）"));
+        assert!(!usable_image_ocr("！！"), "纯标点同样不是有效正文");
         assert!(usable_image_ocr("订单号：HJXH-001"));
+    }
+
+    /// 「第第3版」不是版本尾缀（各剥一次，不许多剥）；空单元格行不是表格行
+    #[test]
+    fn version_token_and_md_row_edge_cases() {
+        assert!(!is_version_token("第第3版"));
+        assert!(is_version_token("第3版"));
+        assert!(parse_md_row("| | ").is_empty(), "全空单元行不许当表格行");
+        assert!(parse_md_row("| | |").is_empty());
+        assert_eq!(parse_md_row("| a | |"), vec!["a".to_string(), String::new()], "部分空单元仍是表格行");
+    }
+
+    /// 单元格里的 `|`/换行必须中和，否则渲染出的 markdown 表结构被破坏、qa 抽取被干扰
+    #[test]
+    fn sheet_cells_are_neutralized_before_rendering() {
+        let s = Sheet {
+            name: "t".into(),
+            header: vec!["a|b".into()],
+            rows: vec![vec!["x\ny".into()]],
+        };
+        let b = sheet_block(&s);
+        assert!(b.text.contains("a｜b"), "竖线全角化: {}", b.text);
+        assert!(b.text.contains("x y"), "换行空格化: {}", b.text);
+        assert_eq!(b.text.matches("a｜b").count(), 1);
     }
 
     /// 🔴 **本表必须覆盖文档服务真支持的每一种扩展名。**
@@ -1638,6 +1762,16 @@ mod tests {
         assert_eq!(dedup_action(Some("failed")), DedupAction::Reprocess);
         assert_eq!(dedup_action(Some("未来新状态")), DedupAction::Reprocess);
         assert_eq!(dedup_action(None), DedupAction::Reprocess);
+    }
+
+    /// 并发删除窗口（锚点）：find_by_sha 命中后 get_doc 为 None 时必须直接 NotFound，
+    /// 不许走 Reprocess 落一个「写权限已失效」的误导文案
+    #[test]
+    fn dedup_after_concurrent_delete_is_not_found() {
+        let src = include_str!("ingest.rs");
+        let body = src.split("fn dedup_or_reprocess").nth(1).unwrap();
+        let body = body.split("/// dedup 命中文档的处置").next().unwrap();
+        assert!(body.contains("KbError::NotFound"), "并发删除必须报不存在而非权限错（若是改名请同步改本锚点）");
     }
 
     /// 落库形状契约：Rust preset 的 chunks 与 spans 等长平行，tokens 按统一口径估算

@@ -30,44 +30,65 @@ pub async fn register_match(
     ds: &str,
     h: &DictHit<'_>,
 ) -> anyhow::Result<serde_json::Value> {
-    // 注册 value_map（eq）——字典全码注册，未来新值也自适应
-    for (code, name) in &h.pairs {
-        // `origin` 盖 dict 章：这一列的取值**可证完整枚举**（登记字典全码 + 抽样 uniq > 60 整列跳过），
-        // 于是 `caliber::load_enum_values`（只取 dict 那批）才会把它造成 `RequireKnownValue`
-        // ——「值不在码表 → SQL 合法 → 返 0 行 → 用户读成『没有这类数据』」那族静默错答的唯一判据。
-        // 🔴 `DO UPDATE` 里也必须带：DDL 默认值是最保守的 `seed`，而**既有 936 行**全是默认值
-        // 落的；不带就重跑也纠不回来，判据永远休眠（上一轮整轮休眠的原因，裁决 二·AQ8）。
+    // 注册 value_map（eq）——字典全码注册，未来新值也自适应。
+    // 先清掉该 (ds,表,列) 的 origin=dict 旧行（字典删值/改名后旧 name 行不许永留 ——
+    // 「字典变了重跑即自适应」），与批量 INSERT 同一事务。
+    let mut tx = pg.begin().await?;
+    sqlx::query(
+        "DELETE FROM meta.value_map WHERE ds_id = $1 AND table_name = $2 AND column_name = $3 AND origin = $4",
+    )
+    .bind(h.table)
+    .bind(h.col)
+    .bind(ds)
+    .bind(crate::ddl::VALUE_ORIGIN_DICT)
+    .execute(&mut *tx)
+    .await?;
+    // `origin` 盖 dict 章：这一列的取值**可证完整枚举**（登记字典全码 + 抽样 uniq > 60 整列跳过），
+    // 于是 `caliber::load_enum_values`（只取 dict 那批）才会把它造成 `RequireKnownValue`
+    // ——「值不在码表 → SQL 合法 → 返 0 行 → 用户读成『没有这类数据』」那族静默错答的唯一判据。
+    // 🔴 `DO UPDATE` 里也必须带：DDL 默认值是最保守的 `seed`，而**既有 936 行**全是默认值
+    // 落的；不带就重跑也纠不回来，判据永远休眠（上一轮整轮休眠的原因，裁决 二·AQ8）。
+    // 批量一次 upsert（原来每对码一次往返，大字典一轮上千次）。
+    if !h.pairs.is_empty() {
+        let names: Vec<&str> = h.pairs.iter().map(|(_, n)| n.as_str()).collect();
+        let codes: Vec<&str> = h.pairs.iter().map(|(c, _)| c.as_str()).collect();
         sqlx::query(
             "INSERT INTO meta.value_map(table_name, column_name, name, code, match_kind, ds_id, origin)
-             VALUES ($1,$2,$3,$4,'eq',$5,$6)
-             ON CONFLICT (ds_id, table_name, column_name, name) DO UPDATE SET code=$4, match_kind='eq', origin=$6",
+             SELECT $1, $2, u.n, u.c, 'eq', $5, $6 FROM unnest($3::text[], $4::text[]) AS u(n, c)
+             ON CONFLICT (ds_id, table_name, column_name, name)
+             DO UPDATE SET code=EXCLUDED.code, match_kind='eq', origin=EXCLUDED.origin",
         )
         .bind(h.table)
         .bind(h.col)
-        .bind(name)
-        .bind(code)
+        .bind(&names)
+        .bind(&codes)
         .bind(ds)
         // 常量而非字面量：`ddl::tests::value_map_origin_defaults_to_the_most_conservative`
         // 守着这三个常量与 DDL 默认值的耦合，写死 'dict' 就绕开了那道门。
         // 走 **bind 不走插值**：`tests/drift.rs` 的 SQL 插值白名单只放 `ds_pred`。
         .bind(crate::ddl::VALUE_ORIGIN_DICT)
-        .execute(pg)
+        .execute(&mut *tx)
         .await?;
     }
     // 注册 dimension（CASE 翻名；码数 >60 仅注册值映射，CASE 过长伤 prompt）
-    if h.pairs.len() <= 60 {
-        register_dimension(pg, ds, h).await?;
+    let dimension_registered = h.pairs.len() <= 60;
+    if dimension_registered {
+        register_dimension(&mut tx, ds, h).await?;
     }
+    tx.commit().await?;
     Ok(serde_json::json!({
         "table": h.table, "column": h.col, "dict": h.dict_key, "dict_name": h.dict_name,
         "distinct_values": h.distinct, "coverage": h.coverage,
+        "dimension_registered": dimension_registered,
     }))
 }
 
 /// 名称型值域取值入库：`meta.value_map` 的 `name` 与 `code` **各为取值本身**
-/// （裁决：复用码值表，不新建 —— DDL/主键/写入路径全现成）。返回写入条数。
+/// （裁决：复用码值表，不新建 —— DDL/主键/写入路径全现成）。
+/// 返回**取值条数**（输入口径；`DO NOTHING` 跳过的撞名行也算在内，不是实际落库数）。
 ///
 /// **先删该 (ds,表,列) 旧行再插**：分类改过名，旧名不许永久残留（重跑即自适应）。
+/// 删除与批量插入在同一事务（中途崩溃不留残缺词典）。
 /// **绝不**顺手给名称型生成 `meta.dimension` 的 CASE 翻名（码型路径会做那件事）：
 /// 60 个分类名的 CASE 是纯垃圾，会把 prompt 撑爆。
 pub async fn register_domain_values(
@@ -77,6 +98,7 @@ pub async fn register_domain_values(
     col: &str,
     values: &[String],
 ) -> anyhow::Result<usize> {
+    let mut tx = pg.begin().await?;
     sqlx::query(
         "DELETE FROM meta.value_map
          WHERE ds_id = $1 AND table_name = $2 AND column_name = $3",
@@ -84,52 +106,75 @@ pub async fn register_domain_values(
     .bind(ds)
     .bind(table)
     .bind(col)
-    .execute(pg)
+    .execute(&mut *tx)
     .await?;
-    for v in values {
+    if !values.is_empty() {
         // DISTINCT 后 trim 仍可能撞名（' 手抓饼' / '手抓饼'）→ DO NOTHING
         // `origin` 盖 probe 章（**不是** dict）：抽样上限 `DOMAIN_LIMIT = 2000` 会截断 ⇒ 不是完整
         // 枚举 ⇒ `RequireKnownValue` 一律不许对这批开火，否则每个未抽到的真取值都是一次假红。
         // `DO NOTHING` 不必带 origin：上面刚 DELETE 过该 (ds,表,列)，走到这儿的都是新行。
         sqlx::query(
             "INSERT INTO meta.value_map(table_name, column_name, name, code, match_kind, ds_id, origin)
-             VALUES ($1,$2,$3,$3,'eq',$4,$5) ON CONFLICT DO NOTHING",
+             SELECT $1, $2, u.v, u.v, 'eq', $4, $5 FROM unnest($3::text[]) AS u(v)
+             ON CONFLICT DO NOTHING",
         )
         .bind(table)
         .bind(col)
-        .bind(v)
+        .bind(values)
         .bind(ds)
         .bind(crate::ddl::VALUE_ORIGIN_PROBE)
-        .execute(pg)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(values.len())
 }
 
-async fn register_dimension(pg: &PgPool, ds: &str, h: &DictHit<'_>) -> anyhow::Result<()> {
+/// CASE 字面量清洗（单趟）：剥单引号**与反斜杠** —— MySQL 默认反斜杠转义，字典值含 `\`
+/// 会吃掉闭合引号，CASE 语法错且该维度此后每次生成 SQL 必炸。
+fn clean_sql_lit(s: &str) -> String {
+    let mut out = s.to_string();
+    out.retain(|ch| ch != '\'' && ch != '\\');
+    out
+}
+
+/// 维度描述（纯函数，断言打这）：coverage 是 0~1 小数，×100 后按整数百分比展示
+/// （原来 `{:.0}%` 直接格式化 0.85 得「1%」——每条 auto 维度的描述都是错的）。
+fn dim_desc(dict_name: &str, dict_key: &str, coverage: f64) -> String {
+    format!("自动发现：编码列对码字典 {dict_name}({dict_key})，抽样覆盖率 {:.0}%", coverage * 100.0)
+}
+
+async fn register_dimension(pg: &mut sqlx::PgConnection, ds: &str, h: &DictHit<'_>) -> anyhow::Result<()> {
     let (col, table) = (h.col, h.table);
     let cases: String = h
         .pairs
         .iter()
-        .map(|(c, n)| format!("WHEN '{}' THEN '{}'", c.replace('\'', ""), n.replace('\'', "")))
+        .map(|(c, n)| format!("WHEN '{}' THEN '{}'", clean_sql_lit(c), clean_sql_lit(n)))
         .collect::<Vec<_>>()
         .join(" ");
     let expr = format!("CASE `{col}` {cases} END");
-    let dim_code: String = format!("auto_{table}_{col}").chars().take(80).collect();
+    let raw_code = format!("auto_{table}_{col}");
+    let dim_code: String = if raw_code.chars().count() <= 80 {
+        raw_code
+    } else {
+        // 截断会撞码（两个长前缀相同的 (表,列) 截成同一 dim_code，ON CONFLICT 互相覆盖
+        // 静默丢一个维度）：留 8 位短哈希区分（fnv1a64 跨版本确定）
+        let prefix: String = raw_code.chars().take(71).collect();
+        let hash = crate::warehouse_catalog::fnv1a64(&raw_code);
+        format!("{prefix}_{}", &hash[..8])
+    };
     // 维度名取列注释的**首段**：注释常是「配送状态：100:待配送, 200:配送中」这种带码值说明的长句，
     // 整句当维度名既不可能被问句命中，又污染注册表（同名重复十几条）。清洗不出就退回字典名。
     let dim_name = match clean_dim_name(h.comment) {
         Some(n) => n,
         None => h.dict_name.clone(),
     };
-    let desc = format!(
-        "自动发现：编码列对码字典 {}({})，抽样覆盖率 {:.0}%",
-        h.dict_name, h.dict_key, h.coverage
-    );
+    let desc = dim_desc(&h.dict_name, &h.dict_key, h.coverage);
     sqlx::query(
         "INSERT INTO meta.dimension(dim_code, name, aliases, source_table, expr, description, ds_id)
          VALUES ($1,$2,'{}',$3,$4,$5,$6)
          ON CONFLICT (ds_id, dim_code) DO UPDATE SET name=$2, source_table=$3, expr=$4, description=$5",
+        // 🔴 SET 刻意不带 status：人工 disabled 的 auto 维度重跑不复活（别顺手把 status 加进来）
     )
     .bind(&dim_code)
     .bind(&dim_name)
@@ -137,13 +182,15 @@ async fn register_dimension(pg: &PgPool, ds: &str, h: &DictHit<'_>) -> anyhow::R
     .bind(&expr)
     .bind(&desc)
     .bind(ds)
-    .execute(pg)
+    .execute(&mut *pg)
     .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// 🔴 **接线**判据：两处 `meta.value_map` 写入都必须盖来源章，且 dict 那条的
     /// `DO UPDATE` 里也要带。无库单测覆盖不到这段 IO，故照 `agent::gather` 的
     /// `gather_all_cards_actually_reads_the_registry` 用**源码**守。
@@ -200,5 +247,14 @@ mod tests {
             let lit = format!("'{c}'");
             assert!(!code.iter().any(|l| l.contains(&lit)), "别写字面量 {lit}，用 ddl.rs 的常量");
         }
+    }
+
+    /// 覆盖率百分比（0.85 → "85%"，不是 "1%"）与 CASE 字面量清洗（引号与反斜杠都剥）。
+    #[test]
+    fn dim_desc_percent_and_literal_cleaning() {
+        assert!(dim_desc("客户分类", "CustClassif", 0.85).contains("85%"), "0.85 必须显示 85%");
+        assert!(dim_desc("x", "K", 1.0).contains("100%"));
+        assert_eq!(clean_sql_lit("it's"), "its");
+        assert_eq!(clean_sql_lit("back\\slash"), "backslash", "反斜杠会吃掉闭合引号");
     }
 }

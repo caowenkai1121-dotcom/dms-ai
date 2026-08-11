@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 /// 抽取并发（Yuxi `concurrency_count` 的固定值形态：4）。
 pub const BUILD_CONCURRENCY: usize = 4;
-/// 每个 chunk 的失败重试次数（指数退避，共 RETRY_MAX+1 次尝试）。
+/// 每个 chunk 的失败重试次数（指数退避，共 RETRY_MAX+1 次尝试；
+/// 语义由测试 `retry_is_exponential_and_bounded` 钉住，改它先改测试）。
 pub const RETRY_MAX: u32 = 2;
 /// 退避基数：400ms → 800ms。
 pub const RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(400);
@@ -31,9 +32,13 @@ const MAX_CHUNK_CHARS: usize = 4000;
 /// status 契约里的失败样本上限（前 5 条）。
 pub const MAX_FAILED_SAMPLES: usize = 5;
 /// 单 chunk 抽取结果上限：防模型失控输出撑爆图写批。
+/// 真实上界注意：关系端点自动补登（`to_chunk_graph`）可再塞进最多 2×50 个实体，
+/// 图写批的实际峰值是 150 实体 + 50 关系。
 const MAX_ITEMS_PER_CHUNK: usize = 50;
 const MAX_NAME_CHARS: usize = 100;
 const MAX_LABEL_CHARS: usize = 30;
+/// 失败样本的错误文案截断长度（字符）。
+const MAX_SAMPLE_ERR_CHARS: usize = 300;
 
 /// 固定 JSON schema 的抽取 prompt（Yuxi `DEFAULT_TRIPLE_EXTRACTION_PROMPT` 同构）。
 /// 不接受自定义 prompt：图谱质量依赖输出形状稳定，开放 prompt 等于开放 schema 漂移。
@@ -118,7 +123,16 @@ pub trait BuildProgress: Send + Sync {
 /// Yuxi `normalize_entity_name` 同款：压缩内部连续空白 + 小写化。
 /// 归并键用它而不是原文 —— 「差旅  报销」与「差旅 报销」必须是同一个实体。
 pub fn normalize_name(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    // fold 直拼省一次中间 Vec；整串 `to_lowercase`（不逐 char）是刻意的——
+    // Unicode 语境规则（如词尾 Σ→ς）只有整串版才正确
+    let joined = s.split_whitespace().fold(String::with_capacity(s.len()), |mut acc, w| {
+        if !acc.is_empty() {
+            acc.push(' ');
+        }
+        acc.push_str(w);
+        acc
+    });
+    joined.to_lowercase()
 }
 
 /// 确定性实体 id = hash(space:规范名)（KB 审查⑤：label 退出归并键 —— 「差旅报销制度·制度」与
@@ -129,9 +143,14 @@ pub fn normalize_name(s: &str) -> String {
 /// 没有 sha2/md5 可用。id 只需在一次部署内自洽：重建本就先清空再全量，不跨版本比对。
 /// ⚠️ id 口径变了（旧 id 含 label）：**必须重建图谱才生效**，新旧 id 永不匹配。
 pub fn entity_id(space_id: &str, normalized_name: &str) -> String {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    format!("{space_id}:{normalized_name}").hash(&mut h);
+    // 与基线 `format!("{space}:{name}").hash(&mut h)` 逐位等价（`str::hash` = 写字节 + 0xFF），
+    // 手写省一次临时 String 分配；等价性由测试 `entity_id_matches_format_baseline` 钉死
+    h.write(space_id.as_bytes());
+    h.write(b":");
+    h.write(normalized_name.as_bytes());
+    h.write_u8(0xff);
     format!("e_{:016x}", h.finish())
 }
 
@@ -154,14 +173,19 @@ fn is_noise_entity(name: &str) -> bool {
     {
         return true;
     }
-    name.chars().all(|c| {
+    if name.chars().all(|c| {
         c.is_ascii_digit()
             || matches!(
                 c,
                 '.' | '-' | '/' | ':' | ',' | '年' | '月' | '日' | '号' | '元' | '万' | '亿'
                     | '角' | '分' | '块' | '¥' | '￥' | '$' | '％' | '%'
             )
-    })
+    }) {
+        return true;
+    }
+    // 兜底族：纯符号名（「——」「…」——一个字母/数字/汉字都没有）同样没有结构价值。
+    // `is_alphanumeric` 是 Unicode 口径，汉字（Lo）已涵盖
+    !name.chars().any(char::is_alphanumeric)
 }
 
 /// 关系 label 受控词表（KB 审查⑤）：自由文本 label 让同一语义长出几十种写法
@@ -242,28 +266,63 @@ pub async fn visible_doc_ids(
         .collect())
 }
 
+/// 容错解析共用文案（两处判定同一失败形态，只许一份字面量）
+const ERR_NO_FULL_JSON: &str = "抽取响应里没有完整 JSON 对象";
+
 /// 抽取响应的容错解析（json_repair 思路的最小实现）：
 /// 剥 markdown 围栏 → 取首个 `{` 到末个 `}` → 直接解析 → 失败则去尾逗号再解析。
 /// 两步都失败才算这个 chunk 失败（进 failed_samples）；形状残缺的条目跳过不报错。
 pub fn parse_extraction(raw: &str) -> Result<Extraction, String> {
     let stripped = strip_fence(raw.trim());
     let start = stripped.find('{').ok_or("抽取响应里没有 JSON 对象")?;
-    let end = stripped.rfind('}').ok_or("抽取响应里没有完整 JSON 对象")?;
+    let end = stripped.rfind('}').ok_or(ERR_NO_FULL_JSON)?;
     if end <= start {
-        return Err("抽取响应里没有完整 JSON 对象".into());
+        return Err(ERR_NO_FULL_JSON.into());
     }
     let candidate = &stripped[start..=end];
     let v: serde_json::Value = serde_json::from_str(candidate)
-        .or_else(|_| serde_json::from_str(&drop_trailing_commas(candidate)))
+        .or_else(|e| {
+            // 多数失败响应根本没有尾逗号——快查不过就不走修复分支（省一次全量分配）；
+            // 快查宁可误报（多试一次，结果不变）不许漏报
+            if may_have_trailing_comma(candidate) {
+                serde_json::from_str(&drop_trailing_commas(candidate))
+            } else {
+                Err(e)
+            }
+        })
         .map_err(|e| format!("抽取响应 JSON 解析失败：{e}"))?;
     Ok(extraction_from_value(&v))
+}
+
+/// 快查：是否可能有尾逗号（`,` 后仅空白就到 `}`/`]`）。只决定要不要走修复分支。
+/// 字节扫描安全：`,`/`}`/`]` 是 ASCII，UTF-8 多字节序列的字节不会与之碰撞。
+fn may_have_trailing_comma(s: &str) -> bool {
+    let b = s.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c != b',' {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < b.len() && (b[j] == b'}' || b[j] == b']') {
+            return true;
+        }
+    }
+    false
 }
 
 /// 剥 ```` ```json ```` 围栏：首行是围栏就丢首行，末行是围栏就丢末行（没有围栏时一个字符都不动）。
 fn strip_fence(s: &str) -> &str {
     let mut out = s;
     if let Some(rest) = out.strip_prefix("```") {
-        out = rest.split_once('\n').map(|(_, body)| body).unwrap_or("");
+        out = match rest.split_once('\n') {
+            Some((_, body)) => body,
+            // 单行围栏（```` ```json{"a":1}``` ````，无换行）：剥语言标记前缀留全文——
+            // 直接给空串会把明明有的 JSON 报成「没有 JSON 对象」
+            None => rest.strip_prefix("json").unwrap_or(rest),
+        };
     }
     let t = out.trim_end();
     if t.ends_with("```") {
@@ -275,51 +334,60 @@ fn strip_fence(s: &str) -> &str {
 /// 去尾逗号（`,}` / `,]` 一族）：字符串感知的扫描，字符串内容一个字符不动。
 /// 按 char 扫而不是按字节 —— 实体名是中文，按字节推 char 会切成乱码。
 fn drop_trailing_commas(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
     let mut in_str = false;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
+    while let Some(c) = it.next() {
         if in_str {
             out.push(c);
             // 转义字符连下一个一起原样带过（\" 不该开关字符串状态）
-            if c == '\\' && i + 1 < chars.len() {
-                out.push(chars[i + 1]);
-                i += 2;
-                continue;
-            }
-            if c == '"' {
+            if c == '\\' {
+                if let Some(escaped) = it.next() {
+                    out.push(escaped);
+                }
+            } else if c == '"' {
                 in_str = false;
             }
-            i += 1;
             continue;
         }
         if c == '"' {
             in_str = true;
             out.push(c);
-            i += 1;
             continue;
         }
         if c == ',' {
-            let mut j = i + 1;
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
+            // 前瞻：逗号后只有空白就到 }/]，则丢逗号（空白原样保留）
+            let mut ws = String::new();
+            while let Some(&w) = it.peek() {
+                if w.is_whitespace() {
+                    ws.push(w);
+                    it.next();
+                } else {
+                    break;
+                }
             }
-            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
-                i += 1;
-                continue; // 丢逗号，空白留给下一轮原样输出
+            if !matches!(it.peek(), Some('}') | Some(']')) {
+                out.push(',');
             }
+            out.push_str(&ws);
+            continue;
         }
         out.push(c);
-        i += 1;
     }
     out
 }
 
-/// 截断辅助：按 Unicode 字符计（与 KB 侧偏移口径一致），多语言文本不按字节切。
+/// 截断辅助：按 Unicode 字符计（按字节截会把中文切成半个字），分配版留给要 owned 的调用点。
 fn truncate_chars(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
+    truncate_str(s, max).to_string()
+}
+
+/// 切片版截断：按 Unicode 字符计（与 KB 侧偏移口径一致），只需要 `&str` 的调用点零分配。
+fn truncate_str(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
 }
 
 /// Value → Extraction：坏条目跳过（拿不到 text 的实体/端点不全的关系），
@@ -352,6 +420,8 @@ fn extraction_from_value(v: &serde_json::Value) -> Extraction {
         .map(|a| {
             a.iter()
                 .filter_map(|r| {
+                    // `r["text"]` 兜底：兼容某些模型把关系名放在 `text` 字段的实测形态
+                    // （prompt schema 之外的宽容路径）
                     let label = r["label"].as_str().or_else(|| r["text"].as_str()).unwrap_or("相关");
                     let label = truncate_chars(label.trim(), MAX_LABEL_CHARS);
                     Some(RawRelation {
@@ -376,8 +446,9 @@ pub fn to_chunk_graph(space_id: &str, chunk_id: i64, doc_id: &str, ex: &Extracti
     for e in &ex.entities {
         it.intern(space_id, &e.text, &e.label);
     }
-    let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
-    let mut relations: Vec<GraphRelation> = vec![];
+    let mut seen_rel: HashSet<(String, String, String)> =
+        HashSet::with_capacity(MAX_ITEMS_PER_CHUNK);
+    let mut relations: Vec<GraphRelation> = Vec::with_capacity(MAX_ITEMS_PER_CHUNK);
     for r in &ex.relations {
         let (Some(src), Some(dst)) = (
             it.intern(space_id, &r.source.text, &r.source.label),
@@ -413,6 +484,9 @@ struct Interner {
     ids: HashMap<String, usize>,
     /// `ballots[i]` = `entities[i]` 各 label 在本 chunk 内的票数（多数决的票箱）
     ballots: Vec<HashMap<String, usize>>,
+    /// `cur_votes[i]` = `entities[i]` 当前 label 的票数（换 label 时同步更新），
+    /// 省得每次投票都拿当前 label 反查票箱
+    cur_votes: Vec<usize>,
 }
 
 impl Interner {
@@ -429,28 +503,32 @@ impl Interner {
         };
         if let Some(&idx) = self.ids.get(&name) {
             // 同名再现一票；票数严格更多才换 label（并列保持先到，确定性）
-            let n = {
-                let b = self.ballots[idx].entry(label.clone()).or_insert(0);
+            // 命中已登记 label 时不克隆（多数路径），miss 才 insert
+            let n = if let Some(b) = self.ballots[idx].get_mut(&label) {
                 *b += 1;
                 *b
+            } else {
+                self.ballots[idx].insert(label.clone(), 1);
+                1
             };
-            let cur = self.ballots[idx].get(&self.entities[idx].label).copied().unwrap_or(0);
-            if n > cur {
+            if n > self.cur_votes[idx] {
                 self.entities[idx].label = label;
+                self.cur_votes[idx] = n;
             }
             return Some(self.entities[idx].id.clone());
         }
         let id = entity_id(space_id, &name);
         self.ids.insert(name.clone(), self.entities.len());
         self.ballots.push(HashMap::from([(label.clone(), 1)]));
+        self.cur_votes.push(1);
         self.entities.push(GraphEntity { id: id.clone(), name, label });
         Some(id)
     }
 }
 
 /// 单次 LLM 抽取（Fast 档：批量后台任务的性价比档；形状约束在 prompt 里）。
-async fn extract_once<L: ChatModel + ?Sized>(llm: &L, text: &str) -> Result<Extraction, String> {
-    let body = truncate_chars(text, MAX_CHUNK_CHARS);
+/// `body` 须已按 `MAX_CHUNK_CHARS` 截断（调用方截一次，重试复用，不逐次重截）。
+async fn extract_once<L: ChatModel + ?Sized>(llm: &L, body: &str) -> Result<Extraction, String> {
     let req = ChatRequest::text(
         ModelTier::Fast,
         EXTRACTION_SYSTEM,
@@ -469,6 +547,8 @@ async fn extract_with_retry<L: ChatModel>(
     text: &str,
     base: std::time::Duration,
 ) -> Result<Extraction, String> {
+    // 入口截一次：同一 chunk 重试几遍，正文截断不该跟着做几遍
+    let body = truncate_str(text, MAX_CHUNK_CHARS);
     let mut wait = base;
     let mut last = String::new();
     for attempt in 0..=RETRY_MAX {
@@ -476,7 +556,10 @@ async fn extract_with_retry<L: ChatModel>(
             tokio::time::sleep(wait).await;
             wait *= 2;
         }
-        match extract_once(llm, text).await {
+        // 解析失败与传输失败同等重试是有意的取舍：温度 0.1 下输出形状仍有随机性，
+        // 重试拿到可解析响应的实测概率不低；为省 1-2 发调用把可救的 chunk 打成失败样本
+        // （留待人工 failed-chunks 干预）不划算。
+        match extract_once(llm, body).await {
             Ok(ex) => return Ok(ex),
             Err(e) => last = e,
         }
@@ -501,8 +584,8 @@ where
     L: ChatModel + Clone + Send + Sync + 'static,
 {
     let chunks = chunks_for_build(store, v, space_id).await?;
-    doc_graph::ensure_graph(pg).await.map_err(|e| KbError::Db(e.to_string()))?;
-    doc_graph::clear_space(pg, space_id).await.map_err(|e| KbError::Db(e.to_string()))?;
+    doc_graph::ensure_graph(pg).await.map_err(as_db_err)?;
+    doc_graph::clear_space(pg, space_id).await.map_err(as_db_err)?;
 
     let mut outcome = BuildOutcome { total: chunks.len(), ..BuildOutcome::default() };
     progress.report(outcome.total, 0, 0, &[]).await;
@@ -514,9 +597,12 @@ where
         let pg = pg.clone();
         let llm = llm.clone();
         let space = space_id.to_string();
+        // spawn 前截断：几千个任务各自持有完整正文（库里多长就多长）会一次性常驻内存；
+        // 截断是幂等的（`extract_with_retry` 入口的同款截断不受影响）
+        let text = truncate_str(&chunk.text, MAX_CHUNK_CHARS).to_string();
         set.spawn(async move {
-            let _permit = gate.acquire_owned().await;
-            match extract_with_retry(&llm, &chunk.text, RETRY_BASE).await {
+            let _permit = gate.acquire_owned().await.expect("build gate 从不关闭");
+            match extract_with_retry(&llm, &text, RETRY_BASE).await {
                 Ok(ex) => {
                     let g = to_chunk_graph(&space, chunk.chunk_id, &chunk.doc_id, &ex);
                     doc_graph::write_chunk(&pg, &g)
@@ -527,6 +613,8 @@ where
             }
         });
     }
+    let mut since_report = 0usize;
+    let mut last_report = std::time::Instant::now();
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok(Ok(())) => outcome.done += 1,
@@ -536,17 +624,42 @@ where
             }
             Err(e) => {
                 outcome.failed += 1;
+                // 哨兵（doc_id 空串 / chunk_id -1）= JoinError：任务 panic 拿不到 chunk 身份，
+                // 只能以不可能值占位（FailedSample 是 wire 形状，类型不动）
                 push_sample(&mut outcome.failed_samples, String::new(), -1, format!("任务中断：{e}"));
             }
         }
-        progress.report(outcome.total, outcome.done, outcome.failed, &outcome.failed_samples).await;
+        // 进度落库节流：每 25 条或 500ms 报一次（2000 chunk 不该是 2000 次
+        // `meta.kb_graph_build` 写），终态必报——判据抽成纯函数有单测钉住
+        since_report += 1;
+        if should_report(&outcome, since_report, last_report.elapsed()) {
+            progress.report(outcome.total, outcome.done, outcome.failed, &outcome.failed_samples).await;
+            since_report = 0;
+            last_report = std::time::Instant::now();
+        }
     }
     Ok(outcome)
 }
 
+/// `doc_graph` 错误 → `KbError::Db`（build_space 里连用，只此一份映射）
+fn as_db_err(e: impl std::fmt::Display) -> KbError {
+    KbError::Db(e.to_string())
+}
+
+/// 进度回报节流判据（纯函数）：每 25 条或 500ms 一到就报；**终态（最后一条）必报**。
+fn should_report(
+    outcome: &BuildOutcome,
+    since_report: usize,
+    elapsed: std::time::Duration,
+) -> bool {
+    outcome.done + outcome.failed == outcome.total
+        || since_report >= 25
+        || elapsed >= std::time::Duration::from_millis(500)
+}
+
 fn push_sample(samples: &mut Vec<FailedSample>, doc_id: String, chunk_id: i64, error: String) {
     if samples.len() < MAX_FAILED_SAMPLES {
-        samples.push(FailedSample { doc_id, chunk_id, error: truncate_chars(&error, 300) });
+        samples.push(FailedSample { doc_id, chunk_id, error: truncate_chars(&error, MAX_SAMPLE_ERR_CHARS) });
     }
 }
 
@@ -713,6 +826,58 @@ mod tests {
         assert_eq!(a, b, "规范名相同必须同 id（归并）");
         assert_ne!(a, entity_id("sp2", &normalize_name("差旅 报销")), "跨空间不许归并");
         assert!(a.starts_with("e_") && a.len() == 18);
+    }
+
+    /// 🔴 id 口径回归钉：手写 hash 必须与基线 `format!("{s}:{n}").hash()` 逐位一致——
+    /// id 变了新旧图永不匹配（这等价于钉死 `entity_id("sp1","差旅报销")` 的既有字面量）
+    #[test]
+    fn entity_id_matches_format_baseline() {
+        use std::hash::{Hash, Hasher};
+        let baseline = |space: &str, name: &str| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{space}:{name}").hash(&mut h);
+            format!("e_{:016x}", h.finish())
+        };
+        for (s, n) in [("sp1", "差旅报销"), ("sp2", "erp 系统"), ("", ""), ("a:b", "c:d")] {
+            assert_eq!(entity_id(s, n), baseline(s, n), "({s},{n}) 的 id 口径漂移");
+        }
+    }
+
+    /// 单行围栏（无换行）里的 JSON 不许被剥成空串
+    #[test]
+    fn single_line_fence_keeps_its_json() {
+        let ex = parse_extraction("```json{\"entities\":[{\"text\":\"烤肠\"}]}```").unwrap();
+        assert_eq!(ex.entities[0].text, "烤肠");
+    }
+
+    /// 纯符号名（一个字母/数字/汉字都没有）是噪声兜底族
+    #[test]
+    fn pure_symbol_names_are_noise() {
+        for noise in ["——", "…", "—— ——", "※"] {
+            assert!(is_noise_entity(&normalize_name(noise)), "{noise} 必须被拦");
+        }
+        // 含一个汉字/字母就放行（别误拦正常实体）
+        for keep in ["第—章", "a-b", "μ 系数"] {
+            assert!(!is_noise_entity(&normalize_name(keep)), "{keep} 不许误拦");
+        }
+    }
+
+    /// 进度回报节流：计数/时间任一到位即报；终态必报（哪怕刚报过）
+    #[test]
+    fn progress_report_is_throttled_but_final_is_always_reported() {
+        use std::time::Duration;
+        let mk = |total: usize, done: usize, failed: usize| BuildOutcome {
+            total,
+            done,
+            failed,
+            failed_samples: vec![],
+        };
+        let o = mk(100, 10, 0);
+        assert!(!should_report(&o, 1, Duration::from_millis(10)), "刚报过就不该再报");
+        assert!(should_report(&o, 25, Duration::from_millis(10)), "25 条一到即报");
+        assert!(should_report(&o, 1, Duration::from_millis(600)), "500ms 一到即报");
+        let fin = mk(100, 99, 1);
+        assert!(should_report(&fin, 1, Duration::from_millis(1)), "终态必报");
     }
 
     /// 图投影：大小写/空白变体归并为一个实体；关系端点自动补登；自环与重复关系丢弃。
@@ -893,7 +1058,10 @@ mod tests {
             assert!(body.contains("effective_from"), "{f} 丢了生效期过滤");
             assert!(body.contains("space_id=$3"), "{f} 的空间过滤必须绑参数，不许拼串");
         }
-        let build = src.split("fn build_chunks_sql").nth(1).unwrap();
+        let build = src
+            .split("fn build_chunks_sql")
+            .nth(1)
+            .unwrap_or_else(|| panic!("fn build_chunks_sql 不见了 —— 锚点失效"));
         assert!(build.contains("LIMIT $4"), "构建成本闸（chunk 上限）没了");
     }
 

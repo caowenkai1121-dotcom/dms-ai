@@ -82,16 +82,48 @@ pub const DOC_COLS: &str = doc_cols!();
 ///
 /// **装配顺序**：依赖 `vector` 与 `pg_trgm` 两个扩展，由 `meta::migrate` 先建 —— 必须在它之后跑。
 pub async fn migrate(store: &OwnedStore) -> Result<(), KbError> {
+    // 多实例同时启动会并发跑这份 DDL：事务内顾问锁收口，避免锁等/约束名撞车
     let mut tx = store.pool().begin().await?;
-    for stmt in statements(KB_DDL).chain(statements(KB_DDL_DELTA)) {
-        (&mut *tx).execute(stmt).await?;
+    (&mut *tx).execute("SELECT pg_advisory_xact_lock(hashtext('kb.migrate'))").await?;
+    for ddl in [KB_DDL, KB_DDL_DELTA] {
+        // 防御：切分器只认裸 `$$`；迁移若引入 `$tag$` 形式会被从函数体内切坏，
+        // 在这里明确报错，而不是带着切坏的语句执行
+        if has_tagged_dollar_quote(ddl) {
+            return Err(KbError::Db("迁移 DDL 含 $tag$ dollar-quote，切分器不支持".into()));
+        }
+        for stmt in statements(ddl) {
+            (&mut *tx).execute(stmt).await?;
+        }
     }
     tx.commit().await?;
     Ok(())
 }
 
+/// 检测 `$tag$` 形式的 dollar-quote（`statements` 只认裸 `$$`，不认识带 tag 的）。
+/// tag 以字母/下划线开头：`$1$` 这类参数占位不会被误判。
+fn has_tagged_dollar_quote(ddl: &str) -> bool {
+    let b = ddl.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') {
+            let mut j = i + 2;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'$' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// 入参**必须**是 `&'static str`（唯一调用点是 `include_str!` 的 `KB_DDL`）：
 /// 切片继承这个生命周期，才进得去 `fixed()`。
+///
+/// ⚠️ 只识别裸 `$$` 的 dollar-quote，**不支持 `$tag$` 形式**——迁移若引入 `$func$`
+/// 之类会被从函数体内切坏（`migrate` 入口有 `has_tagged_dollar_quote` 防御断言挡这种形态）。
 fn statements(ddl: &'static str) -> impl Iterator<Item = &'static str> {
     let bytes = ddl.as_bytes();
     let mut out = Vec::new();
@@ -760,7 +792,8 @@ pub async fn grant_space_roles(
     let (exists, _inserted) = store
         .fixed(
             "WITH target AS (SELECT space_id FROM kb.space WHERE space_id=$1), \
-             roles AS (SELECT DISTINCT btrim(code) AS code FROM unnest($2::text[]) AS u(code)), \
+             roles AS (SELECT DISTINCT btrim(code) AS code FROM unnest($2::text[]) AS u(code) \
+               WHERE btrim(code)<>''), \
              removed AS (DELETE FROM kb.acl a USING target t,roles r \
                WHERE a.scope='space' AND a.target_id=t.space_id AND a.grantee_kind='role' \
                  AND a.grantee=r.code AND a.perm<>$3 RETURNING 1), \
@@ -789,7 +822,10 @@ pub async fn grant_space_acl(
     grantee: &str,
     perm: &str,
 ) -> Result<(), KbError> {
-    if !matches!(grantee_kind, "login" | "role") || !matches!(perm, "read" | "write") {
+    // grantee 先 trim 再判空：空 grantee 落库就是一条永远匹配不上的废授权行
+    let grantee = grantee.trim();
+    if grantee.is_empty() || !matches!(grantee_kind, "login" | "role") || !matches!(perm, "read" | "write")
+    {
         return Err(KbError::BadInput("空间授权参数无效".into()));
     }
     let (exists, _inserted) = store
@@ -847,6 +883,21 @@ pub async fn revoke_space_acl(
     Ok(())
 }
 
+/// 六份文档写语句的公共 ACL 尾部（owner 或空间 write 授权复核，fail-closed）——
+/// 谓词只此一份，各写一遍就是六处漂移面。占位符编号随各语句 SET 参数个数平移，
+/// 由宏参数显式给足（判据条件一字不动；锚点测试钉住宏定义与各处调用的编号）。
+macro_rules! doc_write_acl_tail {
+    ($doc:literal, $login:literal, $roles:literal) => {
+        concat!(
+            " FROM kb.space s WHERE d.doc_id=", $doc,
+            " AND s.space_id=d.space_id AND (s.owner=", $login,
+            " OR EXISTS (SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
+               AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=", $login, ") OR \
+                 (a.grantee_kind='role' AND a.grantee=ANY(", $roles, "::text[])))))"
+        )
+    };
+}
+
 pub async fn set_status(
     store: &OwnedStore,
     viewer: &crate::Viewer,
@@ -855,13 +906,10 @@ pub async fn set_status(
     error: &str,
 ) -> Result<(), KbError> {
     let n = store
-        .fixed(
-            "UPDATE kb.doc d SET status=$1,error=$2,updated_at=now() FROM kb.space s \
-             WHERE d.doc_id=$3 AND s.space_id=d.space_id AND (s.owner=$4 OR EXISTS ( \
-               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
-                 AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=$4) OR \
-                   (a.grantee_kind='role' AND a.grantee=ANY($5::text[])))))",
-        )
+        .fixed(concat!(
+            "UPDATE kb.doc d SET status=$1,error=$2,updated_at=now()",
+            doc_write_acl_tail!("$3", "$4", "$5")
+        ))
         .bind(st.as_str())
         .bind(error)
         .bind(doc_id)
@@ -870,7 +918,7 @@ pub async fn set_status(
         .execute()
         .await?;
     if n == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        return Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效")));
     }
     Ok(())
 }
@@ -883,13 +931,10 @@ pub async fn set_notice(
     notice: &str,
 ) -> Result<(), KbError> {
     let n = store
-        .fixed(
-            "UPDATE kb.doc d SET notice=$1,updated_at=now() FROM kb.space s \
-             WHERE d.doc_id=$2 AND s.space_id=d.space_id AND (s.owner=$3 OR EXISTS ( \
-               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
-                 AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=$3) OR \
-                   (a.grantee_kind='role' AND a.grantee=ANY($4::text[])))))",
-        )
+        .fixed(concat!(
+            "UPDATE kb.doc d SET notice=$1,updated_at=now()",
+            doc_write_acl_tail!("$2", "$3", "$4")
+        ))
         .bind(notice)
         .bind(doc_id)
         .bind(&viewer.login)
@@ -897,7 +942,7 @@ pub async fn set_notice(
         .execute()
         .await?;
     if n == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        return Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效")));
     }
     Ok(())
 }
@@ -909,13 +954,10 @@ pub async fn set_enabled(
     enabled: bool,
 ) -> Result<(), KbError> {
     let n = store
-        .fixed(
-            "UPDATE kb.doc d SET enabled=$1,updated_at=now() FROM kb.space s \
-             WHERE d.doc_id=$2 AND s.space_id=d.space_id AND (s.owner=$3 OR EXISTS ( \
-               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
-                 AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=$3) OR \
-                   (a.grantee_kind='role' AND a.grantee=ANY($4::text[])))))",
-        )
+        .fixed(concat!(
+            "UPDATE kb.doc d SET enabled=$1,updated_at=now()",
+            doc_write_acl_tail!("$2", "$3", "$4")
+        ))
         .bind(enabled)
         .bind(doc_id)
         .bind(&viewer.login)
@@ -923,7 +965,7 @@ pub async fn set_enabled(
         .execute()
         .await?;
     if n == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        return Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效")));
     }
     Ok(())
 }
@@ -939,13 +981,10 @@ pub async fn set_doc_source_uri(
     source_uri: &str,
 ) -> Result<(), KbError> {
     let n = store
-        .fixed(
-            "UPDATE kb.doc d SET source_uri=$1,updated_at=now() FROM kb.space s \
-             WHERE d.doc_id=$2 AND s.space_id=d.space_id AND (s.owner=$3 OR EXISTS ( \
-               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
-                 AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=$3) OR \
-                   (a.grantee_kind='role' AND a.grantee=ANY($4::text[])))))",
-        )
+        .fixed(concat!(
+            "UPDATE kb.doc d SET source_uri=$1,updated_at=now()",
+            doc_write_acl_tail!("$2", "$3", "$4")
+        ))
         .bind(source_uri)
         .bind(doc_id)
         .bind(&viewer.login)
@@ -953,7 +992,7 @@ pub async fn set_doc_source_uri(
         .execute()
         .await?;
     if n == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        return Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效")));
     }
     Ok(())
 }
@@ -966,13 +1005,10 @@ pub async fn set_doc_description(
     description: &str,
 ) -> Result<(), KbError> {
     let n = store
-        .fixed(
-            "UPDATE kb.doc d SET description=$1,updated_at=now() FROM kb.space s \
-             WHERE d.doc_id=$2 AND s.space_id=d.space_id AND (s.owner=$3 OR EXISTS ( \
-               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
-                 AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=$3) OR \
-                   (a.grantee_kind='role' AND a.grantee=ANY($4::text[])))))",
-        )
+        .fixed(concat!(
+            "UPDATE kb.doc d SET description=$1,updated_at=now()",
+            doc_write_acl_tail!("$2", "$3", "$4")
+        ))
         .bind(description)
         .bind(doc_id)
         .bind(&viewer.login)
@@ -980,10 +1016,13 @@ pub async fn set_doc_description(
         .execute()
         .await?;
     if n == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        return Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效")));
     }
     Ok(())
 }
+
+/// 单文档显式关联上限（篇）：关联列表是人工维护面，50 已宽裕；超限直接 BadInput
+const MAX_RELATED_DOCS: usize = 50;
 
 /// 原子更新文档治理元数据与显式关联。
 ///
@@ -1015,8 +1054,8 @@ pub async fn update_doc_metadata_and_links(
         }
         ids.push(id.to_string());
     }
-    if ids.len() > 50 {
-        return Err(KbError::BadInput("关联文档最多 50 篇".into()));
+    if ids.len() > MAX_RELATED_DOCS {
+        return Err(KbError::BadInput(format!("关联文档最多 {MAX_RELATED_DOCS} 篇")));
     }
 
     let state = store
@@ -1071,6 +1110,8 @@ pub async fn update_doc_metadata_and_links(
                SELECT (SELECT count(*) FROM upserted)+(SELECT count(*) FROM removed) AS link_changes \
              ) SELECT CASE WHEN NOT (SELECT source_ok FROM guard) THEN -1 \
                     WHEN NOT (SELECT targets_ok FROM guard) THEN -2 \
+                    /* (0*applied.link_changes)：引用 applied 是强制它求值——PG 不保证未引用的 \
+                       CTE 被执行，去掉它 upsert/删除就可能不落地；乘 0 不影响计数 */ \
                     ELSE (SELECT count(*) FROM updated)+(0*applied.link_changes) END FROM applied"
         ))
         .bind(&viewer.login)
@@ -1090,10 +1131,15 @@ pub async fn update_doc_metadata_and_links(
 
     match state {
         1 => Ok(1),
+        -1 => Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效"))),
         -2 => Err(KbError::Forbidden(
             "关联文档无效、不可见、跨空间或未处于有效可检索状态".into(),
         )),
-        _ => Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效"))),
+        // 契约只有 1/-1/-2 三个状态；出现别的值是 SQL 被改坏，按内部错误报而不是误报权限
+        other => {
+            debug_assert!(false, "update_doc_metadata_and_links 返回了契约外状态 {other}");
+            Err(KbError::Db(format!("文档元数据更新返回了意外状态 {other}")))
+        }
     }
 }
 
@@ -1123,10 +1169,13 @@ pub async fn apply_inferred_doc_version(
         .execute()
         .await?;
     if n == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        return Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效")));
     }
     Ok(())
 }
+
+/// notice 累加上限（字符）：反复重建失败 notice 会无限增长——超限截断，保留最新尾部
+const NOTICE_MAX_CHARS: usize = 2000;
 
 pub async fn append_notice(
     store: &OwnedStore,
@@ -1137,14 +1186,21 @@ pub async fn append_notice(
     if notice.trim().is_empty() {
         return Ok(());
     }
+    // 长度上限只能是 SQL 字面量（`fixed()` 不吃 bind 进 DDL 位置的值），
+    // debug 构建下断言它与 NOTICE_MAX_CHARS 同值（防漂移）
+    const SQL: &str = concat!(
+        "UPDATE kb.doc d SET notice=right(concat_ws('；',NULLIF(d.notice,''),$1),2000),updated_at=now() \
+         FROM kb.space s WHERE d.doc_id=$2 AND s.space_id=d.space_id AND (s.owner=$3 OR EXISTS ( \
+           SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
+             AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=$3) OR \
+               (a.grantee_kind='role' AND a.grantee=ANY($4::text[])))))"
+    );
+    debug_assert!(
+        SQL.contains(&NOTICE_MAX_CHARS.to_string()),
+        "append_notice 的截断字面量须与 NOTICE_MAX_CHARS 同值"
+    );
     let n = store
-        .fixed(
-            "UPDATE kb.doc d SET notice=concat_ws('；',NULLIF(d.notice,''),$1),updated_at=now() \
-             FROM kb.space s WHERE d.doc_id=$2 AND s.space_id=d.space_id AND (s.owner=$3 OR EXISTS ( \
-               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
-                 AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=$3) OR \
-                   (a.grantee_kind='role' AND a.grantee=ANY($4::text[])))))",
-        )
+        .fixed(SQL)
         .bind(notice)
         .bind(doc_id)
         .bind(&viewer.login)
@@ -1152,7 +1208,7 @@ pub async fn append_notice(
         .execute()
         .await?;
     if n == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        return Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效")));
     }
     Ok(())
 }
@@ -1168,12 +1224,12 @@ const TITLE_ONLY_MAX_CHARS: usize = 50;
 const MERGED_MAX_CHARS: usize = 480 * 8 / 5; // 768
 
 /// 与 `ingest::est_tokens` / `embed_service.py::est_tokens` 同口径：ceil(chars/1.6) 的整数写法。
-fn est_tokens(chars: usize) -> i32 {
-    ((chars * 5 + 7) / 8) as i32
-}
+/// 实现在 `ingest`（全 crate 一份，这里不再养第二份）。
+use crate::ingest::est_tokens;
 
 fn leaf_heading(heading_path: &str) -> &str {
-    heading_path.rsplit(" > ").next().map(str::trim).unwrap_or("")
+    // `rsplit` 对任意输入恒产一项（空串也是），`next()` 没有不可达兜底
+    heading_path.rsplit(" > ").next().expect("rsplit 恒产一项").trim()
 }
 
 /// 标题-only 判定：正文==叶子标题（标题块自成一个分块组时的形态），或正文不足 50 字。
@@ -1192,11 +1248,8 @@ struct MergedChunks {
 }
 
 /// 与 `ingest::one_page` 同一条纪律：贡献页集合去重后只剩一个真实页才显示；跨页宁可 None。
-fn merged_page(pages: impl Iterator<Item = Option<i32>>) -> Option<i32> {
-    let mut real = pages.flatten();
-    let first = real.next()?;
-    if real.all(|p| p == first) { Some(first) } else { None }
-}
+/// 实现在 `ingest`（全 crate 一份）。
+use crate::ingest::one_page as merged_page;
 
 /// 把 srcs 指向的输入块按序拼成一块（文本以 `\n` 连接）：span 取全体联集（任一缺失即 None，
 /// 错位的偏移比没有更糟 —— CharSpan 契约），page 取贡献页唯一值，tokens 按合并后文本重估，
@@ -1208,13 +1261,12 @@ fn combine_chunks(chunks: &[Chunk], spans: &[Option<CharSpan>], srcs: &[usize]) 
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    let span = if srcs.iter().all(|&i| spans[i].is_some()) {
-        let mut it = srcs.iter().map(|&i| spans[i].unwrap());
+    // `collect::<Option<Vec<_>>>` 一趟完成「全 Some 才联集」（原 all(is_some)+unwrap 两段式）
+    let span = srcs.iter().map(|&i| spans[i]).collect::<Option<Vec<_>>>().map(|sp| {
+        let mut it = sp.into_iter();
         let first = it.next().expect("srcs 非空");
-        Some(it.fold(first, |a, b| CharSpan { start: a.start.min(b.start), end: a.end.max(b.end) }))
-    } else {
-        None
-    };
+        it.fold(first, |a, b| CharSpan { start: a.start.min(b.start), end: a.end.max(b.end) })
+    });
     let heading_path = srcs
         .iter()
         .rev()
@@ -1232,6 +1284,8 @@ fn combine_chunks(chunks: &[Chunk], spans: &[Option<CharSpan>], srcs: &[usize]) 
 /// 两条入库写路径（`insert_chunks` / `replace_chunks`）都从这里过，各 preset 分块链统一受益。
 fn merge_title_only_chunks(chunks: &[Chunk], spans: &[Option<CharSpan>]) -> MergedChunks {
     debug_assert_eq!(chunks.len(), spans.len());
+    // 各块「trim 后字符数」预算环外一次算好：主循环与尾随合并都要用，不逐块重扫
+    let char_lens: Vec<usize> = chunks.iter().map(|c| c.text.trim().chars().count()).collect();
     let mut out = MergedChunks {
         chunks: Vec::with_capacity(chunks.len()),
         spans: Vec::with_capacity(chunks.len()),
@@ -1250,10 +1304,10 @@ fn merge_title_only_chunks(chunks: &[Chunk], spans: &[Option<CharSpan>]) -> Merg
             continue;
         }
         // 正文块：能装下的积压标题块并到它前面；装不下的原样先落（不留空窗）
-        let mut budget = MERGED_MAX_CHARS.saturating_sub(c.text.trim().chars().count());
+        let mut budget = MERGED_MAX_CHARS.saturating_sub(char_lens[i]);
         let mut srcs: Vec<usize> = Vec::with_capacity(pend.len() + 1);
         for &p in &pend {
-            let n = chunks[p].text.trim().chars().count() + 1; // +1 = 拼接的 \n
+            let n = char_lens[p] + 1; // +1 = 拼接的 \n
             if n <= budget {
                 srcs.push(p);
                 budget -= n;
@@ -1272,7 +1326,7 @@ fn merge_title_only_chunks(chunks: &[Chunk], spans: &[Option<CharSpan>]) -> Merg
             let mut budget = MERGED_MAX_CHARS.saturating_sub(last.text.chars().count());
             let mut srcs = out.sources.last().expect("chunks 与 sources 平行").clone();
             for &p in &pend {
-                let n = chunks[p].text.trim().chars().count() + 1;
+                let n = char_lens[p] + 1;
                 if n > budget {
                     break;
                 }
@@ -1298,18 +1352,19 @@ fn merge_title_only_chunks(chunks: &[Chunk], spans: &[Option<CharSpan>]) -> Merg
 /// expected 置空串（恒不等于 SQL 侧重算的 `kb.chunk_embedding_text`）→ 该块落 NULL →
 /// 文档按 `missing` 停 `chunked`，由 A9/embed_fill（或 `embed_service.py revec`）补算；
 /// 单源块（没动过）的向量原样保留。
-fn remap_shadow_embeddings(
+/// 返回借用视图：单源块不再整串 clone embedding_text/向量字面量（两者都可能很大）。
+fn remap_shadow_embeddings<'a>(
     sources: &[Vec<usize>],
-    embedding_texts: &[String],
-    embeddings: &[Option<String>],
-) -> (Vec<String>, Vec<Option<String>>) {
+    embedding_texts: &'a [String],
+    embeddings: &'a [Option<String>],
+) -> (Vec<&'a str>, Vec<Option<&'a str>>) {
     sources
         .iter()
         .map(|s| {
             if s.len() == 1 {
-                (embedding_texts[s[0]].clone(), embeddings[s[0]].clone())
+                (embedding_texts[s[0]].as_str(), embeddings[s[0]].as_deref())
             } else {
-                (String::new(), None)
+                ("", None) // 空串哨兵（CAS 恒失配 → 落 NULL 走补算）
             }
         })
         .collect()
@@ -1403,7 +1458,12 @@ pub async fn replace_chunks(
         .execute()
         .await?;
     if written == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        // 0 行 = locked 空（DO UPDATE 下全量冲突仍会写）：只剩「文档没了」与「权限没了」两种，
+        // 复核后再定性——别把「不存在」报成权限错
+        return Err(match get_doc(store, doc_id).await? {
+            None => KbError::NotFound(format!("文档 {doc_id} 已不存在")),
+            Some(_) => KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")),
+        });
     }
     Ok(())
 }
@@ -1440,13 +1500,10 @@ pub async fn set_counts(
     chunk_count: i32,
 ) -> Result<(), KbError> {
     let n = store
-        .fixed(
-            "UPDATE kb.doc d SET page_count=$1,chunk_count=$2,updated_at=now() FROM kb.space s \
-             WHERE d.doc_id=$3 AND s.space_id=d.space_id AND (s.owner=$4 OR EXISTS ( \
-               SELECT 1 FROM kb.acl a WHERE a.scope='space' AND a.target_id=s.space_id \
-                 AND a.perm='write' AND ((a.grantee_kind='login' AND a.grantee=$4) OR \
-                   (a.grantee_kind='role' AND a.grantee=ANY($5::text[])))))",
-        )
+        .fixed(concat!(
+            "UPDATE kb.doc d SET page_count=$1,chunk_count=$2,updated_at=now()",
+            doc_write_acl_tail!("$3", "$4", "$5")
+        ))
         .bind(page_count)
         .bind(chunk_count)
         .bind(doc_id)
@@ -1455,7 +1512,7 @@ pub async fn set_counts(
         .execute()
         .await?;
     if n == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        return Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效")));
     }
     Ok(())
 }
@@ -1520,7 +1577,13 @@ pub async fn insert_chunks(
         .execute()
         .await?;
     if written == 0 {
-        return Err(KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")));
+        // 0 行有两种成因：权限没了/文档没了，或并发下全量 ON CONFLICT 冲突的合法重跑。
+        // 先复核文档在不在再定性——别把「不存在」报成权限错（全冲突仍归权限侧，是已知近似：
+        // 放行 Ok(0) 会让上游把 chunk_count 写成 0，那是更坏的误报）
+        return Err(match get_doc(store, doc_id).await? {
+            None => KbError::NotFound(format!("文档 {doc_id} 已不存在")),
+            Some(_) => KbError::Forbidden(format!("文档 {doc_id} 的写权限已失效")),
+        });
     }
     Ok(written as usize)
 }
@@ -1541,20 +1604,21 @@ pub async fn chunk_embedding_jobs(
 }
 
 /// 批量回写向量（一条 UNNEST 语句，不做 N 次往返）。`vlit` 是 `to_pgvector` 的字面量。
+/// 返回实际写入行数：0 行 = CAS 全失配（并发重建把文本/配方改了），调用方应留一声 warn。
 pub async fn set_embeddings(
     store: &OwnedStore,
     doc_id: &str,
     rows: &[(ChunkEmbeddingJob, String)],
     viewer: &crate::Viewer,
-) -> Result<(), KbError> {
+) -> Result<u64, KbError> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let ids: Vec<i64> = rows.iter().map(|(j, _)| j.chunk_id).collect();
     let texts: Vec<&str> = rows.iter().map(|(j, _)| j.text.as_str()).collect();
     let recipes: Vec<i16> = rows.iter().map(|(j, _)| j.recipe).collect();
     let lits: Vec<&str> = rows.iter().map(|(_, lit)| lit.as_str()).collect();
-    store
+    let n = store
         .fixed(
             "UPDATE kb.chunk c SET embedding=v.lit::vector FROM kb.doc d, \
              unnest($1::bigint[],$2::text[],$3::smallint[],$4::text[]) v(id,txt,recipe,lit) \
@@ -1578,7 +1642,7 @@ pub async fn set_embeddings(
         .bind(&viewer.roles)
         .execute()
         .await?;
-    Ok(())
+    Ok(n)
 }
 
 /// 【A9】待补向量的块（跨文档，键集游标由调度侧按 LIMIT 分批 —— 与 meta 侧 `FILL_BATCH` 同约）。
@@ -1691,7 +1755,7 @@ pub async fn list_docs(
                  WHERE a.scope='space' AND a.target_id=s.space_id AND a.perm IN ('read','write') \
                    AND ((a.grantee_kind='login' AND a.grantee=$1) \
                      OR (a.grantee_kind='role' AND a.grantee=ANY($2::text[])))))) \
-             ORDER BY created_at DESC"
+             ORDER BY created_at DESC, doc_id"
         ))
         .bind(&viewer.login)
         .bind(&viewer.roles)
@@ -1957,6 +2021,39 @@ mod tests {
         assert!(!is_comment_only("-- a\nCREATE TABLE x()"));
     }
 
+    /// 角色码/授权对象的空串防御：btrim 后为空不得落成 `grantee=''` 的废授权行
+    #[test]
+    fn blank_grantees_are_filtered_or_rejected() {
+        let src = include_str!("store.rs");
+        let roles = src.split("pub async fn grant_space_roles").nth(1).unwrap();
+        let roles = roles.split("pub async fn ").next().unwrap();
+        assert!(roles.contains("WHERE btrim(code)<>''"), "角色 CTE 必须滤掉空白角色码");
+        let acl = src.split("pub async fn grant_space_acl").nth(1).unwrap();
+        let acl = acl.split("pub async fn ").next().unwrap();
+        assert!(acl.contains("grantee.trim()") && acl.contains("grantee.is_empty()"),
+                "grantee 必须 trim 并拒空");
+    }
+
+    /// list_docs 的稳定次序：created_at 同秒时按 doc_id 决胜（与 list_docs_page 同口径）
+    #[test]
+    fn list_docs_has_a_deterministic_tiebreak() {
+        let src = include_str!("store.rs");
+        let body = src.split("pub async fn list_docs").nth(1).unwrap();
+        let body = body.split("pub async fn ").next().unwrap();
+        assert!(body.contains("ORDER BY created_at DESC, doc_id"), "list_docs 缺决胜键");
+    }
+
+    /// append_notice 的长度上限：right(...) 截断保留最新尾部；字面量与常量同值
+    #[test]
+    fn append_notice_is_capped_at_the_constant() {
+        let src = include_str!("store.rs");
+        let body = src.split("pub async fn append_notice").nth(1).unwrap();
+        let body = body.split("pub async fn ").next().unwrap();
+        assert!(body.contains("right(concat_ws("), "notice 累加必须带截断");
+        assert!(body.contains(&NOTICE_MAX_CHARS.to_string()), "SQL 字面量须与常量同值");
+        assert_eq!(NOTICE_MAX_CHARS, 2000);
+    }
+
     #[test]
     fn doc_cols_match_row_fields() {
         // 列清单与 DocRow 字段一一对应（FromRow 靠名字取列，漏一列是运行时错，钉在这里）
@@ -1987,8 +2084,9 @@ mod tests {
         for f in ["pub async fn set_doc_source_uri", "pub async fn set_doc_description"] {
             let body = src.split(f).nth(1).unwrap();
             let body = body.split("\n}\n").next().unwrap();
-            assert!(body.contains("a.perm='write'"), "{f} 写复核丢了");
-            assert!(body.contains("a.grantee=ANY($4::text[])"), "{f} 角色谓词丢了");
+            // 写复核谓词收在 `doc_write_acl_tail!` 宏里（定义处由钉扎测试守着）；
+            // 这里钉调用点的占位符编号——$1 是字段值，$2/$3/$4 = doc_id/login/roles
+            assert!(body.contains("doc_write_acl_tail!(\"$2\", \"$3\", \"$4\")"), "{f} 写复核调用变了");
         }
         let page = src.split("pub async fn list_docs_page").nth(1).unwrap();
         let page = page.split("\n}\n").next().unwrap();
@@ -2186,15 +2284,32 @@ mod tests {
     #[test]
     fn document_state_writes_recheck_current_actor() {
         let src = include_str!("store.rs");
+        // 宏化六份：谓词在宏定义里（下方单独钉定义），这里钉调用点的占位符编号
+        for (name, tail) in [
+            ("set_status", "doc_write_acl_tail!(\"$3\", \"$4\", \"$5\")"),
+            ("set_notice", "doc_write_acl_tail!(\"$2\", \"$3\", \"$4\")"),
+            ("set_enabled", "doc_write_acl_tail!(\"$2\", \"$3\", \"$4\")"),
+            ("set_doc_source_uri", "doc_write_acl_tail!(\"$2\", \"$3\", \"$4\")"),
+            ("set_doc_description", "doc_write_acl_tail!(\"$2\", \"$3\", \"$4\")"),
+            ("set_counts", "doc_write_acl_tail!(\"$3\", \"$4\", \"$5\")"),
+        ] {
+            let marker = format!("pub async fn {name}");
+            let body = src.split(marker.as_str()).nth(1).unwrap();
+            let body = body.split("pub async fn ").next().unwrap();
+            assert!(body.contains(tail), "{name} 的写复核调用变了（编号漂移 = 绑错参数）");
+            assert!(body.contains("viewer"), "{name} 未接收当前操作者");
+        }
+        // 宏定义本体：谓词只能有这一份
+        let mac = src.split("macro_rules! doc_write_acl_tail").nth(1).unwrap();
+        assert!(mac.contains("a.perm='write'"), "写复核宏丢了 perm 谓词");
+        assert!(mac.contains("grantee_kind='role'"), "写复核宏丢了角色授权");
+        assert!(mac.contains("s.owner="), "写复核宏丢了 owner 放行");
+        // 形状各异的其余写函数：谓词仍内联在各自语句里
         for name in [
-            "set_status",
-            "set_notice",
-            "set_enabled",
             "update_doc_metadata_and_links",
             "apply_inferred_doc_version",
             "append_notice",
             "delete_doc",
-            "set_counts",
         ] {
             let marker = format!("pub async fn {name}");
             let body = src.split(marker.as_str()).nth(1).unwrap();
@@ -2218,7 +2333,19 @@ mod tests {
         let src = include_str!("store.rs");
         let migrate = src.split("pub async fn migrate").nth(1).unwrap();
         let migrate = migrate.split("pub async fn ").next().unwrap();
-        assert!(migrate.contains("statements(KB_DDL).chain(statements(KB_DDL_DELTA))"));
+        // 两份 DDL 都必须挂在 migrate 执行链上，且迁移有并发顾问锁与 $tag$ 防御
+        assert!(migrate.contains("[KB_DDL, KB_DDL_DELTA]"), "migrate 必须覆盖两份 DDL");
+        assert!(migrate.contains("pg_advisory_xact_lock"), "migrate 丢了并发互斥锁");
+        assert!(migrate.contains("has_tagged_dollar_quote"), "migrate 丢了 $tag$ 防御");
+    }
+
+    /// 切分器边界：裸 `$$` 不触发防御，`$func$`/`$body$` 必须被识别（含 `$1` 参数不误报）
+    #[test]
+    fn tagged_dollar_quotes_are_detected() {
+        assert!(!has_tagged_dollar_quote("DO $$ BEGIN RAISE NOTICE; END $$;"));
+        assert!(!has_tagged_dollar_quote("SELECT $1, $2"));
+        assert!(has_tagged_dollar_quote("CREATE FUNCTION f() RETURNS void AS $func$ ... $func$"));
+        assert!(has_tagged_dollar_quote("AS $_$ SELECT 1 $_$"));
     }
 
     /// B3：两条落块语句都必须写偏移列；`None` 元素经 `Vec<Option<i32>>` 落 NULL。
@@ -2364,7 +2491,7 @@ mod tests {
         let texts = vec!["t0".to_string(), "t1".to_string(), "t2".to_string()];
         let vecs = vec![Some("v0".to_string()), Some("v1".to_string()), None];
         let (t, v) = remap_shadow_embeddings(&sources, &texts, &vecs);
-        assert_eq!(t, vec![String::new(), "t2".to_string()], "合并块的 expected 置空串（CAS 恒失配 → NULL）");
+        assert_eq!(t, vec!["", "t2"], "合并块的 expected 置空串（CAS 恒失配 → NULL）");
         assert_eq!(v, vec![None, None], "合并块不许贴旧向量；单源块原样（含本就 None 的）");
     }
 

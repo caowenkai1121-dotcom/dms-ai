@@ -70,6 +70,8 @@ const CONFIDENCE_CAP: f64 = 0.95;
 const JOINABLE_MIN: f32 = 0.9;
 /// 关系卡每表每桶（stat / co_occurs）的 topN。
 const RELATIONS_TOP_N: i64 = 10;
+/// evidence 里共有列名的截断条数（测试钉点：改它即改证据形状，需评审）。
+const EVIDENCE_SHARED_COLS_CAP: usize = 20;
 
 /// 技术列停用表：ETL 审计/软删列在任意两表间都同名，进重叠只注水口径。
 const STOP_COLS: &[&str] = &[
@@ -150,8 +152,10 @@ pub struct LineageReport {
 // ── ① 纯函数：命名规整 / 目录直证 ────────────────────────────────────────────
 
 /// 层前缀 / 域前缀 / 后缀 token（命名规整的剥除清单，只服务弱信号，清单变化需评审）。
+/// 长度与关键成员由 `token_lists_are_pinned` 测试钉死 —— 改清单即改测试，测试即评审触发器。
 const LAYER_TOKENS: &[&str] = &["dws", "ads", "dwd", "ods", "dim", "t"];
 const DOMAIN_TOKENS: &[&str] = &["off", "mkt", "fin", "hr", "msy", "app", "winc"];
+/// "fin" 双清单同录是刻意的：既可作域前缀（dws_fin_…）也可作后缀（…_fin 的活动/费用层表）。
 const SUFFIX_TOKENS: &[&str] = &["dfn", "dnf", "fin", "min", "scd", "d", "m"];
 
 /// 英文 token 去单复数尾（sales→sale）；`ss`/`us` 结尾不剥（status/address 不是复数）。
@@ -167,37 +171,49 @@ fn deplural(token: &str) -> &str {
 /// `dws_fin_customer_balance_dnf` 与 `t_customer_balance` 收敛同核。
 fn table_core(name: &str) -> Vec<String> {
     let lowered = name.to_ascii_lowercase();
-    let mut tokens: Vec<&str> = lowered.split('_').collect();
+    let tokens: Vec<&str> = lowered.split('_').collect();
+    // 起始下标前推代替 remove(0)（每次 O(n) 搬移）
+    let mut start = 0;
     while tokens
-        .first()
+        .get(start)
         .is_some_and(|t| LAYER_TOKENS.contains(t) || DOMAIN_TOKENS.contains(t))
     {
-        tokens.remove(0);
+        start += 1;
     }
-    while tokens.last().is_some_and(|t| SUFFIX_TOKENS.contains(t)) {
-        tokens.pop();
+    let mut end = tokens.len();
+    while end > start && SUFFIX_TOKENS.contains(&tokens[end - 1]) {
+        end -= 1;
     }
-    tokens
-        .into_iter()
-        .map(deplural)
+    tokens[start..end]
+        .iter()
+        .map(|t| deplural(t))
         .filter(|t| !t.is_empty())
         .map(str::to_string)
         .collect()
 }
 
 /// 命名启发（弱信号）：两侧核心 token 集合相同或一方包含另一方。
+/// 测试入口：生产路径在 `plan_edges` 里按表预算核心后走 `name_match_cores`。
+#[cfg(test)]
 fn name_match(high: &str, source: &str) -> bool {
-    let (a, b) = (table_core(high), table_core(source));
+    name_match_cores(&table_core(high), &table_core(source))
+}
+
+/// `name_match` 的核心版：核心 token 在调用侧按表预算一次，配对循环零重算。
+fn name_match_cores(a: &[String], b: &[String]) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
     }
-    let (sa, sb): (HashSet<&String>, HashSet<&String>) = (a.iter().collect(), b.iter().collect());
+    let (sa, sb): (HashSet<&str>, HashSet<&str>) =
+        (a.iter().map(String::as_str).collect(), b.iter().map(String::as_str).collect());
     sa.is_subset(&sb) || sb.is_subset(&sa)
 }
 
 /// 词边界包含：`t_goods` 不许撞上 `t_goods_category`（前后字符非 [a-z0-9_] 才算命中）。
+/// 目录文本可能大写引用表名（表名目录已小写）：先统一小写再逐字匹配。
 fn contains_table_name(haystack: &str, table: &str) -> bool {
     let boundary = |c: char| !(c.is_ascii_alphanumeric() || c == '_');
+    let haystack = haystack.to_ascii_lowercase();
     haystack.match_indices(table).any(|(i, _)| {
         let before = haystack[..i].chars().next_back();
         let after = haystack[i + table.len()..].chars().next();
@@ -214,20 +230,9 @@ fn catalog_mention(high: &Asset, source_table: &str) -> bool {
 
 // ── ② 纯函数：列重叠与分档合成 ──────────────────────────────────────────────
 
-/// 粗粒度类型桶（与 `datamap.rs::dtype_bucket` 同一规则 —— 那一个是私有的，判定逻辑保持
-/// 逐字一致，散开两处是文件边界所迫，改规则要两边一起改）。`None` = 认不出的类型。
-fn dtype_bucket(data_type: &str) -> Option<&'static str> {
-    let t = data_type.to_ascii_lowercase();
-    if t.contains("int") || t.contains("decimal") || t.contains("double") || t.contains("float") || t.contains("numeric") {
-        Some("numeric")
-    } else if t.starts_with("date") || t.starts_with("time") || t == "year" {
-        Some("temporal")
-    } else if t.contains("char") || t.contains("string") || t.contains("text") || t.contains("enum") || t == "boolean" {
-        Some("string")
-    } else {
-        None
-    }
-}
+/// 粗粒度类型桶复用 `datamap::dtype_bucket`（本 crate 唯一事实源，含空间类型排除）。
+/// `None` = 认不出的类型。类型桶一致率只记 evidence 不加分（ETL 常 CAST，类型漂移不是反证）。
+use crate::datamap::dtype_bucket;
 
 /// 有效列索引（去技术列，列名 → 列）。自由函数形态：闭包写不出这个生命周期签名。
 fn indexed(cols: &[ColMeta]) -> HashMap<&str, &ColMeta> {
@@ -239,7 +244,11 @@ fn indexed(cols: &[ColMeta]) -> HashMap<&str, &ColMeta> {
 
 /// 一对表的列重叠（纯函数）：技术列先剔除，重合度 = 共有列数 / min(两表有效列数)。
 pub fn column_overlap(high: &[ColMeta], source: &[ColMeta]) -> Overlap {
-    let (a, b) = (indexed(high), indexed(source));
+    overlap_indexed(&indexed(high), &indexed(source))
+}
+
+/// `column_overlap` 的索引版：`plan_edges` 在配对循环外为每表预建一次索引，逐对复用。
+fn overlap_indexed(a: &HashMap<&str, &ColMeta>, b: &HashMap<&str, &ColMeta>) -> Overlap {
     let mut shared: Vec<&str> = a.keys().filter(|k| b.contains_key(*k)).copied().collect();
     shared.sort_unstable();
     let min_cols = a.len().min(b.len());
@@ -309,7 +318,8 @@ pub fn score_pair(s: &PairSignals) -> Option<Scored> {
     } else {
         return None;
     };
-    if !s.overlap.shared.is_empty() && s.overlap.comment_ratio > 0.0 {
+    // comment_ratio > 0 ⇒ 至少一条共有列注释一致 ⇒ shared 必非空（不重复判空）
+    if s.overlap.comment_ratio > 0.0 {
         confidence += COMMENT_BONUS * s.overlap.comment_ratio;
         signals.push("comment_consistent");
     }
@@ -351,7 +361,15 @@ struct Plan {
 }
 
 /// evidence JSON：主依据 + 全部命中信号 + 重叠细节 + 佐证置信度，复核者一眼能追因。
-fn evidence_of(high: &Asset, source: &Asset, s: &PairSignals, scored: &Scored) -> String {
+/// `cores` 是（高层, 源）的命名核心 token —— `plan_edges` 按表预算好后传进来复用，
+/// 出边时不再重算 `table_core`。
+fn evidence_of(
+    high: &Asset,
+    source: &Asset,
+    s: &PairSignals,
+    scored: &Scored,
+    cores: &(Vec<String>, Vec<String>),
+) -> String {
     json!({
         "source": "warehouse_catalog+column_doc",
         "base": scored.base,
@@ -360,48 +378,56 @@ fn evidence_of(high: &Asset, source: &Asset, s: &PairSignals, scored: &Scored) -
         "right": { "db": source.database, "table": source.table, "layer": source.layer, "domain": source.domain },
         "overlap": round4(s.overlap.ratio),
         "shared_count": s.overlap.shared.len(),
-        "shared_cols": s.overlap.shared.iter().take(20).collect::<Vec<_>>(),
+        "shared_cols": s.overlap.shared.iter().take(EVIDENCE_SHARED_COLS_CAP).collect::<Vec<_>>(),
         "comment_ratio": round4(s.overlap.comment_ratio),
         "type_ratio": round4(s.overlap.type_ratio),
         "joinable_confidence": s.joinable_confidence,
-        "name_core_left": table_core(high.table),
-        "name_core_right": table_core(source.table),
+        "name_core_left": &cores.0,
+        "name_core_right": &cores.1,
     })
     .to_string()
 }
 
 /// 全候选对规划（纯函数）：high × ods 逐对合成；任一侧在 column_doc 无列的表对跳过留痕
 /// （目录直证例外 —— 点名来源本身就是合同，不依赖列 schema）。
+/// `joinable` 是双向登记过的嵌套表（外层左表 → 内层右表 → 置信度），按静态表名直查零分配。
 fn plan_edges(
     high: &[&Asset],
     ods: &[&Asset],
     cols: &HashMap<String, Vec<ColMeta>>,
-    joinable: &HashMap<(String, String), f64>,
+    joinable: &HashMap<String, HashMap<String, f64>>,
 ) -> Plan {
     let mut plan = Plan::default();
-    let empty: &[ColMeta] = &[];
-    for h in high {
-        for o in ods {
+    // 每表的列索引视图与命名核心都在配对循环外建一次（原来 O(high×ods) 每对各重建一遍）
+    let indexed_cols: HashMap<&str, HashMap<&str, &ColMeta>> =
+        cols.iter().map(|(t, c)| (t.as_str(), indexed(c))).collect();
+    let cores_of = |assets: &[&Asset]| assets.iter().map(|a| table_core(a.table)).collect::<Vec<_>>();
+    let (high_cores, ods_cores) = (cores_of(high), cores_of(ods));
+    let empty_view: HashMap<&str, &ColMeta> = HashMap::new();
+    for (hi, h) in high.iter().enumerate() {
+        // 外层循环先取一次（目录表名全小写，与装载侧的小写键同口径）
+        let hc = indexed_cols.get(h.table);
+        for (oi, o) in ods.iter().enumerate() {
             let mention = catalog_mention(h, o.table);
-            let (hc, oc) = match (cols.get(h.table), cols.get(o.table)) {
-                (Some(a), Some(b)) => (a.as_slice(), b.as_slice()),
-                _ if mention => (empty, empty),
+            let (hc, oc) = match (hc, indexed_cols.get(o.table)) {
+                (Some(a), Some(b)) => (a, b),
+                _ if mention => (&empty_view, &empty_view),
                 _ => {
                     plan.pairs_skipped_no_schema += 1;
                     continue;
                 }
             };
             plan.pairs_evaluated += 1;
-            // datamap 统计边按字典序规范化落库，这里两个方向都查（无序对）
+            // joinable 佐证按无序对装载（两个方向都登过），这里直查一次
             let joinable_confidence = joinable
-                .get(&(h.table.to_string(), o.table.to_string()))
-                .or_else(|| joinable.get(&(o.table.to_string(), h.table.to_string())))
+                .get(h.table)
+                .and_then(|m| m.get(o.table))
                 .copied();
             let signals = PairSignals {
                 mention,
                 domain_match: h.domain == o.domain,
-                name_match: name_match(h.table, o.table),
-                overlap: column_overlap(hc, oc),
+                name_match: name_match_cores(&high_cores[hi], &ods_cores[oi]),
+                overlap: overlap_indexed(hc, oc),
                 joinable_confidence,
             };
             let Some(scored) = score_pair(&signals) else {
@@ -414,7 +440,13 @@ fn plan_edges(
                 confidence: scored.confidence,
                 base: scored.base,
                 corroborated: signals.joinable_confidence.is_some(),
-                evidence: evidence_of(h, o, &signals, &scored),
+                evidence: evidence_of(
+                    h,
+                    o,
+                    &signals,
+                    &scored,
+                    &(high_cores[hi].clone(), ods_cores[oi].clone()),
+                ),
             });
         }
     }
@@ -426,14 +458,16 @@ fn plan_edges(
 /// 存在性检查（🔴 不建表：DDL 正本在 `server::datamap_api`，三处逐字一致；缺表或缺
 /// 仲裁唯一索引 = 迁移没跑，直接 Err 指路，绝不自己 CREATE）。
 async fn ensure_edge_table_ready(pg: &PgPool) -> anyhow::Result<()> {
-    let (table,): (Option<String>,) =
-        sqlx::query_as("SELECT to_regclass('meta.datamap_edge')::text").fetch_one(pg).await?;
+    // 表与仲裁索引一次往返查齐（原来两趟）
+    let (table, index): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT to_regclass('meta.datamap_edge')::text, to_regclass('meta.idx_datamap_edge_uniq')::text",
+    )
+    .fetch_one(pg)
+    .await?;
     anyhow::ensure!(
         table.is_some(),
         "meta.datamap_edge 不存在：先跑迁移（DDL 正本 server::datamap_api::migrate），血缘边不落库"
     );
-    let (index,): (Option<String>,) =
-        sqlx::query_as("SELECT to_regclass('meta.idx_datamap_edge_uniq')::text").fetch_one(pg).await?;
     anyhow::ensure!(
         index.is_some(),
         "meta.idx_datamap_edge_uniq 不存在：先跑迁移（它是 upsert ON CONFLICT 的仲裁唯一索引）"
@@ -456,6 +490,8 @@ const JOINABLE_SQL: &str = "SELECT left_table, right_table, MAX(confidence) \
 
 /// 幂等 upsert（与 datamap.rs 同纪律）：新行 status 恒 'pending'；DO UPDATE 只刷
 /// confidence/evidence/updated_at —— **status 不在 SET**，人工复核结论不被重跑冲掉。
+/// `last_seen`/`seen_count` 是「被真实查询观测到」的口径，独归 `datamap_usage` 写口维护，
+/// 静态推断与血缘重跑都不算「被观测」（三处写口分工见 datamap.rs 的 UPSERT 注释）。
 const UPSERT_SQL: &str = "INSERT INTO meta.datamap_edge(ds_id, kind, left_table, left_col, right_table, right_col, confidence, evidence, status)
 VALUES ($1, 'lineage', $2, '', $3, '', $4, $5, 'pending')
 ON CONFLICT (ds_id, kind, left_table, left_col, right_table, right_col) DO UPDATE SET
@@ -463,7 +499,8 @@ ON CONFLICT (ds_id, kind, left_table, left_col, right_table, right_col) DO UPDAT
 
 /// 跑一遍血缘推断：目录分层 × PG 列 schema × 既有统计边佐证 → 全部按 pending upsert。
 ///
-/// 表/索引缺失即 Err（先跑迁移）；单对评估不产生任何 PG 往返，全部输入三次查询取齐。
+/// 表/索引缺失即 Err（先跑迁移）；单对评估不产生任何 PG 往返，全部输入三次数据查询取齐
+/// （另有 `ensure_edge_table_ready` 的一次存在性检查）。
 /// 重跑收敛：同一对表收敛同一行（六元组唯一键），只刷置信度与证据。
 pub async fn build(pg: &PgPool, ds_id: &str) -> anyhow::Result<LineageReport> {
     ensure_edge_table_ready(pg).await?;
@@ -478,27 +515,45 @@ pub async fn build(pg: &PgPool, ds_id: &str) -> anyhow::Result<LineageReport> {
         .filter(|a| a.layer == "ODS")
         .collect();
 
-    let names: Vec<String> = warehouse_catalog::ASSETS.iter().map(|a| a.table.to_string()).collect();
+    // 只收参与推断的（high ∪ ods）表名：DIM/DWD 层的 column_doc 行拉回来也没人读
+    let names: Vec<String> = high
+        .iter()
+        .chain(ods.iter())
+        .map(|a| a.table.to_string())
+        .collect();
     let rows: Vec<(String, String, String, String)> = sqlx::query_as(COLUMNS_SQL)
         .bind(&ds_id)
         .bind(&names)
         .fetch_all(pg)
         .await?;
-    let mut cols: HashMap<String, Vec<ColMeta>> = HashMap::new();
+    let mut cols: HashMap<String, (HashSet<String>, Vec<ColMeta>)> = HashMap::new();
     for (table, name, data_type, comment) in rows {
-        let entry = cols.entry(table.to_ascii_lowercase()).or_default();
-        if !entry.iter().any(|c: &ColMeta| c.name == name) {
+        let (seen, entry) = cols.entry(table.to_ascii_lowercase()).or_default();
+        // 列名与表名同口径小写化（STOP_COLS 过滤同受益）；ds_id DESC 首行优先，重复列只留首见
+        let name = name.to_ascii_lowercase();
+        if seen.insert(name.clone()) {
             entry.push(ColMeta { name, data_type, comment });
         }
     }
+    let cols: HashMap<String, Vec<ColMeta>> =
+        cols.into_iter().map(|(t, (_, v))| (t, v)).collect();
 
     let jrows: Vec<(String, String, f32)> = sqlx::query_as(JOINABLE_SQL)
         .bind(&ds_id)
         .bind(JOINABLE_MIN)
         .fetch_all(pg)
         .await?;
-    let joinable: HashMap<(String, String), f64> =
-        jrows.into_iter().map(|(l, r, c)| ((l, r), f64::from(c))).collect();
+    // 无序对双向登记（同对多行取最大置信度），规划侧按静态表名直查零分配
+    let mut joinable: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    for (l, r, c) in jrows {
+        let c = f64::from(c);
+        for (a, b) in [(&l, &r), (&r, &l)] {
+            let e = joinable.entry(a.clone()).or_default().entry(b.clone()).or_insert(c);
+            if c > *e {
+                *e = c;
+            }
+        }
+    }
 
     let mut tables_without_columns: Vec<String> = high
         .iter()
@@ -507,8 +562,17 @@ pub async fn build(pg: &PgPool, ds_id: &str) -> anyhow::Result<LineageReport> {
         .map(|a| format!("{}.{}", a.database, a.table))
         .collect();
     tables_without_columns.sort();
+    if !tables_without_columns.is_empty() {
+        tracing::warn!(
+            "{} 张目录表在 column_doc 无列：{}",
+            tables_without_columns.len(),
+            tables_without_columns.join(", ")
+        );
+    }
 
     let plan = plan_edges(&high, &ods, &cols, &joinable);
+    // 整批包一个事务：半截失败整体回滚，重跑即收敛（与 datamap/usage 写口同形态）
+    let mut tx = pg.begin().await?;
     for edge in &plan.edges {
         sqlx::query(UPSERT_SQL)
             .bind(&ds_id)
@@ -516,9 +580,10 @@ pub async fn build(pg: &PgPool, ds_id: &str) -> anyhow::Result<LineageReport> {
             .bind(&edge.right_table)
             .bind(edge.confidence)
             .bind(&edge.evidence)
-            .execute(pg)
+            .execute(&mut *tx)
             .await?;
     }
+    tx.commit().await?;
 
     let mut report = LineageReport {
         ds_id,
@@ -540,7 +605,9 @@ pub async fn build(pg: &PgPool, ds_id: &str) -> anyhow::Result<LineageReport> {
             "catalog_mention" => report.by_catalog_mention += 1,
             "column_overlap_strong" => report.by_overlap_strong += 1,
             "column_overlap_mid" => report.by_overlap_mid += 1,
-            _ => report.by_overlap_weak += 1,
+            "column_overlap_weak" => report.by_overlap_weak += 1,
+            // 未来新增 base 串不许静默落进 weak 桶：留痕并不计数
+            other => tracing::warn!("未知血缘主依据 {other}，不计入分桶"),
         }
         if edge.corroborated {
             report.corroborated_joinable += 1;
@@ -610,8 +677,17 @@ pub async fn table_relations(pg: &PgPool, ds_id: &str) -> anyhow::Result<Value> 
     let ds = ds_id.trim().to_ascii_lowercase();
     let mut cards: BTreeMap<String, Card> = BTreeMap::new();
 
-    let contracts: Vec<(String, String, String, String, String, String)> =
-        sqlx::query_as(CONTRACTS_SQL).bind(&ds).fetch_all(pg).await?;
+    // 三条纯 SELECT 互不依赖，一次并发取齐（只读查询，同池并发占用可接受）
+    let (contracts, lineage, stats) = tokio::try_join!(
+        sqlx::query_as::<_, (String, String, String, String, String, String)>(CONTRACTS_SQL)
+            .bind(&ds)
+            .fetch_all(pg),
+        sqlx::query_as::<_, (String, String, f32, String)>(LINEAGE_SQL).bind(&ds).fetch_all(pg),
+        sqlx::query_as::<_, (String, String, String, String, String, f32, String, i64)>(STAT_SQL)
+            .bind(&ds)
+            .bind(RELATIONS_TOP_N)
+            .fetch_all(pg),
+    )?;
     for (lt, lc, rt, rc, card, note) in contracts {
         cards.entry(lt.clone()).or_default().contracts.push(json!({
             "side": "left", "other_table": rt.clone(), "pivot_col": lc.clone(),
@@ -623,8 +699,6 @@ pub async fn table_relations(pg: &PgPool, ds_id: &str) -> anyhow::Result<Value> 
         }));
     }
 
-    let lineage: Vec<(String, String, f32, String)> =
-        sqlx::query_as(LINEAGE_SQL).bind(&ds).fetch_all(pg).await?;
     for (lt, rt, confidence, status) in lineage {
         cards.entry(lt.clone()).or_default().lineage_sources.push(json!({
             "table": rt.clone(), "confidence": confidence, "status": status.clone(),
@@ -634,8 +708,6 @@ pub async fn table_relations(pg: &PgPool, ds_id: &str) -> anyhow::Result<Value> 
         }));
     }
 
-    let stats: Vec<(String, String, String, String, String, f32, String, i64)> =
-        sqlx::query_as(STAT_SQL).bind(&ds).bind(RELATIONS_TOP_N).fetch_all(pg).await?;
     for (pivot, other, pivot_col, other_col, kind, confidence, status, seen_count) in stats {
         let is_co_occurs = kind == "co_occurs";
         let row = json!({
@@ -748,12 +820,14 @@ mod tests {
             "共享 report 一个 token 不构成包含");
     }
 
-    /// 目录直证的词边界：t_goods 不撞 t_goods_category；目录五段文本任一段点名即命中。
+    /// 目录直证的词边界：t_goods 不撞 t_goods_category；目录五段文本任一段点名即命中；
+    /// 大写引用同样命中（haystack 先统一小写）。
     #[test]
     fn mention_uses_word_boundaries() {
         assert!(contains_table_name("数据来自 t_sales_order 汇总", "t_sales_order"));
         assert!(contains_table_name("t_goods", "t_goods"));
         assert!(contains_table_name("（t_goods）", "t_goods"));
+        assert!(contains_table_name("来源 T_GOODS 每日同步", "t_goods"), "大写引用必须命中");
         assert!(!contains_table_name("见 t_goods_category 表", "t_goods"));
         assert!(!contains_table_name("at_sales_orderx", "t_sales_order"));
         let mut a = asset("DWS", "商品", "dws_x_goods_dnf");
@@ -762,6 +836,24 @@ mod tests {
         assert!(!catalog_mention(&a, "t_sales_order"));
         let plain = asset("DWS", "线下销售", "dws_off_offline_sale_dfn");
         assert!(!catalog_mention(&plain, "t_sales_order"), "空文本绝不直证");
+    }
+
+    /// 三份 token 剥除清单钉住长度与关键成员：清单变化 = 命名弱信号变化 = 需评审，
+    /// 测试红即评审触发器（"fin" 双清单同录是刻意的，见 SUFFIX_TOKENS 注释）。
+    #[test]
+    fn token_lists_are_pinned() {
+        assert_eq!(LAYER_TOKENS.len(), 6, "{LAYER_TOKENS:?}");
+        assert_eq!(DOMAIN_TOKENS.len(), 7, "{DOMAIN_TOKENS:?}");
+        assert_eq!(SUFFIX_TOKENS.len(), 7, "{SUFFIX_TOKENS:?}");
+        for t in ["dws", "ads", "t"] {
+            assert!(LAYER_TOKENS.contains(&t));
+        }
+        for t in ["off", "fin", "mkt"] {
+            assert!(DOMAIN_TOKENS.contains(&t));
+        }
+        for t in ["dfn", "dnf", "fin", "min"] {
+            assert!(SUFFIX_TOKENS.contains(&t));
+        }
     }
 
     /// 列重叠：技术列先剔除（两侧 id/created_time/remark 不计），重合度 = 共有/min(有效列数)。
@@ -889,9 +981,12 @@ mod tests {
         ]);
         // t_goods 与 dws_y_sale_analyze_dnf 刻意不进 column_doc：验证 schema 缺失路径
 
-        let mut joinable: HashMap<(String, String), f64> = HashMap::new();
-        // datamap 落库按字典序（dws_... < t_...），规划两个方向都要查得到
-        joinable.insert(("dws_fin_customer_balance_dnf".to_string(), "t_customer_balance".to_string()), 0.92);
+        // joinable 佐证按无序对双向预登记（嵌套表），规划侧直查一次
+        let mut joinable: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        joinable
+            .entry("dws_fin_customer_balance_dnf".to_string())
+            .or_default()
+            .insert("t_customer_balance".to_string(), 0.92);
 
         let plan = plan_edges(&high, &ods, &cols, &joinable);
         // 6 对：balance×balance（出边）+ report×balance（无重叠）+ goods×goods（直证免 schema 出边）
@@ -927,7 +1022,8 @@ mod tests {
             joinable_confidence: Some(0.92),
         };
         let scored = score_pair(&signals).unwrap();
-        let ev: Value = serde_json::from_str(&evidence_of(&h, &o, &signals, &scored)).unwrap();
+        let cores = (table_core(h.table), table_core(o.table));
+        let ev: Value = serde_json::from_str(&evidence_of(&h, &o, &signals, &scored, &cores)).unwrap();
         assert_eq!(ev["base"], json!("column_overlap_strong"));
         assert_eq!(ev["shared_count"], json!(25));
         assert_eq!(ev["shared_cols"].as_array().unwrap().len(), 20, "证据截断 20 条");
@@ -938,7 +1034,14 @@ mod tests {
         assert!(ev["signals"].as_array().unwrap().contains(&json!("joinable_corroborated")));
         // 无佐证时证据里显式为 null（复核者分得清「没查」与「没有」）
         let no = score_pair(&sig(false, false, false, ov(&["a", "b"], 0.4, 0.0), None)).unwrap();
-        let ev2: Value = serde_json::from_str(&evidence_of(&h, &o, &sig(false, false, false, ov(&["a", "b"], 0.4, 0.0), None), &no)).unwrap();
+        let ev2: Value = serde_json::from_str(&evidence_of(
+            &h,
+            &o,
+            &sig(false, false, false, ov(&["a", "b"], 0.4, 0.0), None),
+            &no,
+            &cores,
+        ))
+        .unwrap();
         assert_eq!(ev2["joinable_confidence"], Value::Null);
     }
 }

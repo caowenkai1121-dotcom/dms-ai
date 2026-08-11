@@ -11,13 +11,12 @@
 use crate::recall::RecallCtx;
 use crate::registry::caliber::{UNIT_PERCENT, UNIT_RATIO};
 use crate::registry::{
-    catalog_allows_metric_dimension, catalog_allows_metric_record, source_asset_live_pred_at,
-    warehouse_qualified_source,
+    catalog_allows_metric_record, source_live_pred_single, warehouse_qualified_source,
 };
 use sqlx::PgPool;
 
 /// 最长别名命中 + MapFilter 命中净化四规则：纯文本基元，已收进 kernel（`nl::text`）。
-/// 净化规则的行为契约与 7 个断言原地留在本文件（裁决 T7-3）。
+/// 净化规则的行为契约断言原地留在本文件（裁决 T7-3）。
 pub use dms_kernel::nl::text::{map_filter, match_word};
 
 /// 命中的指标（结构化，供口径卡渲染与口径校正器共用——单一事实源）
@@ -32,8 +31,8 @@ pub struct MetricHit {
     pub description: String,
     /// `meta.metric.unit`；百分数与小数比值约定见 `registry::caliber::{UNIT_PERCENT, UNIT_RATIO}`。
     pub unit: String,
-    /// `meta.metric.time_cap`：指标级时间窗上限（'' = 无；'yesterday' = 算到昨天）。
-    /// 指标级数据新鲜度上限；默认 DWS 销售事实当前不设置该上限。
+    /// `meta.metric.time_cap`：指标级数据新鲜度上限（'' = 无；'yesterday' = 算到昨天）；
+    /// 默认 DWS 销售事实当前不设置该上限。
     /// 只进口径卡提示（`metric_card`），不进判据 —— 时间窗的合法写法太多
     /// （`< CURDATE()` / `<= CURDATE()-1` / `DATE() = 昨天`），AST 判「排除了今天」误伤面大。
     pub time_cap: String,
@@ -59,22 +58,34 @@ pub struct MetricHit {
 /// 排序判据选「命中词更长」而不是「名字字典序」：同一条原则已经在维度侧用过
 /// （`direct::pick` 取最长命中而非行序）。问「库存金额」时 `库存金额` 比 `库存` 更该说话。
 fn order_by_specificity(matched: &mut [(usize, String)], name_of: impl Fn(usize) -> String) {
-    matched.sort_by(|a, b| {
-        b.1.chars().count().cmp(&a.1.chars().count()).then_with(|| name_of(a.0).cmp(&name_of(b.0)))
-    });
+    // 键每元素预算一次（原比较器里每对两次 chars().count() + 两次 name_of 克隆）：
+    // 命中词字数降序 → 名字码点升序，与旧比较器全序全等
+    matched.sort_by_cached_key(|(i, w)| (std::cmp::Reverse(w.chars().count()), name_of(*i)));
 }
 
-/// 召回命中的指标（问句含指标名或别名）
+/// `meta.metric` 召回行（12 列；Vec 标注与 query_as turbofish 共用这一份，加字段只改一处）。
+type MetricRow = (
+    String,
+    Vec<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<String>,
+);
+
+/// 召回命中的指标（问句含指标名或别名）。
+/// 失败语义契约：本函数用 `?` 传播 —— corrector 路（correct_caliber）因此硬失败，
+/// gather 波 1 则由调用方 warn + 缺席降级。谁可以 `?`、谁必须降级，由调用点上下文决定，
+/// 本函数不自作主张吞错。
 pub async fn recall_metric_hits(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec<MetricHit>> {
-    let ds_pred = format!(
-        "{}{}",
-        crate::registry::ds_pred(1),
-        source_asset_live_pred_at("", 1)
-    );
-    let rows: Vec<(String, Vec<String>, String, String, String, String, String, String, String, String, String, Vec<String>)> = sqlx::query_as::<
-        _,
-        (String, Vec<String>, String, String, String, String, String, String, String, String, String, Vec<String>),
-    >(&format!(
+    let ds_pred = source_live_pred_single();
+    let rows: Vec<MetricRow> = sqlx::query_as::<_, MetricRow>(&format!(
         // `ORDER BY name` 是**确定性的底座**（见 `order_by_specificity` 的红字）：
         // 少了它，`rows` 的顺序就是物理行序，而下游有多处按顺序取第一个。
         "SELECT name, aliases, source_table, agg_expr, scope_filter, time_col, dedup_keys, description, unit, time_cap, version, allowed_dimensions
@@ -103,25 +114,27 @@ pub async fn recall_metric_hits(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Resu
     Ok(map_filter(&pairs)
         .into_iter()
         .map(|k| {
+            // 按字段解构引用（原整 12 元组克隆，aliases 深克隆后当 _a 丢弃）
             let (name, _a, source_table, agg_expr, scope_filter, time_col, dedup_keys, description, unit, time_cap, version, allowed_dimensions) =
-                rows[matched[k].0].clone();
-            let allowed_dimensions = allowed_dimensions
-                .into_iter()
-                .filter(|dimension| {
-                    catalog_allows_metric_dimension(cx.ds, &source_table, dimension)
-                })
+                &rows[matched[k].0];
+            // source 解析一次，逐维度判定（原来每个维度都重跑一遍 source_refs）
+            let dim_checker = crate::registry::metric_dimension_checker(cx.ds, source_table);
+            let allowed_dimensions: Vec<String> = allowed_dimensions
+                .iter()
+                .filter(|dimension| dim_checker(dimension))
+                .cloned()
                 .collect();
             MetricHit {
-                name,
-                source_table,
-                agg_expr,
-                scope_filter,
-                time_col,
-                dedup_keys,
-                description,
-                unit,
-                time_cap,
-                version,
+                name: name.clone(),
+                source_table: source_table.clone(),
+                agg_expr: agg_expr.clone(),
+                scope_filter: scope_filter.clone(),
+                time_col: time_col.clone(),
+                dedup_keys: dedup_keys.clone(),
+                description: description.clone(),
+                unit: unit.clone(),
+                time_cap: time_cap.clone(),
+                version: version.clone(),
                 allowed_dimensions,
                 hit_word: matched[k].1.clone(),
             }
@@ -129,7 +142,9 @@ pub async fn recall_metric_hits(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Resu
         .collect())
 }
 
-/// 指标口径卡文本（注入 prompt 让 LLM 严格按口径）
+/// 指标口径卡文本（注入 prompt 让 LLM 严格按口径）。
+/// ds 传 ""：依赖 `warehouse_qualified_source`「""≠DMS_DS_ID → 原样返回」的契约
+/// （无 ds 上下文的纯渲染入口，与 `value_domain_card` 同一形态）。
 pub fn metric_card(m: &MetricHit) -> String {
     metric_card_for("", m)
 }
@@ -158,13 +173,15 @@ pub fn metric_card_for(ds: &str, m: &MetricHit) -> String {
         ""
     };
     // 指标级时间窗上限放卡片**末尾**独立成句，避免埋在说明长段中被忽略。
-    let cap = match m.time_cap.as_str() {
-        "yesterday" => "。⚠️时间窗【不要含今天】：该指标算到**昨天**，时间上限写 `< CURDATE()` \
-                        （不是期月末日、不是今天）—— 今天的单大多还没发生这个动作",
-        _ => "",
+    // 契约：种子值统一小写无空白；匹配侧宽松（trim + 大小写不敏感），写 "Yesterday" 不静默漏渲
+    let cap = if m.time_cap.trim().eq_ignore_ascii_case("yesterday") {
+        "。⚠️时间窗【不要含今天】：该指标算到**昨天**，时间上限写 `< CURDATE()` \
+         （不是期月末日、不是今天）—— 今天的单大多还没发生这个动作"
+    } else {
+        ""
     };
     // 复合子查询口径（agg_expr 含 SELECT）：模型容易改写内部连接或过滤，因此明确要求照抄。
-    let composite = if m.agg_expr.to_uppercase().contains("SELECT") {
+    let composite = if agg_expr_contains_select(&m.agg_expr) {
         "。⚠️该指标是复合子查询口径：【严格照抄】上面表达式的每个子查询，\
          只在各子查询的 WHERE 末尾各加一行时间条件（别重写连接、别改过滤、别换时间列）"
     } else {
@@ -176,7 +193,48 @@ pub fn metric_card_for(ds: &str, m: &MetricHit) -> String {
         format!("；允许维度：{}", m.allowed_dimensions.join("、"))
     };
     let source = warehouse_qualified_source(ds, &m.source_table);
-    format!("【{}·v{}】= {}，来源表 {}{}{}{}{}。说明：{}{}{}{}", m.name, m.version, m.agg_expr, source, filter, tcol, dedup, dims, m.description, pct, cap, composite)
+    format!(
+        "【{name}·v{version}】= {agg}，来源表 {source}{filter}{tcol}{dedup}{dims}。说明：{desc}{pct}{cap}{composite}",
+        name = m.name,
+        version = m.version,
+        agg = m.agg_expr,
+        source = source,
+        filter = filter,
+        tcol = tcol,
+        dedup = dedup,
+        dims = dims,
+        desc = m.description,
+        pct = pct,
+        cap = cap,
+        composite = composite,
+    )
+}
+
+/// 判 agg_expr 是不是复合子查询口径：抹掉字符串字面量后大写、按词边界找 SELECT
+/// （`'select'` 这类字样字面量与 `SELECTED` 类词不误判 —— 启发式前提钉在这里）。
+fn agg_expr_contains_select(expr: &str) -> bool {
+    let mut stripped = String::with_capacity(expr.len());
+    let mut in_lit = false;
+    for c in expr.chars() {
+        if in_lit {
+            if c == '\'' {
+                in_lit = false;
+            }
+            stripped.push(' ');
+        } else if c == '\'' {
+            in_lit = true;
+            stripped.push(' ');
+        } else {
+            stripped.push(c);
+        }
+    }
+    let upper = stripped.to_ascii_uppercase();
+    upper.match_indices("SELECT").any(|(i, _)| {
+        let before = upper[..i].chars().next_back();
+        let after = upper[i + "SELECT".len()..].chars().next();
+        before.map_or(true, |c: char| !c.is_ascii_alphabetic())
+            && after.map_or(true, |c: char| !c.is_ascii_alphabetic())
+    })
 }
 
 pub async fn recall_metrics(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec<String>> {
@@ -188,7 +246,8 @@ pub async fn recall_metrics(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<V
 }
 
 /// 【A17 ②】口径二选一 chip：命中词与第一名**一样长**的落选指标（cap 2 条）。
-/// 命中词等长 = 问句没区分出是哪个（「退款金额」同时像「退款额」与「退款占比」）；
+/// 🔴 判据是「等长」不是「同词」（有意近似）：命中词字数相同但词不同的落选者也出 chip ——
+/// 等长 = 问句没区分出是哪个（「退款金额」同时像「退款额」与「退款占比」）。
 /// 答题仍按最长优先（`order_by_specificity`），但落选者挂出来让人一键改问。
 /// 单命中 / 命中词明显更短的落选者（问句已经说清了）不出 chip。
 pub fn alt_questions(hits: &[MetricHit]) -> Vec<String> {
@@ -258,6 +317,16 @@ mod tests {
         assert!(ratio_card.contains("不得乘 100"), "{ratio_card}");
     }
 
+    /// 复合判据的词边界与字面量豁免：'select' 字样、SELECTED 不误判；真子查询照判。
+    #[test]
+    fn composite_select_respects_word_boundary_and_literals() {
+        assert!(agg_expr_contains_select("(SELECT SUM(x) FROM a)"));
+        assert!(agg_expr_contains_select("sum(case when a>0 then (select 1) else 0 end)"), "小写 select 同判");
+        assert!(!agg_expr_contains_select("SUM(order_total)"));
+        assert!(!agg_expr_contains_select("CASE WHEN x = 'select' THEN 1 ELSE 0 END"), "字符串字面量不算");
+        assert!(!agg_expr_contains_select("COUNT(selected_flag)"), "selected 不含词边界 SELECT");
+    }
+
     /// 延迟确认指标的时间窗上限 —— 'yesterday' 必须渲出
     /// 独立的 ⚠️ 句（埋在长段中间就是它上次被无视的原因）；空值一个字都不多。
     #[test]
@@ -267,6 +336,9 @@ mod tests {
         h.time_cap = "yesterday".into();
         let card = metric_card(&h);
         assert!(card.contains("⚠️时间窗【不要含今天】") && card.contains("< CURDATE()"), "{card}");
+        // 种子写成 Yesterday/带空白也照渲（匹配侧宽松：trim + 大小写不敏感）
+        h.time_cap = " Yesterday ".into();
+        assert!(metric_card(&h).contains("不要含今天"), "大小写/空白不静默漏渲");
     }
 
     /// 复合子查询口径必须带「严格照抄」指令，避免模型改写时丢掉分支过滤；

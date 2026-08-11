@@ -83,19 +83,28 @@ pub struct ColumnProfile {
     counts: HashMap<String, u64>,
     /// 样本内 Top-`TOP_VALUES`（次数降序、同次按取值升序，确定性）。
     pub top_values: Vec<(String, u64)>,
+    /// 琐碎值域（画像构建时算一次，O(n²) 配对循环直接读字段不再重算）：判定见 `trivial_counts`。
+    trivial: bool,
+}
+
+/// `db.table.col` 全小写规范形态：`ColumnProfile::id` 与 correlated 的列 id 共用一份拼接。
+fn fqid(db: &str, table: &str, col: &str) -> String {
+    format!(
+        "{}.{}.{}",
+        db.to_ascii_lowercase(),
+        table.to_ascii_lowercase(),
+        col.to_ascii_lowercase()
+    )
 }
 
 impl ColumnProfile {
     /// `db.table.column` 全小写规范形态：边 src/dst 与证据都用它。
     pub fn id(&self) -> String {
-        format!(
-            "{}.{}.{}",
-            self.database.to_ascii_lowercase(),
-            self.table.to_ascii_lowercase(),
-            self.column.to_ascii_lowercase()
-        )
+        fqid(&self.database, &self.table, &self.column)
     }
 
+    /// 空值率。生产路径目前不消费它（样本空值率对四类判分都没有区分度，刻意不进证据），
+    /// 仅测试与后续证据扩展预留。
     pub fn null_rate(&self) -> f64 {
         if self.sampled == 0 {
             0.0
@@ -254,6 +263,7 @@ fn profile_column(
     // 次数降序、同次按取值升序：同一份样本必得同一份 Top，证据可复现。
     top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     top.truncate(TOP_VALUES);
+    let trivial = trivial_counts(&counts);
     ColumnProfile {
         database: database.to_string(),
         table: table.to_string(),
@@ -265,10 +275,34 @@ fn profile_column(
         nulls,
         counts,
         top_values: top,
+        trivial,
     }
 }
 
-/// 采样一张目录表并画像其全部可采样列。`None` = 不采样（原因已 warn）：
+/// 闸门 + fetch + 回包列校验的共用脚手架（`profile_table` 与 `sample_pair` 同一条纪律）。
+/// Err = 失败原因（不带库表名，调用方补上下文 warn/入报告）：宁可缺证据，不把值记错列。
+async fn gated_fetch(
+    mysql: &ReadOnlyMySql,
+    gate: &MapGate<'_>,
+    sql: &str,
+    cols: &[&ColumnInfo],
+) -> Result<dms_connector::RowSet, String> {
+    let scoped = map_scoped(sql, gate).map_err(|e| format!("采样被闸门拒绝: {e}"))?;
+    let rs = mysql
+        .fetch(&scoped, SAMPLE_ROWS, PROFILE_TIMEOUT)
+        .await
+        .map_err(|e| format!("采样失败: {e}"))?;
+    // 回包列名必须与投影逐位对上（大小写不敏感）：对不上就整表放弃，
+    // 宁可缺画像也不把 A 列的值记到 B 列头上（错画像 = 垃圾边）。
+    if rs.columns.len() != cols.len()
+        || !rs.columns.iter().zip(cols).all(|(got, want)| got.eq_ignore_ascii_case(&want.name))
+    {
+        return Err(format!("回包列与投影不符 {:?}", rs.columns));
+    }
+    Ok(rs)
+}
+
+/// 采样一张目录表并画像其全部可采样列。Err = 不采样的具体原因（调用方 warn + 入报告）：
 /// 无可采样列 / 标识符非法 / 闸门拒绝 / 超时或执行失败 / 回包列对不上（防止把值记错列）。
 async fn profile_table(
     mysql: &ReadOnlyMySql,
@@ -276,45 +310,20 @@ async fn profile_table(
     asset: &Asset,
     row_estimate: i64,
     cols: &[&ColumnInfo],
-) -> Option<Vec<ColumnProfile>> {
+) -> Result<Vec<ColumnProfile>, String> {
     let (db, table) = (asset.database, asset.table);
     let cols: Vec<&ColumnInfo> = cols.iter().copied().filter(|c| samplable(c)).collect();
-    let Some(sql) = sample_sql(db, table, &cols) else {
-        tracing::warn!("datamap 跳过 {db}.{table}：无可采样列或标识符非法");
-        return None;
-    };
-    let scoped = match map_scoped(&sql, gate) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("datamap 采样被闸门拒绝 {db}.{table}: {e}");
-            return None;
-        }
-    };
-    let rs = match mysql.fetch(&scoped, SAMPLE_ROWS, PROFILE_TIMEOUT).await {
-        Ok(rs) => rs,
-        Err(e) => {
-            tracing::warn!("datamap 采样失败 {db}.{table}: {e}");
-            return None;
-        }
-    };
-    // 回包列名必须与投影逐位对上（大小写不敏感）：对不上就整表放弃，
-    // 宁可缺画像也不把 A 列的值记到 B 列头上（错画像 = 垃圾边）。
-    if rs.columns.len() != cols.len()
-        || !rs.columns.iter().zip(&cols).all(|(got, want)| got.eq_ignore_ascii_case(&want.name))
-    {
-        tracing::warn!("datamap 跳过 {db}.{table}：回包列与投影不符 {:?}", rs.columns);
-        return None;
-    }
-    Some(
-        cols.iter()
-            .enumerate()
-            .map(|(i, col)| {
-                let cells: Vec<Option<String>> =
-                    rs.rows.iter().map(|r| r.get(i).and_then(cell_value)).collect();
-                profile_column(db, table, col, row_estimate, &cells)
-            })
-            .collect(),
-    )
+    let sql = sample_sql(db, table, &cols).ok_or_else(|| "无可采样列或标识符非法".to_string())?;
+    let rs = gated_fetch(mysql, gate, &sql, &cols).await?;
+    Ok(cols
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let cells: Vec<Option<String>> =
+                rs.rows.iter().map(|r| r.get(i).and_then(cell_value)).collect();
+            profile_column(db, table, col, row_estimate, &cells)
+        })
+        .collect())
 }
 
 // ── ② 三类推断（全部纯函数，样本即证据）─────────────────────────────────
@@ -330,15 +339,22 @@ fn normalize_name(name: &str) -> String {
 
 /// 名称相似度（逐字移植 DataLink `_name_similarity`）：规范化同名 1.0 → 包含关系按长度比
 /// 0.5–1.0 → 否则取字符 Jaccard 与前缀比的较大者。
+/// 测试入口：生产路径走 `normalized_name_similarity`（配对循环外只 normalize 一次）。
+#[cfg(test)]
 fn name_similarity(a: &str, b: &str) -> f64 {
-    let (a, b) = (normalize_name(a), normalize_name(b));
+    normalized_name_similarity(&normalize_name(a), &normalize_name(b))
+}
+
+/// 已规范化名的相似度：配对热循环在循环外只 normalize 一次，逐对复用这份。
+/// 前缀比的分母用**字符数**（不是字节长），非 ASCII 列名不被系统性压低。
+fn normalized_name_similarity(a: &str, b: &str) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
     if a == b {
         return 1.0;
     }
-    if a.contains(&b) || b.contains(&a) {
+    if a.contains(b) || b.contains(a) {
         let (short, long) = (a.len().min(b.len()), a.len().max(b.len()));
         return 0.5 + 0.5 * short as f64 / long as f64;
     }
@@ -349,15 +365,20 @@ fn name_similarity(a: &str, b: &str) -> f64 {
         .zip(b.chars())
         .take_while(|(x, y)| x == y)
         .count() as f64
-        / a.len().max(b.len()) as f64;
+        / a.chars().count().max(b.chars().count()) as f64;
     jaccard.max(prefix)
 }
 
 /// 粗粒度类型桶（joinable/distribution 的兼容性判据；来源是 information_schema 的
 /// `data_type`，不是 DataLink 的 pandas dtype，故按 MySQL/Doris 类型名归桶）。
 /// `None` = 认不出的类型，不参与带类型闸的推断。
-fn dtype_bucket(data_type: &str) -> Option<&'static str> {
+/// 空间类型先排除：`point` 含 "int"、`linestring` 含 "string"，不归桶好过归错桶。
+/// 本 crate 的唯一事实源（`lineage` 复用这份，散开两份必漂）。
+pub(crate) fn dtype_bucket(data_type: &str) -> Option<&'static str> {
     let t = data_type.to_ascii_lowercase();
+    if ["point", "linestring", "polygon", "geom"].iter().any(|x| t.contains(x)) {
+        return None;
+    }
     if t.contains("int") || t.contains("decimal") || t.contains("double") || t.contains("float") || t.contains("numeric") {
         Some("numeric")
     } else if t.starts_with("date") || t.starts_with("time") || t == "year" {
@@ -371,8 +392,15 @@ fn dtype_bucket(data_type: &str) -> Option<&'static str> {
 
 /// joinable 的类型兼容（DataLink `_compatible_dtypes`）：同桶可判；编码列数值/字符串混存
 /// 是常态（storecode 一侧 VARCHAR 一侧 BIGINT），numeric↔string 放行；temporal 只跟 temporal。
+/// 测试入口：生产路径走 `joinable_buckets`（配对循环外预归桶）。
+#[cfg(test)]
 fn joinable_dtypes(a: &str, b: &str) -> bool {
-    match (dtype_bucket(a), dtype_bucket(b)) {
+    joinable_buckets(dtype_bucket(a), dtype_bucket(b))
+}
+
+/// `joinable_dtypes` 的桶版：配对热循环在循环外已把类型归桶，逐对只比桶。
+fn joinable_buckets(a: Option<&'static str>, b: Option<&'static str>) -> bool {
+    match (a, b) {
         (Some(x), Some(y)) if x == y => true,
         (Some(x), Some(y)) => {
             matches!((x, y), ("numeric", "string") | ("string", "numeric"))
@@ -384,9 +412,10 @@ fn joinable_dtypes(a: &str, b: &str) -> bool {
 /// 琐碎值域（DataLink 的 boolean-skip 推广到本仓）：样本取值全落在 {0,1,true,false} 的列
 /// 与任何同类列必然高重叠，joinable 与 distribution 都跳过（DataLink 只给 joinable 跳过，
 /// 但 {0,1}↔{0,1} 的 distribution 边同样是评审噪音 —— 差异点记录在此）。
-fn trivial_domain(p: &ColumnProfile) -> bool {
+/// 画像构建时算一次存进 `ColumnProfile.trivial`，配对循环不再逐对重算。
+fn trivial_counts(counts: &HashMap<String, u64>) -> bool {
     const TRIVIAL: &[&str] = &["0", "1", "0.0", "1.0", "true", "false"];
-    !p.counts.is_empty() && p.counts.keys().all(|v| TRIVIAL.contains(&v.to_ascii_lowercase().as_str()))
+    !counts.is_empty() && counts.keys().all(|v| TRIVIAL.contains(&v.to_ascii_lowercase().as_str()))
 }
 
 /// 值重叠率（DataLink `_compute_overlap`）：|A∩B| / min(|A|,|B|)，样本取值集即证据。
@@ -427,42 +456,56 @@ fn joinable_confidence(rate: f64, name_match: bool) -> Option<f64> {
 /// 与 DataLink 的另一处差异：规范化同名（`store_code`≡`storecode`）**不发** synonym 边 ——
 /// 那个信号已经由 joinable 的 name_match 加成表达，同义边只留给「名字不同、语义相同」，
 /// 否则评审队列会被 `order_date`↔`order_date` 这类自明边淹没。
-fn synonym_confidence(a: &ColumnProfile, b: &ColumnProfile) -> Option<f64> {
-    if normalize_name(&a.column) == normalize_name(&b.column) {
+/// 返回（置信度, 名称相似度）：相似度随证据复用，调用方不必重算。
+/// 测试入口：生产路径走 `synonym_scoring`（配对循环外预规范化）。
+#[cfg(test)]
+fn synonym_confidence(a: &ColumnProfile, b: &ColumnProfile) -> Option<(f64, f64)> {
+    synonym_scoring(a, b, &normalize_name(&a.column), &normalize_name(&b.column))
+}
+
+/// `synonym_confidence` 的主体：入参是已规范化的列名（配对热循环在循环外只 normalize 一次）。
+fn synonym_scoring(a: &ColumnProfile, b: &ColumnProfile, na: &str, nb: &str) -> Option<(f64, f64)> {
+    if na == nb {
         return None;
     }
     let comment_match = !a.comment.is_empty() && a.comment == b.comment;
-    let name_sim = name_similarity(&a.column, &b.column);
-    if comment_match && name_sim > 0.5 {
-        Some(0.95)
+    let name_sim = normalized_name_similarity(na, nb);
+    let conf = if comment_match && name_sim > 0.5 {
+        0.95
     } else if comment_match {
-        Some(0.85)
+        0.85
     } else if name_sim > 0.7 {
-        Some(0.6)
+        0.6
     } else if name_sim > 0.5 {
-        Some(0.4)
+        0.4
     } else {
-        None
-    }
+        return None;
+    };
+    Some((conf, name_sim))
 }
 
 /// distribution_similar 相似度 = 基数比 × Top 值加权重合度（任务口径：「基数与 Top 值重合度」；
 /// Top 值加权重合逐字移植 DataLink `_categorical_similarity`）。乘法组合是有意的：
 /// 任一项为 0 则整体为 0，不会出现「基数碰巧相同、Top 值零交集」的假相似边。
+/// 测试入口：生产路径在 `infer_edges` 里读预计算桶后直接调 `distribution_scoring`。
+#[cfg(test)]
 fn distribution_similarity(a: &ColumnProfile, b: &ColumnProfile) -> Option<f64> {
     let bucket = dtype_bucket(&a.data_type)?;
-    if dtype_bucket(&b.data_type)? != bucket || trivial_domain(a) || trivial_domain(b) {
+    if dtype_bucket(&b.data_type)? != bucket || a.trivial || b.trivial {
         return None;
     }
+    distribution_scoring(a, b)
+}
+
+/// `distribution_similarity` 的主体（桶兼容与琐碎域已在调用侧判过，配对热循环复用）。
+fn distribution_scoring(a: &ColumnProfile, b: &ColumnProfile) -> Option<f64> {
     let (ca, cb) = (a.cardinality(), b.cardinality());
     if ca == 0 || cb == 0 {
         return None;
     }
     let card_ratio = ca.min(cb) as f64 / ca.max(cb) as f64;
+    // counts 非空 ⇔ non_null > 0（画像只对非空单元格计数），上面 cardinality==0 已挡，恒正不除零。
     let (na, nb) = (a.non_null() as f64, b.non_null() as f64);
-    if na <= 0.0 || nb <= 0.0 {
-        return None;
-    }
     let top_b: HashMap<&str, f64> =
         b.top_values.iter().map(|(v, n)| (v.as_str(), *n as f64 / nb)).collect();
     let mut weighted = 0.0f64;
@@ -491,44 +534,54 @@ fn round4(x: f64) -> f64 {
 /// 第四类 correlated 是同表两列**联合采样**口径，样本不来自画像，不走这里（见 ②b）。
 /// 同一（kind, 无序列对）只留一条边：src/dst 按字典序规范化，重跑/反向发现都收敛同一行。
 pub fn infer_edges(profiles: &[ColumnProfile]) -> Vec<DataEdge> {
-    let mut sorted: Vec<&ColumnProfile> = profiles.iter().collect();
-    sorted.sort_by(|a, b| a.id().cmp(&b.id()));
+    // id 每画像只算一次：先物化成排序键，排序后相邻去重（原来 sort+retain 每画像分配 3+ 次 id）。
+    let mut keyed: Vec<(String, &ColumnProfile)> = profiles.iter().map(|p| (p.id(), p)).collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
     // 同（库,表,列）去重：探针快照在「当前库 + 跨库目录合并」边界上可能重复登记。
-    let mut seen = HashSet::new();
-    sorted.retain(|p| seen.insert(p.id()));
+    keyed.dedup_by(|a, b| a.0 == b.0);
+    let sorted: Vec<&ColumnProfile> = keyed.into_iter().map(|(_, p)| p).collect();
+    // 配对热循环的每画像预计算：规范化列名与类型桶各算一次，逐对不再 normalize/小写化。
+    let pre: Vec<(String, Option<&'static str>)> = sorted
+        .iter()
+        .map(|p| (normalize_name(&p.column), dtype_bucket(&p.data_type)))
+        .collect();
     let mut dedup: BTreeMap<(EdgeKind, String, String), DataEdge> = BTreeMap::new();
     let mut push = |edge: DataEdge| {
-        dedup
-            .entry((edge.kind, edge.src.clone(), edge.dst.clone()))
-            .and_modify(|old| {
-                if edge.confidence > old.confidence {
-                    *old = edge.clone();
+        // 高置信度命中直接换入（不先整边克隆）；未命中或更低置信度零额外分配。
+        match dedup.entry((edge.kind, edge.src.clone(), edge.dst.clone())) {
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if edge.confidence > slot.get().confidence {
+                    *slot.get_mut() = edge;
                 }
-            })
-            .or_insert(edge);
+            }
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(edge);
+            }
+        }
     };
     for i in 0..sorted.len() {
-        for &b in sorted.iter().skip(i + 1) {
-            let a = sorted[i];
+        for j in (i + 1)..sorted.len() {
+            let (a, b) = (sorted[i], sorted[j]);
             if a.database.eq_ignore_ascii_case(&b.database) && a.table.eq_ignore_ascii_case(&b.table) {
                 continue;
             }
-            if let Some(conf) = synonym_confidence(a, b) {
+            let (na, nb) = (&pre[i].0, &pre[j].0);
+            if let Some((conf, name_sim)) = synonym_scoring(a, b, na, nb) {
                 push(DataEdge::new(
                     EdgeKind::Synonym,
                     a,
                     b,
                     conf,
                     serde_json::json!({
-                        "name_similarity": round4(name_similarity(&a.column, &b.column)),
+                        "name_similarity": round4(name_sim),
                         "comment_match": !a.comment.is_empty() && a.comment == b.comment,
                         "comment_a": a.comment, "comment_b": b.comment,
                     }),
                 ));
             }
-            if joinable_dtypes(&a.data_type, &b.data_type) && !trivial_domain(a) && !trivial_domain(b) {
+            if joinable_buckets(pre[i].1, pre[j].1) && !a.trivial && !b.trivial {
                 let rate = value_overlap(a, b);
-                let name_match = normalize_name(&a.column) == normalize_name(&b.column);
+                let name_match = na == nb;
                 if let Some(conf) = joinable_confidence(rate, name_match) {
                     push(DataEdge::new(
                         EdgeKind::Joinable,
@@ -546,18 +599,21 @@ pub fn infer_edges(profiles: &[ColumnProfile]) -> Vec<DataEdge> {
                     ));
                 }
             }
-            if let Some(sim) = distribution_similarity(a, b) {
-                push(DataEdge::new(
-                    EdgeKind::DistributionSimilar,
-                    a,
-                    b,
-                    round4(sim),
-                    serde_json::json!({
-                        "similarity": round4(sim),
-                        "cardinality_a": a.cardinality(), "cardinality_b": b.cardinality(),
-                        "top_a": a.top_values, "top_b": b.top_values,
-                    }),
-                ));
+            // distribution：桶兼容与琐碎域判据与 distribution_similarity 相同，这里读预计算结果
+            if pre[i].1.is_some() && pre[i].1 == pre[j].1 && !a.trivial && !b.trivial {
+                if let Some(sim) = distribution_scoring(a, b) {
+                    push(DataEdge::new(
+                        EdgeKind::DistributionSimilar,
+                        a,
+                        b,
+                        round4(sim),
+                        serde_json::json!({
+                            "similarity": round4(sim),
+                            "cardinality_a": a.cardinality(), "cardinality_b": b.cardinality(),
+                            "top_a": a.top_values, "top_b": b.top_values,
+                        }),
+                    ));
+                }
             }
         }
     }
@@ -575,11 +631,12 @@ pub fn infer_edges(profiles: &[ColumnProfile]) -> Vec<DataEdge> {
 
 /// 成对数值提取（纯函数）：任一侧空/非数值/非有限值都丢行（`parse::<f64>` 收 "NaN"/"inf"
 /// 这类串，必须挡掉 —— 混进一个 NaN 会让系数变 NaN，分档比较全 false 落进最高档）。
+/// 入参已经 `cell_value` 去过空白，这里不再 trim。
 fn paired_numbers(rows: &[(Option<String>, Option<String>)]) -> Vec<(f64, f64)> {
     rows.iter()
         .filter_map(|(a, b)| {
-            let x = a.as_deref()?.trim().parse::<f64>().ok()?;
-            let y = b.as_deref()?.trim().parse::<f64>().ok()?;
+            let x = a.as_deref()?.parse::<f64>().ok()?;
+            let y = b.as_deref()?.parse::<f64>().ok()?;
             (x.is_finite() && y.is_finite()).then_some((x, y))
         })
         .collect()
@@ -685,14 +742,7 @@ fn correlated_edge(
 ) -> Option<DataEdge> {
     let r = pearson(&pairs)?;
     let conf = correlation_band(r.abs())?;
-    let col_id = |c: &ColumnInfo| {
-        format!(
-            "{}.{}.{}",
-            db.to_ascii_lowercase(),
-            table.to_ascii_lowercase(),
-            c.name.to_ascii_lowercase()
-        )
-    };
+    let col_id = |c: &ColumnInfo| fqid(db, table, &c.name);
     Some(DataEdge::with_refs(
         EdgeKind::Correlated,
         col_id(a),
@@ -710,8 +760,8 @@ fn correlated_edge(
 }
 
 /// 一对数值列的联合采样：一条 SQL 选两列（复用 `sample_sql` 的 ident 白名单与 LIMIT），
-/// 同一条 MapGate 全管道 + `PROFILE_TIMEOUT`。None = 标识符非法/闸门拒绝/执行失败/回包列
-/// 对不上（与 `profile_table` 同纪律：宁可缺这对证据，不把值记错列）。
+/// 走 `gated_fetch` 同一条全管道。None = 标识符非法/闸门拒绝/执行失败/回包列对不上
+/// （与 `profile_table` 同纪律：宁可缺这对证据，不把值记错列）。
 async fn sample_pair(
     mysql: &ReadOnlyMySql,
     gate: &MapGate<'_>,
@@ -721,30 +771,13 @@ async fn sample_pair(
     b: &ColumnInfo,
 ) -> Option<(usize, Vec<(f64, f64)>)> {
     let sql = sample_sql(db, table, &[a, b])?;
-    let scoped = match map_scoped(&sql, gate) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("datamap 相关采样被闸门拒绝 {db}.{table}({}, {}): {e}", a.name, b.name);
-            return None;
-        }
-    };
-    let rs = match mysql.fetch(&scoped, SAMPLE_ROWS, PROFILE_TIMEOUT).await {
+    let rs = match gated_fetch(mysql, gate, &sql, &[a, b]).await {
         Ok(rs) => rs,
-        Err(e) => {
-            tracing::warn!("datamap 相关采样失败 {db}.{table}({}, {}): {e}", a.name, b.name);
+        Err(reason) => {
+            tracing::warn!("datamap 相关采样跳过 {db}.{table}({}, {})：{reason}", a.name, b.name);
             return None;
         }
     };
-    if rs.columns.len() != 2
-        || !rs.columns[0].eq_ignore_ascii_case(&a.name)
-        || !rs.columns[1].eq_ignore_ascii_case(&b.name)
-    {
-        tracing::warn!(
-            "datamap 相关采样跳过 {db}.{table}({}, {})：回包列与投影不符 {:?}",
-            a.name, b.name, rs.columns
-        );
-        return None;
-    }
     let rows: Vec<(Option<String>, Option<String>)> = rs
         .rows
         .iter()
@@ -787,9 +820,10 @@ async fn correlate_table(
 
 /// 幂等建表（同 `warehouse_catalog::ensure_snapshot_table` 的先例：写口自确保，不依赖
 /// `ddl::migrate` 的执行顺序）。🔴 本表与 server `datamap_api::DDL`（正本）/ `datamap_usage::DDL`
-/// **三处逐字一致**（CREATE IF NOT EXISTS 先跑者赢，不同构就是 race）：行形是复核域的
-/// left/right_table+col，本模块的 `db.table.col` 全限定名在 `split_ref` 处拆成裸表名+列名
-/// 落库（目录测试保证基础表名跨库唯一，db 维度留在 evidence）。
+/// **三处逐字一致**（CREATE IF NOT EXISTS 先跑者赢，不同构就是 race；crate 内两份有
+/// `datamap_ddl_matches_usage_ddl` 测试互钉）：行形是复核域的 left/right_table+col，
+/// 本模块的 `db.table.col` 全限定名在 `split_ref` 处拆成裸表名+列名落库（目录测试保证
+/// 基础表名跨库唯一；db 维度落库时丢弃，不进 evidence）。
 /// status/kind 的取值集合由 CHECK 钉死，与 `EdgeKind::as_str` / 「一律 pending」互为对账。
 const DATAMAP_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta.datamap_edge(
@@ -826,13 +860,16 @@ async fn ensure_datamap_table(pg: &PgPool) -> anyhow::Result<()> {
 /// ① 新行 status 恒 'pending'（推断边绝不直接进装配/召回，验收是人工动作）；
 /// ② `DO UPDATE` 只刷 confidence/evidence/updated_at —— **status 不在 SET 列表里**，
 ///    人工 accepted/rejected 的结论不会被下一轮推断重跑冲掉。
+/// ③ `last_seen`/`seen_count` 不由本写口刷新：那两个字段是「query_log 共现」口径，
+///    只归 `datamap_usage` 的校准写口维护（静态推断重跑不算「被观测到」）。
 const UPSERT_SQL: &str = "INSERT INTO meta.datamap_edge(ds_id, kind, left_table, left_col, right_table, right_col, confidence, evidence, status)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
 ON CONFLICT (ds_id, kind, left_table, left_col, right_table, right_col) DO UPDATE SET
   confidence = EXCLUDED.confidence, evidence = EXCLUDED.evidence, updated_at = now()";
 
 /// `db.table.col` 全限定名 → (裸表名, 列名)。目录测试保证基础表名跨库唯一，
-/// 落库用裸表名（与 `meta.join_edge` / datamap_api 同一命名空间）；db 维度留在 evidence。
+/// 落库用裸表名（与 `meta.join_edge` / datamap_api 同一命名空间）；db 维度丢弃（不进 evidence）。
+/// 缺表名段的畸形输入（如 `"c1"`）会得出空裸表名 —— 写口（`save_edges`）跳过这类边并 warn。
 fn split_ref(s: &str) -> (String, String) {
     let mut it = s.rsplitn(2, '.');
     let col = it.next().unwrap_or_default();
@@ -843,14 +880,22 @@ fn split_ref(s: &str) -> (String, String) {
     (table.to_string(), col.to_string())
 }
 
-/// 落库一批推断边，返回 upsert 行数。逐行执行（幂等，半截失败重跑即收敛），
-/// 与 crate 内各 seed/同步写口的形态一致。
+/// 落库一批推断边，返回实际 upsert 行数。整批包一个事务：半截失败整体回滚，重跑即收敛
+/// （与 crate 内各 seed/同步写口的幂等语义一致）。空 ds_id 直接 Err（防呆）；
+/// 裸表名为空的畸形边跳过并 warn，不污染复核域唯一键。
 pub async fn save_edges(pg: &PgPool, ds_id: &str, edges: &[DataEdge]) -> anyhow::Result<usize> {
     ensure_datamap_table(pg).await?;
     let ds_id = ds_id.trim().to_ascii_lowercase();
+    anyhow::ensure!(!ds_id.is_empty(), "datamap_edge 拒绝空 ds_id 落库");
+    let mut tx = pg.begin().await?;
+    let mut saved = 0usize;
     for edge in edges {
         let (lt, lc) = split_ref(&edge.src);
         let (rt, rc) = split_ref(&edge.dst);
+        if lt.is_empty() || rt.is_empty() {
+            tracing::warn!("datamap 跳过畸形边 {} -> {}（裸表名为空）", edge.src, edge.dst);
+            continue;
+        }
         sqlx::query(UPSERT_SQL)
             .bind(&ds_id)
             .bind(edge.kind.as_str())
@@ -858,12 +903,15 @@ pub async fn save_edges(pg: &PgPool, ds_id: &str, edges: &[DataEdge]) -> anyhow:
             .bind(&lc)
             .bind(&rt)
             .bind(&rc)
-            .bind(edge.confidence)
+            // 列是 real（f32）：窄化点显式化，不隐式丢精度
+            .bind(edge.confidence as f32)
             .bind(edge.evidence.to_string())
-            .execute(pg)
+            .execute(&mut *tx)
             .await?;
+        saved += 1;
     }
-    Ok(edges.len())
+    tx.commit().await?;
+    Ok(saved)
 }
 
 // ── 入口 ───────────────────────────────────────────────────────────────
@@ -886,13 +934,16 @@ pub async fn build(
         mysql.is_warehouse(),
         "数据地图画像只许打数仓（Doris）目标：当前连接不是数仓能力，拒绝对生产 MySQL 采样"
     );
-    ensure_datamap_table(pg).await?;
+    // 建表由 `save_edges` 自确保（写口先例），这里不再重复付 3 句 DDL。
 
-    // 已验证目录是唯一画像范围：表名（小写）→ 资产（目录测试保证基础表名跨库唯一）。
-    let catalog: HashMap<String, &Asset> = warehouse_catalog::ASSETS
-        .iter()
-        .map(|a| (a.table.to_ascii_lowercase(), a))
-        .collect();
+    // 已验证目录是唯一画像范围：表名（小写）→ 资产。目录测试保证基础表名跨库唯一；
+    // collect 遇重名会静默后者覆盖，这里用 debug_assert 把「唯一性被破坏」变成开发期炸点。
+    let mut catalog: HashMap<String, &Asset> = HashMap::new();
+    for asset in warehouse_catalog::ASSETS {
+        let key = asset.table.to_ascii_lowercase();
+        debug_assert!(!catalog.contains_key(&key), "目录基础表名跨库唯一性被破坏：{key}");
+        catalog.insert(key, asset);
+    }
     let mut cols_by_table: HashMap<String, Vec<&ColumnInfo>> = HashMap::new();
     for (table, col) in &snapshot.columns {
         cols_by_table.entry(table.to_ascii_lowercase()).or_default().push(col);
@@ -902,23 +953,30 @@ pub async fn build(
     let mut correlated_edges: Vec<DataEdge> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut tables_profiled = 0usize;
-    let mut seen_tables = HashSet::new();
+    let mut seen_tables: HashSet<String> = HashSet::new();
     for table in &snapshot.tables {
         let key = table.name.to_ascii_lowercase();
         let Some(asset) = catalog.get(&key).copied() else { continue };
-        if !seen_tables.insert((asset.database, key.clone())) {
+        let name = format!("{}.{}", asset.database, asset.table);
+        if !seen_tables.insert(name.to_ascii_lowercase()) {
             continue;
         }
-        let cols = cols_by_table.get(&key).cloned().unwrap_or_default();
-        match profile_table(mysql, gate, asset, table.row_estimate, &cols).await {
-            Some(cols) if !cols.is_empty() => {
+        // 列清单借用快照侧切片，不再整 Vec 克隆
+        let cols: &[&ColumnInfo] = cols_by_table.get(&key).map_or(&[][..], Vec::as_slice);
+        match profile_table(mysql, gate, asset, table.row_estimate, cols).await {
+            Ok(cols) if !cols.is_empty() => {
                 tables_profiled += 1;
                 profiles.extend(cols);
             }
-            _ => skipped.push((format!("{}.{}", asset.database, asset.table), "采样被拒/失败/无可采样列".to_string())),
+            // 理论不可达：空列集在 sample_sql 已截住（走 Err 臂）
+            Ok(_) => skipped.push((name, "无可采样列".to_string())),
+            Err(reason) => {
+                tracing::warn!("datamap 跳过 {name}：{reason}");
+                skipped.push((name, reason));
+            }
         }
         // correlated（②b）：单列画像成败不影响两列联合采样 —— 两类证据口径独立，互不阻塞
-        correlated_edges.extend(correlate_table(mysql, gate, asset, table.row_estimate, &cols).await);
+        correlated_edges.extend(correlate_table(mysql, gate, asset, table.row_estimate, cols).await);
     }
 
     let mut edges = infer_edges(&profiles);
@@ -934,6 +992,12 @@ pub async fn build(
         }
     }
     let saved = save_edges(pg, ds_id, &edges).await?;
+    tracing::info!(
+        tables = tables_profiled,
+        edges = saved,
+        skipped = skipped.len(),
+        "datamap 建图完成"
+    );
     Ok(DataMapReport {
         ds_id: ds_id.trim().to_ascii_lowercase(),
         tables_profiled,
@@ -1037,19 +1101,19 @@ mod tests {
         // 注释一致 + 名字也近 → 0.95
         let a = col("d", "t_a", "cust_code", "varchar", "客户编码", &["x"]);
         let b = col("d", "t_b", "customer_code", "varchar", "客户编码", &["x"]);
-        assert_eq!(synonym_confidence(&a, &b), Some(0.95));
+        assert_eq!(synonym_confidence(&a, &b).map(|(c, _)| c), Some(0.95));
         // 注释一致但名字不像 → 0.85（storecode↔customer_code 字符集重合度高，特意换远名）
         let far = col("d", "t_b", "kehu_id", "varchar", "客户编码", &["x"]);
         let store = col("d", "t_a", "storecode", "varchar", "客户编码", &["x"]);
-        assert_eq!(synonym_confidence(&store, &far), Some(0.85));
+        assert_eq!(synonym_confidence(&store, &far).map(|(c, _)| c), Some(0.85));
         // 注释为空、名字高相似 → 0.6
         let c = col("d", "t_a", "customer_code", "varchar", "", &["x"]);
         let d = col("d", "t_b", "customer_id", "varchar", "", &["x"]);
-        assert_eq!(synonym_confidence(&c, &d), Some(0.6));
+        assert_eq!(synonym_confidence(&c, &d).map(|(c, _)| c), Some(0.6));
         // 注释不同、名字中相似 → 0.4
         let e = col("d", "t_a", "shop_code", "varchar", "门店", &["x"]);
         let f = col("d", "t_b", "storecode", "varchar", "客户", &["x"]);
-        assert_eq!(synonym_confidence(&e, &f), Some(0.4));
+        assert_eq!(synonym_confidence(&e, &f).map(|(c, _)| c), Some(0.4));
         // 名字不像、注释也不同 → 不发边
         let g = col("d", "t_a", "order_date", "date", "下单日期", &["x"]);
         let h = col("d", "t_b", "gross_profit", "decimal", "毛利", &["x"]);
@@ -1057,10 +1121,11 @@ mod tests {
         // 注释只在一侧为空不算一致
         let i = col("d", "t_a", "amt", "decimal", "金额", &["x"]);
         let j = col("d", "t_b", "amount", "decimal", "", &["x"]);
-        assert!(synonym_confidence(&i, &j).map_or(true, |c| c <= 0.6));
+        assert!(synonym_confidence(&i, &j).map_or(true, |(c, _)| c <= 0.6));
     }
 
     /// 名称相似度形态：同名 1.0、包含按长度比、否则 Jaccard/前缀（DataLink 逐字形态）。
+    /// 前缀比分母是字符数：非 ASCII 列名不被字节长压低。
     #[test]
     fn name_similarity_shape() {
         assert_eq!(name_similarity("store_code", "storecode"), 1.0);
@@ -1068,19 +1133,31 @@ mod tests {
         assert!(sub > 0.5 && sub < 1.0, "{sub}");
         assert_eq!(name_similarity("", "x"), 0.0);
         assert!(name_similarity("order_date", "gross_profit") < 0.5);
+        // CJK 列名：前缀全中但字符少时，按字符数给满分而不是按字节长打折
+        assert_eq!(normalized_name_similarity("门店编码", "门店编码"), 1.0);
+        let cjk = normalized_name_similarity("门店", "门店编码");
+        assert!(cjk > 0.5, "包含关系按长度比：{cjk}");
+        // 非包含关系的同前缀 CJK：前缀比 = 共同前缀字符数 / 最大字符数
+        let prefix = normalized_name_similarity("门店编码", "门店名称");
+        assert!((prefix - 0.5).abs() < 1e-9, "2/4 字符前缀：{prefix}");
     }
 
-    /// 琐碎值域与类型兼容：{0,1} 列不进 joinable/distribution；编码列允许 int↔string。
+    /// 琐碎值域与类型兼容：{0,1} 列不进 joinable/distribution；编码列允许 int↔string；
+    /// 空间类型不归桶（point 含 "int"、linestring 含 "string"，归错桶比不归桶更糟）。
     #[test]
     fn trivial_domains_and_dtype_gates() {
         let flag = col("d", "t_a", "deleted_flag", "int", "", &["0", "1", "1", "0"]);
-        assert!(trivial_domain(&flag));
+        assert!(flag.trivial);
         let code = col("d", "t_a", "storecode", "varchar", "", &["C1", "C2"]);
-        assert!(!trivial_domain(&code));
+        assert!(!code.trivial);
         assert!(joinable_dtypes("bigint", "varchar"), "编码列数值/字符串混存必须放行");
         assert!(joinable_dtypes("decimal(20,2)", "double"));
         assert!(!joinable_dtypes("date", "varchar"), "temporal 只跟 temporal");
         assert!(!joinable_dtypes("hll", "varchar"), "未知桶不参与");
+        // 空间类型：point 不误判 numeric、linestring 不误判 string
+        assert_eq!(dtype_bucket("point"), None, "point 含 int 字样但不许进数值桶");
+        assert_eq!(dtype_bucket("linestring"), None, "linestring 含 string 字样但不许进字符串桶");
+        assert_eq!(dtype_bucket("geometry"), None);
         // {0,1} 对上全同值域也不发 distribution 边
         let flag_b = col("d", "t_b", "is_active", "int", "", &["1", "0", "1"]);
         assert_eq!(distribution_similarity(&flag, &flag_b), None);
@@ -1126,6 +1203,17 @@ mod tests {
         let joinable: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Joinable).collect();
         assert_eq!(joinable.len(), 1, "同一无序列对只能有一行：{edges:?}");
         assert!((joinable[0].confidence - 0.90).abs() < 1e-9, "完全重叠、名不匹配应为 0.90 档：{joinable:?}");
+    }
+
+    /// crate 内两份建表 DDL 逐字一致（server `datamap_api::DDL` 正本由
+    /// `tools/check_datamap_ddl.py` 外部闸盯着；这两份同 crate 可比，自己钉）。
+    #[test]
+    fn datamap_ddl_matches_usage_ddl() {
+        assert_eq!(
+            DATAMAP_DDL,
+            crate::datamap_usage::DDL,
+            "meta.datamap_edge 建表 DDL 在 datamap.rs 与 datamap_usage.rs 之间漂移"
+        );
     }
 
     /// `db.table.col` → (裸表名, 列名)：目录保证基础表名跨库唯一，db 维度不进唯一键

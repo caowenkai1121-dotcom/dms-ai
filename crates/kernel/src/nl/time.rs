@@ -6,6 +6,20 @@
 //! 原先写死 `order_time`，现与 `time_predicate` 同形出模板，列名由调用方填——server 侧
 //! `agg_template` 填回 `order_time`，最终 SQL 字节不变。
 
+/// TopN 上限/默认值（＝全局 MAX_ROWS；改它三处断言与装配行数一起动）
+const MAX_TOP_N: usize = 200;
+
+/// 中文数字字符集（detect_top_n / recent_n / rule_month 四处共用）
+const CN_DIGITS: &str = "零一两二三四五六七八九十";
+
+/// 「今天/昨天」词组（prev_window / yoy_window / rule_relative 三处共用，不抄第三份）
+const TODAY_WORDS: &[&str] = &["今天", "今日"];
+const YESTERDAY_WORDS: &[&str] = &["昨天", "昨日"];
+
+fn contains_any(q: &str, words: &[&str]) -> bool {
+    words.iter().any(|w| q.contains(w))
+}
+
 /// "前N/topN" → 限制条数（中文数字支持）。**未提则 200**（＝全局 MAX_ROWS，见函数末尾）。
 /// 注释原先写「默认 50」，与实现和 `top_n_bounds` 断言都不符 —— 谁照注释改回 50，
 /// 就会把 60 个商品分类静默截成 50。
@@ -22,7 +36,7 @@ pub fn detect_top_n(q: &str) -> usize {
         let after = &q[pos + '前'.len_utf8()..];
         let number: String = after
             .chars()
-            .take_while(|c| c.is_ascii_digit() || "零一两二三四五六七八九十".contains(*c))
+            .take_while(|c| c.is_ascii_digit() || CN_DIGITS.contains(*c))
             .collect();
         let n = cn_num(&number).map(|n| n as usize);
         // 数字后面剩下的第一个字（「三个季度」的「个」不算）
@@ -30,17 +44,20 @@ pub fn detect_top_n(q: &str) -> usize {
         let tail = tail.strip_prefix('个').unwrap_or(tail);
         let is_time = ["天", "日", "周", "星", "月", "年", "季"].iter().any(|u| tail.starts_with(u));
         match n {
-            Some(n) if (1..=200).contains(&n) && !is_time => return n,
+            Some(n) if (1..=MAX_TOP_N).contains(&n) && !is_time => return n,
             _ => continue,
         }
     }
-    // "topN"
+    // "topN"（前一个字符不许是 ASCII 字母：「stop3」「desktop5」里的 "top" 不是 TopN）
     let lower = q.to_lowercase();
     if let Some(pos) = lower.find("top") {
+        let word_hit = pos == 0 || !lower.as_bytes()[pos - 1].is_ascii_alphabetic();
         let digits: String = lower[pos + 3..].chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(n) = digits.parse::<usize>() {
-            if (1..=200).contains(&n) {
-                return n;
+        if word_hit {
+            if let Ok(n) = digits.parse::<usize>() {
+                if (1..=MAX_TOP_N).contains(&n) {
+                    return n;
+                }
             }
         }
     }
@@ -55,23 +72,26 @@ pub fn detect_top_n(q: &str) -> usize {
     // 不认光秃秃的「5个」—— 那可能是「5个仓库的库存」这类**值过滤**里的数量词，
     // 按它截断就等于悄悄改了语义。
     for sup in ["最高", "最多", "最大", "最少", "最小", "最好"] {
-        let Some(pos) = q.find(sup) else { continue };
-        let rest = q[pos + sup.len()..].trim_start_matches('的');
-        let number: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || "零一两二三四五六七八九十".contains(*c))
-            .collect();
-        let n = cn_num(&number).map(|n| n as usize);
-        let tail = &rest[number.len()..];
-        if let Some(n) = n {
-            if (1..=200).contains(&n) && ["个", "名", "条", "项"].iter().any(|u| tail.starts_with(u)) {
-                return n;
+        // 循环**所有**出现位置（与「前」分支同形）：「最高…最好5个…」里真正带数字的
+        // 可能在第二次出现才命中
+        for (pos, _) in q.match_indices(sup) {
+            let rest = q[pos + sup.len()..].trim_start_matches('的');
+            let number: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || CN_DIGITS.contains(*c))
+                .collect();
+            let n = cn_num(&number).map(|n| n as usize);
+            let tail = &rest[number.len()..];
+            if let Some(n) = n {
+                if (1..=MAX_TOP_N).contains(&n) && ["个", "名", "条", "项"].iter().any(|u| tail.starts_with(u)) {
+                    return n;
+                }
             }
         }
     }
     // 未提 TopN → 不截断到小值：分组基数常超 50（商品分类 60 个），
     // 截断会让"各分类销量"静默少 10 个分类且用户无感（评测抓获）。对齐全局 MAX_ROWS。
-    200
+    MAX_TOP_N
 }
 
 /// 时间窗 → 上一期谓词模板 + 环比标签（列名占位 `{}`，与 `time_predicate` 同形）
@@ -88,11 +108,13 @@ pub fn detect_top_n(q: &str) -> usize {
 /// - 「上月」：当期本身就是**完整**的上月，上期该是完整的上上月 —— 不动。
 /// - 「本月/本周/今年」：当期是「期初至今」，上期右端因此必须是「今天平移一期」。
 pub fn prev_window(q: &str) -> Option<(&'static str, &'static str)> {
-    if q.contains("今天") || q.contains("今日") {
+    if contains_any(q, TODAY_WORDS) {
         Some(("DATE({}) = CURDATE() - INTERVAL 1 DAY", "较昨天"))
-    } else if q.contains("昨天") || q.contains("昨日") {
+    } else if contains_any(q, YESTERDAY_WORDS) {
         Some(("DATE({}) = CURDATE() - INTERVAL 2 DAY", "较前天"))
     } else if q.contains("本月") || q.contains("这个月") {
+        // 右端 `CURDATE() - INTERVAL 1 MONTH` 存在月末压缩（3/31→2/28：当期 31 天 vs 上期
+        // 28 天）—— 同进度比较下这一折中接受（逐档核过见函数文档）
         Some(("{} >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH,'%Y-%m-01') AND {} < CURDATE() - INTERVAL 1 MONTH", "较上月"))
     } else if q.contains("上月") || q.contains("上个月") {
         Some(("{} >= DATE_FORMAT(CURDATE() - INTERVAL 2 MONTH,'%Y-%m-01') AND {} < DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH,'%Y-%m-01')", "较上上月"))
@@ -109,21 +131,21 @@ pub fn prev_window(q: &str) -> Option<(&'static str, &'static str)> {
 /// 相对时间词 → MySQL 谓词（基于 CURDATE()，零硬编码年份）
 /// 中文数字 → 阿拉伯数字（仅覆盖 1~99，够用于「近三个月」「第二季度」这类问法）
 fn cn_num(s: &str) -> Option<u32> {
-    const D: &[(&str, u32)] = &[
-        ("零", 0), ("一", 1), ("两", 2), ("二", 2), ("三", 3), ("四", 4),
-        ("五", 5), ("六", 6), ("七", 7), ("八", 8), ("九", 9),
+    const D: &[(char, u32)] = &[
+        ('零', 0), ('一', 1), ('两', 2), ('二', 2), ('三', 3), ('四', 4),
+        ('五', 5), ('六', 6), ('七', 7), ('八', 8), ('九', 9),
     ];
     if let Ok(n) = s.parse::<u32>() {
         return Some(n);
     }
-    let c: Vec<&str> = s.split("").filter(|x| !x.is_empty()).collect();
-    let val = |x: &str| D.iter().find(|(k, _)| *k == x).map(|(_, v)| *v);
+    let c: Vec<char> = s.chars().collect();
+    let val = |x: char| D.iter().find(|(k, _)| *k == x).map(|(_, v)| *v);
     match c.as_slice() {
-        [a] if *a == "十" => Some(10),
-        [a] => val(a),
-        ["十", b] => val(b).map(|v| 10 + v),               // 十二
-        [a, "十"] => val(a).map(|v| v * 10),                // 三十
-        [a, "十", b] => Some(val(a)? * 10 + val(b)?),       // 三十五
+        ['十'] => Some(10),
+        [a] => val(*a),
+        ['十', b] => val(*b).map(|v| 10 + v),               // 十二
+        [a, '十'] => val(*a).map(|v| v * 10),                // 三十
+        [a, '十', b] => Some(val(*a)? * 10 + val(*b)?),       // 三十五
         _ => None,
     }
 }
@@ -131,30 +153,35 @@ fn cn_num(s: &str) -> Option<u32> {
 /// 抽「近/过去/最近 N 天|周|月|年」里的 N 与单位
 fn recent_n(q: &str) -> Option<(u32, &'static str)> {
     for lead in ["最近", "过去", "近"] {
-        let Some(pos) = q.find(lead) else { continue };
-        let rest: String = q[pos + lead.len()..].chars().take(6).collect();
-        let num: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || "零一两二三四五六七八九十".contains(*c))
-            .collect();
-        if num.is_empty() {
-            continue;
-        }
-        let Some(n) = cn_num(&num) else { continue };
-        let tail = &rest[num.len()..];
-        let unit = if tail.starts_with('天') || tail.starts_with('日') {
-            "DAY"
-        } else if tail.starts_with('周') || tail.starts_with("个周") || tail.starts_with('星') {
-            "WEEK"
-        } else if tail.starts_with('月') || tail.starts_with("个月") {
-            "MONTH"
-        } else if tail.starts_with('年') {
-            "YEAR"
-        } else {
-            continue;
-        };
-        if n >= 1 && n <= 60 {
-            return Some((n, unit));
+        // 循环该 lead 的**所有**出现位置：「最近销量，近7天呢」里「最近」后无数字时，
+        // 句尾的「近7天」仍要轮得到（`find` 只看第一次会把整条规则弃权）
+        for (pos, _) in q.match_indices(lead) {
+            // take(6) 的窗口上界：最长形态「三十五」+「个月」= 4 字，6 是带余量的截取
+            let rest: String = q[pos + lead.len()..].chars().take(6).collect();
+            let num: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || CN_DIGITS.contains(*c))
+                .collect();
+            if num.is_empty() {
+                continue;
+            }
+            let Some(n) = cn_num(&num) else { continue };
+            // 「个周/个月」先剥「个」（与 detect_top_n 的同款处理）
+            let tail = rest[num.len()..].strip_prefix('个').unwrap_or(&rest[num.len()..]);
+            let unit = if tail.starts_with('天') || tail.starts_with('日') {
+                "DAY"
+            } else if tail.starts_with('周') || tail.starts_with('星') {
+                "WEEK"
+            } else if tail.starts_with('月') {
+                "MONTH"
+            } else if tail.starts_with('年') {
+                "YEAR"
+            } else {
+                continue;
+            };
+            if (1..=60).contains(&n) {
+                return Some((n, unit));
+            }
         }
     }
     None
@@ -164,8 +191,9 @@ fn recent_n(q: &str) -> Option<(u32, &'static str)> {
 /// 返回的是**列名占位为 `{}` 的谓词模板**，调用方填真实时间列。
 /// 时间是 BI 最高频错误源；能规则解析的一律不交给 LLM 猜。
 ///
-/// **五条规则的先后顺序即行为**（§0 D9）：近 N 单位 → 季度 → 半年 → N 月 → 相对词兜底。
-/// 例：「上个月」必须被相对词兜底接走，若 N 月规则先跑就会把「个月」误解成 N 月。
+/// **六条规则的先后顺序即行为**（§0 D9）：近 N 单位 → 季度 → 半年 → N 月 → 年份 → 相对词兜底。
+/// 例：「上个月」必须被相对词兜底接走，若 N 月规则先跑就会把「个月」误解成 N 月；
+/// `rule_year`（规则④·5）必须排在月/季度之后（否则「2025年6月」被吞成整年）。
 pub fn time_predicate(q: &str) -> Option<String> {
     rule_date_range(q)
         .or_else(|| rule_recent_n(q))
@@ -180,9 +208,9 @@ pub fn time_predicate(q: &str) -> Option<String> {
 /// 当期时间窗 → 去年同期谓词模板。只覆盖能够做严格同进度比较的高频经营周期；
 /// 其它任意区间宁可不展示同比，也不把不同长度的窗口相除。
 pub fn yoy_window(q: &str) -> Option<(&'static str, &'static str)> {
-    if q.contains("今天") || q.contains("今日") {
+    if contains_any(q, TODAY_WORDS) {
         Some(("DATE({}) = CURDATE() - INTERVAL 1 YEAR", "同比"))
-    } else if q.contains("昨天") || q.contains("昨日") {
+    } else if contains_any(q, YESTERDAY_WORDS) {
         Some(("DATE({}) = CURDATE() - INTERVAL 1 YEAR - INTERVAL 1 DAY", "同比"))
     } else if q.contains("本月") || q.contains("这个月") {
         Some(("{} >= DATE_FORMAT(CURDATE() - INTERVAL 1 YEAR,'%Y-%m-01') AND {} < CURDATE() - INTERVAL 1 YEAR", "同比"))
@@ -290,6 +318,7 @@ fn rule_recent_n(q: &str) -> Option<String> {
     let (n, unit) = recent_n(q)?;
     // 🔴 「近 N 天」含今天：起点只回推 N-1 天，窗口才恰好 N 个自然日
     //（修前回推 N 天，「近7天」实测覆盖 8 个自然日）；周/月/年是滚动周期单位，不折算。
+    debug_assert!(n >= 1, "recent_n 的 1..=60 过滤保证 n-1 不下溢");
     let back = if unit == "DAY" { n - 1 } else { n };
     Some(format!(
         "{{}} >= DATE_SUB(CURDATE(), INTERVAL {back} {unit}) AND {{}} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
@@ -299,7 +328,12 @@ fn rule_recent_n(q: &str) -> Option<String> {
 /// 规则②：第 N 季度 / 本季度 / 上季度
 fn rule_quarter(q: &str) -> Option<String> {
     let pos = q.find("季度")?;
-    let head: String = q[..pos].chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+    // 「季度」前最后 3 个字（先收集再切尾部，不做双重反转收集）
+    let all: Vec<char> = q[..pos].chars().collect();
+    let head: String = all[all.len().saturating_sub(3)..].iter().collect();
+    // 序数两种来源语义不一（刻意）：中文支取数组里**最先**出现（position），数字支取 head
+    // 里**最后一个**数字（rev().find）—— head 同时含两种序数时取谁取决于类型而非位置，
+    // 实测形态没踩过这条缝，先注释钉住而不是统一（统一要过装配回归）。
     let qn = ["一", "二", "三", "四"]
         .iter()
         .position(|c| head.contains(c))
@@ -381,10 +415,13 @@ pub fn explicit_year(q: &str) -> Option<i32> {
         if i - j != 4 {
             continue;
         }
-        if let Ok(y) = cs[j..i].iter().collect::<String>().parse::<i32>() {
-            if (2000..=2099).contains(&y) {
-                return Some(y);
-            }
+        // 四位 ASCII 数字直接手算（不再为 4 个字堆分配一个 String 去 parse）
+        let y = (cs[j] as i32 - 48) * 1000
+            + (cs[j + 1] as i32 - 48) * 100
+            + (cs[j + 2] as i32 - 48) * 10
+            + (cs[j + 3] as i32 - 48);
+        if (2000..=2099).contains(&y) {
+            return Some(y);
         }
     }
     None
@@ -409,6 +446,7 @@ fn year_base(q: &str) -> YearBase {
 
 /// `年-月-01` 的 SQL 表达式。`month` 允许 13（＝次年 1 月），供半开区间的右端用。
 fn ym(base: &YearBase, month: u32) -> String {
+    debug_assert!((1..=13).contains(&month), "month=0 或 14+ 会生成非法 SQL（'%Y-00-01'）");
     let (yshift, m) = if month > 12 { (1, month - 12) } else { (0, month) };
     match base {
         YearBase::Explicit(y) => format!("'{}-{m:02}-01'", y + yshift),
@@ -437,6 +475,8 @@ fn rule_half_year(q: &str) -> Option<String> {
 
 /// 规则④：N 月 / N 月份（本年度；「上个月」等相对词在规则⑤兜底，先排除）
 fn rule_month(q: &str) -> Option<String> {
+    // 「个月」同时挡住「前五个月/哪个月」这类没有任何规则承接的说法：一律交兜底/LLM
+    // （保守 None，不臆造窗口）
     if q.contains("个月") || q.contains("上月") {
         return None;
     }
@@ -444,7 +484,7 @@ fn rule_month(q: &str) -> Option<String> {
     let head: String = q[..pos].chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
     let num: String = head
         .chars()
-        .filter(|c| c.is_ascii_digit() || "一两二三四五六七八九十".contains(*c))
+        .filter(|c| c.is_ascii_digit() || CN_DIGITS.contains(*c))
         .collect();
     let m = cn_num(&num).filter(|m| (1..=12).contains(m))?;
     // 同 `rule_quarter`：显式年份/去年走字面日期，今年那一支字节不变
@@ -468,9 +508,9 @@ fn rule_year(q: &str) -> Option<String> {
 
 /// 规则⑤：相对词兜底
 fn rule_relative(q: &str) -> Option<String> {
-    let p = if q.contains("今天") || q.contains("今日") {
+    let p = if contains_any(q, TODAY_WORDS) {
         "DATE({}) = CURDATE()"
-    } else if q.contains("昨天") || q.contains("昨日") {
+    } else if contains_any(q, YESTERDAY_WORDS) {
         "DATE({}) = CURDATE() - INTERVAL 1 DAY"
     } else if q.contains("前天") {
         "DATE({}) = CURDATE() - INTERVAL 2 DAY"
@@ -510,20 +550,24 @@ pub fn cap_at_yesterday(tpl: &str) -> String {
 /// 问句的时间词是不是「当期」（窗口含今天）：`RequireTimeCap` 的构造闸 ——
 /// 只在当期问法时要求「到昨天」的上限；问「上月/去年」时那条件本就不必出现，
 /// 判了就是误伤（与 `drop_conflicting_time_cols` 同一条宁缺毋滥）。
-/// 词表与 `rule_relative` 的当期分支一一对应 + 「近」（近三个月/近7天都含今天）。
+/// 词表与 `rule_relative` 的当期分支一一对应 + 「最近」（无数字也算当期，金标钉着）；
+/// 单字「近」走 `recent_n` 判定（近三个月/近7天都含今天，而「附近的门店」「接近」里的
+/// 「近」不是时间词 —— 单字「近」曾把它们误判成当期 → `RequireTimeCap` 误造闸）。
 pub fn window_includes_today(q: &str) -> bool {
     const CURRENT: &[&str] =
-        &["今天", "今日", "本月", "这个月", "当月", "本周", "这周", "今年", "本年", "年初至今", "近"];
-    CURRENT.iter().any(|w| q.contains(w))
+        &["今天", "今日", "本月", "这个月", "当月", "本周", "这周", "今年", "本年", "年初至今", "最近"];
+    CURRENT.iter().any(|w| q.contains(w)) || recent_n(q).is_some()
 }
 
-/// 问句里**第一个**时间表面词（【A17 ①】日期继承用）：上一轮问句有、改写后丢了时，
+/// 问句里**词表序首个**时间表面词（【A17 ①】日期继承用）：上一轮问句有、改写后丢了时，
 /// 把这个词原样接到新问题尾巴（「那品类第二的呢」→「那品类第二的呢，上月」）。
-/// 词表按**最长最具体优先**排（「上个月」先于「上月」）；`time_predicate` 只认
-/// `Some` 的问句才轮到它 —— 它是「把那句话里的时间词取出来」，不是解析窗口。
-/// 带显式年份（`20xx`）的一律 `None`：继承「2025年上半年」到明年是静默改年份。
+/// 注意是**词表序**（最长最具体优先，「上个月」先于「上月」）而不是句中位置序：
+/// 「本月销量比上月」返回的是「上月」（表序在前）—— 行为钉在这里，别按字面改成位置序。
+/// 只继承唯一无歧义形态（「近三个月」）：recent_n 支持 1~60 全档，但其它「近 N」
+/// 形态不继承是刻意的保守。带显式年份（`20xx`）的一律 `None`：继承「2025年上半年」
+/// 到明年是静默改年份。
 pub fn time_phrase_of(q: &str) -> Option<&'static str> {
-    if q.chars().any(|c| c.is_ascii_digit()) && q.contains("20") {
+    if q.contains("20") {
         return None;
     }
     const PHRASES: &[&str] = &[
@@ -556,7 +600,8 @@ mod tests {
         // N 月（跨年右端）
         assert_eq!(tp("2022年12月"), "{} >= '2022-12-01' AND {} < '2023-01-01'");
         assert_eq!(tp("2025年6月"), "{} >= '2025-06-01' AND {} < '2025-07-01'");
-        // 只给年份 → 整年；且必须**排在月/季度之后**（否则上面那条会被吞成整年）        assert_eq!(tp("2025年的数"), "YEAR({}) = 2025");
+        // 只给年份 → 整年；且必须**排在月/季度之后**（否则上面那条会被吞成整年）
+        assert_eq!(tp("2025年的数"), "YEAR({}) = 2025");
         // 「去年上半年」此前也被算成今年上半年（同一缺陷的另一面）
         assert!(tp("去年上半年").contains("INTERVAL 1 YEAR"), "{}", tp("去年上半年"));
     }
@@ -575,6 +620,27 @@ mod tests {
         assert_eq!(explicit_year("1999年的数"), None);
         // 「近3年」不是显式年份
         assert_eq!(explicit_year("近3年的数"), None);
+    }
+
+    /// 「top」前随字母不算 TopN（stop3/desktop5）；最高级分支认第二次出现
+    #[test]
+    fn top_n_word_boundary_and_second_occurrence() {
+        assert_eq!(detect_top_n("desktop5 的销量"), 200, "desktop 里的 top 不是 TopN");
+        assert_eq!(detect_top_n("top5 客户"), 5);
+        // 「最高…最好5个…」：第一次出现没带数字时，第二次出现仍要命中
+        assert_eq!(detect_top_n("销量最高和最好的5个商品"), 5);
+        // 「最近销量，近7天呢」：「最近」后无数字时，句尾「近7天」仍要命中
+        assert!(recent_n("最近销量，近7天呢").is_some());
+        assert!(time_predicate("最近销量，近7天呢").unwrap().contains("INTERVAL 6 DAY"));
+    }
+
+    /// 单字「近」不再让「附近/接近」误判当期（RequireTimeCap 误造闸的回归钉）
+    #[test]
+    fn nearby_is_not_a_time_window() {
+        assert!(!window_includes_today("附近的门店销量"));
+        assert!(!window_includes_today("接近目标的门店"));
+        assert!(window_includes_today("近7天的销量"));
+        assert!(window_includes_today("最近三个月销量"));
     }
 
     /// 🔴 无显式年份那一支**字节不变**（既有断言与 prompt golden 都钉着它）。

@@ -1,17 +1,20 @@
 //! 问句与注册表文本的匹配基元：最长别名命中、MapFilter 命中净化、列注释洗成维度名、
 //! 全角括注剥离、剥词残留守卫。全部纯函数，词表一律参数化（业务词不进 kernel）。
 //!
-//! 搬运源 `server/src/meta.rs:864-918/1075-1087`、`server/src/direct.rs:110-141/432-455`。
+//! 搬运源（行号已腐，按函数名对拍）：旧 server `meta.rs` 的 `match_word`/`map_filter`/
+//! `clean_dim_name` 段、`direct.rs` 的 `strip_annotations`/残留守卫段。
 
 /// 问句对某元素的命中：返回命中词（名或最长命中别名），未命中返回 None。
 /// 取最长——同一元素多个别名同时命中时，长词更具体（"多少个订单" 优于 "多少单"）。
 pub fn match_word(question: &str, name: &str, aliases: &[String]) -> Option<String> {
     let mut best: Option<String> = None;
+    let mut best_len = 0usize; // 缓存 best 的字符数，每次比较不对两者重算
     let mut consider = |w: &str| {
         if !w.is_empty() && question.contains(w) {
-            let better = best.as_ref().map(|b| w.chars().count() > b.chars().count()).unwrap_or(true);
-            if better {
+            let n = w.chars().count();
+            if best.is_none() || n > best_len {
                 best = Some(w.to_string());
+                best_len = n;
             }
         }
     };
@@ -48,7 +51,10 @@ pub fn map_filter(hits: &[(String, String)]) -> Vec<usize> {
         if !seen_names.insert(name.as_str()) {
             continue; // R2
         }
-        // R3：存在更长且真包含本命中词的命中 → 本条让位
+        // R3：存在更长且真包含本命中词的命中 → 本条让位。
+        // 单位说明：R1 用字符数、这里用字节长——对「真包含」关系两者严格等价
+        // （包含即同向更长，等长即同一个词，而等长让位是 R2 的事），故字节长更省。
+        // O(n²) 扫描的规模前提：单轮命中数上限约几十，词表数千时也是命中数在主导。
         if words.iter().any(|w| w.len() > word.len() && w.contains(word.as_str())) {
             continue;
         }
@@ -61,13 +67,15 @@ pub fn map_filter(hits: &[(String, String)]) -> Vec<usize> {
     out
 }
 
-/// 列注释 → 干净维度名：截到首个分隔符（中英文冒号/括号/逗号/斜杠/空格）之前。
+/// 列注释 → 干净维度名：截到首个分隔符（中英文冒号/括号/逗号/斜杠/空格/分号/句号）之前。
 /// 结果须是 2~8 字的纯中文词；否则 None（调用方退回字典名）。
+/// CJK 范围只收 `\u{4E00}..=\u{9FFF}`（基本区）：扩展 A 的生僻字维度名会被拒 ——
+/// 保守取舍（宁可退回字典名，不放行怪字），真遇到再扩。
 pub fn clean_dim_name(comment: &str) -> Option<String> {
     let head: String = comment
         .trim()
         .chars()
-        .take_while(|c| !":：(（)）,，、/ \t".contains(*c))
+        .take_while(|c| !":：(（)）,，、/ \t；。".contains(*c))
         .collect();
     let n = head.chars().count();
     if (2..=8).contains(&n) && head.chars().all(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)) {
@@ -97,16 +105,23 @@ pub fn strip_annotations(s: &str) -> String {
                 }
                 j += 1;
             }
-            let group: String = chars[i..j].iter().collect();
-            let has_cjk = group.chars().any(|ch| ('\u{4E00}'..='\u{9FFF}').contains(&ch));
-            if open == '(' && !has_cjk {
-                out.push_str(&group);
+            let group = &chars[i..j];
+            // 未闭合括号（注册表文本笔误）必须原样保留：吞掉其后所有内容会把维护文本
+            // 一个笔误放大成「整条口径描述丢失」。
+            let keep = depth > 0
+                || (open == '(' && !group.iter().any(|ch| ('\u{4E00}'..='\u{9FFF}').contains(ch)));
+            if keep {
+                out.extend(group);
             }
             i = j;
         } else {
             out.push(c);
             i += 1;
         }
+    }
+    // 已 trimmed 就直接返回（省一次全量拷贝）
+    if out.trim().len() == out.len() {
+        return out;
     }
     out.trim().to_string()
 }
@@ -119,20 +134,25 @@ pub fn strip_annotations(s: &str) -> String {
 /// 业务同义词由 `consumed` 传入——kernel 不持有任何业务名词。
 pub fn has_residue_with(question: &str, consumed: &[String], strip_words: &[&str]) -> bool {
     let mut s = question.to_string();
-    // 先剥业务词（长词优先，防"客户分类"被"客户"拆散后留下"分类"）
-    let mut words: Vec<&String> = consumed.iter().collect();
-    words.sort_by_key(|w| std::cmp::Reverse(w.chars().count()));
-    for w in words {
+    // 先剥业务词（长词优先，防"客户分类"被"客户"拆散后留下"分类"）。
+    // 词表规模（百级）× 问句长度下 replace 足够，不上 AC 自动机。
+    let mut words: Vec<(usize, &String)> =
+        consumed.iter().map(|w| (w.chars().count(), w)).collect();
+    words.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    for (_, w) in words {
         s = s.replace(w.as_str(), "");
     }
     // 再剥通用虚词/时间词/排序词
     for w in strip_words {
         s = s.replace(w, "");
     }
+    // 判定管线顺序承重：先剥数字与标点，再判 alphanumeric —— 「纯数字不算残留」靠这个顺序
     let s: String = s
         .chars()
         .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !"，。？?、,.~～!！:：".contains(*c))
         .collect();
+    // is_alphanumeric 是 Unicode 感知（CJK 表意文字本就 true）；`> 0x2E7F` 兜住的是 CJK 区的
+    // 非标点符号/表意外字符（双保险，刻意保留）
     s.chars().any(|c| c.is_alphanumeric() || (c as u32) > 0x2E7F)
 }
 
@@ -142,6 +162,8 @@ pub fn has_residue_with(question: &str, consumed: &[String], strip_words: &[&str
 /// 顺序承重 —— 「肉制品」必须在「肉制」之前被试，否则分类名被自己的前缀抢走）；
 /// SQL 路径的切片向量召回（A8：整句向量被长问句稀释，切片后逐片召回再合并）。
 /// 上限 8 字：图里最长的省份名/分类名都在 8 字内，再长的窗口只是白查库/白 embed。
+/// 注意：重复子串会产出重复窗口（如「 sales sales 」），去重由调用方自理
+/// （graph 侧靠 `taken`、gather 侧靠 `seen`）。
 pub fn candidate_windows(text: &str) -> Vec<(usize, String)> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -194,6 +216,7 @@ mod tests {
     fn clean_dim_name_cuts_at_separator() {
         assert_eq!(clean_dim_name("状态说明：100:未开始").as_deref(), Some("状态说明"));
         assert_eq!(clean_dim_name("行类型（甲，乙）").as_deref(), Some("行类型"));
+        assert_eq!(clean_dim_name("状态；0=开").as_deref(), Some("状态"), "全角分号也是分隔符");
         assert_eq!(clean_dim_name("status"), None, "非中文不采纳");
         assert_eq!(clean_dim_name("是"), None, "<2 字不采纳");
         assert_eq!(clean_dim_name("一二三四五六七八九"), None, ">8 字不采纳");
@@ -207,6 +230,8 @@ mod tests {
         assert_eq!(strip_annotations("t_x(含中文的注记)"), "t_x");
         // 嵌套注记整组剥掉
         assert_eq!(strip_annotations("t_x（说明（含嵌套））y"), "t_xy");
+        // 未闭合括号（注册表文本笔误）：原样保留，不吞后续内容
+        assert_eq!(strip_annotations("t_x（说明没收口 y"), "t_x（说明没收口 y");
     }
 
     /// 🔴 长词优先是承重的：「肉制品」必须排在「肉制」之前被试，
@@ -214,7 +239,7 @@ mod tests {
     #[test]
     fn windows_try_long_words_first() {
         let ws = candidate_windows("湖南省烤肠");
-        let pos = |w: &str| ws.iter().position(|(_, x)| x == w).expect("缺候选 {w}");
+        let pos = |w: &str| ws.iter().position(|(_, x)| x == w).unwrap_or_else(|| panic!("缺候选 {w}"));
         assert!(pos("湖南省烤肠") < pos("湖南省"), "5 字窗必须早于 3 字窗");
         assert!(pos("湖南省") < pos("湖南"), "3 字窗必须早于 2 字窗");
         assert!(pos("烤肠") > pos("湖南省"), "同理，短词最后");

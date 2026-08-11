@@ -1,8 +1,9 @@
 //! 呈现协议**类型**（`Answer.view` 需要它们）：列语义 + 图表块 + KPI + 下钻声明。
 //!
 //! 这里只有类型与 serde 形状——**前端字节兼容的唯一事实源**，serde 属性逐字不许动。
-//! 推断算法与中文词表（`infer_role`/`infer_semantic`/`build`/`DIM_POOL`/`PROVINCE_LABELS`）
-//! 整块留在业务侧（server `viewspec.rs`，K3/T7 迁 semantic）——它们全是 DMS 业务语料。
+//! 推断算法与中文词表（`infer_role`/`infer_semantic`/`build`/`DEFAULT_DIM_POOL`/
+//! `DWS_SALES_DIM_POOL`/`PROVINCE_LABELS`，常量在 semantic 侧）整块留在业务侧
+//! （server `viewspec.rs`，K3/T7 迁 semantic）——它们全是 DMS 业务语料。
 //!
 //! 搬运源 `server/src/viewspec.rs:8-105`。
 
@@ -31,7 +32,7 @@ pub enum Semantic {
     None,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ColumnSpec {
     pub name: String,
     pub role: Role,
@@ -43,12 +44,14 @@ fn is_none_sem(s: &Semantic) -> bool {
     matches!(s, Semantic::None)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Block {
     /// 单行全指标 → KPI 卡
     Kpis { items: Vec<Kpi> },
-    /// 单行多列实体 → 键值卡（单据卡）
+    /// 单行多列实体 → 键值卡（单据卡）。
+    /// 🔴 `pairs` 是裸元组：serde 落 JSON 是 `[k,v]` 二元数组而非 `{k:v}` 对象 ——
+    /// 这是**前端契约**，谁「优化」成 map 谁就破坏前端渲染。
     Entity { pairs: Vec<(String, Value)> },
     /// 图表（bar/line/pie）
     Chart {
@@ -72,7 +75,7 @@ pub enum Block {
     Table,
 }
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChartKind {
     Bar,
@@ -80,17 +83,19 @@ pub enum ChartKind {
     Pie,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct Delta {
     pub pct: f64,
-    pub dir: &'static str, // "up" | "down" | "flat"
+    // "up" | "down" | "flat" —— 取值靠本注释维持（semantic 侧写死这三个字符串），
+    // 拼错无编译期防线：改动时对照 semantic 的 present.rs。
+    pub dir: &'static str,
     pub label: String,     // "较上月" 等
     /// 基期原值与绝对变化额。旧消费者忽略新增键；深度 BI 用它展示可核数的比较卡。
     pub baseline: f64,
     pub change: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct Kpi {
     pub label: String,
     pub value: Value,
@@ -101,12 +106,12 @@ pub struct Kpi {
 
 /// 交互声明（对齐 SuperSonic recommendedDimensions/DrillDownDimensions）：
 /// 可下钻的维度——前端渲染 chips，点击后带"按X"重问（参数化下钻）。
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, Debug)]
 pub struct Interact {
     pub drill: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ViewSpec {
     pub columns: Vec<ColumnSpec>,
     pub blocks: Vec<Block>,

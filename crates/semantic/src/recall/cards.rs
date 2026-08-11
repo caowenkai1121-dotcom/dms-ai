@@ -15,7 +15,7 @@ use crate::recall::RecallCtx;
 use super::metric::recall_metrics;
 use crate::registry::{
     catalog_allows_column, catalog_allows_dimension, catalog_allows_metric_record,
-    element_asset_live_pred_at, source_asset_live_pred_at, warehouse_qualified_source,
+    element_asset_live_pred_at, warehouse_qualified_source,
 };
 use crate::registry::lexicon::{
     load_domain_values, load_terms, load_value_domains, load_value_maps, longest_value_hit,
@@ -44,34 +44,34 @@ fn personnel_dimension_allowed(question: &str, name: &str, hit_word: &str) -> bo
     let is_personnel = ["业务员", "经理", "负责人", "人员"]
         .iter()
         .any(|word| name.contains(word) || hit_word.contains(word));
-    !is_personnel
-        || ["订单", "下单", "售后", "费用", "活动", "巡店", "促销"]
-            .iter()
-            .any(|context| question.contains(context))
+    !is_personnel || FACT_CONTEXTS.iter().any(|context| question.contains(context))
 }
 
+/// 人员类维度的「明确业务事实语境」词表：`personnel_dimension_allowed` 与
+/// `ambiguous_sales_personnel` 共用一份（两处各写一份必漂）。
+const FACT_CONTEXTS: &[&str] = &["订单", "下单", "售后", "费用", "活动", "巡店", "促销"];
+
+/// 销售 personnel 歧义短路：问句点了「区域经理/大区经理…」却又没有任何事实语境时，
+/// 整路维度卡收敛成一张澄清卡（与 `personnel_dimension_allowed` 的分工：那边过滤单条
+/// 命中，这边短路整路出澄清卡）。
 fn ambiguous_sales_personnel(question: &str) -> bool {
     ["区域经理", "大区经理", "销售经理", "销售负责人"]
         .iter()
         .any(|word| question.contains(word))
-        && !["订单", "下单", "售后", "费用", "活动", "巡店", "促销"]
-            .iter()
-            .any(|context| question.contains(context))
+        && !FACT_CONTEXTS.iter().any(|context| question.contains(context))
 }
 
 /// 召回命中的维度口径卡（问句含维度名或别名）→ 注入 prompt 让 LLM 按此分组取数
 pub async fn recall_dimensions(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec<String>> {
     if ambiguous_sales_personnel(cx.question) {
+        // 歧义短路只出一张澄清卡：「维度卡为什么只剩一张」在这里留痕
+        tracing::debug!("人员维度歧义短路 → 维度卡收敛为澄清卡");
         return Ok(vec![
             "【人员维度需澄清】“区域经理/大区经理”不是已验证的 DWS 销售维度，禁止拆成“区域”+“经理”或默认映射为业务员。请确认要看订单大区经理、订单所属经理，还是按省区/战区分析销售。"
                 .to_string(),
         ]);
     }
-    let ds_pred = format!(
-        "{}{}",
-        crate::registry::ds_pred(1),
-        source_asset_live_pred_at("", 1)
-    );
+    let ds_pred = crate::registry::source_live_pred_single();
     let rows: Vec<(String, Vec<String>, String, String, String)> = sqlx::query_as::<
         _,
         (String, Vec<String>, String, String, String),
@@ -108,10 +108,11 @@ pub async fn recall_dimensions(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Resul
     Ok(map_filter(&pairs)
         .into_iter()
         .map(|k| {
-            let (name, _a, src, expr, desc) = rows[matched[k].0].clone();
+            // 按字段解构引用（原来整 5 元组克隆，aliases 深克隆后丢弃）
+            let (name, _a, src, expr, desc) = &rows[matched[k].0];
             format!(
                 "【{name}】分组取值 {expr}，来源 {}。说明：{desc}",
-                warehouse_qualified_source(cx.ds, &src)
+                warehouse_qualified_source(cx.ds, src)
             )
         })
         .collect())
@@ -144,6 +145,10 @@ pub async fn recall_terms(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec
 /// 两条防线（计划点名）：① 一层即止 —— mapping 的产出不再 mapping，递归没有第二条路；
 /// ② 增量过名字去重 —— 「维度卡 78 行淹没真口径」（`gather.rs` 的账）与
 /// 「同一批取值双渲」（下面 `value_hint_cards` 的账）都发生在没这道去重的时候。
+/// 术语递归时每路子召回的条数上限：一层即止的辅助召回，给多了喧宾夺主（值 3 是
+/// A19 计划的裁定值，不是拍脑袋）。
+const TERM_MAPPED_LIMIT: usize = 3;
+
 pub async fn recall_term_mapped(
     pg: &PgPool,
     cx: &RecallCtx<'_>,
@@ -159,37 +164,46 @@ pub async fn recall_term_mapped(
         let dc = RecallCtx {
             question: &t.definition,
             tables: &[],
-            limit: 3,
+            limit: TERM_MAPPED_LIMIT,
             ds: cx.ds,
             embed: None,
             embed_slices: &[],
         };
-        out.extend(recall_metrics(pg, &dc).await?);
-        out.extend(recall_dimensions(pg, &dc).await?);
-        out.extend(recall_value_domains(pg, &dc).await?);
+        // 三路子召回互不依赖，一次并发取齐；拼接顺序不变（指标→维度→值域）
+        let (metrics, dims, value_domains) = tokio::try_join!(
+            recall_metrics(pg, &dc),
+            recall_dimensions(pg, &dc),
+            recall_value_domains(pg, &dc),
+        )?;
+        out.extend(metrics);
+        out.extend(dims);
+        out.extend(value_domains);
     }
     Ok(dedup_new_cards(out, existing))
 }
 
-/// 卡名（`【名字】…` 前缀里的那一段）；不是这个形态的一律 None（不参与去重，漏判方向）
+/// 卡名（`【名字】…` 前缀里的那一段）；不是这个形态的一律 None（不参与去重，漏判方向）。
+/// 🔴 前提钉死：卡名来自种子名，约定「卡名不含 】」（含了 find 会截歪）。
 fn card_name(card: &str) -> Option<&str> {
     let s = card.strip_prefix('【')?;
     let end = s.find('】')?;
-    Some(&s[..end])
+    // 空名（「【】…」）一律 None：空名卡互相精确相等，参与去重会互相误删（漏判方向）
+    (end > 0).then_some(&s[..end])
 }
 
 /// 增量去重（**纯函数**）：卡名已出现在任何一张已有卡里的不再重复摆
 /// （名字**精确**相等 —— 包含判据会把「销量占比」当成「销量」误删）。
 fn dedup_new_cards(new: Vec<String>, existing: &[&[String]]) -> Vec<String> {
-    let names: std::collections::HashSet<String> = existing
+    // existing 侧借用不克隆（原来整卡名克隆进 HashSet<String>）；new 侧另备 owned 判重
+    let existing_names: std::collections::HashSet<&str> = existing
         .iter()
         .flat_map(|g| g.iter())
-        .filter_map(|s| card_name(s).map(|n| n.to_string()))
+        .filter_map(|s| card_name(s))
         .collect();
-    let mut seen = names;
+    let mut seen_new: std::collections::HashSet<String> = std::collections::HashSet::new();
     new.into_iter()
         .filter(|c| match card_name(c) {
-            Some(n) => seen.insert(n.to_string()),
+            Some(n) => !existing_names.contains(n) && seen_new.insert(n.to_string()),
             None => true,
         })
         .collect()
@@ -200,13 +214,12 @@ fn dedup_new_cards(new: Vec<String>, existing: &[&[String]]) -> Vec<String> {
 /// 问「湖南省销售额」LLM 压根不知道 province 存的是 '430000'，实测直接漏掉省份过滤答成全量。
 /// 这一层把「值→列→码」在生成前就摆给 LLM，是确定性的（不依赖向量召回）。
 pub async fn recall_value_hints(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec<String>> {
-    let domains = load_value_domains(pg, cx.ds).await?;
-    Ok(value_hint_cards(
-        cx.ds,
-        &load_value_maps(pg, cx.ds).await?,
-        &domains,
-        cx.question,
-    ))
+    // 两条加载互不依赖，一次并发取齐
+    let (domains, maps) = tokio::try_join!(
+        load_value_domains(pg, cx.ds),
+        load_value_maps(pg, cx.ds),
+    )?;
+    Ok(value_hint_cards(cx.ds, &maps, &domains, cx.question))
 }
 
 /// `recall_value_hints` 的纯判据部分（拆出来只为无库可断言）。
@@ -220,16 +233,30 @@ fn value_hint_cards(
     domains: &[ValueDomain],
     question: &str,
 ) -> Vec<String> {
-    let is_domain = |v: &ValueMap| {
-        domains.iter().any(|d| {
-            d.table_name.eq_ignore_ascii_case(&v.table_name)
-                && d.column_name.eq_ignore_ascii_case(&v.column_name)
+    // 值域判定预建小写键集合（原来每行对 domains 线性扫，逐对 eq_ignore_ascii_case）；
+    // 键用 \0 拼接（列名/表名不可能含 NUL）
+    let domain_keys: std::collections::HashSet<String> = domains
+        .iter()
+        .map(|d| {
+            format!(
+                "{}\u{0}{}",
+                d.table_name.to_ascii_lowercase(),
+                d.column_name.to_ascii_lowercase()
+            )
         })
+        .collect();
+    let is_domain = |v: &ValueMap| {
+        domain_keys.contains(&format!(
+            "{}\u{0}{}",
+            v.table_name.to_ascii_lowercase(),
+            v.column_name.to_ascii_lowercase()
+        ))
     };
     let matched: Vec<(usize, String)> = rows
         .iter()
         .enumerate()
         .filter(|(_, v)| !is_domain(v))
+        // ≥2 字门槛与 `lexicon::longest_value_hit` 同一道（两处互指，改一边同步另一边）
         .filter(|(_, v)| v.name.chars().count() >= 2 && question.contains(v.name.as_str()))
         .map(|(i, v)| (i, v.name.clone()))
         .collect();
@@ -244,18 +271,29 @@ fn value_hint_cards(
         .collect();
     map_filter(&pairs)
         .into_iter()
-        .map(|k| {
+        .filter_map(|k| {
             let ValueMap { table_name: t, column_name: c, name, code, match_kind: kind } =
                 &rows[matched[k].0];
+            // 渲染前校验：码值含引号/通配符会把卡面的 '{code}' 字面量或 LIKE 模式打破
+            // （种子受控，正常不触发；触发即留痕跳过，不硬渲一张破卡）
+            let dangerous = if kind == "like" {
+                code.contains(['\'', '%', '_'])
+            } else {
+                code.contains('\'')
+            };
+            if dangerous {
+                tracing::debug!("码值提示卡跳过含引号/通配符的码值 {t}.{c}：{code:?}");
+                return None;
+            }
             if kind == "like" {
                 let table = warehouse_qualified_source(ds, t);
-                format!("「{name}」在 {table}.{c} 列的码是 '{code}'，该列是逗号组合值，必须用 {c} LIKE '%{code}%'")
+                Some(format!("「{name}」在 {table}.{c} 列的码是 '{code}'，该列是逗号组合值，必须用 {c} LIKE '%{code}%'"))
             } else {
                 // 🔴 **不许把 LIKE 形态写进卡里**：反例会被照抄（SALE17 实测：卡里有
                 // `LIKE '%湖南%'`，模型无视「必返 0 行」的警告把反例当答案抄了 ——
                 // 「LLM 照抄的是示例」那本账的又一次）。只给正确写法，禁止形态一概不出现。
                 let table = warehouse_qualified_source(ds, t);
-                format!("「{name}」在 {table}.{c} 列存的是编码 '{code}'，过滤**只许**写 {c} = '{code}' —— 该列存码不存名，任何名称写法都必返 0 行")
+                Some(format!("「{name}」在 {table}.{c} 列存的是编码 '{code}'，过滤**只许**写 {c} = '{code}' —— 该列存码不存名，任何名称写法都必返 0 行"))
             }
         })
         .collect()
@@ -268,6 +306,8 @@ fn value_hint_cards(
 /// （SALE17 实测：province 被 autodiscover 登记成名称型值域，域卡只写「用这一列」，
 /// 模型就写 `province LIKE '%湖南%'` —— 码列上一个字都匹不到，0 行）。
 pub fn value_domain_card(d: &ValueDomain, hit: &str, code: Option<&str>) -> String {
+    // ds 传 ""：依赖 `warehouse_qualified_source`「""≠DMS_DS_ID → 原样返回」的契约
+    // （与 metric.rs 的 metric_card 同一形态 —— 无 ds 上下文的纯渲染入口）
     value_domain_card_for("", d, hit, code)
 }
 
@@ -294,19 +334,29 @@ fn value_domain_card_for(ds: &str, d: &ValueDomain, hit: &str, code: Option<&str
 /// 命中名在 `meta.value_map` 的等值码表里有**不同的码**时，卡片必须带码
 /// （province 那类「长得像名称列的码列」就靠这一句 —— 缺了它模型必写 LIKE/名称等值）。
 pub async fn recall_value_domains(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec<String>> {
-    let domains = load_value_domains(pg, cx.ds).await?;
-    let values = load_domain_values(pg, cx.ds).await?;
-    let maps = load_value_maps(pg, cx.ds).await?;
+    // 三条加载互不依赖，一次并发取齐
+    let (domains, values, maps) = tokio::try_join!(
+        load_value_domains(pg, cx.ds),
+        load_domain_values(pg, cx.ds),
+        load_value_maps(pg, cx.ds),
+    )?;
+    // 取值按（表, 列）小写键预分组：原来每个 domain 都全扫 values 过滤一遍
+    let mut by_col: std::collections::HashMap<(String, String), Vec<&str>> =
+        std::collections::HashMap::new();
+    for (t, c, v) in &values {
+        by_col
+            .entry((t.to_ascii_lowercase(), c.to_ascii_lowercase()))
+            .or_default()
+            .push(v.as_str());
+    }
     Ok(domains
         .iter()
         .filter_map(|d| {
-            let same = |t: &String, c: &String| {
-                t.eq_ignore_ascii_case(&d.table_name) && c.eq_ignore_ascii_case(&d.column_name)
-            };
-            let hit = longest_value_hit(
-                cx.question,
-                values.iter().filter(|(t, c, _)| same(t, c)).map(|(_, _, v)| v.as_str()),
-            )?;
+            let hits = by_col
+                .get(&(d.table_name.to_ascii_lowercase(), d.column_name.to_ascii_lowercase()))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let hit = longest_value_hit(cx.question, hits.iter().copied())?;
             // 命中名在码表里的码与它**不同** → 该列是码列，卡片必须带码
             let code = maps
                 .iter()
@@ -325,16 +375,25 @@ pub async fn recall_value_domains(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Re
 /// 返回 (元素名, 渲染卡) 供 pipeline 与 substring 命中去重合并——口语化问法的语义双保险。
 /// embed 服务缺席自动降级为空（`cx.embed == None`，熔断在 embed 客户端内）。
 ///
-/// 【A8】切片向量：`embed_slices` 非空时按「任一片最近」取 MIN 距离（整句在首位）——
-/// 整句向量被长问句稀释时，专名片段照样打得中。只有整句向量时包成单片走同一条路：
+/// 不返 Result 是有意的：它的任何失败形态都收敛成「元素卡缺席」，没有需要调用方区分的
+/// 错误 —— 让整轮问答因为少几张卡而失败是过度反应（裁决 二·G 同族），但降级必须留痕
+/// （下面那条 `map_err + unwrap_or_default` 的 warn 就是痕）。
+///
+/// 【A8】切片向量：`embed_slices` 非空时按「任一片最近」取 MIN 距离（需含整句向量，顺序
+/// 无关）—— 整句向量被长问句稀释时，专名片段照样打得中。只有整句向量时包成单片走同一条路：
 /// 查询恒为一条，「降级留痕」的判据（下面那条 `map_err + unwrap_or_default`）只数一处。
 pub async fn recall_elements(pg: &PgPool, cx: &RecallCtx<'_>) -> Vec<(String, String)> {
-    let slices: Vec<String> = if !cx.embed_slices.is_empty() {
-        cx.embed_slices.to_vec()
+    // 绑引用不整片克隆（每片是几百字符的向量字面量）
+    let slices: Vec<&str> = if !cx.embed_slices.is_empty() {
+        cx.embed_slices.iter().map(String::as_str).collect()
     } else {
         match cx.embed {
-            Some(lit) => vec![lit.to_string()],
-            None => return vec![],
+            Some(lit) => vec![lit],
+            None => {
+                // 「embed 缺席」与「向量路 0 命中」在日志里必须可区分
+                tracing::debug!("embed 缺席 → 元素向量召回降级为空");
+                return vec![];
+            }
         }
     };
     let ds_pred = format!(
@@ -377,6 +436,8 @@ pub async fn recall_elements(pg: &PgPool, cx: &RecallCtx<'_>) -> Vec<(String, St
                 COALESCE(m.scope_filter, ''), COALESCE(m.time_col, ''),
                 COALESCE(m.dedup_keys, ''), COALESCE(m.description, ''),
                 COALESCE(m.unit, ''), COALESCE(m.time_cap, ''), COALESCE(m.version, ''),
+                -- 多向量 MIN 距离：相关子查询每行 unnest 切片数组，HNSW 用不上 = 顺序扫；
+                -- 元素表量级（千行级）下这是有意的可接受，不另建表达式索引
                 (SELECT MIN(e.embedding <=> v.vec) FROM (SELECT unnest($1::text[])::vector AS vec) v) AS dist
          FROM meta.element e
          LEFT JOIN meta.metric m ON e.kind = 'metric' AND m.status = 'active'
@@ -384,7 +445,8 @@ pub async fn recall_elements(pg: &PgPool, cx: &RecallCtx<'_>) -> Vec<(String, St
          LEFT JOIN meta.dimension d ON e.kind = 'dimension' AND d.status = 'active'
            AND d.ds_id = e.ds_id AND e.element_id = 'dimension:' || d.dim_code
          WHERE e.status = 'active' AND e.embedding IS NOT NULL{ds_pred}
-         ORDER BY dist LIMIT $2",
+         -- dist 并列时按 element_id 定死边界行（LIMIT 截断不随物理序漂）
+         ORDER BY dist, e.element_id LIMIT $2",
     ))
     .bind(slices)
     .bind(cx.limit as i64)
@@ -415,8 +477,10 @@ pub async fn recall_elements(pg: &PgPool, cx: &RecallCtx<'_>) -> Vec<(String, St
     // 【A7】两档阈值：严格档全空才放宽一档（SuperSonic「一个都没命中就把阈值折半」的
     // 对偶 —— 那边是降相似度要求，这边是放大可接受的余弦距离）。**不是全局调阈**：
     // 严格档有命中时宽松档一次都不看，噪声进不来；0.5 的天花板与选源阈值
-    // `DS_MAX_DIST` 的实测距离表同源（真实命中 ≤0.43，错源 ≥0.56）—— 再宽就是噪声区。
+    // `DS_MAX_DIST`（crates/agent/src/source.rs:44）的实测距离表同源（真实命中 ≤0.43，
+    // 错源 ≥0.56）—— 再宽就是噪声区。
     // 重召零额外往返：SQL 一次取回 `limit` 行，放宽只是换个阈值再滤一遍。
+    // （render 对 rows 做两遍 filter+map：rows ≤ limit，量小两遍无妨，不另做 take_while 截断。）
     const STRICT: f64 = 0.35; // 余弦距离阈值：语义相关才入（实测校准值）
     const LOOSE: f64 = 0.5; // A7：只在严格档全空时启用
     let render = |max_dist: f64| {
@@ -425,13 +489,19 @@ pub async fn recall_elements(pg: &PgPool, cx: &RecallCtx<'_>) -> Vec<(String, St
             .filter(|(_, _, _, _, _, _, _, _, _, _, _, _, dist)| *dist < max_dist)
             .map(|(id, kind, name, ref_expr, source, _, _, _, _, _, _, _, _)| {
                 let source = warehouse_qualified_source(cx.ds, source);
+                // 🔴 卡前缀形态（指标·/维度·/码值·/术语·）被 gather 侧 `prompt_card_has_name`
+                // 的前缀清单依赖做跨路去重（agent/gather.rs）—— 改前缀必须两边同步
                 let card = match kind.as_str() {
                     "metric" => format!("【指标·{name}】= {ref_expr}，来源 {source}"),
                     "dimension" => {
                         format!("【维度·{name}】分组取值 {ref_expr}，来源 {source}")
                     }
                     "value" => format!("【码值·{name}】编码列码值（{id}，来源 {source}）"),
-                    _ => format!("【术语·{name}】{ref_expr}"),
+                    _ => {
+                        // 未知 kind（拼错/新增）不许静默渲成术语卡
+                        tracing::warn!("元素召回未知 kind {kind}，按术语卡渲染");
+                        format!("【术语·{name}】{ref_expr}")
+                    }
                 };
                 (name.clone(), card)
             })
@@ -439,6 +509,8 @@ pub async fn recall_elements(pg: &PgPool, cx: &RecallCtx<'_>) -> Vec<(String, St
     };
     let strict = render(STRICT);
     if !strict.is_empty() {
+        // 严格档命中也计数：L446 的放宽频次要和严格档基数对照才是调参依据
+        tracing::debug!(hits = strict.len(), "元素召回严格档命中");
         return strict;
     }
     let loose = render(LOOSE);
@@ -469,8 +541,9 @@ mod tests {
         // new 内部互重也删（两个术语的定义召回到同一个指标）
         let dup = vec!["【销量】= a".to_string(), "【销量】= b".to_string()];
         assert_eq!(dedup_new_cards(dup, &[&[]]).len(), 1);
-        // 卡名提取的形状
+        // 卡名提取的形状（空名不参与去重：空名卡互相精确相等会互删）
         assert_eq!(card_name("【退款占比】= x"), Some("退款占比"));
+        assert_eq!(card_name("【】空名卡"), None);
         assert_eq!(card_name("没有前缀"), None);
         assert_eq!(card_name("【不闭合"), None);
     }
@@ -531,8 +604,19 @@ mod tests {
         assert!(cards[0].contains("已开票") && cards[0].contains("'108'"), "{cards:?}");
         // 未登记为值域时那张卡照旧出（声明缺失不改行为）
         assert_eq!(value_hint_cards("", &rows, &[], "手抓饼分类已开票的销量").len(), 2);
+        // 码值含引号/通配符的行渲染前被拦（防卡面字面量破裂与 LIKE 模式注入）
+        let evil = [vm("t_sales_order", "order_status", "已开票", "10'8")];
+        assert!(value_hint_cards("", &evil, &[], "已开票的销量").is_empty(), "引号码值不许进卡");
+        let evil_like = [ValueMap {
+            table_name: "t_sales_order".into(), column_name: "tags".into(),
+            name: "已开票".into(), code: "10%".into(), match_kind: "like".into(),
+        }];
+        assert!(value_hint_cards("", &evil_like, &[], "已开票的销量").is_empty(), "通配符码值不许进 LIKE 卡");
     }
 
+    /// 🔴 注意：本测试测的是 `#[allow(dead_code)]` 保留品 `dim_hit`（裁决 T7-3 明令保留），
+    /// **不是生产判据** —— 生产路径是 `recall_dimensions` 里的 match_word +
+    /// `personnel_dimension_allowed`（L98-105）。改生产判据别只改这里的断言。
     #[test]
     fn dimension_hit_matching() {
         let aliases = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -578,10 +662,11 @@ mod tests {
         assert!(!body.contains("mod tests"), "切过头了，吃进了测试模块：{body}");
         let degraded = body.matches(".unwrap_or_default()").count();
         assert_eq!(degraded, 1, "只数到 {degraded} 处降级 —— 元素向量那一路哪去了？");
+        // warn 总数 = 降级留痕 1 处 + 未知 kind 防静默 1 处（后者不是降级路径，钉在这里防再涨）
         assert_eq!(
-            degraded,
             body.matches("tracing::warn!").count(),
-            "静默降级又回来了：{body}"
+            degraded + 1,
+            "静默降级又回来了（或防静默 warn 被误删）：{body}"
         );
     }
 

@@ -10,11 +10,11 @@
                POST /embed  {"texts":[...],"query":true} → {"embeddings":[[...]]}
                POST /parse  {"path":"<绝对路径>","mime":""} → {"blocks":[...],"page_count":n,"sheets":[...]}
                POST /chunk  {"blocks":[...],"target_tokens":400,"overlap":60} → {"chunks":[...]}
-               GET  /health → {"ok","model","dim","parse_ok":{...},"parse_caps":{".docx":{ok,why}}}
-  selftest —— 自造 md/csv 跑一遍 parse+chunk（不需要任何第三方解析库）+ 把**每种扩展名**的
+               GET  /health → {"ok","model","dim","parse_ok":{...},"parse_caps":{".docx":{ok,why}, ".pdf":{...,tiers:{text,ocr}}}}
+  selftest —— 自造 md/csv/json/html 跑一遍 parse+chunk（不需要任何第三方解析库）+ 把**每种扩展名**的
                可用/不可用与原因列全 + 钉住能力表纪律（见 `_selftest_caps`）
                + 扫描件 PDF 的 OCR 档判定与夹具（见 `_selftest_pdf_scan`）
-用法: python embed_service.py build [--ds dms] | revec | serve [port] | selftest
+用法: python embed_service.py build [--ds dms] | revec | serve [port] [host] | selftest
 
 外部依赖的位置可用环境变量覆盖（容器里可能不在 PATH 上）：
   DMS_SOFFICE   LibreOffice headless 可执行文件（旧二进制 .doc/.xls/.ppt 靠它转格式）
@@ -23,7 +23,10 @@
 """
 import os, sys, json, re, csv, io, math, itertools, importlib.util, shutil, subprocess, tempfile, threading, urllib.request
 from html.parser import HTMLParser   # _p_html 去标签用标准库（SAC 拦的是编译扩展，stdlib 两侧都一定有）
-sys.stdout.reconfigure(encoding='utf-8')
+# pythonw（stdout=None）/pytest 捕获流没有 reconfigure：缺席就跳过，不许为编码起不来
+for _s in (sys.stdout, sys.stderr):
+    if getattr(_s, 'reconfigure', None):
+        _s.reconfigure(encoding='utf-8')
 
 MODEL = 'BAAI/bge-small-zh-v1.5'
 DIM = 512
@@ -52,8 +55,8 @@ def embedder():
 # 推理的全局锁：fastembed/onnxruntime 的 session 不是线程安全的，所以推理**仍然串行**。
 # 它存在的唯一理由是让 `serve` 能换成 ThreadingHTTPServer（见那里的注释）——
 # /parse（上限 120s）与 /health 从此不再排在一次 275 块的 /embed 后面。
-# 实测（本文件 `_selftest_serve_unblocked`，/embed 桩睡 0.6s）：单线程 /health 要 0.605s，
-# 多线程 0.002s。顺带把首次惰性加载也串了：两个线程同时进来会各造一个 TextEmbedding。
+# 实测（本文件 `_selftest_serve_unblocked`；数字出自旧版 0.6s 桩，现桩睡 2s，量级结论不变）：
+# 单线程 /health 要 0.605s，多线程 0.002s。顺带把首次惰性加载也串了：两个线程同时进来会各造一个 TextEmbedding。
 # ponytail: 一把进程级锁 —— 本进程只有一个模型；真要并发推理得起多进程，那时再拆。
 _EMBED_LOCK = threading.Lock()
 
@@ -88,7 +91,8 @@ def _path(stack):
 def _blk(text, page, stack):
     return {'text': text, 'page': page, 'heading_path': _path(stack)}
 
-_H_MD = re.compile(r'^(#{1,6})\s+(.+?)\s*#*$')
+# 中文文档常写 `#一级标题`（# 后不空格）：放行，但标题首字符须非 ASCII —— `#tag`/`#123` 不算标题
+_H_MD = re.compile(r'^(#{1,6})(?:\s+|(?=[^\x00-\x7f]))(.+?)\s*#*$')
 
 def md_blocks(text, page, stack):
     """markdown/纯文本 → blocks：# 层级维护 heading_path，空行分段。pdf 的 markdown 也走这里"""
@@ -112,9 +116,12 @@ def md_blocks(text, page, stack):
     return out
 
 def _read_text(path):
-    """中文文档常是 GBK：utf-8 → gbk → 替换式兜底，绝不因编码整份失败"""
+    """中文文档常是 GBK：utf-8 → gbk → 替换式兜底，绝不因编码整份失败。
+    Windows 导出的 UTF-16（带 BOM）先拦：落入 gbk 会解出夹 NUL 的乱码而不是正确解码。"""
     with open(path, 'rb') as f:
         raw = f.read()
+    if raw[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        return raw.decode('utf-16')      # BOM 在，utf-16 解码器自己分大小端
     for enc in ('utf-8-sig', 'gbk'):
         try:
             return raw.decode(enc)
@@ -123,7 +130,9 @@ def _read_text(path):
     return raw.decode('utf-8', 'replace')
 
 def _p_text(path):
-    return md_blocks(_read_text(path), None, []), 0, []
+    # 滤掉没有任何词字符的块（md 的 `---`/`***` 分隔线），与 `_p_pdf` 的过滤同一口径
+    return [b for b in md_blocks(_read_text(path), None, [])
+            if re.search(r'\w', b['text'])], 0, []
 
 def _p_json(path):
     """JSON → 美化后的 ```json 代码块（口径：json 转代码块，与文本同一条分块链）。
@@ -175,7 +184,9 @@ def _p_html(path):
     parser = _HtmlToText()
     parser.feed(_read_text(path))
     parser.close()
-    return md_blocks(parser.text(), None, []), 0, []
+    # 同 `_p_text`：无词字符块（剥完标签只剩分隔线的段）不进 blocks
+    return [b for b in md_blocks(parser.text(), None, [])
+            if re.search(r'\w', b['text'])], 0, []
 
 def _p_pdf(path):
     """三级降级：pymupdf4llm（**保章节层级**）→ fitz（逐页纯文本）→ pypdf（逐页纯文本）。
@@ -202,7 +213,11 @@ def _p_pdf(path):
         import pymupdf4llm
     except Exception:
         return _pdf_fitz(path)
-    pages = pymupdf4llm.to_markdown(path, page_chunks=True)
+    try:
+        pages = pymupdf4llm.to_markdown(path, page_chunks=True)
+    except Exception:
+        # 运行期异常（损坏/异形 PDF）也续降一级：import 能成不代表转换能成，不许整份 500
+        return _pdf_fitz(path)
     stack, out, page_chars = [], [], {}
     for i, pg in enumerate(pages, 1):
         no = (pg.get('metadata') or {}).get('page', i)
@@ -238,7 +253,6 @@ def _pdf_page_ocr(path, page_no):
     with fitz.open(path) as doc:
         pix = doc[page_no - 1].get_pixmap(dpi=OCR_DPI)
         png = pix.tobytes('png')
-    import tempfile
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
         f.write(png)
         tmp = f.name
@@ -353,10 +367,9 @@ def _pdf_fitz(path):
         import fitz
     except Exception:
         return _pdf_pypdf(path)
-    doc = fitz.open(path)
-    texts = [p.get_text() for p in doc]
-    n = doc.page_count
-    doc.close()
+    with fitz.open(path) as doc:      # with 收口：get_text 中途抛错也不泄漏句柄
+        texts = [p.get_text() for p in doc]
+        n = doc.page_count
     page_chars = {i: _page_chars(t) for i, t in enumerate(texts, 1)}
     out = [_blk(t.strip(), i, []) for i, t in enumerate(texts, 1) if t.strip()]
     notes = _pdf_ocr_fill(path, n, page_chars, out)
@@ -371,10 +384,15 @@ def _pdf_pypdf(path):
     except Exception:
         raise ParseError('unsupported', _cap_pdf() or 'PDF 依赖不可用')
     r = PdfReader(path)
-    texts = [(p.extract_text() or '') for p in r.pages]
+    try:
+        texts = [(p.extract_text() or '') for p in r.pages]
+    finally:
+        r.close()                    # 常驻 serve 下不 close 是文件句柄泄漏（pypdf ≥ 3 支持）
     out = [_blk(t.strip(), i, []) for i, t in enumerate(texts, 1) if t.strip()]
     if not out:
-        raise ParseError('no_text_layer')      # 扫描版：与上面两级同一口径，显式失败
+        # 扫描版：与上面两级同一口径，显式失败；detail 说清这一级为什么补不了 OCR
+        raise ParseError('no_text_layer',
+                         '文本层为空（扫描版）；OCR 补页要 PyMuPDF 渲染页面，当前是 pypdf 兜底级')
     # 低文本量判定在这一级也要做：垃圾文本层（每页零星几个字符）按「已入库」静默过去，
     # 就是 `_pdf_ocr_fill` 文档里那个失败族 —— 这一级补不了 OCR，至少要响亮失败。
     total = sum(_page_chars(t) for t in texts)
@@ -391,12 +409,11 @@ _PSEUDO_HEADING_MAX = 40
 
 
 def _pseudo_heading_level(p, text):
-    import re as _re
     if len(text) > _PSEUDO_HEADING_MAX:
         return 0
-    if _re.match(r'^(?:第[一二三四五六七八九十百\d]+[章节条篇]|[一二三四五六七八九十]+[、.．]|[（(][一二三四五六七八九十]+[)）])', text):
+    if re.match(r'^(?:第[一二三四五六七八九十百\d]+[章节条篇]|[一二三四五六七八九十]+[、.．]|[（(][一二三四五六七八九十]+[)）])', text):
         return 1
-    if _re.match(r'^\d+(?:\.\d+)*[、.．\s]', text):
+    if re.match(r'^\d+(?:\.\d+)*[、.．\s]', text):
         return 2
     runs = [r for r in p.runs if r.text.strip()]
     if runs and all(r.bold for r in runs):
@@ -435,15 +452,18 @@ def _p_pptx(path):
     out, n = [], 0
     for i, slide in enumerate(prs.slides, 1):
         n = i
-        title = (slide.shapes.title.text.strip() if slide.shapes.title is not None else '') or f'第{i}页'
+        _ts = slide.shapes.title      # shape 代理每次访问都是新对象，比身份要用 shape_id
+        title = (_ts.text.strip() if _ts is not None else '') or f'第{i}页'
+        title_id = _ts.shape_id if _ts is not None else None
+        # 标题 shape 也有 text_frame：排除它 —— 标题进 heading_path，再进正文就被向量化两遍
         texts = [s.text_frame.text.strip() for s in slide.shapes
-                 if s.has_text_frame and s.text_frame.text.strip()]
+                 if s.has_text_frame and s.shape_id != title_id and s.text_frame.text.strip()]
         if texts:
             out.append({'text': '\n'.join(texts), 'page': i, 'heading_path': title})
     return out, n, []
 
 def _cell(v):
-    return '' if v is None else str(v)
+    return '' if v is None else str(v).strip()   # ' 10 ' 这类带空白值不该原样进 sheets/表头
 
 def _sheet(name, rows):
     """行列上限：超出立刻报错（不截断——截断=用户以为传成功但数据少一半；也不先吃满内存，本进程还托着 /embed）"""
@@ -452,10 +472,10 @@ def _sheet(name, rows):
         if not any(x != '' for x in r):
             continue
         if len(r) > MAX_COLS:
-            raise ParseError('too_large', f'{name} 列数超 {MAX_COLS}')
+            raise ParseError('too_large', f'{name} 列数超 {MAX_COLS}（实际 {len(r)} 列）')
         keep.append(r)
         if len(keep) > MAX_ROWS + 1:
-            raise ParseError('too_large', f'{name} 行数超 {MAX_ROWS}')
+            raise ParseError('too_large', f'{name} 行数超 {MAX_ROWS}（实际至少 {len(keep)} 行）')
     if not keep:
         # 🔴 空 sheet **也要报出来**（空表头 + 空行），不能在这里丢掉。
         # Rust 侧 `tabular::plan` 的契约是「空表/无表头不建表，但把名字放进 `skipped`，
@@ -484,10 +504,9 @@ def _p_xlsx(path):
             elif _dims_suspect(ws):
                 # openpyxl < 3.1 的兜底：声明不可信 → 非 read_only 按实际单元格重读整本
                 return _xlsx_eager(path)      # 本 wb 由 finally 关闭
-            s = _sheet(ws.title, ([_cell(c) for c in r]
-                                  for r in ws.iter_rows(values_only=True)))
-            if s:
-                out.append(s)
+            # `_sheet` 恒返 dict（空 sheet 返哨兵，见它的注释），旧「返 None」契约的判空已删
+            out.append(_sheet(ws.title, ([_cell(c) for c in r]
+                                         for r in ws.iter_rows(values_only=True))))
     finally:
         wb.close()
     return [], 0, out
@@ -506,9 +525,9 @@ def _xlsx_eager(path):
     import openpyxl
     wb = openpyxl.load_workbook(path, read_only=False, data_only=True)
     try:
-        return [], 0, [s for ws in wb.worksheets
-                       if (s := _sheet(ws.title, ([_cell(c) for c in r]
-                                                  for r in ws.iter_rows(values_only=True))))]
+        return [], 0, [_sheet(ws.title, ([_cell(c) for c in r]
+                                         for r in ws.iter_rows(values_only=True)))
+                       for ws in wb.worksheets]
     finally:
         wb.close()
 
@@ -519,8 +538,7 @@ def _p_csv(path):
     except csv.Error:
         dialect = csv.excel
     rows = ([_cell(c) for c in r] for r in csv.reader(io.StringIO(text), dialect))
-    s = _sheet(os.path.splitext(os.path.basename(path))[0], rows)
-    return [], 0, ([s] if s else [])
+    return [], 0, [_sheet(os.path.splitext(os.path.basename(path))[0], rows)]
 
 OCR_LANG = os.environ.get('DMS_OCR_LANG', 'chi_sim+eng')
 
@@ -540,7 +558,8 @@ def _p_image(path):
       - `mixed.pdf` 文本层+图像页 → 千问逐页全对（`TEXTPAGE1-5566` / `PDFOCR2-9911`）
     千问 flash 是 vision 模型（自己吃图，988ms 级，3/3 全对，比 tesseract 准且**逐帧不丢**）。
     零新依赖（`urllib.request` 发 HTTP，不引 openai 包 —— 宿主机 SAC 会拦新编译扩展）。
-    配置：`DMS_QWEN_OCR_KEY`（或复用 `llm_api_key`）、`DMS_QWEN_OCR_MODEL`（默认 qwen3.7-flash）、
+    配置：`DMS_QWEN_OCR_KEY`（或 `QWEN_KEY`，只读环境变量、不回退 settings 的 llm_api_key）、
+    `DMS_QWEN_OCR_MODEL`（默认 qwen3.7-flash）、
     `DMS_QWEN_OCR_BASE`（默认 dashscope compatible-mode）。千问不可用时回落 tesseract。
     """
     from PIL import Image, ImageSequence
@@ -548,12 +567,22 @@ def _p_image(path):
     blocks, frames = [], 0
     try:
         with Image.open(path) as im:
+            # 帧数护栏（与 PDF 侧 OCR_PAGE_CAP 同口径）：每帧一次千问 HTTP（60s 超时），
+            # N 帧最坏远超 Rust 120s 解析超时 —— 超了响亮 too_large，不「OCR 前 N 帧报已入库」
+            n_frames = getattr(im, 'n_frames', 1)
+            if n_frames > OCR_PAGE_CAP:
+                raise ParseError('too_large',
+                                 f'图片 {n_frames} 帧超上限 {OCR_PAGE_CAP}（每帧一次 OCR 请求）')
             for i, frame in enumerate(ImageSequence.Iterator(im), 1):
                 frames = i
                 # 优先千问；不可用/失败回落 tesseract（两路同一形状：一帧一块）
                 t = _ocr_qwen_frame(frame) or _ocr_tesseract_frame(frame)
                 if t:
-                    blocks.append({'text': t, 'page': i, 'heading_path': name})
+                    # 多帧各带帧号：共用文件名做 heading_path 会被 chunk 分组合并出跨帧重复
+                    hp = name if n_frames == 1 else f'{name}#f{i}'
+                    blocks.append({'text': t, 'page': i, 'heading_path': hp})
+    except ParseError:
+        raise            # ParseError 原样上抛：再包一层 detail 双重套娃（OCR 失败（…OCR 失败（…）））
     except Exception as e:
         raise ParseError('unsupported', f'OCR 失败（{e}）')
     if not blocks:
@@ -584,8 +613,7 @@ def _ocr_qwen_frame(frame):
     if not key:
         return None
     import base64
-    import io as _io
-    b = _io.BytesIO()
+    b = io.BytesIO()                 # io 顶层已有，不重复 import
     frame.convert('RGB').save(b, 'PNG')
     b64 = base64.b64encode(b.getvalue()).decode()
     body = {
@@ -614,19 +642,30 @@ def _ocr_qwen_frame(frame):
 IMG_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp', '.gif')
 # ── 扫描件检测与 OCR 档（Y1）：文本层「低文本量」即判扫描件 → 页面渲染成图 → vision OCR ──
 # 阈值是**可调常量**（环境变量覆盖），判据由 `_selftest_pdf_scan` 钉住 —— 改阈值先改钉。
+def _env_int(name, default):
+    """阈值环境变量的整数解析：写错值要指出是哪个变量、值是什么 ——
+    裸 ValueError traceback 会让服务起不来且不知所云。"""
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        raise SystemExit(f'环境变量 {name}={v!r} 不是整数，embed 服务无法启动')
+
 # 单页非空白字符 < 50 → 该页送 OCR（零文本页是它的特例：原「没有块的页」判据被它覆盖）。
-PDF_PAGE_MIN_CHARS = int(os.environ.get('DMS_PDF_PAGE_MIN_CHARS', '50'))
+PDF_PAGE_MIN_CHARS = _env_int('DMS_PDF_PAGE_MIN_CHARS', 50)
 # 整份判扫描件：全文 < 200，或页均 < 单页阈值（垃圾文本层：每页零星几个字符，合计不少、内容没有）。
-PDF_DOC_MIN_CHARS = int(os.environ.get('DMS_PDF_DOC_MIN_CHARS', '200'))
+PDF_DOC_MIN_CHARS = _env_int('DMS_PDF_DOC_MIN_CHARS', 200)
 # 渲染 dpi（`_pdf_page_ocr`）：200 是实测折中 —— 150 下 12pt 中文 tesseract 常丢字，300 单页多花 ~1.5 倍。
-OCR_DPI = int(os.environ.get('DMS_OCR_DPI', '200'))
+OCR_DPI = _env_int('DMS_OCR_DPI', 200)
 # PDF 逐页补 OCR 的页数上限（`_pdf_ocr_fill`）。可用 DMS_OCR_PAGE_CAP 覆盖。
 # 成本口径：OCR 档每页 ≈ fitz 渲染 0.1s（200dpi）+ 识别 0.2~1s（千问 vision ~1s/页，tesseract 0.2~1s/页）。
 # 30 页 × ~1s ≈ 半分钟，仍低于 Rust 侧 120s 解析超时（connector/src/doc.rs PARSE_TIMEOUT_SECS）；
 # 超 cap 不「OCR 前 N 页然后报已入库」—— too_large 响亮失败。
-OCR_PAGE_CAP = int(os.environ.get('DMS_OCR_PAGE_CAP', '30'))
+OCR_PAGE_CAP = _env_int('DMS_OCR_PAGE_CAP', 30)
 LEGACY_TARGET = {'.doc': '.docx', '.xls': '.xlsx', '.ppt': '.pptx'}
-SOFFICE_TIMEOUT = 120      # 首次转换含 LibreOffice 建 profile，慢；超时要响亮而不是挂死请求
+SOFFICE_TIMEOUT = 120      # 每次转换都用全新临时 profile（`_p_legacy` 为并发隔离），建 profile 的成本每次都付；超时要响亮而不是挂死请求
 
 def _p_legacy(path):
     """旧二进制 Office（OLE/CFB 的 .doc/.xls/.ppt）：**不自己解**，交 LibreOffice headless
@@ -713,9 +752,12 @@ def _cap_ocr():
     qwen_ok = bool(os.environ.get('DMS_QWEN_OCR_KEY') or os.environ.get('QWEN_KEY'))
     if qwen_ok and _have('PIL.Image'):
         return ''       # 千问路通，tesseract 那套不是必需
-    miss = [f'{m}（{_why(m)}）' for m in ('PIL.Image', 'pytesseract') if not _have(m)]
+    miss = [(m, pip) for m, pip in (('PIL.Image', 'pillow'), ('pytesseract', 'pytesseract'))
+            if not _have(m)]
     if miss:
-        return 'OCR 依赖不可用（pip install pillow pytesseract）：' + '；'.join(miss)
+        # 按实际缺的那半给安装建议：千问路根本不需要 pytesseract，一句「全装」误导运维多装
+        pips = ' '.join(dict.fromkeys(pip for _, pip in miss))
+        return f'OCR 依赖不可用（pip install {pips}）：' + '；'.join(f'{m}（{_why(m)}）' for m, _ in miss)
     if not _exe('DMS_TESSERACT', 'tesseract'):
         return ('找不到 tesseract 可执行文件（pytesseract 只是包装器，二进制要单独装）：'
                 'apt-get install tesseract-ocr tesseract-ocr-chi-sim，或 DMS_TESSERACT 指全路径；'
@@ -746,6 +788,8 @@ CAPS = {
     '.json': (_p_json, 'text', _cap_ok),
     '.log': (_p_text, 'text', _cap_ok),
     '.html': (_p_html, 'text', _cap_ok),
+    # .htm 刻意不登记：Rust 侧 EXTS 白名单（knowledge/src/ingest.rs）与本表是**集合相等**判据，
+    # 单侧加 .htm 会红那边的 `exts_cover_the_doc_service_capabilities`；要支持需两侧同加（本轮只动本文件，暂缓）。
     # 旧二进制 Office：各自一个能力名（三个 LibreOffice 组件是分开装的，合成一个键会
     # 让「只装了 writer」上报成整族可用）
     '.doc': (_p_legacy, 'doc', _cap_legacy('.docx')),
@@ -770,10 +814,11 @@ MIME_EXT = {
 def parse_doc(path, mime=''):
     ext = os.path.splitext(path)[1].lower()
     if ext not in CAPS:
-        ext = MIME_EXT.get((mime or '').split(';')[0].strip(), ext)
+        # mime 大小写不敏感（RFC 允许 `Application/PDF` 这种写法），查表前统一 lower
+        ext = MIME_EXT.get((mime or '').split(';')[0].strip().lower(), ext)
     cap = CAPS.get(ext)
     if cap is None:
-        raise ParseError('unsupported', ext or mime or path)
+        raise ParseError('unsupported', f'不支持的格式：{ext or mime or path}')
     if not os.path.isfile(path):
         raise ParseError('not_found', path, 404)
     # 依赖门**只有这一处**：缺依赖 = 明确的 `unsupported` + 一句原因（Rust 侧映成 BadInput，
@@ -805,10 +850,11 @@ def _exe(env, *names):
     """外部**可执行文件**探测：soffice / tesseract 不是 python 模块，`_have` 探不到它们。
     `env` 优先（容器里可能装在非 PATH 位置）。缓存同 `_have`（`/health` 每次都调）——
     代价是改了 PATH/环境变量要重启服务，与依赖装卸同一个口径。"""
-    if env not in _EXE_CACHE:
-        _EXE_CACHE[env] = os.environ.get(env) or next(
+    key = (env, names)         # 键带 names：同名 env 不同 names 的两个调用点不许互相污染缓存
+    if key not in _EXE_CACHE:
+        _EXE_CACHE[key] = os.environ.get(env) or next(
             (p for n in names if (p := shutil.which(n))), '')
-    return _EXE_CACHE[env]
+    return _EXE_CACHE[key]
 
 def _soffice():
     return _exe('DMS_SOFFICE', 'soffice', 'libreoffice')
@@ -895,7 +941,9 @@ def _emit(chunks, text, hp, page):
     if not (text := text.strip()):
         return
     n = est_tokens(text)
-    assert n <= MAX_TOKENS, f'块 {n} token 超上限 {MAX_TOKENS}（bge 512 窗口会静默截断）'
+    # 不用 assert：python -O 会把 assert 整条剥掉，超窗块静默进库被 fastembed 截断
+    if n > MAX_TOKENS:
+        raise ValueError(f'块 {n} token 超上限 {MAX_TOKENS}（bge 512 窗口会静默截断）')
     chunks.append({'text': text, 'heading_path': hp, 'page': page, 'tokens': n})
 
 def _fill(chunks, blocks, hp, target_chars, overlap_chars, cap):
@@ -970,7 +1018,7 @@ def _fill_table(chunks, prefix, rows, hp, page, tc):
     按 `\n` 行装箱到目标长度，**每块重复「# 标题 + 表头 + 分隔行」前缀**（markdown 表跨块的
     标准做法）；块间不做字符重叠 —— 表格的重叠尾巴是半行裸数据，表头重复才是上下文。"""
     budget = tc - len(prefix) - 1                            # 每块数据行的字符预算
-    hard_cap = int(MAX_TOKENS * CHARS_PER_TOKEN) - len(prefix) - 1   # 单行硬切上限（不破 512 窗口）
+    # budget ≤ int(480×1.6)−len(prefix)−1：预算本身就破不了 512 窗口（原 hard_cap 恒 ≥ budget，死防御已删）
     cur, cur_len = [], 0
     for row in rows:
         need = len(row) + 1
@@ -978,8 +1026,8 @@ def _fill_table(chunks, prefix, rows, hp, page, tc):
             _emit(chunks, prefix + '\n' + '\n'.join(cur), hp, page)
             cur, cur_len = [], 0
         if need > budget:
-            # 单行就超目标（单元格超长的病态行）：带表头硬切，仍不破 MAX_TOKENS 窗口
-            for piece in _split_long(row, max(1, min(budget, hard_cap))):
+            # 单行就超目标（单元格超长的病态行）：带表头硬切，仍不破 MAX_TOKENS 窗口（见上面 budget 注释）
+            for piece in _split_long(row, max(1, budget)):
                 _emit(chunks, prefix + '\n' + piece, hp, page)
             continue
         cur.append(row)
@@ -999,7 +1047,9 @@ def chunk_blocks(blocks, target_tokens=TARGET_TOKENS, overlap=OVERLAP):
             t = (b.get('text') or '').strip()
             split = _table_split(t) if t else None
             if split is None or tc - len(split[0]) - 1 < 50:
-                # 非表格块照旧；表头本身就吃掉大半预算的宽表（如 200 列）也回通用路径
+                # 非表格块照旧；表头本身就吃掉大半预算的宽表（如 200 列）也回通用路径。
+                # 50 的依据：数据行连 50 字符预算都分不到时，行感知装箱每块只放得下一行，
+                # 不如回通用路径（与 PDF_PAGE_MIN_CHARS 同个「一点残量不算内容」的量级）
                 prose.append(b)
                 continue
             _fill(chunks, prose, hp, tc, oc, cap)   # 先收掉表格前面的散文段
@@ -1023,52 +1073,63 @@ def _revec(cur, what, sel, upd, sel_params=(), upd_tail=(), is_query=False):
     if not rows:
         return 0
     print(f'计算 {len(rows)} {what} embedding …', flush=True)
-    for r, v in zip(rows, embed([(r[1] or '')[:1000] for r in rows], is_query)):
+    vecs = embed([(r[1] or '')[:1000] for r in rows], is_query)
+    if len(vecs) != len(rows):
+        # 条数不符不许 zip 静默截断：少返一行会把向量错位回写到别的行（Rust embed.rs 同一纪律）
+        raise RuntimeError(f'{what} embedding 返回 {len(vecs)} 条，与 {len(rows)} 行不符')
+    for r, v in zip(rows, vecs):
         cur.execute(upd, (_vlit(v), r[0]) + upd_tail)
     return len(rows)
 
 def build(ds='dms'):
     import psycopg2
-    pg = psycopg2.connect(**pg_conf()); pg.autocommit = True; cur = pg.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    cur.execute(f"ALTER TABLE meta.table_doc ADD COLUMN IF NOT EXISTS embedding vector({DIM})")
-    n_tbl = _revec(
-        cur, '表',
-        "SELECT table_name, coalesce(nullif(search_doc, ''), table_name) FROM meta.table_doc"
-        " WHERE ds_id = %s",                      # ds 限定 = Rust 侧 meta::DS_PRED
-        "UPDATE meta.table_doc SET embedding = %s WHERE table_name = %s AND ds_id = %s",
-        (ds,), (ds,))
-    cur.execute("DROP INDEX IF EXISTS meta.idx_doc_hnsw")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_doc_hnsw ON meta.table_doc"
-                " USING hnsw (embedding vector_cosine_ops)")
-    # 语料问句向量（供语义缓存召回；问句侧 query embedding，与 Rust 回写一致）
-    n_ex = _revec(
-        cur, '条语料问句',
-        "SELECT id, question FROM meta.sql_exemplar"
-        " WHERE status = 'enabled' AND embedding IS NULL AND ds_id = %s",   # 同上：meta::DS_PRED
-        "UPDATE meta.sql_exemplar SET embedding = %s WHERE id = %s AND ds_id = %s",
-        (ds,), (ds,), True)
-    # 元素注册表向量（SuperSonic SchemaMapper 元素召回；search_text 变了自动 NULL 待重建）
-    # 建表 DDL 的事实源在 Rust `meta::bootstrap_meta`；这份兜底副本必须跟着带 ds_id，
-    # 否则「先跑 build 再启服务」会建出没有 ds_id 的表，下面那条 SQL 当场报缺列。
-    cur.execute("CREATE TABLE IF NOT EXISTS meta.element("
-                "element_id text PRIMARY KEY, kind text NOT NULL, name text NOT NULL,"
-                "aliases text[] NOT NULL DEFAULT '{}', ref_expr text NOT NULL DEFAULT '',"
-                "description text NOT NULL DEFAULT '', search_text text NOT NULL DEFAULT '',"
-                "status text NOT NULL DEFAULT 'active',"
-                "ds_id text NOT NULL DEFAULT 'dms')")
-    cur.execute(f"ALTER TABLE meta.element ADD COLUMN IF NOT EXISTS embedding vector({DIM})")
-    n_el = _revec(
-        cur, '元素',
-        "SELECT element_id, search_text FROM meta.element"
-        " WHERE status = 'active' AND embedding IS NULL AND ds_id = %s",    # 同上：meta::DS_PRED
-        "UPDATE meta.element SET embedding = %s WHERE element_id = %s AND ds_id = %s",
-        (ds,), (ds,))
-    cur.execute("DROP INDEX IF EXISTS meta.idx_element_hnsw")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_element_hnsw ON meta.element"
-                " USING hnsw (embedding vector_cosine_ops)")
-    n_ds = _revec_datasources(cur)
-    pg.close()
+    # connect_timeout 与 revec 同口径：PG 不在时 5s 响亮失败，不挂死在 TCP 上
+    pg = psycopg2.connect(connect_timeout=5, **pg_conf()); pg.autocommit = True; cur = pg.cursor()
+    try:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute(f"ALTER TABLE meta.table_doc ADD COLUMN IF NOT EXISTS embedding vector({DIM})")
+        # table_doc 刻意不带 embedding IS NULL 过滤（exemplar/element 的 SELECT 都带）：
+        # search_doc 变更的置 NULL 失效钩子不在本服务视野内，全量重算是防「文本改了向量没改」
+        # 的保守口径；代价是每次 build 重算全部表向量，接受它。
+        n_tbl = _revec(
+            cur, '表',
+            "SELECT table_name, coalesce(nullif(search_doc, ''), table_name) FROM meta.table_doc"
+            " WHERE ds_id = %s",                      # ds 限定 = Rust 侧 meta::DS_PRED
+            "UPDATE meta.table_doc SET embedding = %s WHERE table_name = %s AND ds_id = %s",
+            (ds,), (ds,))
+        cur.execute("DROP INDEX IF EXISTS meta.idx_doc_hnsw")
+        # 上面刚 DROP 过，这里裸 CREATE INDEX：再写 IF NOT EXISTS 读起来像不确定 drop 过没有
+        cur.execute("CREATE INDEX idx_doc_hnsw ON meta.table_doc"
+                    " USING hnsw (embedding vector_cosine_ops)")
+        # 语料问句向量（供语义缓存召回；问句侧 query embedding，与 Rust 回写一致）
+        n_ex = _revec(
+            cur, '条语料问句',
+            "SELECT id, question FROM meta.sql_exemplar"
+            " WHERE status = 'enabled' AND embedding IS NULL AND ds_id = %s",   # 同上：meta::DS_PRED
+            "UPDATE meta.sql_exemplar SET embedding = %s WHERE id = %s AND ds_id = %s",
+            (ds,), (ds,), True)
+        # 元素注册表向量（SuperSonic SchemaMapper 元素召回；search_text 变了自动 NULL 待重建）
+        # 建表 DDL 的事实源在 Rust `meta::bootstrap_meta`；这份兜底副本必须跟着带 ds_id，
+        # 否则「先跑 build 再启服务」会建出没有 ds_id 的表，下面那条 SQL 当场报缺列。
+        cur.execute("CREATE TABLE IF NOT EXISTS meta.element("
+                    "element_id text PRIMARY KEY, kind text NOT NULL, name text NOT NULL,"
+                    "aliases text[] NOT NULL DEFAULT '{}', ref_expr text NOT NULL DEFAULT '',"
+                    "description text NOT NULL DEFAULT '', search_text text NOT NULL DEFAULT '',"
+                    "status text NOT NULL DEFAULT 'active',"
+                    "ds_id text NOT NULL DEFAULT 'dms')")
+        cur.execute(f"ALTER TABLE meta.element ADD COLUMN IF NOT EXISTS embedding vector({DIM})")
+        n_el = _revec(
+            cur, '元素',
+            "SELECT element_id, search_text FROM meta.element"
+            " WHERE status = 'active' AND embedding IS NULL AND ds_id = %s",    # 同上：meta::DS_PRED
+            "UPDATE meta.element SET embedding = %s WHERE element_id = %s AND ds_id = %s",
+            (ds,), (ds,))
+        cur.execute("DROP INDEX IF EXISTS meta.idx_element_hnsw")
+        cur.execute("CREATE INDEX idx_element_hnsw ON meta.element"
+                    " USING hnsw (embedding vector_cosine_ops)")
+        n_ds = _revec_datasources(cur)
+    finally:
+        pg.close()                  # 中途异常也不许残留连接（revec 同口径）
     print(f'完成[ds={ds}]：{n_tbl} 表 / {n_ex} 语料问句 / {n_el} 元素 / {n_ds} 数据源'
           f' 向量化 + HNSW 索引', flush=True)
 
@@ -1076,7 +1137,9 @@ def _revec_datasources(cur):
     """向量选源（`pipeline::select_source` → `meta::nearest_datasources`）的唯一写入点。
     ⚠️ 这里**不加也不能加 ds 限定**：meta.datasource 是 ds 注册表本身（Rust 那条漂移守卫
        也把它列为豁免），按 ds 过滤就只有当前源有向量 → 选源永远选不到别的源。
-    只处理 embedding IS NULL：Rust `upsert_datasource` 在 description 变更时置 NULL 作失效。
+    只处理 embedding IS NULL：Rust `upsert_datasource` 在 description 变更时置 NULL 作失效
+    （指 semantic/registry/datasource.rs 的主 upsert；它还有第二条 `register_upload_datasource`
+    路径改 description **不清** embedding —— 陈旧向量的真正修复在 Rust 侧那条，这里口径不变）。
     文本 = name + description，与 `pick_by_llm` 给模型看的两个字段一致；
     问句侧是 embed_query（带指令前缀），故这里是文档侧 is_query=False，同 table_doc。"""
     return _revec(cur, '数据源',
@@ -1176,6 +1239,8 @@ def revec_chunks(cur, embed_fn=embed, batch=KB_BATCH):
             texts = [kb_embedding_text(name, folder, heading, body)
                      for _, _, name, folder, heading, body, _, _ in rows]
             vecs = embed_fn(texts)
+            if len(vecs) != len(texts):
+                raise RuntimeError(f'向量服务返回 {len(vecs)}/{len(texts)} 条，条数不符按本批失败处理')
         except Exception as e:
             # 保持 NULL 并让它计入「仍缺」——静默推进状态才是本节要修的缺陷
             print(f'  chunk …{last} 这批向量化失败，保持 NULL：{e}', flush=True)
@@ -1217,7 +1282,9 @@ def revec():
     # 口径注意：这两个只管**单条 SQL**，最慢的 embed 根本不是 SQL（一批 64 块实测 2.21s，
     # 不受 statement_timeout 约束）。实测 6 行那趟一共 10 条 SQL + 模型加载 + embed 合计 0.97s，
     # 所以 60s 对单条语句是纯兜底：真触发说明有锁或有全表扫，那时候该报错而不是等。
-    cur.execute("SET statement_timeout = '60s'; SET lock_timeout = '5s'")
+    # 两条 SET 分两次执行：塞在一个 execute 里是靠 psycopg2 简单查询协议才生效的，读着像会报错
+    cur.execute("SET statement_timeout = '60s'")
+    cur.execute("SET lock_timeout = '5s'")
     try:
         scanned, fixed, still, promoted = revec_chunks(cur)
     finally:
@@ -1227,32 +1294,76 @@ def revec():
     return revec_exit(scanned, fixed, still)
 
 
+# /embed 一次请求的条数上限：Rust 侧 embed.rs BATCH=64，这里给 4 倍余量；
+# 不封顶的批量会长时间占住 `_EMBED_LOCK`（推理串行），把其它请求全饿死
+EMBED_MAX_TEXTS = 256
+
+def _int_param(body, name, default):
+    """缺省/JSON null 用默认；显式给值必须能转 int（'abc' → 400 不是 500）。
+    🔴 不许写 `body.get(name) or default`：显式 0 会被吞成默认（overlap=0 正是「关重叠」）。"""
+    v = body.get(name)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise ParseError('bad_request', f'{name} 必须是整数：{v!r}', 400)
+
 def handle_post(path, body):
-    """POST 路由。未知路径按 /embed 处理（兼容原来忽略 path 的行为）"""
-    if path.startswith('/parse'):
-        return parse_doc(body.get('path') or '', body.get('mime') or '')
-    if path.startswith('/chunk'):
-        return {'chunks': chunk_blocks(body.get('blocks') or [],
-                                      int(body.get('target_tokens') or TARGET_TOKENS),
-                                      int(body.get('overlap') or OVERLAP))}
-    texts = body.get('texts', [])
-    return {'embeddings': embed(texts, is_query=bool(body.get('query', True))) if texts else []}
+    """POST 路由。/parse、/chunk **精确匹配**（/parseXYZ 不许进 /parse），未知路径按 /embed
+    处理（兼容原来忽略 path 的行为）。字段类型错是 400（调用方的错）不是 500（我们的错）：
+    path 传 list、blocks 传 dict、texts 传 "abc" 以前是 TypeError/AttributeError 500，
+    而 texts 传 "abc" 更糟 —— 按字符逐一向量化，静默错。"""
+    path = path.split('?')[0]          # 查询串不影响路由
+    if path == '/parse':
+        p, m = body.get('path'), body.get('mime')
+        if (p is not None and not isinstance(p, str)) or (m is not None and not isinstance(m, str)):
+            raise ParseError('bad_request', 'path/mime 必须是字符串', 400)
+        return parse_doc(p or '', m or '')
+    if path == '/chunk':
+        blocks = body.get('blocks')
+        if blocks is None:
+            blocks = []
+        if not isinstance(blocks, list) or any(not isinstance(b, dict) for b in blocks):
+            raise ParseError('bad_request', 'blocks 必须是对象数组', 400)
+        return {'chunks': chunk_blocks(blocks, _int_param(body, 'target_tokens', TARGET_TOKENS),
+                                       _int_param(body, 'overlap', OVERLAP))}
+    texts = body.get('texts')
+    if texts is None:
+        texts = []
+    if not isinstance(texts, list) or any(not isinstance(t, str) for t in texts):
+        raise ParseError('bad_request', 'texts 必须是字符串数组', 400)
+    if len(texts) > EMBED_MAX_TEXTS:
+        raise ParseError('too_large', f'texts {len(texts)} 条超上限 {EMBED_MAX_TEXTS}', 413)
+    # query 缺省 False（文档侧）：漏传就静默进 query 向量空间是错的方向（与 passages 不同空间，
+    # 检索恒排后）。Rust 端（embed.rs build_body）与 tools/ 探针都显式传 query，不受缺省影响。
+    return {'embeddings': embed(texts, is_query=bool(body.get('query', False))) if texts else []}
+
+# 请求体上限：/chunk 的 blocks 是大头（整份文档的块，实测量级 ~1MB）；32MB 是防内存 DoS
+# 的兜底，不是业务限制 —— 超过直接 413，不许全读进内存（本进程还托着 /embed 的模型）
+MAX_BODY_BYTES = 32 * 1024 * 1024
+
+def _content_length(v):
+    """Content-Length 解析：畸形/负值按 400 拒（以前 `int()` 在 try 外，
+    ValueError 直接掐断连接、客户端什么响应都拿不到）。"""
+    try:
+        n = int(v or 0)
+    except ValueError:
+        raise ParseError('bad_request', f'Content-Length 非法：{v!r}', 400)
+    if n < 0:
+        raise ParseError('bad_request', f'Content-Length 非法：{v!r}', 400)
+    return n
 
 def serve(port=8077, host='127.0.0.1'):
     # host 显式可选（默认回环不松）：Linux 服务器部署时容器要经 docker 网桥（172.17.0.1）
     # 访问本服务 —— 绑网桥地址即可，0.0.0.0 会把解析/向量面暴露给公网。
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     embedder()
-    # 启动就把「哪些扩展名不可用 + 为什么」打全：这条日志是运维唯一会看的地方，
-    # 只打一个 True/False 的字典等于让人自己去猜缺哪个包。
-    bad = [f"{e}（{c['why']}）" for e, c in sorted(parse_caps().items()) if not c['ok']]
-    print(f'embed 服务就绪 :{port}（{MODEL}, {DIM}维）解析能力 {parse_ok()}'
-          + (''.join(f'\n  ⛔ {b}' for b in bad) if bad else ''), flush=True)
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a): pass
         def do_GET(self):
             # 健康检查（run.ps1 常驻化轮询用）
-            if self.path == '/health':
+            if self.path.split('?')[0] == '/health':   # 探活常带 ?ts=… 防缓存
                 resp = json.dumps({'ok': True, 'model': MODEL, 'dim': DIM,
                                    'parse_ok': parse_ok(), 'parse_caps': parse_caps()},
                                   ensure_ascii=False).encode()
@@ -1265,16 +1376,26 @@ def serve(port=8077, host='127.0.0.1'):
             self.end_headers()
             self.wfile.write(resp)
         def do_POST(self):
-            n = int(self.headers.get('Content-Length', 0))
             try:
-                body = json.loads(self.rfile.read(n) or b'{}')
+                n = _content_length(self.headers.get('Content-Length'))
+                if n > MAX_BODY_BYTES:
+                    raise ParseError('too_large', f'请求体 {n} 字节超上限 {MAX_BODY_BYTES}', 413)
+                try:
+                    body = json.loads(self.rfile.read(n) or b'{}')
+                except json.JSONDecodeError as e:
+                    raise ParseError('bad_json', f'请求体不是合法 JSON：{e}', 400)
+                if not isinstance(body, dict):
+                    raise ParseError('bad_request', '请求体必须是 JSON 对象', 400)
                 resp = json.dumps(handle_post(self.path, body), ensure_ascii=False).encode()
                 self.send_response(200)
             except ParseError as e:
                 resp = json.dumps(e.payload, ensure_ascii=False).encode()
                 self.send_response(e.status)
             except Exception as e:
-                resp = json.dumps({'error': str(e)}, ensure_ascii=False).encode()
+                # 细节只进服务端日志：响应体回 str(e) 会把服务器绝对路径/内部形状泄给客户端
+                # （serve 支持绑非回环地址，那是信息外泄面）
+                print(f'[500] {self.path}: {type(e).__name__}: {e}', flush=True)
+                resp = json.dumps({'error': 'internal'}, ensure_ascii=False).encode()
                 self.send_response(500)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Content-Length', str(len(resp)))
@@ -1289,7 +1410,14 @@ def serve(port=8077, host='127.0.0.1'):
     # 同一件事 `docker/parser/parse_service.py:142` 早就修了，宿主这份漏了 —— 一份实现两个入口，
     # 只修一个入口等于没修。判据：`_selftest_serve_unblocked`（换回 HTTPServer 立刻红）。
     # 模型推理仍然串行（`_EMBED_LOCK`），并发的只有 IO 与解析。
-    ThreadingHTTPServer((host, port), H).serve_forever()
+    srv = ThreadingHTTPServer((host, port), H)
+    # 先 bind 成功再报就绪：端口被占时上面那行就抛 OSError —— 先说就绪再炸会误导运维。
+    # 启动就把「哪些扩展名不可用 + 为什么」打全：这条日志是运维唯一会看的地方，
+    # 只打一个 True/False 的字典等于让人自己去猜缺哪个包。
+    bad = [f"{e}（{c['why']}）" for e, c in sorted(parse_caps().items()) if not c['ok']]
+    print(f'embed 服务就绪 :{port}（{MODEL}, {DIM}维）解析能力 {parse_ok()}'
+          + (''.join(f'\n  ⛔ {b}' for b in bad) if bad else ''), flush=True)
+    srv.serve_forever()
 
 def selftest():
     """parse+chunk 自检：只用标准库（md/csv/json/html 四类），不依赖任何解析库与模型。
@@ -1350,7 +1478,17 @@ def selftest():
     _selftest_xlsx_dims(d)
     _selftest_table_chunks()
     _selftest_revec()
+    _selftest_md_heading()
+    _selftest_text_edges(d)
+    _selftest_pdf_runtime_fallback()
+    _selftest_pptx_title(d)
+    _selftest_image_frames(d)
+    _selftest_emit_guard()
+    _selftest_revec_len_guard()
+    _selftest_handle_post()
     dt = _selftest_serve_unblocked()
+    _selftest_http_errors()
+    shutil.rmtree(d, ignore_errors=True)     # 临时目录不留（以前每跑一次 selftest 留一个）
     print(f'selftest ok: md块={len(r["blocks"])} 分块={len(ch)} tokens={[c["tokens"] for c in ch]}'
           f'（含 revec 纯逻辑 + 能力表双向一致 + /embed 忙 2s 时 /health {dt * 1000:.0f}ms 返回）'
           f'\n  parse_ok={parse_ok()}', flush=True)
@@ -1623,6 +1761,295 @@ def _selftest_revec():
     assert kb_embedding_text('制度.md', '/财务/报销', '第一章 > 范围', '正文') == \
         '文件：制度.md\n目录：/财务/报销\n章节：第一章 > 范围\n\n正文'
 
+def _selftest_md_heading():
+    """`_H_MD` 的钉：中文文档常写 `#一级标题`（# 后不空格），要认出层级；
+    但 `#tag` / `#123` 不是标题（# 后首字符是 ASCII 字母数字的不放行）。"""
+    b = md_blocks('#一级标题\n正文。\n\n##二级\n再一句。', None, [])
+    assert [x['text'] for x in b] == ['一级标题', '正文。', '二级', '再一句。'], b
+    assert b[-1]['heading_path'] == '一级标题 > 二级', b
+    b = md_blocks('#tag\n#123', None, [])
+    assert [x['heading_path'] for x in b] == [''], b      # 都不是标题，合成一段正文
+
+
+def _selftest_text_edges(tmpdir):
+    """文本族入口的边角钉（`_read_text`/`_p_text`/`parse_doc`）：
+    ① UTF-16 BOM 先拦：Windows 导出的 txt 落入 gbk 会解成夹 NUL 的乱码而不是正确解码
+    ② `---`/`***` 这种无词字符块不进 blocks（与 `_p_pdf` 同一过滤口径）
+    ③ mime 匹配大小写不敏感（RFC 允许 `Text/Plain` 这种写法）"""
+    p = os.path.join(tmpdir, 'u16.txt')
+    with open(p, 'w', encoding='utf-16') as f:          # 带 BOM
+        f.write('第二章\n带 BOM 的 UTF-16 内容。')
+    r = parse_doc(p)
+    joined = '\n'.join(b['text'] for b in r['blocks'])
+    assert '带 BOM 的 UTF-16 内容。' in joined and '\x00' not in joined, r
+    p = os.path.join(tmpdir, 'sep.md')
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write('# 标题\n正文。\n\n---\n\n***\n\n下一段。')
+    r = parse_doc(p)
+    assert all(re.search(r'\w', b['text']) for b in r['blocks']), r['blocks']
+    p = os.path.join(tmpdir, 'only_sep.md')
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write('---\n\n***\n')
+    assert parse_doc(p)['blocks'] == [], '分隔线-only 文档不该产出块'
+    p = os.path.join(tmpdir, 'x.dat')                    # 没登记的扩展名，靠 mime 查表
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write('纯文本内容一句。')
+    r = parse_doc(p, 'Text/Plain; charset=UTF-8')
+    assert r['blocks'], 'mime 大小写必须不影响查表'
+    # `_cell` strip：xlsx/csv 里 ' 10 ' 这类带空白值不该原样进 sheets/表头
+    p = os.path.join(tmpdir, 'pad.csv')
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write('客户,金额\n甲, 10 \n')
+    assert parse_doc(p)['sheets'][0]['rows'] == [['甲', '10']], '单元格带空白必须 strip'
+
+
+def _selftest_pdf_runtime_fallback():
+    """`_p_pdf` 的运行期降级钉：pymupdf4llm **import 成功**但 `to_markdown` 抛异常
+    （损坏/异形 PDF）必须续降 `_pdf_fitz`，不许整份 500。桩模块驱动，不碰真 PDF。"""
+    import types
+    fake = types.ModuleType('pymupdf4llm')
+    fake.to_markdown = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('模拟损坏 PDF'))
+    sentinel = ([{'text': 'x', 'page': 1, 'heading_path': ''}], 1, [], [])
+    keep_mod, keep_fitz = sys.modules.get('pymupdf4llm'), globals()['_pdf_fitz']
+    sys.modules['pymupdf4llm'] = fake
+    globals()['_pdf_fitz'] = lambda path: sentinel
+    try:
+        assert _p_pdf('x.pdf') is sentinel, 'pymupdf4llm 运行期异常必须续降 _pdf_fitz'
+    finally:
+        if keep_mod is None:
+            sys.modules.pop('pymupdf4llm', None)
+        else:
+            sys.modules['pymupdf4llm'] = keep_mod
+        globals()['_pdf_fitz'] = keep_fitz
+
+
+def _selftest_pptx_title(tmpdir):
+    """pptx 标题去重的钉：标题 shape 也有 text_frame，不排除会同时进 heading_path 和正文，
+    标题被向量化两遍。没有 python-pptx 时跳过（同 `_selftest_xlsx_dims` 纪律）。"""
+    if not _have('pptx'):
+        print('  ⏭️  pptx 标题判据跳过（python-pptx 不可用）', flush=True)
+        return
+    from pptx import Presentation
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[0])   # 版式 0 带标题占位符
+    slide.shapes.title.text = '报销制度'
+    slide.placeholders[1].text = '上限三千。'
+    p = os.path.join(tmpdir, 't.pptx')
+    prs.save(p)
+    r = parse_doc(p)
+    assert len(r['blocks']) == 1, r['blocks']
+    assert r['blocks'][0]['heading_path'] == '报销制度', r['blocks']
+    assert '报销制度' not in r['blocks'][0]['text'] and '上限三千。' in r['blocks'][0]['text'], r['blocks']
+
+
+def _selftest_image_frames(tmpdir):
+    """多帧图片的三颗钉（桩 OCR 驱动，不碰引擎；PIL 缺席跳过）：
+    ① 帧数超 OCR_PAGE_CAP → too_large（每帧一次千问 HTTP，N 帧会远超 Rust 120s 解析超时）
+    ② 多帧 heading_path 带帧号（共用文件名会被 chunk 按 heading_path 合并出跨帧重复）；
+       单帧图保持裸文件名
+    ③ OCR 引擎抛的 ParseError 原样上抛，不许再包一层套娃 detail"""
+    if not _have('PIL.Image'):
+        print('  ⏭️  图片帧判据跳过（PIL 不可用）', flush=True)
+        return
+    from PIL import Image
+    p = os.path.join(tmpdir, 'frames.gif')
+    Image.new('RGB', (8, 8), 'white').save(
+        p, save_all=True, append_images=[Image.new('RGB', (8, 8), 'black'),
+                                        Image.new('RGB', (8, 8), 'red')])
+    g = globals()
+    keep = g['_ocr_qwen_frame'], g['_ocr_tesseract_frame'], g['OCR_PAGE_CAP']
+    try:
+        g['_ocr_qwen_frame'] = lambda frame: None
+        g['_ocr_tesseract_frame'] = lambda frame: '第N帧文字'
+        # ② 三帧 → heading_path 各不相同且带帧号；单帧图保持裸文件名
+        blocks, frames, _, _ = _p_image(p)
+        assert frames == 3 and len(blocks) == 3, (frames, blocks)
+        assert [b['heading_path'] for b in blocks] == \
+            ['frames.gif#f1', 'frames.gif#f2', 'frames.gif#f3'], blocks
+        one = os.path.join(tmpdir, 'one.png')
+        Image.new('RGB', (8, 8), 'white').save(one)
+        b1 = _p_image(one)[0]
+        assert [b['heading_path'] for b in b1] == ['one.png'], b1
+        # ③ ParseError 原样上抛不套娃
+        def _bad(frame):
+            raise ParseError('unsupported', 'tesseract OCR 失败（lang=x）')
+        g['_ocr_tesseract_frame'] = _bad
+        try:
+            _p_image(one)
+            raise AssertionError('ParseError 应原样上抛')
+        except ParseError as e:
+            detail = e.payload.get('detail', '')
+            assert 'tesseract OCR 失败' in detail and 'OCR 失败（tesseract' not in detail, e.payload
+        # ① 帧数护栏：cap 调到 2，三帧 gif 响亮 too_large
+        g['_ocr_tesseract_frame'] = keep[1]
+        g['OCR_PAGE_CAP'] = 2
+        try:
+            _p_image(p)
+            raise AssertionError('超帧数上限应报 too_large')
+        except ParseError as e:
+            assert e.payload['error'] == 'too_large' and '3' in e.payload['detail'], e.payload
+    finally:
+        g['_ocr_qwen_frame'], g['_ocr_tesseract_frame'], g['OCR_PAGE_CAP'] = keep
+
+
+def _selftest_emit_guard():
+    """`_emit` 的窗护栏钉：超 MAX_TOKENS 必须显式 raise（python -O 下 assert 会被剥掉，
+    超窗块静默进库被 fastembed 截断）。"""
+    try:
+        _emit([], '超' * (MAX_TOKENS * 2), 'H', None)      # est_tokens ≈ 1.25×MAX_TOKENS
+        raise AssertionError('超窗块必须 raise')
+    except ValueError as e:
+        assert '上限' in str(e), e
+
+
+def _selftest_revec_len_guard():
+    """向量条数与行数不符的钉（`_revec`/`revec_chunks`，与 Rust embed.rs
+    「少返一行→整批 None」同一纪律）：`_revec` 响亮失败（zip 静默截断会把向量错位回写），
+    `revec_chunks` 按「该批失败」处理（保持 NULL、计入仍缺、游标前进）。"""
+    cur = _FakeCur(batches=[[(1, 'd1', 'a.md', '/', '', 'a', 'old-a', KB_RECIPE),
+                             (2, 'd1', 'a.md', '/', '', 'b', 'old-b', KB_RECIPE)]],
+                   groups=[], missing=2)
+    got = revec_chunks(cur, lambda texts: [[0.5] * DIM] * (len(texts) - 1), batch=2)
+    assert got == (2, 0, 2, 0), got                     # 少返一条 → 这批保持 NULL
+    assert cur.updated == [] and cur.cursors == [0, 2], cur.cursors
+    class _Cur:
+        def execute(self, sql, params=()):
+            self.rows = [(1, 't1'), (2, 't2')]
+        def fetchall(self):
+            return self.rows
+    keep = globals()['embed']
+    globals()['embed'] = lambda texts, is_query=False: [[0.5] * DIM] * (len(texts) - 1)
+    try:
+        try:
+            _revec(_Cur(), '表', 'SEL', 'UPD')
+            raise AssertionError('条数不符必须响亮失败')
+        except RuntimeError as e:
+            assert '不符' in str(e), e
+    finally:
+        globals()['embed'] = keep
+
+
+def _selftest_handle_post():
+    """HTTP 入口形状的钉（不起服务，直接打 `handle_post`）：
+    ① 路由精确：/parseXYZ、/chunky 不许进对应 handler（未知路径按 /embed，兼容口径不变）
+    ② 显式 `overlap: 0` 不许被吞成默认 60（`x or DEFAULT` 的坑）；缺省/None 仍用默认
+    ③ 字段类型错 → 400：path 传 list / blocks 传 dict / texts 传 "abc" / overlap 传 'abc'
+    ④ /embed 缺省 query=false（Rust 端总是显式传）；texts 条数封顶 413"""
+    g = globals()
+    keep = g['embed']
+    seen = []
+    g['embed'] = lambda texts, is_query=False: (seen.append(is_query), [[0.0] * DIM] * len(texts))[1]
+    try:
+        # ① 未知路径（含 /parseXYZ、/chunky）按 /embed；查询串不影响路由
+        r = handle_post('/parseXYZ', {'texts': ['a']})
+        assert 'embeddings' in r and seen[-1] is False, r
+        r = handle_post('/chunky?x=1', {'texts': ['a'], 'query': True})
+        assert 'embeddings' in r and seen[-1] is True, r
+        # ④ 缺省 query = False
+        handle_post('/embed', {'texts': ['a']})
+        assert seen[-1] is False, seen
+        # ② overlap=0 真的 0（与直接调 chunk_blocks 逐字节一致）；缺省/None 仍是默认 60
+        blocks = [{'text': ''.join(chr(0x4e00 + i % 500) for i in range(300)),
+                   'heading_path': 'H', 'page': 1}]
+        want0 = chunk_blocks(blocks, 60, 0)
+        assert handle_post('/chunk', {'blocks': blocks, 'target_tokens': 60, 'overlap': 0})['chunks'] \
+            == want0, '显式 overlap=0 被吞成默认值'
+        wantd = chunk_blocks(blocks, 60, OVERLAP)
+        assert handle_post('/chunk', {'blocks': blocks, 'target_tokens': 60})['chunks'] == wantd
+        assert handle_post('/chunk', {'blocks': blocks, 'target_tokens': 60, 'overlap': None})['chunks'] \
+            == wantd, 'JSON null 应按缺省处理'
+        assert want0 != wantd, '夹具没造出重叠差异，这条钉白搭'
+        # /parse 正常路径仍通（文件不存在 → 404 not_found）
+        try:
+            handle_post('/parse', {'path': 'Z:/no/such/file.md'})
+            raise AssertionError('应报 not_found')
+        except ParseError as e:
+            assert e.payload['error'] == 'not_found' and e.status == 404, e.payload
+        # ③ 类型校验
+        for path, body in (('/parse', {'path': ['x']}),
+                           ('/parse', {'path': 'x.md', 'mime': 1}),
+                           ('/chunk', {'blocks': {'text': 'x'}}),
+                           ('/chunk', {'blocks': ['x']}),
+                           ('/chunk', {'blocks': [], 'overlap': 'abc'}),
+                           ('/embed', {'texts': 'abc'}),
+                           ('/embed', {'texts': [1]})):
+            try:
+                handle_post(path, body)
+                raise AssertionError(f'{path} {body} 应报 400')
+            except ParseError as e:
+                assert e.status == 400, (path, body, e.payload)
+        # ④ 条数上限
+        try:
+            handle_post('/embed', {'texts': ['a'] * (EMBED_MAX_TEXTS + 1)})
+            raise AssertionError('超上限应报 413')
+        except ParseError as e:
+            assert e.status == 413, e.payload
+    finally:
+        g['embed'] = keep
+
+
+def _selftest_http_errors():
+    """HTTP 错误形状的钉（真起一次 serve，桩 embed 抛错）：
+    ① 非法 JSON → 400 bad_json（以前走 except Exception 回 500）
+    ② 非对象 JSON（数组）→ 400 bad_request
+    ③ handler 意外异常 → 500 但响应体**不带**异常原文（内部细节只进服务端日志）
+    ④ /health 带查询串也认（探活防缓存写法 ?ts=…）
+    ⑤ 超大/畸形 Content-Length → 413/400（以前超大全读进内存、畸形直接掐断连接）"""
+    import socket
+    import time
+    g = globals()
+    keep = g['embed'], g['embedder']
+    def _boom(texts, is_query=False):
+        raise RuntimeError('内部细节-D:/secret/path 不该外泄')
+    g['embed'] = _boom
+    g['embedder'] = lambda: None
+    with socket.socket() as s:                 # 借一个空闲端口：别撞常驻的 8077
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+    base = f'http://127.0.0.1:{port}'
+    def post(raw):
+        req = urllib.request.Request(base + '/embed', data=raw,
+                                     headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+    def raw_status(cl):                        # 手写 Content-Length 的原始请求
+        with socket.socket() as c:
+            c.settimeout(5)
+            c.connect(('127.0.0.1', port))
+            c.sendall(b'POST /embed HTTP/1.1\r\nHost: x\r\nContent-Length: ' + cl +
+                      b'\r\nConnection: close\r\n\r\n')
+            resp = b''
+            while True:
+                chunk = c.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+        return resp.split(b'\r\n', 1)[0]
+    try:
+        threading.Thread(target=serve, args=(port,), daemon=True).start()  # 关不掉，同 unblocked 那条注释
+        for _ in range(50):                    # 等监听就绪
+            try:
+                with urllib.request.urlopen(base + '/health?ts=1', timeout=5) as r:   # ④
+                    assert r.status == 200 and json.loads(r.read())['ok']
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise AssertionError(f'serve 没能在 5s 内起在 {port}')
+        code, j = post(b'{not json')                                   # ①
+        assert code == 400 and j['error'] == 'bad_json', (code, j)
+        code, j = post(b'[1,2]')                                       # ②
+        assert code == 400 and j['error'] == 'bad_request', (code, j)
+        code, j = post(json.dumps({'texts': ['a']}).encode())          # ③
+        assert code == 500 and '内部细节' not in json.dumps(j, ensure_ascii=False), (code, j)
+        assert b' 413' in raw_status(b'999999999'), '超大 Content-Length 必须 413'      # ⑤
+        assert b' 400' in raw_status(b'abc'), '畸形 Content-Length 必须 400'
+    finally:
+        g['embed'], g['embedder'] = keep
+
 def _selftest_serve_unblocked():
     """**真起一次 serve**：/embed 慢的时候 /health 必须仍在 500ms 内返回。
 
@@ -1638,7 +2065,6 @@ def _selftest_serve_unblocked():
     不加载模型（patch 掉 `embedder`/`embed`）：selftest 的纪律是不碰第三方库与 95MB 模型。"""
     import socket
     import time
-    import urllib.request
     g = globals()
     keep = g['embed'], g['embedder']
     # 桩睡 2s。**别调小**：断言在 /embed 发出后 0.15s 才开始计时，剩余时间必须仍远超 500ms 阈值。
@@ -1656,6 +2082,8 @@ def _selftest_serve_unblocked():
             return json.loads(r.read())
 
     try:
+        # serve 不返回 server 对象（serve_forever 阻塞），这里起的实例关不掉 ——
+        # 靠 daemon 线程 + 进程退出兜底；selftest 进程短命，可接受
         threading.Thread(target=serve, args=(port,), daemon=True).start()
         for _ in range(50):                    # 等监听就绪（bind 之后到 accept 之前有个窗口）
             try:

@@ -25,7 +25,8 @@
 //!   `.route("/api/artifact/{id}/promote", post(artifact_api::promote))`
 //! `view/download` 的 `?version=N` 复用既有路由，无需新行。
 
-use std::sync::Arc;
+use std::fmt::Write as _;
+use std::sync::{Arc, LazyLock};
 
 use axum::{
     extract::{Path, Query, State},
@@ -43,9 +44,16 @@ fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
     (code, Json(serde_json::json!({ "error": msg.to_string() })))
 }
 
-/// 驱动错误可能带主机、库名或 SQL，产物接口一律只返回固定文案。
-fn db_err(_: impl std::fmt::Display) -> ApiErr {
+/// 驱动错误可能带主机、库名或 SQL，产物接口一律只返回固定文案 —— 真因只进服务端日志
+///（此前全文件零日志：DB 故障对外 500「请稍后重试」，运维侧没有任何线索）。
+fn db_err(e: impl std::fmt::Display) -> ApiErr {
+    tracing::warn!(err = %e, "artifact DB 操作失败");
     err(StatusCode::INTERNAL_SERVER_ERROR, "产物操作失败，请稍后重试")
+}
+
+/// 400 文案回显用户入参的上限（kind/fmt/feed 都是无长度上限的用户字符串）
+fn clipped_echo(s: &str) -> String {
+    s.chars().take(64).collect()
 }
 
 /// 管理员产物不接受兼容模式下的 `login_name` 回退，必须持有服务端签发的会话。
@@ -67,7 +75,7 @@ const ARTIFACT_CSP: &str = "sandbox allow-scripts; default-src 'none'; style-src
 const CSP_META_MARKER: &str = "data-dms-artifact-csp";
 
 /// 【D6 版本链】版本自增在库内单条语句完成（MAX(version)+1），唯一索引
-/// `idx_artifact_chain` 兜底并发撞号（撞号 = 第二次写入报错重试，不产生重复版本）。
+/// `idx_artifact_chain` 兜底并发撞号（撞号 = 第二次写入报错、由调用方重试，不产生重复版本）。
 const INSERT_SQL: &str =
     "INSERT INTO meta.artifact(conv_id, kind, title, html, created_by, version) \
      VALUES ($1,$2,$3,$4,$5,(SELECT COALESCE(MAX(version),0)+1 FROM meta.artifact \
@@ -131,11 +139,14 @@ pub struct CreateReq {
 
 /// `POST /api/artifact` —— 手工/内部造物（admin_only；分析与日报不走这里，直接调 `save_artifact`）。
 pub async fn create(
-    State(st): State<Arc<AppState>>, h: HeaderMap, Json(req): Json<CreateReq>,
+    State(st): State<Arc<AppState>>, h: HeaderMap, Json(mut req): Json<CreateReq>,
 ) -> ApiRes {
     require_bearer_session(&h)?;
-    let _p = crate::admin_api::admin_only(&st, &h, (&req.login_name, &req.role_code)).await?;
-    let conv_id = req.conv_id.as_deref().unwrap_or("");
+    let p = crate::admin_api::admin_only(&st, &h, (&req.login_name, &req.role_code)).await?;
+    // title/kind/conv_id 先 take 出来：html 分支要 move content，借用序先清场
+    let title = req.title.take().unwrap_or_else(|| "分析报告".to_string());
+    let kind = req.kind.take().unwrap_or_else(|| "markdown".to_string());
+    let conv_id = req.conv_id.take().unwrap_or_default();
     if !conv_id.is_empty() {
         let cid: i64 = conv_id
             .parse()
@@ -143,26 +154,18 @@ pub async fn create(
         let owner = crate::chat::conv_owner(st.owned.pool(), cid)
             .await
             .map_err(db_err)?;
-        if owner.as_deref() != Some(_p.login_name.as_str()) {
+        if owner.as_deref() != Some(p.login_name.as_str()) {
             return Err(err(StatusCode::FORBIDDEN, "无权向该会话写入产物"));
         }
     }
-    let kind = req.kind.as_deref().unwrap_or("markdown");
-    let html = match kind {
-        "markdown" | "report" => page_shell(req.title.as_deref().unwrap_or("分析报告"), &md_to_html(&req.content)),
-        "html" => req.content.clone(),
-        other => return Err(err(StatusCode::BAD_REQUEST, format!("kind 只能是 markdown|report|html：{other}"))),
+    let html = match kind.as_str() {
+        "markdown" | "report" => page_shell(&title, &md_to_html(&req.content)),
+        "html" => std::mem::take(&mut req.content), // 整页 HTML 直接 move，不再整页克隆
+        other => return Err(err(StatusCode::BAD_REQUEST, format!("kind 只能是 markdown|report|html：{}", clipped_echo(other)))),
     };
-    let (id, version) = save_artifact_versioned(
-        &st,
-        conv_id,
-        kind,
-        req.title.as_deref().unwrap_or("分析报告"),
-        &html,
-        &_p.login_name,
-    )
-    .await
-    .map_err(db_err)?;
+    let (id, version) = save_artifact_versioned(&st, &conv_id, &kind, &title, &html, &p.login_name)
+        .await
+        .map_err(db_err)?;
     Ok(Json(serde_json::json!({
         "id": id,
         "version": version,
@@ -253,7 +256,11 @@ async fn check_perm(
         let cid: i64 = row
             .conv_id
             .parse()
-            .map_err(|_| err(StatusCode::FORBIDDEN, "产物归属异常，禁止访问"))?;
+            .map_err(|_| {
+                // 解析失败 = 库里数据异常：留痕再拒（数据腐化不该静默 403）
+                tracing::warn!(artifact_id = row.id, conv_id = %row.conv_id, "产物 conv_id 无法解析为会话主键");
+                err(StatusCode::FORBIDDEN, "产物归属异常，禁止访问")
+            })?;
         let owner = crate::chat::conv_owner(st.owned.pool(), cid).await
             .map_err(db_err)?;
         if owner.as_deref() != Some(login) {
@@ -271,26 +278,31 @@ async fn check_perm(
 /// 沙箱响应头（双隔离的一半）：无 `allow-same-origin`；图表是无脚本 SVG，
 /// `script-src 'none'` 继续阻断历史产物里的脚本。产物始终读不到父页、Cookie、localStorage。
 fn sandbox_headers(content_type: &'static str) -> HeaderMap {
-    let mut h = HeaderMap::new();
+    // 七个头里六个全静态：底图只建一次，每次响应克隆一份再补 CONTENT_TYPE
+    static BASE: LazyLock<HeaderMap> = LazyLock::new(|| {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(ARTIFACT_CSP),
+        );
+        h.insert(
+            header::HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        );
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store, max-age=0"));
+        h.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+        h.insert(
+            header::HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("no-referrer"),
+        );
+        h.insert(
+            header::HeaderName::from_static("x-robots-tag"),
+            HeaderValue::from_static("noindex, nofollow, noarchive"),
+        );
+        h
+    });
+    let mut h = BASE.clone();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    h.insert(
-        header::HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static(ARTIFACT_CSP),
-    );
-    h.insert(
-        header::HeaderName::from_static("x-content-type-options"),
-        HeaderValue::from_static("nosniff"),
-    );
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store, max-age=0"));
-    h.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
-    h.insert(
-        header::HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("no-referrer"),
-    );
-    h.insert(
-        header::HeaderName::from_static("x-robots-tag"),
-        HeaderValue::from_static("noindex, nofollow, noarchive"),
-    );
     h
 }
 
@@ -311,11 +323,12 @@ fn download_name_ext(title: &str, ext: &str) -> String {
 /// RFC5987 `filename*`：非 ASCII 全转义（中文标题靠这条进 Content-Disposition）。
 fn encoded_download_name_ext(title: &str, ext: &str) -> String {
     let mut out = String::new();
-    for byte in format!("{title}.{ext}").bytes() {
+    // 分段迭代 title/ext 字节（不先拼 "{title}.{ext}" 整串）；转义 write! 直写缓冲
+    for byte in title.bytes().chain([b'.']).chain(ext.bytes()) {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
             out.push(byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out
@@ -370,7 +383,7 @@ pub async fn versions(
         .await
         .map_err(db_err)?;
     let items: Vec<serde_json::Value> = chain
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(i, (vid, v, at))| serde_json::json!({
             "id": vid,
@@ -399,10 +412,11 @@ pub struct ExportQuery {
 pub async fn export(
     State(st): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<i64>, Query(q): Query<ExportQuery>,
 ) -> Result<(HeaderMap, Vec<u8>), ApiErr> {
+    // version 走独立参数（load_versioned 只读参数版，塞进 ViewQuery 是死赋值）
     let vq = ViewQuery {
         login_name: q.login_name.clone(),
         role_code: q.role_code.clone(),
-        version: q.version,
+        ..Default::default()
     };
     let (row, _) = load_versioned(&st, &h, &vq, id, q.version).await?;
     let tables = extract_tables(&secure_artifact_html(&row.html));
@@ -410,7 +424,9 @@ pub async fn export(
         return Err(err(StatusCode::BAD_REQUEST, "该产物不含表格，无法导出"));
     }
     let title = secure_artifact_title(&row.title);
-    match q.fmt.as_deref().unwrap_or("csv") {
+    // fmt 大小写不敏感（低代码平台常传大写 CSV/XLSX）
+    let fmt = q.fmt.as_deref().unwrap_or("csv").to_ascii_lowercase();
+    match fmt.as_str() {
         "csv" => Ok((
             attachment_headers("text/csv; charset=utf-8", &title, "csv"),
             to_csv(&tables).into_bytes(),
@@ -423,7 +439,7 @@ pub async fn export(
             ),
             build_xlsx(&tables),
         )),
-        other => Err(err(StatusCode::BAD_REQUEST, format!("fmt 只能是 csv|xlsx：{other}"))),
+        other => Err(err(StatusCode::BAD_REQUEST, format!("fmt 只能是 csv|xlsx：{}", clipped_echo(other)))),
     }
 }
 
@@ -446,10 +462,11 @@ pub struct PromoteReq {
 pub async fn promote(
     State(st): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<i64>, Json(req): Json<PromoteReq>,
 ) -> ApiRes {
+    // version 走独立参数（同上：塞 ViewQuery 是死赋值）
     let q = ViewQuery {
         login_name: req.login_name.clone(),
         role_code: req.role_code.clone(),
-        version: req.version,
+        ..Default::default()
     };
     // ① 产物读权限：属主/管理员判据全部复用 load_versioned（读不到产物的人更不许引用它）
     let (row, login) = load_versioned(&st, &h, &q, id, req.version).await?;
@@ -475,6 +492,8 @@ pub async fn promote(
     crate::chat::save_msg(st.owned.pool(), req.target_conv_id, "ai", "", Some(&payload))
         .await
         .map_err(db_err)?;
+    // 安全敏感端点的成功路径必须有审计轨迹（id、操作人、目标 conv）
+    tracing::info!(artifact_id = row.id, operator = %login, target_conv = req.target_conv_id, "产物引用已钉入会话");
     Ok(Json(serde_json::json!({ "ok": true, "conv_id": req.target_conv_id })))
 }
 
@@ -494,6 +513,8 @@ fn sanitize_promote_note(note: &str) -> String {
 
 /// 导出行数护栏：产物是自渲染内容，理论体量小；上限防的是异常输入把导出拖死。
 const MAX_EXPORT_ROWS: usize = 20_000;
+/// 单元格总数护栏：行数护栏挡不住「2 万行 × 超宽表」在内存里拼出巨型 CSV/XML
+const MAX_EXPORT_CELLS: usize = 200_000;
 
 /// 从 HTML 抽出所有表格（表 → 行 → 单元格文本）。`<th>` 行天然就是表头行。
 fn extract_tables(html: &str) -> Vec<Vec<Vec<String>>> {
@@ -501,13 +522,20 @@ fn extract_tables(html: &str) -> Vec<Vec<Vec<String>>> {
     let lower = html.to_ascii_lowercase();
     let mut cursor = 0;
     let mut rows_left = MAX_EXPORT_ROWS;
-    while rows_left > 0 {
+    let mut cells_left = MAX_EXPORT_CELLS;
+    while rows_left > 0 && cells_left > 0 {
         let Some(relative) = lower[cursor..].find("<table") else { break };
         let start = cursor + relative;
+        // 标签边界闸：`<tablex` 伪标签不算表格起点（与 extract_cells 同一先例）
+        let boundary = lower[start + 6..].chars().next();
+        if !matches!(boundary, Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')) {
+            cursor = start + 6;
+            continue;
+        }
         let Some(open_end_rel) = lower[start..].find('>') else { break };
         let open_end = start + open_end_rel + 1;
         let Some(end) = matching_element_end(&lower, "table", open_end) else { break };
-        let rows = extract_rows(&html[start..end], &mut rows_left);
+        let rows = extract_rows(&html[start..end], &mut rows_left, &mut cells_left);
         if !rows.is_empty() {
             tables.push(rows);
         }
@@ -516,17 +544,24 @@ fn extract_tables(html: &str) -> Vec<Vec<Vec<String>>> {
     tables
 }
 
-fn extract_rows(table: &str, rows_left: &mut usize) -> Vec<Vec<String>> {
+fn extract_rows(table: &str, rows_left: &mut usize, cells_left: &mut usize) -> Vec<Vec<String>> {
     let lower = table.to_ascii_lowercase();
     let mut rows = Vec::new();
     let mut cursor = 0;
-    while *rows_left > 0 {
+    while *rows_left > 0 && *cells_left > 0 {
         let Some(relative) = lower[cursor..].find("<tr") else { break };
         let start = cursor + relative;
+        // 标签边界闸：`<trxyz` 不算行起点（与 extract_cells 同一先例）
+        let boundary = lower[start + 3..].chars().next();
+        if !matches!(boundary, Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')) {
+            cursor = start + 3;
+            continue;
+        }
         let Some(end_relative) = lower[start..].find("</tr>") else { break };
         let end = start + end_relative + "</tr>".len();
         let cells = extract_cells(&table[start..end]);
         if !cells.is_empty() {
+            *cells_left = (*cells_left).saturating_sub(cells.len());
             rows.push(cells);
             *rows_left -= 1;
         }
@@ -575,7 +610,13 @@ fn cell_text(html: &str) -> String {
     while let Some(i) = rest.find('<') {
         out.push_str(&rest[..i]);
         match rest[i..].find('>') {
-            Some(j) => rest = &rest[i + j + 1..],
+            Some(j) => {
+                // <br>/<br/> 是换行语义：剥掉前留一个空白，否则 "a<br>b" 导出成 "ab" 粘连
+                if rest[i + 1..i + j].trim_end_matches(['/', ' ', '\t']).eq_ignore_ascii_case("br") {
+                    out.push(' ');
+                }
+                rest = &rest[i + j + 1..];
+            }
             None => break,
         }
     }
@@ -583,15 +624,35 @@ fn cell_text(html: &str) -> String {
     decode_entities(&out).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// 最小实体集：自渲染链路（escape/display_value）只会产出这几个；`&amp;` 必须最后解。
+/// 最小实体集：自渲染链路（escape/display_value）只会产出这几个。
+/// 单趟扫描 `&` 起跳一次解码 —— 左到右匹配天然等价于「`&amp;` 最后解」
+///（`&amp;lt;` → 先命中 `&amp;` 产 `&`，余下 `lt;` 原样 = 旧实现结果），不再串 7 次全文 replace。
 fn decode_entities(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
+    const ENTITIES: &[(&str, &str)] = &[
+        ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&#39;", "'"),
+        ("&apos;", "'"), ("&nbsp;", " "), ("&amp;", "&"),
+    ];
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        match ENTITIES.iter().find(|(e, _)| tail.starts_with(e)) {
+            Some((e, r)) => {
+                out.push_str(r);
+                rest = &tail[e.len()..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 // ── CSV：形状对齐前端 downloadCsv（全量加引号、CRLF、BOM），另加公式注入护栏 ──
@@ -643,8 +704,10 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// 列号 → Excel 列标（1→A, 26→Z, 27→AA）。
+/// 列号 → Excel 列标（1→A, 26→Z, 27→AA）。`n=0` 会返回空串 —— 契约是「从 1 起」，
+/// 调用方恒传 `ci+1`，debug_assert 把契约钉在函数里而不是靠调用方自觉。
 fn col_letter(mut n: usize) -> String {
+    debug_assert!(n > 0, "列号从 1 起");
     let mut s = String::new();
     while n > 0 {
         n -= 1;
@@ -673,14 +736,16 @@ fn worksheet_xml(tables: &[Vec<Vec<String>>]) -> String {
         }
         for row in table {
             row_no += 1;
-            out.push_str(&format!("<row r=\"{row_no}\">"));
+            // write! 直写缓冲：每行每格 format! 出临时 String 是数万次白分配
+            let _ = write!(out, "<row r=\"{row_no}\">");
             for (ci, cell) in row.iter().enumerate() {
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "<c r=\"{}{}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{}</t></is></c>",
                     col_letter(ci + 1),
                     row_no,
                     xml_text(cell)
-                ));
+                );
             }
             out.push_str("</row>");
         }
@@ -693,7 +758,14 @@ fn worksheet_xml(tables: &[Vec<Vec<String>>]) -> String {
 fn zip_stored(parts: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
+    // ZIP32 字段上限断言：`as u32`/`as u16` 是静默截断 —— 单部件 >4GiB、部件名 >65535、
+    // 偏移 >4GiB 时 ZIP 头会写错值而无任何报错。内容全在内存（KB~MB 级），撞上即实现 bug，
+    // panic 好过产出错文件。
+    assert!(parts.len() <= u16::MAX as usize, "ZIP 部件数超 65535");
     for (name, data) in parts {
+        assert!(out.len() <= u32::MAX as usize, "ZIP 本地偏移超 4GiB");
+        assert!(data.len() <= u32::MAX as usize, "ZIP 单部件超 4GiB");
+        assert!(name.len() <= u16::MAX as usize, "ZIP 部件名超 65535 字节");
         let offset = out.len() as u32;
         let crc = crc32(data);
         let size = data.len() as u32;
@@ -732,6 +804,7 @@ fn zip_stored(parts: &[(&str, &[u8])]) -> Vec<u8> {
         central.extend_from_slice(&offset.to_le_bytes());
         central.extend_from_slice(name_bytes);
     }
+    assert!(out.len() <= u32::MAX as usize && central.len() <= u32::MAX as usize, "ZIP 目录偏移超 4GiB");
     let cd_offset = out.len() as u32;
     let cd_size = central.len() as u32;
     out.extend_from_slice(&central);
@@ -789,8 +862,10 @@ const SHARE_GET_SQL: &str =
 pub async fn share(
     State(st): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<i64>, Query(q): Query<ViewQuery>,
 ) -> ApiRes {
-    // 属主校验复用 load()（非属主连产物都读不到，更不许发链接）
-    let _ = load(&st, &h, &q, id).await?;
+    // 属主校验复用 load_versioned（非属主连产物都读不到，更不许发链接）
+    let (_, login) = load_versioned(&st, &h, &q, id, None).await?;
+    // 已有 token 时（CASE 保留旧值）这个 uuid 白生成 —— 接受的取舍：uuid 生成是纳秒级
+    // 纯 CPU，为它先 SELECT 查现有 token 反而多付一次 PG 往返
     let token = uuid::Uuid::new_v4().to_string();
     let row: Option<(String,)> = st
         .owned
@@ -803,6 +878,7 @@ pub async fn share(
     let Some((tok,)) = row else {
         return Err(err(StatusCode::NOT_FOUND, "产物不存在"));
     };
+    tracing::info!(artifact_id = id, operator = %login, "产物分享链接已签发（或复用既有 token）");
     Ok(Json(serde_json::json!({ "share_url": format!("/api/artifact/shared/{tok}") })))
 }
 
@@ -810,7 +886,7 @@ pub async fn share(
 pub async fn unshare(
     State(st): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<i64>, Query(q): Query<ViewQuery>,
 ) -> ApiRes {
-    let _ = load(&st, &h, &q, id).await?;
+    let (_, login) = load_versioned(&st, &h, &q, id, None).await?;
     let affected = st.owned
         .fixed(SHARE_CLEAR_SQL)
         .bind(id)
@@ -820,6 +896,7 @@ pub async fn unshare(
     if affected == 0 {
         return Err(err(StatusCode::NOT_FOUND, "产物不存在"));
     }
+    tracing::info!(artifact_id = id, operator = %login, "产物分享链接已撤销");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -884,7 +961,7 @@ pub async fn list(
                 .await
                 .map_err(db_err)?
         }
-        Some(other) => return Err(err(StatusCode::BAD_REQUEST, format!("未知产物 feed：{other}"))),
+        Some(other) => return Err(err(StatusCode::BAD_REQUEST, format!("未知产物 feed：{}", clipped_echo(other)))),
         None => {
             // 传了 conv_id 就校验归属；不传仍只查空 conv，不许枚举别人的会话产物。
             if let Some(cid) = &q.conv_id {
@@ -898,7 +975,7 @@ pub async fn list(
                 }
             }
             st.owned.fixed(LIST_SQL)
-                .bind(q.conv_id.clone().unwrap_or_default())
+                .bind(q.conv_id.as_deref().unwrap_or(""))
                 .bind(&login)
                 .bind(q.limit.unwrap_or(20).clamp(1, 100))
                 .fetch_all().await.map_err(db_err)?
@@ -918,7 +995,15 @@ pub async fn list(
 /// 整页外壳（标题 + 正文）。样式**全部内联**（沙箱里没有任何外部资源可达）。
 pub fn page_shell(title: &str, body_html: &str) -> String {
     let title = secure_artifact_title(title);
-    let heading = if body_html.trim_start().starts_with("<h1") {
+    // 已有顶级 <h1> 就不叠双标题：大小写不敏感 + 边界闸（`<H1>` 不命中会叠双标题，
+    // `<h1foo` 误命中会吞标题）
+    let body_trim = body_html.trim_start();
+    let has_h1 = body_trim.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("<h1"))
+        && matches!(
+            body_trim.get(4..).and_then(|r| r.chars().next()),
+            Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')
+        );
+    let heading = if has_h1 {
         String::new()
     } else {
         format!("<h1>{}</h1>", escape(&title))
@@ -1002,6 +1087,8 @@ fn secure_artifact_html(html: &str) -> String {
 
 fn secure_artifact_title(title: &str) -> String {
     let title = strip_internal_refs(&redact_sensitive(title));
+    // 「证据」在标题里整词删除、在正文里改名「数据」（secure_artifact_html）：标题是紧凑
+    // 展示位，改名后语义立不住；正文要保可读性，故改名 —— 两种处置是有意的，不是漂移
     let title = title
         .replace("证据编号", "")
         .replace("证据", "")
@@ -1015,18 +1102,23 @@ fn secure_artifact_title(title: &str) -> String {
     if title.is_empty() { "分析报告".to_string() } else { title }
 }
 
+/// needle 入参约定**已小写**（调用点全是小写字面量，debug_assert 钉着）：只小写化 haystack，
+/// 不再每次调用连 needle 也小写化一遍、haystack 整串复制一遍之外再多一份
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    haystack.to_ascii_lowercase().find(&needle.to_ascii_lowercase())
+    debug_assert!(needle.bytes().all(|b| !b.is_ascii_uppercase()), "needle 必须已小写：{needle}");
+    haystack.to_ascii_lowercase().find(needle)
 }
 
 fn redact_sensitive(input: &str) -> String {
     let mut out = input.to_string();
+    // lower 与 out 增量同步（掩码是纯 CJK，无大小写差）：替换发生在哪就同步改哪，
+    // 不再每轮迭代对整串重算小写化（命中多时 O(n×次数) 反复全量分配）
+    let mut lower = out.to_ascii_lowercase();
     for prefix in [
         "mysql://", "postgres://", "postgresql://", "jdbc:", "redis://", "mongodb://",
         "bearer ",
     ] {
         loop {
-            let lower = out.to_ascii_lowercase();
             let Some(start) = lower.find(prefix) else { break };
             let mut end = start + prefix.len();
             while end < out.len() {
@@ -1037,6 +1129,7 @@ fn redact_sensitive(input: &str) -> String {
                 end += ch.len_utf8();
             }
             out.replace_range(start..end, "[敏感连接信息已隐藏]");
+            lower.replace_range(start..end, "[敏感连接信息已隐藏]");
         }
     }
     for label in [
@@ -1052,9 +1145,9 @@ fn redact_sensitive(input: &str) -> String {
 }
 
 fn redact_long_prefixed(text: &mut String, prefix: &str, minimum_len: usize) {
+    let mut lower = text.to_ascii_lowercase(); // 增量同步，理由同 redact_sensitive
     let mut from = 0;
     loop {
-        let lower = text.to_ascii_lowercase();
         let Some(relative) = lower[from..].find(prefix) else { break };
         let start = from + relative;
         let mut end = start + prefix.len();
@@ -1068,6 +1161,7 @@ fn redact_long_prefixed(text: &mut String, prefix: &str, minimum_len: usize) {
         }
         if end - start >= minimum_len {
             text.replace_range(start..end, "[敏感凭据已隐藏]");
+            lower.replace_range(start..end, "[敏感凭据已隐藏]");
             from = start + "[敏感凭据已隐藏]".len();
         } else {
             from = end;
@@ -1076,9 +1170,9 @@ fn redact_long_prefixed(text: &mut String, prefix: &str, minimum_len: usize) {
 }
 
 fn redact_assignment(text: &mut String, label: &str) {
+    let mut lower = text.to_ascii_lowercase(); // 增量同步，理由同 redact_sensitive
     let mut from = 0;
     loop {
-        let lower = text.to_ascii_lowercase();
         let Some(relative) = lower[from..].find(label) else { break };
         let start = from + relative + label.len();
         let mut value_start = start;
@@ -1114,6 +1208,7 @@ fn redact_assignment(text: &mut String, label: &str) {
         }
         if end > value_start {
             text.replace_range(value_start..end, "[已隐藏]");
+            lower.replace_range(value_start..end, "[已隐藏]");
             from = value_start + "[已隐藏]".len();
         } else {
             from = start;
@@ -1162,10 +1257,11 @@ fn is_ipv4_port(value: &str) -> bool {
 
 fn strip_internal_refs(input: &str) -> String {
     let mut out = input.to_string();
+    // upper 与 out 增量同步（替换全是删除，不动大小写）：不再每轮全量重算大写化
+    let mut upper = out.to_ascii_uppercase();
     for prefix in ["[KPI-", "[SEC-", "[CON-"] {
         let mut cursor = 0;
         loop {
-            let upper = out.to_ascii_uppercase();
             let Some(relative) = upper[cursor..].find(prefix) else { break };
             let start = cursor + relative;
             let mut end = start + prefix.len();
@@ -1174,6 +1270,7 @@ fn strip_internal_refs(input: &str) -> String {
             }
             if end > start + prefix.len() && out.as_bytes().get(end) == Some(&b']') {
                 out.replace_range(start..=end, "");
+                upper.replace_range(start..=end, "");
                 cursor = start;
             } else {
                 cursor = end.max(start + prefix.len());
@@ -1183,7 +1280,6 @@ fn strip_internal_refs(input: &str) -> String {
     for prefix in ["KPI-", "SEC-", "CON-"] {
         let mut cursor = 0;
         loop {
-            let upper = out.to_ascii_uppercase();
             let Some(relative) = upper[cursor..].find(prefix) else { break };
             let start = cursor + relative;
             let mut end = start + prefix.len();
@@ -1199,6 +1295,7 @@ fn strip_internal_refs(input: &str) -> String {
                 continue;
             }
             out.replace_range(start..end, "");
+            upper.replace_range(start..end, "");
             cursor = start;
         }
     }
@@ -1207,8 +1304,8 @@ fn strip_internal_refs(input: &str) -> String {
 
 fn remove_elements_by_tag(input: &str, tag: &str) -> String {
     let mut out = input.to_string();
+    let mut lower = out.to_ascii_lowercase(); // 增量同步（替换全是删除），理由同 redact_sensitive
     loop {
-        let lower = out.to_ascii_lowercase();
         let needle = format!("<{tag}");
         let mut cursor = 0;
         let mut range = None;
@@ -1227,15 +1324,53 @@ fn remove_elements_by_tag(input: &str, tag: &str) -> String {
         }
         let Some((start, end)) = range else { break };
         out.replace_range(start..end, "");
+        lower.replace_range(start..end, "");
     }
     out
 }
 
+/// 开标签里 class 属性的取值列表（只够收自渲染产物的口径，不是通用 HTML 解析器）：
+/// 等号两侧空白（`class = "x"`）与无引号写法（`class=x`）都认；`data-class` 之类不算。
+fn class_values(opening: &str) -> Vec<&str> {
+    let mut values = Vec::new();
+    let mut rest = opening;
+    while let Some(i) = rest.find("class") {
+        // 词边界：前一字符贴着属性名字符（data-class）不算
+        let before_ok = rest[..i]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')));
+        let after = rest[i + 5..].trim_start();
+        rest = after;
+        if !before_ok {
+            continue;
+        }
+        let Some(after_eq) = after.strip_prefix('=') else { continue };
+        let v = after_eq.trim_start();
+        let (raw, remain) = match v.chars().next() {
+            Some(q @ ('"' | '\'')) => {
+                let body = &v[1..];
+                match body.find(q) {
+                    Some(j) => (&body[..j], &body[j..]),
+                    None => (body, ""),
+                }
+            }
+            _ => {
+                let j = v.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(v.len());
+                (&v[..j], &v[j..])
+            }
+        };
+        values.extend(raw.split_whitespace());
+        rest = remain;
+    }
+    values
+}
+
 fn remove_elements_with_class(input: &str, class_name: &str) -> String {
     let mut out = input.to_string();
+    let mut lower = out.to_ascii_lowercase(); // 增量同步（替换全是删除），理由同上
     for tag in ["section", "details", "div", "aside", "article"] {
         loop {
-            let lower = out.to_ascii_lowercase();
             let needle = format!("<{tag}");
             let mut cursor = 0;
             let mut found = None;
@@ -1244,11 +1379,7 @@ fn remove_elements_with_class(input: &str, class_name: &str) -> String {
                 let Some(open_end_rel) = lower[start..].find('>') else { break };
                 let open_end = start + open_end_rel + 1;
                 let opening = &lower[start..open_end];
-                if opening.contains("class=")
-                    && opening
-                        .split(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace())
-                        .any(|part| part == class_name)
-                {
+                if class_values(opening).iter().any(|v| *v == class_name) {
                     found = Some((start, open_end));
                     break;
                 }
@@ -1257,6 +1388,7 @@ fn remove_elements_with_class(input: &str, class_name: &str) -> String {
             let Some((start, open_end)) = found else { break };
             let end = matching_element_end(&lower, tag, open_end).unwrap_or(open_end);
             out.replace_range(start..end, "");
+            lower.replace_range(start..end, "");
         }
     }
     out
@@ -1273,7 +1405,11 @@ fn matching_element_end(lower: &str, tag: &str, content_start: usize) -> Option<
         match (next_open, next_close) {
             (_, None) => return None,
             (Some(open_at), Some(close_at)) if open_at < close_at => {
-                depth += 1;
+                // 开标签边界闸：`<tablex` 不计作 `<table` 嵌套（深度算错会让结束位偏移）
+                let boundary = lower[open_at + open.len()..].chars().next();
+                if matches!(boundary, Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')) {
+                    depth += 1;
+                }
                 cursor = open_at + open.len();
             }
             (_, Some(close_at)) => {
@@ -1287,9 +1423,11 @@ fn matching_element_end(lower: &str, tag: &str, content_start: usize) -> Option<
 
 fn remove_elements_containing_terms(input: &str, tags: &[&str], terms: &[&str]) -> String {
     let mut out = input.to_string();
+    let mut lower = out.to_ascii_lowercase(); // 增量同步（替换全是删除），理由同上
+    // terms 小写化一次（逐元素 any() 闭包里反复 to_ascii_lowercase 是白分配）
+    let terms: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
     for tag in tags {
         loop {
-            let lower = out.to_ascii_lowercase();
             let needle = format!("<{tag}");
             let mut cursor = 0;
             let mut range = None;
@@ -1303,7 +1441,7 @@ fn remove_elements_containing_terms(input: &str, tags: &[&str], terms: &[&str]) 
                 let Some(open_end_relative) = lower[start..].find('>') else { break };
                 let open_end = start + open_end_relative + 1;
                 let Some(end) = matching_element_end(&lower, tag, open_end) else { break };
-                if terms.iter().any(|term| lower[start..end].contains(&term.to_ascii_lowercase())) {
+                if terms.iter().any(|term| lower[start..end].contains(term)) {
                     range = Some((start, end));
                     break;
                 }
@@ -1311,6 +1449,7 @@ fn remove_elements_containing_terms(input: &str, tags: &[&str], terms: &[&str]) 
             }
             let Some((start, end)) = range else { break };
             out.replace_range(start..end, "");
+            lower.replace_range(start..end, "");
         }
     }
     out
@@ -1318,22 +1457,29 @@ fn remove_elements_containing_terms(input: &str, tags: &[&str], terms: &[&str]) 
 
 fn remove_heading_section(input: &str, heading: &str) -> String {
     let mut out = input.to_string();
+    let mut lower = out.to_ascii_lowercase(); // 增量同步（替换全是删除），理由同上
     for level in ["h2", "h3"] {
         loop {
-            let lower = out.to_ascii_lowercase();
-            let open = format!("<{level}>");
+            let needle = format!("<{level}");
             let close = format!("</{level}>");
             let mut cursor = 0;
             let mut range = None;
-            while let Some(relative) = lower[cursor..].find(&open) {
+            while let Some(relative) = lower[cursor..].find(&needle) {
                 let start = cursor + relative;
-                let body_start = start + open.len();
+                // 边界闸 + 带属性开标签（`<h2 class="x">` 里的该删标题不许静默漏过）
+                let boundary = lower[start + needle.len()..].chars().next();
+                if !matches!(boundary, Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')) {
+                    cursor = start + needle.len();
+                    continue;
+                }
+                let Some(open_end_rel) = lower[start..].find('>') else { break };
+                let body_start = start + open_end_rel + 1;
                 let Some(close_relative) = lower[body_start..].find(&close) else { break };
                 let heading_end = body_start + close_relative + close.len();
                 let text = out[body_start..body_start + close_relative].trim();
                 if text.eq_ignore_ascii_case(heading) {
                     let end = lower[heading_end..]
-                        .find(&open)
+                        .find(&needle)
                         .map(|offset| heading_end + offset)
                         .or_else(|| lower[heading_end..].find("</main>").map(|offset| heading_end + offset))
                         .or_else(|| lower[heading_end..].find("</body>").map(|offset| heading_end + offset))
@@ -1345,6 +1491,7 @@ fn remove_heading_section(input: &str, heading: &str) -> String {
             }
             let Some((start, end)) = range else { break };
             out.replace_range(start..end, "");
+            lower.replace_range(start..end, "");
         }
     }
     out
@@ -1352,12 +1499,18 @@ fn remove_heading_section(input: &str, heading: &str) -> String {
 
 fn remove_table_rows_with_terms(input: &str, terms: &[&str]) -> String {
     let mut out = input.to_string();
+    let mut lower = out.to_ascii_lowercase(); // 增量同步（替换全是删除），理由同上
     loop {
-        let lower = out.to_ascii_lowercase();
         let mut cursor = 0;
         let mut range = None;
         while let Some(relative) = lower[cursor..].find("<tr") {
             let start = cursor + relative;
+            // 标签边界闸：`<trxyz` 不算行起点（与 extract_cells 同一先例）
+            let boundary = lower[start + 3..].chars().next();
+            if !matches!(boundary, Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')) {
+                cursor = start + 3;
+                continue;
+            }
             let Some(end_relative) = lower[start..].find("</tr>") else { break };
             let end = start + end_relative + "</tr>".len();
             if terms.iter().any(|term| lower[start..end].contains(term)) {
@@ -1368,23 +1521,31 @@ fn remove_table_rows_with_terms(input: &str, terms: &[&str]) -> String {
         }
         let Some((start, end)) = range else { break };
         out.replace_range(start..end, "");
+        lower.replace_range(start..end, "");
     }
     out
 }
 
 fn remove_table_columns_with_headers(input: &str, terms: &[&str]) -> String {
     let mut out = input.to_string();
+    let mut lower = out.to_ascii_lowercase(); // 增量同步，理由同上
     let mut cursor = 0;
     loop {
-        let lower = out.to_ascii_lowercase();
         let Some(relative) = lower[cursor..].find("<table") else { break };
         let start = cursor + relative;
+        // 标签边界闸：`<tablex` 伪标签不算（与 extract_cells 同一先例）
+        let boundary = lower[start + 6..].chars().next();
+        if !matches!(boundary, Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')) {
+            cursor = start + 6;
+            continue;
+        }
         let Some(open_end_relative) = lower[start..].find('>') else { break };
         let open_end = start + open_end_relative + 1;
         let Some(end) = matching_element_end(&lower, "table", open_end) else { break };
         let replacement = strip_table_columns(&out[start..end], terms);
         if replacement.as_str() != &out[start..end] {
             out.replace_range(start..end, &replacement);
+            lower.replace_range(start..end, &replacement.to_ascii_lowercase());
             cursor = start + replacement.len();
         } else {
             cursor = end;
@@ -1401,6 +1562,8 @@ fn strip_table_columns(table: &str, terms: &[&str]) -> String {
     };
     let header_end = header_start + header_end_relative + "</tr>".len();
     let headers = cell_ranges(&table[header_start..header_end], "th");
+    // terms 小写化一次（逐单元格 any() 闭包里反复算白分配；调用点本就全小写字面量）
+    let terms: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
     let hidden = headers
         .iter()
         .enumerate()
@@ -1408,7 +1571,7 @@ fn strip_table_columns(table: &str, terms: &[&str]) -> String {
             let cell = table[header_start + start..header_start + end].to_ascii_lowercase();
             terms
                 .iter()
-                .any(|term| cell.contains(&term.to_ascii_lowercase()))
+                .any(|term| cell.contains(term))
                 .then_some(index)
         })
         .collect::<Vec<_>>();
@@ -1425,6 +1588,12 @@ fn strip_table_columns(table: &str, terms: &[&str]) -> String {
     let mut cursor = 0;
     while let Some(relative) = lower[cursor..].find("<tr") {
         let start = cursor + relative;
+        // 标签边界闸：`<trxyz` 不算行起点（与 extract_cells 同一先例）
+        let boundary = lower[start + 3..].chars().next();
+        if !matches!(boundary, Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')) {
+            cursor = start + 3;
+            continue;
+        }
         let Some(end_relative) = lower[start..].find("</tr>") else { break };
         let end = start + end_relative + "</tr>".len();
         rows.push((start, end));
@@ -1467,18 +1636,16 @@ fn cell_ranges(row: &str, tag: &str) -> Vec<(usize, usize)> {
 
 fn remove_meta_tags_containing(input: &str, terms: &[&str]) -> String {
     let mut out = input.to_string();
+    let mut lower = out.to_ascii_lowercase(); // 增量同步（替换全是删除），理由同上
+    let terms: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
     loop {
-        let lower = out.to_ascii_lowercase();
         let mut cursor = 0;
         let mut range = None;
         while let Some(relative) = lower[cursor..].find("<meta") {
             let start = cursor + relative;
             let Some(end_relative) = lower[start..].find('>') else { break };
             let end = start + end_relative + 1;
-            if terms
-                .iter()
-                .any(|term| lower[start..end].contains(&term.to_ascii_lowercase()))
-            {
+            if terms.iter().any(|term| lower[start..end].contains(term)) {
                 range = Some((start, end));
                 break;
             }
@@ -1486,6 +1653,7 @@ fn remove_meta_tags_containing(input: &str, terms: &[&str]) -> String {
         }
         let Some((start, end)) = range else { break };
         out.replace_range(start..end, "");
+        lower.replace_range(start..end, "");
     }
     out
 }
@@ -1523,7 +1691,10 @@ fn move_segment_before_document_end(input: &str, start: usize, end: usize) -> St
     let segment = input[start..end].to_string();
     let mut out = input.to_string();
     out.replace_range(start..end, "");
-    let insert_at = out.find("</main>").or_else(|| out.find("</body>")).unwrap_or(out.len());
+    // 大小写不敏感：大写闭合标签时锚点丢失会退化成追加到文末
+    let insert_at = find_ascii_case_insensitive(&out, "</main>")
+        .or_else(|| find_ascii_case_insensitive(&out, "</body>"))
+        .unwrap_or(out.len());
     out.insert_str(insert_at, &segment);
     out
 }
@@ -1864,7 +2035,7 @@ mod tests {
     fn share_flow_keeps_ownership_gate_and_token_shape() {
         let src = include_str!("artifact_api.rs");
         let share = src.split("pub async fn share(").nth(1).expect("share 没了");
-        assert!(share.contains("load(&st, &h, &q, id).await?"), "发链接少了属主校验：{share}");
+        assert!(share.contains("load_versioned(&st, &h, &q, id, None).await?"), "发链接少了属主校验：{share}");
         // 已有 token 不轮换（轮换 = 旧链接静默失效，用户不知道）
         assert!(share.contains("CASE WHEN share_token = '' THEN $2 ELSE share_token END"), "{share}");
         let shared = src.split("pub async fn shared(").nth(1).expect("shared 没了");
@@ -1873,7 +2044,7 @@ mod tests {
         assert!(shared.contains("sandbox_headers"), "分享页也必须给沙箱头：{shared}");
         let unshare = src.split("pub async fn unshare(").nth(1).expect("unshare 没了");
         assert!(unshare.contains("share_token = ''"), "撤销 = 清空 token：{unshare}");
-        assert!(unshare.contains("load(&st, &h, &q, id).await?"), "撤销也少属主校验：{unshare}");
+        assert!(unshare.contains("load_versioned(&st, &h, &q, id, None).await?"), "撤销也少属主校验：{unshare}");
     }
 
     #[test]
@@ -1938,6 +2109,47 @@ mod tests {
         assert_eq!(tables[1][0], vec!["lone".to_string(), "x<y".to_string()], "{:?}", tables[1]);
         // 无表格 → 空（端点据此 400「该产物不含表格」）
         assert!(extract_tables("<p>纯文本报告</p>").is_empty());
+    }
+
+    /// 单元格文本：<br> 是换行语义，剥掉要留空白（否则 "a<br>b" 导出成 "ab" 粘连）
+    #[test]
+    fn cell_text_keeps_br_as_whitespace() {
+        assert_eq!(cell_text("a<br>b"), "a b");
+        assert_eq!(cell_text("a<BR/>b"), "a b", "大小写与自闭合都要认");
+        assert_eq!(cell_text("a<br>  b"), "a b", "多空白照常折叠");
+        assert_eq!(cell_text("a<b>b</b>c"), "abc", "无语义标签照旧剥掉");
+    }
+
+    /// 单趟实体解码与旧「&amp; 最后解」逐字等价（含嵌套形态）
+    #[test]
+    fn decode_entities_single_pass_matches_legacy_order() {
+        assert_eq!(decode_entities("&lt;"), "<");
+        assert_eq!(decode_entities("&amp;"), "&");
+        assert_eq!(decode_entities("&amp;lt;"), "&lt;", "嵌套只解一层");
+        assert_eq!(decode_entities("&amp;amp;"), "&amp;");
+        assert_eq!(decode_entities("x&lt;y &amp; z&quot;"), "x<y & z\"");
+        assert_eq!(decode_entities("&unknown;"), "&unknown;", "未知实体原样保留");
+        assert_eq!(decode_entities("无实体"), "无实体");
+    }
+
+    /// class 属性解析：等号两侧空白与无引号写法都认；data-class 不算
+    #[test]
+    fn class_values_accept_whitespace_around_equals() {
+        assert_eq!(class_values(r#"<section class="sqlx x">"#), vec!["sqlx", "x"]);
+        assert_eq!(class_values(r#"<section class = "sqlx">"#), vec!["sqlx"], "等号带空格");
+        assert_eq!(class_values("<section class=sqlx>"), vec!["sqlx"], "无引号");
+        assert_eq!(class_values(r#"<section class='sqlx'>"#), vec!["sqlx"], "单引号");
+        assert!(class_values(r#"<section data-class="sqlx">"#).is_empty(), "data-class 不算");
+        // 清洗端对端：带空格的 class 写法里的该删段不许漏
+        let cleaned = remove_elements_with_class(r#"<p>留</p><div class = "sqlx"><p>删</p></div>"#, "sqlx");
+        assert!(cleaned.contains('留') && !cleaned.contains('删'), "{cleaned}");
+    }
+
+    /// 导出护栏常量钉：行数 + 单元格总数（改数值的人必须读常量注释再想一遍）
+    #[test]
+    fn export_budget_constants_are_pinned() {
+        assert_eq!(MAX_EXPORT_ROWS, 20_000);
+        assert_eq!(MAX_EXPORT_CELLS, 200_000);
     }
 
     /// 【D6 导出】CSV：BOM、全量引号、内嵌引号翻倍、公式注入前置 `'`、多表空行分隔。

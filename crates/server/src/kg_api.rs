@@ -80,6 +80,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use dms_knowledge::{acl, kg, Viewer};
+use futures::FutureExt;
 use sqlx::Row;
 use std::sync::Arc;
 
@@ -89,6 +90,14 @@ type ApiOk = Json<serde_json::Value>;
 /// 响应体沿用现有 `{"error": msg}` 形状（前端只认这一种）。
 fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
     (code, Json(serde_json::json!({ "error": msg.to_string() })))
+}
+
+/// 500 统一收口：底层错误原文进 warn 日志（线上排障的唯一线索），客户端只见固定文案。
+fn err500<E: std::fmt::Display>(msg: &'static str) -> impl FnOnce(E) -> ApiErr {
+    move |e| {
+        tracing::warn!(err = %e, "{}", msg);
+        err(StatusCode::INTERNAL_SERVER_ERROR, msg)
+    }
 }
 
 /// 身份换算与 `kb_api::viewer` 同一条链（resolve_identity → load_principal）。
@@ -103,7 +112,11 @@ async fn viewer(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
     let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
-        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
+        .map_err(|e| {
+            // 底层错误原文只进日志：DB 故障不该被误判成身份问题（403 文案不透出是刻意的）
+            tracing::warn!(login = %login, err = %e, "DMS 身份/角色查询失败");
+            err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用")
+        })?;
     Ok(Viewer::new(p.login_name, vec![p.role_code]))
 }
 
@@ -138,6 +151,15 @@ pub async fn migrate(pg: &sqlx::PgPool) -> anyhow::Result<()> {
     for stmt in DDL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         sqlx::query(stmt).execute(pg).await?;
     }
+    Ok(())
+}
+
+/// 进程内只迁移一次：build/status/failed_chunks/reset/reconcile 每请求各跑 2 条 DDL
+/// RTT 太贵（status 还是构建期轮询热点）。失败不占位，下次请求自动重试。
+static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+async fn migrate_once(pg: &sqlx::PgPool) -> anyhow::Result<()> {
+    MIGRATED.get_or_try_init(|| migrate(pg)).await?;
     Ok(())
 }
 
@@ -196,31 +218,49 @@ pub async fn build(
     Json(req): Json<BuildReq>,
 ) -> Result<ApiOk, ApiErr> {
     let v = viewer(&st, &headers, &req.login_name, &req.role_code).await?;
-    let space_id = space_param(Some(req.space_id.as_str()))?.to_string();
-    if !acl::space_writable(&st.owned, &v, &space_id)
+    // 原地借用校验：只有 spawn 需要 owned，全程只分配这一次
+    let space_id = space_param(Some(req.space_id.as_str()))?;
+    if !acl::space_writable(&st.owned, &v, space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用"))?
+        .map_err(err500("知识库服务暂时不可用"))?
     {
         return Err(err(StatusCode::FORBIDDEN, format!("无权构建空间 {space_id} 的图谱")));
     }
     let pool = st.owned.pool().clone();
-    migrate(&pool)
+    migrate_once(&pool)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱状态表初始化失败"))?;
+        .map_err(err500("图谱状态表初始化失败"))?;
     let claimed: Option<String> = sqlx::query_scalar(CLAIM_SQL)
-        .bind(&space_id)
+        .bind(space_id)
         .fetch_optional(&pool)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱构建认领失败"))?;
+        .map_err(err500("图谱构建认领失败"))?;
     if claimed.is_none() {
         return Err(err(StatusCode::CONFLICT, "该空间图谱正在构建中，请稍后查询进度"));
     }
     let st2 = st.clone();
-    let space = space_id.clone();
+    let space = space_id.to_string();
     tokio::spawn(async move {
         let progress = PgProgress { pool: st2.owned.pool().clone(), space_id: space.clone() };
-        let out =
-            kg::build_space(&st2.owned, st2.owned.pool(), &st2.llm, &v, &space, &progress).await;
+        // catch_unwind 兜底：build_space panic 也必须落 failed 终态，否则状态行卡
+        // building 直到 30 分钟过期才被接管。
+        let out = std::panic::AssertUnwindSafe(kg::build_space(
+            &st2.owned,
+            st2.owned.pool(),
+            &st2.llm,
+            &v,
+            &space,
+            &progress,
+        ))
+        .catch_unwind()
+        .await;
+        let out = match out {
+            Ok(out) => out,
+            Err(_) => {
+                tracing::error!(space_id = %space, "图谱构建任务 panic，落 failed 终态");
+                Err(dms_knowledge::KbError::Upstream("图谱构建任务异常中断".into()))
+            }
+        };
         finish(st2.owned.pool(), &space, out).await;
     });
     Ok(Json(serde_json::json!({ "ok": true, "state": "building", "space_id": space_id })))
@@ -231,16 +271,19 @@ pub async fn build(
 async fn finish(pool: &sqlx::PgPool, space_id: &str, out: Result<kg::BuildOutcome, dms_knowledge::KbError>) {
     let result = match out {
         Ok(o) => {
-            let samples = serde_json::to_value(&o.failed_samples)
-                .unwrap_or_else(|_| serde_json::json!([]));
+            let samples = serde_json::to_value(&o.failed_samples).unwrap_or_else(|e| {
+                tracing::warn!(space_id, err = %e, "失败样本序列化失败，按空数组落库");
+                serde_json::json!([])
+            });
             sqlx::query(
                 "UPDATE meta.kb_graph_build SET state='done',total=$2,done=$3,failed=$4,\
                  failed_samples=$5,error='',updated_at=now() WHERE space_id=$1",
             )
             .bind(space_id)
-            .bind(o.total as i32)
-            .bind(o.done as i32)
-            .bind(o.failed as i32)
+            // usize→i32 溢出不许静默回绕：超上限按 MAX 落库（计数只用于展示）
+            .bind(i32::try_from(o.total).unwrap_or(i32::MAX))
+            .bind(i32::try_from(o.done).unwrap_or(i32::MAX))
+            .bind(i32::try_from(o.failed).unwrap_or(i32::MAX))
             .bind(samples)
             .execute(pool)
             .await
@@ -278,8 +321,10 @@ impl kg::BuildProgress for PgProgress {
         samples: &'a [kg::FailedSample],
     ) -> dms_kernel::BoxFut<'a, ()> {
         Box::pin(async move {
-            let samples =
-                serde_json::to_value(samples).unwrap_or_else(|_| serde_json::json!([]));
+            let samples = serde_json::to_value(samples).unwrap_or_else(|e| {
+                tracing::warn!(space_id = %self.space_id, err = %e, "失败样本序列化失败，按空数组落库");
+                serde_json::json!([])
+            });
             if let Err(e) = sqlx::query(
                 "UPDATE meta.kb_graph_build SET total=$2,done=$3,failed=$4,failed_samples=$5,\
                  updated_at=now() WHERE space_id=$1",
@@ -308,14 +353,14 @@ pub async fn status(
     let space_id = space_param(q.space_id.as_deref())?;
     if !acl::space_readable(&st.owned, &v, space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用"))?
+        .map_err(err500("知识库服务暂时不可用"))?
     {
         return Err(err(StatusCode::FORBIDDEN, format!("空间 {space_id} 不可见")));
     }
     let pool = st.owned.pool().clone();
-    migrate(&pool)
+    migrate_once(&pool)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱状态表初始化失败"))?;
+        .map_err(err500("图谱状态表初始化失败"))?;
     let row = sqlx::query(
         "SELECT state,total,done,failed,failed_samples,error,updated_at::text AS updated_at \
          FROM meta.kb_graph_build WHERE space_id=$1",
@@ -323,10 +368,14 @@ pub async fn status(
     .bind(space_id)
     .fetch_optional(&pool)
     .await
-    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱状态查询失败"))?;
+    .map_err(err500("图谱状态查询失败"))?;
     let body = match row {
         Some(r) => serde_json::json!({
-            "state": r.try_get::<String, _>("state").unwrap_or_default(),
+            // state 列失配按 idle 透出并留痕：契约四值之外不许透出 ""（轮询方按四值分支）
+            "state": r.try_get::<String, _>("state").unwrap_or_else(|e| {
+                tracing::warn!(err = %e, "图谱状态列读取失败，按 idle 透出");
+                "idle".to_string()
+            }),
             "total": r.try_get::<i32, _>("total").unwrap_or(0),
             "done": r.try_get::<i32, _>("done").unwrap_or(0),
             "failed": r.try_get::<i32, _>("failed").unwrap_or(0),
@@ -357,8 +406,13 @@ pub async fn subgraph(
     let limit = clamp_limit(q.limit);
     let docs = kg::visible_doc_ids(&st.owned, &v, space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用"))?;
+        .map_err(err500("知识库服务暂时不可用"))?;
     let center = q.center.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    // 传了 center 但 trim 后为空：显式 400——静默降级成全量 TOP 子图，
+    // 调用方无法区分「center 无效」与「没传 center」
+    if q.center.is_some() && center.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "center 不能为空或全空白"));
+    }
     let sg = match center {
         Some(c) => dms_connector::doc_graph::neighborhood(
             st.owned.pool(),
@@ -370,15 +424,20 @@ pub async fn subgraph(
         .await,
         None => dms_connector::doc_graph::subgraph(st.owned.pool(), space_id, &docs, limit).await,
     }
-    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱查询暂时不可用"))?;
-    Ok(Json(serde_json::json!({
-        "nodes": sg.nodes.iter().map(|n| serde_json::json!({
+    .map_err(err500("图谱查询暂时不可用"))?;
+    let mut nodes = Vec::with_capacity(sg.nodes.len());
+    for n in &sg.nodes {
+        nodes.push(serde_json::json!({
             "id": n.id, "name": n.name, "label": n.label, "weight": n.weight,
-        })).collect::<Vec<_>>(),
-        "edges": sg.edges.iter().map(|e| serde_json::json!({
+        }));
+    }
+    let mut edges = Vec::with_capacity(sg.edges.len());
+    for e in &sg.edges {
+        edges.push(serde_json::json!({
             "src": e.src, "dst": e.dst, "relation": e.relation, "weight": e.weight,
-        })).collect::<Vec<_>>(),
-    })))
+        }));
+    }
+    Ok(Json(serde_json::json!({ "nodes": nodes, "edges": edges })))
 }
 
 /// `GET /api/kb/graph/stats?space_id=` —— 同样在可见文档集合上计数。
@@ -391,10 +450,10 @@ pub async fn stats(
     let space_id = space_param(q.space_id.as_deref())?;
     let docs = kg::visible_doc_ids(&st.owned, &v, space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用"))?;
+        .map_err(err500("知识库服务暂时不可用"))?;
     let s = dms_connector::doc_graph::stats(st.owned.pool(), space_id, &docs)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱查询暂时不可用"))?;
+        .map_err(err500("图谱查询暂时不可用"))?;
     Ok(Json(serde_json::json!({
         "entities": s.entities, "relations": s.relations, "docs": s.docs,
     })))
@@ -409,7 +468,7 @@ async fn build_state(pool: &sqlx::PgPool, space_id: &str) -> Result<Option<Strin
         .bind(space_id)
         .fetch_optional(pool)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱状态查询失败"))
+        .map_err(err500("图谱状态查询失败"))
 }
 
 /// failed-chunks 的分页钳制（契约：limit 默认 50、钳 1..=200；offset 默认 0、钳 ≤100000）。
@@ -438,19 +497,19 @@ pub async fn failed_chunks(
     let space_id = space_param(q.space_id.as_deref())?;
     if !acl::space_readable(&st.owned, &v, space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用"))?
+        .map_err(err500("知识库服务暂时不可用"))?
     {
         return Err(err(StatusCode::FORBIDDEN, format!("空间 {space_id} 不可见")));
     }
     let pool = st.owned.pool().clone();
-    migrate(&pool)
+    migrate_once(&pool)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱状态表初始化失败"))?;
+        .map_err(err500("图谱状态表初始化失败"))?;
     let row = sqlx::query("SELECT state, failed_samples FROM meta.kb_graph_build WHERE space_id=$1")
         .bind(space_id)
         .fetch_optional(&pool)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱状态查询失败"))?;
+        .map_err(err500("图谱状态查询失败"))?;
     let (state, samples) = match row {
         Some(r) => (
             r.try_get::<String, _>("state").unwrap_or_default(),
@@ -459,20 +518,21 @@ pub async fn failed_chunks(
         ),
         None => ("idle".to_string(), serde_json::json!([])),
     };
-    let mut sample_map: std::collections::HashMap<(String, i64), String> =
+    // key 借用 samples 里的字符串：逐样本克隆 String 纯为查表太亏
+    let mut sample_map: std::collections::HashMap<(&str, i64), &str> =
         std::collections::HashMap::new();
     for s in samples.as_array().into_iter().flatten() {
-        let doc_id = s["doc_id"].as_str().unwrap_or_default().to_string();
+        let doc_id = s["doc_id"].as_str().unwrap_or_default();
         let chunk_id = s["chunk_id"].as_i64().unwrap_or(-1);
-        sample_map.insert((doc_id, chunk_id), s["error"].as_str().unwrap_or_default().to_string());
+        sample_map.insert((doc_id, chunk_id), s["error"].as_str().unwrap_or_default());
     }
     let eligible = kg::eligible_chunks(&st.owned, &v, space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用"))?;
+        .map_err(err500("知识库服务暂时不可用"))?;
     let present: std::collections::HashSet<i64> =
         dms_connector::doc_graph::chunk_nodes(&pool, space_id)
             .await
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱查询暂时不可用"))?
+            .map_err(err500("图谱查询暂时不可用"))?
             .into_iter()
             .map(|(_, chunk_id)| chunk_id)
             .collect();
@@ -484,7 +544,7 @@ pub async fn failed_chunks(
         .skip(offset)
         .take(limit)
         .map(|(chunk_id, doc_id, ord)| {
-            let error = sample_map.get(&(doc_id.clone(), *chunk_id));
+            let error = sample_map.get(&(doc_id.as_str(), *chunk_id));
             serde_json::json!({
                 "chunk_id": chunk_id,
                 "doc_id": doc_id,
@@ -509,28 +569,34 @@ pub async fn reset(
     let space_id = space_param(Some(req.space_id.as_str()))?.to_string();
     if !acl::space_writable(&st.owned, &v, &space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用"))?
+        .map_err(err500("知识库服务暂时不可用"))?
     {
         return Err(err(StatusCode::FORBIDDEN, format!("无权清空空间 {space_id} 的图谱")));
     }
     let pool = st.owned.pool().clone();
-    migrate(&pool)
+    migrate_once(&pool)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱状态表初始化失败"))?;
+        .map_err(err500("图谱状态表初始化失败"))?;
     if build_state(&pool, &space_id).await?.as_deref() == Some("building") {
         return Err(err(StatusCode::CONFLICT, "该空间图谱正在构建中，构建结束后再清空"));
     }
     // 清图复用 build 前清库的同一个收口（Chunk/Entity 双标签 DETACH DELETE，标签未建 = 空操作）
     dms_connector::doc_graph::clear_space(&pool, &space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱清空失败"))?;
-    // 状态行一并删除：status 对缺行空间回 idle 零值行 —— 清空后不该再透出旧计数
-    sqlx::query("DELETE FROM meta.kb_graph_build WHERE space_id=$1")
+        .map_err(err500("图谱清空失败"))?;
+    // 状态行一并删除：status 对缺行空间回 idle 零值行 —— 清空后不该再透出旧计数。
+    // DELETE 带 state 谓词收口 TOCTOU：检查通过后另一请求认领到 building 时，本语句
+    // 删不掉那行（rows_affected=0），据实 409 而不是把正在跑的构建状态行删掉。
+    let deleted = sqlx::query("DELETE FROM meta.kb_graph_build WHERE space_id=$1 AND state<>'building'")
         .bind(&space_id)
         .execute(&pool)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱状态行清理失败"))?;
-    tracing::info!(space_id, "图谱已按空间清空（reset）");
+        .map_err(err500("图谱状态行清理失败"))?
+        .rows_affected();
+    if deleted == 0 && build_state(&pool, &space_id).await?.as_deref() == Some("building") {
+        return Err(err(StatusCode::CONFLICT, "该空间图谱正在构建中，构建结束后再清空"));
+    }
+    tracing::info!(space_id, operator = %v.login, "图谱已按空间清空（reset）");
     Ok(Json(serde_json::json!({ "ok": true, "space_id": space_id, "state": "idle" })))
 }
 
@@ -565,14 +631,14 @@ pub async fn reconcile(
     let space_id = space_param(Some(req.space_id.as_str()))?.to_string();
     if !acl::space_writable(&st.owned, &v, &space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用"))?
+        .map_err(err500("知识库服务暂时不可用"))?
     {
         return Err(err(StatusCode::FORBIDDEN, format!("无权修复空间 {space_id} 的图谱")));
     }
     let pool = st.owned.pool().clone();
-    migrate(&pool)
+    migrate_once(&pool)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱状态表初始化失败"))?;
+        .map_err(err500("图谱状态表初始化失败"))?;
     if build_state(&pool, &space_id).await?.as_deref() == Some("building") {
         return Err(err(StatusCode::CONFLICT, "该空间图谱正在构建中，构建结束后再修复"));
     }
@@ -583,20 +649,20 @@ pub async fn reconcile(
         .clamp(1, RECONCILE_ORPHANS_CAP);
     let alive: std::collections::HashSet<String> = kg::alive_doc_ids(&st.owned, &space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "存活文档查询失败"))?
+        .map_err(err500("存活文档查询失败"))?
         .into_iter()
         .collect();
     let graph_chunks = dms_connector::doc_graph::chunk_nodes(&pool, &space_id)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱读取失败"))?;
+        .map_err(err500("图谱读取失败"))?;
     let plan = kg::plan_reconcile(&graph_chunks, &alive, max_orphans);
-    let dangling = dms_connector::doc_graph::dangling_entities(&pool, &space_id, &plan.orphan_chunk_ids)
-        .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱读取失败"))?;
-    let relations =
-        dms_connector::doc_graph::relation_count_of_chunks(&pool, &space_id, &plan.orphan_chunk_ids)
-            .await
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "图谱读取失败"))?;
+    // 两条只读查询互不依赖：并发发出，不串行累加 RTT
+    let (dangling, relations) = tokio::join!(
+        dms_connector::doc_graph::dangling_entities(&pool, &space_id, &plan.orphan_chunk_ids),
+        dms_connector::doc_graph::relation_count_of_chunks(&pool, &space_id, &plan.orphan_chunk_ids),
+    );
+    let dangling = dangling.map_err(err500("图谱读取失败"))?;
+    let relations = relations.map_err(err500("图谱读取失败"))?;
     let mut deleted = serde_json::json!({ "relations": 0, "chunks": 0, "entities": 0 });
     if !dry_run {
         // 执行闸：超阈值一律拒删（此前一个字节都没动 —— 统计查询不改图）
@@ -612,13 +678,13 @@ pub async fn reconcile(
         }
         dms_connector::doc_graph::delete_relations_of_chunks(&pool, &space_id, &plan.orphan_chunk_ids)
             .await
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "孤儿关系边清理失败"))?;
+            .map_err(err500("孤儿关系边清理失败"))?;
         dms_connector::doc_graph::delete_chunks(&pool, &space_id, &plan.orphan_chunk_ids)
             .await
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "孤儿块清理失败"))?;
+            .map_err(err500("孤儿块清理失败"))?;
         dms_connector::doc_graph::delete_entities(&pool, &space_id, &dangling)
             .await
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "悬空实体清理失败"))?;
+            .map_err(err500("悬空实体清理失败"))?;
         deleted = serde_json::json!({
             "relations": relations,
             "chunks": plan.orphan_chunk_ids.len(),
@@ -626,8 +692,10 @@ pub async fn reconcile(
         });
         tracing::info!(
             space_id,
+            operator = %v.login,
             orphans = plan.orphan_chunk_ids.len(),
             dangling = dangling.len(),
+            relations = relations,
             "图谱 reconcile 已执行"
         );
     }
@@ -788,14 +856,16 @@ mod tests {
     }
 
     /// reset：清图必须复用 build 前清库的同一个收口（clear_space），且状态行一并删除
-    /// （不删的话 status 会透出一张已被清空的图的旧计数）。
+    /// （不删的话 status 会透出一张已被清空的图的旧计数）；DELETE 必须带 building 谓词
+    /// （TOCTOU 收口：检查通过后另一请求认领到 building，无谓词的 DELETE 会摘掉它的状态行）。
     #[test]
     fn reset_clears_graph_and_status_row() {
         let src = include_str!("kg_api.rs");
         let body = src.split("pub async fn reset(").nth(1).expect("reset 不见了");
         let body = body.split("\n}\n").next().unwrap();
         assert!(body.contains("doc_graph::clear_space"), "清图必须走 doc_graph 收口，不许另拼");
-        assert!(body.contains("DELETE FROM meta.kb_graph_build WHERE space_id=$1"), "状态行必须一并删除");
+        assert!(body.contains("DELETE FROM meta.kb_graph_build WHERE space_id=$1 AND state<>'building'"),
+                "状态行删除必须带 building 谓词（TOCTOU 收口）");
     }
 
     /// reconcile 的三条铁律锚点：dry-run 默认开；执行闸拒删必须发生在任何 DELETE 之前；
@@ -820,5 +890,49 @@ mod tests {
         let chunk = body.find("delete_chunks").unwrap();
         let ent = body.find("delete_entities").unwrap();
         assert!(rel < chunk && chunk < ent, "删除顺序必须是 边→Chunk→实体");
+    }
+
+    /// center 空白必须 400：静默降级全量子图会让调用方分不清「center 无效」与「没传 center」
+    #[test]
+    fn subgraph_rejects_blank_center() {
+        let src = include_str!("kg_api.rs");
+        let body = src
+            .split(concat!("pub async fn sub", "graph"))
+            .nth(1)
+            .expect("subgraph 不见了");
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("BAD_REQUEST"), "空白 center 必须显式 400: {body}");
+    }
+
+    /// 构建 panic 必须落 failed 终态（catch_unwind 兜底），不许卡 building 等 30 分钟过期
+    #[test]
+    fn build_spawn_catches_panic_into_failed_state() {
+        let src = include_str!("kg_api.rs");
+        assert!(src.contains("catch_unwind"), "build 的 spawn 必须 catch_unwind 兜底");
+        assert!(src.contains("图谱构建任务异常中断"), "panic 的终态 error 文案没了");
+    }
+
+    /// 进程内只迁移一次（status 是构建期轮询热点，每请求 2 条 DDL RTT 太贵）；
+    /// 失败不占位（OnceCell 只在成功后初始化），下次请求自动重试。
+    #[test]
+    fn migrate_is_once_per_process() {
+        let src = include_str!("kg_api.rs");
+        assert!(src.contains("tokio::sync::OnceCell"), "migrate 必须走 OnceCell 只跑一次");
+        assert!(!src.contains(concat!("migrate(&po", "ol)")), "请求路径不许再直调 migrate（走 migrate_once）");
+    }
+
+    /// reset/reconcile 的 info 日志必须带操作者（运维要追溯谁清的图）；
+    /// reconcile 日志不许漏 relations 删除数（响应里有，日志里也必须有）。
+    #[test]
+    fn ops_logs_carry_operator_and_relation_count() {
+        let src = include_str!("kg_api.rs");
+        for f in ["pub async fn reset(", "pub async fn reconcile("] {
+            let body = src.split(f).nth(1).unwrap_or_else(|| panic!("{f} 不见了"));
+            let end = body.find("\n}\n").expect("处理器形状变了");
+            let body = &body[..end];
+            assert!(body.contains("operator = %v.login"), "{f} 的 info 日志必须带 operator");
+        }
+        let rec = src.split("pub async fn reconcile(").nth(1).unwrap();
+        assert!(rec.contains("relations = relations"), "reconcile 日志漏了 relations 删除数");
     }
 }

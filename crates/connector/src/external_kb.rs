@@ -11,13 +11,15 @@
 //! 这三个变量配齐，等于部署方把这只数据集授给全体 KB 用户；它走不到 `kb.doc` 的 ACL 子查询，
 //! 作为交换，每条记录都带 `source_uri` 标注来源，让用户能看穿「这条证据来自外部系统」。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// 单次请求超时（对齐 embed/rerank 问句侧的 3s）：外部检索在检索关键路径上，用户在等。
-const TIMEOUT_SECS: u64 = 3;
-/// send 失败后的冷却期（对齐 embed/rerank 的 300s）：外部服务挂时每问白等一个 3s 超时才是事故。
-const COOLDOWN_SECS: u64 = 300;
+use crate::{now, COOLDOWN_SECS, HTTP_CALL_TIMEOUT_SECS};
+
+/// 一次检索的 top_k 上限（防御性 clamp：巨型 top_k 原样透传就是巨型响应）
+const MAX_TOP_K: usize = 100;
+/// 问句外发上限（字符）：超大问句不原样外发（成本与对方 413 面）
+const MAX_QUERY_CHARS: usize = 2000;
 
 /// 一条远程检索记录。`source_uri` 由客户端按 base/dataset/segment 拼出 —— 来源标注在
 /// connector 收口，调用方拿到的每条记录都自带可回看的出处。
@@ -42,25 +44,37 @@ pub struct ExtKbClient {
     url: String,
     source_prefix: String,
     api_key: Option<String>,
-    cooldown_until: Arc<AtomicU64>,
+    cooldown_until: Arc<std::sync::atomic::AtomicU64>,
+    /// 实例级复用的 HTTP 客户端（与 `EmbedClient` 同一条修法）：超时逐请求设。
+    http: reqwest::Client,
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+// 手写 Debug：derive 会把 api_key 打进日志
+impl std::fmt::Debug for ExtKbClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtKbClient")
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 impl ExtKbClient {
     /// `base_url` 例 `http://dify.internal/v1`（请求打 `{base}/datasets/{dataset}/retrieve`）。
     pub fn new(base_url: &str, api_key: Option<&str>, dataset: &str) -> Self {
+        // 空值/特殊字符只能来自手调 new（from_vars 已拦截）：debug 构建当场炸
+        debug_assert!(
+            !base_url.trim().is_empty() && Self::valid_dataset(dataset),
+            "空 base/dataset 或非法 dataset 字符请走 from_vars 判据"
+        );
         let prefix = format!("{}/datasets/{}", base_url.trim_end_matches('/'), dataset);
         Self {
             url: format!("{prefix}/retrieve"),
             source_prefix: prefix,
             api_key: api_key.map(str::trim).filter(|k| !k.is_empty()).map(str::to_string),
-            cooldown_until: Arc::new(AtomicU64::new(0)),
+            cooldown_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // build() 只在 TLS 后端缺失这类部署事故时失败：启动即崩是刻意取舍（同 embed.rs）
+            http: reqwest::Client::builder().build().expect("ext-kb http client"),
         }
     }
 
@@ -80,8 +94,19 @@ impl ExtKbClient {
         if base.is_empty() || dataset.is_empty() {
             return None;
         }
+        if !Self::valid_dataset(dataset) {
+            // dataset 直接拼 URL：含 `/`/`?`/`#` 即破路径，宁可关闭也不乱发
+            tracing::warn!("DMS_EXT_KB_DATASET 含 URL 特殊字符，外部 KB 关闭");
+            return None;
+        }
         Some(Self::new(base, api_key, dataset))
     }
+
+/// dataset 名的合法字符集（UUID/slug 形态）：它要原样拼进 URL 路径段
+fn valid_dataset(dataset: &str) -> bool {
+    !dataset.is_empty()
+        && dataset.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
     /// 检索远程数据集，返回**响应原序**（即名次序）的记录。
     /// 空问句 / 熔断中 / 超时 / 服务挂 / 响应形状不符 → `None`（调用方回退原有召回路）。
@@ -90,14 +115,18 @@ impl ExtKbClient {
         if query.is_empty() || top_k == 0 {
             return None;
         }
+        // 超大问句截断外发（取字符数安全截断）；top_k 防御性 clamp
+        let query_owned;
+        let query = if query.chars().count() > MAX_QUERY_CHARS {
+            query_owned = query.chars().take(MAX_QUERY_CHARS).collect::<String>();
+            query_owned.as_str()
+        } else {
+            query
+        };
+        let top_k = top_k.min(MAX_TOP_K);
         if now() < self.cooldown_until.load(Ordering::Relaxed) {
             return None;
         }
-        // ponytail: 每次调用新建 Client＝与 embed.rs 同款的历史行为（丢连接复用）。
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-            .build()
-            .ok()?;
         // Dify 数据集检索的请求形状：`retrieval_model` 必须给全（缺省字段服务端按各自默认填，
         // 而我们要的是确定行为 —— top_k 由调用方定，阈值/精排一律关，过滤全留在本地 RRF）。
         let body = serde_json::json!({
@@ -109,18 +138,34 @@ impl ExtKbClient {
                 "score_threshold_enabled": false,
             },
         });
-        let mut req = client.post(&self.url).json(&body);
+        let mut req = self
+            .http
+            .post(&self.url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(HTTP_CALL_TIMEOUT_SECS));
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
         match req.send().await {
             Ok(resp) => {
-                let v: serde_json::Value = resp.json().await.ok()?;
+                if !resp.status().is_success() {
+                    // 401（key 错）与形状不符要能区分（不熔断，对齐形状语义）
+                    tracing::warn!(status = %resp.status(), "外部 KB 服务返回非 2xx，降级");
+                    return None;
+                }
+                let v: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!(err = %e, "外部 KB 响应解析失败，降级");
+                        return None;
+                    }
+                };
                 // 形状不符不熔断（对齐 embed/rerank）：服务活着只是回了别的，熔断解决不了它。
                 parse_records(&v, &self.source_prefix)
             }
-            Err(_) => {
+            Err(e) => {
                 // send 失败（连接拒/超时）才熔断 300s（对齐 embed/rerank）。
+                tracing::debug!(err = %e, "外部 KB 服务不可达，熔断 {COOLDOWN_SECS}s");
                 self.cooldown_until.store(now() + COOLDOWN_SECS, Ordering::Relaxed);
                 None
             }
@@ -145,7 +190,8 @@ fn parse_records(v: &serde_json::Value, source_prefix: &str) -> Option<Vec<ExtKb
             if content.is_empty() {
                 return None;
             }
-            let document_id = segment["document_id"].as_str().unwrap_or("").to_string();
+            // document_id 与 name 同口径 trim：空白的 document_id 不该落成空白兜底名
+            let document_id = segment["document_id"].as_str().unwrap_or("").trim().to_string();
             let name = segment["document"]["name"].as_str().unwrap_or("").trim();
             let document_name = if !name.is_empty() {
                 name.to_string()
@@ -160,10 +206,15 @@ fn parse_records(v: &serde_json::Value, source_prefix: &str) -> Option<Vec<ExtKb
                 document_name,
                 content: content.to_string(),
                 score: item["score"].as_f64().unwrap_or(0.0),
+                // 前提：segment_id 是 UUID 形态（Dify 契约），含 `#` 等字符会破 URI —— 今天无强制
                 source_uri: format!("{source_prefix}#segment-{segment_id}"),
             })
         })
         .collect();
+    let dropped = arr.len() - out.len();
+    if dropped > 0 {
+        tracing::debug!(dropped, total = arr.len(), "外部 KB 记录缺 id/空正文被丢弃");
+    }
     Some(out)
 }
 
@@ -233,7 +284,7 @@ mod tests {
         );
     }
 
-    /// 最小 HTTP 桩（与 rerank.rs 测试同款：不引新依赖）。记录每次请求的 body 与是否带 key，
+    /// 最小 HTTP 桩（`crate::test_stub` 共用件）。记录每次请求的 body 与是否带 key，
     /// 固定回两条记录；`delay` 用来逼客户端 3s 超时。
     async fn stub(
         delay: std::time::Duration,
@@ -247,25 +298,15 @@ mod tests {
                 let Ok((mut sock, _)) = l.accept().await else { return };
                 let s = s0.clone();
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = Vec::new();
-                    // 必须按 Content-Length 读满（rerank.rs/embed.rs 测试桩同款教训）：半个 body
-                    // 喂给 serde_json 会 panic 在桩里，看起来像「客户端没发全」。
-                    let head = loop {
-                        if let Some(h) = find(&buf, b"\r\n\r\n") {
-                            if buf.len() >= h + 4 + content_len(&buf[..h]) {
-                                break h;
-                            }
-                        }
-                        let mut b = [0u8; 8192];
-                        match sock.read(&mut b).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => buf.extend_from_slice(&b[..n]),
-                        }
+                    use tokio::io::AsyncWriteExt;
+                    let Some((head_text, raw)) =
+                        crate::test_stub::read_request(&mut sock).await
+                    else {
+                        return;
                     };
-                    let head_text = String::from_utf8_lossy(&buf[..head]).to_lowercase();
                     let authed = head_text.contains("authorization: bearer ");
-                    let v: serde_json::Value = serde_json::from_slice(&buf[head + 4..]).unwrap();
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&raw).expect("stub 收到坏 JSON");
                     s.lock().unwrap().push((v, authed));
                     tokio::time::sleep(delay).await;
                     let body = serde_json::json!({"records": [
@@ -275,34 +316,11 @@ mod tests {
                          "score": 0.4},
                     ]})
                     .to_string();
-                    let _ = sock
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                body.len()
-                            )
-                            .as_bytes(),
-                        )
-                        .await;
+                    let _ = sock.write_all(&crate::test_stub::json_response(&body)).await;
                 });
             }
         });
         (base, seen)
-    }
-
-    fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-        hay.windows(needle.len()).position(|w| w == needle)
-    }
-
-    fn content_len(head: &[u8]) -> usize {
-        String::from_utf8_lossy(head)
-            .to_lowercase()
-            .split("content-length:")
-            .nth(1)
-            .and_then(|t| t.split("\r\n").next())
-            .and_then(|t| t.trim().parse().ok())
-            .unwrap_or(0)
     }
 
     #[tokio::test]
@@ -347,5 +365,27 @@ mod tests {
         assert!(c.retrieve("  ", 4).await.is_none());
         assert!(c.retrieve("q", 0).await.is_none());
         assert_eq!(c.cooldown_until.load(Ordering::Relaxed), 0, "空输入是调用方的事，不熔断");
+    }
+
+    /// dataset 字符集校验：含 URL 特殊字符宁可关闭也不乱发
+    #[test]
+    fn dataset_with_url_special_chars_disables_the_client() {
+        assert!(ExtKbClient::from_vars(Some("http://h:1"), None, Some("ds/x")).is_none());
+        assert!(ExtKbClient::from_vars(Some("http://h:1"), None, Some("ds?x")).is_none());
+        assert!(ExtKbClient::from_vars(Some("http://h:1"), None, Some("ds-1_a")).is_some());
+    }
+
+    /// top_k 防御性 clamp（巨型 top_k 不许原样透传）
+    #[tokio::test]
+    async fn top_k_is_clamped() {
+        let (base, seen) = stub(std::time::Duration::ZERO).await;
+        let c = ExtKbClient::new(&base, None, "ds1");
+        assert!(c.retrieve("q", 999_999).await.is_some());
+        let (body, _) = seen.lock().unwrap().pop().unwrap();
+        assert_eq!(body["retrieval_model"]["top_k"], MAX_TOP_K, "top_k 必须被 clamp");
+        // Debug 不泄 key
+        let c = ExtKbClient::new("http://h:1", Some("s3cret-key"), "ds1");
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("s3cret-key"), "{dbg}");
     }
 }

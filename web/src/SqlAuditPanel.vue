@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { authHeaders, authTail, errMessage, errText } from './panel-utils'
 
 /** 【SQL 审计】`GET /api/audit/sql?status=&limit=100` 的只读抽屉。
  *  表格列：时间 / 用户 / 路由 / 状态 / 耗时 / SQL 摘要；行点击展开完整 SQL（含错误信息）。
@@ -25,26 +26,20 @@ const emit = defineEmits<{
 const STATUS_LABELS: Record<string, string> = {
   succeeded: '成功', blocked: '已拦截', failed: '失败', timeout: '超时',
 }
+/** 状态下拉选项由 STATUS_LABELS 生成，闭集只维护一处。 */
+const STATUS_OPTIONS = Object.entries(STATUS_LABELS).map(([value, label]) => ({ value, label }))
+/** 每次拉取条数上限（与后端 limit 口径一致；满额时提示已达上限）。 */
+const LIMIT = 100
+/** 表列数：加列时同步改这里（展开行 colspan 引用它，不再硬编码）。 */
+const COLS = 6
 
 const loading = ref(true)
 const error = ref('')
 const rows = ref<AuditRow[]>([])
 const statusFilter = ref('')
 const expandedId = ref('')
-
-function authTail(): string {
-  return props.token ? '' : `&login_name=${encodeURIComponent(props.login ?? '')}`
-}
-function authHeaders(): Record<string, string> {
-  return props.token ? { Authorization: `Bearer ${props.token}` } : {}
-}
-/** 先取 text 再试解析：端点未上线时 axum 兜底 404 是空体，直接 .json() 只会抛 SyntaxError。 */
-async function errText(r: Response, fallback: string): Promise<string> {
-  const raw = await r.text()
-  let body: { error?: string } | null = null
-  try { body = raw ? JSON.parse(raw) : null } catch { /* 非 JSON 按原文报 */ }
-  return body?.error || raw.trim().slice(0, 200) || `${fallback}（HTTP ${r.status}）`
-}
+const copiedId = ref('')
+const closeBtn = ref<HTMLButtonElement | null>(null)
 
 function normalize(raw: unknown): AuditRow[] {
   const root = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
@@ -85,6 +80,11 @@ const CTX_KIND_LABELS: Record<string, string> = {
 function ctxKindLabel(kind: string): string {
   return CTX_KIND_LABELS[kind] ?? kind
 }
+/** 脏字符串数字兜底 0，不把 NaN 显示到 UI 上。 */
+function num(v: unknown): number {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : 0
+}
 /** context_summary 可能是解析好的对象（新 API）、JSON 文本（旧缓存）或 null（老行/无摘要）。 */
 function normCtx(raw: unknown): CtxSummary | null {
   let v: unknown = raw
@@ -104,39 +104,60 @@ function normCtx(raw: unknown): CtxSummary | null {
     cards: list(o.cards).map(c => ({
       kind: String(c.kind ?? ''),
       name: typeof c.name === 'string' ? c.name : undefined,
-      chars: Number(c.chars ?? 0),
+      chars: num(c.chars),
     })),
     trimmed: list(o.trimmed).map(t => ({
       kind: String(t.kind ?? ''),
-      dropped: Number(t.dropped ?? 0),
-      kept: Number(t.kept ?? 0),
+      dropped: num(t.dropped),
+      kept: num(t.kept),
       names: Array.isArray(t.names) ? t.names.map(String) : undefined,
     })),
   }
 }
+/** 被裁卡总数：trimmed 是按卡种分组的，每组带自己的 dropped，求和才是实际裁掉的卡数。 */
+function ctxDropped(ctx: CtxSummary): number {
+  return ctx.trimmed.reduce((sum, t) => sum + t.dropped, 0)
+}
 function fmtMs(ms: number | null): string {
   if (ms == null) return '—'
-  if (ms < 1000) return `${Math.round(ms)}ms`
-  if (ms < 60000) return `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`
-  return `${Math.floor(ms / 60000)}m${Math.round((ms % 60000) / 1000)}s`
+  // 先取整再分档：999.6 → 1000 应走秒档；负值（异常数据）按 0 处理
+  const v = Math.max(0, Math.round(ms))
+  if (v < 1000) return `${v}ms`
+  if (v < 60000) return `${(v / 1000).toFixed(v < 10000 ? 1 : 0)}s`
+  return `${Math.floor(v / 60000)}m${Math.round((v % 60000) / 1000)}s`
 }
-/** ISO 串压成「MM-DD HH:mm:ss」；不是这个格式就原样显示（title 里总有全文）。 */
+/** 后端 at 是 UTC RFC3339（落库 to_rfc3339）：转本地「MM-DD HH:mm:ss」再显示；解析不了原样显示（title 里总有全文）。 */
 function shortAt(at: string): string {
-  const m = at.match(/^\d{4}-(\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/)
-  return m ? `${m[1]} ${m[2]}` : at
+  const t = new Date(at)
+  if (!at || Number.isNaN(t.getTime())) return at
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`
 }
 function toggle(row: AuditRow) {
   expandedId.value = expandedId.value === row.id ? '' : row.id
 }
 
+async function copySql(row: AuditRow) {
+  try {
+    await navigator.clipboard.writeText(row.sql)
+    copiedId.value = row.id
+    setTimeout(() => { if (copiedId.value === row.id) copiedId.value = '' }, 1500)
+  } catch { /* 剪贴板不可用时静默，展开区仍可手选复制 */ }
+}
+
+let aborter: AbortController | null = null
 async function load() {
+  // 竞态闸：快速切换状态过滤时旧请求作废，后到者不会覆盖先到者
+  aborter?.abort()
+  const ctl = new AbortController()
+  aborter = ctl
   loading.value = true
   error.value = ''
   expandedId.value = ''
   try {
     const r = await fetch(
-      `/api/audit/sql?status=${encodeURIComponent(statusFilter.value)}&limit=100${authTail()}`,
-      { headers: authHeaders() },
+      `/api/audit/sql?status=${encodeURIComponent(statusFilter.value)}&limit=${LIMIT}${authTail(props.token, props.login)}`,
+      { headers: authHeaders(props.token), signal: ctl.signal },
     )
     if (r.status === 401) {
       emit('auth-expired')
@@ -149,20 +170,28 @@ async function load() {
     }
     rows.value = normalize(await r.json().catch(() => null))
   } catch (e) {
-    error.value = `SQL 审计加载失败（网络）：${e}`
+    if (ctl.signal.aborted) return
+    error.value = `SQL 审计加载失败（网络）：${errMessage(e)}`
   } finally {
-    loading.value = false
+    if (aborter === ctl) loading.value = false
   }
 }
 
 function onEsc(e: KeyboardEvent) {
-  if (e.key === 'Escape') emit('close')
+  if (e.key !== 'Escape') return
+  // select 下拉展开时按 Esc 是收起下拉，不连带关抽屉
+  if (e.target instanceof HTMLSelectElement) return
+  emit('close')
 }
 onMounted(() => {
   void load()
   window.addEventListener('keydown', onEsc)
+  closeBtn.value?.focus()
 })
-onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
+onBeforeUnmount(() => {
+  aborter?.abort()
+  window.removeEventListener('keydown', onEsc)
+})
 </script>
 
 <template>
@@ -174,24 +203,21 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
           <h2 id="sa-title">查询执行记录</h2>
           <p class="sa-sub">每次取数落一条：时间 / 用户 / 路由 / 状态 / 耗时 / SQL。只读，点行展开完整 SQL。</p>
         </div>
-        <button type="button" class="sa-close" title="关闭" @click="emit('close')">✕</button>
+        <button ref="closeBtn" type="button" class="sa-close" title="关闭" aria-label="关闭" @click="emit('close')">✕</button>
       </header>
 
       <div class="sa-tools">
         <select v-model="statusFilter" aria-label="状态过滤" @change="load">
           <option value="">全部状态</option>
-          <option value="succeeded">成功</option>
-          <option value="blocked">已拦截</option>
-          <option value="failed">失败</option>
-          <option value="timeout">超时</option>
+          <option v-for="o in STATUS_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
         </select>
         <button type="button" class="sa-btn" :disabled="loading" @click="load">刷新</button>
-        <span v-if="!loading && !error" class="sa-count">{{ rows.length }} 条</span>
+        <span v-if="!loading && !error" class="sa-count">{{ rows.length }} 条{{ rows.length >= LIMIT ? '（已达上限）' : '' }}</span>
       </div>
 
-      <div v-if="loading" class="sa-state"><span class="sa-spin"></span>审计记录加载中…</div>
-      <div v-else-if="error" class="sa-state sa-error">{{ error }}</div>
-      <div v-else-if="!rows.length" class="sa-state">暂无审计记录</div>
+      <div v-if="loading" class="sa-state" role="status"><span class="sa-spin"></span>审计记录加载中…</div>
+      <div v-else-if="error" class="sa-state sa-error" role="alert">{{ error }}</div>
+      <div v-else-if="!rows.length" class="sa-state">{{ statusFilter ? '该状态下暂无记录' : '暂无审计记录' }}</div>
       <div v-else class="sa-table-wrap">
         <table class="sa-table">
           <thead>
@@ -199,28 +225,33 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
           </thead>
           <tbody>
             <template v-for="row in rows" :key="row.id">
-              <tr class="sa-row" :class="{ on: expandedId === row.id }" @click="toggle(row)">
+              <tr
+                class="sa-row" :class="{ on: expandedId === row.id }" tabindex="0"
+                :aria-expanded="expandedId === row.id"
+                @click="toggle(row)" @keydown.enter.prevent="toggle(row)" @keydown.space.prevent="toggle(row)"
+              >
                 <td class="sa-at" :title="row.at">{{ shortAt(row.at) || '—' }}</td>
                 <td>{{ row.user || '—' }}</td>
                 <td>{{ routeLabels?.[row.route] || row.route || '—' }}</td>
                 <td><span class="sa-pill" :data-s="row.status">{{ statusLabel(row.status) }}</span></td>
                 <td class="num">{{ fmtMs(row.ms) }}</td>
-                <td class="sa-sql" :title="row.sql">{{ row.sql || '—' }}</td>
+                <td class="sa-sql">{{ row.sql || '—' }}</td>
               </tr>
               <tr v-if="expandedId === row.id" class="sa-expand">
-                <td colspan="6">
+                <td :colspan="COLS">
                   <pre class="sa-full">{{ row.sql || '（无 SQL 文本）' }}</pre>
+                  <button v-if="row.sql" type="button" class="sa-copy" @click="copySql(row)">{{ copiedId === row.id ? '已复制' : '复制 SQL' }}</button>
                   <div v-if="row.error" class="sa-err">{{ row.error }}</div>
                   <details v-if="row.ctx" class="sa-ctx">
                     <summary>
-                      本轮上下文 {{ row.ctx.prompt_chars }} 字节 · {{ row.ctx.cards.length }} 张卡
-                      <template v-if="row.ctx.trimmed.length"> · 裁掉 {{ row.ctx.trimmed.length }} 项</template>
+                      本轮上下文 {{ row.ctx.prompt_chars }} 字符 · {{ row.ctx.cards.length }} 张卡
+                      <template v-if="row.ctx.trimmed.length"> · 裁掉 {{ ctxDropped(row.ctx) }} 项</template>
                       <template v-if="row.ctx.summary_used"> · 含历史摘要</template>
                     </summary>
                     <ul class="sa-ctx-list">
                       <li v-for="(c, i) in row.ctx.cards" :key="i">
                         {{ ctxKindLabel(c.kind) }}<template v-if="c.name">·{{ c.name }}</template>
-                        <span class="sa-ctx-chars">{{ c.chars }}</span>
+                        <span class="sa-ctx-chars">{{ c.chars }} 字</span>
                       </li>
                       <li v-for="(t, i) in row.ctx.trimmed" :key="'t' + i" class="sa-ctx-trim">
                         裁掉 {{ ctxKindLabel(t.kind) }} ×{{ t.dropped }}（留 {{ t.kept }}）
@@ -242,7 +273,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
 .sa-mask { position: fixed; inset: 0; z-index: 1100; background: rgba(17, 24, 39, .38); backdrop-filter: blur(5px); }
 .sa-drawer { position: absolute; top: 0; right: 0; bottom: 0; width: min(880px, 96vw); display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--bg-card); box-shadow: -18px 0 50px rgba(17, 24, 39, .18); }
 .sa-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 16px 18px 8px; }
-.sa-kicker { display: block; margin-bottom: 4px; color: var(--primary); font-size: 11px; font-weight: 750; }
+.sa-kicker { display: block; margin-bottom: 4px; color: var(--primary); font-size: 11px; font-weight: 700; }
 .sa-head h2 { margin: 0; color: var(--text-primary); font-size: 17px; font-weight: 700; }
 .sa-sub { margin: 5px 0 0; color: var(--text-muted); font-size: 11.5px; line-height: 1.6; }
 .sa-close { width: 30px; height: 30px; flex-shrink: 0; border: 0; border-radius: 5px; background: transparent; color: var(--text-muted); cursor: pointer; }
@@ -253,7 +284,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
 .sa-tools select:focus { border-color: var(--primary); box-shadow: var(--ring); }
 .sa-btn { height: 30px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text-regular); font: inherit; font-size: 12px; cursor: pointer; }
 .sa-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
-.sa-btn:disabled { opacity: .5; cursor: default; }
+.sa-btn:disabled { opacity: .5; cursor: not-allowed; }
 .sa-count { color: var(--text-faint); font-size: 11px; font-variant-numeric: tabular-nums; }
 
 .sa-state { display: flex; align-items: center; justify-content: center; gap: 9px; padding: 34px 22px; color: var(--text-muted); font-size: 13px; }
@@ -278,6 +309,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
 .sa-sql { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-family: var(--font-mono); font-size: 11px; }
 .sa-expand td { background: var(--bg-main); }
 .sa-full { margin: 2px 0 4px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text-regular); font-family: var(--font-mono); font-size: 11.5px; line-height: 1.7; white-space: pre-wrap; word-break: break-all; }
+.sa-copy { margin: 0 0 6px; padding: 3px 10px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg-card); color: var(--text-regular); font-size: 11px; cursor: pointer; }
+.sa-copy:hover { border-color: var(--primary); color: var(--primary); }
 .sa-err { margin-top: 4px; color: var(--error-text); font-size: 11.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
 .sa-ctx { margin-top: 6px; }
 .sa-ctx summary { cursor: pointer; color: var(--text-muted); font-size: 11.5px; }

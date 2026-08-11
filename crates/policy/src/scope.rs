@@ -26,6 +26,9 @@ pub use dms_kernel::policy::scope::{
     BaseDecision, ScopeSets, SENTINEL,
 };
 
+/// 字符串形态的拒绝哨兵（kernel 只导出 i64 版 `SENTINEL`）：全文件统一走这个常量
+const SENTINEL_STR: &str = "-1";
+
 /// 权限计算结果 = 集合 + **凭什么无限制**的出处。
 ///
 /// 全部集合为空有且只有两个来源，二者都由角色档决定：超管短路（`admin_shortcut`）
@@ -48,6 +51,8 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// 天花板（见 struct 注释）：谁都能硬写 `new(default(), true)` 撒谎，
+    /// 但那是一行显式的、`grep 'Scope::new'` 就能列全的谎。
     pub fn new(sets: ScopeSets, unrestricted_by_role: bool) -> Self {
         Self {
             sets,
@@ -63,9 +68,11 @@ impl Scope {
     pub fn unrestricted_by_role(&self) -> bool {
         self.unrestricted_by_role
     }
+    /// `t_account_bill_header.manager` 双形态里的姓名侧（由已授权 employee_ids 派生）
     pub fn manager_names(&self) -> &[String] {
         &self.manager_names
     }
+    /// 设备订单页的两个专职角色例外（xiaoyunbp/shebeiyy 全量放行证明）
     pub fn device_unrestricted_by_role(&self) -> bool {
         self.device_unrestricted_by_role
     }
@@ -121,6 +128,8 @@ pub async fn compute_scope(mysql: &ReadOnlyMySql, p: &Principal) -> anyhow::Resu
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// DMS 三类特殊角色（由 DataScopeManager 独立策略接管，先于 t_role_data_scope 分流）；
+/// 空角色归 visitor。语义见 `special_role`。
 enum SpecialRole {
     Visitor,
     CustomerContact,
@@ -180,13 +189,13 @@ async fn visitor_scope(mysql: &ReadOnlyMySql, p: &Principal) -> anyhow::Result<S
     );
     Ok(ScopeSets {
         employee_ids: vec![SENTINEL],
-        employee_codes: vec!["-1".into()],
+        employee_codes: vec![SENTINEL_STR.into()],
         customer_codes,
         // 登录名维度仍供其它已登记策略使用；空登录名改哨兵，不能退化成无条件。
         login_names: deny_empty_strings(vec![p.login_name.clone()]),
         manager_customer_codes: vec![],
         // Visitor.getShopByCurrentUser 明确返回空集合。
-        shop_codes: vec!["-1".into()],
+        shop_codes: vec![SENTINEL_STR.into()],
     })
 }
 
@@ -202,7 +211,7 @@ async fn customer_contact_scope(
     let employee_codes = if has_real_codes(&customer_codes) {
         deny_empty_strings(t::contact_login_names_by_customers(mysql, &customer_codes).await?)
     } else {
-        vec!["-1".into()]
+        vec![SENTINEL_STR.into()]
     };
     let manager_customer_codes = clean_strings(
         t::customers_by_area_manager(mysql, &employee_ids).await?,
@@ -230,7 +239,7 @@ async fn shop_contact_scope(
         accounts.iter().filter_map(|(_, shop)| shop.clone()).collect(),
     );
     let shop_codes = if bound_shop_codes.is_empty() {
-        vec!["-1".into()]
+        vec![SENTINEL_STR.into()]
     } else {
         deny_empty_strings(t::active_shop_codes_by_codes(mysql, &bound_shop_codes).await?)
     };
@@ -259,7 +268,7 @@ async fn shops_for_customer_scope(
         return Ok(vec![]);
     }
     if !has_real_codes(customer_codes) {
-        return Ok(vec!["-1".into()]);
+        return Ok(vec![SENTINEL_STR.into()]);
     }
     Ok(deny_empty_strings(
         t::active_shop_codes_by_customers(mysql, customer_codes).await?,
@@ -267,7 +276,7 @@ async fn shops_for_customer_scope(
 }
 
 fn has_real_codes(codes: &[String]) -> bool {
-    codes.iter().any(|code| code != "-1" && !code.trim().is_empty())
+    codes.iter().any(|code| code != SENTINEL_STR && !code.trim().is_empty())
 }
 
 fn deny_empty_ids(ids: Vec<i64>) -> Vec<i64> {
@@ -282,14 +291,15 @@ fn clean_strings(mut values: Vec<String>) -> Vec<String> {
 
 fn deny_empty_strings(values: Vec<String>) -> Vec<String> {
     let values = clean_strings(values);
-    if values.is_empty() { vec!["-1".into()] } else { values }
+    if values.is_empty() { vec![SENTINEL_STR.into()] } else { values }
 }
 
 fn device_full_scope_role(role_code: &str) -> bool {
     matches!(role_code, "xiaoyunbp" | "shebeiyy")
 }
 
-/// 编排：基础档 → 101 下属 → 权限维度合并。查询顺序与 server/src/scope.rs:85-183 逐条等同。
+/// 编排：基础档 → 101 下属 → 权限维度合并。查询顺序与 Java DefaultEmployee 逐条等同
+/// （原 server/src/scope.rs:85-183，该文件已删除，本文件即迁移后的落点）。
 async fn compute_from_rows(
     mysql: &ReadOnlyMySql,
     p: &Principal,
@@ -299,8 +309,15 @@ async fn compute_from_rows(
         // Java L275: 抛「当前登录用户角色未正确设定[角色-数据范围]」→ fail-closed
         anyhow::bail!("当前登录用户角色未正确设定[角色-数据范围]");
     }
-    let base_rows: Vec<i32> = rows.iter().filter(|(t, _)| *t == 1).map(|(_, v)| *v).collect();
-    let custom: Vec<i32> = rows.iter().filter(|(t, _)| *t == 2).map(|(_, v)| *v).collect();
+    let mut base_rows: Vec<i32> = Vec::new();
+    let mut custom: Vec<i32> = Vec::new();
+    for &(t, v) in rows {
+        if t == 1 {
+            base_rows.push(v);
+        } else if t == 2 {
+            custom.push(v);
+        }
+    }
 
     // 放行来源②：基础档 ALL（view_type=10）或无 type=1 行
     let Some(base) = base_ids(mysql, p, &base_rows).await? else {
@@ -324,8 +341,9 @@ async fn compute_from_rows(
         employee_ids,
         employee_codes,
         customer_codes,
+        // login_name 来自 DB（load_principal 查出），非空 —— 故不似它处再包 deny_empty_strings
         login_names: vec![p.login_name.clone()],
-        manager_customer_codes,
+        manager_customer_codes: clean_strings(manager_customer_codes),
         shop_codes,
     }, false, device_full).await
 }
@@ -337,7 +355,7 @@ async fn base_ids(
     p: &Principal,
     base_rows: &[i32],
 ) -> anyhow::Result<Option<Vec<i64>>> {
-    let ids = match decide_base(base_rows).map_err(|e| anyhow::anyhow!("{e}"))? {
+    let ids = match decide_base(base_rows).map_err(anyhow::Error::from)? {
         BaseDecision::Unrestricted => return Ok(None),
         // Me 走占位空集分支：由此处填本人 id（纯函数不碰 principal）
         BaseDecision::Ids(ids) if ids.is_empty() => vec![p.employee_id],
@@ -389,7 +407,7 @@ async fn employee_codes(mysql: &ReadOnlyMySql, x: &Parts<'_>) -> anyhow::Result<
         }
     }
     if out.is_empty() && !codes_flag {
-        out.push("-1".into());
+        out.push(SENTINEL_STR.into());
     }
     Ok(dedup_str(out))
 }
@@ -409,10 +427,10 @@ async fn customer_codes(mysql: &ReadOnlyMySql, x: &Parts<'_>) -> anyhow::Result<
     }
     // 4. 定制 103 客户团队（contact_name = 姓名）
     if x.custom.contains(&103) {
-        segs.push((t::manager_customer_codes(mysql, &[x.p.actual_name.clone()]).await?, true));
+        segs.push((t::manager_customer_codes(mysql, std::slice::from_ref(&x.p.actual_name)).await?, true));
     }
     // 5. 下属为团队成员/分组的客户（Java addSubordinateToCustomerManager L337-359）
-    if x.custom.contains(&101) && !x.sub.contains(&SENTINEL) && !x.sub.is_empty() {
+    if x.custom.contains(&101) && !x.sub.is_empty() && !x.sub.contains(&SENTINEL) {
         let names = t::actual_names_by_ids(mysql, x.sub).await?;
         let mut sc = t::manager_customer_codes(mysql, &names).await?;
         sc.extend(t::group_customer_codes(mysql, x.sub).await?);

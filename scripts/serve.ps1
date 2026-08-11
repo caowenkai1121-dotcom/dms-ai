@@ -1,4 +1,4 @@
-﻿# 在容器内跑后端（Windows 侧 SAC 强制态，本机 exe 起不来 —— 裁决 二·E）。
+# 在容器内跑后端（Windows 侧 SAC 强制态，本机 exe 起不来 —— 裁决 二·E）。
 #
 #   .\scripts\serve.ps1              # 重建容器并启动
 #   .\scripts\serve.ps1 -Build       # 先 docker build 再启动
@@ -22,9 +22,17 @@ $repo = (Get-Location).Path
 
 # 本机容器部署使用 host.docker.internal:8078。先保证向量/解析链就绪，避免后端首次
 # 上传碰到连接失败后进入 300 秒熔断；外部部署地址不由这个脚本托管。
+# 缺文件时给友好文案再 throw，别抛 Get-Content 的裸错（run.ps1 有 settings.json 回退，
+# 但下面 mounts 挂死 settings.docker.json，这里不能回退 —— 只统一友好文案这一半）
+if (-not (Test-Path "$repo\settings.docker.json")) {
+    throw '缺少 settings.docker.json，请从 settings.example.json 创建'
+}
 $runtimeSettings = Get-Content "$repo\settings.docker.json" -Raw | ConvertFrom-Json
-if ($runtimeSettings.service_url -match '^http://host\.docker\.internal:8078/?$') {
+# Trim 后再匹配：service_url 带尾随空格/换行会静默跳过 ensure-services，首次上传就撞 300s 熔断
+if ("$($runtimeSettings.service_url)".Trim() -match '^http://host\.docker\.internal:8078/?$') {
     & "$PSScriptRoot\ensure-services.ps1" -Parser
+} else {
+    Write-Host 'service_url 非本机解析链（host.docker.internal:8078），跳过依赖检查'
 }
 
 if ($Build) {

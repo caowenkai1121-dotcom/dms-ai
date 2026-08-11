@@ -4,11 +4,13 @@
 #
 # 用法:
 #   python tools/kb_eval.py [--filter KB05]
-#   python tools/kb_eval.py --selfcheck   # 判定逻辑 + 退出码闸自检（不连库、不起服务）
+#   python tools/kb_eval.py --cases tools/kb_eval_cases_binary.json  # 换题集（二进制格式那批与主题集分开跑）
+#   python tools/kb_eval.py --selfcheck   # 判定逻辑 + 退出码闸自检（不连库、不起服务；--selftest 同义）
 #   python tools/kb_eval.py --keep-fixtures  # 调试时保留评测语料；默认结束即清理
 #   python tools/kb_eval.py --allow-skip     # 仅本地容许依赖缺席/0 题执行返回 0；报告仍明确标记未实测
 #   环境变量: DMSAI_BASE(默认 http://127.0.0.1:8100) DMSAI_KB_LOGIN_A/B
 #             DMSAI_KB_TOKEN_A/B 或 DMSAI_KB_PASSWORD_A/B（密码只用于换会话 token）
+#             DMSAI_SETTINGS(默认 settings.json，kb_root 出处) DMSAI_EMBED_ADDR(默认 127.0.0.1:8077)
 #
 # 退出码:
 #   0 = **真跑了 ≥1 题且全对**。0 题执行绝不给 0（对齐 scripts/docker-test.ps1 的
@@ -27,7 +29,15 @@
 # - recall@6 优先用 POST /api/kb/search 的原始 hits 前 6 条；只有该端点 404 时才回退
 #   回答 citations。401/403/5xx 都是明确失败（ACL 题仍沿用既有 blocked 语义）。
 # - ACL 题：接口层 401/403 与「答没有相关内容 + citations 空」都算守住，泄露内容或 5xx 才算破。
-import json, os, re, socket, subprocess, sys, urllib.error, urllib.request, uuid
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
 
@@ -46,7 +56,9 @@ def _opt(name, default=None):
         return default
     i = sys.argv.index(name) + 1
     if i >= len(sys.argv) or sys.argv[i].startswith("--"):
-        sys.exit(f"{name} 后面缺少取值")
+        # 参数错是「门没开」不是「有题判红」：打 stderr 并 exit 2，不与退出码 1 撞车
+        print(f"{name} 后面缺少取值", file=sys.stderr)
+        sys.exit(2)
     return sys.argv[i]
 
 
@@ -67,22 +79,31 @@ CASES_PATH = Path(_opt("--cases") or (ROOT / "tools" / "kb_eval_cases.json"))
 if not CASES_PATH.exists():
     sys.exit(f"题集不存在：{CASES_PATH}")
 SPEC = json.loads(CASES_PATH.read_text(encoding="utf-8"))
-BASE = os.environ.get("DMSAI_BASE", "http://127.0.0.1:8100")
+BASE = os.environ.get("DMSAI_BASE", "http://127.0.0.1:8100").rstrip("/")
+# 题集缺 logins 键时不许在导入期 KeyError：先容忍 None，validate_spec（main 第一闸）具名报出
+_spec_logins = SPEC.get("logins") if isinstance(SPEC, dict) else None
 LOGINS = {
-    "a": os.environ.get("DMSAI_KB_LOGIN_A") or SPEC["logins"]["a"],
-    "b": os.environ.get("DMSAI_KB_LOGIN_B") or SPEC["logins"]["b"],
+    "a": os.environ.get("DMSAI_KB_LOGIN_A") or (_spec_logins or {}).get("a"),
+    "b": os.environ.get("DMSAI_KB_LOGIN_B") or (_spec_logins or {}).get("b"),
 }
 TOKENS = {}
 AUTH_MODE = {"a": "session", "b": "session"}  # selftest 默认按已认证语义；main 会重置
 TOPK = 6   # recall@6
+_ERR_TAIL = 160   # 错误摘要统一截断长度（原来 90/100/160 各处漂移）
 # 问答入口候选：专用入口优先，回退 /api/ask + forced intent（K5 之前后端可能忽略 intent）。
 # 只有 404 才换下一个候选——422/500 是真失败，不许被「换个入口试试」掩盖。
+# ⚠️ 运行期状态：ask() 会对 404 的入口原地 remove，这个列表随运行收缩。
 ASK_PATHS = ["/api/kb/ask", "/api/ask"]
 SEARCH_PATH = "/api/kb/search"
 MIME = {".md": "text/markdown", ".txt": "text/plain", ".csv": "text/csv", ".pdf": "application/pdf",
         ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
 ALLOWED_EXPECT = {"keywords", "must_any", "forbid", "citations", "cited", "chunk_keywords"}
 TRACKED_DOCS = {}
+
+
+def _dict_or_data(parsed):
+    """JSON 响应不一定是对象（list/标量）：包一层，调用方一律 .get 不会 AttributeError。"""
+    return parsed if isinstance(parsed, dict) else {"data": parsed}
 
 
 def req(method, path, body=None, ctype=None, timeout=120, login=None):
@@ -93,17 +114,20 @@ def req(method, path, body=None, ctype=None, timeout=120, login=None):
         r.add_header("Authorization", "Bearer " + TOKENS[login])
     try:
         with urllib.request.urlopen(r, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+            code, raw = resp.status, resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
         try:
-            return e.code, json.loads(raw)
+            return e.code, _dict_or_data(json.loads(raw))
         except json.JSONDecodeError:
             return e.code, {"error": raw[:300]}
-    except json.JSONDecodeError as e:
-        return 0, {"error": f"响应不是 JSON: {e}"}
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
+    except (urllib.error.URLError, OSError) as e:
         return 0, {"error": str(e)}
+    try:
+        return code, _dict_or_data(json.loads(raw or "{}"))
+    except json.JSONDecodeError as e:
+        # 成功响应却不是 JSON：保留真实 HTTP 状态，code=0 是「连接失败」专属，别混淆
+        return code, {"error": f"响应不是 JSON: {e}"}
 
 
 def post(path, obj, timeout=120, login=None):
@@ -122,6 +146,8 @@ def init_auth():
             AUTH_MODE[alias] = "token" if code == 200 else "invalid"
             if code != 200:
                 TOKENS.pop(login, None)
+                # 只标 invalid 不打状态码，排障得手工重放才知道是 401 还是服务挂了
+                print(f"⚠️ 身份 {alias.upper()} token 校验 HTTP {code}")
             continue
         if password:
             code, j = post("/api/login", {"login_name": login, "password": password}, timeout=30)
@@ -130,6 +156,8 @@ def init_auth():
                 AUTH_MODE[alias] = "password"
             else:
                 AUTH_MODE[alias] = "invalid"
+                # 哑的 invalid 没法排障：带上服务端 error 摘要（不含口令）
+                print(f"⚠️ 身份 {alias.upper()} 密码登录失败 HTTP {code}: {str(j.get('error'))[:80]}")
             continue
         AUTH_MODE[alias] = "none"
 
@@ -159,13 +187,15 @@ def upload(fp, login):
 
 def ask(question, login):
     body = {"question": question, "login_name": login, "intent": "knowledge"}
-    for path in list(ASK_PATHS):
+    tried = list(ASK_PATHS)
+    for path in tried:
         code, j = post(path, body, login=login)
         if code == 404:                 # 该入口不存在，换下一个
             ASK_PATHS.remove(path)
             continue
         return code, j
-    return 0, {"error": "/api/kb/ask 与 /api/ask 都是 404，没有知识库问答入口"}
+    # 文案跟着已尝试路径走，不写死——改 ASK_PATHS 时它不过期
+    return 0, {"error": f"{' 与 '.join(tried)} 都是 404，没有知识库问答入口"}
 
 
 def raw_search(question, login):
@@ -189,10 +219,17 @@ def chunk_text(chunk_id, login, span=None):
     # 🔴 带上 `span`：检索会把同文档相邻块合并成一条命中，`chunk_id` 只是**首块**。
     # 用 window=1 回查只能看到首块±1 —— 实测支撑答案的那句在第 5 块，于是这条校验
     # 会把「引用其实有据」误判成「引用块原文缺关键词」。span 才是模型看到的那一段。
-    qs = f"?login_name={login}" + (f"&span={span}" if span and span > 1 else "&window=1")
+    # login 必须 urlencode（含特殊字符时会拼坏 query；本文件别处同款拼接已用 quote/urlencode）；
+    # span 只信 int——服务端若给字符串，`> 1` 直接 TypeError 终止整趟
+    qs = "?" + urlencode({"login_name": login})
+    qs += f"&span={span}" if isinstance(span, int) and span > 1 else "&window=1"
     code, j = req("GET", f"/api/kb/chunk/{chunk_id}{qs}", timeout=30, login=login)
     if code == 200:
-        return json.dumps(j, ensure_ascii=False)
+        # 只取正文字段：整份响应 dumps 会带上 doc_name/folder_path 等元数据，
+        # chunk_keywords 可能命中元数据而非正文 —— 假绿
+        if isinstance(j.get("text"), str):
+            return j["text"]
+        return "__HTTP_200__ chunk 响应缺 text 正文字段（形状变了，判红逼人来对齐）"
     if code == 404:
         return None                      # 真·未落地 → 调用方跳过
     return f"__HTTP_{code}__ {str(j.get('error'))[:120]}"   # 其余一律判红
@@ -209,13 +246,25 @@ def tcp_up(host, port):
 def missing_deps():
     u = urlparse(BASE)
     miss = []
-    if not tcp_up(u.hostname or "127.0.0.1", u.port or 80):
+    # https 的默认端口是 443，不是 80
+    if not tcp_up(u.hostname or "127.0.0.1", u.port or (443 if u.scheme == "https" else 80)):
         miss.append(f"dms-ai-server 未起（{BASE}）")
-    if not tcp_up("127.0.0.1", 8077):
-        miss.append("文档/embed 服务未起（tools/embed_service.py serve 8077）")
-    r = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True)
-    if "dms-ai-pg" not in r.stdout:
-        miss.append("PG 容器 dms-ai-pg 未起")
+    # embed 服务地址可配：BASE 指远端时，死查 127.0.0.1 是在检查错误的对象
+    embed = os.environ.get("DMSAI_EMBED_ADDR", "127.0.0.1:8077").rsplit(":", 1)
+    embed_host = embed[0] or "127.0.0.1"
+    embed_port = int(embed[1]) if len(embed) > 1 and embed[1].isdigit() else 8077
+    if not tcp_up(embed_host, embed_port):
+        miss.append(f"文档/embed 服务未起（tools/embed_service.py serve {embed_port}）")
+    # docker 未装/daemon 宕/卡死都不许让依赖门自己 traceback 或挂死：按「缺席」具名上报
+    try:
+        r = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            miss.append(f"docker daemon 不可用（docker ps rc={r.returncode}）")
+        elif "dms-ai-pg" not in r.stdout:
+            miss.append("PG 容器 dms-ai-pg 未起")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        miss.append(f"docker 不可用：{e}")
     return miss
 
 
@@ -226,7 +275,8 @@ def footnote_gaps(md, cits):
 
 
 def footnote_refs(md):
-    return sorted({int(x) for x in re.findall(r"\[\^(\d+)\]", md)})
+    # `(?!:)` 排除文末的 `[^n]:` 定义行——定义不是引用，计入会虚增 refs
+    return sorted({int(x) for x in re.findall(r"\[\^(\d+)\](?!:)", md)})
 
 
 def check_search_recall(c, result, cits):
@@ -252,7 +302,7 @@ def check_search_recall(c, result, cits):
         notes = [f"{SEARCH_PATH} 404，recall@{TOPK} 回退回答 citations"]
     elif code != 200:
         error = body.get("error") if isinstance(body, dict) else body
-        return [f"{SEARCH_PATH} HTTP {code}: {str(error)[:90]}"], [], []
+        return [f"{SEARCH_PATH} HTTP {code}: {str(error)[:_ERR_TAIL]}"], [], []
     else:
         if not isinstance(body, dict) or not isinstance(body.get("hits"), list):
             return [f"{SEARCH_PATH} 响应缺少 hits 数组"], [], []
@@ -286,11 +336,16 @@ def check(c, code, j, search_result=None):
     """
     e, fails, notes, blocked = c.get("expect", {}), [], [], []
     md, cits = j.get("markdown") or "", j.get("citations") or []
+    if not isinstance(cits, list):
+        # 畸形响应：citations 给成 dict/str 时，后面的迭代 .get 会崩掉整趟 —— 判红而不是崩
+        return fails + [f"citations 结构非法（{type(cits).__name__}，应为数组）"], notes, blocked
     sf, sn, sb = check_search_recall(c, search_result, cits)
     fails.extend(sf)
     notes.extend(sn)
     blocked.extend(sb)
     raw = json.dumps(j, ensure_ascii=False).lower()
+    # 口径刻意不同：forbid 对整份响应 JSON 小写化比对（泄露换大小写也是泄露）；
+    # 下面 keywords/must_any 是正文精确子串（题面写的那个词必须原样出现）。
     for w in e.get("forbid", []):
         if w.lower() in raw:
             fails.append(f"泄露禁词[{w}]")
@@ -301,9 +356,9 @@ def check(c, code, j, search_result=None):
                 f"身份 {alias.upper()} 未建立有效会话，只验证到认证层拒绝（HTTP {code}），"
                 "未实测跨账号知识 ACL"
             ]
-        return fails, ["接口层拒绝（%d）即守住" % code], blocked
+        return fails, [f"接口层拒绝（{code}）即守住"], blocked
     if code != 200:
-        return fails + [f"HTTP {code}: {str(j.get('error'))[:90]}"], notes, blocked
+        return fails + [f"HTTP {code}: {str(j.get('error'))[:_ERR_TAIL]}"], notes, blocked
     if j.get("kind") != "text":
         return fails + [f"回答 kind={j.get('kind')}≠text（知识库路由未生效）"], notes, blocked
     for w in e.get("keywords", []):
@@ -334,7 +389,8 @@ def check(c, code, j, search_result=None):
         bad = [p for p in parts if p and p.startswith("__HTTP_")]
         texts = "".join(p for p in parts if p and not p.startswith("__HTTP_"))
         if bad:
-            fails.append(f"原文回查失败：{bad[0]}")
+            # 多条回查失败全拼上（只报第一条会把其余证据丢掉），总长仍截断
+            fails.append(f"原文回查失败：{'；'.join(bad)[:_ERR_TAIL]}")
         elif not texts:
             # 🔴 **不是 note，是第三态**。这条是「引用块原文里真的含那个关键词」的唯一校验
             # （KB03 全靠它）。原来一条 note 就放过去、题仍判 ✅、退出码仍 0 ——
@@ -378,9 +434,9 @@ def upload_fixtures():
         code, j = upload(FIXTURES / f["file"], LOGINS[f["as"]])
         if not isinstance(j, dict):
             j = {"error": f"响应不是对象：{type(j).__name__}"}
-        doc_id = j.get("doc_id") if isinstance(j, dict) else None
+        doc_id = j.get("doc_id")
         if code != 200 or not isinstance(doc_id, str) or not doc_id.strip():
-            print(f"❌ 夹具上传失败（{f['file']} → HTTP {code}）：{str(j.get('error'))[:160]}")
+            print(f"❌ 夹具上传失败（{f['file']} → HTTP {code}）：{str(j.get('error'))[:_ERR_TAIL]}")
             bad.add(f["file"])
             continue
         TRACKED_DOCS[(f["as"], f["file"])] = {
@@ -389,7 +445,8 @@ def upload_fixtures():
             "alias": f["as"],
             "login": LOGINS[f["as"]],
         }
-        print(f"✅ 语料 {f['file']} → {LOGINS[f['as']]} · {j.get('status')} {j.get('chunk_count')} 块")
+        print(f"✅ 语料 {f['file']} → {LOGINS[f['as']]} · {j.get('status') or '-'} "
+              f"{j.get('chunk_count') if j.get('chunk_count') is not None else '?'} 块")
     return bad
 
 
@@ -399,17 +456,23 @@ def sql_quote(value):
 
 def pg_json(sql):
     """只读查询自有 PG；凭据不进命令，复用本机 dms-ai-pg 容器内认证。"""
-    r = subprocess.run(
-        ["docker", "exec", "-i", "dms-ai-pg", "psql", "-U", "postgres", "-d", "dms_ai",
-         "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1"],
-        input=sql, capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-i", "dms-ai-pg", "psql", "-U", "postgres", "-d", "dms_ai",
+             "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1"],
+            input=sql, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,   # docker 卡死不许挂死整趟评测
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"docker 不可用或超时：{e}"
     if r.returncode != 0:
         return None, (r.stderr or r.stdout).strip()[:240]
     lines = [line.strip() for line in r.stdout.splitlines() if line.strip()]
     if not lines:
         return None, "PG 查询没有返回 JSON"
     try:
+        # 调用约定是单行 JSON（本文件全是单条 json_build_object 查询）；
+        # 取最后一行只是 psql 可能回显 NOTICE 的兜底，不是多行支持
         return json.loads(lines[-1]), None
     except json.JSONDecodeError as e:
         return None, f"PG 查询返回非 JSON：{e}"
@@ -449,7 +512,10 @@ def kb_root():
     root = "data/kb"
     if settings.exists():
         try:
-            root = json.loads(settings.read_text(encoding="utf-8")).get("kb_root") or root
+            parsed = json.loads(settings.read_text(encoding="utf-8"))
+            # 顶层不一定是对象（list/标量），.get 之前必须确认
+            if isinstance(parsed, dict):
+                root = parsed.get("kb_root") or root
         except (OSError, json.JSONDecodeError):
             pass
     path = Path(root)
@@ -505,9 +571,27 @@ def set_doc_enabled(item, enabled):
 def exact_search(file_name, question, login):
     code, body = raw_search(question, login)
     if code != 200 or not isinstance(body, dict) or not isinstance(body.get("hits"), list):
-        return False, f"search HTTP {code}: {str(body.get('error'))[:100]}"
+        return False, f"search HTTP {code}: {str(body.get('error'))[:_ERR_TAIL]}"
     names = [h.get("doc_name") for h in body["hits"] if isinstance(h, dict)]
     return file_name in names, names
+
+
+def _assert_recall_and_state(item, query, want_hit, want_status, tag):
+    """停用/启用后的「搜索召回 + PG 数据源状态」核验（两段原本近乎逐字复制，漂移风险）。
+    → 失败消息列表；tag 是「停用后/重新启用后」文案，保持报告措辞稳定。"""
+    failures = []
+    fixture, login = item["file"], item["login"]
+    hit, detail = exact_search(fixture, query, login)
+    if want_hit and not hit:
+        failures.append(f"lifecycle:{fixture} {tag}未召回：{detail}")
+    elif not want_hit and hit:
+        failures.append(f"lifecycle:{fixture} {tag}仍被召回：{detail}")
+    state, error = resource_state(item["doc_id"])
+    if error:
+        failures.append(f"lifecycle:{fixture} {tag}PG 状态核验失败：{error}")
+    elif state.get("datasource") and state.get("datasource_status") != want_status:
+        failures.append(f"lifecycle:{fixture} {tag}数据源状态={state.get('datasource_status')!r}")
+    return failures
 
 
 def run_contracts():
@@ -577,30 +661,12 @@ def run_contracts():
         if code != 200 or body.get("enabled") is not False:
             failures.append(f"lifecycle:{spec['fixture']} 停用失败 HTTP {code}: {body}")
             continue
-        hit, detail = exact_search(spec["fixture"], query, login)
-        if hit:
-            failures.append(f"lifecycle:{spec['fixture']} 停用后仍被召回：{detail}")
-        state, error = resource_state(item["doc_id"])
-        if error:
-            failures.append(f"lifecycle:{spec['fixture']} PG 状态核验失败：{error}")
-        elif state.get("datasource") and state.get("datasource_status") != "disabled":
-            failures.append(
-                f"lifecycle:{spec['fixture']} 停用后数据源状态={state.get('datasource_status')!r}"
-            )
+        failures += _assert_recall_and_state(item, query, False, "disabled", "停用后")
         code, body = set_doc_enabled(item, True)
         if code != 200 or body.get("enabled") is not True:
             failures.append(f"lifecycle:{spec['fixture']} 重新启用失败 HTTP {code}: {body}")
             continue
-        hit, detail = exact_search(spec["fixture"], query, login)
-        if not hit:
-            failures.append(f"lifecycle:{spec['fixture']} 重新启用后未召回：{detail}")
-        state, error = resource_state(item["doc_id"])
-        if error:
-            failures.append(f"lifecycle:{spec['fixture']} 启用后 PG 状态核验失败：{error}")
-        elif state.get("datasource") and state.get("datasource_status") != "active":
-            failures.append(
-                f"lifecycle:{spec['fixture']} 启用后数据源状态={state.get('datasource_status')!r}"
-            )
+        failures += _assert_recall_and_state(item, query, True, "active", "重新启用后")
     return ran, failures
 
 
@@ -667,9 +733,30 @@ def validate_spec(spec):
     cases = spec.get("cases")
     if not isinstance(fixtures, list) or not isinstance(cases, list):
         return ["fixtures/cases 必须是数组"]
-    fixture_names = {f.get("file") for f in fixtures if isinstance(f, dict)}
+    # logins 是导入期就消费的（LOGINS 常量）：缺键会在上传期 KeyError，必须预检具名
+    logins = spec.get("logins")
+    if not isinstance(logins, dict) or any(
+        not str(logins.get(k) or "").strip() for k in ("a", "b")
+    ):
+        errors.append("logins 必须含非空的 a/b 两个登录名（或被 DMSAI_KB_LOGIN_A/B 覆盖）")
+    fixture_names = set()
+    for f in fixtures:
+        if not isinstance(f, dict) or not str(f.get("file") or "").strip():
+            errors.append(f"fixtures 条目必须是含 file 的对象：{f}")
+            continue
+        fixture_names.add(f["file"])
+        if f.get("as") not in ("a", "b"):
+            errors.append(f"fixtures 条目 as 必须是 a/b：{f}")
+    seen = set()
     for c in cases:
         name = c.get("name", "<unnamed>")
+        for key in ("name", "kind", "question"):
+            if not str(c.get(key) or "").strip():
+                errors.append(f"{name}: 缺必填字段 {key}（runner 直接下标消费，缺了是运行期 KeyError）")
+        if c.get("name"):
+            if name in seen:
+                errors.append(f"{name}: 题名重复（报告里无法区分两题）")
+            seen.add(name)
         unknown = set(c.get("expect", {})) - ALLOWED_EXPECT
         if unknown:
             errors.append(f"{name}: expect 有 runner 不消费的键 {sorted(unknown)}")
@@ -683,10 +770,18 @@ def validate_spec(spec):
     unknown = set(contracts) - {"metadata", "versions", "lifecycle"}
     if unknown:
         errors.append(f"contracts 有 runner 不消费的键 {sorted(unknown)}")
-    for c in contracts.get("metadata", []):
+    # 三键必须是数组：写成 dict/str 时迭代出来的是键/字符，后面 .get 直接崩
+    clists = {}
+    for key in ("metadata", "versions", "lifecycle"):
+        value = contracts.get(key, [])
+        if not isinstance(value, list):
+            errors.append(f"contracts.{key} 必须是数组")
+            value = []
+        clists[key] = value
+    for c in clists["metadata"]:
         if c.get("fixture") not in fixture_names or not isinstance(c.get("metadata"), dict):
             errors.append(f"metadata contract 非法：{c}")
-    for c in contracts.get("versions", []):
+    for c in clists["versions"]:
         docs = c.get("documents")
         if not c.get("family") or not isinstance(docs, list) or len(docs) < 2:
             errors.append(f"version contract 至少需要两份文档：{c}")
@@ -694,7 +789,7 @@ def validate_spec(spec):
         for d in docs:
             if d.get("fixture") not in fixture_names or not isinstance(d.get("metadata"), dict):
                 errors.append(f"version document 非法：{d}")
-    for c in contracts.get("lifecycle", []):
+    for c in clists["lifecycle"]:
         if c.get("fixture") not in fixture_names or not str(c.get("question", "")).strip():
             errors.append(f"lifecycle contract 非法：{c}")
     return errors
@@ -733,20 +828,60 @@ def selfcheck():
     msg = cleanup_state_failures("d1", dirty, [Path("d1.md")])
     assert msg and "chunk=1" in msg[0] and "datasource_status=active" in msg[0] and "d1.md" in msg[0]
     # ⑦ 题集契约自身可执行，未知 expect/contract 键不许静默登记
-    assert validate_spec(SPEC) == [], validate_spec(SPEC)
+    spec_errors = validate_spec(SPEC)
+    assert spec_errors == [], spec_errors
     bad_spec = {
         "fixtures": [{"file": "a.md", "as": "a"}],
-        "cases": [{"name": "x", "fixture": "a.md", "expect": {"never_checked": True}}],
+        "logins": {"a": "x", "b": "y"},
+        "cases": [{"name": "x", "kind": "recall", "question": "q", "fixture": "a.md",
+                   "expect": {"never_checked": True}}],
         "contracts": {"future_magic": []},
     }
     errors = validate_spec(bad_spec)
     assert any("never_checked" in e for e in errors) and any("future_magic" in e for e in errors)
     nohit_spec = {
         "fixtures": [],
-        "cases": [{"name": "nohit", "kind": "nohit", "expect": {"citations": "empty"}}],
+        "logins": {"a": "x", "b": "y"},
+        "cases": [{"name": "nohit", "kind": "nohit", "question": "有吗",
+                   "expect": {"citations": "empty"}}],
         "contracts": {},
     }
     assert validate_spec(nohit_spec) == [], validate_spec(nohit_spec)
+    # ⑦b 结构预检：缺 logins、fixtures 条目非 dict、as 越界、缺 name/kind/question、
+    # 题名重复、contracts 三键非数组 —— 原来全是运行期 KeyError/TypeError
+    good_spec = {
+        "fixtures": [{"file": "a.md", "as": "a"}],
+        "logins": {"a": "x", "b": "y"},
+        "cases": [{"name": "n", "kind": "recall", "question": "q", "fixture": "a.md"}],
+        "contracts": {},
+    }
+    assert validate_spec(good_spec) == [], validate_spec(good_spec)
+    assert any("logins" in e for e in validate_spec({**good_spec, "logins": {"a": "x"}}))
+    assert any("as 必须是 a/b" in e for e in validate_spec(
+        {**good_spec, "fixtures": [{"file": "a.md", "as": "c"}]}))
+    assert any("fixtures 条目" in e for e in validate_spec({**good_spec, "fixtures": ["a.md"]}))
+    assert any("question" in e for e in validate_spec(
+        {**good_spec, "cases": [{"name": "n", "kind": "recall"}]}))
+    dup_spec = {**good_spec, "cases": [dict(good_spec["cases"][0]), dict(good_spec["cases"][0])]}
+    assert any("题名重复" in e for e in validate_spec(dup_spec))
+    assert any("contracts.metadata 必须是数组" in e for e in validate_spec(
+        {**good_spec, "contracts": {"metadata": {"fixture": "a.md"}}}))
+    # ⑦c 脚注定义行不是引用：文末列 [^n]: 定义不许虚增 refs
+    assert footnote_refs("正文[^1] 又见[^2]\n\n[^1]: 甲\n[^2]: 乙") == [1, 2]
+    assert footnote_refs("[^1]: 只有定义") == []
+    # ⑦d 非 dict JSON 响应包一层，调用方 .get 不崩
+    assert _dict_or_data([1]) == {"data": [1]} and _dict_or_data({"a": 1}) == {"a": 1}
+    # ⑦e _opt 缺值是「门没开」：exit 2，不与「有题判红」的 1 撞车
+    real_argv = sys.argv
+    sys.argv = ["kb_eval.py", "--cases"]
+    try:
+        try:
+            _opt("--cases")
+            raise AssertionError("缺值必须退出")
+        except SystemExit as se:
+            assert se.code == 2, se.code
+    finally:
+        sys.argv = real_argv
     # ⑧ raw search 是 cited=yes 的必跑判据；空 hits、漏调、坏响应都不许假绿
     recall = {"name": "R", "kind": "recall", "fixture": "d6.md", "expect": {"cited": "yes"}}
     hits = [{"doc_name": f"d{i}.md"} for i in range(1, 8)]
@@ -809,6 +944,21 @@ def selftest():
     assert any("孤儿证据" in x for x in ck(cite, 200, partial)[0])
     grounded = {"kind": "text", "markdown": "制度要求如此[^1]", "citations": [{"chunk_id": 1}]}
     assert ck(cite, 200, grounded)[0] == []
+    # citations 畸形（dict/str）判红不崩：原来迭代 .get 直接 AttributeError 终止整趟
+    f, n, b = ck(cite, 200, {"kind": "text", "markdown": "x", "citations": {"doc_name": "d.md"}})
+    assert f and "citations 结构非法" in f[0] and b == []
+    # chunk_text 只拼正文字段 + span 非 int 不许崩（打 stub 替掉 req，不连库）
+    real_req = req
+    try:
+        globals()["req"] = lambda *a, **k: (200, {"text": "正文", "doc_name": "元数据词"})
+        assert chunk_text(1, "u") == "正文", "只许取 text 正文，dumps 整份响应会假绿"
+        assert chunk_text(1, "u", span="3") == "正文", "字符串 span 必须回退 window 而不是 TypeError"
+        globals()["req"] = lambda *a, **k: (200, {"doc_name": "缺正文"})
+        assert chunk_text(1, "u").startswith("__HTTP_"), "缺 text 字段判红，不许假绿"
+        globals()["req"] = lambda *a, **k: (404, {})
+        assert chunk_text(1, "u") is None
+    finally:
+        globals()["req"] = real_req
     print("selftest ok")
 
 
@@ -865,6 +1015,10 @@ def main():
         f"base={BASE} A={LOGINS['a']}({AUTH_MODE['a']}) "
         f"B={LOGINS['b']}({AUTH_MODE['b']}) 题数={len(cases)}"
     )
+    if all(AUTH_MODE[a] in ("none", "invalid") for a in ("a", "b")):
+        # 前置警示：双身份都没建立时，问答类题会全 401 记成「答错」(1) 而非阻塞，归因就错了
+        print("⚠️ 双身份均未建立有效会话：问答类题将 401 记红而非阻塞，"
+              "先查 DMSAI_KB_TOKEN_A/B 或 DMSAI_KB_PASSWORD_A/B")
 
     # 入口探针：必须真出 kind=text 才继续。
     # 少了这一步，K5 分诊未落地时 /api/ask 会拿 SQL 路径的 403/表格结果冒充「守住」——ACL 题会假绿。
@@ -902,10 +1056,12 @@ def main():
     elif contract_ran == 0 and SPEC.get("contracts"):
         print("❌ 题集声明了治理契约，但实际执行 0 条")
         rc = 0 if allow_skip else 2
-    if rc == 2:
+    # 独立于 rc 打印：契约失败把 rc 压成 1 时，夹具阻塞证据不许跟着消失
+    if bad:
         print(f"❌ 门没开：{len(bad)} 个夹具未就绪 {sorted(bad)} —— 这轮不构成「知识库全绿」")
     warn_uninjected([c for c, ok, _ in results if ok is None and c["kind"] == "inject"])
-    if not cleanup_fixtures():
+    # 归因不反转：题红(1) 不许被清理失败改写成门没开(2)；清理失败本身已在上面打 ❌ 明细
+    if not cleanup_fixtures() and rc == 0:
         rc = 2
     return rc
 

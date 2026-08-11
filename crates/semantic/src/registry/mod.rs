@@ -26,8 +26,34 @@ pub const DS_PRED: &str = " AND $Q.ds_id IN ($DS, '*')";
 
 /// `DS_PRED` 的**唯一**拼接点。`alias` 为空 = 单表查询（不加前缀）。
 pub fn ds_pred_at(alias: &str, n: usize) -> String {
-    let q = if alias.is_empty() { String::new() } else { format!("{alias}.") };
-    DS_PRED.replace("$Q.", &q).replace("$DS", &format!("${n}"))
+    expand_pred(DS_PRED, alias, n)
+}
+
+/// 谓词模板的单趟展开（`$Q.` → 别名前缀、`$DS` → 绑定序号）：`ds_pred_at` 与
+/// `scoped_asset_pred` 共用这一份，不开第二份双 replace 拷贝。
+fn expand_pred(template: &str, alias: &str, n: usize) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(template.len() + alias.len() + 8);
+    let mut rest = template;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i..];
+        if let Some(r) = after.strip_prefix("$Q.") {
+            if !alias.is_empty() {
+                out.push_str(alias);
+                out.push('.');
+            }
+            rest = r;
+        } else if let Some(r) = after.strip_prefix("$DS") {
+            let _ = write!(out, "${n}");
+            rest = r;
+        } else {
+            out.push('$');
+            rest = &after[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 单表召回的谓词（99% 的调用点）
@@ -35,9 +61,22 @@ pub fn ds_pred(n: usize) -> String {
     ds_pred_at("", n)
 }
 
+/// `ds_pred(1) + source_asset_live_pred_at("", 1)` 的进程内缓存成品：
+/// 单表源资产活性谓词组合，召回 SQL 每问句都拼这同一串（对固定入参是确定串）。
+pub fn source_live_pred_single() -> &'static str {
+    static P: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    P.get_or_init(|| format!("{}{}", ds_pred(1), source_asset_live_pred_at("", 1)))
+}
+
+/// 「ds_pred(1) + 某活性谓词 ("",1)」的拼装：registry/model 七个加载点同一形态，共用一份。
+pub(crate) fn scoped_pred_1(live_pred_at: fn(&str, usize) -> String) -> String {
+    format!("{}{}", ds_pred(1), live_pred_at("", 1))
+}
+
 // 业务库热切换后，手工/自动发现的语义资产可能仍引用旧库表。`table_doc` 是当前物理
 // schema 的事实源；DMS 必须命中 enabled 行才放行，尚未采集 schema 时 fail-closed。
 // 其他数据源保留原冷启动兼容。`source_table` 允许写 JOIN/UNION 说明，因此提取全部表引用。
+// 🔴 下面正则里的七类表前缀与 `TABLE_PREFIXES`（Rust 侧锚定清单）互为拷贝，改前缀两边一起改。
 pub const SOURCE_ASSET_LIVE_PRED: &str = r#" AND (
   ($DS <> 'dms' AND NOT EXISTS (SELECT 1 FROM meta.table_doc live_any
                                 WHERE live_any.enabled AND live_any.ds_id IN ($DS, '*')))
@@ -131,8 +170,7 @@ pub const ELEMENT_ASSET_LIVE_PRED: &str = r#" AND (
 )"#;
 
 fn scoped_asset_pred(template: &str, alias: &str, n: usize) -> String {
-    let q = if alias.is_empty() { String::new() } else { format!("{alias}.") };
-    template.replace("$Q.", &q).replace("$DS", &format!("${n}"))
+    expand_pred(template, alias, n)
 }
 
 pub fn source_asset_live_pred_at(alias: &str, n: usize) -> String {
@@ -153,7 +191,8 @@ pub fn element_asset_live_pred_at(alias: &str, n: usize) -> String {
 
 /// Doris 运行时目录的共享读取口。物理存在/启停仍由 `meta.table_doc` 决定；这里仅把
 /// 已验证的 57 项白名单复用到召回、注册表投影与历史样例，避免各模块复制表清单。
-fn catalog_ident(value: &str) -> &str {
+/// pub(crate)：`recall::ods` 的 JOIN 证据 forms 归一复用同一判定（去空白/反引号）。
+pub(crate) fn catalog_ident(value: &str) -> &str {
     value
         .trim()
         .trim_matches(|c| matches!(c, '`' | '"'))
@@ -166,11 +205,25 @@ fn warehouse_table_parts(table: &str) -> (Option<&str>, &str) {
     (database, table)
 }
 
+/// 表名（目录字面量全小写）→ 资产的静态索引：热路径零线性扫（原来每调一次扫 57 项）。
+fn asset_index()
+-> &'static std::collections::HashMap<&'static str, &'static crate::warehouse_catalog::Asset> {
+    static INDEX: std::sync::LazyLock<
+        std::collections::HashMap<&'static str, &'static crate::warehouse_catalog::Asset>,
+    > = std::sync::LazyLock::new(|| {
+        crate::warehouse_catalog::ASSETS.iter().map(|a| (a.table, a)).collect()
+    });
+    &INDEX
+}
+
 pub fn warehouse_asset(table: &str) -> Option<&'static crate::warehouse_catalog::Asset> {
     let (database, table) = warehouse_table_parts(table);
-    let asset = crate::warehouse_catalog::ASSETS
-        .iter()
-        .find(|asset| asset.table.eq_ignore_ascii_case(table))?;
+    // 目录表名全小写：精确命中零分配；混入大写的输入回落线性的大小写不敏感扫（同旧行为）
+    let asset = asset_index().get(table).copied().or_else(|| {
+        crate::warehouse_catalog::ASSETS
+            .iter()
+            .find(|asset| asset.table.eq_ignore_ascii_case(table))
+    })?;
     database
         .map_or(true, |database| {
             database.eq_ignore_ascii_case(crate::warehouse_catalog::database_of(asset))
@@ -197,10 +250,18 @@ fn push_warehouse_ident(out: &mut String, ident: &mut String) {
     if ident.is_empty() {
         return;
     }
-    if let Some(qualified) = warehouse_qualified_table(ident) {
-        out.push_str(&qualified);
-    } else {
-        out.push_str(ident);
+    // 直接写入 out（原来经 `warehouse_qualified_table` 每 ident 一个临时 String）
+    match warehouse_asset(ident) {
+        Some(asset) => {
+            use std::fmt::Write as _;
+            let _ = write!(
+                out,
+                "{}.{}",
+                crate::warehouse_catalog::database_of(asset),
+                asset.table
+            );
+        }
+        None => out.push_str(ident),
     }
     ident.clear();
 }
@@ -263,22 +324,45 @@ pub fn catalog_allows_table(ds: &str, table: &str) -> bool {
     ds != datasource::DMS_DS_ID || warehouse_asset(table).is_some()
 }
 
+/// 业务表锚定前缀（七类分层/业务表）：本模块 SQL 正则（`SOURCE_ASSET_LIVE_PRED` 等三处）、
+/// `source_refs`、`extract_tables 共用同一份清单 —— 改前缀只许改这里。
+pub(crate) const TABLE_PREFIXES: &[&str] = &["t_", "dws_", "dwd_", "ads_", "ods_", "dim_", "fact_"];
+
 fn source_refs(source: &str) -> Vec<(Option<String>, String)> {
-    source
-        .replace('`', "")
-        .replace('"', "")
+    // 单趟抹掉引号段：字符串字面量里的 `t_x` 不是表引用（与 `warehouse_qualified_source`
+    // 同一引号语义），同时完成去引号（原两次 replace 两遍全串扫描）
+    let mut cleaned = String::with_capacity(source.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in source.chars() {
+        if let Some(end) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == end {
+                quote = None;
+            }
+            cleaned.push(' ');
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            cleaned.push(' ');
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    cleaned
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
         .filter_map(|token| {
-            let mut parts = token.rsplit('.');
+            // 三段名 a.b.c 取 database="a.b"（与 `warehouse_table_parts` 同一 rsplitn 语义）
+            let mut parts = token.rsplitn(2, '.');
             let table = parts.next()?.to_ascii_lowercase();
-            (table.starts_with("t_")
-                || table.starts_with("dws_")
-                || table.starts_with("dwd_")
-                || table.starts_with("ads_")
-                || table.starts_with("ods_")
-                || table.starts_with("dim_")
-                || table.starts_with("fact_"))
-            .then(|| (parts.next().map(str::to_ascii_lowercase), table))
+            TABLE_PREFIXES
+                .iter()
+                .any(|p| table.starts_with(p))
+                .then(|| (parts.next().map(str::to_ascii_lowercase), table))
         })
         .collect()
 }
@@ -314,44 +398,47 @@ pub fn catalog_allows_column(ds: &str, table: &str, column: &str) -> bool {
     if !asset.table.eq_ignore_ascii_case(crate::sales_fact::TABLE_NAME) {
         return true;
     }
-    matches!(
-        column.to_ascii_lowercase().as_str(),
-        "order_date"
-            | "storecode"
-            | "storename"
-            | "skucode"
-            | "skuname"
-            | "war_zone"
-            | "region"
-            | "qty"
-            | "amount"
-            | "cost_excluding_tax"
-            | "revenue_excluding_tax"
-            | "gross_profit"
-    )
+    // 逐词大小写不敏感比较（原来每列先 to_ascii_lowercase 分配一个 String）
+    const ALLOWED: &[&str] = &[
+        "order_date",
+        "storecode",
+        "storename",
+        "skucode",
+        "skuname",
+        "war_zone",
+        "region",
+        "qty",
+        "amount",
+        "cost_excluding_tax",
+        "revenue_excluding_tax",
+        "gross_profit",
+    ];
+    ALLOWED.iter().any(|c| c.eq_ignore_ascii_case(column))
 }
 
 pub fn forbidden_default_sales_column(column: &str) -> bool {
-    matches!(
-        column.to_ascii_lowercase().as_str(),
-        "id"
-            | "type"
-            | "purchase_company_name"
-            | "clear_code"
-            | "ea_convert_quantity"
-            | "group_number"
-            | "ref_order_type"
-            | "state"
-            | "city"
-            | "price_group_name"
-            | "class2"
-            | "classfinal"
-            | "manger"
-            | "goods_type"
-    )
+    const FORBIDDEN: &[&str] = &[
+        "id",
+        "type",
+        "purchase_company_name",
+        "clear_code",
+        "ea_convert_quantity",
+        "group_number",
+        "ref_order_type",
+        "state",
+        "city",
+        "price_group_name",
+        "class2",
+        "classfinal",
+        "manger",
+        "goods_type",
+    ];
+    FORBIDDEN.iter().any(|c| c.eq_ignore_ascii_case(column))
 }
 
-fn compact_contract_expr(expr: &str) -> String {
+/// 合同表达式规范化：去空白/反引号 + 小写。pub(crate)：`registry::exemplar` 的语料
+/// SQL 比对复用同一份（别开第三份拷贝）。
+pub(crate) fn compact_contract_expr(expr: &str) -> String {
     expr.chars()
         .filter(|c| !c.is_ascii_whitespace() && *c != '`')
         .flat_map(char::to_lowercase)
@@ -368,7 +455,11 @@ fn default_sales_metric(name: &str) -> Option<crate::sales_fact::Metric> {
 /// 商品分类、城市、价格组等分析应由目录中的专用 DWS/ADS 提供，不能借默认事实旧列兜底。
 pub fn catalog_allows_dimension(ds: &str, name: &str, source: &str, expr: &str) -> bool {
     if ds != datasource::DMS_DS_ID || !catalog_allows_source(ds, source) {
-        return ds != datasource::DMS_DS_ID;
+        // 非 DMS 源才放行；DMS 源但目录不放行 → 拒
+        if ds != datasource::DMS_DS_ID {
+            return true;
+        }
+        return false;
     }
     let refs = source_refs(source);
     let references_default_sales = refs
@@ -403,6 +494,29 @@ pub fn catalog_allows_dimension(ds: &str, name: &str, source: &str, expr: &str) 
     })
 }
 
+/// 只剥**标识符前缀位置**的 `sf.` 别名（`asf.qty` 里的子串不是别名，误剥会让合同比对假阴性）。
+/// pub(crate)：`registry::exemplar` 的历史样例比对复用同一份。
+pub(crate) fn strip_sf_alias(compact: &str) -> String {
+    let mut out = String::with_capacity(compact.len());
+    let mut chars = compact.chars().peekable();
+    let mut at_boundary = true; // 串首即边界；边界 = 前一字符不是 [A-Za-z0-9_]
+    while let Some(c) = chars.next() {
+        if at_boundary && c == 's' && chars.peek() == Some(&'f') {
+            let mut probe = chars.clone();
+            probe.next(); // 'f'
+            if probe.next() == Some('.') {
+                chars.next(); // 吃掉 'f'
+                chars.next(); // 吃掉 '.'
+                at_boundary = true; // '.' 是边界字符
+                continue;
+            }
+        }
+        at_boundary = !(c.is_ascii_alphanumeric() || c == '_');
+        out.push(c);
+    }
+    out
+}
+
 /// 指标卡/元素向量必须使用当前默认事实公式；仅换到正确表名不足以让旧口径重新生效。
 pub fn catalog_allows_metric_expr(ds: &str, name: &str, source: &str, expr: &str) -> bool {
     if !catalog_allows_metric(ds, name, source) {
@@ -411,7 +525,7 @@ pub fn catalog_allows_metric_expr(ds: &str, name: &str, source: &str, expr: &str
     if ds != datasource::DMS_DS_ID {
         return true;
     }
-    let compact = compact_contract_expr(expr).replace("sf.", "");
+    let compact = strip_sf_alias(&compact_contract_expr(expr));
     if let Some(metric) = default_sales_metric(name) {
         return compact == compact_contract_expr(metric.expression());
     }
@@ -463,20 +577,24 @@ pub fn catalog_allows_metric_record(
 
 /// 历史 `allowed_dimensions` 只作为候选；默认事实最终以当前确认合同为准。
 pub fn catalog_allows_metric_dimension(ds: &str, source: &str, dimension: &str) -> bool {
-    if ds != datasource::DMS_DS_ID {
-        return true;
+    metric_dimension_checker(ds, source)(dimension)
+}
+
+/// `catalog_allows_metric_dimension` 的批量版：source 解析一次，返回逐维度判定闭包
+/// （逐行过滤 allowed_dimensions 的调用点原来每个维度都重跑一遍 source_refs）。
+pub fn metric_dimension_checker(ds: &str, source: &str) -> impl Fn(&str) -> bool {
+    // 「与默认事实无关就整批放行」的半边在闭包外只算一次
+    let free = ds != datasource::DMS_DS_ID || {
+        let refs = source_refs(source);
+        !refs
+            .iter()
+            .any(|(_, table)| table.eq_ignore_ascii_case(crate::sales_fact::TABLE_NAME))
+    };
+    move |dimension| {
+        free || crate::sales_fact::DIMENSIONS
+            .iter()
+            .any(|d| d.name() == dimension)
     }
-    let refs = source_refs(source);
-    if !refs
-        .iter()
-        .any(|(_, table)| table.eq_ignore_ascii_case(crate::sales_fact::TABLE_NAME))
-    {
-        return true;
-    }
-    matches!(
-        dimension,
-        "销售日期" | "客户编码" | "客户" | "商品编码" | "商品" | "战区" | "省区" | "月份"
-    )
 }
 
 /// 默认销售事实指标只能绑定唯一受信 DWS；其他已验证指标仍按 57 项目录放行。
@@ -490,7 +608,7 @@ pub fn catalog_allows_metric(ds: &str, name: &str, source: &str) -> bool {
     let refs = source_refs(source);
     let exact_default_fact = refs.len() == 1
         && refs.first().is_some_and(|(database, table)| {
-            database.as_deref() == Some("sales_dw")
+            database.as_deref().is_some_and(|db| db.eq_ignore_ascii_case("sales_dw"))
                 && table == crate::sales_fact::TABLE_NAME
         });
     match default_sales_metric(name) {
@@ -501,8 +619,9 @@ pub fn catalog_allows_metric(ds: &str, name: &str, source: &str) -> bool {
 
 /// 备份/快照表（t_employee_260410、bak_*、*_copy1、*_del_log 之类）不入元数据
 pub fn is_backup_table(name: &str) -> bool {
-    let tail: String = name.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
-    tail.len() >= 4
+    // 只用尾段长度，不收集字符串（原实现为取长度收集了整个尾部）
+    let tail_len = name.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    tail_len >= 4
         || name.starts_with("bak_")
         || name.contains("_copy")
         || name.ends_with("_del_log")
@@ -512,10 +631,10 @@ pub fn is_backup_table(name: &str) -> bool {
         || name.ends_with("_backups")
         || name.ends_with("_history")
         || name.ends_with("_delete_history")
-        // 6 位日期备份段（YYMMDD，如 t_xxx_260515_01）
-        || name.split('_').any(|seg| seg.len() == 6 && seg.chars().all(|c| c.is_ascii_digit()))
-        // bak_sales_order_20251016_01 形态：含 8 位日期段
-        || name.split('_').any(|seg| seg.len() == 8 && seg.chars().all(|c| c.is_ascii_digit()))
+        // 6/8 位数字日期段单遍判（YYMMDD 如 t_xxx_260515_01；bak_sales_order_20251016_01 形态）
+        || name.split('_').any(|seg| {
+            matches!(seg.len(), 6 | 8) && seg.chars().all(|c| c.is_ascii_digit())
+        })
 }
 
 /// 敏感列词表：**全仓单一事实源**已收进 kernel（F5），schema 过滤与 is_safe_select 共用一份。
@@ -523,19 +642,28 @@ pub use dms_kernel::nl::lexicon::SENSITIVE_COLS;
 
 /// 敏感列：绝不进给 LLM 的 schema（旧项目 live.rs 同款，治本）
 pub fn is_sensitive_col(name: &str) -> bool {
-    let n = name.to_lowercase();
+    // 物理列名惯例全小写：只有混入大写时才为小写化分配（schema 渲染热路径逐列调）
+    let lowered;
+    let n = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        lowered = name.to_lowercase();
+        &lowered
+    } else {
+        name
+    };
     SENSITIVE_COLS.iter().any(|k| n.contains(k))
 }
 
-/// 表域归类（按名前缀，供检索上下文分组展示）
+/// 表域归类（按名前缀，供检索上下文分组展示）。
+/// 长前缀排前：`t_marketing_*` 不许被 `t_market` 抢中（测试钉着）。
 pub fn domain_of(table: &str) -> &'static str {
     for (pre, d) in [
         ("t_sales_order", "订单"), ("t_after_sales", "售后"), ("t_customer", "客户"),
-        ("t_goods", "商品"), ("t_market", "市场费用"), ("t_activity", "活动"),
+        ("t_goods", "商品"), ("t_marketing", "营销"), ("t_market", "市场费用"),
+        ("t_activity", "活动"),
         ("t_invoice", "开票"), ("t_account", "对账"), ("t_device", "设备"),
         ("t_shop", "门店"), ("t_warehouse", "仓库"), ("t_winc", "赢销通"),
         ("t_employee", "组织"), ("t_department", "组织"), ("t_role", "权限"), ("t_menu", "权限"),
-        ("t_points", "积分"), ("t_marketing", "营销"),
+        ("t_points", "积分"),
     ] {
         if table.starts_with(pre) {
             return d;
@@ -544,13 +672,20 @@ pub fn domain_of(table: &str) -> &'static str {
     "其他"
 }
 
-/// 从 SQL 提取物理表名（复盘教训的锚定触发词）
+/// 从 SQL 提取物理表名（复盘教训的锚定触发词，写路径使用）。
+/// 大小写不敏感（LLM 大写 SQL 的 `T_SALES_ORDER` 同样锚定），产出统一小写；
+/// 前缀清单 = `TABLE_PREFIXES`（与目录闸门的七类同一份）。
 pub fn extract_tables(sql: &str) -> String {
     let mut tabs: Vec<String> = vec![];
     let mut cur = String::new();
     let push = |cur: &str, tabs: &mut Vec<String>| {
-        if cur.starts_with("t_") && cur.len() > 2 && cur.len() < 60 && !tabs.contains(&cur.to_string()) {
-            tabs.push(cur.to_string());
+        let lower = cur.to_ascii_lowercase();
+        if lower.len() > 2
+            && lower.len() < 60
+            && TABLE_PREFIXES.iter().any(|p| lower.starts_with(p))
+            && !tabs.iter().any(|t| *t == lower)
+        {
+            tabs.push(lower);
         }
     };
     for c in sql.chars() {
@@ -584,11 +719,100 @@ mod tests {
         assert!(!is_backup_table("t_customer_balance"));
     }
 
+    /// sf. 别名只剥标识符前缀位置：asf.qty 这类子串不许被误伤（合同比对假阴性防线）。
+    #[test]
+    fn strip_sf_alias_only_at_identifier_start() {
+        assert_eq!(strip_sf_alias("sum(sf.amount)"), "sum(amount)");
+        assert_eq!(strip_sf_alias("sf.amount"), "amount");
+        assert_eq!(strip_sf_alias("asf.qty"), "asf.qty", "asf. 子串不许误剥");
+        assert_eq!(strip_sf_alias("coalesce(sf.x,sf.y),'asf.z'"), "coalesce(x,y),'asf.z'");
+        assert_eq!(strip_sf_alias("无别名"), "无别名");
+    }
+
+    /// 表域归类：长前缀优先（t_marketing_* 归「营销」，不被 t_market 抢成「市场费用」）。
+    #[test]
+    fn domain_of_prefers_longer_prefix() {
+        assert_eq!(domain_of("t_marketing_goods"), "营销");
+        assert_eq!(domain_of("t_marketing_zone_product"), "营销");
+        assert_eq!(domain_of("t_market_total_expense"), "市场费用");
+        assert_eq!(domain_of("t_sales_order"), "订单");
+    }
+
+    /// 锚定提取：大小写不敏感、产出小写、七类前缀全认（与目录闸门同一份清单）。
+    #[test]
+    fn extract_tables_case_insensitive_and_all_prefixes() {
+        assert_eq!(extract_tables("SELECT * FROM T_SALES_ORDER"), "t_sales_order");
+        let got = extract_tables("SELECT * FROM dws_x JOIN t_a ON 1=1 JOIN ods_y");
+        assert_eq!(got, "dws_x,t_a,ods_y", "{got}");
+        assert_eq!(extract_tables("select 1"), "");
+    }
+
+    /// source_refs：字符串字面量里的 t_x 不是表引用；三段名取 rsplitn 语义（db="a.b"）。
+    #[test]
+    fn source_refs_skip_string_literals() {
+        // 字面量里的 t_secret 不算引用：真实目录表在 → 通过
+        assert!(source_uses_warehouse_catalog(
+            "sales_dw.dws_off_offline_sale_dfn WHERE note='t_secret'"
+        ));
+        // 只有字面量引用 = 没有任何表引用 → 不过
+        assert!(!source_uses_warehouse_catalog("SELECT 't_sales_order'"));
+    }
+
     #[test]
     fn sensitive_cols_filtered() {
         assert!(is_sensitive_col("login_pwd"));
         assert!(is_sensitive_col("api_token"));
         assert!(!is_sensitive_col("customer_code"));
+    }
+
+    /// `catalog_allows_metric_record` 连传 10+ 个同类型参数：字段两两不同的样本必须过判据，
+    /// 任两个实参换位必须翻转 —— 传参顺序错位在这里直接红。
+    #[test]
+    fn metric_record_args_order_is_pinned() {
+        let pass = catalog_allows_metric_record(
+            datasource::DMS_DS_ID,
+            "销售额",
+            crate::sales_fact::TABLE,
+            crate::sales_fact::Metric::SalesAmount.expression(),
+            "",
+            crate::sales_fact::ORDER_DATE,
+            "",
+            crate::sales_fact::Metric::SalesAmount.description(),
+            crate::sales_fact::Metric::SalesAmount.unit(),
+            "",
+            crate::sales_fact::VERSION,
+        );
+        assert!(pass);
+        // scope_filter 与 time_col 换位：判据必须翻 false（两槽位语义不同）
+        let swapped = catalog_allows_metric_record(
+            datasource::DMS_DS_ID,
+            "销售额",
+            crate::sales_fact::TABLE,
+            crate::sales_fact::Metric::SalesAmount.expression(),
+            crate::sales_fact::ORDER_DATE, // 挪到 scope_filter 槽位 → 非空即拒
+            "",
+            "",
+            crate::sales_fact::Metric::SalesAmount.description(),
+            crate::sales_fact::Metric::SalesAmount.unit(),
+            "",
+            crate::sales_fact::VERSION,
+        );
+        assert!(!swapped, "scope_filter/time_col 换位必须拒");
+        // description 与 version 换位同样拒
+        let swapped2 = catalog_allows_metric_record(
+            datasource::DMS_DS_ID,
+            "销售额",
+            crate::sales_fact::TABLE,
+            crate::sales_fact::Metric::SalesAmount.expression(),
+            "",
+            crate::sales_fact::ORDER_DATE,
+            "",
+            crate::sales_fact::VERSION,
+            crate::sales_fact::Metric::SalesAmount.unit(),
+            "",
+            crate::sales_fact::Metric::SalesAmount.description(),
+        );
+        assert!(!swapped2, "description/version 换位必须拒");
     }
 
     #[test]

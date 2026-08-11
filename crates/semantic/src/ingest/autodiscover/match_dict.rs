@@ -3,75 +3,139 @@
 //! 🔴 **一个判据都不许松**：这是两轮实跑血泪的落点。`menu_type` 撞对账单状态、
 //! `data_scope_type={1,2}` 撞联系人类型都靠它挡；下面三个断言就是那两次误配的复现。
 //!
-//! 搬运源 `server/src/meta.rs:1533-1600`（`best_dict_match` / `name_aligns` 一字未改）。
+//! 搬运源 `server/src/meta.rs:1533-1600`（`best_dict_match` / `name_aligns` 的判据与阈值逐字保留；
+//! 本轮加了 `DictIndex` 预建视图与同分确定性排序，判据本身没动）。
+
+/// 对码判据阈值（每个都有测试钉点，改动即评审；doc 注释引常量不抄数字）。
+/// 值集不同值数下限（单值列证据近零）。
+const MIN_DISTINCT: usize = 2;
+/// 值集不同值数上限（超过即非码列）。
+const MAX_DISTINCT: usize = 60;
+/// 覆盖率下限：`列实际取值 ∩ 字典码 / 列实际取值`。
+const MIN_COVERAGE: f64 = 0.8;
+/// 直通档：覆盖率 100% 且不同值 ≥ 此数（大集合免名称对齐）。
+const DIRECT_MIN_DISTINCT: usize = 8;
+/// 名称对齐的连续公共子串字数（CJK n-gram 的 n）。
+const NAME_GRAM: usize = 3;
+
+/// `best_dict_match` 的命中（dict_key, dict_name, 码名对, 覆盖率）。
+pub type DictMatch = (String, String, Vec<(String, String)>, f64);
+
+/// 一轮对码的预建视图（小写键/名 + 各字典码集 + 码集引用）：原来每个候选列都重建一遍，
+/// 且 HashMap 迭代序随机 → 同分谁先看谁随机。构建时按 key 排序 = 跨轮可复现。
+pub struct DictIndex<'a> {
+    entries: Vec<DictEntry<'a>>,
+}
+
+struct DictEntry<'a> {
+    key: &'a str,
+    name: &'a str,
+    pairs: &'a [(String, String)],
+    key_low: String,
+    name_low: String,
+    codes: std::collections::HashSet<&'a str>,
+}
+
+impl<'a> DictIndex<'a> {
+    pub fn build(dicts: &'a std::collections::HashMap<String, (String, Vec<(String, String)>)>) -> Self {
+        let mut entries: Vec<DictEntry<'a>> = dicts
+            .iter()
+            .map(|(kc, (kn, pairs))| DictEntry {
+                key: kc,
+                name: kn,
+                pairs,
+                key_low: kc.to_lowercase(),
+                name_low: kn.to_lowercase(),
+                codes: pairs.iter().map(|(c, _)| c.as_str()).collect(),
+            })
+            .collect();
+        // 按 key 排序：同 cov 同 hit 的两个字典谁中与迭代序无关（跨轮可复现）
+        entries.sort_by(|a, b| a.key.cmp(b.key));
+        Self { entries }
+    }
+}
 
 /// 值集对码：找覆盖率最高的 dict key。防误配硬闸（两轮实跑教训）：
 ///   教训① 数值小码集互相撞车（menu_type 撞对账单状态、wms_type 撞 28 项发票类型）；
 ///   教训② 含字母码的字典一样是撞车磁铁（data_scope_type={1,2} 撞联系人类型、审批状态撞设备处置状态）——
 ///          小值集证据本质不足，除名称对齐外无捷径。
 /// 规则：A. 注释点名优先：列注释里出现某 dict 的 key_code/key_name（如「数据字典 MARKETING_GOODS_CATEGORY」）→ 只评该字典；
-///        B. 直通：覆盖率 100% 且 ≥8 个不同值；
-///        C. 名称对齐：列注释与字典名有 ≥3 字连续公共子串。
-/// 值集需 2~60 个不同值，覆盖 ≥80%。纯函数可单测。
+///        B. 直通：覆盖率 100% 且 ≥ `DIRECT_MIN_DISTINCT` 个不同值；
+///        C. 名称对齐：列注释与字典名有 ≥`NAME_GRAM` 字连续公共子串。
+/// 值集需 `MIN_DISTINCT`~`MAX_DISTINCT` 个不同值，覆盖 ≥ `MIN_COVERAGE`。纯函数可单测。
 pub fn best_dict_match(
     values: &[String],
     dicts: &std::collections::HashMap<String, (String, Vec<(String, String)>)>,
     col_comment: &str,
-) -> Option<(String, String, Vec<(String, String)>, f64)> {
+) -> Option<DictMatch> {
+    best_dict_match_ix(values, &DictIndex::build(dicts), col_comment)
+}
+
+/// `best_dict_match` 的索引版：一轮多候选列共用一份 `DictIndex`。
+pub fn best_dict_match_ix(
+    values: &[String],
+    index: &DictIndex<'_>,
+    col_comment: &str,
+) -> Option<DictMatch> {
     use std::collections::HashSet;
     let uniq: HashSet<&String> = values.iter().collect();
-    if uniq.len() < 2 || uniq.len() > 60 {
+    if uniq.len() < MIN_DISTINCT || uniq.len() > MAX_DISTINCT {
         return None;
     }
-    // A. 注释点名的字典优先（只评点名的；点名了但不匹配也宁缺毋滥）
+    // A. 注释点名的字典优先（只评点名的；点名了但不匹配也宁缺毋滥）。
+    //    key 与 name 统一小写比对（字典名含 ASCII 时大小写不一致不再漏点名）。
     let comment_low = col_comment.to_lowercase();
-    let named: Vec<&String> = dicts
-        .keys()
-        .filter(|kc| {
-            (!kc.is_empty() && kc.len() >= 4 && comment_low.contains(&kc.to_lowercase()))
-                || dicts
-                    .get(*kc)
-                    .map(|(kn, _)| !kn.is_empty() && kn.len() >= 3 && col_comment.contains(kn.as_str()))
-                    .unwrap_or(false)
+    let named: Vec<&DictEntry<'_>> = index
+        .entries
+        .iter()
+        .filter(|e| {
+            (!e.key.is_empty() && e.key.chars().count() >= 4 && comment_low.contains(&e.key_low))
+                || (!e.name.is_empty()
+                    && e.name.chars().count() >= 3
+                    && comment_low.contains(&e.name_low))
         })
         .collect();
-    let candidates: Vec<&String> = if !named.is_empty() {
+    let candidates: Vec<&DictEntry<'_>> = if !named.is_empty() {
         named
     } else {
-        dicts.keys().collect()
+        index.entries.iter().collect()
     };
-    let mut best: Option<(String, String, Vec<(String, String)>, f64, usize)> = None;
-    for kc in candidates {
-        let (kn, pairs) = &dicts[kc];
-        let codes: HashSet<&String> = pairs.iter().map(|(c, _)| c).collect();
-        let hit = uniq.iter().filter(|v| codes.contains(**v)).count();
+    let mut best: Option<(&DictEntry<'_>, f64, usize)> = None;
+    for e in candidates {
+        let hit = uniq.iter().filter(|v| e.codes.contains(v.as_str())).count();
         let cov = hit as f64 / uniq.len() as f64;
-        if hit < 2 || cov < 0.8 {
+        if hit < MIN_DISTINCT || cov < MIN_COVERAGE {
             continue;
         }
-        let pass = (cov >= 1.0 && uniq.len() >= 8) || name_aligns(col_comment, kn);
+        let pass = (cov >= 1.0 && uniq.len() >= DIRECT_MIN_DISTINCT) || name_aligns(col_comment, e.name);
         if !pass {
             continue;
         }
+        // 严格大于才换：同 cov 同 hit 保持 key 序在前者（确定性）
         let better = match &best {
-            Some((_, _, _, bcov, bhit)) => (cov, hit) > (*bcov, *bhit),
+            Some((_, bcov, bhit)) => (cov, hit) > (*bcov, *bhit),
             None => true,
         };
         if better {
-            best = Some((kc.clone(), kn.clone(), pairs.clone(), cov, hit));
+            best = Some((e, cov, hit));
         }
     }
-    best.map(|(kc, kn, pairs, cov, _)| (kc, kn, pairs, cov))
+    // 出循环后克隆一次（原来每次刷新 best 都 pairs.clone() 整份码表）
+    best.map(|(e, cov, _)| (e.key.to_string(), e.name.to_string(), e.pairs.to_vec(), cov))
 }
 
-/// 名称对齐：列注释与字典名存在 ≥3 字连续公共子串（CJK 3-gram 双向包含判定）
+/// 名称对齐：列注释与字典名存在 ≥`NAME_GRAM` 字连续公共子串（CJK n-gram 包含判定；
+/// 「存在公共 n-gram」数学上对称，单向判一次即可 —— 原双向各判一次是冗余）。
+/// 统一小写比对（CJK 无大小写；含 ASCII 的字典名与注释大小写不同也照中 —— 与点名闸同口径）。
 pub fn name_aligns(comment: &str, dict_name: &str) -> bool {
-    let c: Vec<char> = comment.chars().collect();
-    let d: Vec<char> = dict_name.chars().collect();
-    let has_common_3gram = |a: &[char], b: &[char]| {
-        b.windows(3).any(|w| a.windows(3).any(|x| x == w))
-    };
-    c.len() >= 3 && d.len() >= 3 && (has_common_3gram(&c, &d) || has_common_3gram(&d, &c))
+    let c: Vec<char> = comment.to_lowercase().chars().collect();
+    let d: Vec<char> = dict_name.to_lowercase().chars().collect();
+    if c.len() < NAME_GRAM || d.len() < NAME_GRAM {
+        return false;
+    }
+    // HashSet 包含判定（原 O(|a|×|b|) 双层 windows 比较）
+    let grams: std::collections::HashSet<&[char]> = c.windows(NAME_GRAM).collect();
+    d.windows(NAME_GRAM).any(|w| grams.contains(w))
 }
 
 #[cfg(test)]
@@ -173,5 +237,38 @@ mod tests {
         assert!(name_aligns("所属公司", "所属公司"));
         assert!(!name_aligns("数据范围类型", "合同类型"));
         assert!(!name_aligns("菜单类型", "对账单状态"));
+    }
+
+    /// 同 cov 同 hit 的两个字典：结果跨轮可复现（按 key 序取前者，不看 HashMap 迭代序）。
+    #[test]
+    fn tied_dicts_resolve_deterministically() {
+        let mut dicts = std::collections::HashMap::new();
+        // 两本字典码集相同、名称都与注释对齐 → cov/hit 全平
+        for key in ["Zb_dict", "Aa_dict"] {
+            dicts.insert(
+                key.to_string(),
+                ("订单状态".to_string(), vec![("01".into(), "暂存".into()), ("02".into(), "生效".into())]),
+            );
+        }
+        let vals = vec!["01".to_string(), "02".to_string()];
+        let first = best_dict_match(&vals, &dicts, "订单状态").unwrap();
+        for _ in 0..20 {
+            let again = best_dict_match(&vals, &dicts, "订单状态").unwrap();
+            assert_eq!(again.0, first.0, "同分结果跨轮必须可复现");
+        }
+        assert_eq!(first.0, "Aa_dict", "同分按 key 序取前者");
+    }
+
+    /// 点名的统一小写口径：字典名含 ASCII 时，注释与名大小写不同也照中。
+    #[test]
+    fn named_dict_match_is_case_insensitive_on_ascii_names() {
+        let mut dicts = std::collections::HashMap::new();
+        dicts.insert(
+            "WMS_STATUS".to_string(),
+            ("WMS状态".to_string(), vec![("01".into(), "启用".into()), ("02".into(), "停用".into())]),
+        );
+        let vals = vec!["01".to_string(), "02".to_string()];
+        let (kc, ..) = best_dict_match(&vals, &dicts, "wms状态说明").unwrap();
+        assert_eq!(kc, "WMS_STATUS", "小写注释点大写名字典必须中");
     }
 }

@@ -5,6 +5,7 @@
 //! 但必须同时更新说明、来源和指标版本；没有稳定公式的资产不得按字段相似度替换。
 //! `METRICS`/`MAPS` 继续留在函数体内，避免再造一套种子装配框架。
 
+use crate::registry::datasource::DMS_DS_ID;
 use crate::sales_fact::{self, Metric as SalesMetric};
 use sqlx::PgPool;
 
@@ -33,7 +34,8 @@ pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
         // **只有无维度那一支**被 `agg_template` 的硬编码分支服务，`成交客户数 × 维度`
         // （「各省成交客户数」这类）压根进不了装配器。补成指标是**加法式**的：
         // 无维度那支仍走模板（指标 only 的让路门保证数与 KPI 环比不变），
-        // 新增的只是「带维度」那一类。口径与 `meta.term` 同名条目一字不差 —— 两处漂了就是两个答案。
+        // 新增的只是「带维度」那一类。与 `meta.term` 同名条目两处口径同义、措辞各自维护
+        // （漂了就是两个答案 —— 改一边时对照另一边）。
         ("buyer_count", "成交客户数", &["下单客户数", "成交客户", "多少客户", "客户数"],
          "t_sales_order", "COUNT(DISTINCT customer_code)",
          "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
@@ -240,12 +242,18 @@ pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
         ("active_sku_count", "2-order", ORDER_PRODUCT_DIMS),
     ];
     for (code, version, dims) in METRIC_POLICIES {
-        sqlx::query("UPDATE meta.metric SET version=$1, allowed_dimensions=$2 WHERE ds_id='dms' AND metric_code=$3")
+        // 0 行 = code 与 METRICS 打漂（version/allowed_dimensions 静默不生效）：收集后 warn
+        let affected = sqlx::query("UPDATE meta.metric SET version=$1, allowed_dimensions=$2 WHERE ds_id=$3 AND metric_code=$4")
             .bind(version)
-            .bind(dims.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .bind(dims.to_vec())
+            .bind(DMS_DS_ID)
             .bind(code)
             .execute(pg)
-            .await?;
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            tracing::warn!("METRIC_POLICIES 未命中指标行（code={code} 与 METRICS 打漂？）");
+        }
     }
 
     let sales_dims = sales_fact::dimension_names()
@@ -255,9 +263,10 @@ pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
     for metric in sales_fact::METRICS {
         // DWS 日事实按 order_date 覆盖完整自然日，不沿用旧发货口径的 yesterday 上限。
         // 显式清空而非依赖列默认值，确保已存在的 sales_amount 行也能消除历史残留。
-        sqlx::query("UPDATE meta.metric SET version=$1, allowed_dimensions=$2, time_cap='' WHERE ds_id='dms' AND metric_code=$3")
+        sqlx::query("UPDATE meta.metric SET version=$1, allowed_dimensions=$2, time_cap='' WHERE ds_id=$3 AND metric_code=$4")
             .bind(sales_fact::VERSION)
             .bind(&sales_dims)
+            .bind(DMS_DS_ID)
             .bind(metric.code())
             .execute(pg)
             .await?;
@@ -275,10 +284,11 @@ pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
         .collect::<Vec<_>>();
     let mut stale_codes = sqlx::query_scalar::<_, String>(
         "SELECT metric_code FROM meta.metric
-         WHERE ds_id = 'dms' AND name = ANY($1) AND NOT (metric_code = ANY($2))",
+         WHERE ds_id = $3 AND name = ANY($1) AND NOT (metric_code = ANY($2))",
     )
     .bind(&current_sales_names)
     .bind(&current_sales_codes)
+    .bind(DMS_DS_ID)
     .fetch_all(pg)
     .await?;
     // 已知历史代码名称并不等于“销售额”，不能依赖同名扫描捎带删除。
@@ -287,16 +297,21 @@ pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
             stale_codes.push(code.to_string());
         }
     }
-    for code in stale_codes {
-        sqlx::query("DELETE FROM meta.element WHERE ds_id = 'dms' AND element_id = $1")
-            .bind(format!("metric:{code}"))
-            .execute(pg)
-            .await?;
-        sqlx::query("DELETE FROM meta.metric WHERE ds_id = 'dms' AND metric_code = $1")
-            .bind(code)
-            .execute(pg)
-            .await?;
-    }
+    // 批量两条 DELETE（原来每 code 两次往返；element 与 metric 必须是分开的两条，
+    // 同一批 code 一个事务：中途失败不留孤儿）
+    let mut tx = pg.begin().await?;
+    let elem_ids: Vec<String> = stale_codes.iter().map(|code| format!("metric:{code}")).collect();
+    sqlx::query("DELETE FROM meta.element WHERE ds_id = $1 AND element_id = ANY($2)")
+        .bind(DMS_DS_ID)
+        .bind(&elem_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM meta.metric WHERE ds_id = $1 AND metric_code = ANY($2)")
+        .bind(DMS_DS_ID)
+        .bind(&stale_codes)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -314,15 +329,16 @@ async fn upsert_metric(
     description: &str,
     unit: &str,
 ) -> anyhow::Result<()> {
+    // 显式写 ds_id（不靠 DDL DEFAULT；别名绑 Vec<&str> 零逐条 String 分配）
     sqlx::query(
-        "INSERT INTO meta.metric(metric_code, name, aliases, source_table, agg_expr, scope_filter, time_col, dedup_keys, description, unit)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        "INSERT INTO meta.metric(metric_code, name, aliases, source_table, agg_expr, scope_filter, time_col, dedup_keys, description, unit, ds_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
          ON CONFLICT (ds_id, metric_code) DO UPDATE SET
            name=$2, aliases=$3, source_table=$4, agg_expr=$5, scope_filter=$6, time_col=$7, dedup_keys=$8, description=$9, unit=$10",
     )
     .bind(code)
     .bind(name)
-    .bind(aliases.iter().map(|alias| alias.to_string()).collect::<Vec<_>>())
+    .bind(aliases.to_vec())
     .bind(source_table)
     .bind(agg_expr)
     .bind(scope_filter)
@@ -330,6 +346,7 @@ async fn upsert_metric(
     .bind(dedup_keys)
     .bind(description)
     .bind(unit)
+    .bind(DMS_DS_ID)
     .execute(pg)
     .await?;
     Ok(())
@@ -409,8 +426,9 @@ pub(crate) async fn seed_dimensions(pg: &PgPool) -> anyhow::Result<()> {
     // 避免它被当成可用于权限或人员归属分析的“业务员”维度。
     sqlx::query(
         "UPDATE meta.dimension SET status='disabled' \
-         WHERE ds_id='dms' AND dim_code IN ('owner','manager_name')",
+         WHERE ds_id=$1 AND dim_code IN ('owner','manager_name')",
     )
+    .bind(DMS_DS_ID)
     .execute(pg)
     .await?;
     Ok(())
@@ -426,21 +444,36 @@ async fn upsert_dimension(
     description: &str,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO meta.dimension(dim_code, name, aliases, source_table, expr, description)
-         VALUES ($1,$2,$3,$4,$5,$6)
+        "INSERT INTO meta.dimension(dim_code, name, aliases, source_table, expr, description, ds_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
          ON CONFLICT (ds_id, dim_code) DO UPDATE SET
            name=$2, aliases=$3, source_table=$4, expr=$5, description=$6",
     )
     .bind(code)
     .bind(name)
-    .bind(aliases.iter().map(|alias| alias.to_string()).collect::<Vec<_>>())
+    .bind(aliases.to_vec())
     .bind(source_table)
     .bind(expr)
     .bind(description)
+    .bind(DMS_DS_ID)
     .execute(pg)
     .await?;
     Ok(())
 }
+
+/// 32 省行政区划（名, 码）：`t_customer.province` 与 `t_sales_order.receiver_province`
+/// 共用同一本字典 —— 单一份事实源，补码只改这里（原来两处逐字抄写）。
+const PROVINCE_CODES: &[(&str, &str)] = &[
+    ("北京", "110000"), ("天津", "120000"), ("河北", "130000"), ("山西", "140000"),
+    ("内蒙古", "150000"), ("辽宁", "210000"), ("吉林", "220000"), ("黑龙江", "230000"),
+    ("上海", "310000"), ("江苏", "320000"), ("浙江", "330000"), ("安徽", "340000"),
+    ("福建", "350000"), ("江西", "360000"), ("山东", "370000"), ("河南", "410000"),
+    ("湖北", "420000"), ("湖南", "430000"), ("广东", "440000"), ("广西", "450000"),
+    ("海南", "460000"), ("重庆", "500000"), ("四川", "510000"), ("贵州", "520000"),
+    ("云南", "530000"), ("西藏", "540000"), ("陕西", "610000"), ("甘肃", "620000"),
+    ("青海", "630000"), ("宁夏", "640000"), ("新疆", "650000"), ("台湾", "710000"),
+    ("香港", "810000"), ("澳门", "820000"),
+];
 
 /// 值链接码表种子（全部来自 meta.pitfall 已连库坐实的码表教训——不猜字典）
 pub(crate) async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
@@ -528,30 +561,13 @@ pub(crate) async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
          "eq"),
         // 省份=行政区划码（实测 t_customer.province 存 '430000' 这类 6 位码，不是省名）。
         // 缺这组映射时问「湖南省销售额」LLM 无从下手——实测直接漏掉省份过滤答成全量。
-        ("t_customer", "province",
-         &[("北京", "110000"), ("天津", "120000"), ("河北", "130000"), ("山西", "140000"),
-           ("内蒙古", "150000"), ("辽宁", "210000"), ("吉林", "220000"), ("黑龙江", "230000"),
-           ("上海", "310000"), ("江苏", "320000"), ("浙江", "330000"), ("安徽", "340000"),
-           ("福建", "350000"), ("江西", "360000"), ("山东", "370000"), ("河南", "410000"),
-           ("湖北", "420000"), ("湖南", "430000"), ("广东", "440000"), ("广西", "450000"),
-           ("海南", "460000"), ("重庆", "500000"), ("四川", "510000"), ("贵州", "520000"),
-           ("云南", "530000"), ("西藏", "540000"), ("陕西", "610000"), ("甘肃", "620000"),
-           ("青海", "630000"), ("宁夏", "640000"), ("新疆", "650000"), ("台湾", "710000"),
-           ("香港", "810000"), ("澳门", "820000")], "eq"),
+        ("t_customer", "province", PROVINCE_CODES, "eq"),
         // 🔴 同一本行政区划字典的第二张表（SALE17 实测的**逃逸列**）：
         // `receiver_province` 实测同样存 6 位码（DISTINCT 抽样全是 '430000' 一族）——
         // 模型在 customer.province 被口径判据追着改时，会逃到 `receiver_province LIKE '%湖南%'`
-        // 接着错（码列 LIKE 名称照样 0 行）。同一批值，两个落点，判据与换码卡都得看得见。
-        ("t_sales_order", "receiver_province",
-         &[("北京", "110000"), ("天津", "120000"), ("河北", "130000"), ("山西", "140000"),
-           ("内蒙古", "150000"), ("辽宁", "210000"), ("吉林", "220000"), ("黑龙江", "230000"),
-           ("上海", "310000"), ("江苏", "320000"), ("浙江", "330000"), ("安徽", "340000"),
-           ("福建", "350000"), ("江西", "360000"), ("山东", "370000"), ("河南", "410000"),
-           ("湖北", "420000"), ("湖南", "430000"), ("广东", "440000"), ("广西", "450000"),
-           ("海南", "460000"), ("重庆", "500000"), ("四川", "510000"), ("贵州", "520000"),
-           ("云南", "530000"), ("西藏", "540000"), ("陕西", "610000"), ("甘肃", "620000"),
-           ("青海", "630000"), ("宁夏", "640000"), ("新疆", "650000"), ("台湾", "710000"),
-           ("香港", "810000"), ("澳门", "820000")], "eq"),
+        // 接着错（码列 LIKE 名称照样 0 行）。同一批值（`PROVINCE_CODES` 单一份事实源），
+        // 两个落点，判据与换码卡都得看得见。
+        ("t_sales_order", "receiver_province", PROVINCE_CODES, "eq"),
         // 客户分类（字典 CustClassif，与 meta.dimension customer_class 的 CASE 同源）：
         // 「线下客户」这类问法必须换成 '04'，否则 LLM 会去猜别的列（实测猜到了 customer_channel）
         ("t_customer", "customer_class",
@@ -574,9 +590,12 @@ pub(crate) async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
          &[("增值税普通发票", "1"), ("普票", "1"), ("增值税专用发票", "2"), ("专票", "2")], "eq"),
         ("t_customer", "invoice_type",
          &[("增值税普通发票", "1"), ("普票", "1"), ("增值税专用发票", "2"), ("专票", "2")], "eq"),
-        // 有效订单口径（pitfall 坐实 0暂存/108无效/199作废）
+        // 有效订单口径（pitfall 坐实 0暂存/108/199）。🔴 DMS 校准正名（SystemConsant.java:23-38）：
+        // 108=已取消、199=已删除 —— 旧名「无效/作废」由 seed_value_maps 开头的 DELETE 收敛
+        // （upsert 键含 name，不删旧行就是两名一码）。Java 侧共 17 档，其余 14 档码名
+        // 待源码清单导出后补齐（不臆造）。
         ("t_sales_order", "order_status",
-         &[("暂存", "0"), ("无效", "108"), ("作废", "199")], "eq"),
+         &[("暂存", "0"), ("已取消", "108"), ("已删除", "199")], "eq"),
         // PayWayEnum：真库有逗号组合值——ZX01 纯值可等值，余额类必须 LIKE 含组合（pitfall 坐实）
         ("t_sales_order", "paid_way", &[("在线支付", "ZX01")], "eq"),
         ("t_sales_order", "paid_way",
@@ -591,22 +610,46 @@ pub(crate) async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
          &[("待确认", "0"), ("已确认", "1"), ("部分开票", "2"), ("已开票", "3"), ("拒绝", "4")], "eq"),
         ("t_account_bill_header", "account_mode",
          &[("月结", "M"), ("半月", "HM"), ("周结", "WK")], "eq"),
-        // 明细行类型（M6w 坐实：1商品行/2赠品/3结算行）
+        // 明细行类型（M6w 坐实）。🔴 DMS 校准正名：「商品行」→「正品」（与 SystemConsant.java
+        // 注释及 pitfall 教训里的「1正品」口径一致；旧名由 DELETE 收敛，防两名一码）
         ("t_sales_order_detail", "item_type",
-         &[("商品行", "1"), ("赠品", "2"), ("结算行", "3")], "eq"),
-        // 客户分类/类型（字典 key=CustClassif/CUST_TYPE 探针坐实，过滤问句换码）
-        ("t_customer", "customer_class",
-         &[("货架店铺", "01"), ("新媒体店铺", "02"), ("社团店铺", "03"), ("线下客户", "04"),
-           ("内部客户", "05"), ("其他财务专用", "06"), ("外部客户的店铺", "99")], "eq"),
-        ("t_customer", "customer_type",
-         &[("一般销售客户", "Z001"), ("财务专用客户", "Z002"), ("关联方客户", "Z003"),
-           ("货架店铺", "Z004"), ("客户终端仓", "Z005")], "eq"),
+         &[("正品", "1"), ("赠品", "2"), ("结算行", "3")], "eq"),
+        // ── DMS 后端源码校准补齐（专项调研，码名以 Java 侧枚举/常量为准）──────────────
+        // 订单类型六值（SystemConsant.java）
+        ("t_sales_order", "order_type",
+         &[("线下销售", "SO01"), ("设备", "SO04"), ("样品", "SO10"),
+           ("样品领用", "SO12"), ("营销物料", "SO15"), ("积分兑换", "SO16")], "eq"),
+        // 支付状态三值
+        ("t_sales_order", "paid_status",
+         &[("未支付", "0"), ("已支付", "1"), ("支付中", "2")], "eq"),
+        // 售后状态九档（AfterSalesStatusEnum.java:19-30）
+        ("t_after_sales_order_header", "after_sales_status",
+         &[("待提交确认", "1"), ("发货确认中", "2"), ("待退货入库", "3"), ("退款中", "4"),
+           ("完成", "5"), ("取消", "6"), ("驳回", "7"), ("退款执行中", "8"), ("退款失败", "9")], "eq"),
     ];
+    // 🔴 DMS 校准正名的旧行先收敛：upsert 键含 name，不删旧名行就是两名一码
+    // （108 已取消←无效、199 已删除←作废、item_type 1 正品←商品行）。
+    // 逐条 bind 而不是 IN 列表字面量：本文件的码值过滤源码守卫会扫 IN 段里的中文字面量。
+    for (t, c, old) in [
+        ("t_sales_order", "order_status", "无效"),
+        ("t_sales_order", "order_status", "作废"),
+        ("t_sales_order_detail", "item_type", "商品行"),
+    ] {
+        sqlx::query(
+            "DELETE FROM meta.value_map WHERE ds_id = $1 AND table_name = $2 AND column_name = $3 AND name = $4",
+        )
+        .bind(DMS_DS_ID)
+        .bind(t)
+        .bind(c)
+        .bind(old)
+        .execute(pg)
+        .await?;
+    }
     for (table, col, pairs, kind) in MAPS {
         for (name, code) in *pairs {
             sqlx::query(
-                "INSERT INTO meta.value_map(table_name, column_name, name, code, match_kind)
-                 VALUES ($1,$2,$3,$4,$5)
+                "INSERT INTO meta.value_map(table_name, column_name, name, code, match_kind, ds_id)
+                 VALUES ($1,$2,$3,$4,$5,$6)
                  ON CONFLICT (ds_id, table_name, column_name, name) DO UPDATE SET code=$4, match_kind=$5",
             )
             .bind(table)
@@ -614,6 +657,7 @@ pub(crate) async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
             .bind(name)
             .bind(code)
             .bind(kind)
+            .bind(DMS_DS_ID)
             .execute(pg)
             .await?;
         }
@@ -631,20 +675,23 @@ pub(crate) async fn seed_terms(pg: &PgPool) -> anyhow::Result<()> {
         ("订单客单价", "订单客单价＝订单额÷订单数＝SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)；不使用默认 Doris DWS 销售额", &["客单价", "订单单均", "平均客单"]),
     ];
     // 旧术语把订单额写成销售额，保留会与 DWS 默认销售额同时召回。
-    sqlx::query("DELETE FROM meta.term WHERE ds_id='dms' AND term='客单价'")
+    sqlx::query("DELETE FROM meta.term WHERE ds_id=$1 AND term='客单价'")
+        .bind(DMS_DS_ID)
         .execute(pg)
         .await?;
-    sqlx::query("DELETE FROM meta.element WHERE ds_id='dms' AND element_id='term:客单价'")
+    sqlx::query("DELETE FROM meta.element WHERE ds_id=$1 AND element_id='term:客单价'")
+        .bind(DMS_DS_ID)
         .execute(pg)
         .await?;
     for (term, def, aliases) in TERMS {
         sqlx::query(
-            "INSERT INTO meta.term(term, definition, aliases) VALUES ($1,$2,$3)
+            "INSERT INTO meta.term(term, definition, aliases, ds_id) VALUES ($1,$2,$3,$4)
              ON CONFLICT (ds_id, term) DO UPDATE SET definition=$2, aliases=$3",
         )
         .bind(term)
         .bind(def)
-        .bind(aliases.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .bind(aliases.to_vec())
+        .bind(DMS_DS_ID)
         .execute(pg)
         .await?;
     }
@@ -653,15 +700,6 @@ pub(crate) async fn seed_terms(pg: &PgPool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// 🔴 本文件里不许出现裸「余额」这个名字/别名（种子是 const、在函数体内，测试够不到，
-    /// 只能扫源码本身）。`match_word` 取最长命中：2 字的「余额」对「账户余额」与「信控余额」
-    /// 两条**同时**命中，而这两条的 `balance_type` 互斥（可开票+不可开票 8/9 vs 信控 1）——
-    /// 谁赢由行序决定，等于随机答错另一条。真库坐实的失败面：FIN02 与 FIN04 一起翻红。
-    /// （`seed.rs` 的 KW_FORCE 里有一条「余额 → t_customer_balance」，那是另一回事：
-    /// 它只强制把表补进 schema 召回，不参与指标命中。本判据只扫本文件。）
-    ///
-    /// ⚠️ 判据是文本扫描：本文件里连**注释**都不许写出带引号的那个两字词，否则守卫自伤
-    /// （第一版就这么红过一次 —— 也算它真的会响）。
     /// 🔴 **码值过滤不许写中文名**（业主要求「深度参考源码」时挖出的活错答）。
     ///
     /// ⚠️ 本注释**刻意不写出带引号的中文名**：判据是文本扫描，会扫到自己的文档
@@ -765,6 +803,15 @@ mod tests {
         );
     }
 
+    /// 🔴 本文件里不许出现裸「余额」这个名字/别名（种子是 const、在函数体内，测试够不到，
+    /// 只能扫源码本身）。`match_word` 取最长命中：2 字的「余额」对「账户余额」与「信控余额」
+    /// 两条**同时**命中，而这两条的 `balance_type` 互斥（可开票+不可开票 8/9 vs 信控 1）——
+    /// 谁赢由行序决定，等于随机答错另一条。真库坐实的失败面：FIN02 与 FIN04 一起翻红。
+    /// （`seed.rs` 的 KW_FORCE 里有一条「余额 → t_customer_balance」，那是另一回事：
+    /// 它只强制把表补进 schema 召回，不参与指标命中。本判据只扫本文件。）
+    ///
+    /// ⚠️ 判据是文本扫描：本文件里连**注释**都不许写出带引号的那个两字词，否则守卫自伤
+    /// （第一版就这么红过一次 —— 也算它真的会响）。
     #[test]
     fn no_bare_balance_alias() {
         let src = include_str!("seed_defs.rs");
@@ -821,6 +868,8 @@ mod tests {
     /// 只能抄一份 —— 与 `recall/metric.rs::refund_ratio_aliases_do_not_shadow_refund_amount`
     /// 同一处置：**改那边的别名必须改这里**（改漏了下面两条行为断言会红）。
     const OTHERS: &[(&str, &[&str])] = &[
+        // 「订单额」曾漏抄（与 buyer_count 同族事故）——下方的覆盖断言就是抓这种漏抄的
+        ("订单额", &["订单金额", "下单金额", "订单总额"]),
         ("订单数", &["订单量", "单量", "成交订单数", "多少单", "多少个订单", "多少订单", "几个订单", "几单", "订单笔数", "下了多少"]),
         ("订单客单价", &["客单价", "订单单均", "平均客单"]),
         ("市场费用", &["营销费用", "费用总额", "推广费"]),
@@ -990,5 +1039,130 @@ mod tests {
         assert_eq!(recalled("本月销量"), ["销量"]);
         assert_eq!(recalled("2026年上半年卖了多少件"), ["销量"]);
         assert_eq!(recalled("本月各商品分类销量"), ["销量"]);
+    }
+
+    /// 从函数体内 const 段解析「行首元组」的（前两段引号串）：METRICS/MAPS 判据共用的解析器。
+    /// 只认 `("` 开头且首段是全小写标识的行（表名/指标码），码值对（中文名, 码）不会误入。
+    fn tuple_heads(block: &str) -> Vec<(&str, &str)> {
+        block
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("(\""))
+            .filter_map(|line| {
+                let segs: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+                let (a, b) = (segs.first()?, segs.get(1)?);
+                // 首段必须是全小写 ASCII 标识（指标码/表名），滤掉续行的码值对
+                (a.chars().all(|c| c.is_ascii_lowercase() || c == '_') && !a.is_empty())
+                    .then_some((*a, *b))
+            })
+            .collect()
+    }
+
+    /// 🔴 `METRICS` 里每个 code 在 `METRIC_POLICIES` 里有且仅有一条（buyer_count 漏抄
+    /// OTHERS 的事故在这份文件自己记录过 —— 两集合漂移无守卫就会再犯）。
+    #[test]
+    fn every_metric_has_exactly_one_policy() {
+        let src = include_str!("seed_defs.rs");
+        let metrics = src.split("const METRICS:").nth(1).expect("METRICS 不见了")
+            .split("];").next().expect("METRICS 结束锚点不见了");
+        let policies = src.split("const METRIC_POLICIES:").nth(1).expect("METRIC_POLICIES 不见了")
+            .split("];").next().expect("METRIC_POLICIES 结束锚点不见了");
+        let metric_codes: std::collections::HashSet<&str> =
+            tuple_heads(metrics).into_iter().map(|(c, _)| c).collect();
+        // policies 只取行首第一个引号段（第二段可能是 `sales_fact::VERSION` 常量而非字面量）
+        let policy_codes: std::collections::HashSet<&str> = policies
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("(\""))
+            .filter_map(|line| line.split('"').nth(1))
+            .collect();
+        assert!(metric_codes.len() >= 15, "METRICS 解析异常：{metric_codes:?}");
+        // refund_ratio 不在 METRICS 常量里（单独 upsert），但在 POLICIES 里
+        let expected: std::collections::HashSet<&str> =
+            metric_codes.iter().copied().chain(std::iter::once("refund_ratio")).collect();
+        assert_eq!(
+            policy_codes, expected,
+            "METRICS 与 METRIC_POLICIES 的 code 集合漂移（多退少补都在这红）"
+        );
+    }
+
+    /// 🔴 `METRICS` 里每个指标名都必须进碰撞断言集（OTHERS/ACTIVE_SKU/GIFT）——
+    /// 漏抄 = 它的别名从没被碰撞断言核过（buyer_count「客户数」就是这么漏的）。
+    #[test]
+    fn every_metric_name_is_in_collision_sets() {
+        let src = include_str!("seed_defs.rs");
+        let metrics = src.split("const METRICS:").nth(1).expect("METRICS 不见了")
+            .split("];").next().expect("METRICS 结束锚点不见了");
+        for (code, name) in tuple_heads(metrics) {
+            let covered = OTHERS.iter().any(|(n, _)| *n == name)
+                || ACTIVE_SKU.0 == name
+                || GIFT.0 == name
+                // 默认销售六指标由 crate::sales_fact::METRICS 喂进 recalled()，不走本地抄本
+                || crate::sales_fact::METRICS.iter().any(|m| m.name() == name);
+            assert!(covered, "指标 {code}「{name}」不在碰撞断言集里——别名撞词风险无测试盯着");
+        }
+    }
+
+    /// MAPS 的（表, 列）条目不得逐字重复（重复段曾让每次启动多打 14 条冗余 upsert）。
+    /// 唯一合法的一表两登记是 `paid_way`（eq 纯值 + like 组合值两种 match_kind）。
+    #[test]
+    fn value_map_entries_have_unique_table_column() {
+        let src = include_str!("seed_defs.rs");
+        let maps = src.split("const MAPS:").nth(1).expect("MAPS 不见了")
+            .split("];").next().expect("MAPS 结束锚点不见了");
+        let mut counts: std::collections::HashMap<(&str, &str), usize> = std::collections::HashMap::new();
+        for (t, c) in tuple_heads(maps) {
+            assert!(t.starts_with("t_"), "MAPS 解析错位：{t} 不像表名");
+            *counts.entry((t, c)).or_default() += 1;
+        }
+        assert!(counts.len() >= 20, "MAPS 解析异常：{counts:?}");
+        for (key, n) in &counts {
+            let allowed = if *key == ("t_sales_order", "paid_way") { 2 } else { 1 };
+            assert_eq!(*n, allowed, "MAPS 条目重复：{}.{}", key.0, key.1);
+        }
+    }
+
+    /// DMS 后端源码校准补齐的 value_map 条目（码名以 Java 枚举/常量为准）：
+    /// order_status 正名 / order_type 六值 / paid_status 三值 / after_sales_status 九档 /
+    /// item_type「正品」正名 —— 与正名 DELETE 收敛清单。
+    #[test]
+    fn dms_calibration_value_maps_are_seeded() {
+        let src = include_str!("seed_defs.rs");
+        let maps = src.split("const MAPS:").nth(1).expect("MAPS 不见了")
+            .split("];").next().expect("MAPS 结束锚点不见了")
+            .split_whitespace().collect::<String>();
+        for frag in [
+            "(\"t_sales_order\",\"order_status\",&[(\"暂存\",\"0\"),(\"已取消\",\"108\"),(\"已删除\",\"199\")]",
+            "(\"线下销售\",\"SO01\")", "(\"设备\",\"SO04\")", "(\"样品\",\"SO10\")",
+            "(\"样品领用\",\"SO12\")", "(\"营销物料\",\"SO15\")", "(\"积分兑换\",\"SO16\")",
+            "(\"t_sales_order\",\"paid_status\",&[(\"未支付\",\"0\"),(\"已支付\",\"1\"),(\"支付中\",\"2\")]",
+            "(\"待提交确认\",\"1\")", "(\"退款执行中\",\"8\")", "(\"退款失败\",\"9\")",
+            "(\"t_sales_order_detail\",\"item_type\",&[(\"正品\",\"1\")",
+        ] {
+            assert!(maps.contains(frag), "校准码表条目缺失：{frag}");
+        }
+        // 旧名不许留在 MAPS 里（否则与正名两名一码）；DELETE 收敛清单必须在
+        assert!(!maps.contains("(\"无效\",\"108\")") && !maps.contains("(\"作废\",\"199\")")
+            && !maps.contains("(\"商品行\",\"1\")"), "旧名还在 MAPS 里");
+        for old in ["(\"t_sales_order\", \"order_status\", \"无效\")",
+                    "(\"t_sales_order\", \"order_status\", \"作废\")",
+                    "(\"t_sales_order_detail\", \"item_type\", \"商品行\")"] {
+            assert!(src.contains(old), "正名 DELETE 收敛清单缺：{old}");
+        }
+    }
+
+    /// refund_ratio 的 agg_expr 内嵌 :begin/:end 占位符（全文件唯一自带占位符的指标）：
+    /// 分母由 `sales_fact::metric_subquery` 生成 —— 钉住这条构造链不断。
+    #[test]
+    fn refund_ratio_keeps_placeholder_subquery() {
+        // 纯函数侧：子查询必须带占位符（装配器替换 :begin/:end 的前提）
+        let sub = crate::sales_fact::metric_subquery(crate::sales_fact::Metric::SalesAmount, ":begin", ":end");
+        assert!(sub.contains(":begin") && sub.contains(":end"), "{sub}");
+        // 构造链锚点：refund_ratio 的分母必须来自 metric_subquery（不许复制销售额 SQL）
+        let src = include_str!("seed_defs.rs");
+        assert!(
+            src.contains("sales_fact::metric_subquery(SalesMetric::SalesAmount, \":begin\", \":end\")"),
+            "refund_ratio 的分母构造链断了"
+        );
     }
 }

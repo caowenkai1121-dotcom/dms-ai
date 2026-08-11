@@ -7,7 +7,7 @@
 //! .route("/api/kb/mindmap/regenerate", post(kb_mindmap_api::regenerate_mindmap))
 //! .route("/api/kb/doc/{id}/markdown", get(kb_mindmap_api::doc_markdown))
 //! .route("/api/kb/doc/{id}/chunks", get(kb_mindmap_api::doc_chunks))
-//! // ③ 内容级导图：本轮新增，接线契约在此、**刻意不注册 `main.rs`**（集成时加这一行即可）：
+//! // ③ 内容级导图（已在 `main.rs` 接线，注册行如下）：
 //! .route("/api/kb/doc/{id}/sections", get(kb_mindmap_api::doc_sections))
 //! ```
 //!
@@ -39,7 +39,7 @@
 //! - 两个都过 `acl::doc_for_viewer`：**不存在与不可见统一 403**（现有 kb_api 惯例，
 //!   不泄露他人文档的存在性）。
 //!
-//! ## ③ 内容级导图（章节分桶；本轮新增，端点未注册，接线契约见上）
+//! ## ③ 内容级导图（章节分桶；已在 `main.rs` 注册，见上）
 //! - `GET /api/kb/doc/{id}/sections` → `{ "doc_id", "doc_name", "sections": [
 //!   { "section", "chunk_count", "first_ord", "page", "excerpt" } ] }`。
 //!   章节＝`kb.chunk.heading_path` 的**顶层段**（`" > "` 分隔，与 ingest 写入同口径）分桶；
@@ -72,6 +72,8 @@ const MAX_LLM_BRANCHES: usize = 50;
 const MAX_NAMES_PER_BRANCH: usize = 12;
 /// 模型标签的字符上限（导图节点要短；超长截断而不是拒收）。
 const MAX_LABEL_CHARS: usize = 24;
+/// 喂给模型的文档名截断长度（提示词体量闸，与 MAX_NAMES_PER_BRANCH 一族）。
+const MAX_PROMPT_NAME_CHARS: usize = 40;
 
 const LABEL_SYSTEM: &str = "你是企业知识库的主题归纳助手。给定若干分组（组名＝目录名，附组内文档名），\
 为每个分组写一个不超过 12 字的主题标签。只输出 JSON 字符串数组，长度与分组数一致、顺序一致，\
@@ -93,8 +95,15 @@ fn kb_err(e: dms_knowledge::KbError) -> ApiErr {
     };
     let message = match &e {
         KbError::BadInput(_) | KbError::Forbidden(_) | KbError::NotFound(_) => e.to_string(),
-        KbError::Upstream(_) => "文档处理服务暂时不可用，请稍后重试".to_string(),
-        KbError::Db(_) => "知识库服务暂时不可用，请稍后重试".to_string(),
+        // 5xx 两臂：细节全丢 + 无日志 = 排障零线索；原文进 warn，客户端仍只见固定文案
+        KbError::Upstream(_) => {
+            tracing::warn!(err = %e, "文档处理服务故障（对客户端收敛为固定文案）");
+            "文档处理服务暂时不可用，请稍后重试".to_string()
+        }
+        KbError::Db(_) => {
+            tracing::warn!(err = %e, "知识库 DB 故障（对客户端收敛为固定文案）");
+            "知识库服务暂时不可用，请稍后重试".to_string()
+        }
     };
     err(code, message)
 }
@@ -110,7 +119,11 @@ async fn viewer(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
     let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
         .await
-        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
+        .map_err(|e| {
+            // 底层错误原文只进日志：DB 故障不该被误判成身份问题（403 文案不透出是刻意的）
+            tracing::warn!(login = %login, err = %e, "DMS 身份/角色查询失败");
+            err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用")
+        })?;
     Ok(Viewer::new(p.login_name, vec![p.role_code]))
 }
 
@@ -190,18 +203,19 @@ fn build_skeleton(space_label: &str, docs: &[SkelDoc]) -> MindNode {
 
 /// 给模型的素材：分支序号 + 目录名（即骨架标签）+ 前几条文档名。只取材于标签所需的最小集。
 fn label_prompt(branches: &[MindNode]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::from("分组清单：\n");
     for (i, b) in branches.iter().enumerate() {
         let names = b
             .children
             .iter()
             .take(MAX_NAMES_PER_BRANCH)
-            .map(|d| d.label.chars().take(40).collect::<String>())
+            .map(|d| d.label.chars().take(MAX_PROMPT_NAME_CHARS).collect::<String>())
             .collect::<Vec<_>>()
             .join("、");
-        out.push_str(&format!("{}. 目录「{}」：{}\n", i + 1, b.label, names));
+        let _ = writeln!(out, "{}. 目录「{}」：{}", i + 1, b.label, names);
     }
-    out.push_str(&format!("共 {} 个分组，请输出 {} 个主题标签的 JSON 数组。", branches.len(), branches.len()));
+    let _ = write!(out, "共 {} 个分组，请输出 {} 个主题标签的 JSON 数组。", branches.len(), branches.len());
     out
 }
 
@@ -259,7 +273,12 @@ async fn llm_labels(st: &AppState, root: &MindNode) -> Option<Vec<String>> {
             return None;
         }
     };
-    parse_labels(reply.content.as_deref()?, sent.len())
+    let Some(content) = reply.content.as_deref() else {
+        // 传输与超时分支上面都有 warn，这条缺 content 的路径不能无声
+        tracing::warn!("导图分支标签 fast 调用无 content → 回退目录名骨架");
+        return None;
+    };
+    parse_labels(content, sent.len())
 }
 
 /// 空间显示名（根节点标签）；空名回退 `space_id` 本身。
@@ -298,7 +317,8 @@ async fn generate_mindmap(
 /// 写缓存失败只记 warn 不报错：导图已经生成出来，没有理由因为缓存写不进让用户看见 500
 /// （代价只是下次 GET 重新生成一次）。
 async fn write_cache(st: &AppState, space_id: &str, body: &serde_json::Value) {
-    let text = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
+    // Value 的 Display 即紧凑 JSON（序列化不可失败，unwrap_or_else 的 fallback 是死代码）
+    let text = body.to_string();
     if let Err(e) = st
         .owned
         .fixed(crate::admin_api::KV_SET_SQL)
@@ -311,6 +331,24 @@ async fn write_cache(st: &AppState, space_id: &str, body: &serde_json::Value) {
     }
 }
 
+/// 缓存写放后台：响应路径不白等一个 RTT（写失败本来就只 warn）。
+fn spawn_write_cache(st: &Arc<AppState>, space_id: &str, body: &serde_json::Value) {
+    let st = st.clone();
+    let space_id = space_id.to_string();
+    let body = body.clone();
+    tokio::spawn(async move { write_cache(&st, &space_id, &body).await });
+}
+
+/// `space_id` 缺省＝个人空间；trim 后空串按缺省、超长拒——与 `kb_eval_api::normalize_space`
+/// 同口径（那份是它模块私有的拿不出来，同族端点保持同一闸形）。
+fn normalize_space(v: &Viewer, space_id: Option<&str>) -> Result<String, ApiErr> {
+    let s = space_id.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&v.login);
+    if s.chars().count() > 64 {
+        return Err(err(StatusCode::BAD_REQUEST, "space_id 不能超过 64 字符"));
+    }
+    Ok(s.to_string())
+}
+
 /// `GET /api/kb/mindmap?space_id=`：缓存命中直接返回；未命中/缓存损坏则生成后落缓存。
 pub async fn mindmap(
     State(st): State<Arc<AppState>>,
@@ -318,17 +356,24 @@ pub async fn mindmap(
     Query(q): Query<MindmapQuery>,
 ) -> Result<ApiOk, ApiErr> {
     let v = viewer(&st, &headers, &q.login_name, &q.role_code).await?;
-    let space_id = q.space_id.clone().unwrap_or_else(|| v.login.clone());
+    let space_id = normalize_space(&v, q.space_id.as_deref())?;
     if !acl::space_readable(&st.owned, &v, &space_id).await.map_err(kb_err)? {
         return Err(err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {space_id}")));
     }
-    let cached: Option<(String,)> = st
+    // 缓存只是加速器：读失败不该 500，按未命中重新生成（与缓存损坏同口径）
+    let cached: Option<(String,)> = match st
         .owned
         .fixed(crate::admin_api::KV_GET_SQL)
         .bind(cache_key(&space_id))
         .fetch_optional()
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用，请稍后重试"))?;
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(space_id = %space_id, err = %e, "导图缓存读取失败，按未命中重新生成");
+            None
+        }
+    };
     if let Some((text,)) = cached {
         // 缓存损坏（手改/旧版形状）按未命中处理：覆盖写回，不报错。
         if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -338,7 +383,7 @@ pub async fn mindmap(
         }
     }
     let body = generate_mindmap(&st, &v, &space_id).await?;
-    write_cache(&st, &space_id, &body).await;
+    spawn_write_cache(&st, &space_id, &body);
     Ok(Json(body))
 }
 
@@ -350,12 +395,12 @@ pub async fn regenerate_mindmap(
     Json(req): Json<RegenerateReq>,
 ) -> Result<ApiOk, ApiErr> {
     let v = viewer(&st, &headers, &req.login_name, &req.role_code).await?;
-    let space_id = req.space_id.clone().unwrap_or_else(|| v.login.clone());
+    let space_id = normalize_space(&v, req.space_id.as_deref())?;
     if !acl::space_writable(&st.owned, &v, &space_id).await.map_err(kb_err)? {
         return Err(err(StatusCode::FORBIDDEN, format!("无权修改知识空间 {space_id} 的导图")));
     }
     let body = generate_mindmap(&st, &v, &space_id).await?;
-    write_cache(&st, &space_id, &body).await;
+    spawn_write_cache(&st, &space_id, &body);
     Ok(Json(body))
 }
 
@@ -398,6 +443,7 @@ async fn load_chunks(st: &AppState, doc_id: &str) -> Result<Vec<PreviewChunk>, A
 /// 从块重建整篇文本：general 分块带重叠尾巴，用字符偏移把已覆盖的头部跳掉
 /// （`start/end_char_pos` 覆盖的是 **trim 后**的文本，见 `ingest::locate_offsets`）；
 /// 偏移缺失的块全文保留——预览宁可是带重复的原文，也不做猜出来的删减。
+/// 退化跨度（`e <= s`）同按缺失处理：落入全文保留分支。
 fn markdown_from_chunks(chunks: &[PreviewChunk]) -> String {
     let mut out = String::new();
     let mut covered_end: i64 = 0; // 已拼进 out 的流区间右端（字符计）
@@ -442,7 +488,7 @@ pub async fn doc_markdown(
     if markdown.is_empty() {
         return Err(err(
             StatusCode::NOT_FOUND,
-            "文档暂无解析文本（可能仍在解析中或解析失败），请稍后重试或重新上传",
+            "文档暂无解析文本（可能仍在解析中、解析失败或已被删除），请稍后重试或重新上传",
         ));
     }
     Ok(Json(serde_json::json!({ "name": row.name, "markdown": markdown })))
@@ -457,27 +503,29 @@ pub async fn doc_chunks(
     Query(q): Query<MindmapQuery>,
 ) -> Result<ApiOk, ApiErr> {
     let v = viewer(&st, &headers, &q.login_name, &q.role_code).await?;
-    let _row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
+    let _ = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
     let chunks = load_chunks(&st, &id).await?;
-    Ok(Json(serde_json::json!({
-        "chunks": chunks.iter().map(|c| serde_json::json!({
+    let mut out = Vec::with_capacity(chunks.len());
+    for c in &chunks {
+        out.push(serde_json::json!({
             "ord": c.ord,
             "text": c.text,
             "heading_path": c.heading_path,
             "page": c.page,
             "start_char_pos": c.start_char_pos,
             "end_char_pos": c.end_char_pos,
-        })).collect::<Vec<_>>()
-    })))
+        }));
+    }
+    Ok(Json(serde_json::json!({ "chunks": out })))
 }
 
 // ════════════════════════ ③ 内容级导图（章节分桶）════════════════════════
 //
-// 接线契约（本轮**不注册 `main.rs`**，集成时加一行）：
+// 已在 `main.rs` 接线（注册行如下，路由变动时两边同步改）：
 //   .route("/api/kb/doc/{id}/sections", get(kb_mindmap_api::doc_sections))
 // 用途：导图文档节点展开到章节级（顶层 heading 分桶 + 块数徽标），点章节出摘要卡（首块摘录）。
-// 接线前整块属未达代码：与 `kb_api::ops_pack` 同一模子（子模块 + glob re-export，
-// 接线方写 `kb_mindmap_api::doc_sections` 即可）；已在 main.rs 接线。
+// 形态与 `kb_api::ops_pack` 同一模子（子模块 + glob re-export，接线方写
+// `kb_mindmap_api::doc_sections` 即可）。
 mod content_pack {
     use super::*;
 
@@ -511,6 +559,7 @@ mod content_pack {
     /// 封顶 `SECTION_EXCERPT_CHARS` 字符。
     fn clip_excerpt(text: &str) -> String {
         let mut out = String::new();
+        let mut len = 0usize; // 字符计数器：chars().count() 每字符重扫是 O(n²)
         let mut pending_space = false;
         for c in text.trim().chars() {
             if c.is_whitespace() {
@@ -519,10 +568,12 @@ mod content_pack {
             }
             if pending_space && !out.is_empty() {
                 out.push(' ');
+                len += 1;
             }
             pending_space = false;
             out.push(c);
-            if out.chars().count() >= SECTION_EXCERPT_CHARS {
+            len += 1;
+            if len >= SECTION_EXCERPT_CHARS {
                 break;
             }
         }
@@ -545,18 +596,21 @@ mod content_pack {
         let mut out: Vec<SectionBucket> = Vec::new();
         for c in chunks {
             let top = top_section(&c.heading_path);
+            // 满 MAX_SECTIONS 桶后不再新建（结果本就截断到这里），只累计已有桶——
+            // 继续建新桶纯吃内存，对截断后结果零影响（先取出来：match 期间 out 被借用）
+            let capped = out.len() >= MAX_SECTIONS;
             match out.iter_mut().find(|b| b.section == top) {
                 Some(b) => b.chunk_count += 1,
-                None => out.push(SectionBucket {
+                None if !capped => out.push(SectionBucket {
                     section: top.to_string(),
                     chunk_count: 1,
                     first_ord: c.ord,
                     page: c.page,
                     excerpt: clip_excerpt(&c.text),
                 }),
+                None => {}
             }
         }
-        out.truncate(MAX_SECTIONS);
         out
     }
 
@@ -677,9 +731,8 @@ mod content_pack {
     }
 }
 
-// 与 `kb_api::ops_pack` 同一模子：glob re-export 让接线方写 `kb_mindmap_api::doc_sections` 即可；
-// 接线（main.rs 注册路由）后这行 re-export 即被真正使用，`unused_imports` 的 allow 一并删掉。
-#[allow(unused_imports)]
+// 与 `kb_api::ops_pack` 同一模子：glob re-export 让接线方写 `kb_mindmap_api::doc_sections` 即可。
+// 已在 main.rs 接线，re-export 被真正使用（`unused_imports` 的 allow 已随接线删除）。
 pub(crate) use content_pack::*;
 
 #[cfg(test)]
@@ -862,6 +915,32 @@ mod tests {
             let gate = body.find("doc_for_viewer").unwrap();
             let load = body.find("load_chunks").unwrap();
             assert!(gate < load, "{name} 必须先过可见性再取块: {body}");
+        }
+    }
+
+    /// space_id 闸：缺省个人空间、trim、全空白按缺省、超长 400（与 kb_eval_api 同口径）
+    #[test]
+    fn normalize_space_trims_defaults_and_caps() {
+        let v = Viewer::new("zhangsan", vec![]);
+        assert_eq!(normalize_space(&v, None).unwrap(), "zhangsan");
+        assert_eq!(normalize_space(&v, Some("  ")).unwrap(), "zhangsan", "全空白按缺省");
+        assert_eq!(normalize_space(&v, Some("  kb-hr  ")).unwrap(), "kb-hr", "文本值要 trim");
+        let long = "a".repeat(65);
+        assert_eq!(normalize_space(&v, Some(&long)).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    /// 缓存读失败必须降级为重新生成（缓存只是加速器，不该 500）；
+    /// 两个端点的缓存写都必须放后台（响应路径不白等一个 RTT）
+    #[test]
+    fn cache_read_degrades_and_write_is_off_response_path() {
+        let src = include_str!("kb_mindmap_api.rs");
+        let mindmap = src.split("pub async fn mindmap").nth(1).unwrap();
+        let mindmap = mindmap.split("pub async fn regenerate_mindmap").next().unwrap();
+        assert!(mindmap.contains("按未命中重新生成"), "缓存读失败必须降级为重新生成: {mindmap}");
+        let regen = src.split("pub async fn regenerate_mindmap").nth(1).unwrap();
+        let regen = regen.split("pub async fn doc_markdown").next().unwrap();
+        for (name, body) in [("mindmap", mindmap), ("regenerate_mindmap", regen)] {
+            assert!(body.contains("spawn_write_cache"), "{name} 必须后台写缓存: {body}");
         }
     }
 }

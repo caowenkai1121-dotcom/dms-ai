@@ -50,11 +50,13 @@ pub fn contract_columns() -> impl Iterator<Item = &'static str> {
 /// 保留探针已经取得的表规模、类型和注释，并补齐缺失的合同警示与列元数据。
 pub fn enrich_schema_snapshot(snapshot: &mut SchemaSnapshot) -> bool {
     let mut changed = false;
-    let table_name = if let Some(table) = snapshot
+    // 先定位再改：索引形态避免「找到分支」结尾那次整名克隆
+    let table_index = snapshot
         .tables
-        .iter_mut()
-        .find(|table| table.name.eq_ignore_ascii_case(TABLE_NAME))
-    {
+        .iter()
+        .position(|table| table.name.eq_ignore_ascii_case(TABLE_NAME));
+    if let Some(index) = table_index {
+        let table = &mut snapshot.tables[index];
         if table.comment.trim().is_empty() {
             table.comment = TABLE_COMMENT.to_string();
             changed = true;
@@ -62,7 +64,6 @@ pub fn enrich_schema_snapshot(snapshot: &mut SchemaSnapshot) -> bool {
             table.comment = format!("{}；{TABLE_COMMENT}", table.comment.trim());
             changed = true;
         }
-        table.name.clone()
     } else {
         snapshot.tables.push(TableInfo {
             name: TABLE_NAME.to_string(),
@@ -70,13 +71,15 @@ pub fn enrich_schema_snapshot(snapshot: &mut SchemaSnapshot) -> bool {
             row_estimate: 0,
         });
         changed = true;
-        TABLE_NAME.to_string()
-    };
+    }
+    let table_name: &str = table_index
+        .map(|index| snapshot.tables[index].name.as_str())
+        .unwrap_or(TABLE_NAME);
 
     // 跨库 DESCRIBE 可能带回更多真实字段；默认销售事实合同仍只暴露业务确认列。
     let before = snapshot.columns.len();
     snapshot.columns.retain(|(source, column)| {
-        !source.eq_ignore_ascii_case(&table_name)
+        !source.eq_ignore_ascii_case(table_name)
             || SNAPSHOT_COLUMNS
                 .iter()
                 .any(|(name, _, _)| column.name.eq_ignore_ascii_case(name))
@@ -85,7 +88,7 @@ pub fn enrich_schema_snapshot(snapshot: &mut SchemaSnapshot) -> bool {
 
     for (index, &(name, data_type, comment)) in SNAPSHOT_COLUMNS.iter().enumerate() {
         if let Some((_, column)) = snapshot.columns.iter_mut().find(|(source, column)| {
-            source.eq_ignore_ascii_case(&table_name) && column.name.eq_ignore_ascii_case(name)
+            source.eq_ignore_ascii_case(table_name) && column.name.eq_ignore_ascii_case(name)
         }) {
             if column.data_type.trim().is_empty() {
                 column.data_type = data_type.to_string();
@@ -102,7 +105,7 @@ pub fn enrich_schema_snapshot(snapshot: &mut SchemaSnapshot) -> bool {
             continue;
         }
         snapshot.columns.push((
-            table_name.clone(),
+            table_name.to_string(),
             ColumnInfo {
                 name: name.to_string(),
                 data_type: data_type.to_string(),
@@ -349,16 +352,23 @@ impl Dimension {
 pub struct Predicate(String);
 
 impl Predicate {
+    /// 等值谓词。🔴 空串清规：`eq(dim, "")` 对非 NULL 行恒假（表达式侧 COALESCE 不产出空串）。
     pub fn eq(dimension: Dimension, value: &str) -> Self {
+        debug_assert!(!value.is_empty(), "eq 空串谓词恒假，多半是调用方漏判");
         Self(format!("{} = {}", dimension.expression(), quote(value)))
     }
 
+    /// 子串谓词。🔴 空串清规（与 `eq` 相反！）：`INSTR(expr, '')` 对非 NULL 行恒真，
+    /// 传空串 = 静默匹配全表 —— 调用方必须先判空。
     pub fn contains(dimension: Dimension, value: &str) -> Self {
+        debug_assert!(!value.is_empty(), "contains 空串谓词恒真（匹配全表），多半是调用方漏判");
         // INSTR 而不是 LIKE ESCAPE：Doris 不支持 ESCAPE 子句（实测 1105 语法错误），
         // 且子串语义本就是字面的（%/_ 不再特殊），两种方言同形。
         Self(format!("INSTR({}, {}) > 0", dimension.expression(), quote(value)))
     }
 
+    /// 多值谓词。调用方保证 values 非空、无重复、无空串元素（`IN ('')` 恒不命中，
+    /// 重复值只产生冗余 IN 项 —— 两层都不在内部拦，靠调用方自觉）。
     pub fn one_of(dimension: Dimension, values: &[&str]) -> Option<Self> {
         if values.is_empty() {
             return None;
@@ -415,26 +425,26 @@ impl Sort {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct QueryOptions<'a> {
     pub predicates: &'a [Predicate],
     pub sort: Option<Sort>,
     pub limit: Option<u32>,
 }
 
-impl<'a> Default for QueryOptions<'a> {
-    fn default() -> Self {
-        Self { predicates: &[], sort: None, limit: None }
-    }
-}
-
+/// SQL 字符串字面量引用：只转义 `\` 和 `'`。值域约定：维度取值来自枚举/码值，
+/// 不含控制字符（`\0`/`\n` 进 SQL 会被连接器/DB 拒绝，构造期就拦）。
 fn quote(value: &str) -> String {
+    debug_assert!(
+        !value.chars().any(|c| c.is_control()),
+        "谓词值含控制字符：{value:?}"
+    );
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 /// 当前事实合同允许的全部分组维度名称。
-pub fn dimension_names() -> Vec<&'static str> {
-    DIMENSIONS.iter().map(|dimension| dimension.name()).collect()
+pub fn dimension_names() -> impl Iterator<Item = &'static str> {
+    DIMENSIONS.iter().map(|dimension| dimension.name())
 }
 
 /// 构造半开区间时间条件。`begin_sql`/`end_sql` 必须是调用方生成的可信 SQL 片段。
@@ -444,26 +454,36 @@ pub fn time_predicate(begin_sql: &str, end_sql: &str) -> String {
     )
 }
 
+/// kernel 时间谓词模板的拼接片段（与 kernel 时间解析器的产出一字对应，四处引用一份）。
+const TEMPLATE_BEGIN: &str = "{} >= ";
+const TEMPLATE_AND_END: &str = " AND {} < ";
+
 /// 把统一自然语言时间解析器产出的 `{}` 谓词还原为半开区间。
 ///
 /// 只接受 kernel 生成的固定形态；无法证明边界时返回 `None`，调用方必须回落，不能静默改成全期。
+/// 🔴 单日/年/季模板若带了显式右端（`AND {} <`），本函数不认、返回 `None` 让调用方回落 ——
+/// 绝不静默丢掉已解析出的右端把它当完整周期（目前只有 YEARWEEK 分支消费显式右端）。
 pub fn time_bounds_from_template(template: &str) -> Option<(String, String)> {
-    if let Some(rest) = template.strip_prefix("{} >= ") {
-        let (begin, end) = rest.split_once(" AND {} < ")?;
+    if let Some(rest) = template.strip_prefix(TEMPLATE_BEGIN) {
+        let (begin, end) = rest.split_once(TEMPLATE_AND_END)?;
         return Some((begin.to_string(), end.to_string()));
     }
 
     let (base, explicit_end) = template
-        .split_once(" AND {} < ")
+        .split_once(TEMPLATE_AND_END)
         .map_or((template, None), |(base, end)| (base, Some(end)));
     if let Some(rhs) = base.strip_prefix("DATE({}) = ") {
-        return Some((rhs.to_string(), format!("DATE_ADD({rhs}, INTERVAL 1 DAY)")));
+        return explicit_end
+            .is_none()
+            .then(|| (rhs.to_string(), format!("DATE_ADD({rhs}, INTERVAL 1 DAY)")));
     }
     if let Some(rhs) = base.strip_prefix("YEAR({}) = ") {
-        return Some((
-            format!("MAKEDATE(({rhs}),1)"),
-            format!("MAKEDATE(({rhs}) + 1,1)"),
-        ));
+        return explicit_end.is_none().then(|| {
+            (
+                format!("MAKEDATE(({rhs}),1)"),
+                format!("MAKEDATE(({rhs}) + 1,1)"),
+            )
+        });
     }
     if let Some(anchor) = base
         .strip_prefix("YEARWEEK({}, 1) = YEARWEEK(")
@@ -477,11 +497,16 @@ pub fn time_bounds_from_template(template: &str) -> Option<(String, String)> {
     }
     if base == "QUARTER({}) = QUARTER(CURDATE()) AND YEAR({}) = YEAR(CURDATE())" {
         let begin = "MAKEDATE(YEAR(CURDATE()),1) + INTERVAL QUARTER(CURDATE())*3-3 MONTH";
-        return Some((begin.into(), format!("DATE_ADD({begin}, INTERVAL 3 MONTH)")));
+        return explicit_end
+            .is_none()
+            .then(|| (begin.into(), format!("DATE_ADD({begin}, INTERVAL 3 MONTH)")));
     }
     None
 }
 
+/// 进行中周期词表（本月/本周/今年/本季度…）：这是 kernel 时间解析器相对周期词表的
+/// **影子副本** —— kernel 加新词（如「当季」）时这里必须同步，否则模板命中却不截右端，
+/// 未来日期脏数据混入。kernel 源：`crates/kernel/src/nl/time.rs`。
 fn is_current_period_to_date(question: &str) -> bool {
     if ![
         "本月", "这个月", "当月", "本周", "这周", "今年", "本年", "年初至今",
@@ -500,20 +525,22 @@ fn is_current_period_to_date(question: &str) -> bool {
 }
 
 fn has_explicit_month(question: &str) -> bool {
-    let chars = question.chars().collect::<Vec<_>>();
-    chars.iter().enumerate().any(|(index, ch)| {
-        if *ch != '月' || index == 0 {
-            return false;
-        }
-        let previous = chars[index - 1];
-        previous.is_ascii_digit() || "一二三四五六七八九十".contains(previous)
+    // 零分配遍历：只看「月」的前一个字（原实现为按下标取前字 collect 整个 Vec<char>）
+    let mut prev: Option<char> = None;
+    question.chars().any(|ch| {
+        let hit = ch == '月'
+            && prev.is_some_and(|p| p.is_ascii_digit() || "一二三四五六七八九十".contains(p));
+        prev = Some(ch);
+        hit
     })
 }
 
 fn has_explicit_quarter(question: &str) -> bool {
-    let Some(index) = question.find("季度") else { return false };
-    let head = question[..index].chars().rev().take(3).collect::<String>();
-    head.chars().any(|ch| ch.is_ascii_digit() || "一二三四".contains(ch))
+    // 检查全部出现（不是只查第一个）：「本季度和三季度对比」里第二个「季度」才是显式的
+    question.match_indices("季度").any(|(index, _)| {
+        let head = question[..index].chars().rev().take(3).collect::<String>();
+        head.chars().any(|ch| ch.is_ascii_digit() || "一二三四".contains(ch))
+    })
 }
 
 /// 当前销售事实窗口。进行中的月/周/年/季度只取到今天（含今天），避免未来日期脏数据混入；
@@ -531,11 +558,14 @@ pub fn question_time_bounds(question: &str) -> Option<(String, String)> {
 
 /// DWS 销售环比/同比窗口。进行中周期的基期同样包含对应日，和当前窗口保持同进度；
 /// `DATE({}) = ...` 这类单日模板本身已是完整自然日，不再额外扩一天。
+/// 🔴 耦合钉死：单日模板不得带 `AND {} <` 显式右端（`time_bounds_from_template` 对带右端
+/// 形态直接 None 回落）——kernel 若给单日模板加右端，这里的「显式右端 → 扩一天」逻辑
+/// 会静默反转，两边必须一起改。
 pub fn comparison_time_bounds(
     question: &str,
     template: &str,
 ) -> Option<(String, String)> {
-    let has_explicit_end = template.contains(" AND {} < ");
+    let has_explicit_end = template.contains(TEMPLATE_AND_END);
     let (begin, mut end) = time_bounds_from_template(template)?;
     if has_explicit_end && is_current_period_to_date(question) {
         end = format!("DATE_ADD({end}, INTERVAL 1 DAY)");
@@ -544,6 +574,7 @@ pub fn comparison_time_bounds(
 }
 
 /// 构造单指标时间窗子查询；派生指标必须调用它复用基础指标口径。
+/// 🔴 子查询复用固定别名 `sf`：不得嵌入同样以 `sf` 为外层别名的查询（阴影别名）。
 pub fn metric_subquery(metric: Metric, begin_sql: &str, end_sql: &str) -> String {
     format!(
         "(SELECT {} FROM {TABLE} {ALIAS} WHERE {})",
@@ -579,6 +610,7 @@ pub fn aggregate_sql_many(
 }
 
 /// 同一事实表上的受信查询入口：统一 FROM、聚合、时间、追加谓词、排序与 LIMIT。
+/// `limit` 被静默钳制到 [1, 1000]；维度/指标重复或排序维度未入选都会在装配期 assert。
 pub fn aggregate_sql_with_options(
     metrics: &[Metric],
     dimensions: &[Dimension],
@@ -587,9 +619,14 @@ pub fn aggregate_sql_with_options(
     options: QueryOptions<'_>,
 ) -> String {
     assert!(!metrics.is_empty() || !dimensions.is_empty(), "事实查询至少选择一个指标或维度");
+    // 重复维度/指标会生成重复 `AS 名` 别名与重复 GROUP BY 表达式（Doris 重复列错误/歧义结果）
     assert!(
-        dimensions.iter().all(|dimension| DIMENSIONS.contains(dimension)),
-        "默认销售事实只允许业务确认维度"
+        dimensions.iter().enumerate().all(|(i, d)| !dimensions[..i].contains(d)),
+        "默认销售事实维度不许重复"
+    );
+    assert!(
+        metrics.iter().enumerate().all(|(i, m)| !metrics[..i].contains(m)),
+        "默认销售事实指标不许重复"
     );
     let mut select = dimensions
         .iter()
@@ -601,8 +638,10 @@ pub fn aggregate_sql_with_options(
             .map(|metric| format!("{} AS `{}`", metric.sql_expression(), metric.name())),
     );
 
-    let mut predicates = vec![time_predicate(begin_sql, end_sql)];
-    predicates.extend(options.predicates.iter().map(|predicate| predicate.0.clone()));
+    let time = time_predicate(begin_sql, end_sql);
+    let predicates: Vec<&str> = std::iter::once(time.as_str())
+        .chain(options.predicates.iter().map(|predicate| predicate.0.as_str()))
+        .collect();
     let mut sql = format!(
         "SELECT {} FROM {TABLE} {ALIAS} WHERE {}",
         select.join(", "),
@@ -618,6 +657,11 @@ pub fn aggregate_sql_with_options(
         sql.push_str(&group_by);
     }
     if let Some(sort) = options.sort {
+        // 排序维度必须出自本次分组维度（GROUP BY 下 ORDER BY 非分组表达式 Doris 运行期报错）；
+        // 指标排序键是聚合表达式，不在 SELECT 里也是合法 SQL，不拦。
+        if let SortKey::Dimension(d) = sort.key {
+            assert!(dimensions.contains(&d), "排序维度必须出自本次查询的分组维度");
+        }
         sql.push_str(" ORDER BY ");
         sql.push_str(sort.expression());
         sql.push(' ');
@@ -633,14 +677,18 @@ pub fn aggregate_sql_with_options(
 /// 销售经营明细的唯一受信构造器。字段顺序与业务确认 SQL 一致；毛利率按当前明细行的
 /// `gross_profit / revenue_excluding_tax` 展示，汇总毛利率仍必须使用 `Metric::GrossMargin`
 /// 的“先汇总分子分母再相除”口径。
+/// 排序口径：时间倒序后按金额绝对值倒序（`ABS(sf.amount) DESC`，大额退单不会被压底）；
+/// `limit` 被静默钳制到 [1, 500]。
 pub fn detail_sql(
     begin_sql: &str,
     end_sql: &str,
     predicates: &[Predicate],
     limit: u32,
 ) -> String {
-    let mut filters = vec![time_predicate(begin_sql, end_sql)];
-    filters.extend(predicates.iter().map(|predicate| predicate.0.clone()));
+    let time = time_predicate(begin_sql, end_sql);
+    let filters: Vec<&str> = std::iter::once(time.as_str())
+        .chain(predicates.iter().map(|predicate| predicate.0.as_str()))
+        .collect();
     format!(
         "SELECT sf.order_date AS `日期`, sf.storecode AS `客户编码`, \
                 sf.storename AS `客户名称`, sf.skucode AS `商品编码`, \
@@ -764,6 +812,71 @@ mod tests {
         assert_ne!(july.1, "DATE_ADD(CURDATE(), INTERVAL 1 DAY)");
         let explicit_year = question_time_bounds("2025年销售额").expect("显式年份窗口");
         assert_ne!(explicit_year.1, "DATE_ADD(CURDATE(), INTERVAL 1 DAY)");
+    }
+
+    /// 显式右端纪律：DATE/YEAR/QUARTER 分支带 `AND {} <` 时返回 None 回落（不静默丢右端）；
+    /// YEARWEEK 分支仍消费显式右端。
+    #[test]
+    fn explicit_end_on_non_week_templates_falls_back() {
+        assert!(time_bounds_from_template("DATE({}) = '2026-08-01'").is_some(), "单日模板无右端正常解析");
+        assert!(
+            time_bounds_from_template("DATE({}) = '2026-08-01' AND {} < '2026-08-09'").is_none(),
+            "单日模板带显式右端必须回落"
+        );
+        assert!(
+            time_bounds_from_template("YEAR({}) = 2026 AND {} < '2027-01-01'").is_none(),
+            "年模板带显式右端必须回落"
+        );
+        assert!(
+            time_bounds_from_template(
+                "QUARTER({}) = QUARTER(CURDATE()) AND YEAR({}) = YEAR(CURDATE()) AND {} < '2026-10-01'"
+            )
+            .is_none(),
+            "季模板带显式右端必须回落"
+        );
+        assert!(
+            time_bounds_from_template("YEARWEEK({}, 1) = YEARWEEK('2026-08-01', 1) AND {} < '2026-08-10'")
+                .is_some(),
+            "YEARWEEK 分支消费显式右端"
+        );
+    }
+
+    /// 「本季度和三季度对比」第二个「季度」才是显式的：全出现扫描，不做进行中截断。
+    #[test]
+    fn explicit_quarter_checks_all_occurrences() {
+        assert!(!has_explicit_quarter("本季度销售额"), "纯本季度是进行中");
+        assert!(has_explicit_quarter("本季度和三季度对比"), "第二个「季度」显式");
+        assert!(has_explicit_quarter("4季度销售额"), "数字季显式");
+        assert!(!has_explicit_quarter("季度销售额"));
+    }
+
+    /// 排序维度必须出自分组维度（装配期拦，不到 Doris 才报错）。
+    #[test]
+    #[should_panic(expected = "排序维度必须出自本次查询的分组维度")]
+    fn sort_dimension_must_be_selected() {
+        let _ = aggregate_sql_with_options(
+            &[Metric::SalesAmount],
+            &[Dimension::Region],
+            ":begin",
+            ":end",
+            QueryOptions {
+                predicates: &[],
+                sort: Some(Sort::dimension(Dimension::WarZone, SortDirection::Desc)),
+                limit: None,
+            },
+        );
+    }
+
+    /// 重复维度在装配期拦（重复别名/重复 GROUP BY 表达式）。
+    #[test]
+    #[should_panic(expected = "维度不许重复")]
+    fn duplicate_dimensions_are_rejected() {
+        let _ = aggregate_sql(
+            Metric::SalesAmount,
+            &[Dimension::Region, Dimension::Region],
+            ":begin",
+            ":end",
+        );
     }
 
     /// 同窗补充五值的合同钉：指标集与列序固定，一条 SQL 同时间窗取齐；

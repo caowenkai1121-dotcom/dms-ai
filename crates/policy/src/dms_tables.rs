@@ -5,7 +5,7 @@
 //! `t_customer_contacts_info` / `t_customer_contacts_account` / `t_master_shop` / `t_config`。
 //!
 //! 每条 SQL 都是 `&'static str` 字面量，动态 `IN` 只有 `fixed(tpl).expand(n)` 一条路
-//! （裁决 C1）：拼串的入口在编译期就不存在。逐行搬自 server/src/scope.rs:186-355。
+//! （裁决 C1）：拼串的入口在编译期就不存在。逐行搬自 server/src/scope.rs（原文件已删除）。
 
 use std::collections::HashSet;
 
@@ -44,11 +44,15 @@ pub async fn role_data_scope(mysql: &ReadOnlyMySql, role_id: i64) -> anyhow::Res
 
 /// 游客默认经销商。DMS `ConfigService.selectByKey` 无 deleted/disabled 条件；重复或空值拒绝。
 pub async fn guest_distributor_code(mysql: &ReadOnlyMySql) -> anyhow::Result<Option<String>> {
-    let rows: Vec<(Option<String>,)> = mysql.fixed(GUEST_DISTRIBUTOR).fetch_all().await?;
+    let mut rows: Vec<(Option<String>,)> = mysql.fixed(GUEST_DISTRIBUTOR).fetch_all().await?;
     if rows.len() != 1 {
+        if rows.len() > 1 {
+            // 配置重复是数据事故：fail-closed 但必须留痕，否则 visitor 客户维度无声落哨兵
+            tracing::warn!("guest_distributor 配置 {} 行，按拒绝处理", rows.len());
+        }
         return Ok(None);
     }
-    Ok(rows.into_iter().next().and_then(|(v,)| v).filter(|v| !v.trim().is_empty()))
+    Ok(rows.pop().and_then(|(v,)| v).filter(|v| !v.trim().is_empty()))
 }
 
 /// CustomerContacts.listByContactId：内外层都刻意不加 deleted/status，逐字保持 DMS 语义。
@@ -148,7 +152,9 @@ pub async fn department_employee_ids(
     if dept_ids.is_empty() {
         return Ok(vec![]);
     }
-    // 两个 `{in}` 用同一个 n（`expand` 展开模板里的每个标记），bind 顺序 = 占位符顺序
+    // 两个 `{in}` 用同一个 n（`expand` 展开模板里的每个标记），bind 顺序 = 占位符顺序。
+    // 双占位符模板的 bind 轮数与模板槽数严格相等：
+    const IN_SLOTS: usize = 2; // 本模板的 {in} 个数（改模板同改）
     let mut q = mysql
         .fixed(
             "SELECT DISTINCT t.employee_id FROM t_employee t
@@ -157,7 +163,7 @@ pub async fn department_employee_ids(
          WHERE t.department_id IN ({in}) OR td.department_id IN ({in})",
         )
         .expand(dept_ids.len());
-    for _ in 0..2 {
+    for _ in 0..IN_SLOTS {
         for d in dept_ids {
             q = q.bind(d);
         }
@@ -166,7 +172,9 @@ pub async fn department_employee_ids(
 }
 
 /// 下属递归（含本人；任职行 deleted=0 且 service_status=0 按 manager_id 下钻）。
-/// DMS 一旦在当前层发现任一环边，就保留本层新节点但停止继续下钻，避免异常关系扩大权限。
+/// DMS 一旦在当前层发现任一**已访问节点**（含环边与菱形汇聚：两上级共一下属、非同层环
+/// 同样触发），就保留本层新节点但停止继续下钻，避免异常关系扩大权限。
+/// 返回前排序：HashSet 迭代序不定会让下游 IN 列表与 trace/审计 diff 全是噪声。
 pub async fn subordinate_ids(mysql: &ReadOnlyMySql, user_id: i64) -> anyhow::Result<Vec<i64>> {
     let mut result: HashSet<i64> = HashSet::from([user_id]);
     let mut frontier: Vec<i64> = vec![user_id];
@@ -188,22 +196,28 @@ pub async fn subordinate_ids(mysql: &ReadOnlyMySql, user_id: i64) -> anyhow::Res
         }
         frontier = found;
     }
-    Ok(result.into_iter().collect())
+    let mut out: Vec<i64> = result.into_iter().collect();
+    out.sort_unstable();
+    Ok(out)
 }
 
+/// 员工 ID → 登录名（Java getEmployeeCodes 段）
 pub async fn login_names_by_ids(mysql: &ReadOnlyMySql, ids: &[i64]) -> anyhow::Result<Vec<String>> {
     fetch_str_in(mysql, "SELECT login_name FROM t_employee WHERE employee_id IN ({in})", ids).await
 }
 
+/// 员工 ID → 姓名（Java actualName 段；103 客户团队的 contact_name 按它匹配）
 pub async fn actual_names_by_ids(mysql: &ReadOnlyMySql, ids: &[i64]) -> anyhow::Result<Vec<String>> {
     fetch_str_in(mysql, "SELECT actual_name FROM t_employee WHERE employee_id IN ({in})", ids).await
 }
 
+/// 区域经理名下的有效客户（Java 基础客户段：area_manager_id IN 基础ids）
 pub async fn customers_by_area_manager(
     mysql: &ReadOnlyMySql,
     ids: &[i64],
 ) -> anyhow::Result<Vec<String>> {
-    if ids.is_empty() {
+    // 恒假哨兵短路：IN(-1) 必然为空，不值得发一次查询
+    if ids.is_empty() || ids == [dms_kernel::policy::scope::SENTINEL] {
         return Ok(vec![]);
     }
     fetch_str_in(
@@ -214,7 +228,8 @@ pub async fn customers_by_area_manager(
     .await
 }
 
-/// 公用客户：字典三 key 的 value_code（Java getGeneralCustomerCodes L173-190）
+/// 公用客户：字典三 key 的 value_code（Java getGeneralCustomerCodes L173-190）。
+/// 字典脏数据（空 value_code）直接丢弃，不进合并段。
 pub async fn common_customer_codes(mysql: &ReadOnlyMySql) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> = mysql
         .fixed(
@@ -225,7 +240,7 @@ pub async fn common_customer_codes(mysql: &ReadOnlyMySql) -> anyhow::Result<Vec<
         )
         .fetch_all()
         .await?;
-    Ok(rows.into_iter().map(|(s,)| s).collect())
+    Ok(rows.into_iter().map(|(s,)| s).filter(|s| !s.trim().is_empty()).collect())
 }
 
 /// 102 客户分组：FIND_IN_SET(员工组码, 客户.customer_group)（Java EmployeeCustomerGroupMapper.xml L80-93）
@@ -277,6 +292,8 @@ pub async fn manager_customer_codes(
 }
 
 /// 单列字符串取数的公用体：`sql` 必是 `&'static str` 模板（含 `{in}`），值全走 bind。
+/// 空白串结果直接丢弃（与 `fetch_str_by_str_in` 同口径）：空串 login_name/actual_name/
+/// customer_code 原样进 `IN ('')` 是垃圾条件。
 async fn fetch_str_in(
     mysql: &ReadOnlyMySql,
     sql: &'static str,
@@ -289,7 +306,13 @@ async fn fetch_str_in(
     for id in ids {
         q = q.bind(id);
     }
-    Ok(q.fetch_all::<(String,)>().await?.into_iter().map(|(s,)| s).collect())
+    Ok(q
+        .fetch_all::<(String,)>()
+        .await?
+        .into_iter()
+        .map(|(s,)| s)
+        .filter(|s| !s.trim().is_empty())
+        .collect())
 }
 
 /// 字符串 `IN` 的固定模板版本；空白结果不能形成可用权限标识，直接丢弃。

@@ -5,17 +5,19 @@
 //! `server/src/meta.rs:1602-1633`（`render_schema`）——SQL 文本、绑定序号、score 常量
 //! （1.0 / 0.9 / trgm 原值）、去重与短路位置逐行保留。
 //!
-//! **三路的先后与短路即行为**，只提取了函数没有重排：
-//! ① kw_force 命中必入（`forced=true`，不占 k 的额度）；② 向量补足到 k（`out.len() >= k` 先判后取）；
-//! ③ trgm 兜底（`out.len() >= k + forced 数` 与循环尾部的 `out.len() >= k` **两个**判据都不许动）。
-//! `cx.embed == None`（embed 服务挂 / 还没建向量）→ 整条向量路跳过，与今天 `embed_query()`
-//! 返 `None` 时的降级完全等价。
+//! **三路的先后与短路即行为**，只提取了函数没有重排。额度口径钉准（不许改）：
+//! ① kw_force 命中必入（`forced=true`）；② 向量补足到 k（`out.len() >= k` 先判后取，
+//! **forced 计入 k 的额度**）；③ trgm 兜底：循环头 `out.len() >= k + forced 数` 与循环尾
+//! `out.len() >= k` 两个判据都不许动 —— 交互语义实测是「循环尾永远先触发，循环头判据
+//! 实为死路（forced 占额度）」，由 `trgm_dual_break_interaction_is_pinned` 测试钉住；
+//! 要不要让 k+forced 真正生效是评审事项，不是顺手能改的。
+//! `cx.embed == None`（embed 服务挂 / 还没建向量）→ 整条向量路跳过，与 gather 侧
+//! `embed_query()` 返 `None` 时的现行降级等价。
 
 use crate::recall::RecallCtx;
 use crate::registry::datasource::DMS_DS_ID;
 use crate::registry::{
     catalog_allows_column, catalog_allows_table, ds_pred, is_sensitive_col, warehouse_contract,
-    warehouse_qualified_table, warehouse_table_name,
 };
 use sqlx::PgPool;
 
@@ -35,7 +37,8 @@ pub struct SchemaCard {
     pub columns: Vec<(String, String)>,
 }
 
-/// 三路召回：关键词强制补表（必入）+ trgm 相似排序补足到 k。返回渲染好的 schema 上下文。
+/// 三路召回：关键词强制补表（必入）+ 向量近邻补足 + trgm 相似排序兜底。
+/// 返回渲染好的 schema 上下文。
 pub async fn retrieve(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec<TableCtx>> {
     let mut out: Vec<TableCtx> = vec![];
     forced_tables(pg, cx, &mut out).await?;
@@ -44,16 +47,17 @@ pub async fn retrieve(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec<Tab
     Ok(out)
 }
 
-fn catalog_table(cx: &RecallCtx<'_>, table: &str) -> bool {
-    catalog_allows_table(cx.ds, table)
+fn catalog_table(ds: &str, table: &str) -> bool {
+    catalog_allows_table(ds, table)
 }
 
-fn catalog_table_filter(ds: &str) -> Option<Vec<String>> {
+fn catalog_table_filter(ds: &str) -> Option<Vec<&'static str>> {
+    // 目录表名清单进程内只建一次（原来 DMS 时每调用新建 57 个 String、一次 retrieve 建两回）
+    static TABLES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     (ds == DMS_DS_ID).then(|| {
-        crate::warehouse_catalog::ASSETS
-            .iter()
-            .map(|asset| asset.table.to_string())
-            .collect()
+        TABLES
+            .get_or_init(|| crate::warehouse_catalog::ASSETS.iter().map(|asset| asset.table).collect())
+            .clone()
     })
 }
 
@@ -71,18 +75,26 @@ async fn forced_tables(
     .fetch_all(pg)
     .await?;
     for (kw, t) in &forces {
-        if !catalog_table(cx, t) {
+        // 空/全空白关键词永不命中（kw_force 的 PK 不拒 ''，`contains("")` 恒真会强制每轮补表）；
+        // trim 后判定：种子「销量 」（带空格）不至于永不命中
+        let kw = kw.trim();
+        if kw.is_empty() {
             continue;
         }
-        if cx.question.contains(kw.as_str()) && !out.iter().any(|c| &c.table_name == t) {
-            if let Some(card) = render_schema(pg, cx.ds, t).await? {
-                out.push(TableCtx {
-                    table_name: t.clone(),
-                    schema_text: card.text,
-                    score: 1.0,
-                    forced: true,
-                });
-            }
+        // 便宜的 contains 先判（两判据无副作用，顺序只影响成本）
+        if !cx.question.contains(kw) || out.iter().any(|c| &c.table_name == t) {
+            continue;
+        }
+        if !catalog_table(cx.ds, t) {
+            continue;
+        }
+        if let Some(card) = render_schema(pg, cx.ds, t).await? {
+            out.push(TableCtx {
+                table_name: t.clone(),
+                schema_text: card.text,
+                score: 1.0,
+                forced: true,
+            });
         }
     }
     Ok(())
@@ -94,15 +106,20 @@ async fn vector_tables(
     cx: &RecallCtx<'_>,
     out: &mut Vec<TableCtx>,
 ) -> anyhow::Result<()> {
-    // word_similarity：短问句在长文档中的非对称匹配，中文场景优于 similarity
     // 向量召回（移植 SuperSonic 双召回的向量半）：语义相似补词典/trgm 不足。embed 挂则降级
     let Some(vlit) = cx.embed else {
+        // 「embed 缺席」与「向量路 0 命中」在日志里必须可区分
+        tracing::debug!("embed 缺席 → 表向量召回路跳过（trgm 会把额度填满）");
         return Ok(());
     };
     let k = cx.limit;
     // 旧向量只编码 `search_doc`，不含本轮目录合同字段；至少留 1 个名额给下面
     // 使用 custom_comment/domain/warn 的 trgm，确保目录真实参与排序而不改离线向量配方。
     let vector_k = k.saturating_sub(1);
+    if vector_k == 0 {
+        tracing::debug!("表向量召回额度为 0（k={k} ≤ 1，名额全留给 trgm）→ 跳过");
+        return Ok(());
+    }
     let catalog = catalog_table_filter(cx.ds);
     let hits: Vec<(String,)> = sqlx::query_as(&format!(
         "SELECT table_name FROM meta.table_doc
@@ -131,7 +148,7 @@ async fn vector_tables(
         if out.iter().any(|c| c.table_name == t) {
             continue;
         }
-        if !catalog_table(cx, &t) {
+        if !catalog_table(cx.ds, &t) {
             continue;
         }
         if let Some(card) = render_schema(pg, cx.ds, &t).await? {
@@ -142,6 +159,7 @@ async fn vector_tables(
 }
 
 /// ③ trgm `word_similarity` 兜底
+/// （word_similarity：短问句在长文档中的非对称匹配，中文场景优于 similarity）
 async fn trgm_tables(
     pg: &PgPool,
     cx: &RecallCtx<'_>,
@@ -159,19 +177,21 @@ async fn trgm_tables(
         ds_pred = ds_pred(3)
     ))
     .bind(cx.question)
-    .bind((k * 2) as i64)
+    .bind(k.saturating_mul(2) as i64)
     .bind(cx.ds)
     .bind(catalog)
     .fetch_all(pg)
     .await?;
+    // 循环内不新增 forced:true → forced 计数 hoist 到循环前，语义全等
+    let forced_n = out.iter().filter(|c| c.forced).count();
     for (t, s) in ranked {
-        if out.len() >= k + out.iter().filter(|c| c.forced).count() {
+        if out.len() >= k + forced_n {
             break;
         }
         if out.iter().any(|c| c.table_name == t) {
             continue;
         }
-        if !catalog_table(cx, &t) {
+        if !catalog_table(cx.ds, &t) {
             continue;
         }
         if let Some(card) = render_schema(pg, cx.ds, &t).await? {
@@ -210,13 +230,14 @@ pub async fn schema_card_with_columns(
 /// bare schema 渲染：⚠️ 警告进表头注释（LLM 读 schema 必见），敏感列剔除
 async fn render_schema(pg: &PgPool, ds: &str, table: &str) -> anyhow::Result<Option<SchemaCard>> {
     let (lookup_table, qualified) = if ds == DMS_DS_ID {
-        let Some(lookup_table) = warehouse_table_name(table) else {
+        // 一次 `warehouse_asset` 兼得裸名与限定名（原来两个帮手各自扫一遍目录）
+        let Some(asset) = crate::registry::warehouse_asset(table) else {
             return Ok(None);
         };
-        let Some(qualified) = warehouse_qualified_table(table) else {
-            return Ok(None);
-        };
-        (lookup_table, qualified)
+        (
+            asset.table,
+            format!("{}.{}", crate::warehouse_catalog::database_of(asset), asset.table),
+        )
     } else {
         (table, table.to_string())
     };
@@ -226,35 +247,52 @@ async fn render_schema(pg: &PgPool, ds: &str, table: &str) -> anyhow::Result<Opt
     // `ingest::schema_sync` 的 upsert 一个字都不许碰它。
     // 【A20】`AND enabled` 是人工勾选的总闸：forced/向量/trgm/对面表卡片全在这里汇流，
     // 一个闸盖所有渲染路径（两路列表 SQL 另有谓词 —— 那是效率，这一处是兜底）。
-    let doc: Option<(String, String, String)> = sqlx::query_as(&format!(
+    // 🔴 裸 String 解码依赖 DDL：`table_doc.domain/warn` 与 `column_doc.column_name` 等列
+    // 是 NOT NULL（semantic/ddl.rs）—— 老库若由更早 DDL 建表，一行 NULL 就会 decode Err
+    // 整轮失败。
+    // table_doc 与 column_doc 两条查询互不依赖，一次并发取齐（SQL 先落局部变量，
+    // try_join 两臂的借用要活到宏结束）
+    let doc_sql = format!(
         "SELECT COALESCE(NULLIF(custom_comment, ''), table_comment), domain, warn
          FROM meta.table_doc WHERE table_name = $1 AND enabled{ds_pred}",
         ds_pred = ds_pred(2)
-    ))
-    .bind(lookup_table)
-    .bind(ds)
-    .fetch_optional(pg)
-    .await?;
-    let Some((doc_comment, doc_domain, doc_warn)) = doc else {
-        return Ok(None);
-    };
-    let cols: Vec<(String, String, String)> = sqlx::query_as(&format!(
+    );
+    let cols_sql = format!(
         "SELECT column_name, data_type, COALESCE(NULLIF(custom_comment, ''), col_comment)
          FROM meta.column_doc
          WHERE table_name = $1{ds_pred} ORDER BY ordinal",
         ds_pred = ds_pred(2)
-    ))
-    .bind(lookup_table)
-    .bind(ds)
-    .fetch_all(pg)
-    .await?;
+    );
+    let (doc, cols) = tokio::try_join!(
+        sqlx::query_as::<_, (String, String, String)>(&doc_sql)
+            .bind(lookup_table)
+            .bind(ds)
+            .fetch_optional(pg),
+        sqlx::query_as::<_, (String, String, String)>(&cols_sql)
+            .bind(lookup_table)
+            .bind(ds)
+            .fetch_all(pg),
+    )?;
+    let Some((doc_comment, doc_domain, doc_warn)) = doc else {
+        return Ok(None);
+    };
     let header = if ds == DMS_DS_ID {
         let Some(contract) = warehouse_contract(lookup_table) else {
             return Ok(None);
         };
+        // DMS 表头只渲目录 contract、不另渲 table_doc.warn：seed 把 forbidden/comparison
+        // 同内容同时写进 warn 与 contract 两段，再渲是重复（刻意，不是漏）
         format!("-- {contract}\n")
     } else {
-        format!("-- [{doc_domain}] {qualified}（{doc_comment}）{doc_warn}\n")
+        // 表头字段全部压成单行：上传侧注释（K4 用户可控文本）含换行会逃出 `-- ` 前缀，
+        // 后续行以裸文本进 prompt
+        format!(
+            "-- [{}] {}（{}）{}\n",
+            one_line(&doc_domain),
+            qualified,
+            one_line(&doc_comment),
+            one_line(&doc_warn)
+        )
     };
     let mut s = format!("{header}CREATE TABLE {qualified} (\n");
     let mut columns: Vec<(String, String)> = vec![];
@@ -264,17 +302,24 @@ async fn render_schema(pg: &PgPool, ds: &str, table: &str) -> anyhow::Result<Opt
             !is_sensitive_col(name) && catalog_allows_column(ds, lookup_table, name)
         })
     {
+        // 卡文本与语料同一份清洗（剥单引号 + 压单行），循环顶算一次复用
+        let cmt_clean = one_line(&cmt.replace('\'', ""));
         s.push_str(&format!("  {name} {ty}"));
-        if !cmt.trim().is_empty() {
-            s.push_str(&format!(" COMMENT '{}'", cmt.replace('\'', "")));
+        if !cmt_clean.trim().is_empty() {
+            s.push_str(&format!(" COMMENT '{cmt_clean}'"));
         }
         s.push_str(",\n");
-        // 语料与卡内文本同源：注释同样剥单引号（LLM 见到的就是这个形态）
-        columns.push((name.clone(), cmt.replace('\'', "")));
+        // 语料与卡内文本同源（LLM 见到的就是这个形态）
+        columns.push((name.clone(), cmt_clean));
     }
     s.push_str(");\n");
     let text = if ds == DMS_DS_ID { s } else { wrap_untrusted_schema(&s) };
     Ok(Some(SchemaCard { text, columns }))
+}
+
+/// 压成单行：换行/回车替换成空格（表头/列注释进 `-- ` 注释与 `COMMENT '…'` 前的净化）。
+fn one_line(s: &str) -> String {
+    s.replace(['\n', '\r'], " ")
 }
 
 /// 【F4 ③】非 DMS 主源的表头是**用户可控文本**（K4 把 Excel 中文表头写进 PG 列注释），整体包
@@ -297,6 +342,7 @@ fn wrap_untrusted_schema(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::warehouse_qualified_table;
 
     /// F4 ③：非主源的表头整体包 `<untrusted_schema>`，且正文里的闭合标签必须转义 ——
     /// 不转义则上传表的一行注释就能闭合标签逃逸，后面的文字变成系统级指令。
@@ -323,8 +369,9 @@ mod tests {
             embed: None,
             embed_slices: &[],
         };
-        assert!(catalog_table(&cx, "dws_off_offline_sale_dfn"));
-        assert!(!catalog_table(&cx, "dws_mkt_app_distribution_inventory_dfn"));
+        assert_eq!(cx.limit, 6, "cx 仅为召回上下文形状样例");
+        assert!(catalog_table(DMS_DS_ID, "dws_off_offline_sale_dfn"));
+        assert!(!catalog_table(DMS_DS_ID, "dws_mkt_app_distribution_inventory_dfn"));
         assert_eq!(catalog_table_filter(DMS_DS_ID).unwrap().len(), 57);
         assert_eq!(
             warehouse_qualified_table("dws_off_offline_sale_dfn").as_deref(),
@@ -332,7 +379,45 @@ mod tests {
         );
     }
 
+    /// trgm 双判据交互钉住**当前**语义（无库模拟循环骨架，判据与 `trgm_tables` 逐字同源）：
+    /// 循环头 `>= k + forced` 给 forced 让额度，但循环尾 `>= k` 在每次成功入集后先触发 ——
+    /// 净效果：forced 计入 k 额度、循环头判据实为死路。要让 k+forced 真正生效是评审事项。
+    #[test]
+    fn trgm_dual_break_interaction_is_pinned() {
+        // out 初始含 forced 张强制表；candidates 全部可入集（去重/目录过滤不改容量模型）
+        let final_len = |k: usize, forced: usize, candidates: usize| {
+            let mut len = forced;
+            for _ in 0..candidates {
+                if len >= k + forced {
+                    break; // 循环头判据（hoist 后的 forced_n 与逐字同值）
+                }
+                len += 1; // 成功入集
+                if len >= k {
+                    break; // 循环尾判据
+                }
+            }
+            len
+        };
+        assert_eq!(final_len(6, 0, 100), 6, "无强制表：trgm 推满 k");
+        assert_eq!(final_len(6, 2, 100), 6, "forced 计入 k 额度（总量仍封顶 k）");
+        assert_eq!(final_len(6, 2, 2), 4, "候选不足：2 forced + 2 候选全收");
+        // 候选全挂（render None/去重跳过）时两个判据都不触发：len 停在 forced
+        assert_eq!(final_len(6, 2, 0), 2);
+    }
+
+    /// 表头/列注释压单行：换行逃出 `-- ` 注释前缀的口子必须焊死（K4 上传可控文本）。
+    #[test]
+    fn one_line_flattens_newlines() {
+        assert_eq!(one_line("第一行\n第二行\r\n第三行"), "第一行 第二行  第三行");
+        assert_eq!(one_line("无换行"), "无换行");
+        assert_eq!(one_line(""), "");
+    }
+
     /// 🔴 向量那一路读失败必须**留痕**。
+    ///
+    /// 排版前提（钉死）：本测试按 `.split("\n///")` 切段，依赖「函数体后紧跟下一个项的
+    /// doc 注释」的排版约定 —— 在函数体内插 `///`  doc 注释或调整项顺序都会让切段歪掉，
+    /// 改排版先改这里的切法。
     ///
     /// 由来：那条 SQL 因为 `meta.table_doc` 没有 embedding 列而每次 42703，被
     /// `.unwrap_or_default()` 吞成空集，零日志 —— 而 trgm 兜底总能把额度填满，

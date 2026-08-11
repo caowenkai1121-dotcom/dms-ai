@@ -20,8 +20,13 @@ type ApiOk = Json<serde_json::Value>;
 
 /// 上传并发闸：20MB（`kb_max_mb` 默认）全量入内存 × N 并发会打爆进程。
 /// 拿不到许可**直接 429 而不排队**——排队只是把内存问题推迟到队列长度上。
-static UPLOAD_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// 许可数只许从这里改：429 文案（`upload_gate_full`）与单测都读这个常量。
+const UPLOAD_PERMITS: usize = 4;
+static UPLOAD_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(UPLOAD_PERMITS);
 const UPLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 下载并发闸（`download_doc`）：整文件入内存 × N 并发，与上传闸防的是同一个问题。
+const DOWNLOAD_PERMITS: usize = 8;
+static DOWNLOAD_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(DOWNLOAD_PERMITS);
 
 const IMAGE_OCR_PROMPT: &str = "请逐字识别图片中的全部可见文字，并完整还原表格结构、金额、数字和日期。保持原文顺序和字段，不总结、不改写、不补全、不猜测；无法辨认处标记[无法辨认]。仅输出识别结果。";
 
@@ -61,6 +66,45 @@ fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
     (code, Json(serde_json::json!({ "error": msg.to_string() })))
 }
 
+/// 500 收敛文案：`kb_err` 的 Db 臂与各端点的直写 500 共用同一处，改文案全族生效。
+const MSG_KB_UNAVAILABLE: &str = "知识库服务暂时不可用，请稍后重试";
+/// 落盘文件读失败的 500 文案（reprocess/download_doc 两处共用）。
+const MSG_FILE_UNREADABLE: &str = "文档文件暂时不可读取";
+
+/// 上传/URL 入库并发闸占满的统一 429：许可数与文案同源（`UPLOAD_PERMITS`），改数不漂。
+fn upload_gate_full() -> ApiErr {
+    err(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("上传并发已满（同时最多 {UPLOAD_PERMITS} 个），请稍后重试"),
+    )
+}
+
+/// 401 统一文案（`viewer`/`manager_principal` 两处同一条认证收口）。
+fn unauthenticated() -> ApiErr {
+    err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name")
+}
+
+/// 空间写权限 403（多个端点同一文案，改一处全族生效）。
+fn no_space_write(space_id: &str) -> ApiErr {
+    err(StatusCode::FORBIDDEN, format!("无权修改空间 {space_id} 的文档"))
+}
+
+/// 空间读权限 403（多个端点同一文案）。
+fn no_space_read(space_id: &str) -> ApiErr {
+    err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {space_id}"))
+}
+
+/// Principal 现查的统一 403 映射（`load_viewer`/`manager_principal` 共用；底层错误不透出）。
+async fn principal_or_403(
+    st: &AppState,
+    login: &str,
+    role: Option<&str>,
+) -> Result<crate::dms_policy_core::Principal, ApiErr> {
+    crate::auth::load_principal(&st.auth_mysql, login, role)
+        .await
+        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))
+}
+
 /// `KbError` → HTTP。只公开可操作的业务错误；数据库与文档服务错误可能携带
 /// 连接信息或上游正文，统一收敛为固定文案。
 fn kb_err(e: KbError) -> ApiErr {
@@ -73,7 +117,7 @@ fn kb_err(e: KbError) -> ApiErr {
     let message = match &e {
         KbError::BadInput(_) | KbError::Forbidden(_) | KbError::NotFound(_) => e.to_string(),
         KbError::Upstream(_) => "文档处理服务暂时不可用，请稍后重试".to_string(),
-        KbError::Db(_) => "知识库服务暂时不可用，请稍后重试".to_string(),
+        KbError::Db(_) => MSG_KB_UNAVAILABLE.to_string(),
     };
     err(code, message)
 }
@@ -91,6 +135,8 @@ pub struct KbQuery {
 
 #[derive(serde::Deserialize, Default)]
 pub struct CreateSpaceReq {
+    // default：缺 name 字段落到下方 400「名称不能为空」的友好文案，而非 axum 反序列化 422
+    #[serde(default)]
     name: String,
     space_id: Option<String>,
     login_name: Option<String>,
@@ -112,6 +158,8 @@ pub struct DocStateReq {
 
 #[derive(serde::Deserialize, Default)]
 pub struct DocMetadataReq {
+    // default：与 related_doc_ids 同口径——缺 tags 字段不该走 422
+    #[serde(default)]
     tags: Vec<String>,
     business_domain: Option<String>,
     effective_from: Option<String>,
@@ -165,7 +213,7 @@ struct RoleOption {
 /// 否则 KB 这一族端点会绕过那道闸（`/api/kb/chunk/{id}` 直取块正文，绕过它就是读他人文档）。
 async fn viewer(st: &AppState, headers: &HeaderMap, q: &KbQuery) -> Result<Viewer, ApiErr> {
     let (login, role) = crate::resolve_identity(st, headers, &q.login_name, &q.role_code)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
+        .ok_or_else(unauthenticated)?;
     load_viewer(st, login, role).await
 }
 
@@ -182,9 +230,7 @@ async fn load_viewer(
     login: String,
     role: Option<String>,
 ) -> Result<Viewer, ApiErr> {
-    let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
-        .await
-        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
+    let p = principal_or_403(st, &login, role.as_deref()).await?;
     Ok(Viewer::new(p.login_name, vec![p.role_code]))
 }
 
@@ -215,10 +261,8 @@ async fn manager_principal(
     role_code: &Option<String>,
 ) -> Result<crate::dms_policy_core::Principal, ApiErr> {
     let (login, role) = crate::resolve_identity(st, headers, login_name, role_code)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
-    let p = crate::auth::load_principal(&st.auth_mysql, &login, role.as_deref())
-        .await
-        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
+        .ok_or_else(unauthenticated)?;
+    let p = principal_or_403(st, &login, role.as_deref()).await?;
     if !kb_manager_allowed(&p, st.cfg().kb_manager_grants.as_ref()) {
         return Err(err(StatusCode::FORBIDDEN, "知识库管理未对你开放"));
     }
@@ -293,8 +337,9 @@ fn optional_date(value: Option<&str>, label: &str) -> Result<Option<chrono::Naiv
 }
 
 fn is_safe_source_uri(uri: &str) -> bool {
-    let uri = uri.to_ascii_lowercase();
-    uri.starts_with("https://") || uri.starts_with("http://")
+    // 只比前缀：不为判定把最长 500 字符的 URI 整体小写化分配一次
+    uri.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        || uri.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
 }
 
 pub async fn upload(
@@ -302,11 +347,9 @@ pub async fn upload(
     headers: HeaderMap,
     mp: Multipart,
 ) -> Result<ApiOk, ApiErr> {
-    // 先认证再占上传槽：未认证慢请求不能耗尽 4 个许可。
+    // 先认证再占上传槽：未认证慢请求不能耗尽许可。
     let v = session_viewer(&st, &headers).await?;
-    let _permit = UPLOAD_GATE.try_acquire().map_err(|_| {
-        err(StatusCode::TOO_MANY_REQUESTS, "上传并发已满（同时最多 4 个），请稍后重试")
-    })?;
+    let _permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
     let form = tokio::time::timeout(UPLOAD_READ_TIMEOUT, read_form(mp))
         .await
         .map_err(|_| err(StatusCode::REQUEST_TIMEOUT, "上传读取超时，请重试"))??;
@@ -347,7 +390,7 @@ pub async fn upload(
     }
     // 入库是同步链，回来时状态已终态——顺手带上，省前端一次轮询
     let row = acl::doc_for_viewer(&st.owned, &v, &out.doc_id).await.map_err(kb_err)?;
-    let mut body = doc_json(&row);
+    let mut body = doc_json(&row, chrono::Local::now().date_naive());
     // 通道②的产物：不带出来，「上传即可问数」对前端就是不可见的
     if let (Some(src), Some(obj)) = (&out.source, body.as_object_mut()) {
         obj.insert("datasource".into(), source_json(src));
@@ -366,8 +409,14 @@ pub async fn spaces(
     let p = manager_principal(&st, &headers, &q.login_name, &q.role_code).await?;
     let is_admin = p.administrator_flag;
     let v = Viewer::new(p.login_name, vec![p.role_code]);
-    store::ensure_space(&st.owned, &v.login, &v.login).await.map_err(kb_err)?;
+    // 读端点上每次必写太亏：先列，缺个人空间再幂等建并重列（常见路径省一次 INSERT）
     let rows = store::list_spaces(&st.owned, &v.login, &v.roles).await.map_err(kb_err)?;
+    let rows = if rows.iter().any(|s| s.space_id == v.login) {
+        rows
+    } else {
+        store::ensure_space(&st.owned, &v.login, &v.login).await.map_err(kb_err)?;
+        store::list_spaces(&st.owned, &v.login, &v.roles).await.map_err(kb_err)?
+    };
     Ok(Json(serde_json::json!({
         "is_admin": is_admin,
         "kb_manager": true,
@@ -399,14 +448,15 @@ pub async fn create_space(
     if !valid_space_id(&space_id) {
         return Err(err(StatusCode::BAD_REQUEST, "space_id 只能包含字母、数字、下划线和短横线，且不超过 64 字符"));
     }
+    // 存在性判定用点查：COUNT 恒返一行（fetch_optional 语义错位），且用不着全表计数
     let collision = st
         .auth_mysql
-        .fixed("SELECT COUNT(*) FROM t_employee WHERE login_name=? AND deleted_flag=0")
+        .fixed("SELECT 1 FROM t_employee WHERE login_name=? AND deleted_flag=0 LIMIT 1")
         .bind(&space_id)
         .fetch_optional::<(i64,)>()
         .await
         .map_err(|_| err(StatusCode::BAD_GATEWAY, "DMS 身份服务暂时不可用"))?
-        .is_some_and(|(n,)| n > 0);
+        .is_some();
     if collision {
         return Err(err(StatusCode::CONFLICT, "space_id 不能与 DMS 登录账号相同"));
     }
@@ -429,9 +479,9 @@ pub async fn reprocess(
     if !acl::space_writable(&st.owned, &v, &row.space_id).await.map_err(kb_err)? {
         return Err(err(StatusCode::FORBIDDEN, format!("无权重处理空间 {} 的文档", row.space_id)));
     }
-    let is_tabular = ["csv", "xls", "xlsx", "xlsm"]
-        .iter()
-        .any(|ext| row.name.to_ascii_lowercase().ends_with(&format!(".{ext}")));
+    // 本地改写：一次小写化 + 字面量后缀比较（原形态每次调用 4 次 format! 分配）
+    let lower_name = row.name.to_ascii_lowercase();
+    let is_tabular = [".csv", ".xls", ".xlsx", ".xlsm"].iter().any(|ext| lower_name.ends_with(ext));
     if is_tabular {
         return Err(err(
             StatusCode::CONFLICT,
@@ -441,15 +491,21 @@ pub async fn reprocess(
     let path = stored_file(&st.kb_cfg.root, &row.doc_id)
         .await
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "原始文件已不存在，请重新上传"))?;
-    let bytes = tokio::fs::read(&path)
+    // 与 upload 同一条内存闸：重处理同样整文件入内存，不占许可就绕过了 20MB × N 的防线；
+    // 429 语义与 upload 一致（拿不到直接拒，不排队）。
+    let _permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
+    let bytes = tokio::time::timeout(UPLOAD_READ_TIMEOUT, tokio::fs::read(&path))
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "文档文件暂时不可读取"))?;
+        .map_err(|_| err(StatusCode::REQUEST_TIMEOUT, "文档文件读取超时，请重试"))?
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, MSG_FILE_UNREADABLE))?;
     let req = ingest::UploadReq {
         space_id: &row.space_id,
         folder_id: row.folder_id.as_deref(),
         file_name: &row.name,
         mime: &row.mime,
         bytes: &bytes,
+        // 重处理不保留原分块策略（恒 general）：preset 未持久化到 doc 行，当前是有意的
+        // 简化——按 qa/laws 等策略上传的文档重处理会回到 general 分块，恢复策略需先落库。
         preset: None,
     };
     let image_ocr = RuntimeImageOcr { llm: &st.llm };
@@ -465,9 +521,11 @@ pub async fn reprocess(
     )
     .await
     .map_err(kb_err)?;
-    register_source(&st, &v, &row.name, &out).await;
+    // 响应由 doc_json 重建、不带 datasource——register_source 的返回值在这里没有消费者
+    // （upload 侧才据它清 out.source）。
+    let _ = register_source(&st, &v, &row.name, &out).await;
     let row = acl::doc_for_viewer(&st.owned, &v, &out.doc_id).await.map_err(kb_err)?;
-    Ok(Json(doc_json(&row)))
+    Ok(Json(doc_json(&row, chrono::Local::now().date_naive())))
 }
 
 pub async fn set_doc_state(
@@ -489,10 +547,17 @@ pub async fn set_doc_state(
         return Err(err(StatusCode::FORBIDDEN, format!("文档 {id} 不可见")));
     }
     if !acl::space_writable(&st.owned, &v, &row.space_id).await.map_err(kb_err)? {
-        return Err(err(StatusCode::FORBIDDEN, format!("无权修改空间 {} 的文档", row.space_id)));
+        return Err(no_space_write(&row.space_id));
     }
     store::set_enabled(&st.owned, &v, &id, req.enabled).await.map_err(kb_err)?;
-    sync_source_state(&st, &id, req.enabled).await?;
+    // 走到这里文档状态已翻转：同步失败报裸 500 会让调用方以为整单没成（重试又返回 ok），
+    // 文案必须带上「状态已变更」这一半真相。
+    sync_source_state(&st, &id, req.enabled).await.map_err(|_| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "文档状态已变更，但问数数据源状态同步失败，请重试以收敛两侧状态",
+        )
+    })?;
     Ok(Json(serde_json::json!({ "ok": true, "enabled": req.enabled })))
 }
 
@@ -502,12 +567,9 @@ pub async fn update_doc_metadata(
     Path(id): Path<String>,
     Json(req): Json<DocMetadataReq>,
 ) -> Result<ApiOk, ApiErr> {
-    let q = KbQuery {
-        login_name: req.login_name.clone(), role_code: req.role_code.clone(),
-        space_id: None, folder_id: None,
-        preset: None,
-    };
-    let v = manager_viewer(&st, &headers, &q).await?;
+    // manager_viewer 的展开形态：身份字段直接借 req，不克隆两份 String 组一次性 KbQuery
+    let p = manager_principal(&st, &headers, &req.login_name, &req.role_code).await?;
+    let v = Viewer::new(p.login_name, vec![p.role_code]);
     let meta = validate_doc_metadata(&req).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     store::update_doc_metadata_and_links(
         &st.owned,
@@ -527,21 +589,33 @@ pub async fn update_doc_metadata(
     .await
     .map_err(kb_err)?;
     let updated = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
-    sync_source_state(&st, &id, updated.enabled).await?;
-    Ok(Json(doc_json(&updated)))
+    // 非表格文档没有上传数据源，sync 只是白打一条 UPDATE——仅存在上传源时才同步；
+    // 且同步失败只 warn：元数据变更已提交，报 500 就是「已提交又报失败」的部分失败。
+    let has_source = dms_semantic::registry::datasource::get_datasource(
+        st.owned.pool(),
+        &tabular::upload_ds_id(&id),
+    )
+    .await
+    .ok()
+    .flatten()
+    .is_some();
+    if has_source {
+        if let Err(e) = sync_source_state(&st, &id, updated.enabled).await {
+            tracing::warn!(doc_id = %id, err = %e.1.0, "元数据已提交，问数数据源状态同步失败");
+        }
+    }
+    Ok(Json(doc_json(&updated, chrono::Local::now().date_naive())))
 }
 
 // ════════════════════════ KB 运营小包（Y12 + Y7）════════════════════════
 //
-// 三个 handler 的**接线契约**（本轮不注册 `main.rs`，集成时各加一行）：
+// 三个 handler **已在 `main.rs` 接线**（注册行如下，路由变动时两边同步改）：
 //   .route("/api/kb/ingest-url", post(kb_api::ingest_url))
 //   .route("/api/kb/space/{id}/export", get(kb_api::export_space))
 //   .route("/api/kb/doc/{id}/description", post(kb_api::generate_description))
 //
 // 权限判据：先过 `kb_manager` 管理闸（本块三个 handler 均属管理面），空间级仍沿用既有口径——
 // 读 = `acl::space_readable`，写 = `acl::space_writable`，且写语句内联复核（fail-closed）。
-//
-// 接线前整块属未达代码：`allow` 挂子模块（`artifact_api`/`trace_api` 同一模子）。
 mod ops_pack {
     use super::*;
 
@@ -569,11 +643,12 @@ mod ops_pack {
         headers: HeaderMap,
         Json(req): Json<IngestUrlReq>,
     ) -> Result<ApiOk, ApiErr> {
-        // 先认证再占上传槽（与 `upload` 同序）：未认证请求不能耗尽 4 个许可。
+        // 先认证再占上传槽（与 `upload` 同序）：未认证请求不能耗尽许可。
+        // 认证口径与 upload 有刻意差异：upload 走 `session_viewer`（multipart 必须先认证
+        // 再读 body，刻意拒绝 body 身份回退）；本端点是 JSON body 可预读，故用
+        // `manager_viewer`（接受 body 的 login_name 回退，同一条 resolve_identity 收口）。
         let v = manager_viewer(&st, &headers, &req.q).await?;
-        let _permit = UPLOAD_GATE.try_acquire().map_err(|_| {
-            err(StatusCode::TOO_MANY_REQUESTS, "上传并发已满（同时最多 4 个），请稍后重试")
-        })?;
+        let _permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
         let page = fetch_url_guarded(req.url.trim()).await?;
         let space_id = space_of(&v, &req.q);
         let up = ingest::UploadReq {
@@ -599,7 +674,7 @@ mod ops_pack {
             tracing::warn!(doc_id = %out.doc_id, err = %e, "URL 已入库，来源地址回写失败");
         }
         let row = acl::doc_for_viewer(&st.owned, &v, &out.doc_id).await.map_err(kb_err)?;
-        Ok(Json(doc_json(&row)))
+        Ok(Json(doc_json(&row, chrono::Local::now().date_naive())))
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -713,6 +788,10 @@ mod ops_pack {
     /// 2. 每跳 DNS 解析后全量校验 IP，并把校验过的地址钉进该跳专用 client（防 rebinding）；
     /// 3. 重定向手动跟随 ≤3 跳（reqwest 自动跟随无法在跳转间重验目标，故 `Policy::none()`）；
     /// 4. 15s 总超时、5MB 大小帽（Content-Length 预检只是早退，真正的帽是分块流式累计）。
+    ///
+    /// 每跳重建 reqwest Client 是**刻意的安全换性能**：resolve 钉定（`resolve_to_addrs`）
+    /// 绑在 client 上，共享 client 会让被钉地址串到别的 host。要优化可按 `(host, addrs)`
+    /// 做小型缓存，但现状（≤4 跳、低频管理面操作）是有意权衡，先别动。
     async fn fetch_url_guarded(raw: &str) -> Result<FetchedPage, ApiErr> {
         let mut current = checked_url_shape(raw)?;
         for hop in 0..=URL_FETCH_MAX_REDIRECTS {
@@ -806,9 +885,9 @@ mod ops_pack {
 
     /// 首 512 字节转小写、去 BOM 与空白后，以 `<!doctype html` / `<html` 开头
     fn looks_like_html(bytes: &[u8]) -> bool {
-        let head: Vec<u8> = bytes.iter().take(512).map(|b| b.to_ascii_lowercase()).collect();
-        let text = String::from_utf8_lossy(&head);
-        let text = text.trim_start_matches('\u{feff}').trim_start();
+        // 先截取再一次性小写化（原形态 collect Vec 再 lossy 转换，两次分配）
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]).to_ascii_lowercase();
+        let text = head.trim_start_matches('\u{feff}').trim_start();
         text.starts_with("<!doctype html") || text.starts_with("<html")
     }
 
@@ -828,13 +907,16 @@ mod ops_pack {
             _ => raw.as_str(),
         };
         let mut slug = String::new();
+        let mut len = 0usize; // 字符计数器：chars().count() 每字符重扫全串是 O(n²)
         for c in stem.chars() {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') || ('\u{4e00}'..='\u{9fff}').contains(&c) {
                 slug.push(c);
+                len += 1;
             } else if !slug.ends_with('_') {
                 slug.push('_');
+                len += 1;
             }
-            if slug.chars().count() >= 60 {
+            if len >= 60 {
                 break;
             }
         }
@@ -908,14 +990,21 @@ mod ops_pack {
         };
         let v = manager_viewer(&st, &headers, &kq).await?;
         if !acl::space_readable(&st.owned, &v, &id).await.map_err(kb_err)? {
-            return Err(err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {id}")));
+            return Err(no_space_read(&id));
         }
         let (limit, offset) = export_page_params(q.limit, q.offset);
-        let total = store::count_space_docs(&st.owned, &v, &id).await.map_err(kb_err)?;
-        let rows = store::list_docs_page(&st.owned, &v, &id, limit, offset).await.map_err(kb_err)?;
-        let mut folders = store::list_folders(&st.owned, &v, &id).await.map_err(kb_err)?;
+        // 三条查询互不依赖：并发发出，不串行累加 RTT（同一池，错误各自收敛）
+        let (total, rows, folders) = tokio::join!(
+            store::count_space_docs(&st.owned, &v, &id),
+            store::list_docs_page(&st.owned, &v, &id, limit, offset),
+            store::list_folders(&st.owned, &v, &id),
+        );
+        let total = total.map_err(kb_err)?;
+        let rows = rows.map_err(kb_err)?;
+        let mut folders = folders.map_err(kb_err)?;
         folders.truncate(EXPORT_MAX_FOLDERS);
         let next_offset = (offset + limit < total).then_some(offset + limit);
+        let today = chrono::Local::now().date_naive();
         Ok(Json(serde_json::json!({
             "space_id": id,
             "offset": offset,
@@ -923,7 +1012,7 @@ mod ops_pack {
             "total_docs": total,
             "next_offset": next_offset,
             "folders": folders.iter().map(folder_json).collect::<Vec<_>>(),
-            "docs": rows.iter().map(doc_json).collect::<Vec<_>>(),
+            "docs": rows.iter().map(|d| doc_json(d, today)).collect::<Vec<_>>(),
         })))
     }
 
@@ -977,7 +1066,7 @@ mod ops_pack {
         let v = manager_viewer(&st, &headers, &kq).await?;
         let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
         if !acl::space_writable(&st.owned, &v, &row.space_id).await.map_err(kb_err)? {
-            return Err(err(StatusCode::FORBIDDEN, format!("无权修改空间 {} 的文档", row.space_id)));
+            return Err(no_space_write(&row.space_id));
         }
         if !matches!(row.status.as_str(), "chunked" | "embedded") || row.chunk_count == 0 {
             return Err(err(StatusCode::CONFLICT, "文档尚未完成入库或无可检索内容，无法生成描述"));
@@ -991,7 +1080,7 @@ mod ops_pack {
             .bind(DESC_EXCERPT_CHUNKS)
             .fetch_all()
             .await
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库服务暂时不可用，请稍后重试"))?;
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, MSG_KB_UNAVAILABLE))?;
         let mut excerpt = String::new();
         for (text,) in &chunks {
             excerpt.push_str(&text.chars().take(DESC_EXCERPT_CLIP_CHARS).collect::<String>());
@@ -1016,12 +1105,13 @@ mod ops_pack {
         }
         store::set_doc_description(&st.owned, &v, &id, &desc).await.map_err(kb_err)?;
         let updated = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
-        Ok(Json(doc_json(&updated)))
+        Ok(Json(doc_json(&updated, chrono::Local::now().date_naive())))
     }
 
     /// LLM 产出 → 单段描述：压缩空白为一行、剥首尾成对引号、封顶 `DESC_MAX_CHARS`。
     fn sanitize_description(text: &str) -> String {
         let mut out = String::new();
+        let mut len = 0usize; // 字符计数器：chars().count() 每字符重扫是 O(n²)
         let mut pending_space = false;
         for c in text.trim().chars() {
             if c.is_whitespace() {
@@ -1030,10 +1120,12 @@ mod ops_pack {
             }
             if pending_space && !out.is_empty() {
                 out.push(' ');
+                len += 1;
             }
             pending_space = false;
             out.push(c);
-            if out.chars().count() >= DESC_MAX_CHARS {
+            len += 1;
+            if len >= DESC_MAX_CHARS {
                 break;
             }
         }
@@ -1227,7 +1319,7 @@ pub async fn grant_space(
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<SpaceGrantReq>,
-) -> Result<(StatusCode, ApiOk), ApiErr> {
+) -> Result<ApiOk, ApiErr> {
     manager_principal(&st, &headers, &req.login_name, &req.role_code).await?;
     ensure_space_exists(&st, &id).await?;
 
@@ -1246,16 +1338,18 @@ pub async fn grant_space(
     )
     .await
     .map_err(kb_err)?;
-    Ok((StatusCode::OK, Json(serde_json::json!({
+    // wire 契约冻结：单授权的 "succeeded" 是数字 1，批量（grant_roles）是对象数组——
+    // 前端按两种形状解析；统一为数组留给下个协议版本。
+    Ok(Json(serde_json::json!({
         "ok": true, "updated": true, "succeeded": 1, "failed": []
-    }))))
+    })))
 }
 
 async fn grant_roles(
     st: &AppState,
     id: &str,
     req: &SpaceGrantReq,
-) -> Result<(StatusCode, ApiOk), ApiErr> {
+) -> Result<ApiOk, ApiErr> {
     if req.grantee_kind != "role" {
         return Err(err(StatusCode::BAD_REQUEST, "批量授权只支持 DMS 角色"));
     }
@@ -1285,9 +1379,9 @@ async fn grant_roles(
             "perm": perm.as_str(),
         }))
         .collect::<Vec<_>>();
-    Ok((StatusCode::OK, Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "ok": true, "updated": true, "partial": false, "succeeded": succeeded, "failed": [],
-    }))))
+    })))
 }
 
 fn validated_role_codes(
@@ -1307,7 +1401,7 @@ fn validated_role_codes(
         if !catalog.contains_key(code) {
             return Err("所选 DMS 角色不存在");
         }
-        if seen.insert(code.to_string()) {
+        if seen.insert(code) {
             out.push(code.to_string());
         }
     }
@@ -1371,7 +1465,17 @@ async fn validate_grantee(st: &AppState, grantee: &acl::Grantee) -> Result<(), A
             }
         }
         acl::Grantee::Role(code) => {
-            if !dms_role_options(st).await?.iter().any(|role| role.role_code == *code) {
+            // 点查：拉全表目录（LIMIT 500）校验一个 code 既费，又会因目录截断把合法角色
+            // 误判「不存在」——存在性判定就该是 SELECT 1
+            let exists = st
+                .auth_mysql
+                .fixed("SELECT 1 FROM t_role WHERE TRIM(role_code)=? LIMIT 1")
+                .bind(code)
+                .fetch_optional::<(i64,)>()
+                .await
+                .map_err(|_| err(StatusCode::BAD_GATEWAY, "DMS 角色目录暂时不可用"))?
+                .is_some();
+            if !exists {
                 return Err(err(StatusCode::BAD_REQUEST, "DMS 角色不存在"));
             }
         }
@@ -1395,12 +1499,15 @@ async fn dms_role_options(st: &AppState) -> Result<Vec<RoleOption>, ApiErr> {
         .fetch_all()
         .await
         .map_err(|_| err(StatusCode::BAD_GATEWAY, "DMS 角色目录暂时不可用"))?;
-    let mut seen = HashSet::new();
-    Ok(rows
-        .into_iter()
-        .filter(|(role_code, _)| seen.insert(role_code.clone()))
-        .map(|(role_code, role_name)| RoleOption { role_code, role_name })
-        .collect())
+    // 借用判重：只在构造 RoleOption 时克隆一次（原形态每行都克隆一次 code）
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for (role_code, role_name) in &rows {
+        if seen.insert(role_code.as_str()) {
+            out.push(RoleOption { role_code: role_code.clone(), role_name: role_name.clone() });
+        }
+    }
+    Ok(out)
 }
 
 async fn ensure_space_exists(st: &AppState, id: &str) -> Result<(), ApiErr> {
@@ -1411,6 +1518,14 @@ async fn ensure_space_exists(st: &AppState, id: &str) -> Result<(), ApiErr> {
     }
 }
 
+/// 撤权复核（fail-closed）：写路径两步之间权限可能已失效，查不到/查错一律按不可写。
+async fn still_writable(st: &AppState, v: &Viewer, doc_id: &str) -> bool {
+    match store::get_doc(&st.owned, doc_id).await {
+        Ok(Some(row)) => acl::space_writable(&st.owned, v, &row.space_id).await.unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// 【K4 通道②】登记数据源。可见性由数据源注册表动态继承来源文档的空间 owner/ACL，
 /// 不复制一套会与空间分享、撤权漂移的 ds ACL。
 ///
@@ -1418,10 +1533,7 @@ async fn ensure_space_exists(st: &AppState, id: &str) -> Result<(), ApiErr> {
 /// 必须成套成功，否则立即清理半成品并把降级提示写回文档。
 async fn register_source(st: &AppState, v: &Viewer, doc_name: &str, out: &ingest::Ingested) -> bool {
     let Some(src) = &out.source else { return true };
-    let allowed = match store::get_doc(&st.owned, &out.doc_id).await {
-        Ok(Some(row)) => acl::space_writable(&st.owned, v, &row.space_id).await.unwrap_or(false),
-        _ => false,
-    };
+    let allowed = still_writable(st, v, &out.doc_id).await;
     if !allowed {
         let _ = cleanup_source(st, &out.doc_id).await;
         tracing::warn!(doc_id = %out.doc_id, reason = "upload_permission_revoked", "表格数据源登记前写权限已失效");
@@ -1459,10 +1571,7 @@ async fn register_source(st: &AppState, v: &Viewer, doc_name: &str, out: &ingest
         .await;
         return false;
     }
-    let still_allowed = match store::get_doc(&st.owned, &out.doc_id).await {
-        Ok(Some(row)) => acl::space_writable(&st.owned, v, &row.space_id).await.unwrap_or(false),
-        _ => false,
-    };
+    let still_allowed = still_writable(st, v, &out.doc_id).await;
     if !still_allowed {
         let _ = cleanup_source(st, &out.doc_id).await;
         tracing::warn!(doc_id = %out.doc_id, reason = "upload_permission_revoked", "表格数据源登记后写权限已失效，已清理");
@@ -1559,11 +1668,17 @@ pub async fn docs(
     let v = manager_viewer(&st, &headers, &q).await?;
     let space_id = space_of(&v, &q);
     if !acl::space_readable(&st.owned, &v, &space_id).await.map_err(kb_err)? {
-        return Err(err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {space_id}")));
+        return Err(no_space_read(&space_id));
     }
-    let rows = store::list_docs(&st.owned, &v, &space_id).await.map_err(kb_err)?;
-    let folders = store::list_folders(&st.owned, &v, &space_id).await.map_err(kb_err)?;
-    let docs: Vec<serde_json::Value> = rows.iter().map(doc_json).collect();
+    // 两条查询互不依赖：并发发出，不串行累加 RTT
+    let (rows, folders) = tokio::join!(
+        store::list_docs(&st.owned, &v, &space_id),
+        store::list_folders(&st.owned, &v, &space_id),
+    );
+    let rows = rows.map_err(kb_err)?;
+    let folders = folders.map_err(kb_err)?;
+    let today = chrono::Local::now().date_naive();
+    let docs: Vec<serde_json::Value> = rows.iter().map(|d| doc_json(d, today)).collect();
     Ok(Json(serde_json::json!({
         "space_id": space_id,
         "folders": folders.iter().map(folder_json).collect::<Vec<_>>(),
@@ -1595,7 +1710,7 @@ pub async fn folders(
     let v = manager_viewer(&st, &headers, &q).await?;
     let space_id = space_of(&v, &q);
     if !acl::space_readable(&st.owned, &v, &space_id).await.map_err(kb_err)? {
-        return Err(err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {space_id}")));
+        return Err(no_space_read(&space_id));
     }
     let rows = store::list_folders(&st.owned, &v, &space_id).await.map_err(kb_err)?;
     Ok(Json(serde_json::json!({
@@ -1682,13 +1797,13 @@ pub async fn move_doc(
     let v = manager_viewer(&st, &headers, &q).await?;
     let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
     if !acl::space_writable(&st.owned, &v, &row.space_id).await.map_err(kb_err)? {
-        return Err(err(StatusCode::FORBIDDEN, format!("无权修改空间 {} 的文档", row.space_id)));
+        return Err(no_space_write(&row.space_id));
     }
     store::move_doc(&st.owned, &v, &id, &row.space_id, req.folder_id.as_deref())
         .await
         .map_err(kb_err)?;
     let updated = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
-    Ok(Json(doc_json(&updated)))
+    Ok(Json(doc_json(&updated, chrono::Local::now().date_naive())))
 }
 
 pub async fn doc(
@@ -1698,9 +1813,14 @@ pub async fn doc(
     Query(q): Query<KbQuery>,
 ) -> Result<ApiOk, ApiErr> {
     let v = manager_viewer(&st, &headers, &q).await?;
-    let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
-    let related = store::related_docs(&st.owned, &v, &id).await.map_err(kb_err)?;
-    let mut body = doc_json(&row);
+    // 两条查询互不依赖：并发发出，不串行累加 RTT
+    let (row, related) = tokio::join!(
+        acl::doc_for_viewer(&st.owned, &v, &id),
+        store::related_docs(&st.owned, &v, &id),
+    );
+    let row = row.map_err(kb_err)?;
+    let related = related.map_err(kb_err)?;
+    let mut body = doc_json(&row, chrono::Local::now().date_naive());
     if let Some(obj) = body.as_object_mut() {
         obj.insert("related_documents".into(), serde_json::json!(related.iter().map(relation_json).collect::<Vec<_>>()));
     }
@@ -1726,9 +1846,17 @@ pub async fn download_doc(
     let path = stored_file(&st.kb_cfg.root, &row.doc_id)
         .await
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "原始文件已不存在"))?;
+    // 整文件入内存 × N 并发与上传闸防的是同一个问题：先过 ACL 再占下载槽，
+    // 无权请求不耗许可；拿不到直接 429（不排队，同 UPLOAD_GATE 的理由）。
+    let _permit = DOWNLOAD_GATE.try_acquire().map_err(|_| {
+        err(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("下载并发已满（同时最多 {DOWNLOAD_PERMITS} 个），请稍后重试"),
+        )
+    })?;
     let bytes = tokio::fs::read(&path)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "文档文件暂时不可读取"))?;
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, MSG_FILE_UNREADABLE))?;
     let mut out = HeaderMap::new();
     out.insert(header::CONTENT_TYPE, HeaderValue::from_static(serve_mime(&path)));
     out.insert(header::HeaderName::from_static("x-content-type-options"), HeaderValue::from_static("nosniff"));
@@ -1767,12 +1895,14 @@ fn serve_mime(path: &std::path::Path) -> &'static str {
 }
 
 fn percent_encode_filename(name: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     for b in name.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_' | b'.') {
             out.push(*b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            // 直接写进 out：每字节一次 format! 堆分配，CJK 文件名每字符 3 次
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
@@ -1840,8 +1970,9 @@ pub async fn search(
     headers: HeaderMap,
     Json(req): Json<SearchKbReq>,
 ) -> Result<ApiOk, ApiErr> {
-    let question = nonempty_question(&req.question)?;
+    // 认证优先（与文件内其他端点同序）：未认证空问题应得 401 而非 400
     let v = viewer(&st, &headers, &req.q).await?;
+    let question = nonempty_question(&req.question)?;
     let dms_knowledge::retrieve::SearchReport {
         normalized_query,
         hits,
@@ -1918,13 +2049,15 @@ pub async fn ask(
     Json(req): Json<AskKbReq>,
 ) -> Result<Json<dms_kernel::Answer>, ApiErr> {
     let v = viewer(&st, &headers, &req.q).await?;
+    // 与 search 同一条边缘校验（同族端点同文案）；knowledge 层的 BadInput 仍是兜底防线
+    let question = nonempty_question(&req.question)?;
     let a = dms_knowledge::answer::answer(
         &st.owned,
         &st.embed,
         &st.llm,
         &v,
         req.q.space_id.as_deref(),
-        &req.question,
+        question,
         &st.cfg().kb_rrf_weights,
     )
     .await
@@ -1966,7 +2099,9 @@ pub async fn chunk(
     // `span` 优先：引用的价值全在可核对，而 `window` 的 ±3 覆盖不了 5 块的合并跨度
     // （实测：支撑答案的那句在第 5 块，读者点开引用看不到它）。
     let hits = match cq.span {
-        Some(n) if n > 1 => dms_knowledge::retrieve::span(&st.owned, &v, id, n).await,
+        // span=1 也是合并跨度回查（retrieve::span 内部 clamp(1,16)）——落进 window 分支
+        // 会把「单块」偷偷换成「三块上下文」，语义不对
+        Some(n) if n >= 1 => dms_knowledge::retrieve::span(&st.owned, &v, id, n).await,
         _ => dms_knowledge::retrieve::window(&st.owned, &v, id, cq.window.unwrap_or(1)).await,
     }
     .map_err(kb_err)?;
@@ -2039,15 +2174,28 @@ async fn read_form(mut mp: Multipart) -> Result<Form, ApiErr> {
             }
             "space_id" => f.q.space_id = text(field).await,
             "folder_id" => f.q.folder_id = text(field).await,
+            // 分块策略（可选）：与 ingest_url 的 JSON 路径同口径，缺省 general
+            "preset" => f.q.preset = text(field).await,
             _ => {}
         }
     }
     Ok(f)
 }
 
-/// 空串按缺省处理（表单里没填的字段常以空串到达）
+/// 空串按缺省处理（表单里没填的字段常以空串到达）；文本值先 trim——`space_id="  "`
+/// 不该原样当空间 ID 用（走到 403 才暴露）。读取失败记 warn 后按缺省：与未提交不可区分，
+/// 但失败本身不该无声。
 async fn text(field: axum::extract::multipart::Field<'_>) -> Option<String> {
-    field.text().await.ok().filter(|s| !s.is_empty())
+    match field.text().await {
+        Ok(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "multipart 文本字段读取失败，按缺省处理");
+            None
+        }
+    }
 }
 
 /// data URL 的 MIME 只从图片白名单中取，绝不把 multipart 的任意字符串拼进协议头。
@@ -2103,8 +2251,9 @@ fn encode_base64(bytes: &[u8]) -> String {
     out
 }
 
-/// `DocRow` → JSON（`DocRow` 不实现 Serialize：knowledge 不该为了 HTTP 形状而依赖协议层）
-fn doc_json(d: &DocRow) -> serde_json::Value {
+/// `DocRow` → JSON（`DocRow` 不实现 Serialize：knowledge 不该为了 HTTP 形状而依赖协议层）。
+/// `today` 由处理函数入口取一次传入：列表端点 N 个文档不该做 N 次时区系统调用。
+fn doc_json(d: &DocRow, today: chrono::NaiveDate) -> serde_json::Value {
     let (quality_level, quality_label) = doc_quality(
         &d.status,
         d.enabled,
@@ -2112,7 +2261,7 @@ fn doc_json(d: &DocRow) -> serde_json::Value {
         &d.notice,
         d.effective_from,
         d.effective_to,
-        chrono::Local::now().date_naive(),
+        today,
     );
     serde_json::json!({
         "doc_id": d.doc_id,
@@ -2236,25 +2385,54 @@ async fn stored_file(root: &std::path::Path, doc_id: &str) -> Option<std::path::
 /// `ponytail:` O(目录条数) 扫描，单空间上万文档时才需要索引/或让 knowledge 的
 /// `delete_doc` 一并返回路径。
 async fn remove_files(root: &std::path::Path, doc_id: &str) {
-    let Ok(mut rd) = tokio::fs::read_dir(root).await else { return };
-    while let Ok(Some(e)) = rd.next_entry().await {
-        let p = e.path();
+    let mut rd = match tokio::fs::read_dir(root).await {
+        Ok(rd) => rd,
+        Err(e) => {
+            // 孤儿文件无声累积是这里唯一的代价，失败必须留痕
+            tracing::warn!(doc_id, err = %e, "文档磁盘清理失败：目录不可读，孤儿文件待回收");
+            return;
+        }
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let p = entry.path();
         if p.file_stem().is_some_and(|s| s == doc_id) {
-            let _ = tokio::fs::remove_file(&p).await;
+            if let Err(e) = tokio::fs::remove_file(&p).await {
+                tracing::warn!(doc_id, err = %e, path = %p.display(), "文档磁盘文件删除失败，孤儿文件待回收");
+            }
         }
     }
 }
 
+/// 三步各自 best-effort：物理表/登记行/结构文档任一失败都不跳过剩余步骤——首个失败即
+/// early-return 会留下另外两行孤儿（与 delete 注释承诺的「幂等回收」不齐）。错误汇总返回，
+/// 调用方（upload/register_source/delete）本就只拿它记 warn。
 async fn cleanup_source(st: &AppState, doc_id: &str) -> Result<(), ApiErr> {
-    tabular::drop_source(&st.owned, doc_id).await.map_err(kb_err)?;
     let up_ds = tabular::upload_ds_id(doc_id);
-    dms_semantic::registry::datasource::delete_datasource(st.owned.pool(), &up_ds)
-        .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库数据源清理失败"))?;
-    dms_semantic::ingest::schema_sync::drop_schema_docs(st.owned.pool(), &up_ds)
-        .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "知识库结构清理失败"))?;
-    Ok(())
+    let mut failed: Vec<&str> = Vec::new();
+    if let Err(e) = tabular::drop_source(&st.owned, doc_id).await {
+        tracing::warn!(doc_id, err = %e, "上传物理表清理失败");
+        failed.push("物理表");
+    }
+    if let Err(e) =
+        dms_semantic::registry::datasource::delete_datasource(st.owned.pool(), &up_ds).await
+    {
+        tracing::warn!(doc_id, err = %e, "数据源登记行清理失败");
+        failed.push("数据源登记");
+    }
+    if let Err(e) =
+        dms_semantic::ingest::schema_sync::drop_schema_docs(st.owned.pool(), &up_ds).await
+    {
+        tracing::warn!(doc_id, err = %e, "结构注册清理失败");
+        failed.push("结构注册");
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("知识库数据源清理失败（{}），可重跑同名清理幂等回收", failed.join("/")),
+        ))
+    }
 }
 
 async fn sync_source_state(
@@ -2643,5 +2821,131 @@ mod tests {
         assert!(root.join("other.pdf").exists());
         assert!(root.join(format!("{id}x.pdf")).exists());
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    /// multipart 解析：preset 必须入 `f.q`（上传入口的分块策略不再是死参数）；
+    /// 文本字段 trim、全空白按缺省（与「空串按缺省」同口径）
+    #[tokio::test]
+    async fn read_form_parses_preset_and_trims_text_fields() {
+        use axum::extract::FromRequest;
+        let body = concat!(
+            "--testboundary\r\nContent-Disposition: form-data; name=\"preset\"\r\n\r\nqa\r\n",
+            "--testboundary\r\nContent-Disposition: form-data; name=\"space_id\"\r\n\r\n  kb-hr  \r\n",
+            "--testboundary\r\nContent-Disposition: form-data; name=\"folder_id\"\r\n\r\n   \r\n",
+            "--testboundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n",
+            "--testboundary--\r\n",
+        );
+        let req = axum::http::Request::builder()
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "multipart/form-data; boundary=testboundary",
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let mp = Multipart::from_request(req, &()).await.unwrap();
+        let form = read_form(mp).await.unwrap();
+        assert_eq!(form.q.preset.as_deref(), Some("qa"), "multipart 的 preset 必须入队");
+        assert_eq!(form.q.space_id.as_deref(), Some("kb-hr"), "文本字段要 trim");
+        assert_eq!(form.q.folder_id, None, "全空白按缺省");
+        assert_eq!(
+            form.file.as_ref().map(|(n, _, b)| (n.as_str(), b.len())),
+            Some(("a.txt", 5))
+        );
+    }
+
+    /// 下载闸：DOWNLOAD_PERMITS 个许可用完即拒（与上传闸同款的「不排队」语义）
+    #[test]
+    fn download_gate_rejects_when_full() {
+        let held: Vec<_> =
+            (0..DOWNLOAD_PERMITS).map(|_| DOWNLOAD_GATE.try_acquire().unwrap()).collect();
+        assert!(DOWNLOAD_GATE.try_acquire().is_err());
+        drop(held);
+        assert!(DOWNLOAD_GATE.try_acquire().is_ok());
+    }
+
+    /// reprocess 必须复用上传内存闸 + 读超时（不占许可就绕过了 20MB × N 的防线）
+    #[test]
+    fn reprocess_shares_upload_gate_and_read_timeout() {
+        let src = include_str!("kb_api.rs");
+        let body = src.split("pub async fn reprocess").nth(1).unwrap();
+        let body = body.split("pub async fn set_doc_state").next().unwrap();
+        assert!(body.contains("UPLOAD_GATE.try_acquire"), "reprocess 必须占上传许可");
+        assert!(body.contains("UPLOAD_READ_TIMEOUT"), "reprocess 读取必须有超时");
+        let permit = body.find("UPLOAD_GATE.try_acquire").unwrap();
+        let read = body.find("tokio::fs::read").unwrap();
+        assert!(permit < read, "先占许可再读文件: {body}");
+    }
+
+    /// spaces 读端点：先列后建（常见路径省一次幂等 INSERT）
+    #[test]
+    fn spaces_lists_before_ensuring_personal_space() {
+        let src = include_str!("kb_api.rs");
+        let body = src.split("pub async fn spaces").nth(1).unwrap();
+        let body = body.split("pub async fn create_space").next().unwrap();
+        let list = body.find("store::list_spaces").unwrap();
+        let ensure = body.find("store::ensure_space").unwrap();
+        assert!(list < ensure, "spaces 必须先列后建: {body}");
+    }
+
+    /// 存在性判定用点查：COUNT + fetch_optional 语义错位，角色目录 LIMIT 截断会误判合法角色
+    #[test]
+    fn existence_checks_use_point_queries() {
+        let src = include_str!("kb_api.rs");
+        assert!(src.contains("SELECT 1 FROM t_employee WHERE login_name=? AND deleted_flag=0 LIMIT 1"));
+        assert!(src.contains("SELECT 1 FROM t_role WHERE TRIM(role_code)=? LIMIT 1"));
+        assert!(
+            !src.contains(concat!("SELECT COUNT(*) FROM t_employee WHERE login_name", "=?")),
+            "碰撞检查不该再全表计数"
+        );
+    }
+
+    /// ask/search 同族同校验：都过 nonempty_question，且都先认证后校验（401 优先于 400）
+    #[test]
+    fn ask_and_search_validate_question_after_auth() {
+        let src = include_str!("kb_api.rs");
+        for (name, next) in
+            [("pub async fn search", "pub async fn ask"), ("pub async fn ask", "/// `GET /api/kb/chunk/{id}?window=1` 的 query。")]
+        {
+            let body = src.split(name).nth(1).unwrap().split(next).next().unwrap();
+            let auth = body.find("viewer(").unwrap();
+            let check = body
+                .find("nonempty_question")
+                .unwrap_or_else(|| panic!("{name} 必须过 nonempty_question"));
+            assert!(auth < check, "{name} 必须先认证再校验问题: {body}");
+        }
+    }
+
+    /// span=1 必须走合并跨度回查（落进 window 分支会把「单块」偷偷换成「三块上下文」）
+    #[test]
+    fn chunk_span_one_uses_span_not_window() {
+        let src = include_str!("kb_api.rs");
+        let body = src.split("pub async fn chunk").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("Some(n) if n >= 1"), "span=1 不许落 window 分支: {body}");
+    }
+
+    /// 缺 name/tags 字段落到友好 400 而非 axum 422（serde default 口径一致）
+    #[test]
+    fn create_space_and_metadata_req_tolerate_missing_fields() {
+        let r: CreateSpaceReq = serde_json::from_str(r#"{"login_name":"zhangsan"}"#).unwrap();
+        assert_eq!(r.name, "");
+        let m: DocMetadataReq = serde_json::from_str(r#"{"business_domain":"财务"}"#).unwrap();
+        assert!(m.tags.is_empty());
+    }
+
+    /// update_doc_metadata：仅存在上传源时才同步，且同步失败只 warn（部分失败不报 500）；
+    /// set_doc_state 的 500 文案必须带「状态已变更」（否则状态面自相矛盾）
+    #[test]
+    fn metadata_sync_is_conditional_and_warn_only() {
+        let src = include_str!("kb_api.rs");
+        let body = src.split("pub async fn update_doc_metadata").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        let check = body
+            .find("get_datasource")
+            .unwrap_or_else(|| panic!("必须先查上传源存在性: {body}"));
+        let sync = body.find("sync_source_state").unwrap();
+        assert!(check < sync, "先查存在性再同步");
+        assert!(body.contains("tracing::warn!"), "同步失败只 warn: {body}");
+        assert!(src.contains("文档状态已变更"), "set_doc_state 的同步失败文案变了");
     }
 }

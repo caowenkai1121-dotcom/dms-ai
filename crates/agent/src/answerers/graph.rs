@@ -23,7 +23,7 @@ use crate::ctx::{AskCtx, AskResult};
 /// `Debug` 输出进 `AskResult.sql`（`[AGE 图查询] BuyersOfGoods("烤肠")`），改名即改前端可见的字节。
 /// ponytail: 与 `DirectHit` 同一笔临时重复 —— 识别函数与本枚举的终态在 semantic
 /// （T8 的 `fastpath/relation.rs`），届时本枚举删掉。
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Relation {
     /// 买过某商品的客户（含实体名）
     BuyersOfGoods(String),
@@ -84,7 +84,9 @@ impl Answerer for GraphAnswerer {
             let Some(rel) = self.hit(cx.question) else { return Ok(None) };
             let Some(lease) = graph::ready_lease(cx.source_name) else { return Ok(None) };
             let answer = try_graph(cx.pg, &rel, cx.t0).await;
-            if !cx.source.is_warehouse() || !graph::lease_is_current(&lease) {
+            // `is_warehouse` 不复查：`accept` 已强制且 cx.source 跨 await 不变 ——
+            // TOCTOU 防的是快照代次，不是数据源。
+            if !graph::lease_is_current(&lease) {
                 tracing::info!(target = %cx.source_name, "图查询期间目标或快照代次变化，丢弃旧结果");
                 return Ok(None);
             }
@@ -93,12 +95,27 @@ impl Answerer for GraphAnswerer {
     }
 }
 
+/// 三条 Cypher 的行上限（`graph::*` 四个调用点同一个值）。
+const GRAPH_ROW_LIMIT: usize = 50;
+
 /// 图关系查询 → AskResult（表格形态）。查询失败/空结果返回 None（回落 LLM）。
 pub async fn try_graph(pg: &PgPool, rel: &Relation, t0: Instant) -> Option<AskResult> {
-    let (entity_label, mut rows_data) = match rel {
-        Relation::BuyersOfGoods(name) => ("客户", graph::buyers_of_goods(pg, name, 50).await.ok()?),
-        Relation::GoodsOfCustomer(name) => ("商品", graph::goods_of_customer(pg, name, 50).await.ok()?),
-        Relation::Copurchase(name) => ("商品", graph::copurchase(pg, name, 50).await.ok()?),
+    // AGE 错误不许零留痕吞掉回落 —— hits.rs 为同款静默付过账（5 轮回归失败无言）
+    let result = match rel {
+        Relation::BuyersOfGoods(name) => graph::buyers_of_goods(pg, name, GRAPH_ROW_LIMIT).await,
+        Relation::GoodsOfCustomer(name) => graph::goods_of_customer(pg, name, GRAPH_ROW_LIMIT).await,
+        Relation::Copurchase(name) => graph::copurchase(pg, name, GRAPH_ROW_LIMIT).await,
+    };
+    let mut rows_data = match result {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(err = %e, rel = ?rel, "AGE 图查询失败 → 回落 LLM");
+            return None;
+        }
+    };
+    let entity_label = match rel {
+        Relation::BuyersOfGoods(_) => "客户",
+        Relation::GoodsOfCustomer(_) | Relation::Copurchase(_) => "商品",
     };
     // 🔴 空结果**不直接放弃**：先问一句「剥词剩下的这坨到底是什么」。
     //
@@ -127,21 +144,28 @@ pub async fn try_graph(pg: &PgPool, rel: &Relation, t0: Instant) -> Option<AskRe
         "购买额".to_string(),
     ];
     let rows: Vec<Vec<serde_json::Value>> = rows_data
-        .iter()
+        .into_iter()
         .map(|g| {
             vec![
-                serde_json::Value::from(g.code.clone()),
-                serde_json::Value::from(g.name.clone()),
-                serde_json::Value::from(format!("{:.2}", g.amount)),
+                serde_json::Value::from(g.code),
+                serde_json::Value::from(g.name),
+                // 购买额存**数值**而不是 JSON 字符串：前端排序/合计/CSV 与 present 的
+                // 数值列识别全都认数字，字符串形态是文本语义
+                serde_json::Value::from((g.amount * 100.).round() / 100.),
             ]
         })
         .collect();
     let row_count = rows.len();
     let view = dms_semantic::present::build(&columns, &rows);
+    // Cypher 自带 LIMIT 50：恰好顶到上限时结果本身已被图侧截断 —— 恒 false 等于装没看见
+    let hit_cap = row_count >= GRAPH_ROW_LIMIT;
     Some(AskResult {
         sql: format!("[AGE 图查询] {rel:?}"),
         columns,
-        truncated: false,
+        truncated: hit_cap,
+        truncation_note: hit_cap.then(|| {
+            format!("图查询结果已达 {GRAPH_ROW_LIMIT} 条上限：只返回前 {GRAPH_ROW_LIMIT} 条，完整明细请换 SQL 问法")
+        }),
         row_count,
         rows,
         elapsed_ms: t0.elapsed().as_millis(),
@@ -151,8 +175,6 @@ pub async fn try_graph(pg: &PgPool, rel: &Relation, t0: Instant) -> Option<AskRe
         comparisons: vec![],
         subs: vec![],
         caliber_note: None, // 图查询不产 SQL，没有可判的口径
-        // Cypher 自带 `LIMIT 50`，到不了 `MAX_ROWS`：截断提示恒缺席（`truncated` 同样恒 false）
-        truncation_note: None,
         // 图查询走 AGE、不过 connector 的敏感列防线（列是 code/name/amount 三个固定列）
         redacted: vec![],
         // 图查询不过行权限注入器（走的是 AGE 的 Cypher，不是 ScopedSql）
@@ -173,17 +195,29 @@ pub async fn try_graph(pg: &PgPool, rel: &Relation, t0: Instant) -> Option<AskRe
 /// 而丢掉「湖南省」，用户会拿到**全国**的客户名单，零报错、route 还是 `graph`。
 /// 这里的判据是：解析出的实体数必须等于装上的限定数，且残留里**不许有没被解析掉的中文**。
 async fn resolved_buyers(pg: &PgPool, raw: &str) -> Option<Vec<graph::GraphRow>> {
-    let found = graph::resolve_entities(pg, raw).await.ok()?;
+    let found = match graph::resolve_entities(pg, raw).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(err = %e, residue = %raw, "图实体解析失败 → 回落");
+            return None;
+        }
+    };
     let (goods, sales_region, province) = into_slots(&found, raw)?;
-    let rows = graph::buyers_filtered(
+    let rows = match graph::buyers_filtered(
         pg,
         goods.as_deref(),
         sales_region.as_deref(),
         province.as_deref(),
-        50,
+        GRAPH_ROW_LIMIT,
     )
     .await
-    .ok()?;
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(err = %e, "图限定查询失败 → 回落");
+            return None;
+        }
+    };
     if !rows.is_empty() {
         tracing::info!(
             goods = ?goods, sales_region = ?sales_region, province = ?province,
@@ -221,7 +255,7 @@ fn into_slots(
     // 🔴 按 **窗口** 算，不是按实体名算。实测的静默错答就出在这一行：
     // 「湖南省烤肠」的窗口「烤肠」模糊匹到 `皇家小虎黑猪肉烤肠（原味）0500G00`，
     // 按实体名算 covered=13 ≥ 5 → 判据被绕过 → 「湖南省」整个丢掉 → 全国 27 个客户。
-    let covered: usize = found.iter().map(|h| hanzi_count(&h.window)).sum();
+    let covered = covered_hanzi(found, raw);
     let required = constraint_hanzi_count(raw);
     if covered < required {
         tracing::info!(
@@ -233,40 +267,44 @@ fn into_slots(
     Some((goods, sales_region, province))
 }
 
+/// 覆盖窗口的汉字数：窗口区间按 start 排序、合并重叠后从原文数 —— 同一坨汉字被两个命中
+/// 各盖一次时，覆盖率不许虚增（虚增会放过「只解析出一部分」）。
+fn covered_hanzi(found: &[graph::Hit], raw: &str) -> usize {
+    let mut spans: Vec<(usize, usize)> = found
+        .iter()
+        .map(|h| (h.start, h.start + h.window.chars().count()))
+        .collect();
+    spans.sort_unstable();
+    let mut covered = 0usize;
+    let mut cur: Option<(usize, usize)> = None;
+    for (s, e) in spans {
+        match cur {
+            Some((cs, ce)) if s <= ce => cur = Some((cs, ce.max(e))),
+            Some((cs, ce)) => {
+                covered += hanzi_count(&raw.chars().skip(cs).take(ce - cs).collect::<String>());
+                cur = Some((s, e));
+            }
+            None => cur = Some((s, e)),
+        }
+    }
+    if let Some((cs, ce)) = cur {
+        covered += hanzi_count(&raw.chars().skip(cs).take(ce - cs).collect::<String>());
+    }
+    covered
+}
+
+/// 未验证维度黑名单：`accept` 与 `answer` 每问各调一次，提常量不每次重建。
+/// 同族短词已覆盖的长词不重复列（「商品分类」⊂「分类」、「商品大类」⊂「大类」等，
+/// contains 语义下是死条目）。
+const UNSUPPORTED_DIM_WORDS: &[&str] = &[
+    "肉制品", "分类", "品类", "类别", "大类", "小类", "类型", "品种", "品牌",
+    "按省", "各省", "战区", "大区", "区域", "地区", "城市", "地市", "市级", "区县", "县区",
+    "渠道", "业务员", "经理",
+];
+
 /// 未验证维度必须交给 SQL/LLM 口径链路，不能让图查询忽略维度词后返回更大范围。
 fn has_unverified_graph_dimension(question: &str) -> bool {
-    let unsupported = [
-        "商品分类",
-        "商品类型",
-        "商品大类",
-        "商品小类",
-        "肉制品",
-        "分类",
-        "品类",
-        "类别",
-        "大类",
-        "小类",
-        "类型",
-        "品种",
-        "品牌",
-        "客户类型",
-        "按省",
-        "各省",
-        "战区",
-        "大区",
-        "销售区域",
-        "区域",
-        "地区",
-        "城市",
-        "地市",
-        "市级",
-        "区县",
-        "县区",
-        "渠道",
-        "业务员",
-        "经理",
-    ];
-    unsupported.iter().any(|word| question.contains(word))
+    UNSUPPORTED_DIM_WORDS.iter().any(|word| question.contains(word))
 }
 
 /// 汉字数。只数汉字：残留里可能有剥词剩下的标点/空格，那些不算「没理解的限定词」。
@@ -275,8 +313,20 @@ fn hanzi_count(s: &str) -> usize {
 }
 
 /// “省区/省份”是选择已验证 `region/state` 的维度标签，不是业务值；覆盖率只要求实体值被解析。
+/// 单遍过滤（跳过「省区/省份」子串后数汉字）：两次 replace 是两次全串分配。
 fn constraint_hanzi_count(s: &str) -> usize {
-    hanzi_count(&s.replace("省区", "").replace("省份", ""))
+    let mut n = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '省' && matches!(chars.peek(), Some('区') | Some('份')) {
+            chars.next();
+            continue;
+        }
+        if ('\u{4e00}'..='\u{9fff}').contains(&c) {
+            n += 1;
+        }
+    }
+    n
 }
 
 #[cfg(test)]
@@ -363,6 +413,11 @@ mod tests {
 
         // ⑤ 什么都没解析出来 → 拒
         assert!(into_slots(&[], "不知道是什么").is_none());
+
+        // ⑤½ 重叠窗口不许重复计数：同一坨汉字被两个命中各盖一次时 covered 虚增，
+        // 会放过「只解析出一部分」（不去重时这例 covered=5 ≥ required=4 被放行）
+        let overlap = vec![hit(0, "湖南", pv("湖南")), hit(0, "湖南省", g("湖南省"))];
+        assert!(into_slots(&overlap, "湖南省肠").is_none(), "重叠窗口重复计数会虚增覆盖率");
 
         // ⑥ 非汉字不算「没理解的限定词」（剥词会剩标点/空格）
         assert!(into_slots(&vec![hit(0, "烤肠", g("烤肠"))], "烤肠 ").is_some());

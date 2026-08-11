@@ -1,9 +1,10 @@
-//! `route="llm"` 的 IO 落地：生成 → 五个校正器 → 三段闸门 → EXPLAIN 预检 → 取数，
+//! `route="llm"` 的 IO 落地：生成 → schema 校正 + 七件确定性校正 → 三段闸门 → EXPLAIN 预检 → 取数，
 //! 外加口径回炉、语料沉淀与失败复盘。变更原因＝「LLM 这一路一轮里做什么、按什么顺序」。
 //!
 //! 搬运源 `server/src/pipeline.rs:713-884`（`ask_single` 的 LLM 那支）+ `1080-1109`（`repair`）。
-//! **顺序即行为**，逐行保留：五个校正器的先后、`schema-fix` 在循环外（不占预算）、
-//! 口径复核在闸门**之前**、EXPLAIN 只在首轮、失败首轮自修次轮定案。
+//! **顺序即行为**，逐行保留：schema 校正与七件确定性校正的先后、`schema-fix` 在循环外（不占预算）、
+//! 口径复核在闸门**之前**、EXPLAIN 只在首轮（steer 重组后预算归零，EXPLAIN 对新 SQL 重跑）、
+//! 失败首轮自修次轮定案。
 //!
 //! **显式尝试循环（`while attempt < MAX_ATTEMPTS`）而不是状态机**：ARCHITECTURE §8 删掉了 `AskRun`
 //! （`Step`/`Stage`/`ExecFailure` + 8 个回调，575 行）—— 这里的全部决策只有三件（最多 2 轮 /
@@ -16,10 +17,11 @@
 //!
 //! 两个入参化的依赖（`LlmDeps`），都不是抽象癖：`correctors` 的实现仍在
 //! `server/src/corrector.rs`（它的解体是 T8/T10 的活，agent 不能反向依赖 server）；
-//! `on_usage` 的落点 `Trace`（`server/src/query_log.rs`）带 axum，而两次 precise 调用的用量
+//! `on_usage` 的落点 `Trace`（`server/src/query_log.rs`）带 axum，而每次 precise 调用的用量
 //! 必须照旧累加进查询日志，否则 token 列静默变空且没有任何测试会红。
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -57,7 +59,7 @@ pub const CALIBER_ROUNDS: usize = 2;
 /// 在 1.97 上不是 dyn 兼容的。
 pub type Fix<'a> = BoxFut<'a, anyhow::Result<Option<String>>>;
 
-/// 五个校正器的**形状**。实现仍在 `server/src/corrector.rs`（`schema_check(pg,ds,sql)` /
+/// schema 校正 + 七件确定性校正的**形状**。实现仍在 `server/src/corrector.rs`（`schema_check(pg,ds,sql)` /
 /// `fix_group_by(sql)` / `correct_agg(pg,ds,question,sql)` / `correct_caliber(..)` /
 /// `correct_value(pg,ds,sql)`，`pg`/`ds`/`question` 三个都在 `cx` 里），wire 那步在 server 侧写 `impl`。
 /// 顺序即行为，见 `correct_chain`；`fix_group_by` 同步是因为它本来就纯 AST、零 IO。
@@ -92,6 +94,8 @@ pub struct LlmDeps<'a> {
 pub const MAX_STEERS_PER_CONV: usize = 4;
 /// 单条 steer 的字符护栏（与 refs 的 500 字同档；截断不是拒绝，同 refs 纪律）。
 pub const MAX_STEER_CHARS: usize = 500;
+/// 信箱表兜底清扫阈值：条目数超过它才做 `retain` 清扫（正常 `run_end` 已 remove，这里只防漏）。
+const MAX_STEER_CONVS: usize = 512;
 
 /// 一个会话的运行登记 + 待并入插话队列。进程内存态（与 server 会话表同形态）：
 /// 重启即空，无跨进程语义 —— steer 只服务「正在跑」的任务，重启后没有该跑的东西。
@@ -109,17 +113,30 @@ fn steers() -> &'static Mutex<HashMap<String, ConvSteers>> {
     STEERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// steer 锁的统一策略：**中毒恢复**。某线程持锁 panic ≠ 数据坏了 —— 这张表只是「运行中」
+/// 登记的进程内存态，panic 线程留下的中间态最多是一条深度计数。五个入口此前两种处置
+/// （`run_begin`/`push_steer` 直接 `.expect` panic、其余三处静默吞掉）：panic 那条会把
+/// 「信箱故障」升级成「问答 500」，而 steer 是纯附加功能，不许炸主路；静默吞掉则让
+/// 端点的 409/429 判据说谎。与同仓 registry.rs 的 `into_inner` 恢复同一策略。
+fn lock_steers() -> std::sync::MutexGuard<'static, HashMap<String, ConvSteers>> {
+    steers().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// 登记一次运行的开始（同一 conv_id 可嵌套/并发，深度 +1）。
 /// 新一轮的第一个进入者清掉上一轮残留的迟到插话 —— 它们不属于这一轮。
 pub fn run_begin(conv_id: &str) {
-    let mut map = steers().lock().expect("steer 锁中毒");
-    if map.len() > 512 {
+    let mut map = lock_steers();
+    if map.len() > MAX_STEER_CONVS {
         // 防漏：只清「既不在跑又没积压」的死条目（正常 run_end 已 remove，这里兜底）
         map.retain(|_, c| c.depth > 0 || !c.queue.is_empty());
     }
-    let e = map
-        .entry(conv_id.to_string())
-        .or_insert_with(|| ConvSteers { depth: 0, queue: VecDeque::new() });
+    // 命中已有条目时不为 key 白分配一次字符串
+    let e = match map.get_mut(conv_id) {
+        Some(e) => e,
+        None => map
+            .entry(conv_id.to_string())
+            .or_insert_with(|| ConvSteers { depth: 0, queue: VecDeque::new() }),
+    };
     e.depth += 1;
     if e.depth == 1 {
         e.queue.clear();
@@ -129,7 +146,7 @@ pub fn run_begin(conv_id: &str) {
 /// 登记一次运行的结束（深度 -1，归零时清信箱）。
 /// 运行结束没来得及消费的插话**不带进下一次问答** —— 下一次的上下文由用户的新问句自己带。
 pub fn run_end(conv_id: &str) {
-    let Ok(mut map) = steers().lock() else { return };
+    let mut map = lock_steers();
     let done = match map.get_mut(conv_id) {
         Some(e) => {
             e.depth = e.depth.saturating_sub(1);
@@ -144,10 +161,7 @@ pub fn run_end(conv_id: &str) {
 
 /// 会话当前是否有运行中的任务（steer 端点 409 的事实源）。
 pub fn is_running(conv_id: &str) -> bool {
-    steers()
-        .lock()
-        .map(|m| m.get(conv_id).is_some_and(|c| c.depth > 0))
-        .unwrap_or(false)
+    lock_steers().get(conv_id).is_some_and(|c| c.depth > 0)
 }
 
 /// steer 入队的拒绝理由（端点按它映状态码）。
@@ -162,7 +176,7 @@ pub enum SteerReject {
 /// 入队一条 steer（content 应已过 `sanitize_steer`；这里只认运行态与容量）。
 /// 返回入队后该会话的排队条数（端点回显用）。
 pub fn push_steer(conv_id: &str, content: String) -> Result<usize, SteerReject> {
-    let mut map = steers().lock().expect("steer 锁中毒");
+    let mut map = lock_steers();
     let Some(e) = map.get_mut(conv_id) else {
         return Err(SteerReject::NotRunning);
     };
@@ -178,7 +192,7 @@ pub fn push_steer(conv_id: &str, content: String) -> Result<usize, SteerReject> 
 
 /// 安全点取信：按到达序取走**整批**待并入插话（取走即消费，不重投）。
 fn take_steers(conv_id: &str) -> Vec<String> {
-    let Ok(mut map) = steers().lock() else { return vec![] };
+    let mut map = lock_steers();
     let Some(e) = map.get_mut(conv_id) else { return vec![] };
     e.queue.drain(..).collect()
 }
@@ -254,7 +268,6 @@ struct Round<'a> {
     /// 本轮该生效的口径声明，或**取不到的原因**。
     /// `Err` 而不是 `unwrap_or_else(vec![])`：取不到 ≠ 没有声明，见 [`caliber_check`]。
     rules: &'a Result<Vec<CaliberRule>, String>,
-    t0: Instant,
 }
 
 /// LLM 路径的入口。`sc_samples <= 1` 时就是 `run_once`（零额外开销）。
@@ -295,14 +308,19 @@ pub async fn run_llm(cx: &AskCtx<'_>, d: &LlmDeps<'_>) -> anyhow::Result<AskResu
     let gate = crate::ask::need_intent_reply(&**cx.llm, cx.on_usage, cx.pg, cx.ds, cx.question, cx.t0);
     let gathered = gather::gather(cx, d.embed);
     let (gate, gathered) = tokio::join!(gate, gathered);
-    if let Some(r) = gate? {
+    if let Some(r) = gate {
+        // 反问成立时召回材料整份丢弃 —— 但 gather 若是 Err，那是真实故障（embed/PG 挂了），
+        // 不能随材料一起静默蒸发（反问答案不读材料，这次回答不受影响）
+        if let Err(e) = &gathered {
+            tracing::warn!(err = %e, "意图反问成立，召回材料的错误随材料一并丢弃");
+        }
         return Ok(r);
     }
     let gathered = gathered?;
     if d.sc_samples <= 1 {
         return run_once(cx, d, TEMP_FIRST, &gathered).await;
     }
-    let need = d.sc_samples / 2 + 1; // 多数派门槛：3→2，5→3
+    let need = majority_need(d.sc_samples);
     let mut got: Vec<AskResult> = vec![];
     let mut prints: Vec<String> = vec![];
     for i in 0..d.sc_samples {
@@ -337,17 +355,29 @@ pub async fn run_llm(cx: &AskCtx<'_>, d: &LlmDeps<'_>) -> anyhow::Result<AskResu
     }
     let mut first = got.swap_remove(0);
     tracing::warn!(samples = prints.len(), "SC 无多数派，返回首次结果并标注不可信");
-    let note = format!(
-        "自一致采样 {} 次得到 {} 个互不相同的结果，没有多数派；这里返回的是第一次的结果，\
-         数字**不可信**，建议换个问法或指明口径（如时间列、去重键、金额/数量）。",
-        prints.len(),
-        prints.len()
-    );
+    let note = no_majority_note(d.sc_samples, &prints);
     first.caliber_note = Some(match first.caliber_note.take() {
         Some(old) => format!("{old}\n{note}"),
         None => note,
     });
     Ok(first)
+}
+
+/// 多数派门槛（**严格过半**：3→2，5→3；偶数也必须过半，不许 2/4 就算多数派）。
+/// 生产路径与判据同调这一个函数 —— 判据里另抄一份公式，生产表达式改坏它也绿（自证型哑测试）。
+fn majority_need(n: usize) -> usize {
+    n / 2 + 1
+}
+
+/// 无多数派的用户可见标注（纯函数，故单测可钉文案）：`samples` 是**尝试**次数，
+/// 「互不相同」按指纹去重数 —— 两处占位符都填成功票数时，2v2、A/B/A/B/C 这类重复票
+/// 在场措辞就失实（成功票数 ≠ 互不相同数）。
+fn no_majority_note(samples: usize, prints: &[String]) -> String {
+    let distinct = prints.iter().collect::<std::collections::HashSet<_>>().len();
+    format!(
+        "自一致采样 {samples} 次得到 {distinct} 个互不相同的结果，没有多数派；这里返回的是第一次的结果，\
+         数字**不可信**，建议换个问法或指明口径（如时间列、去重键、金额/数量）。"
+    )
 }
 
 /// 🔴 温度分档的三条不变量。全是「哪一次用哪个温度」这类事实 —— 走的是 IO 层，
@@ -448,9 +478,14 @@ fn retry_and_sampling_use_a_higher_temperature() {
     );
 }
 
+/// f64 能精确表示的最大整数（2^53）：指纹归一的分界。
+const MAX_F64_EXACT_INT: u64 = 1 << 53;
+
 /// 结果指纹：只看**值**，不看列名。中文别名每轮措辞可能不同（「销量」/「总销量」），
 /// 把列名算进去会让两个数字完全相同的结果被判成不一致 —— 那正好把 SC 变成永不收敛。
 /// 数值按 6 位小数归一（DECIMAL 走字符串，`12` / `12.0` / `"12.0000"` 是同一个答案）。
+/// 例外：**> 2^53 的大整数**（大金额分、大 ID）`as_f64` 会精度截断 —— 两个不同大整数
+/// 会撞成同一 `{f:.6}` 指纹，SC 把不同结果误判成多数派，故原样写入。
 /// 入参是 `&[Vec<Value>]` 而不是 `&AskResult`：它只需要行值，收窄签名让判据能无依赖单测
 /// （造一个 `AskResult` 要连 `ViewSpec` 一起造，而那与本函数的判据毫无关系）。
 fn result_print(rows: &[Vec<serde_json::Value>]) -> String {
@@ -458,15 +493,35 @@ fn result_print(rows: &[Vec<serde_json::Value>]) -> String {
     for row in rows {
         for c in row {
             match c {
-                serde_json::Value::Number(n) => match n.as_f64() {
-                    Some(f) => s.push_str(&format!("{f:.6}")),
-                    None => s.push_str(&n.to_string()),
-                },
+                serde_json::Value::Number(n) => {
+                    let big = n
+                        .as_u64()
+                        .filter(|u| *u > MAX_F64_EXACT_INT)
+                        .map(|u| u.to_string())
+                        .or_else(|| {
+                            n.as_i64()
+                                .filter(|i| i.unsigned_abs() > MAX_F64_EXACT_INT)
+                                .map(|i| i.to_string())
+                        });
+                    match big {
+                        Some(raw) => s.push_str(&raw),
+                        None => match n.as_f64() {
+                            Some(f) => {
+                                let _ = write!(s, "{f:.6}");
+                            }
+                            None => s.push_str(&n.to_string()),
+                        },
+                    }
+                }
                 serde_json::Value::String(t) => match t.trim().parse::<f64>() {
-                    Ok(f) => s.push_str(&format!("{f:.6}")),
+                    Ok(f) => {
+                        let _ = write!(s, "{f:.6}");
+                    }
                     Err(_) => s.push_str(t.trim()),
                 },
-                other => s.push_str(&other.to_string()),
+                other => {
+                    let _ = write!(s, "{other}");
+                }
             }
             s.push('\u{1}');
         }
@@ -501,13 +556,10 @@ async fn run_once(
     temperature: f32,
     g: &Gathered,
 ) -> anyhow::Result<AskResult> {
-    let t0 = cx.t0;
-    let out = generate_sql_at(cx, temperature, g).await?;
-    let GenOut { sql, tables: recalled, snapshot, alt_questions } = out;
-    let mut st = State { sql, candidate: String::new(), route: "llm".into(), note: None, snapshot, alt_questions };
-    schema_fix(cx, d, &mut st).await;
-    let corrected = correct_chain(cx, d, std::mem::take(&mut st.sql)).await;
-    st.sql = corrected;
+    let mut out = generate_sql_at(cx, temperature, g).await?;
+    // 召回表名单独取出（`fresh_state` 消费 out）
+    let recalled = std::mem::take(&mut out.tables);
+    let mut st = fresh_state(cx, d, out).await;
     // 本轮该生效的口径声明（召回到的表 + 问句命中的指标）。取一次给两轮共用：规则只取决于
     // 问句与召回，与候选 SQL 无关。
     let mut rules = build_rules_logged(cx, cx.question, &recalled).await;
@@ -540,7 +592,7 @@ async fn run_once(
                 }
             }
         }
-        let r = Round { cx, d, rules: &rules, t0 };
+        let r = Round { cx, d, rules: &rules };
         if let Some(out) = r.attempt(&mut st, attempt).await? {
             return Ok(out);
         }
@@ -580,6 +632,22 @@ async fn build_rules_logged(
     rules
 }
 
+/// 「生成产物 → State」的收口：State 初始化 → schema 校正 → 七件校正链。
+/// `run_once` 与 `steer_regen` 共用 —— 同一串样板写两遍，未来加一步就得改两处。
+async fn fresh_state(cx: &AskCtx<'_>, d: &LlmDeps<'_>, out: GenOut) -> State {
+    let mut st = State {
+        sql: out.sql,
+        candidate: String::new(),
+        route: "llm".into(),
+        note: None,
+        snapshot: out.snapshot,
+        alt_questions: out.alt_questions,
+    };
+    schema_fix(cx, d, &mut st).await;
+    st.sql = correct_chain(cx, d, std::mem::take(&mut st.sql)).await;
+    st
+}
+
 /// 【Y5】steer 重组：把插话并入当前问题上下文，重走一次「组 SQL → schema 校正 → 校正链 → 口径规则」。
 /// 产出整份新 `State` 与重取的口径规则；调用方只在 `Ok` 时换状态 —— 任何一步失败
 /// 都不许动正在跑的那一份（重组失败 = 沿用原 SQL，见 `run_once` 的 `steer-failed` 分支）。
@@ -595,18 +663,10 @@ async fn steer_regen(
     batch: &[String],
 ) -> anyhow::Result<(State, Result<Vec<CaliberRule>, String>)> {
     let q = steer_question(question, batch);
-    let out = generate_sql_for(cx, TEMP_FIRST, g, &q).await?;
-    let mut st = State {
-        sql: out.sql,
-        candidate: String::new(),
-        route: "llm".into(),
-        note: None,
-        snapshot: out.snapshot,
-        alt_questions: out.alt_questions,
-    };
-    schema_fix(cx, d, &mut st).await;
-    st.sql = correct_chain(cx, d, std::mem::take(&mut st.sql)).await;
-    let rules = build_rules_logged(cx, &q, &out.tables).await;
+    let mut out = generate_sql_for(cx, TEMP_FIRST, g, &q).await?;
+    let tables = std::mem::take(&mut out.tables);
+    let st = fresh_state(cx, d, out).await;
+    let rules = build_rules_logged(cx, &q, &tables).await;
     Ok((st, rules))
 }
 
@@ -640,7 +700,8 @@ impl Round<'_> {
                 // `correction_log` 就是这类痕迹该去的地方，不在 query_log 里多开一个列。
                 if n == 0 {
                     log(self.cx, "gate-blocked", &e.to_string()).await;
-                    self.repair_round(st, &e.to_string()).await?;
+                    let err = e.to_string();
+                    self.repair_round(st, &err).await.map_err(|re| repair_fail(&err, re))?;
                     return Ok(None);
                 }
                 anyhow::bail!("SQL 安全校验未通过: {e}");
@@ -652,11 +713,20 @@ impl Round<'_> {
         // 报错更早（大表可能扫十几秒才失败，白占生产库）。**只对首轮做**（次轮已是 repair 结果）。
         // `Ok(Some(_))` 才是「数据库明确判定 SQL 有问题」；`Ok(None)`=抖动/超时、`Err`=连不上池
         // 一律不改写（抖动触发的改写可能把对的 SQL 改坏）。
+        // 两种「没判成」都留 debug（不升级 warn 免噪音）：「预检层今天到底跑没跑」必须可证伪。
         if n == 0 {
-            if let Ok(Some(err)) = self.cx.source.explain(&scoped, EXPLAIN_TIMEOUT).await {
-                log(self.cx, "explain-fail", &err).await;
-                self.repair_round(st, &err).await?;
-                return Ok(None);
+            match self.cx.source.explain(&scoped, EXPLAIN_TIMEOUT).await {
+                Ok(Some(err)) => {
+                    log(self.cx, "explain-fail", &err).await;
+                    self.repair_round(st, &err).await.map_err(|re| repair_fail(&err, re))?;
+                    return Ok(None);
+                }
+                Ok(None) => {
+                    tracing::debug!("EXPLAIN 预检跳过：超时或引擎未返回诊断（照常执行）");
+                }
+                Err(e) => {
+                    tracing::debug!(err = %e, "EXPLAIN 预检跳过：连接池不可用（照常执行）");
+                }
             }
         }
         self.execute(st, &scoped, n).await
@@ -677,8 +747,8 @@ impl Round<'_> {
         // 标注与「是否再来一轮」都由纯函数 `outcome` 决定 —— 见它的文档：
         // 这两支的 `st.note` 被删掉时 91 条单测一条都不红（实测），所以判据必须打在能测的地方。
         let (note, again) = outcome(&verdict);
-        if let Some(n) = note {
-            st.note = Some(n.to_string());
+        if let Some(text) = note {
+            st.note = Some(text.to_string());
         }
         match verdict {
             Verdict::Retry(msg) => {
@@ -687,7 +757,12 @@ impl Round<'_> {
                 // （FIN01 实测：判据开火 4 次、修复 4 次被形状闸挡，预算耗尽返回错值）。
                 // 把要保的列**点名**进判词 —— 点名一行，被否决一轮 precise。
                 // 只挂在口径回炉上：执行错误的自修可能要换输出列，不吃这句。
-                let keep = dms_kernel::output_shape(&st.candidate)
+                // candidate 的输出形状只解析一次：keep 提示词与「不采纳」warn 共用
+                // （`keeps_output_shape` 内部还会再 parse 一遍 —— 那是 kernel 的签名决定的，
+                // 这里没有第二份可传）。
+                let before_shape = dms_kernel::output_shape(&st.candidate);
+                let keep = before_shape
+                    .as_ref()
                     .map(|cols| {
                         format!(
                             "\n\n🔴 输出列（含别名）与排序必须逐字保持：{} —— 改一个字符都会被整单否决，只许动口径。",
@@ -708,9 +783,9 @@ impl Round<'_> {
                 } else {
                     // 打两份形状 + 改写原文：模型把输出列改成了什么样，是这个 warn 唯一想说的事
                     tracing::warn!(
-                        before = ?dms_kernel::output_shape(&st.candidate),
+                        before = ?before_shape,
                         after = ?dms_kernel::output_shape(&rewritten),
-                        rewritten = %rewritten.chars().take(400).collect::<String>(),
+                        rewritten = %clip(&rewritten, 400),
                         "口径回炉改动了输出列，不采纳（只补口径才采纳）"
                     );
                 }
@@ -775,24 +850,33 @@ impl Round<'_> {
                     tokio::spawn(async move {
                         let content =
                             format!("问「{q}」：首版 SQL 未过口径复核或执行出错，修正后通过。正确写法：{fixed}");
-                        let _ = dms_semantic::registry::memory::save_memory(
+                        // 蒸馏失败零痕迹是排障盲区（写 PG 挂了与「没东西可学」同形）；
+                        // warn 不传播 —— 蒸馏是附加动作，不许拖死主路
+                        if let Err(e) = dms_semantic::registry::memory::save_memory(
                             &pg, &ds, "", "review", &q, &content,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(err = %e, "经验蒸馏落库失败");
+                        }
                     });
                 }
-                let mut out = table_answer(scoped, rs, st.route.clone(), self.t0);
+                let mut out = table_answer(scoped, rs, std::mem::take(&mut st.route), self.cx.t0);
                 out.caliber_note = st.note.take();
                 // 【A17 ②】落选口径挂成最前的可点 chip（答案照常给，不阻断）
                 if !st.alt_questions.is_empty() {
-                    let mut drill = st.alt_questions.clone();
+                    let mut drill = std::mem::take(&mut st.alt_questions);
                     drill.extend(out.view.interact.drill.iter().cloned());
                     out.view.interact.drill = drill;
                 }
                 Ok(Some(out))
             }
             Err(e) if n == 0 => {
-                self.repair_round(st, &e.to_string()).await?;
+                // 首轮执行错误也落 `correction_log`：闸门拒绝与 EXPLAIN 失败首轮都有痕迹，
+                // 唯独这条支此前没有 ——「模型首版 SQL 执行报什么错」是排障取证材料
+                log(cx, "exec-error", &e.to_string()).await;
+                let err = e.to_string();
+                self.repair_round(st, &err).await.map_err(|re| repair_fail(&err, re))?;
                 Ok(None)
             }
             Err(e) => {
@@ -825,7 +909,11 @@ impl Round<'_> {
     async fn save_exemplar(&self, candidate: &str, snapshot: &(String, String)) {
         let (cx, d) = (self.cx, self.d);
         if !exemplar::save_with_context(cx.pg, cx.ds, cx.question, candidate, &snapshot.0, &snapshot.1).await {
-            return; // 已有同问句语料（`save` 靠 NOT EXISTS 去重）→ 不重复复核、不重算向量
+            // false 有两种含义：已有同问句语料（`save` 靠 NOT EXISTS 去重 → 不重复复核、
+            // 不重算向量，是刻意）**或 PG 写失败**（`save_with_context` 对错误 `unwrap_or(false)`）——
+            // 后者只是本轮少一次复核/向量回写，留 debug 可证伪，不升级 warn
+            tracing::debug!("语料未写入（已有同问句语料或 PG 失败）→ 跳过复核与向量回写");
+            return;
         }
         let llm = Arc::clone(cx.llm);
         let (pg, ds, q) = (cx.pg.clone(), cx.ds.to_string(), cx.question.to_string());
@@ -939,7 +1027,7 @@ fn worth_learning(st: &State, rs: &dms_connector::source::RowSet) -> bool {
 pub(crate) fn sales_contract_metrics(
     question: &str,
 ) -> Vec<(dms_semantic::sales_fact::Metric, &'static str)> {
-    let mut candidates = dms_semantic::sales_fact::METRICS
+    let candidates = dms_semantic::sales_fact::METRICS
         .iter()
         .copied()
         .filter_map(|m| {
@@ -951,9 +1039,12 @@ pub(crate) fn sales_contract_metrics(
                 .map(|w| (m, w))
         })
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|(_, w)| std::cmp::Reverse(w.chars().count()));
+    // 词长只算一次再排：`sort_by_key` 的比较器会按比较次数重算 key（O(n log n) 次 `chars().count()`）
+    let mut candidates: Vec<(usize, (dms_semantic::sales_fact::Metric, &'static str))> =
+        candidates.into_iter().map(|c| (c.1.chars().count(), c)).collect();
+    candidates.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
     let mut selected: Vec<(dms_semantic::sales_fact::Metric, &'static str)> = vec![];
-    for candidate in candidates {
+    for (_, candidate) in candidates {
         if selected.iter().any(|(_, word)| word.contains(candidate.1)) {
             continue;
         }
@@ -1031,10 +1122,14 @@ async fn schema_fix(cx: &AskCtx<'_>, d: &LlmDeps<'_>, st: &mut State) {
             return;
         }
     };
-    if let Ok(fixed) = repair(cx, d, &st.sql, &hint).await {
-        st.sql = fixed;
-        st.route = "llm+schema-fix".into();
-        log(cx, "schema-fix", &hint).await;
+    match repair(cx, d, &st.sql, &hint).await {
+        Ok(fixed) => {
+            st.sql = fixed;
+            st.route = "llm+schema-fix".into();
+            log(cx, "schema-fix", &hint).await;
+        }
+        // 自修本身失败同样不许静默（同函数上面 schema_check 失败都有 warn，这条支不能反而无痕）
+        Err(e) => tracing::warn!("schema-fix 自修失败（保持上一版 SQL 继续）: {e}"),
     }
 }
 
@@ -1046,17 +1141,17 @@ async fn correct_chain(cx: &AskCtx<'_>, d: &LlmDeps<'_>, mut sql: String) -> Str
     let c = d.correctors;
     // 【A12】SelectCorrector：GROUP BY 有、SELECT 没有 ⇒ 补分类轴列
     if let Some(fixed) = c.fix_select_fields(&sql) {
-        log(cx, "select-fields-fix", &format!("补分组列进投影：{}", clip(&sql, 150))).await;
+        log(cx, "select-fields-fix", &format!("补分组列进投影：{} → {}", clip(&sql, 120), clip(&fixed, 120))).await;
         sql = fixed;
     }
     // 【A12】removeSameFieldFromSelect：投影逐字重复项只留第一份
     if let Some(fixed) = c.dedup_select_fields(&sql) {
-        log(cx, "dedup-select-fix", &format!("去投影重复列：{}", clip(&sql, 150))).await;
+        log(cx, "dedup-select-fix", &format!("去投影重复列：{} → {}", clip(&sql, 120), clip(&fixed, 120))).await;
         sql = fixed;
     }
     // GroupByCorrector：漏 GROUP BY 确定性补全
     if let Some(fixed) = c.fix_group_by(&sql) {
-        log(cx, "groupby-fix", &format!("补 GROUP BY：{}", clip(&sql, 150))).await;
+        log(cx, "groupby-fix", &format!("补 GROUP BY：{} → {}", clip(&sql, 120), clip(&fixed, 120))).await;
         sql = fixed;
     }
     // AggCorrector（correctAggFunction）：命中指标的聚合列归一到注册表默认聚合
@@ -1093,7 +1188,7 @@ async fn correct_chain(cx: &AskCtx<'_>, d: &LlmDeps<'_>, mut sql: String) -> Str
     }
     // 【A12】TimeCorrector 半边：只有上界补下界（防全表扫；**缺时间补默认窗**是 X3 禁止的）
     if let Some(fixed) = c.fix_time_lower_bound(&sql) {
-        log(cx, "time-lower-bound-fix", &format!("补时间下界：{}", clip(&sql, 150))).await;
+        log(cx, "time-lower-bound-fix", &format!("补时间下界：{} → {}", clip(&sql, 120), clip(&fixed, 120))).await;
         sql = fixed;
     }
     sql
@@ -1148,7 +1243,7 @@ async fn generate_sql_for(
     let resp = chat_precise_at(cx, &system, &user, temperature).await?;
     tracing::info!(
         ms = t_llm.elapsed().as_millis(),
-        prompt_chars = system.len() + user.len(),
+        prompt_bytes = system.len() + user.len(),
         "precise 生成耗时"
     );
     let sql = prompt::extract_sql(&resp).ok_or_else(|| {
@@ -1168,6 +1263,12 @@ pub async fn repair(
     // 🔴 自修用**更高的温度**：0.1 的重试就是同一个错误再来一遍（见 `TEMP_RETRY`）
     let resp = chat_precise_at(cx, &system, &user, TEMP_RETRY).await?;
     prompt::extract_sql(&resp).ok_or_else(|| anyhow::anyhow!("自修未产出 SQL"))
+}
+
+/// repair（LLM 调用）本身失败时的上抛错误：把**原始错误**并进消息。否则排障看到的报错
+/// （模型超时/5xx）与根因（闸门拒绝详情 / EXPLAIN 诊断 / MySQL 执行错误）毫无关系，方向性误导。
+fn repair_fail(original: &str, re: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!("自修调用失败：{re:#}；被自修的原始错误：{original}")
 }
 
 /// 首轮生成的温度：**确定性优先**。同一个问句同一份材料该给同一条 SQL，
@@ -1203,10 +1304,10 @@ async fn chat_precise_at(
     reply.content.ok_or_else(|| LlmError::MissingContent.into())
 }
 
-/// `correction_log` 的唯一落点。**九个 kind 一个不少**：六个字面量在本文件
-/// （`schema-fix`/`groupby-fix`/`agg-fix`/`caliber-fix`/`value-fix`/`explain-fail`），
-/// 三个由 `guard::Verdict::log_kind()` 给
-/// （`caliber-retry`/`caliber-unresolved`/`caliber-grader-error`）。
+/// `correction_log` 的唯一落点。kind 全清单（16 个）：本文件 13 个字面量
+/// （`schema-fix`/`select-fields-fix`/`dedup-select-fix`/`groupby-fix`/`agg-fix`/`caliber-fix`/
+/// `value-fix`/`time-lower-bound-fix`/`explain-fail`/`gate-blocked`/`exec-error`/`steer-applied`/`steer-failed`），
+/// 加 `guard::Verdict::log_kind()` 给的三个（`caliber-retry`/`caliber-unresolved`/`caliber-grader-error`）。
 /// 少一个＝一类自进化数据静默断供（`correction_kinds_all_present` 守着）。
 async fn log(cx: &AskCtx<'_>, kind: &str, detail: &str) {
     exemplar::log_correction_traced(cx.pg, kind, cx.question, detail, &cx.trace_id).await;
@@ -1364,12 +1465,55 @@ mod sc_tests {
         assert!(worth_learning(&st(None), &rows(vec![vec![Value::Null], vec![json!(3)]])));
     }
 
-    /// 门槛公式：`n/2 + 1` —— 偶数也必须是**过半**，不许 2/4 就算多数派。
+    /// 门槛公式：严格过半 —— 偶数也必须是**过半**，不许 2/4 就算多数派。
+    /// 生产与判据同调 `majority_need`（判据里另抄一份字面公式 = 生产改坏它也绿的哑测试）。
     #[test]
     fn threshold_is_strict_majority() {
         for (n, want) in [(1usize, 1usize), (2, 2), (3, 2), (4, 3), (5, 3), (6, 4)] {
-            assert_eq!(n / 2 + 1, want, "n={n}");
+            assert_eq!(majority_need(n), want, "n={n}");
         }
+    }
+
+    /// 🔴 无多数派文案：「互不相同」按指纹去重数、采样次数按**尝试**数 —— 两处都填成功票数时，
+    /// 2v2 / A/B/A/B/C 这类重复票在场措辞就失实（prints.len() 是成功票数，不是互不相同数）。
+    #[test]
+    fn no_majority_note_counts_distinct_prints() {
+        let p = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let note = no_majority_note(5, &p(&["A", "B", "A", "B", "C"]));
+        assert!(note.contains("采样 5 次"), "{note}");
+        assert!(note.contains("3 个互不相同"), "{note}");
+        let note = no_majority_note(3, &p(&["A", "B", "C"]));
+        assert!(note.contains("采样 3 次") && note.contains("3 个互不相同"), "{note}");
+    }
+
+    /// 🔴 > 2^53 的大整数（大金额分、大 ID）：`as_f64` 精度截断会把两个不同整数
+    /// 归一成同一指纹 —— SC 把不同结果误判成多数派。必须原样写入。
+    #[test]
+    fn print_does_not_collapse_big_integers_into_one_f64() {
+        use serde_json::json;
+        let a = json!(1u64 << 60);
+        let b = json!((1u64 << 60) + 1);
+        assert_ne!(
+            result_print(&[vec![a]]),
+            result_print(&[vec![b]]),
+            "两个 >2^53 的不同整数不得撞成同一指纹"
+        );
+        assert_ne!(
+            result_print(&[vec![json!(-(1i64 << 60))]]),
+            result_print(&[vec![json!(-(1i64 << 60) - 1)]]),
+            "负数同族"
+        );
+        // 契约不破：2^53 以内的整数仍与浮点/字符串写法同指纹
+        assert_eq!(result_print(&[vec![json!(12)]]), result_print(&[vec![json!(12.0)]]));
+    }
+
+    /// repair（LLM）本身失败时，上抛的错误必须同时带**原始错误** —— 否则排障看到的
+    /// 报错（模型超时）与根因（闸门拒绝/EXPLAIN/MySQL 错误）毫无关系。
+    #[test]
+    fn a_failed_repair_reports_the_original_error_too() {
+        let e = repair_fail("column 'x' not found", anyhow::anyhow!("模型超时"));
+        let msg = format!("{e}");
+        assert!(msg.contains("模型超时") && msg.contains("column 'x' not found"), "{msg}");
     }
 }
 
@@ -1468,13 +1612,26 @@ mod tests {
         assert_eq!(outcome(&guard::judge(Ok(&v), 0, CALIBER_ROUNDS)), (None, true));
     }
 
-    /// 🔴 `correction_log` 九个 kind 一个不少（铁律 1）。少一个＝一类自进化数据静默断供，
-    /// 而那件事没有任何运行时报错 —— 所以用源码守：六个字面量必须各自出现在本文件的
-    /// `log(...)` 调用里（常量表里那一次之外还得有一次），另两个必须走 `log_kind()` 通道。
+    /// 🔴 `correction_log` 十六个 kind 一个不少（铁律 1）。少一个＝一类自进化数据静默断供，
+    /// 而那件事没有任何运行时报错 —— 所以用源码守：十三个字面量必须各自出现在本文件的
+    /// `log(...)` 调用里（常量表里那一次之外还得有一次），另三个必须走 `log_kind()` 通道。
     #[test]
     fn correction_kinds_all_present() {
-        const LITERALS: &[&str] =
-            &["schema-fix", "groupby-fix", "agg-fix", "caliber-fix", "value-fix", "explain-fail"];
+        const LITERALS: &[&str] = &[
+            "schema-fix",
+            "select-fields-fix",
+            "dedup-select-fix",
+            "groupby-fix",
+            "agg-fix",
+            "caliber-fix",
+            "value-fix",
+            "time-lower-bound-fix",
+            "explain-fail",
+            "gate-blocked",
+            "exec-error",
+            "steer-applied",
+            "steer-failed",
+        ];
         let src = include_str!("run.rs");
         for k in LITERALS {
             let quoted = format!("\"{k}\"");
@@ -1485,18 +1642,19 @@ mod tests {
         }
         // 同样要求 ≥2：写成 `contains` 的话本测试自己就满足它（哑测试，裁决 二·F F2）
         assert!(src.matches("verdict.log_kind()").count() >= 2, "caliber 三个 kind 的通道没了");
-        // 🔴 `gate-blocked` 是第十个 kind —— 闸门拒绝那条支原来既不写 `correction_log`
-        // 也到不了 EXPLAIN，是三题（AS01/AS04/FIN01）共有的取证盲区。
-        // 单独一条而不是并进 LITERALS：它是**这一轮**补的，清单一合并就说不清它是什么时候加的。
+        // 🔴 `gate-blocked` 单独再钉一次**调用形态** —— 闸门拒绝那条支原来既不写
+        // `correction_log` 也到不了 EXPLAIN，是三题（AS01/AS04/FIN01）共有的取证盲区；
+        // 只在清单里数出现次数钉不住「闸门那处还在落」。
         //
-        // 判据不用「≥2」：它只该在闸门那一处出现一次，加上**本判据自己**是第二处。
-        // 所以断言的是「闸门那处 `log(..., "gate-blocked", ...)` 还在」——
-        // 锚点用 `concat!` 拼（否则 `split` 的第一个匹配落在判据自己身上，那正是 AX17 的恒真坑）。
+        // 锚点用 `concat!` 拼（否则 `split`/`find` 的第一个匹配落在判据自己身上，那正是 AX17 的恒真坑）。
         let gate_call = concat!("log(self.cx, \"gate-", "blocked\", &e.to_string())");
         assert!(src.contains(gate_call), "闸门拒绝那处的 gate-blocked 留痕没了（回到零取证）");
-        // `LITERALS.len() + 3 == 9` 写成断言是**常量表达式**，永远不可能红（交叉审抓的）。
+        // 首轮执行错误的 `exec-error` 同理钉调用形态（取数支的取证材料）
+        let exec_call = concat!("log(cx, \"exec-", "error\", &e.to_string())");
+        assert!(src.contains(exec_call), "首轮执行错误的 exec-error 留痕没了");
+        // `LITERALS.len() + 3 == 16` 写成断言是**常量表达式**，永远不可能红（交叉审抓的）。
         // 真正要守的是「清单没被人删条目」，所以断言的是清单长度本身。
-        assert_eq!(LITERALS.len(), 6, "九个 kind = 这六个字面量 + guard 的三个");
+        assert_eq!(LITERALS.len(), 13, "十六个 kind = 这十三个字面量 + guard 的三个");
         assert_eq!(guard::KIND_RETRY, "caliber-retry");
         assert_eq!(guard::KIND_UNRESOLVED, "caliber-unresolved");
         assert_eq!(guard::KIND_GRADER_ERROR, "caliber-grader-error");
@@ -1595,6 +1753,27 @@ mod steer_tests {
             Err(SteerReject::NotRunning),
             "运行结束（深度归零）不再受理"
         );
+    }
+
+    /// 🔴 锁中毒策略统一为「恢复使用」：持锁线程 panic 后，五个入口都不许 panic、
+    /// 不许挂死、不许静默丢信 —— steer 是纯附加功能，信箱故障不许升级成问答 500。
+    #[test]
+    fn steer_lock_poisoning_recovers_instead_of_panicking() {
+        let k = unique_key();
+        run_begin(&k);
+        let t = std::thread::spawn(move || {
+            let _guard = lock_steers();
+            panic!("模拟持锁 panic（人为把锁弄中毒）");
+        });
+        assert!(t.join().is_err(), "中毒线程必须真的 panic 了，否则本判据恒绿");
+        // 中毒后五个入口全部照常工作
+        run_begin(&k);
+        assert!(is_running(&k));
+        assert_eq!(push_steer(&k, "中毒后仍能入队".into()), Ok(1));
+        assert_eq!(take_steers(&k), vec!["中毒后仍能入队".to_string()]);
+        run_end(&k);
+        run_end(&k);
+        assert!(!is_running(&k));
     }
 
     /// 🔴 容量上限：满员必须拒（端点映 429），不是静默积压 —— 再多的插话等不到执行机会。

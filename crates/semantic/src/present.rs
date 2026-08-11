@@ -23,7 +23,7 @@ fn infer_drill(specs: &[ColumnSpec], has_metric: bool) -> Vec<String> {
     if !has_metric {
         return vec![]; // 无指标（明细/实体卡）不下钻
     }
-    let used: String = specs.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join("");
+    let used: String = specs.iter().map(|c| c.name.as_str()).collect();
     let pool = if specs
         .iter()
         .any(|c| DWS_SALES_METRICS.iter().any(|metric| c.name.contains(metric)))
@@ -45,24 +45,24 @@ fn infer_drill(specs: &[ColumnSpec], has_metric: bool) -> Vec<String> {
 
 /// 列名 → 语义
 fn infer_semantic(name: &str) -> Semantic {
-    let n = name;
-    if n.contains('率') || n.contains("占比") || n.contains('%') {
+    if name.contains('率') || name.contains("占比") || name.contains('%') {
         Semantic::Percent
-    } else if n.contains("金额") || n.contains("销售额") || n.contains("营业额") || n.contains("客单价")
-        || n.contains("余额") || n.contains("费用") || n.contains("成本") || n.contains("收入")
-        || n.ends_with('额')
+    } else if name.contains("金额") || name.contains("销售额") || name.contains("营业额") || name.contains("客单价")
+        || name.contains("余额") || name.contains("费用") || name.contains("成本") || name.contains("收入")
+        || name.ends_with('额')
     {
         Semantic::Money
-    } else if n.contains("省") || n.contains("市") || n.contains("区县") || n.contains("地区") {
+    } else if name.contains("省") || name.contains("市") || name.contains("区县") || name.contains("地区") {
         Semantic::Geo
-    } else if n.contains("客户") {
+    } else if name.contains("客户") {
         Semantic::Customer
-    } else if n.contains("商品") || n.contains("SKU") || n.contains("sku") {
+    } else if name.contains("商品") || name.to_ascii_lowercase().contains("sku") {
+        // SKU 只小写化 ASCII（`Sku`/`sKu` 同族）；中文关键词不受影响
         Semantic::Goods
-    } else if n.contains('数') || n.contains("销量") || n.contains("笔数") || n.ends_with('量') {
+    } else if name.contains('数') || name.contains("销量") || name.ends_with('量') {
         // 「订单数/售后单数」是计数指标——必须先于 Order 判定，否则被"订单"抢走永远不算指标列
         Semantic::Count
-    } else if n.contains("单号") || n.contains("订单") {
+    } else if name.contains("单号") || name.contains("订单") {
         Semantic::Order
     } else {
         Semantic::None
@@ -90,19 +90,20 @@ fn is_numeric_col(rows: &[Vec<Value>], i: usize) -> bool {
 
 /// 列名 + 数据 → role
 fn infer_role(name: &str, rows: &[Vec<Value>], i: usize) -> Role {
-    let n = name;
+    // ASCII 尾巴大小写无关（`下单DATE`/`EndTime`/`ORDER_ID` 同族）；中文关键词不受影响
+    let lower = name.to_ascii_lowercase();
     // 时间（趋势线 x 轴）：含时间/日期关键词，或月份/季度/年月等时间维度
-    if n.contains("时间") || n.contains("日期") || n.contains("月份") || n.contains("季度")
-        || n.contains("年月") || n.ends_with("date") || n.ends_with("time")
+    if name.contains("时间") || name.contains("日期") || name.contains("月份") || name.contains("季度")
+        || name.contains("年月") || lower.ends_with("date") || lower.ends_with("time")
     {
         return Role::Time;
     }
     // 编码/单号：名称信号 + 值非纯聚合数字
-    if n.contains("编码") || n.contains("单号") || n.contains("编号") || n.ends_with("code") || n.ends_with("_id") {
+    if name.contains("编码") || name.contains("单号") || name.contains("编号") || lower.ends_with("code") || lower.ends_with("_id") {
         return Role::Id;
     }
     // 指标：名称含指标语义 且 列数值
-    let sem = infer_semantic(n);
+    let sem = infer_semantic(name);
     let metric_sem = matches!(sem, Semantic::Money | Semantic::Count | Semantic::Percent);
     if metric_sem && is_numeric_col(rows, i) {
         return Role::Metric;
@@ -120,6 +121,9 @@ const ENTITY_MIN_COLS: usize = 6;
 pub fn patch_kpi_delta(view: &mut ViewSpec, cur: f64, prev: f64, label: String) {
     if let Some(Block::Kpis { items }) = view.blocks.first_mut() {
         if items.len() == 1 {
+            if items[0].delta.is_some() {
+                return; // 已有 delta：先判，后面的计算全白做
+            }
             if prev.abs() < f64::EPSILON {
                 return; // 上期为 0，环比无意义
             }
@@ -145,7 +149,7 @@ pub fn patch_kpi_delta(view: &mut ViewSpec, cur: f64, prev: f64, label: String) 
                 baseline: prev,
                 change: cur - prev,
             };
-            if items[0].delta.is_none() { items[0].delta = Some(delta); }
+            items[0].delta = Some(delta);
         }
     }
 }
@@ -157,22 +161,27 @@ fn is_ratio_percent_label(label: &str) -> bool {
     normalized == "毛利率" || normalized == "销售毛利率"
 }
 
-/// 组装 ViewSpec：推断下钻维度 + 结论洞察（has_metric 从列 role 判定）
-fn mk(specs: Vec<ColumnSpec>, blocks: Vec<Block>, rows: &[Vec<Value>]) -> ViewSpec {
-    let has_metric = specs.iter().any(|c| c.role == Role::Metric);
-    let drill = infer_drill(&specs, has_metric);
-    let insight = compute_insight(&specs, rows);
+/// 组装 ViewSpec：推断下钻维度 + 结论洞察（角色下标复用 `build` 算好的 `ix`，不再重扫）
+fn mk(specs: Vec<ColumnSpec>, blocks: Vec<Block>, rows: &[Vec<Value>], ix: &RoleIdx) -> ViewSpec {
+    let drill = infer_drill(&specs, !ix.metric.is_empty());
+    let insight = compute_insight(&specs, rows, ix);
     ViewSpec { columns: specs, blocks, interact: Interact { drill }, insight }
 }
 
 /// 结论洞察（移植 SuperSonic textSummary）：排行占比+CR3集中度 / 趋势涨跌，确定性 0-LLM。
-fn compute_insight(specs: &[ColumnSpec], rows: &[Vec<Value>]) -> Option<String> {
-    compute_insight_on(specs, rows, chrono::Local::now().date_naive())
+fn compute_insight(specs: &[ColumnSpec], rows: &[Vec<Value>], ix: &RoleIdx) -> Option<String> {
+    // 「今天」按业务时区（东八区，与 SQL 侧 CURDATE() 同口径）取：用进程本地时区
+    // （容器常 UTC）会在月初/月末当天差一天，不足月判定就错。
+    let today = chrono::FixedOffset::east_opt(8 * 3600)
+        .map(|tz| chrono::Local::now().with_timezone(&tz).date_naive())
+        .unwrap_or_else(|| chrono::Local::now().date_naive());
+    compute_insight_on(specs, rows, today, ix)
 }
 
-/// 全局行上限（= `dms_agent::MAX_ROWS`；agent→semantic 单向依赖，这里只能复刻数值）。
+/// 全局行上限（= `dms_agent::MAX_ROWS`；agent→semantic 单向依赖，这里只能复刻数值
+/// —— 两侧相等由 agent 侧的 `row_cap_matches_agent_max_rows` 断言守着）。
 /// 判据与 `agent::ctx` 的截断提示同源：行数顶到上限即「可能被截断」。
-const ROW_CAP: usize = 200;
+pub const ROW_CAP: usize = 200;
 
 /// 月份标签（`YYYY-MM`，月度维度的出数形态）是不是「本月至今」的不足月：
 /// 等于当前年月、且今天还不是月末最后一天（月末当天全月已齐，端点可用）。
@@ -198,29 +207,37 @@ fn is_partial_current_month(label: &str, today: chrono::NaiveDate) -> bool {
 
 /// `today` 参数化：不足月判定要「今天」，测试用固定日期打判据
 /// （生产路径恒为本地今天，与 SQL 侧 CURDATE() 同口径）。
-fn compute_insight_on(specs: &[ColumnSpec], rows: &[Vec<Value>], today: chrono::NaiveDate) -> Option<String> {
+fn compute_insight_on(
+    specs: &[ColumnSpec],
+    rows: &[Vec<Value>],
+    today: chrono::NaiveDate,
+    ix: &RoleIdx,
+) -> Option<String> {
     // 🔴 **单行全 NULL 要说话**。`SUM` over 0 行给的是一行 NULL，不是 0 行 ——
     // 于是它既不走「无结果」提示、也没有洞察，前端渲染成**一个空格子**，
     // 用户分不清「这段时间没数据」和「系统坏了」。实测现场：数据从 2025-09-29 起，
     // 问「2025年上半年的销量」得到 `rows=[[null]]`、`insight=None`、只有一张空表。
-    // 这一支放在最前面：它与「有几个指标列」无关，后面那些判据都会先被 `metric_idx` 挡掉。
-    if rows.len() == 1 && rows[0].iter().all(|c| matches!(c, Value::Null)) {
+    // 这一支放在最前面：它与「有几个指标列」无关，后面那些判据都会先被指标数挡掉。
+    // （空行 `vec![[]]` 不算：`all()` 对空迭代恒真，空列空行不该报「没有数据」。）
+    if rows.len() == 1 && !rows[0].is_empty() && rows[0].iter().all(|c| matches!(c, Value::Null)) {
         return Some(
             "该条件下没有数据（聚合结果为空）——请确认时间范围与筛选条件；\
              若时间早于系统数据起点，换个区间再试。"
                 .into(),
         );
     }
-    let metric_idx: Vec<usize> = specs.iter().enumerate().filter(|(_, s)| s.role == Role::Metric).map(|(i, _)| i).collect();
-    if metric_idx.len() != 1 {
+    if ix.metric.len() != 1 {
         return None;
     }
-    let mi = metric_idx[0];
-    let cat_i = specs.iter().position(|s| s.role == Role::Category);
-    let time_i = specs.iter().position(|s| s.role == Role::Time);
+    let mi = ix.metric[0];
+    let cat_i = ix.cat.first().copied();
+    let time_i = ix.time.first().copied();
     let sem = specs[mi].semantic;
+    // 毛利率族是小数比值口径（`patch_kpi_delta` 的 ×100 同族）：洞察里 0.1963 要渲染成 19.6%
+    let ratio_pct = is_ratio_percent_label(&specs[mi].name);
     let unit = |v: f64| match sem {
         Semantic::Money => format!("¥{}", compress(v)),
+        Semantic::Percent if ratio_pct => format!("{:.1}%", v * 100.0),
         Semantic::Percent => format!("{:.1}%", v),
         _ => compress(v),
     };
@@ -251,7 +268,15 @@ fn compute_insight_on(specs: &[ColumnSpec], rows: &[Vec<Value>], today: chrono::
                 // 本函数是纯函数、拿不到全量合计（一次 SUM 要改管线签名），按裁决**不显示占比**。
                 if rows.len() >= ROW_CAP {
                     return Some(format!(
-                        "榜首「{}」{}；前三合计 {}（结果已截断为前 {} 项，占比缺全量分母从略）",
+                        "榜首「{}」{}；前三合计 {}（结果已截断为前 {} 行，占比缺全量分母从略）",
+                        top.0, unit(top.1), unit(cr3), rows.len()
+                    ));
+                }
+                // 含负值时占比无意义：分母被负值压低，`top/total` 能算出 >100% 的「占比」
+                // （饼图分支的 `all_nonneg` 守卫同族）。只报名次与合计，不出百分比。
+                if vals.iter().any(|(_, v)| *v < 0.0) {
+                    return Some(format!(
+                        "榜首「{}」{}；前三合计 {}（含负值项，占比从略；共 {} 项）",
                         top.0, unit(top.1), unit(cr3), vals.len()
                     ));
                 }
@@ -278,8 +303,12 @@ fn compute_insight_on(specs: &[ColumnSpec], rows: &[Vec<Value>], today: chrono::
                 let last = cell_f64(&rows[end - 1][mi])?;
                 if first.abs() > f64::EPSILON {
                     let pct = (last - first) / first * 100.0;
-                    let dir = if pct >= 0.0 { "增长" } else { "下降" };
                     let note = if partial_tail { "（末月为本月至今，未纳入端点比较）" } else { "" };
+                    // 首末完全相等是「持平」，不是「增长 0.0%」
+                    if pct.abs() < 1e-9 {
+                        return Some(format!("从 {} 到 {}，整体持平{}", unit(first), unit(last), note));
+                    }
+                    let dir = if pct > 0.0 { "增长" } else { "下降" };
                     return Some(format!(
                         "从 {} 到 {}，整体{} {:.1}%{}",
                         unit(first),
@@ -316,7 +345,7 @@ pub const PROVINCE_LABELS: &[(&str, &str)] = &[
 ];
 
 /// 省级区划码 → 省名（insight 里 geo 列翻名，与前端 format.ts 一致）
-// ponytail: 34 项线性扫描，行数上限 50 时无所谓；真要热再上 phf。
+// ponytail: 34 项线性扫描，消费点（排行洞察）行数上限 200（ROW_CAP）时无所谓；真要热再上 phf。
 fn province_cn(code: &str) -> Option<&'static str> {
     PROVINCE_LABELS.iter().find(|(c, _)| *c == code).map(|(_, n)| *n)
 }
@@ -338,6 +367,11 @@ fn index_roles(specs: &[ColumnSpec]) -> RoleIdx {
 
 /// 决策树（SuperSonic getMsgContentType 对齐 + 增强）
 pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
+    // 行宽恒等于列数是调用方（DB RowSet）的约定：下游按列下标直取，锯齿行会当场 panic
+    debug_assert!(
+        rows.iter().all(|r| r.len() == columns.len()),
+        "build 要求每行宽度 == 列数（锯齿行是调用方 bug）"
+    );
     let specs: Vec<ColumnSpec> = columns
         .iter()
         .enumerate()
@@ -349,7 +383,7 @@ pub fn build(columns: &[String], rows: &[Vec<Value>]) -> ViewSpec {
         .collect();
     let ix = index_roles(&specs);
     let blocks = blocks_of(&specs, rows, &ix);
-    mk(specs, blocks, rows)
+    mk(specs, blocks, rows, &ix)
 }
 
 /// **判定顺序即行为**：明细/多维必须在趋势线之前，兜底才是纯表格。只许提取不许重排。
@@ -428,7 +462,8 @@ fn trend(rows: &[Vec<Value>], ix: &RoleIdx) -> Option<Vec<Block>> {
 /// ①无时间列（x 就是那唯一的类别列，没有第二个维度可切）②`rows < 2`（一个点，切了也是它自己）。
 /// 两种都让那一支恒不触发＝死代码，而「加一支再给它写个绿判据」正是本仓反复抓的形态。
 fn one_cat_one_metric(specs: &[ColumnSpec], rows: &[Vec<Value>], ix: &RoleIdx) -> Option<Vec<Block>> {
-    if ix.cat.len() != 1 || ix.metric.len() != 1 || rows.len() > BAR_MAX {
+    // 0 行守卫：空结果落纯表格（前面 kpis/entity/detail/trend 全被行数挡掉，这里不能出空图块）
+    if ix.cat.len() != 1 || ix.metric.len() != 1 || rows.is_empty() || rows.len() > BAR_MAX {
         return None;
     }
     let (x, y) = (ix.cat[0], ix.metric[0]);
@@ -444,7 +479,8 @@ fn one_cat_one_metric(specs: &[ColumnSpec], rows: &[Vec<Value>], ix: &RoleIdx) -
 
 /// 4b. 恰一类别列 + ≥2 指标列 → 分组柱图（对齐 SuperSonic：多指标同类别并排呈现）
 fn grouped_bar(rows: &[Vec<Value>], ix: &RoleIdx) -> Option<Vec<Block>> {
-    if ix.cat.len() != 1 || ix.metric.len() < 2 || rows.len() > BAR_MAX {
+    // 0 行守卫同 `one_cat_one_metric`：空结果落纯表格，不出空图块
+    if ix.cat.len() != 1 || ix.metric.len() < 2 || rows.is_empty() || rows.len() > BAR_MAX {
         return None;
     }
     Some(vec![
@@ -697,14 +733,14 @@ mod tests {
             vec![json!("2026-08"), json!("150")], // 本月至今 10 天 —— 当端点就是「下降 62.5%」的假数
         ];
         let v = build(&cols(&["月份", "销售额"]), &rows);
-        let s = compute_insight_on(&v.columns, &rows, today).unwrap();
+        let s = compute_insight_on(&v.columns, &rows, today, &index_roles(&v.columns)).unwrap();
         assert!(s.contains("整体增长 300.0%"), "端点必须是 05→07（100→400）：{s}");
         assert!(s.contains("本月至今"), "必须标注末月未纳入：{s}");
         assert!(!s.contains("下降"), "{s}");
 
         // 月末当天：全月已齐，端点可用（不标注）
         let month_end = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
-        let s2 = compute_insight_on(&v.columns, &rows, month_end).unwrap();
+        let s2 = compute_insight_on(&v.columns, &rows, month_end, &index_roles(&v.columns)).unwrap();
         assert!(s2.contains("整体增长 50.0%"), "月末当天 08 月是完整月：{s2}");
         assert!(!s2.contains("本月至今"), "{s2}");
 
@@ -715,7 +751,7 @@ mod tests {
             vec![json!("2026-07"), json!("400")],
         ];
         let v3 = build(&cols(&["月份", "销售额"]), &rows_done);
-        let s3 = compute_insight_on(&v3.columns, &rows_done, today).unwrap();
+        let s3 = compute_insight_on(&v3.columns, &rows_done, today, &index_roles(&v3.columns)).unwrap();
         assert_eq!(s3, "从 ¥100 到 ¥400，整体增长 300.0%");
 
         // 不足月排除后只剩一个完整端点：宁可不出趋势洞察，也不拿不足月比
@@ -724,7 +760,7 @@ mod tests {
             vec![json!("2026-08"), json!("150")],
         ];
         let v4 = build(&cols(&["月份", "销售额"]), &rows_two);
-        assert!(compute_insight_on(&v4.columns, &rows_two, today).is_none());
+        assert!(compute_insight_on(&v4.columns, &rows_two, today, &index_roles(&v4.columns)).is_none());
 
         // 不足月判定本体：日粒度/非法标签/往年同月都不算
         assert!(is_partial_current_month("2026-08", today));
@@ -757,6 +793,52 @@ mod tests {
         let s2 = v2.insight.as_deref().unwrap_or("");
         assert!(s2.contains('%'), "未截断必须保留占比：{s2}");
         assert!(s2.contains("共 100 项"), "{s2}");
+    }
+
+    /// 排行洞察含负值不出百分比（分母被负值压低，`top/total` 能算出 >100% 的假占比）；
+    /// 首末相等报「持平」；0 行结果落纯表格不出空图块；空列空行不报「没有数据」。
+    #[test]
+    fn insight_edge_cases_negative_flat_and_empty() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        // 负值：只报名次与合计，一个 % 都不出
+        let rows = vec![
+            vec![json!("客户A"), json!("100")],
+            vec![json!("客户B"), json!("90")],
+            vec![json!("客户C"), json!("80")],
+            vec![json!("客户D"), json!("-50")],
+            vec![json!("客户E"), json!("60")],
+        ];
+        let v = build(&cols(&["客户", "毛利额"]), &rows);
+        let s = v.insight.as_deref().unwrap_or("");
+        assert!(s.contains("榜首"), "{s}");
+        assert!(s.contains("含负值项"), "{s}");
+        assert!(!s.contains('%'), "含负值不许出百分比：{s}");
+        // 非负照旧出占比（防「守卫误伤常态」）
+        let pos: Vec<Vec<Value>> = (0..5).map(|i| vec![json!(format!("c{i}")), json!((100 - i).to_string())]).collect();
+        let v2 = build(&cols(&["客户", "毛利额"]), &pos);
+        assert!(v2.insight.as_deref().unwrap_or("").contains('%'), "非负必须保留占比");
+        // 首末相等 → 「持平」，不是「增长 0.0%」
+        let flat = vec![vec![json!("2026-05"), json!("100")], vec![json!("2026-06"), json!("100")]];
+        let v3 = build(&cols(&["月份", "销售额"]), &flat);
+        let s3 = compute_insight_on(&v3.columns, &flat, today, &index_roles(&v3.columns)).unwrap();
+        assert!(s3.contains("持平"), "{s3}");
+        assert!(!s3.contains("增长") && !s3.contains("下降"), "{s3}");
+        // 0 行：落纯表格，不出空 Pie/Bar
+        let v4 = build(&cols(&["省份", "销售额"]), &[]);
+        assert!(matches!(v4.blocks[0], Block::Table), "0 行不许出图块：{}", serde_json::to_string(&v4.blocks).unwrap());
+        let v5 = build(&cols(&["省份", "销售额", "订单数"]), &[]);
+        assert!(matches!(v5.blocks[0], Block::Table), "0 行分组柱同理");
+        // 空列空行（vec![[]]）：不报「没有数据」（all() 对空迭代恒真的那个坑）
+        let v6 = build(&cols(&[]), &[vec![]]);
+        assert!(!v6.insight.as_deref().unwrap_or("").contains("没有数据"), "{:?}", v6.insight);
+        // 毛利率族洞察按 0-100 渲染：0.1963 → 19.6%，不是 0.2%
+        let pct_rows = vec![
+            vec![json!("2026-05"), json!("0.1930")],
+            vec![json!("2026-06"), json!("0.1963")],
+        ];
+        let v7 = build(&cols(&["月份", "毛利率"]), &pct_rows);
+        let s7 = compute_insight_on(&v7.columns, &pct_rows, today, &index_roles(&v7.columns)).unwrap();
+        assert!(s7.contains("19.6%") && s7.contains("19.3%"), "比值口径必须 ×100：{s7}");
     }
 
     /// ⑤ 百分比指标的 KPI delta 用百分点：毛利率 19.30%→19.63% 是 +0.33pp，不是「+1.7%」。

@@ -29,18 +29,29 @@ pub fn for_principal(p: &Principal, scope: &Scope) -> Option<UnrestrictedProof> 
 /// （标识符还另过 `probe::ident` 白名单）。所以第二个证据不可能来自身份 ——
 /// 那就让它来自**进程形态**：argv 必须真的是这个子命令。
 ///
-/// 为什么不是在调用点写 `UnrestrictedProof::new(&ScopeSets::default(), true)`（本轮迁移后
-/// `main.rs:104` 就是那样）：① 那个 `true` 是硬编码的自证，与 F2 的套路一字不差；
+/// 为什么不是在调用点写 `UnrestrictedProof::new(&ScopeSets::default(), true)`（迁移后
+/// main.rs 的管理任务分支就是那样）：① 那个 `true` 是硬编码的自证，与 F2 的套路一字不差；
 /// ② 它让本文件开头那句「`grep 'UnrestrictedProof::new'` 就是全仓放行清单」变成谎话。
 /// 校验 argv 之后，谁把这一行粘进 axum handler 都铸不出凭证（服务进程的 argv 里没有该子命令）
 /// —— 失败方向是 fail-closed，而不是静默放行整库。
 pub fn for_admin_cli(task: &str) -> Option<UnrestrictedProof> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    if !argv.join(" ").starts_with(task) {
-        tracing::error!("非 `{task}` 进程试图铸造管理任务放行凭证（argv={argv:?}）");
+    // args_os + lossy：非 UTF-8 参数（Windows 环境变量/路径）不该把管理进程整体崩掉
+    let argv: Vec<String> =
+        std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    if !argv_matches(&argv, task) {
+        // 只记首词：完整 argv 可能带敏感值（DSN/临时密钥），不落日志
+        tracing::error!("非 `{task}` 进程试图铸造管理任务放行凭证（argv 首词={:?}）", argv.first());
         return None;
     }
     UnrestrictedProof::new(&crate::scope::ScopeSets::default(), true)
+}
+
+/// argv 逐 token 以 task 开头（`argv.join(" ").starts_with(task)` 会把 `meta autodiscover-x`
+/// 也判成 `meta autodiscover` —— 凭证铸造面不许被前缀意外扩大）
+fn argv_matches(argv: &[String], task: &str) -> bool {
+    let task_tokens: Vec<&str> = task.split(' ').collect();
+    argv.len() >= task_tokens.len()
+        && argv.iter().zip(task_tokens.iter()).all(|(a, t)| a == t)
 }
 
 #[cfg(test)]
@@ -77,5 +88,15 @@ mod tests {
     #[test]
     fn admin_cli_proof_needs_matching_argv() {
         assert!(super::for_admin_cli("meta autodiscover").is_none());
+    }
+
+    /// 逐 token 前缀判据：join+starts_with 会把 `meta autodiscover-x` 误判成目标子命令
+    #[test]
+    fn argv_match_is_token_based() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(super::argv_matches(&argv(&["meta", "autodiscover"]), "meta autodiscover"));
+        assert!(super::argv_matches(&argv(&["meta", "autodiscover", "--ds", "x"]), "meta autodiscover"));
+        assert!(!super::argv_matches(&argv(&["meta", "autodiscover-x"]), "meta autodiscover"), "前缀词不许扩大铸造面");
+        assert!(!super::argv_matches(&argv(&["meta"]), "meta autodiscover"));
     }
 }

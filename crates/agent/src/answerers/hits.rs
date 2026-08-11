@@ -83,9 +83,8 @@ impl Answerer for HitAnswerer {
 
     fn answer<'a>(&'a self, cx: &'a AskCtx<'a>) -> BoxFut<'a, anyhow::Result<Option<AskResult>>> {
         Box::pin(async move {
-            // `t0` 的起点：拆分前是 `ask_single` 入口（`pipeline.rs:641`）。`AskCtx` 今天没有
-            // `t0` 字段，故成员内自取；差值＝router 前几位的耗时（graph 的 `accept` 是纯判断）。
-            // 想让 `elapsed_ms` 起点一字不差，`AskCtx` 加一个 `t0` 即可（见交接单）。
+            // `t0` 来自 `AskCtx`（字段文档：由调用方给，成员不许自取），覆盖整次单问 ——
+            // 含 router 前几位成员的耗时（graph 的 `accept` 是纯判断，占用可忽略）。
             let t0 = cx.t0;
             match (self.produce)(cx).await {
                 Some(hit) => land(cx, hit, t0).await,
@@ -113,7 +112,11 @@ pub async fn land(
     let DirectHit { sql, route, prev, comparisons, detail, sales_context } = hit;
     let gated = match gate_on(cx.p, &sql, cx.scope, cx.ds_global, cx.source.dialect()) {
         Ok(s) => Some(s),
-        Err(e) if is_guard_err(&e) => None,
+        Err(e) if is_guard_err(&e) => {
+            // 红线拒 → 静默回落是刻意的（见函数头），但留一条 debug 可排查
+            tracing::debug!(route = %route, err = %e, "确定性 SQL 未过红线闸门 → 回落下一个成员");
+            None
+        }
         Err(e) => return Err(e),
     };
     let Some(scoped) = gated else { return Ok(None) };
@@ -142,12 +145,15 @@ pub async fn land(
     tracing::info!(
         ms = t_fetch.elapsed().as_millis(),
         rows = rs.rows.len(),
+        truncated = rs.rows.len() >= MAX_ROWS,
         route = %route,
         "确定性路径主查询取数完成"
     );
     // Doris 可能尚未同步当天新单。已识别为 DMS 单据时，数仓零行不能冒充最终答案：
     // 回落到后面的 business-lookup，由它通过独立 DMS 连接执行主表/明细表单表索引点查。
     // 只放行有生产登记的单据族；普通明细零行、聚合零行和数仓专属单据仍保持原行为。
+    // `resolve_document` 重扫一遍问句是有意的隔离：上游产出方已识别过一次，但把 family
+    // 透传进来要改 `DirectHit` 的形状（它的临时地位见文件头 ponytail）—— 纯函数重扫的 CPU 可忽略。
     if rs.rows.is_empty()
         && route == "direct-doc"
         && cx.source.is_warehouse()
@@ -175,7 +181,7 @@ pub async fn land(
     // 【单据卡】头行在手且带了明细 SQL → 补明细（缺席不塌卡：头行键值卡照旧给）
     let want_detail = detail.is_some() && r.row_count > 0;
     let dsql = detail.unwrap_or_default();
-    let detail_rows = async { if want_detail { fetch_detail(cx, &dsql).await } else { None } };
+    let detail_rows = async { if want_detail { fetch_detail(cx, &dsql, &r.route).await } else { None } };
     // 【同窗补充】销售单指标 KPI 落定后补一条五值（销售额/成本/收入/毛利额/毛利率）。
     // 触发判据收窄：仅 direct-agg 且主结果是**单行单值 KPI** —— 维度拆解/明细问题
     // 自带这些列，不挂补充；补充缺席同样不塌主卡。
@@ -184,7 +190,7 @@ pub async fn land(
         && r.row_count == 1
         && r.columns.len() == 1;
     let csql = sales_context.unwrap_or_default();
-    let context_rows = async { if want_context { fetch_sales_context(cx, &csql).await } else { None } };
+    let context_rows = async { if want_context { fetch_sales_context(cx, &csql, &r.route).await } else { None } };
     let (prev_vals, detail_rows, context_rows) = tokio::join!(prevs, detail_rows, context_rows);
     for (spec, val) in prev_specs.iter().zip(prev_vals) {
         if let (Some(cur), Some(prev)) = (cur, val) {
@@ -214,18 +220,18 @@ fn mark_derived_sql(route: &str, sql: String) -> String {
 /// 补充明细的取数半（供 `land` 与基期查询**并行**发起）。
 /// 一切失败（闸门拒/执行错/零行）= None：调用方保留主结果 —— 两句 warn 与拆分前
 /// `attach_detail` 的文案逐字相同（失败不许 `?` 掉整张卡）。
-async fn fetch_detail(cx: &AskCtx<'_>, dsql: &str) -> Option<(String, dms_connector::source::RowSet)> {
+async fn fetch_detail(cx: &AskCtx<'_>, dsql: &str, route: &str) -> Option<(String, dms_connector::source::RowSet)> {
     let scoped = match gate_on(cx.p, dsql, cx.scope, cx.ds_global, cx.source.dialect()) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(err = %e, "单据明细闸门未过 → 只给头卡");
+            tracing::warn!(route = %route, err = %e, "单据明细闸门未过 → 只给头卡");
             return None;
         }
     };
     let drs = match cx.source.fetch(&scoped, MAX_ROWS, EXEC_TIMEOUT).await {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!(err = %e, sql = %scoped.wire(), "单据明细取数失败 → 只给头卡");
+            tracing::warn!(route = %route, err = %e, sql = %scoped.wire(), "单据明细取数失败 → 只给头卡");
             return None;
         }
     };
@@ -239,23 +245,6 @@ async fn fetch_detail(cx: &AskCtx<'_>, dsql: &str) -> Option<(String, dms_connec
 /// 单据查询把顶层换成明细；聚合查询写入独立 supplemental，顶层主指标的行列契约保持不变。
 fn attach_detail(detail: (String, dms_connector::source::RowSet), replace_primary: bool, r: &mut AskResult) {
     let (d_sql, drs) = detail;
-    // 头行键值先抽（`present::build` 对单行出的就是 Entity 卡；防御：没出就手工拼）
-    let header_pairs = r
-        .view
-        .blocks
-        .iter()
-        .find_map(|b| match b {
-            dms_kernel::present::Block::Entity { pairs } => Some(pairs.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            r.columns
-                .iter()
-                .cloned()
-                .zip(r.rows.first().cloned().unwrap_or_default())
-                .filter(|(_, v)| !v.is_null())
-                .collect()
-        });
     let d_rows = drs.rows.len();
     let d_trunc = d_rows >= MAX_ROWS;
     let dview = dms_semantic::present::build(&drs.columns, &drs.rows);
@@ -273,17 +262,37 @@ fn attach_detail(detail: (String, dms_connector::source::RowSet), replace_primar
     }
     // 单据卡维持既有契约：头查询只负责 Entity 头卡，顶层行列给真实业务明细，
     // CSV 与单据型深度分析因此仍拿明细行。
+    // 头行键值先抽（`present::build` 对单行出的就是 Entity 卡；防御：没出就手工拼）——
+    // 只在 replace_primary 分支算：聚合路径在上面已经 return，白克隆一份 pairs 没意义。
+    let header_pairs = r
+        .view
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            dms_kernel::present::Block::Entity { pairs } => Some(pairs.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            r.columns
+                .iter()
+                .cloned()
+                .zip(r.rows.first().cloned().unwrap_or_default())
+                .filter(|(_, v)| !v.is_null())
+                .collect()
+        });
     r.columns = drs.columns;
     r.rows = drs.rows;
     r.row_count = d_rows;
     r.truncated = d_trunc;
-    let leading = std::mem::take(&mut r.view.blocks)
+    // 前置块全保留（Entity/Kpis 在 build 的决策树里互斥，filter 与 find 今天等价，
+    // 但「只留第一个」在将来多块同现时就是静默丢卡）
+    let mut blocks: Vec<_> = std::mem::take(&mut r.view.blocks)
         .into_iter()
-        .find(|b| matches!(b,
+        .filter(|b| matches!(b,
             dms_kernel::present::Block::Entity { .. }
                 | dms_kernel::present::Block::Kpis { .. }
-        ));
-    let mut blocks: Vec<_> = leading.into_iter().collect();
+        ))
+        .collect();
     if blocks.is_empty() {
         blocks.push(dms_kernel::present::Block::Entity { pairs: header_pairs });
     }
@@ -299,18 +308,18 @@ fn attach_detail(detail: (String, dms_connector::source::RowSet), replace_primar
 /// 同窗补充的取数半（供 `land` 与基期/明细**并行**发起）。与主查询同一条闸门、
 /// 同一次权限注入、同一个执行超时 —— 补充不是第二条通道，是同口径的再一次取数。
 /// 一切失败（闸门拒/执行错/零行）= None：补充缺席不塌主答案（文案与 `fetch_detail` 同族）。
-async fn fetch_sales_context(cx: &AskCtx<'_>, csql: &str) -> Option<dms_connector::source::RowSet> {
+async fn fetch_sales_context(cx: &AskCtx<'_>, csql: &str, route: &str) -> Option<dms_connector::source::RowSet> {
     let scoped = match gate_on(cx.p, csql, cx.scope, cx.ds_global, cx.source.dialect()) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(err = %e, "销售同窗补充闸门未过 → 只给主 KPI");
+            tracing::warn!(route = %route, err = %e, "销售同窗补充闸门未过 → 只给主 KPI");
             return None;
         }
     };
     let crs = match cx.source.fetch(&scoped, MAX_ROWS, EXEC_TIMEOUT).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(err = %e, sql = %scoped.wire(), "销售同窗补充取数失败 → 只给主 KPI");
+            tracing::warn!(route = %route, err = %e, sql = %scoped.wire(), "销售同窗补充取数失败 → 只给主 KPI");
             return None;
         }
     };
@@ -331,15 +340,24 @@ fn attach_sales_context(crs: dms_connector::source::RowSet, r: &mut AskResult) {
 /// （即 `cur` 为 `None` 时闸门照走一遍，纯 CPU 无 IO），两者都成才发上期那次取数。
 ///
 /// 本函数只是**取数半**（供 `land` 把 prev/comparisons 多路并行发起）；
-/// 取数失败/零行/非数 = None（基期缺席不塌主答案，与原 `if let Ok(prs)` 的静默跳过一致）。
+/// 取数失败/零行/非数 = None（基期缺席不塌主答案，语义同拆分前），但失败各留一条 debug。
 async fn fetch_prev(cx: &AskCtx<'_>, prev_sql: &str, cur: Option<f64>) -> Option<f64> {
     let (Some(_), Ok(prev_scoped)) = (
         cur,
         gate_on(cx.p, prev_sql, cx.scope, cx.ds_global, cx.source.dialect()),
     ) else {
+        // 无主值 / 闸门未过：静默跳过是既有语义，但留一条 debug 可排查
+        tracing::debug!("KPI 基期查询未发起（无主值或闸门未过）→ 环比缺席");
         return None;
     };
-    let prs = cx.source.fetch(&prev_scoped, MAX_ROWS, EXEC_TIMEOUT).await.ok()?;
+    let prs = match cx.source.fetch(&prev_scoped, MAX_ROWS, EXEC_TIMEOUT).await {
+        Ok(prs) => prs,
+        Err(e) => {
+            // 同族 `fetch_detail`/`fetch_sales_context` 的失败都有留痕 —— 基期半也不能整个丢掉
+            tracing::debug!(err = %e, "KPI 基期取数失败 → 环比缺席");
+            return None;
+        }
+    };
     prs.rows.first().and_then(|row| row.first()).and_then(cell_num)
 }
 
@@ -347,30 +365,36 @@ async fn fetch_prev(cx: &AskCtx<'_>, prev_sql: &str, cur: Option<f64>) -> Option
 /// （去重判据读的是累积中的 `r.comparisons`），所以留在 `land` 里按
 /// prev → comparisons 的原序逐个做 —— 与拆分前逐次 `patch_prev` 的终态逐字节相同。
 fn apply_prev(r: &mut AskResult, cur: f64, label: &str, prev: f64) {
-    dms_semantic::present::patch_kpi_delta(&mut r.view, cur, prev, label.to_string());
-    if !r.comparisons.iter().any(|item| item.label == label) {
-        // 基期为 0 仍是有效业务事实（例如新业务同比新增），不能把整项比较吞掉。
-        // `pct=0` 只是底层兼容占位；深度报告会结合 baseline 输出“新增”，不伪造 0%。
-        let pct = if prev.abs() >= f64::EPSILON {
-            (cur - prev) / prev * 100.0
-        } else {
-            0.0
-        };
-        r.comparisons.push(crate::ctx::KpiComparison {
-            label: label.to_string(),
-            current: cur,
-            baseline: prev,
-            change: cur - prev,
-            pct: (pct * 10.0).round() / 10.0,
-            dir: if cur - prev > 0.000_001 {
-                "up"
-            } else if cur - prev < -0.000_001 {
-                "down"
-            } else {
-                "flat"
-            },
-        });
+    // 去重判据在 patch **之前**：prev 与 comparisons 撞同名标签时两处都只入一次
+    // （patch 在 delta 已落时幂等，但判据前置让「视图打两次补丁、列表只入一条」不再可能）。
+    if r.comparisons.iter().any(|item| item.label == label) {
+        return;
     }
+    let label = label.to_string();
+    dms_semantic::present::patch_kpi_delta(&mut r.view, cur, prev, label.clone());
+    // 基期为 0 仍是有效业务事实（例如新业务同比新增），不能把整项比较吞掉。
+    // `pct=0` 只是底层兼容占位；深度报告会结合 baseline 输出“新增”，不伪造 0%。
+    // 零判与 dir 用同一个业务 epsilon（1e-6）：`f64::EPSILON` 对金额形同虚设，
+    // prev=1e-9 会算出天文数字环比。
+    let pct = if prev.abs() >= 1e-6 {
+        (cur - prev) / prev * 100.0
+    } else {
+        0.0
+    };
+    r.comparisons.push(crate::ctx::KpiComparison {
+        label,
+        current: cur,
+        baseline: prev,
+        change: cur - prev,
+        pct: (pct * 10.0).round() / 10.0,
+        dir: if cur - prev > 0.000_001 {
+            "up"
+        } else if cur - prev < -0.000_001 {
+            "down"
+        } else {
+            "flat"
+        },
+    });
 }
 
 /// JSON 单元格 → f64（DECIMAL 存字符串，数字直取）。逐行搬 `pipeline.rs:172-178`。
@@ -378,7 +402,16 @@ fn apply_prev(r: &mut AskResult, cur: f64, label: &str, prev: f64) {
 pub fn cell_num(v: &serde_json::Value) -> Option<f64> {
     match v {
         serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.trim().parse().ok(),
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            // 千分位字符串（"1,234,567.89"）直 parse 失败 → 去逗号再试一次
+            // （否则环比静默消失 —— 那正是下面测试注释最怕的形态）
+            match t.parse::<f64>() {
+                Ok(v) => Some(v),
+                Err(_) if t.contains(',') => t.replace(',', "").parse().ok(),
+                Err(_) => None,
+            }
+        }
         _ => None,
     }
 }

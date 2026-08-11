@@ -42,7 +42,7 @@ pub fn builtin_rules() -> HashMap<String, TableRule> {
         local_col: l.to_string(),
         remote_col: r.to_string(),
     };
-    let mut m: HashMap<String, TableRule> = HashMap::new();
+    let mut m: HashMap<String, TableRule> = HashMap::with_capacity(39);
     // —— scoped：Java joinSql 权威模板 → 列绑定
     m.insert("t_sales_order".into(), b("customer_code", Some("owner_manager"), Ids));
     m.insert("t_sales_order_his".into(), b("customer_code", Some("owner_manager"), Ids));
@@ -57,13 +57,17 @@ pub fn builtin_rules() -> HashMap<String, TableRule> {
     // 不能套用新开票的 customer OR manager 注解，否则会扩大旧流程可见客户面。
     m.insert("t_invoice_apply_header".into(), owner_only("manager", Ids));
     m.insert("t_invoice_new_apply_header".into(), b("customer_code", Some("manager"), Ids));
-    // 对账单页面按 `manager`（历史兼容员工 ID/姓名）裁决，无法用通用 AST 单字段绑定
-    // 精确表达。禁止登记成 customer/created_by 的近似规则，避免通用 NL2SQL 扩大可见面；
+    // t_account_bill_header（已退役，故不在本文件的登记清单里）：对账单页面按 `manager`
+    //（历史兼容员工 ID/姓名）裁决，无法用通用 AST 单字段绑定精确表达。禁止登记成
+    // customer/created_by 的近似规则，避免通用 NL2SQL 扩大可见面；
     // 精确单号由 business-lookup 在头表点查后按 manager 双形态单独裁决。
     m.insert("t_device_inspection_header".into(), b("customer_code", Some("manager_code"), Codes));
     m.insert("t_long_promotion_person".into(), b("customer_code", Some("manager_id"), Ids));
     // 无 owner 维度的表（Java 模板只有 customer 段）
-    for t in ["t_customer_balance", "t_customer_device_ledger", "t_device_disposal_order", "t_shop_inspection_records"] {
+    for t in [
+        "t_customer_balance", "t_customer_device_ledger", "t_device_disposal_order",
+        "t_shop_inspection_records",
+    ] {
         m.insert(t.into(), b("customer_code", None, Ids));
     }
     // 设备列表的普通范围是 customer_code OR area_manager_id，但两个专职角色还有设备专属
@@ -143,7 +147,7 @@ mod tests {
         };
         assert_eq!(sales.customer_col.as_deref(), Some("storecode"));
         assert!(sales.customer_kind == CustomerKind::RequiredCodes);
-        assert!(sales.owner_col.is_none(), "不得用 manger 名称模拟稳定员工 ID");
+        assert!(sales.owner_col.is_none(), "不得用 manager 名称模拟稳定员工 ID");
         let Some(TableRule::Via { table, local_col, remote_col }) = m.get("t_activity_promoter_fee") else {
             panic!("t_activity_promoter_fee 必须经活动头表继承权限");
         };

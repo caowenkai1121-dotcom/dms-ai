@@ -40,7 +40,7 @@ const MIN_SUBS: usize = 2;
 /// 或「A 情况，其中最 X 的 B」族（「其中」+ 极值词 = 总体与极值个体两问，见函数体注释）。
 pub fn is_compound(q: &str) -> bool {
     q.contains("分别")
-        || (q.contains("对比") && q.matches('和').count() + q.matches('与').count() >= 1)
+        || (q.contains("对比") && (q.contains('和') || q.contains('与')))
         // 【其中族】「本月的活动费用情况，其中最高的客户信息」：没有「分别/对比」，
         // 但「其中」+ 极值词的语义恒为「总体情况 + 极值个体」两问。实测不拆的后果：
         // LLM 单问只答了极值那一半（LIMIT 1），总体的「费用情况」整半句静默丢掉。
@@ -80,11 +80,12 @@ where
     let results = futures::future::join_all(subs_q.iter().cloned().map(&ask_one)).await;
     let mut subs: Vec<SubResult> = vec![];
     let mut failed: Vec<String> = vec![];
-    for (q, r) in subs_q.into_iter().zip(results) {
+    let total = subs_q.len();
+    for (idx, (q, r)) in subs_q.into_iter().zip(results).enumerate() {
         match r {
             Ok(res) => subs.push(SubResult { question: q, result: res }),
             Err(e) => {
-                tracing::warn!(sub = %q, err = %e, "复合子问失败 → 结果里点名，不静默丢");
+                tracing::warn!(idx = idx + 1, total, sub = %q, err = %e, "复合子问失败 → 结果里点名，不静默丢");
                 failed.push(q);
             }
         }
@@ -126,23 +127,40 @@ fn missing_note(failed: &[String], ok: usize) -> Option<String> {
 /// 拆解复合问题为独立子问题（fast 模型，deepagents write_todos 思想）
 async fn split_questions(llm: &dyn ChatModel, question: &str) -> Vec<String> {
     let system = "把用户的复合问题拆成 2-3 个可独立查询的子问题，每个子问题自包含（含时间/维度）。「其中/它/那个」等指代词必须展开成前半句的完整对象与口径。只输出 JSON 字符串数组，如 [\"各省销售额\",\"各商品分类销量\"]，不要解释。";
-    // 温度 0.1 = 搬运前 `LlmClient::chat` 写死的那个值（`server/src/llm.rs:53`）
-    let req = ChatRequest::text(ModelTier::Fast, system, question, Some(0.1));
-    match llm.chat(req).await.ok().and_then(|r| r.content) {
-        Some(r) => parse_subs(&r),
-        None => vec![],
+    // 温度用全仓既定值（`insight::LLM_TEMP`）
+    let req = ChatRequest::text(ModelTier::Fast, system, question, Some(insight::LLM_TEMP));
+    // 拆解挂了静默退回单问：降级语义保留，但必须吼一声（对比：子问失败在 `try_compound` 有 warn）
+    match llm.chat(req).await {
+        Ok(r) => match r.content {
+            Some(text) => parse_subs(&text),
+            None => {
+                tracing::warn!("复合拆解 LLM 回空 content → 不拆");
+                vec![]
+            }
+        },
+        Err(e) => {
+            tracing::warn!(err = %e, "复合拆解 LLM 失败 → 不拆");
+            vec![]
+        }
     }
 }
 
 /// 回复 → 子问题清单（**纯函数**）。抽 JSON 数组、剔空串、`MAX_SUBS` 硬截断。
 /// 抽不出数组返回空 = 不拆（默认不拆偏置的第二道）。
 fn parse_subs(r: &str) -> Vec<String> {
-    // 抽 JSON 数组
+    // 抽 JSON 数组。LLM 输出是不可信输入：`"]…["`（右括号先于左括号）时 `s > e`，
+    // 直接切片会 panic —— 先守卫再切；散文里照抄示例格式多出 `[` 时解析失败留一条 debug。
     let start = r.find('[');
     let end = r.rfind(']');
     if let (Some(s), Some(e)) = (start, end) {
-        if let Ok(v) = serde_json::from_str::<Vec<String>>(&r[s..=e]) {
-            return v.into_iter().filter(|s| !s.trim().is_empty()).take(MAX_SUBS).collect();
+        if s <= e {
+            match serde_json::from_str::<Vec<String>>(&r[s..=e]) {
+                // 留存项先 trim 再剔空：带空白的子问会原样进子问链路与汇总 prompt
+                Ok(v) => {
+                    return v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(MAX_SUBS).collect();
+                }
+                Err(err) => tracing::debug!(err = %err, "复合拆解回复的 JSON 数组解析失败 → 不拆"),
+            }
         }
     }
     vec![]
@@ -390,5 +408,46 @@ mod tests {
         assert!(n.contains("3 个子问") && n.contains("2 条没查出来"), "{n}");
         assert!(n.contains("乙省销售额；丙省销售额"), "{n}");
         assert!(n.contains("另外 1 条"), "{n}");
+    }
+
+    /// 拆解回复解析的补充边界：右括号先于左括号不许 panic、留存项先 trim 再剔空。
+    #[test]
+    fn parse_subs_guards_inverted_brackets_and_trims() {
+        assert!(parse_subs("] 先右后左 [").is_empty(), "s > e 不许 panic");
+        assert_eq!(
+            parse_subs(r#"["  各省销售额  ","乙省销售额"]"#),
+            vec!["各省销售额", "乙省销售额"],
+            "留存项要 trim"
+        );
+    }
+
+    /// 拆解步失败 / 回垃圾 → `try_compound` 返 None（交回单问链路），不 panic。
+    #[tokio::test]
+    async fn split_failure_means_no_compound() {
+        // 拆解步回非 JSON
+        struct Garbage;
+        impl ChatModel for Garbage {
+            fn chat<'a>(&'a self, _req: ChatRequest) -> BoxFut<'a, Result<ChatReply, LlmError>> {
+                Box::pin(async { Ok(ChatReply { content: Some("我拆不了".into()), usage: Default::default() }) })
+            }
+        }
+        assert!(
+            try_compound(&Garbage, "甲省和乙省分别卖了多少", Instant::now(), |q: String| async move { Ok(one(&q)) })
+                .await
+                .is_none(),
+            "拆不出子问必须交回单问"
+        );
+        // 拆解步 LLM 直接挂
+        struct Down;
+        impl ChatModel for Down {
+            fn chat<'a>(&'a self, _req: ChatRequest) -> BoxFut<'a, Result<ChatReply, LlmError>> {
+                Box::pin(async { Err(LlmError::Transport("模型挂了".into())) })
+            }
+        }
+        assert!(
+            try_compound(&Down, "甲省和乙省分别卖了多少", Instant::now(), |q: String| async move { Ok(one(&q)) })
+                .await
+                .is_none()
+        );
     }
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import KbDocPreview from './KbDocPreview.vue'
 import KbEval from './KbEval.vue'
 import KbGraph from './KbGraph.vue'
@@ -7,6 +7,8 @@ import KbMindmap from './KbMindmap.vue'
 
 interface DsTable { sheet: string; table: string; rows: number }
 interface Ds { ds_id: string; schema: string; tables: DsTable[]; skipped: string[] }
+// folder_path 与 directory_path 双字段并存是 legacy 兼容：folderPath() 优先 folder_path，
+// 空则回退 directory_path，再退化到 folder_id 现拼路径（SearchHit 同口径）。
 interface Doc {
   doc_id: string; name: string; mime: string; bytes: number
   status: string; error?: string | null; notice?: string | null
@@ -51,6 +53,14 @@ const UPLOAD_ACCEPT = [
 ].join(',')
 // 单文件上限 20MB：与服务端 `kb_max_mb` 默认值同口径（服务端配置可调，前端按产品口径预校验）
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+// 关联文档上限：toggleRelatedDoc 的判定与界面文案共用一处，不各写 50
+const MAX_RELATED = 50
+// 上传队列上限：队列只增不清，批量上传大目录时行数封顶（保留最近 N 条）
+const UPLOAD_QUEUE_MAX = 200
+// 模块级单例 formatter：文档行多时每行渲染都过 dateText，不能一格 new 一个
+const DATE_FMT = new Intl.DateTimeFormat('zh-CN', {
+  month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+})
 // 扩展名集合（与 UPLOAD_ACCEPT 同一份清单）：文件夹选择器不认 accept，前端按它逐个预过滤
 const UPLOAD_EXTS = new Set(UPLOAD_ACCEPT.split(',').map((ext) => ext.trim().toLowerCase()))
 interface Grant {
@@ -98,6 +108,9 @@ const folderEditName = ref('')
 const folderEditParentId = ref('')
 const folderDialogErr = ref('')
 const folderDeletingId = ref('')
+// 删文件夹用自定义确认框（与删文档的 confirm-box 同款），不再用原生 window.confirm
+const folderDeleteConfirm = ref(false)
+const folderDeleteErr = ref('')
 const docMovingId = ref('')
 // 【KB 管理闸】管理操作区（共享权限/新建空间等）的显隐依据：服务端 `/api/kb/spaces` 过闸才返
 // `kb_manager:true`（配置授权的角色/人员 + 管理员）。隐藏只是体验，安全闸在服务端各管理端点。
@@ -137,6 +150,8 @@ const urlBusy = ref(false)
 const descGeneratingId = ref('')
 const createOpen = ref(false)
 const creating = ref(false)
+// 新建空间对话框的专属错误位：失败时对话框还开着，写 actionErr 会被对话框盖住看不到
+const createErr = ref('')
 const newSpaceName = ref('')
 const newSpaceId = ref('')
 const grantOpen = ref(false)
@@ -289,6 +304,11 @@ function updateUpload(id: number, patch: Partial<UploadRow>) {
   const row = uploads.value.find((item) => item.id === id)
   if (row) Object.assign(row, patch)
 }
+/** 入队统一走这里：行数封顶（队列只增不清，批量上传大目录时保留最近 N 条）。 */
+function pushUpload(row: UploadRow) {
+  uploads.value.unshift(row)
+  if (uploads.value.length > UPLOAD_QUEUE_MAX) uploads.value.length = UPLOAD_QUEUE_MAX
+}
 function sizeText(n?: number | null): string {
   if (typeof n !== 'number') return '-'
   if (n < 1024) return `${n} B`
@@ -301,10 +321,12 @@ function extOf(name: string): string {
 }
 function typeText(d: Doc): string {
   const ext = extOf(d.name)
+  // 与 UPLOAD_ACCEPT 清单同口径（accept 无 .htm，这里也不单列 HTM）
   const groups: Record<string, string> = {
-    DOC: 'Word', DOCX: 'Word', XLS: 'Excel', XLSX: 'Excel', CSV: 'CSV',
-    PPT: 'PPT', PPTX: 'PPT', PDF: 'PDF', TXT: '文本', MD: 'Markdown',
-    HTML: '网页', HTM: '网页', JSON: 'JSON', XML: 'XML',
+    DOC: 'Word', DOCX: 'Word', XLS: 'Excel', XLSX: 'Excel', XLSM: 'Excel', CSV: 'CSV',
+    PPT: 'PPT', PPTX: 'PPT', PDF: 'PDF', TXT: '文本', LOG: '文本', MD: 'Markdown', MARKDOWN: 'Markdown',
+    HTML: '网页', JSON: 'JSON', XML: 'XML',
+    PNG: '图片', JPG: '图片', JPEG: '图片', WEBP: '图片', GIF: '图片', BMP: '图片', TIF: '图片', TIFF: '图片',
   }
   return groups[ext] ?? ext
 }
@@ -312,14 +334,13 @@ function dateText(value?: string): string {
   if (!value) return '-'
   const d = new Date(value)
   if (Number.isNaN(d.getTime())) return value.slice(0, 16).replace('T', ' ')
-  return new Intl.DateTimeFormat('zh-CN', {
-    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
-  }).format(d)
+  return DATE_FMT.format(d)
 }
 function hitLocation(hit: SearchHit): string {
   const parts: string[] = []
   const directory = folderPath(hit)
-  if (directory) parts.push(`目录 ${directory}`)
+  // 与文档行的「目录：X」同款分隔符
+  if (directory) parts.push(`目录：${directory}`)
   const heading = Array.isArray(hit.heading_path)
     ? hit.heading_path.filter(Boolean).join(' / ')
     : String(hit.heading_path ?? '').trim()
@@ -335,9 +356,6 @@ function displayState(d: Doc): 'ready' | 'processing' | 'attention' | 'disabled'
   if (d.quality?.level === 'processing') return 'processing'
   if (d.quality?.level === 'good') return 'ready'
   return 'attention'
-}
-function displayStatusText(d: Doc): string {
-  return d.quality?.label || docStatusText(d)
 }
 function dateInputValue(value?: string | null): string {
   return value ? value.slice(0, 10) : ''
@@ -358,10 +376,50 @@ function resetRetrieval() {
   hitErr.value = {}
 }
 
+/** 换空间的作用域状态复位：loadSpaces 自动换房/失败清空、changeSpace 三处共用，字段只维护一处
+ *  （search/filter/actionErr 也在此复位 —— 旧关键词/筛选不许跨空间残留）。 */
+function resetSpaceScopedState() {
+  docs.value = []
+  folders.value = []
+  uploads.value = []
+  busy.value = false
+  search.value = ''
+  filter.value = 'all'
+  actionErr.value = ''
+  collapsedFolderIds.value = []
+  foldersErr.value = ''
+  folderApiAvailable.value = null
+  selectedFolderId.value = ''
+  uploadFolderId.value = ''
+  folderCreateOpen.value = false
+  folderEditOpen.value = false
+  folderDeleteConfirm.value = false
+  folderDeleteErr.value = ''
+  previewDoc.value = null
+  confirmDoc.value = null
+  deleteDialogErr.value = ''
+  folderDialogErr.value = ''
+  folderCreating.value = false
+  folderEditing.value = false
+  folderDeletingId.value = ''
+  docMovingId.value = ''
+  reprocessingId.value = ''
+  stateChangingId.value = ''
+  deletingId.value = ''
+  newFolderName.value = ''
+  newFolderParentId.value = ''
+  resetRetrieval()
+  retrievalLoading.value = false
+  sampleQuestions.value = []
+  closeMetadata(true)
+  closeGrants(true)
+}
+
 function governanceText(hit: SearchHit): string {
-  if (hit.effective_from && hit.effective_to) return `${hit.effective_from} 至 ${hit.effective_to}`
-  if (hit.effective_from) return `${hit.effective_from} 起生效`
-  if (hit.effective_to) return `有效至 ${hit.effective_to}`
+  // 与文档行 effectiveText 同口径：截到日期，不拼完整 ISO
+  if (hit.effective_from && hit.effective_to) return `${dateInputValue(hit.effective_from)} 至 ${dateInputValue(hit.effective_to)}`
+  if (hit.effective_from) return `${dateInputValue(hit.effective_from)} 起生效`
+  if (hit.effective_to) return `有效至 ${dateInputValue(hit.effective_to)}`
   return '未设置生效期'
 }
 
@@ -390,7 +448,8 @@ async function downloadDoc(docId: string, name: string) {
     document.body.appendChild(anchor)
     anchor.click()
     anchor.remove()
-    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+    // 延迟回收：0ms 在部分浏览器（Firefox）下载尚未开始即被回收，可能截断
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   } catch (e) {
     if (contextIsCurrent(requestEpoch, requestSpace)) actionErr.value = `下载原件失败：${errorText(e)}`
   }
@@ -448,6 +507,9 @@ async function openMetadata(d: Doc) {
   const requestId = ++metadataRequestId
   const requestEpoch = contextEpoch
   const requestSpace = spaceId.value
+  // 复位保存闸：上一份文档保存中打开新文档时，旧 finally 因 requestId 失效会跳过复位，
+  // 不在这里清零的话新文档的保存按钮会被永久禁用
+  metadataSaving.value = false
   metadataDoc.value = d
   metadataTags.value = (d.tags ?? []).join(', ')
   metadataDomain.value = d.business_domain ?? ''
@@ -499,10 +561,13 @@ const inferredRelations = computed(() => metadataRelations.value.filter((relatio
 function toggleRelatedDoc(docId: string) {
   if (metadataRelatedSet.value.has(docId)) {
     metadataRelatedIds.value = metadataRelatedIds.value.filter((id) => id !== docId)
-  } else if (metadataRelatedIds.value.length < 50) {
+    metadataErr.value = ''
+  } else if (metadataRelatedIds.value.length < MAX_RELATED) {
     metadataRelatedIds.value = [...metadataRelatedIds.value, docId]
+    // 成功勾选后清掉旧的超限错误，不留滞
+    metadataErr.value = ''
   } else {
-    metadataErr.value = '关联文档最多 50 篇'
+    metadataErr.value = `关联文档最多 ${MAX_RELATED} 篇`
   }
 }
 
@@ -564,7 +629,8 @@ async function saveMetadata() {
 const currentSpace = computed(() => spaces.value.find((space) => space.space_id === spaceId.value) ?? null)
 const switchingDisabled = computed(() => busy.value || creating.value || folderCreating.value || folderEditing.value
   || !!folderDeletingId.value || !!docMovingId.value || metadataSaving.value || granting.value
-  || !!revokingGrant.value || !!deletingId.value || !!reprocessingId.value || !!stateChangingId.value)
+  || !!revokingGrant.value || !!deletingId.value || !!reprocessingId.value || !!stateChangingId.value
+  || urlBusy.value || !!descGeneratingId.value)
 const folderRows = computed<FolderRow[]>(() => {
   const byParent = new Map<string, Folder[]>()
   for (const folder of folders.value) {
@@ -723,7 +789,9 @@ function resetGrantDraft() {
   grantFeedbackError.value = false
 }
 function closeSpaceCreate() {
-  if (!creating.value) createOpen.value = false
+  if (creating.value) return
+  createOpen.value = false
+  createErr.value = ''
 }
 function closeFolderCreate() {
   if (folderCreating.value) return
@@ -761,13 +829,18 @@ function grantName(g: Grant): string {
   return name ? `${name} · ${g.grantee}` : g.grantee
 }
 
-const counts = computed(() => ({
-  all: docs.value.length,
-  ready: docs.value.filter((d) => displayState(d) === 'ready').length,
-  processing: docs.value.filter((d) => displayState(d) === 'processing').length,
-  attention: docs.value.filter((d) => displayState(d) === 'attention').length,
-  disabled: docs.value.filter((d) => displayState(d) === 'disabled').length,
-}))
+const counts = computed(() => {
+  // 单趟聚合：不对 docs 跑 5 趟 filter
+  const c = { all: 0, ready: 0, processing: 0, attention: 0, disabled: 0 }
+  for (const d of docs.value) {
+    c.all++
+    c[displayState(d)]++
+  }
+  return c
+})
+const unfiledCount = computed(() => docs.value.filter((doc) => !doc.folder_id).length)
+/** 已结束（成功/部分/失败）的上传行数：没有可清的行时「清除已结束」按钮禁用。 */
+const uploadsDoneCount = computed(() => uploads.value.filter((u) => u.state !== 'doing').length)
 const filters = computed<{ value: Filter; label: string; count: number }[]>(() => [
   { value: 'all', label: '全部', count: counts.value.all },
   { value: 'ready', label: '可检索', count: counts.value.ready },
@@ -866,7 +939,8 @@ async function loadKnowledgeAssets(space = spaceId.value, epoch = contextEpoch) 
   const requestId = ++assetsRequestId
   foldersLoading.value = false
   const foldersEmbeddedInDocs = await load(space, requestId, epoch)
-  if (foldersEmbeddedInDocs === false) await loadFolders(space, requestId, epoch)
+  // 已知目录接口 404（folderApiAvailable===false）时不再多发一个注定失败的请求
+  if (foldersEmbeddedInDocs === false && folderApiAvailable.value !== false) await loadFolders(space, requestId, epoch)
 }
 
 async function loadSpaces(preferred?: string) {
@@ -898,35 +972,7 @@ async function loadSpaces(preferred?: string) {
       grantsRequestId++
       uploadRequestId++
       spaceId.value = next
-      folders.value = []
-      docs.value = []
-      uploads.value = []
-      busy.value = false
-      collapsedFolderIds.value = []
-      foldersErr.value = ''
-      folderApiAvailable.value = null
-      selectedFolderId.value = ''
-      uploadFolderId.value = ''
-      folderCreateOpen.value = false
-      folderEditOpen.value = false
-      previewDoc.value = null
-      confirmDoc.value = null
-      deleteDialogErr.value = ''
-      folderDialogErr.value = ''
-      folderCreating.value = false
-      folderEditing.value = false
-      folderDeletingId.value = ''
-      docMovingId.value = ''
-      reprocessingId.value = ''
-      stateChangingId.value = ''
-      deletingId.value = ''
-      newFolderName.value = ''
-      newFolderParentId.value = ''
-      resetRetrieval()
-      retrievalLoading.value = false
-      sampleQuestions.value = []
-      closeMetadata(true)
-      closeGrants(true)
+      resetSpaceScopedState()
     }
     const requestEpoch = contextEpoch
     await loadKnowledgeAssets(next, requestEpoch)
@@ -946,26 +992,9 @@ async function loadSpaces(preferred?: string) {
     spaces.value = []
     kbManager.value = false
     spaceId.value = ''
-    docs.value = []
-    folders.value = []
-    uploads.value = []
-    selectedFolderId.value = ''
-    uploadFolderId.value = ''
-    busy.value = false
     loading.value = false
     foldersLoading.value = false
-    retrievalLoading.value = false
-    folderCreating.value = false
-    folderEditing.value = false
-    folderDeletingId.value = ''
-    docMovingId.value = ''
-    reprocessingId.value = ''
-    stateChangingId.value = ''
-    deletingId.value = ''
-    resetRetrieval()
-    sampleQuestions.value = []
-    closeMetadata(true)
-    closeGrants(true)
+    resetSpaceScopedState()
   }
 }
 
@@ -981,36 +1010,7 @@ async function changeSpace() {
   const requestEpoch = contextEpoch
   loading.value = false
   foldersLoading.value = false
-  search.value = ''
-  filter.value = 'all'
-  uploads.value = []
-  actionErr.value = ''
-  folders.value = []
-  collapsedFolderIds.value = []
-  foldersErr.value = ''
-  folderApiAvailable.value = null
-  selectedFolderId.value = ''
-  uploadFolderId.value = ''
-  folderCreateOpen.value = false
-  folderEditOpen.value = false
-  previewDoc.value = null
-  confirmDoc.value = null
-  deleteDialogErr.value = ''
-  folderDialogErr.value = ''
-  folderCreating.value = false
-  folderEditing.value = false
-  folderDeletingId.value = ''
-  docMovingId.value = ''
-  reprocessingId.value = ''
-  stateChangingId.value = ''
-  deletingId.value = ''
-  newFolderName.value = ''
-  newFolderParentId.value = ''
-  closeGrants(true)
-  closeMetadata(true)
-  resetRetrieval()
-  retrievalLoading.value = false
-  sampleQuestions.value = []
+  resetSpaceScopedState()
   await loadKnowledgeAssets(requestSpace, requestEpoch)
   void loadSampleQuestions(requestSpace, requestEpoch)
   if (contextIsCurrent(requestEpoch, requestSpace) && currentSpace.value) {
@@ -1080,7 +1080,7 @@ async function createSpace() {
   const name = newSpaceName.value.trim()
   if (!name || creating.value) return
   creating.value = true
-  actionErr.value = ''
+  createErr.value = ''
   try {
     const body: Record<string, string> = { name }
     if (newSpaceId.value.trim()) body.space_id = newSpaceId.value.trim()
@@ -1094,7 +1094,7 @@ async function createSpace() {
     newSpaceId.value = ''
     await loadSpaces(data.space_id)
   } catch (e) {
-    actionErr.value = `新建空间失败：${errorText(e)}`
+    createErr.value = `新建空间失败：${errorText(e)}`
   } finally {
     creating.value = false
   }
@@ -1147,14 +1147,14 @@ function openFolderEdit() {
   folderEditOpen.value = true
 }
 
-function folderIsDescendant(candidate: Folder, ancestorId: string): boolean {
-  const byId = new Map(folders.value.map((folder) => [folder.folder_id, folder]))
+function folderIsDescendant(candidate: Folder, ancestorId: string, byId?: Map<string, Folder>): boolean {
+  const map = byId ?? new Map(folders.value.map((folder) => [folder.folder_id, folder]))
   const seen = new Set<string>()
   let current: Folder | undefined = candidate
   while (current && !seen.has(current.folder_id)) {
     if (current.parent_id === ancestorId) return true
     seen.add(current.folder_id)
-    current = current.parent_id ? byId.get(current.parent_id) : undefined
+    current = current.parent_id ? map.get(current.parent_id) : undefined
   }
   return false
 }
@@ -1162,14 +1162,21 @@ function folderIsDescendant(candidate: Folder, ancestorId: string): boolean {
 const folderMoveTargets = computed(() => {
   const current = selectedFolder.value
   if (!current) return folderRows.value
+  // byId 只建一次、闭包复用：逐行调 folderIsDescendant 各自重建 Map 是 O(n²)
+  const byId = new Map(folders.value.map((folder) => [folder.folder_id, folder]))
   return folderRows.value.filter((row) => row.folder.folder_id !== current.folder_id
-    && !folderIsDescendant(row.folder, current.folder_id))
+    && !folderIsDescendant(row.folder, current.folder_id, byId))
 })
 
 async function saveFolderEdit() {
   const folder = selectedFolder.value
   const name = folderEditName.value.trim()
   if (!folder || !name || folderEditing.value) return
+  // 名称/父目录都没改：不发 POST 不整刷，直接关窗
+  if (name === folder.name && (folderEditParentId.value || '') === (folder.parent_id || '')) {
+    folderEditOpen.value = false
+    return
+  }
   const requestSpace = spaceId.value
   const requestEpoch = contextEpoch
   folderEditing.value = true
@@ -1204,11 +1211,23 @@ async function deleteSelectedFolder() {
     actionErr.value = `无法删除“${folderLabel(folder)}”：目录中还有 ${childCount} 个子文件夹、${docCount} 份文档，请先移动后再删除。`
     return
   }
-  if (!window.confirm(`删除文件夹“${folderLabel(folder)}”？仅空文件夹可以删除。`)) return
+  folderDeleteErr.value = ''
+  folderDeleteConfirm.value = true
+}
+
+function closeFolderDeleteConfirm() {
+  if (folderDeletingId.value) return
+  folderDeleteConfirm.value = false
+  folderDeleteErr.value = ''
+}
+
+async function removeFolderConfirmed() {
+  const folder = selectedFolder.value
+  if (!folder || folderDeletingId.value) return
   const requestSpace = spaceId.value
   const requestEpoch = contextEpoch
   folderDeletingId.value = folder.folder_id
-  actionErr.value = ''
+  folderDeleteErr.value = ''
   try {
     const response = await fetch(`/api/kb/folder/${encodeURIComponent(folder.folder_id)}${spaceQuery(requestSpace)}`, {
       method: 'DELETE', headers: headers(),
@@ -1216,11 +1235,12 @@ async function deleteSelectedFolder() {
     const data = await responseJson(response)
     if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`)
     if (!contextIsCurrent(requestEpoch, requestSpace)) return
+    folderDeleteConfirm.value = false
     selectedFolderId.value = ''
     uploadFolderId.value = ''
     await loadKnowledgeAssets(requestSpace, requestEpoch)
   } catch (e) {
-    if (contextIsCurrent(requestEpoch, requestSpace)) actionErr.value = `删除文件夹失败：${errorText(e)}`
+    if (contextIsCurrent(requestEpoch, requestSpace)) folderDeleteErr.value = `删除文件夹失败：${errorText(e)}`
   } finally {
     if (contextIsCurrent(requestEpoch, requestSpace)) folderDeletingId.value = ''
   }
@@ -1253,7 +1273,8 @@ async function moveDoc(d: Doc, folderId: string) {
   }
 }
 
-async function send(files: File[], retrying?: Doc) {
+// route：按文件给出目标文件夹与目的地文案（文件夹层级上传用）；不传则全部进 uploadFolderId 当前选择
+async function send(files: File[], route?: (file: File) => { folderId: string; destination: string } | undefined) {
   if (!files.length || busy.value || !spaceId.value) return
   const requestId = ++uploadRequestId
   const requestSpace = spaceId.value
@@ -1266,30 +1287,39 @@ async function send(files: File[], retrying?: Doc) {
   }
   const requestFolder = targetFolder?.folder_id ?? ''
   const destination = targetFolder ? folderLabel(targetFolder) : '根目录 / 未分类'
+  // 记录是否发生过实际上传：全部预校验失败（无一发起请求）时不整刷空间
+  let attempted = false
   busy.value = true
   actionErr.value = ''
   try {
     for (const file of files) {
+      const routed = route?.(file)
+      // route 显式给 '' 是「根目录」的意思，不能用 || 回退（?? 只认 null/undefined）
+      const fileFolder = routed?.folderId ?? requestFolder
+      const fileDestination = routed?.destination ?? destination
+      // 层级上传时行名带相对路径，同名的多级文件才分得清谁是谁
+      const displayName = routed ? (file.webkitRelativePath || file.name) : file.name
       // 前端预校验（逐个反馈，不中断队列）：超限/空文件直接落失败行，权威判定仍在服务端
       if (file.size > MAX_UPLOAD_BYTES || file.size === 0) {
         const why = file.size === 0
           ? '文件为空，未上传'
-          : `超过单文件 20MB 上限（实际 ${(file.size / 1024 / 1024).toFixed(1)}MB），未上传`
-        uploads.value.unshift({ id: ++uploadId, name: file.name, state: 'fail', msg: why, destination })
+          : `超过单文件 ${MAX_UPLOAD_BYTES / 1024 / 1024}MB 上限（实际 ${(file.size / 1024 / 1024).toFixed(1)}MB），未上传`
+        pushUpload({ id: ++uploadId, name: displayName, state: 'fail', msg: why, destination: fileDestination })
         continue
       }
+      attempted = true
       const row: UploadRow = {
-        id: ++uploadId, name: file.name, state: 'doing',
-        msg: retrying ? `正在重新处理《${retrying.name}》` : '正在上传并建立索引',
-        destination,
+        id: ++uploadId, name: displayName, state: 'doing',
+        msg: '正在上传并建立索引',
+        destination: fileDestination,
       }
-      uploads.value.unshift(row)
+      pushUpload(row)
       const rowId = row.id
       try {
         const form = new FormData()
         form.append('file', file, file.name)
         form.append('space_id', requestSpace)
-        if (requestFolder) form.append('folder_id', requestFolder)
+        if (fileFolder) form.append('folder_id', fileFolder)
         const resp = await fetch('/api/kb/upload', {
           method: 'POST', headers: headers(), body: form,
         })
@@ -1312,7 +1342,7 @@ async function send(files: File[], retrying?: Doc) {
     }
   } finally {
     if (requestId === uploadRequestId) busy.value = false
-    if (contextIsCurrent(requestEpoch, requestSpace)) await loadSpaces(requestSpace)
+    if (contextIsCurrent(requestEpoch, requestSpace) && attempted) await loadSpaces(requestSpace)
   }
 }
 
@@ -1321,8 +1351,27 @@ function onPick(e: Event) {
   void send(Array.from(el.files ?? []))
   el.value = ''
 }
+// 拖放高亮用进入/离开计数：划过子元素（upload-mark 等）时 dragleave 频繁触发会闪烁
+let dragDepth = 0
+function onDragEnter(e: DragEvent) {
+  e.preventDefault()
+  dragDepth++
+  dragging.value = true
+}
+function onDragLeave(e: DragEvent) {
+  e.preventDefault()
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (!dragDepth) dragging.value = false
+}
 function onDrop(e: DragEvent) {
   dragging.value = false
+  dragDepth = 0
+  // 拖入目录项时 files 会给 size 0 的假文件，误报「文件为空」：识别出来指路「上传文件夹」
+  const items = Array.from(e.dataTransfer?.items ?? [])
+  if (items.some((item) => item.webkitGetAsEntry?.()?.isDirectory)) {
+    actionErr.value = '拖入的是文件夹：请改用下方「上传文件夹」按钮。'
+    return
+  }
   void send(Array.from(e.dataTransfer?.files ?? []))
 }
 function openFilePicker() {
@@ -1331,8 +1380,8 @@ function openFilePicker() {
 function openDirPicker() {
   if (!busy.value) dirEl.value?.click()
 }
-// 上传文件夹：webkitdirectory 一次给出整棵目录树；文件夹名建成同名 KB 文件夹
-// （上传契约只认 folder_id，所以先复用/创建目录拿到 id，再走既有批量上传队列 send()）。
+// 上传文件夹：webkitdirectory 一次给出整棵目录树；目录层级原样映射成 KB 文件夹树
+// （上传契约只认 folder_id，所以按相对路径逐级复用/创建目录拿到 id，再走既有批量上传队列 send()）。
 function onPickDir(e: Event) {
   const el = e.target as HTMLInputElement
   const files = Array.from(el.files ?? [])
@@ -1343,56 +1392,84 @@ async function sendDirectory(files: File[]) {
   if (!files.length || busy.value || !spaceId.value) return
   const requestSpace = spaceId.value
   const requestEpoch = contextEpoch
-  // webkitRelativePath 形如「根文件夹/子目录/文件」；KB 文件夹名 = 第一段（嵌套子目录不建层级，全部进该文件夹）
-  const rootName = String(files[0]?.webkitRelativePath || '').split('/')[0]?.trim()
-  const parentId = uploadFolderId.value || null
-  const parentLabel = uploadFolder.value ? folderLabel(uploadFolder.value) : ''
-  const destination = rootName ? [parentLabel, rootName].filter(Boolean).join(' / ') : '根目录 / 未分类'
+  const baseParentId = uploadFolderId.value || null
+  const baseLabel = uploadFolder.value ? folderLabel(uploadFolder.value) : ''
+  // webkitRelativePath 形如「根文件夹/子目录/…/文件」：目录段逐级映射为 KB 文件夹，
+  // 源文件夹有几层就建几层（「上传到」选择是整个目录树的挂载点）
+  const dirSegsOf = (file: File): string[] =>
+    String(file.webkitRelativePath || file.name).split('/').map((seg) => seg.trim()).filter(Boolean).slice(0, -1)
+  const destinationOf = (dirSegs: string[]): string =>
+    [baseLabel, ...dirSegs].filter(Boolean).join(' / ') || '根目录 / 未分类'
   // 逐个预过滤不支持的扩展名（失败行进队列、逐个提示）；超 20MB / 空文件由 send() 预校验同口径处理
   const accepted: File[] = []
   for (const file of files) {
     const dot = file.name.lastIndexOf('.')
     const ext = dot > 0 ? file.name.slice(dot).toLowerCase() : ''
     if (!ext || !UPLOAD_EXTS.has(ext)) {
-      uploads.value.unshift({
+      pushUpload({
         id: ++uploadId, name: file.webkitRelativePath || file.name,
-        state: 'fail', msg: '不支持的文件类型，未上传', destination,
+        state: 'fail', msg: '不支持的文件类型，未上传', destination: destinationOf(dirSegsOf(file)),
       })
       continue
     }
     accepted.push(file)
   }
-  if (!accepted.length || !rootName) {
-    if (accepted.length) void send(accepted)
+  if (!accepted.length) return
+  // 逐级「找到或创建」KB 文件夹（与「新建文件夹」对话框同一条 POST /api/kb/folders 契约）。
+  // pathCache 以「根/子/…」相对路径为键整批共享：同一目录无论多少文件只建一次
+  const pathCache = new Map<string, string>()
+  const findChild = (name: string, parentId: string | null): string =>
+    folders.value.find((folder) => folder.name === name && (folder.parent_id || null) === parentId)?.folder_id ?? ''
+  // 返回末级 folder_id（'' = 根目录）；null = 空间/上下文已切换，调用方整批放弃
+  const ensurePath = async (dirSegs: string[]): Promise<string | null> => {
+    let parentId = baseParentId
+    let prefix = ''
+    for (const seg of dirSegs) {
+      prefix = prefix ? `${prefix}/${seg}` : seg
+      const cached = pathCache.get(prefix)
+      if (cached != null) { parentId = cached || null; continue }
+      let folderId = findChild(seg, parentId)
+      if (!folderId) {
+        try {
+          const response = await fetch('/api/kb/folders', {
+            method: 'POST', headers: { ...headers(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ space_id: requestSpace, name: seg, parent_id: parentId }),
+          })
+          const data = await responseJson(response)
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`)
+          folderId = String(data.folder_id ?? data.id ?? '')
+          if (!contextIsCurrent(requestEpoch, requestSpace)) return null
+          await loadKnowledgeAssets(requestSpace, requestEpoch)
+        } catch (e) {
+          // 本地目录列表可能过期（服务端已有同名目录）：刷新后按名再认一次，认不到才报错
+          if (!contextIsCurrent(requestEpoch, requestSpace)) return null
+          await loadKnowledgeAssets(requestSpace, requestEpoch)
+          folderId = findChild(seg, parentId)
+          if (!folderId) throw e
+        }
+      }
+      pathCache.set(prefix, folderId)
+      parentId = folderId || null
+    }
+    return parentId ?? ''
+  }
+  // 先把整批文件的目录层级建齐（逐文件拿到末级 folder_id），再走既有批量上传队列
+  const routeMap = new Map<File, { folderId: string; destination: string }>()
+  try {
+    for (const file of accepted) {
+      const dirSegs = dirSegsOf(file)
+      const folderId = dirSegs.length ? await ensurePath(dirSegs) : (baseParentId ?? '')
+      if (folderId === null) return
+      routeMap.set(file, { folderId, destination: destinationOf(dirSegs) })
+    }
+  } catch (e) {
+    if (contextIsCurrent(requestEpoch, requestSpace)) {
+      actionErr.value = `创建目录层级失败：${errorText(e)}。文件未上传，请重试或改用「选择文件」。`
+    }
     return
   }
-  // 复用同名同级目录；没有再调既有 POST /api/kb/folders（与「新建文件夹」对话框同一条契约）
-  let folderId = folders.value.find((folder) => folder.name === rootName && (folder.parent_id || null) === parentId)?.folder_id ?? ''
-  if (!folderId) {
-    try {
-      const response = await fetch('/api/kb/folders', {
-        method: 'POST', headers: { ...headers(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ space_id: requestSpace, name: rootName, parent_id: parentId }),
-      })
-      const data = await responseJson(response)
-      if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`)
-      folderId = String(data.folder_id ?? data.id ?? '')
-      if (!contextIsCurrent(requestEpoch, requestSpace)) return
-      await loadKnowledgeAssets(requestSpace, requestEpoch)
-    } catch (e) {
-      // 本地目录列表可能过期（服务端已有同名目录）：刷新后按名再认一次，认不到才报错
-      if (!contextIsCurrent(requestEpoch, requestSpace)) return
-      await loadKnowledgeAssets(requestSpace, requestEpoch)
-      folderId = folders.value.find((folder) => folder.name === rootName && (folder.parent_id || null) === parentId)?.folder_id ?? ''
-      if (!folderId) {
-        actionErr.value = `创建文件夹“${rootName}”失败：${errorText(e)}。文件未上传，请重试或改用「选择文件」。`
-        return
-      }
-    }
-  }
-  if (!folderId || !contextIsCurrent(requestEpoch, requestSpace)) return
-  uploadFolderId.value = folderId
-  void send(accepted)
+  if (!contextIsCurrent(requestEpoch, requestSpace)) return
+  void send(accepted, (file) => routeMap.get(file))
 }
 // 从 URL 添加入库（Y12）：服务端抓取 HTML/PDF → 与文件上传同一条 ingest 链。
 // 反馈复用上传队列行；目标目录沿用「上传到」选择。权威校验（SSRF/大小/类型）全在服务端。
@@ -1407,11 +1484,16 @@ async function ingestUrl() {
   const requestEpoch = contextEpoch
   const requestedFolder = uploadFolderId.value
   const targetFolder = folders.value.find((folder) => folder.folder_id === requestedFolder)
+  // 与 send() 同口径：目标目录已失效（folders 过期）时不静默落到根目录，明确报错
+  if (requestedFolder && !targetFolder) {
+    actionErr.value = '上传目标目录已失效，请刷新目录后重新选择。'
+    return
+  }
   const destination = targetFolder ? folderLabel(targetFolder) : '根目录 / 未分类'
   urlBusy.value = true
   actionErr.value = ''
   const row: UploadRow = { id: ++uploadId, name: url, state: 'doing', msg: '正在抓取并建立索引', destination }
-  uploads.value.unshift(row)
+  pushUpload(row)
   const rowId = row.id
   try {
     const body: Record<string, string> = { url, space_id: requestSpace }
@@ -1439,6 +1521,8 @@ async function ingestUrl() {
 // 生成描述（Y7）：AI 按文档开头摘录生成并写回；响应是整份 doc，直接取 description 更新行内展示
 async function generateDescription(d: Doc) {
   if (descGeneratingId.value) return
+  const requestSpace = spaceId.value
+  const requestEpoch = contextEpoch
   descGeneratingId.value = d.doc_id
   actionErr.value = ''
   try {
@@ -1446,15 +1530,17 @@ async function generateDescription(d: Doc) {
       method: 'POST', headers: { ...headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({}),
     })
     const data = await responseJson(resp)
+    // 全程按 requestEpoch+requestSpace 守卫：成功/失败都不写可能已不属当前空间的状态
+    if (!contextIsCurrent(requestEpoch, requestSpace)) return
     if (!resp.ok) {
       actionErr.value = data.error ?? `生成描述失败（HTTP ${resp.status}）`
       return
     }
     d.description = data.description ?? ''
   } catch (e) {
-    actionErr.value = `生成描述失败：${errorText(e)}`
+    if (contextIsCurrent(requestEpoch, requestSpace)) actionErr.value = `生成描述失败：${errorText(e)}`
   } finally {
-    descGeneratingId.value = ''
+    if (contextIsCurrent(requestEpoch, requestSpace)) descGeneratingId.value = ''
   }
 }
 async function reprocess(d: Doc) {
@@ -1566,8 +1652,11 @@ async function saveGrant() {
     const succeeded = Array.isArray(data.succeeded) ? data.succeeded.length : Number(data.succeeded) || 0
     if (failed.length) {
       grantFeedbackError.value = true
-      grantFeedback.value = `已成功 ${succeeded} 项，失败 ${failed.length} 项：${failed
-        .slice(0, 5).map((item: any) => `${item.role_code || item.grantee || '未知'}（${item.error || '失败'}）`).join('、')}`
+      const detail = failed
+        .slice(0, 5).map((item: any) => `${item.role_code || item.grantee || '未知'}（${item.error || '失败'}）`).join('、')
+      // 超过 5 条时补「等 N 条」，不让用户以为只有 5 条
+      const more = failed.length > 5 ? ` 等 ${failed.length} 条` : ''
+      grantFeedback.value = `已成功 ${succeeded} 项，失败 ${failed.length} 项：${detail}${more}`
       const available = new Set(roleOptions.value.map((role) => role.role_code))
       selectedRoleCodes.value = failed
         .map((item: any) => String(item.role_code || ''))
@@ -1577,12 +1666,8 @@ async function saveGrant() {
       grantTarget.value = ''
       selectedRoleCodes.value = []
     }
-    const response2 = await fetch(`/api/kb/space/${encodeURIComponent(requestSpace)}/grant`, { headers: headers() })
-    const refreshed = await responseJson(response2)
-    if (requestId === grantsRequestId && contextIsCurrent(requestEpoch, requestSpace) && grantOpen.value && response2.ok) {
-      grants.value = refreshed.grants ?? []
-      roleOptions.value = refreshed.roles ?? roleOptions.value
-    }
+    // 复用 refreshGrants（grants/roles/batch limit 一把刷，失败 codes 重选逻辑不被冲掉）
+    await refreshGrants(requestSpace, requestId, requestEpoch)
     if (requestId === grantsRequestId && contextIsCurrent(requestEpoch, requestSpace)) await loadSpaces(requestSpace)
   } catch (e) {
     if (requestId === grantsRequestId && contextIsCurrent(requestEpoch, requestSpace) && grantOpen.value) {
@@ -1657,12 +1742,27 @@ onBeforeUnmount(() => {
   uploadRequestId++
 })
 
+/** 主对话框打开即聚焦（aria-modal 的键盘起点；section 本身 tabindex=-1 可聚焦）。 */
+const panelEl = ref<HTMLElement>()
+onMounted(() => panelEl.value?.focus())
+
+/** WAI Tabs：←/→ 在 tab 间切换并移动焦点（自动激活模式）。 */
+function onTabKeydown(e: KeyboardEvent) {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+  const tabs: WorkbenchTab[] = ['documents', 'retrieval', 'graph', 'mindmap', 'eval']
+  const index = tabs.indexOf(activeTab.value)
+  const next = tabs[(index + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length]
+  activeTab.value = next
+  const nav = (e.currentTarget as HTMLElement | null)
+  nav?.querySelector<HTMLElement>(`#kb-${next}-tab`)?.focus()
+}
+
 void loadSpaces(props.initialSpace)
 </script>
 
 <template>
   <div class="kbp-mask" @click.self="closePanel">
-    <section class="kbp" role="dialog" aria-modal="true" aria-labelledby="kb-title" @keydown.esc="closePanel">
+    <section ref="panelEl" class="kbp" role="dialog" aria-modal="true" aria-labelledby="kb-title" tabindex="-1" @keydown.esc="closePanel">
       <header class="kbp-head">
         <div>
           <div class="kbp-title-line">
@@ -1688,13 +1788,13 @@ void loadSpaces(props.initialSpace)
             </option>
           </select>
           <div v-if="kbManager" class="space-actions">
-            <button v-if="currentSpace" class="secondary-btn" type="button" @click="openGrants">共享权限</button>
-            <button class="secondary-btn" type="button" @click="createOpen = true">新建空间</button>
+            <button v-if="currentSpace" class="secondary-btn" type="button" :disabled="switchingDisabled" @click="openGrants">共享权限</button>
+            <button class="secondary-btn" type="button" :disabled="switchingDisabled" @click="createErr = ''; createOpen = true">新建空间</button>
           </div>
         </section>
         <div v-if="spacesErr" class="action-error" role="alert">空间读取失败：{{ spacesErr }}</div>
 
-        <nav class="workbench-tabs" role="tablist" aria-label="知识库工作台">
+        <nav class="workbench-tabs" role="tablist" aria-label="知识库工作台" @keydown="onTabKeydown">
           <button
             id="kb-documents-tab" type="button" role="tab" :class="{ active: activeTab === 'documents' }"
             :aria-selected="activeTab === 'documents'" aria-controls="kb-documents-panel"
@@ -1759,13 +1859,14 @@ void loadSpaces(props.initialSpace)
                 <span class="folder-icon">▰</span><span>{{ row.folder.name }}</span><b>{{ row.folder.doc_count ?? folderCounts.get(row.folder.folder_id) ?? 0 }}</b>
               </button>
             </div>
-            <button v-if="docs.some((doc) => !doc.folder_id)" type="button" class="folder-node" :class="{ active: selectedFolderId === '__unfiled__' }" :aria-current="selectedFolderId === '__unfiled__' ? 'page' : undefined" :disabled="switchingDisabled" @click="selectFolder('__unfiled__')">
-              <span class="folder-icon">◇</span><span>未分类</span><b>{{ docs.filter((doc) => !doc.folder_id).length }}</b>
+            <button v-if="unfiledCount" type="button" class="folder-node" :class="{ active: selectedFolderId === '__unfiled__' }" :aria-current="selectedFolderId === '__unfiled__' ? 'page' : undefined" :disabled="switchingDisabled" @click="selectFolder('__unfiled__')">
+              <span class="folder-icon">◇</span><span>未分类</span><b>{{ unfiledCount }}</b>
             </button>
             <div v-if="foldersLoading" class="folder-state" role="status">正在读取目录…</div>
             <div v-else-if="foldersErr" class="folder-state error" role="alert">
               <span>目录加载失败</span>
-              <button type="button" class="text-btn" :disabled="loading || foldersLoading" @click="loadFolders()">重试</button>
+              <!-- 整体刷新：单调 loadFolders 走 ++assetsRequestId，会令在途的 docs 加载失效被静默丢弃 -->
+              <button type="button" class="text-btn" :disabled="loading || foldersLoading" @click="loadKnowledgeAssets()">重试</button>
             </div>
             <div v-else-if="folderApiAvailable !== false && !folders.length" class="folder-state">暂无文件夹</div>
             <p v-if="folderApiAvailable === false" class="folder-contract">当前服务端尚未启用目录接口；现有文档仍按“全部文档”管理。</p>
@@ -1778,7 +1879,7 @@ void loadSpaces(props.initialSpace)
                 <template v-if="selectedFolder">
                   <template v-for="folder in selectedFolderTrail" :key="folder.folder_id">
                     <span aria-hidden="true">/</span>
-                    <button type="button" :class="{ current: folder.folder_id === selectedFolderId }" @click="selectFolder(folder.folder_id)">{{ folder.name }}</button>
+                    <button type="button" :class="{ current: folder.folder_id === selectedFolderId }" :aria-current="folder.folder_id === selectedFolderId ? 'page' : undefined" @click="selectFolder(folder.folder_id)">{{ folder.name }}</button>
                   </template>
                 </template>
                 <template v-else-if="selectedFolderId === '__unfiled__'">
@@ -1788,7 +1889,7 @@ void loadSpaces(props.initialSpace)
               <small>{{ visibleDocs.length }} 份文档</small>
               <div v-if="selectedFolder && currentSpace?.writable" class="folder-commands">
                 <button class="text-btn" type="button" :disabled="switchingDisabled" @click="openFolderEdit">改名/移动</button>
-                <button class="text-btn danger" type="button" :disabled="!!folderDeletingId" @click="deleteSelectedFolder">{{ folderDeletingId ? '删除中' : '删除' }}</button>
+                <button class="text-btn danger" type="button" :disabled="switchingDisabled" @click="deleteSelectedFolder">{{ folderDeletingId ? '删除中' : '删除' }}</button>
               </div>
             </nav>
         <section v-if="currentSpace?.writable" class="upload-section" aria-label="上传文档">
@@ -1803,7 +1904,7 @@ void loadSpaces(props.initialSpace)
           <div
             class="drop-zone" :class="{ active: dragging, disabled: busy }" role="button" tabindex="0"
             :aria-busy="busy" :aria-disabled="busy" aria-label="选择或拖放文件上传"
-            @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false"
+            @dragover.prevent @dragenter.prevent="onDragEnter" @dragleave.prevent="onDragLeave"
             @drop.prevent="onDrop" @click="openFilePicker"
             @keydown.enter.prevent="openFilePicker" @keydown.space.prevent="openFilePicker"
           >
@@ -1811,14 +1912,14 @@ void loadSpaces(props.initialSpace)
             <span class="upload-mark" aria-hidden="true">↑</span>
             <div class="drop-copy">
               <strong>{{ busy ? '正在处理上传队列' : '拖放文件到此处，或点击选择（可多选）' }}</strong>
-              <span>支持 PDF/Word/Excel/PPT/txt/md/csv/json/log/html 与 png/jpg/webp/gif/bmp 等图片；单文件 ≤20MB，逐个上传逐个反馈。</span>
+              <span>支持 PDF/Word/Excel/PPT/txt/md/csv/json/log/html 与 png/jpg/webp/gif/bmp 等图片；单文件 ≤{{ MAX_UPLOAD_BYTES / 1024 / 1024 }}MB，逐个上传逐个反馈。</span>
             </div>
             <span class="primary-btn upload-action" aria-hidden="true">{{ busy ? '处理中' : '选择文件' }}</span>
           </div>
           <div class="dir-upload">
             <input ref="dirEl" type="file" webkitdirectory hidden @click.stop @change="onPickDir" />
-            <button class="secondary-btn" type="button" :disabled="busy" @click="openDirPicker">📁 上传文件夹</button>
-            <span class="dir-hint">文件夹名会建成同名 KB 文件夹（嵌套子目录不建层级）；不支持的类型与超 20MB 的文件逐个跳过并在队列中提示</span>
+            <button class="secondary-btn" type="button" :disabled="busy || folderApiAvailable === false" :title="folderApiAvailable === false ? '服务端尚未启用目录接口' : '上传整个文件夹'" @click="openDirPicker">▰ 上传文件夹</button>
+            <span class="dir-hint">按源文件夹的目录层级原样建 KB 文件夹（嵌套子目录逐级保留）；不支持的类型与超 {{ MAX_UPLOAD_BYTES / 1024 / 1024 }}MB 的文件逐个跳过并在队列中提示</span>
           </div>
 
           <form class="url-ingest" @submit.prevent="ingestUrl">
@@ -1836,7 +1937,7 @@ void loadSpaces(props.initialSpace)
           <div v-if="uploads.length" class="upload-queue" aria-live="polite">
             <div class="queue-head">
               <strong>本次处理</strong>
-              <button type="button" class="text-btn" @click="uploads = uploads.filter((u) => u.state === 'doing')">清除已完成</button>
+              <button type="button" class="text-btn" :disabled="!uploadsDoneCount" @click="uploads = uploads.filter((u) => u.state === 'doing')">清除已结束</button>
             </div>
             <div v-for="u in uploads" :key="u.id" class="queue-row" :class="u.state">
               <span class="queue-state" aria-hidden="true">{{ u.state === 'doing' ? '···' : u.state === 'ok' ? '✓' : u.state === 'partial' ? '!' : '×' }}</span>
@@ -1866,7 +1967,7 @@ void loadSpaces(props.initialSpace)
             <div class="library-tools">
               <label class="search-box">
                 <span class="sr-only">搜索文档</span>
-                <input v-model="search" type="search" placeholder="搜索名称、类型、状态或失败原因" />
+                <input v-model="search" type="text" placeholder="搜索文档（名称、标签、目录、状态等）" />
                 <button v-if="search" type="button" title="清空搜索" aria-label="清空搜索" @click="search = ''">×</button>
               </label>
               <button class="icon-btn" type="button" title="刷新列表" aria-label="刷新列表" :disabled="loading || switchingDisabled" @click="loadSpaces(spaceId)">↻</button>
@@ -1876,7 +1977,7 @@ void loadSpaces(props.initialSpace)
           <div class="filter-bar" aria-label="文档状态筛选">
             <button
               v-for="item in filters" :key="item.value" type="button"
-              :class="{ active: filter === item.value }" @click="filter = item.value"
+              :class="{ active: filter === item.value }" :aria-pressed="filter === item.value" @click="filter = item.value"
             >
               {{ item.label }} <span>{{ item.count }}</span>
             </button>
@@ -1885,7 +1986,7 @@ void loadSpaces(props.initialSpace)
           <div v-if="listErr" class="list-state error" role="alert">
             <strong>文档列表加载失败</strong>
             <span>{{ listErr }}</span>
-            <button class="secondary-btn" type="button" @click="loadSpaces(spaceId)">重新加载</button>
+            <button class="secondary-btn" type="button" :disabled="loading" @click="loadSpaces(spaceId)">重新加载</button>
           </div>
           <div v-else-if="loading && !docs.length" class="list-state">
             <strong>正在读取知识库</strong>
@@ -1899,7 +2000,7 @@ void loadSpaces(props.initialSpace)
           <div v-else-if="!visibleDocs.length" class="list-state empty">
             <strong>没有匹配的文档</strong>
             <span>调整关键词或切换状态筛选。</span>
-            <button class="secondary-btn" type="button" @click="search = ''; filter = 'all'">清除筛选</button>
+            <button class="secondary-btn" type="button" @click="search = ''; filter = 'all'; selectFolder('')">清除筛选</button>
           </div>
           <div v-else class="doc-table">
             <div class="doc-table-head" aria-hidden="true">
@@ -1930,7 +2031,8 @@ void loadSpaces(props.initialSpace)
               <div class="doc-status-cell">
                 <div class="status-line">
                   <span class="status-dot" aria-hidden="true"></span>
-                  <strong>{{ displayStatusText(d) }}</strong>
+                  <!-- strong 只放状态文案：quality.label 由同行的 badge 渲染，不重复两遍 -->
+                  <strong>{{ docStatusText(d) }}</strong>
                   <span v-if="d.quality?.label" class="quality-badge" :class="qualityClass(d.quality.level)">{{ d.quality.label }}</span>
                 </div>
                 <span class="status-hint" :class="{ notice: d.notice && !d.error }" :title="statusHint(d)">{{ statusHint(d) }}</span>
@@ -1941,7 +2043,7 @@ void loadSpaces(props.initialSpace)
                     <label class="doc-move" :title="`当前目录：${folderPath(d) || '根目录 / 未分类'}`">
                       <span>移动至</span>
                       <select
-                        class="doc-folder-select" :value="d.folder_id || ''" :disabled="!!docMovingId"
+                        class="doc-folder-select" :value="d.folder_id || ''" :disabled="!!docMovingId || folderApiAvailable === false"
                         :aria-label="`移动《${d.name}》到文件夹`"
                         @change="moveDoc(d, ($event.target as HTMLSelectElement).value)"
                       >
@@ -2060,6 +2162,8 @@ void loadSpaces(props.initialSpace)
           </div>
         </section>
 
+        <!-- graph/mindmap/eval 三个面板用 v-if 互斥挂载、切 tab 即销毁是刻意取舍：
+             keep-alive 保活会让隐藏画布的 RAF/轮询空转；评估草稿等瞬态丢失可接受，切回重来。 -->
         <section v-else-if="activeTab === 'graph'" id="kb-graph-panel" class="graph-section" role="tabpanel" aria-labelledby="kb-graph-tab">
           <KbGraph :token="token" :space-id="spaceId" :writable="!!currentSpace?.writable" @auth-expired="emit('auth-expired')" />
         </section>
@@ -2083,8 +2187,9 @@ void loadSpaces(props.initialSpace)
           </label>
           <label>
             <span>空间标识（可选）</span>
-            <input v-model="newSpaceId" maxlength="64" pattern="[A-Za-z0-9_-]+" placeholder="留空则自动生成" />
+            <input v-model="newSpaceId" maxlength="64" pattern="[A-Za-z0-9_-]+" title="仅字母、数字、下划线、短横线" placeholder="留空则自动生成" />
           </label>
+          <div v-if="createErr" class="action-error" role="alert">{{ createErr }}</div>
           <div class="confirm-actions">
             <button class="secondary-btn" type="button" :disabled="creating" @click="closeSpaceCreate()">取消</button>
             <button class="primary-btn" type="submit" :disabled="creating || !newSpaceName.trim()">{{ creating ? '创建中' : '创建空间' }}</button>
@@ -2219,6 +2324,20 @@ void loadSpaces(props.initialSpace)
         </form>
       </div>
 
+      <div v-if="folderDeleteConfirm && selectedFolder" class="confirm-mask" @click.self="closeFolderDeleteConfirm()">
+        <div class="confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="delete-folder-title" @keydown.esc.stop="closeFolderDeleteConfirm()">
+          <h3 id="delete-folder-title">删除文件夹？</h3>
+          <p>仅空文件夹可以删除。「{{ folderLabel(selectedFolder) }}」将被删除，且无法撤销。</p>
+          <div v-if="folderDeleteErr" class="action-error" role="alert">{{ folderDeleteErr }}</div>
+          <div class="confirm-actions">
+            <button class="secondary-btn" type="button" :disabled="!!folderDeletingId" @click="closeFolderDeleteConfirm()">取消</button>
+            <button class="danger-btn" type="button" :disabled="!!folderDeletingId" @click="removeFolderConfirmed">
+              {{ folderDeletingId ? '删除中' : '确认删除' }}
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div v-if="metadataDoc" class="confirm-mask" @click.self="closeMetadata()">
         <form class="confirm-box metadata-box" role="dialog" aria-modal="true" aria-labelledby="metadata-title" @submit.prevent="saveMetadata" @keydown.esc.stop="closeMetadata()">
           <h3 id="metadata-title">文档信息与关联</h3>
@@ -2242,7 +2361,7 @@ void loadSpaces(props.initialSpace)
             </label>
             <label>
               <span>生效日期</span>
-              <input v-model="metadataEffectiveFrom" type="date" />
+              <input v-model="metadataEffectiveFrom" type="date" :max="metadataEffectiveTo || undefined" />
             </label>
             <label>
               <span>失效日期</span>
@@ -2259,17 +2378,17 @@ void loadSpaces(props.initialSpace)
                 <h4 id="relation-title">关联文档</h4>
                 <span>关联内容会参与跨文档检索和答案组织</span>
               </div>
-              <button v-if="metadataRelatedIds.length" class="text-btn" type="button" @click="metadataRelatedIds = []">清空已选</button>
+              <button v-if="metadataRelatedIds.length" class="text-btn" type="button" :disabled="metadataSaving" @click="metadataRelatedIds = []">清空已选</button>
             </header>
             <div v-if="metadataLoading" class="relation-state" role="status">正在加载关联信息…</div>
             <template v-else-if="metadataRelationReady">
               <label class="relation-search">
                 <span class="sr-only">搜索关联文档</span>
-                <input v-model="metadataRelationSearch" placeholder="搜索文档名、文件夹、文档族或版本" />
+                <input v-model="metadataRelationSearch" type="search" placeholder="搜索文档名、文件夹、标签、文档族或版本" />
               </label>
               <div class="relation-summary">
                 <strong>已选 {{ metadataRelatedIds.length }}</strong>
-                <span>最多 50 篇</span>
+                <span>最多 {{ MAX_RELATED }} 篇</span>
               </div>
               <div v-if="metadataCandidateDocs.length" class="relation-options">
                 <label v-for="doc in metadataCandidateDocs" :key="doc.doc_id" class="relation-option">
@@ -2531,7 +2650,8 @@ void loadSpaces(props.initialSpace)
   color: var(--text-regular); font: 12px/1.7 var(--font-sans); overflow-wrap: anywhere;
 }
 .library-section { margin-top: 22px; }
-.doc-lineage:empty { display: none; }
+/* 特异性要压过 .doc-name-cell span:not(.file-type)（0,2,1），否则空 lineage 占位仍留 margin-top 缝隙 */
+.doc-name-cell .doc-lineage:empty { display: none; }
 .folder-create-box { width: min(460px, calc(100% - 32px)); }
 .folder-create-box > label { display: block; margin-top: 12px; }
 .folder-create-box > label > span { display: block; margin-bottom: 5px; color: var(--text-primary); font-size: 11.5px; font-weight: 650; }
@@ -2650,6 +2770,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   width: 100%; height: 34px; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px;
   outline: 0; background: var(--bg-card); color: var(--text-primary); font: inherit; font-size: 12px;
 }
+.create-box input:focus { border-color: var(--primary); box-shadow: var(--ring); }
 .grant-box { width: min(720px, calc(100% - 32px)); }
 .grant-form { display: grid; grid-template-columns: 112px minmax(150px, 1fr) 104px auto; align-items: end; gap: 8px; margin-top: 14px; }
 .grant-form label span { display: block; margin-bottom: 5px; color: var(--text-primary); font-size: 11.5px; font-weight: 650; }
@@ -2729,10 +2850,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .inferred-relations { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
 .inferred-relations strong { width: 100%; color: var(--text-muted); font-size: 10.5px; }
 .inferred-relations span { padding: 2px 6px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg-main); color: var(--text-muted); font-size: 10px; }
-.create-box input:focus { border-color: var(--primary); box-shadow: var(--ring); }
 .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-/* 文档表中间档：面板内容宽 < 文档表网格最小宽（≈800px）时操作列被裁 —— 820 之上先切卡片堆叠 */
+.kbp:focus { outline: none; }
+/* 文档表中间档：面板内容宽 < 文档表网格最小宽时操作列被裁 —— 1130px 断点先切卡片堆叠（820 是下一个媒体查询） */
 @media (max-width: 1130px) {
   .doc-table-head { display: none; }
   .doc-table { border: 0; overflow: visible; }

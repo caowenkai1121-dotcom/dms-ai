@@ -58,7 +58,7 @@ fn seed_clears_legacy_sales_time_cap_and_disables_untrusted_manager() {
     let seed = include_str!("../src/seed_defs.rs");
     let clears_time_cap = concat!(
         "UPDATE meta.metric SET version=$1, allowed_dimensions=$2, ",
-        "time_cap='' WHERE ds_id='dms' AND metric_code=$3"
+        "time_cap='' WHERE ds_id=$3 AND metric_code=$4"
     );
     assert!(seed.contains(clears_time_cap), "DWS 销售指标必须显式清空旧 yesterday time_cap");
 

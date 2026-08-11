@@ -1,4 +1,7 @@
-//! dms-ai 服务端：M0 骨架（/api/health）+ M1 权限内核（principal/scope/inject + scope 判官子命令）。
+//! dms-ai 服务端：axum HTTP 面（问数 /api/ask、会话 /api/conv*、知识库 /api/kb/*、数据地图
+//! /api/datamap/*、管理面 /api/admin/* 等）+ 判官/运维 CLI 子命令（ask、exec-sql、scope、
+//! meta sync/autodiscover/datamap-build/datamap-calibrate/lineage-build、eval-batch、
+//! why-not-compose、audit-exemplars 等；无参 = 启动服务）。
 
 mod admin_api;
 mod artifact_api;
@@ -27,8 +30,6 @@ mod query_log;
 mod quality_api;
 mod skills_api;
 mod trace_api;
-// 路由注册不在本轮（统一由集成方在下方 Router 处补 .route 两行）。
-// 集成方接线后这个 allow 一行删掉：两个 handler 一经 .route 引用，全模块即活。
 mod usage_api;
 mod vision_api;
 mod wework;
@@ -126,9 +127,10 @@ struct AppState {
 }
 
 impl AppState {
-    /// 配置快照（克隆 —— 读者拿的是当时那份，写者整体替换；`Settings: Clone` 是小 struct）
+    /// 配置快照（克隆 —— 读者拿的是当时那份，写者整体替换；`Settings: Clone` 是小 struct）。
+    /// 锁中毒（某写者 panic）容错取回：一次中毒不该让所有 handler 永久 panic。
     fn cfg(&self) -> db::Settings {
-        self.cfg.read().expect("cfg 锁中毒").clone()
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -230,7 +232,25 @@ async fn bootstrap_meta(owned: &OwnedStore, mysql: &ReadOnlyMySql) -> anyhow::Re
     Ok(())
 }
 
-fn llm_client(cfg: &db::Settings) -> llm::LlmClient {
+/// `split(';')` 逐句执行的 migrate 样板（chat / query_log 共用；semantic 那份在它自己 crate 里）。
+/// 🔴 split 纪律：DDL 文本里不许出现 `DO $$` 与**注释内 ASCII 分号**（会切出碎句，启动期才炸）。
+/// 全部语句包在一个事务里：中途失败整体回滚，不留半迁移态（句句幂等，下次启动重跑即自愈）。
+pub(crate) async fn run_ddl(pg: &sqlx::PgPool, ddl: &str) -> anyhow::Result<()> {
+    let mut tx = pg.begin().await?;
+    for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        sqlx::query(stmt).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 位置参数空串过滤（`serve.ps1 -Cmd` 按空格切参会产出空 token）：空串 = 该位缺省。
+/// `Some("")` 当 role_code 会让 `load_principal` 去查一个不存在的角色 —— 空串必须过滤掉。
+fn arg_slot(args: &[String], i: usize) -> Option<&str> {
+    args.get(i).map(|s| s.as_str()).filter(|s| !s.is_empty())
+}
+
+fn llm_client(cfg: &db::Settings) -> anyhow::Result<llm::LlmClient> {
     // 经供应商目录解析（文件供应商 = `llm_provider` 或按 base_url 推断）：文件值覆盖
     // 目录默认（老配置逐字等价），目录补文件缺省字段（只写 key 的最小配置也能起）。
     let name = if cfg.llm_provider.is_empty() {
@@ -238,11 +258,14 @@ fn llm_client(cfg: &db::Settings) -> llm::LlmClient {
     } else {
         cfg.llm_provider.as_str()
     };
-    let conf = db::resolve_provider(name, cfg).unwrap_or_else(|e| panic!("settings.json 的 LLM 配置无效: {e}"));
+    // 配置无效返回 Err（`main` 就是 anyhow::Result）：panic 无上下文链，
+    // 与启动失败路径的其他分支两种风格混用
+    let conf = db::resolve_provider(name, cfg)
+        .map_err(|e| anyhow::anyhow!("settings.json 的 LLM 配置无效: {e}"))?;
     let fallback = db::resolve_fallback_vision(cfg)
-        .unwrap_or_else(|e| panic!("settings.json 的备用多模态配置无效: {e}"))
+        .map_err(|e| anyhow::anyhow!("settings.json 的备用多模态配置无效: {e}"))?
         .map(|(_, conf)| conf);
-    llm::LlmClient::with_conf_and_fallback(conf, fallback)
+    Ok(llm::LlmClient::with_conf_and_fallback(conf, fallback))
 }
 
 /// 问数分析源（只读 MySQL 协议，当前为 Doris）。`DsId::new("dms")` 是历史固定标识：
@@ -258,8 +281,8 @@ async fn dms_source(cfg: &db::Settings, owned: &OwnedStore) -> anyhow::Result<Ar
         db::db_target_capability(cfg, &target),
     )
     .await
-    .map_err(|_| anyhow::anyhow!(
-        "分析库目标 {target} 连接失败：请检查目标配置、网络与只读权限"
+    .map_err(|e| anyhow::anyhow!(
+        "分析库目标 {target} 连接失败（{e}）：请检查目标配置、网络与只读权限"
     ))?;
     m.set_target_name(&target);
     // A8：数据源级查询策略（settings.json 的 mysql_targets.<name>.max_rows/timeout_ms），
@@ -281,8 +304,8 @@ async fn auth_source(cfg: &db::Settings) -> anyhow::Result<Arc<ReadOnlyMySql>> {
             dms_connector::mysql::MysqlCapability::IdentityPermission,
         )
         .await
-        .map_err(|_| anyhow::anyhow!(
-            "DMS 身份/权限库连接失败：请检查正式 settings 配置、网络与只读权限"
+        .map_err(|e| anyhow::anyhow!(
+            "DMS 身份/权限库连接失败（{e}）：请检查正式 settings 配置、网络与只读权限"
         ))?,
     ))
 }
@@ -311,8 +334,8 @@ async fn autodiscover(
 async fn owned_store(cfg: &db::Settings) -> anyhow::Result<OwnedStore> {
     Ok(OwnedStore::connect(&cfg.pg_url, 10)
         .await
-        .map_err(|_| anyhow::anyhow!(
-            "自有元数据库连接失败：请检查正式 settings 配置、网络与数据库权限"
+        .map_err(|e| anyhow::anyhow!(
+            "自有元数据库连接失败（{e}）：请检查正式 settings 配置、网络与数据库权限"
         ))?)
 }
 
@@ -385,6 +408,31 @@ fn parse_why_args(argv: &[String]) -> Result<WhyArgs, String> {
         }
     }
     Ok(a)
+}
+
+/// `meta datamap-calibrate [days]` 的天数位：宽容解析 = 假绿（敲 `abc` 静默按 30 天跑，
+/// 正是 `parse_why_args` 反对的形状）—— 非正整数直接报错。
+fn parse_calibrate_days(arg: Option<&str>) -> anyhow::Result<u32> {
+    match arg {
+        None => Ok(30),
+        Some(s) => match s.parse::<u32>() {
+            Ok(d) if d > 0 => Ok(d),
+            _ => anyhow::bail!("datamap-calibrate 的 days 必须是正整数（收到 {s:?}）"),
+        },
+    }
+}
+
+/// `audit-exemplars` 的参数：只认 `--fix`，且只扫子命令位（`args[2..]`，不含程序名）。
+/// 未知 flag 静默忽略与 `parse_why_args` 反对的是同一个形状：宽容解析 = 假绿。
+fn parse_audit_exemplars_args(argv: &[String]) -> Result<bool, String> {
+    let mut fix = false;
+    for a in argv {
+        match a.as_str() {
+            "--fix" => fix = true,
+            other => return Err(format!("未知参数「{other}」。用法：audit-exemplars [--fix]")),
+        }
+    }
+    Ok(fix)
 }
 
 /// `audit-exemplars` 喂给 `build_rules` 的召回表名。
@@ -542,6 +590,15 @@ async fn eval_batch_one(
     eval_batch_output(id, got, gold, ask_wall_ms, gold_ms, errors)
 }
 
+/// 多源注册中心统一构造：dsn 映射 + 各目标的数据源级策略（CLI 与服务四处同一形态，别各抄一份）。
+fn build_registry(cfg: &db::Settings) -> SourceRegistry {
+    let sources = SourceRegistry::new(cfg.dsn_map());
+    for (name, target) in &cfg.mysql_targets {
+        sources.set_policy(&DsId::new(name), target.policy());
+    }
+    sources
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 日志一律走 stderr：stdout 留给子命令的 JSON 输出（判官脚本要解析）
@@ -555,7 +612,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = db::load_settings()?;
 
-    let args: Vec<String> = std::env::args().collect();
+    // args_os + 显式报错：`std::env::args()` 遇非 UTF-8 argv 直接 panic，连句人话都没有
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| {
+            a.into_string()
+                .map_err(|a| anyhow::anyhow!("命令行参数含非 UTF-8 内容（{a:?}），拒绝启动"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     // M2 子命令：meta sync —— 采集 schema 入 PG 并播种警告/强制补表
     if args.len() >= 3 && args[1] == "meta" && args[2] == "sync" {
@@ -648,7 +711,7 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 3 && args[1] == "meta" && args[2] == "datamap-calibrate" {
         let owned = owned_store(&cfg).await?;
         let pg = owned.pool();
-        let days: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30);
+        let days = parse_calibrate_days(args.get(3).map(String::as_str))?;
         let r = dms_semantic::datamap_usage::calibrate_from_query_log(pg, days).await?;
         println!("{}", serde_json::json!({
             "window_days": r.window_days,
@@ -669,14 +732,29 @@ async fn main() -> anyhow::Result<()> {
         let pg = owned.pool();
         let ds = args.get(3).map(String::as_str).unwrap_or(ds_reg::DMS_DS_ID);
         let r = dms_semantic::lineage::build(pg, ds).await?;
-        println!("{r:?}");
+        // stdout 只出 JSON（其他子命令同）：Debug dump 脚本没法解析
+        println!("{}", serde_json::json!({
+            "ds": r.ds_id,
+            "high_tables": r.high_tables,
+            "ods_tables": r.ods_tables,
+            "pairs_evaluated": r.pairs_evaluated,
+            "pairs_skipped_no_schema": r.pairs_skipped_no_schema,
+            "skipped_below_threshold": r.skipped_below_threshold,
+            "edges": r.edges,
+            "by_catalog_mention": r.by_catalog_mention,
+            "by_overlap_strong": r.by_overlap_strong,
+            "by_overlap_mid": r.by_overlap_mid,
+            "by_overlap_weak": r.by_overlap_weak,
+            "corroborated_joinable": r.corroborated_joinable,
+            "tables_without_columns": r.tables_without_columns,
+        }));
         return Ok(());
     }
 
     // 子命令：review-pending —— 批量复核 pending 语料（SuperSonic MemoryReviewTask）
     if args.len() >= 2 && args[1] == "review-pending" {
         let owned = owned_store(&cfg).await?;
-        let client = llm_client(&cfg);
+        let client = llm_client(&cfg)?;
         let n = dms_agent::review::review_all_pending(&client, owned.pool(), 100).await?;
         println!("复核处理 {n} 条 pending 语料");
         return Ok(());
@@ -685,7 +763,7 @@ async fn main() -> anyhow::Result<()> {
     // 引擎 C 子命令：review-lessons —— 批量复核失败复盘产出的候选教训（candidate → active/disabled）
     if args.len() >= 2 && args[1] == "review-lessons" {
         let owned = owned_store(&cfg).await?;
-        let client = llm_client(&cfg);
+        let client = llm_client(&cfg)?;
         let n = dms_agent::review::review_lessons(&client, owned.pool(), 100).await?;
         println!("复核处理 {n} 条候选教训");
         return Ok(());
@@ -713,10 +791,7 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "resync-uploads" {
         let owned = owned_store(&cfg).await?;
         let pg = owned.pool();
-        let sources = SourceRegistry::new(cfg.dsn_map());
-        for (name, target) in &cfg.mysql_targets {
-            sources.set_policy(&DsId::new(name), target.policy());
-        }
+        let sources = build_registry(&cfg);
         let rows = ds_reg::list_datasources(pg).await?;
         let ups: Vec<_> = rows.iter().filter(|r| r.ds_id.starts_with("upload_")).collect();
         let mut ok = 0usize;
@@ -783,7 +858,8 @@ async fn main() -> anyhow::Result<()> {
                          也可以 `--cases <path>` 指到别处，或直接带问句参数单问。"
                     )
                 })?;
-                let v: serde_json::Value = serde_json::from_str(&txt)?;
+                let v: serde_json::Value = serde_json::from_str(&txt)
+                    .map_err(|e| anyhow::anyhow!("解析题库 {p} 失败：{e}"))?;
                 v["cases"]
                     .as_array()
                     .map(|a| {
@@ -883,7 +959,14 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "audit-exemplars" {
         let owned = owned_store(&cfg).await?;
         let pg = owned.pool();
-        let fix = args.iter().any(|a| a == "--fix");
+        let fix = match parse_audit_exemplars_args(&args[2..]) {
+            Ok(f) => f,
+            // 退 2 而不是 1：与 why-not-compose 同码，脚本能把「参数写错」与「跑完有结论」分开
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
         let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
             "SELECT id, question, sql, status FROM meta.sql_exemplar \
              WHERE status <> 'disabled' ORDER BY id",
@@ -894,10 +977,20 @@ async fn main() -> anyhow::Result<()> {
         for (id, q, sql, status) in &rows {
             // 召回表名从 SQL 自己抽（语料没存召回结果）：`build_rules` 的表级判据要它
             let tables = audit_tables(sql);
-            let rules =
-                dms_semantic::registry::caliber::build_rules(pg, ds_reg::DMS_DS_ID, q, &tables)
-                    .await
-                    .unwrap_or_default();
+            let rules = match dms_semantic::registry::caliber::build_rules(pg, ds_reg::DMS_DS_ID, q, &tables)
+                .await
+            {
+                Ok(r) => r,
+                // PG 出错 → 空规则 → `check_caliber` 恒干净 = 审计假绿（这正是本命令要防的失败形状）：
+                // 失败必须计入违规统计并留痕，不静默当零违规
+                Err(e) => {
+                    tracing::warn!("audit-exemplars #{id} 口径规则加载失败（按违规计入）: {e}");
+                    bad += 1;
+                    println!("[{status}] #{id} {q}");
+                    println!("    rules_load_failed · 口径规则加载失败: {e}");
+                    continue;
+                }
+            };
             let v = dms_kernel::check_caliber(sql, &rules);
             if v.is_empty() {
                 continue;
@@ -977,46 +1070,55 @@ async fn main() -> anyhow::Result<()> {
         let auth_mysql = auth_source(&cfg).await?;
         let pg = owned.pool();
         bootstrap_meta(&owned, &mysql).await?;
-        let client = llm_client(&cfg);
-        let sources = SourceRegistry::new(cfg.dsn_map());
-        for (name, target) in &cfg.mysql_targets {
-            sources.set_policy(&DsId::new(name), target.policy());
-        }
+        let client = llm_client(&cfg)?;
+        let sources = build_registry(&cfg);
         sources.preload(mysql.clone());
         let embed = dms_connector::embed::EmbedClient::new(&cfg.service_url);
 
-        use std::io::{BufRead, Write};
-        let stdin = std::io::stdin();
+        use std::io::Write;
+        use tokio::io::AsyncBufReadExt;
         let stdout = std::io::stdout();
         let mut output = std::io::BufWriter::new(stdout.lock());
-        for line in stdin.lock().lines() {
-            let response = match line {
-                Ok(line) => match serde_json::from_str::<EvalBatchReq>(&line) {
-                    Ok(req) => match req.validate() {
-                        Ok(()) => {
-                            eval_batch_one(
-                                req,
-                                &client,
-                                &auth_mysql,
-                                &mysql,
-                                &sources,
-                                pg,
-                                &embed,
-                                cfg.sc_samples,
-                            )
-                            .await
-                        }
-                        Err(e) => eval_batch_output(
-                            req.id,
-                            None,
-                            None,
-                            0,
-                            0,
-                            vec![format!("protocol: {e}")],
-                        ),
-                    },
-                    Err(e) => eval_batch_output(
+        // stdin 走 tokio 异步读：`std::io::stdin().lock().lines()` 是同步阻塞读，
+        // 题间等待会占住一个 runtime worker
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                // 持续性 stdin IO 错误：回一行错误后退出 —— 原地续跑只会无限刷错误行灌满下游
+                Err(e) => {
+                    let response = eval_batch_output(
                         serde_json::Value::Null,
+                        None,
+                        None,
+                        0,
+                        0,
+                        vec![format!("stdin: {e}")],
+                    );
+                    serde_json::to_writer(&mut output, &response)?;
+                    output.write_all(b"\n")?;
+                    output.flush()?;
+                    break;
+                }
+            };
+            let response = match serde_json::from_str::<EvalBatchReq>(&line) {
+                Ok(req) => match req.validate() {
+                    Ok(()) => {
+                        eval_batch_one(
+                            req,
+                            &client,
+                            &auth_mysql,
+                            &mysql,
+                            &sources,
+                            pg,
+                            &embed,
+                            cfg.sc_samples,
+                        )
+                        .await
+                    }
+                    Err(e) => eval_batch_output(
+                        req.id,
                         None,
                         None,
                         0,
@@ -1030,7 +1132,7 @@ async fn main() -> anyhow::Result<()> {
                     None,
                     0,
                     0,
-                    vec![format!("stdin: {e}")],
+                    vec![format!("protocol: {e}")],
                 ),
             };
             serde_json::to_writer(&mut output, &response)?;
@@ -1052,16 +1154,13 @@ async fn main() -> anyhow::Result<()> {
         let auth_mysql = auth_source(&cfg).await?;
         let pg = owned.pool();
         bootstrap_meta(&owned, &mysql).await?;
-        let client = llm_client(&cfg);
+        let client = llm_client(&cfg)?;
         // 空串 = 该位缺省。位置式参数的必然代价：只传 prev 不传 role 时得给 role 占一个空位，
         // 而 `Some("")` 当 role_code 会让 `load_principal` 去查一个不存在的角色 —— 空串必须过滤掉。
-        let slot = |i: usize| args.get(i).map(|s| s.as_str()).filter(|s| !s.is_empty());
+        let slot = |i: usize| arg_slot(&args, i);
         let p = principal::load_principal(&auth_mysql, &args[2], slot(4)).await?;
         // 判官链路（regression.py / kb_eval.py 走这条）与服务共用同一条选源+闸门管道
-        let sources = SourceRegistry::new(cfg.dsn_map());
-        for (name, target) in &cfg.mysql_targets {
-            sources.set_policy(&DsId::new(name), target.policy());
-        }
+        let sources = build_registry(&cfg);
         sources.preload(mysql.clone());
         // CLI 是短生命周期进程：图就绪状态不在内存里，靠持久化标记接管
         // （仅数仓目标可能有图；标记缺席/不是当前目标 = 回落非图路径，与未同步一致）。
@@ -1095,7 +1194,7 @@ async fn main() -> anyhow::Result<()> {
         let mysql = dms_source(&cfg, &owned).await?;
         let auth_mysql = auth_source(&cfg).await?;
         bootstrap_meta(&owned, &mysql).await?;
-        let p = principal::load_principal(&auth_mysql, &args[2], args.get(4).map(|s| s.as_str())).await?;
+        let p = principal::load_principal(&auth_mysql, &args[2], arg_slot(&args, 4)).await?;
         let scope = scope::compute_scope_cached(&auth_mysql, &p).await?;
         // 判官与服务共用同一条闸门（`dms_agent::gate`）——评测可信的前提是走的就是生产那条管道。
         // ⚠️ gold SQL 不带 LIMIT 时会被 `check()` 追加 `LIMIT 200`：这是**已知且已记录**的行为
@@ -1122,7 +1221,7 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 3 && args[1] == "scope" {
         let auth_mysql = auth_source(&cfg).await?;
         let login = &args[2];
-        let role = args.get(3).map(|s| s.as_str());
+        let role = arg_slot(&args, 3);
         let p = principal::load_principal(&auth_mysql, login, role).await?;
         let scope = scope::compute_scope(&auth_mysql, &p).await?;
         let sets = scope.sets();
@@ -1149,6 +1248,20 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 🔴 未知子命令兜底：带了参数却没命中任何子命令分支（如 `meta syn` 拼错、`ask` 少带一个
+    // 位置参数），**不许静默落入服务启动** —— 判官/脚本会把一个服务器挂在那里，而参数错误
+    // 本该立刻红。退 2 与 why-not-compose 的参数错误同码。
+    if args.len() >= 2 {
+        eprintln!(
+            "未知子命令「{}」。无参 = 启动服务；子命令：\n  \
+             meta sync|autodiscover|datamap-build|datamap-calibrate|lineage-build\n  \
+             review-pending、review-lessons、check-sql、resync-uploads、why-not-compose、\n  \
+             audit-exemplars、graph sync、retrieve、eval-batch、ask、exec-sql、scope",
+            args[1..].join(" ")
+        );
+        std::process::exit(2);
+    }
+
     let owned = owned_store(&cfg).await?;
     let auth_mysql = auth_source(&cfg).await?;
     let mysql = dms_source(&cfg, &owned).await?;
@@ -1166,18 +1279,17 @@ async fn main() -> anyhow::Result<()> {
     // `spec.dsn_ref` 查表。主分析源只允许通过 preload 命中当前非 dms 连接池；即便元数据里
     // 留有历史 `dsn_ref="mysql_url"`，`Settings::dsn_map` 也刻意不暴露 DMS 权限 DSN，避免
     // preload 缺失时懒连接回权限库。
-    let sources = Arc::new(SourceRegistry::new(cfg.dsn_map()));
-    for (name, target) in &cfg.mysql_targets {
-        sources.set_policy(&DsId::new(name), target.policy());
-    }
+    let sources = Arc::new(build_registry(&cfg));
     sources.preload(mysql.clone());
 
+    // KB 单文档字节上限：AppState 与 upload 路由的 body limit 共用一份（两处各算一遍 = 改一忘一）
+    let kb_max_bytes = cfg.kb_max_mb * 1024 * 1024;
     let state = Arc::new(AppState {
         auth_mysql,
         mysql,
         owned,
         sources,
-        llm: llm_client(&cfg),
+        llm: llm_client(&cfg)?,
         dms_base_url: cfg.dms_base_url.clone(),
         wework: wework::WeworkCfg {
             corpid: cfg.wework_corpid.clone(),
@@ -1189,7 +1301,7 @@ async fn main() -> anyhow::Result<()> {
         embed: dms_connector::embed::EmbedClient::new(&cfg.service_url),
         kb_cfg: dms_knowledge::ingest::IngestCfg {
             root: std::path::PathBuf::from(&cfg.kb_root),
-            max_bytes: cfg.kb_max_mb * 1024 * 1024,
+            max_bytes: kb_max_bytes,
         },
         mcp_keys: cfg.mcp_keys.clone(),
         graph_status: Arc::new(std::sync::Mutex::new(String::from("never"))),
@@ -1213,12 +1325,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             // 启动补偿：从未同步（never）或上次失败（fail）先补一轮 —— 图问句不该等凌晨 3 点
             // （电脑重启后 status 回 never，今天的购买边可能已经是上周的）
-            let stale = {
-                let s = st.graph_status.lock().unwrap().clone();
-                s.starts_with("never") || s.starts_with("fail")
-            };
+            // 单次 lock 取值 + 中毒容错（同 health 的读法）：连取两次之间值不会变，取一次就够
+            let status = st.graph_status.lock().map(|s| s.clone()).unwrap_or_default();
+            let stale = status.starts_with("never") || status.starts_with("fail");
             if stale {
-                tracing::info!("graph sync 启动补偿：{}", st.graph_status.lock().unwrap());
+                tracing::info!("graph sync 启动补偿：{status}");
                 graph_sync_and_record(&st).await;
             }
             loop {
@@ -1305,7 +1416,7 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/kb/upload",
             post(kb_api::upload).layer(axum::extract::DefaultBodyLimit::max(
-                (cfg.kb_max_mb * 1024 * 1024) as usize,
+                kb_max_bytes as usize,
             )),
         )
         .route("/api/kb/docs", get(kb_api::docs))
@@ -1410,12 +1521,19 @@ async fn main() -> anyhow::Result<()> {
     if cfg.insecure_login_fallback {
         tracing::warn!(
             listen = %cfg.listen,
-            "⚠️ insecure_login_fallback=true：无会话 token 时采信请求自报的 login_name              —— 任何能连到上面这个地址的人都能冒充任意用户（含管理员）。             仅供本机判官脚本使用；生产请删掉该键，并把 docker 端口映射收到 127.0.0.1。"
+            "⚠️ insecure_login_fallback=true：无会话 token 时采信请求自报的 login_name —— 任何能连到该地址的人都能冒充任意用户（含管理员）。仅供本机判官脚本使用；生产请删掉该键，并把 docker 端口映射收到 127.0.0.1。"
         );
     }
-    tracing::info!("dms-ai server listening on {}", cfg.listen);
+    // bind 成功再报 listening：先报后绑的话，bind 失败时日志已谎称在监听
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
-    axum::serve(listener, app).await?;
+    tracing::info!("dms-ai server listening on {}", cfg.listen);
+    axum::serve(listener, app)
+        // Ctrl-C 优雅停机：等在途请求收尾，不直接掐断在途 ask 与 spawn 出的观测 INSERT
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("收到 Ctrl-C，开始优雅停机");
+        })
+        .await?;
     Ok(())
 }
 
@@ -1425,6 +1543,17 @@ struct SsoReq {
     dms_token: String,
     /// DMS 当前激活角色（可选，前端知道）
     role_code: Option<String>,
+}
+
+/// 「单角色自动选、零角色 admin 兜底」的自动激活判据 —— api_login / api_wework_login 共用，
+/// `sso_role` 的未指定角色分支也是它。判据本身不许再抄第二份（多角色恒 None = 必须显式选，
+/// 不替用户默认 —— 不同角色数据权限档差异巨大）。
+fn auto_active_role(roles: &[String], administrator: bool) -> Option<String> {
+    match roles.len() {
+        1 => Some(roles[0].clone()),
+        0 if administrator => Some("admin".into()),
+        _ => None,
+    }
 }
 
 fn sso_role(
@@ -1439,9 +1568,7 @@ fn sso_role(
         Some(role) if roles.iter().any(|r| r == role) => Ok(Some(role.to_string())),
         Some("admin") if administrator && roles.is_empty() => Ok(Some("admin".into())),
         Some(role) => anyhow::bail!("该账号无角色 {role}"),
-        None if roles.len() == 1 => Ok(Some(roles[0].clone())),
-        None if roles.is_empty() && administrator => Ok(Some("admin".into())),
-        None => Ok(None),
+        None => Ok(auto_active_role(roles, administrator)),
     }
 }
 
@@ -1463,16 +1590,25 @@ async fn api_sso(
     }
     let login_name = auth::verify_dms_token(&st.dms_base_url, &req.dms_token)
         .await
-        .map_err(|_| err(StatusCode::UNAUTHORIZED, "DMS 身份认证失败，请重新登录".into()))?;
+        .map_err(|e| {
+            tracing::warn!("DMS token 验真失败: {e}");
+            err(StatusCode::UNAUTHORIZED, "DMS 身份认证失败，请重新登录".into())
+        })?;
     let (identity, roles) = tokio::join!(
         auth::active_identity(&st.auth_mysql, &login_name),
         principal::list_roles(&st.auth_mysql, &login_name),
     );
     let administrator = identity
-        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "DMS 账号状态校验暂不可用".into()))?
+        .map_err(|e| {
+            tracing::warn!("DMS 账号状态校验失败: {e}");
+            err(StatusCode::SERVICE_UNAVAILABLE, "DMS 账号状态校验暂不可用".into())
+        })?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "DMS 账号已禁用或已删除".into()))?;
     let roles = roles
-        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "读取 DMS 角色失败".into()))?;
+        .map_err(|e| {
+            tracing::warn!("读取 DMS 角色失败: {e}");
+            err(StatusCode::SERVICE_UNAVAILABLE, "读取 DMS 角色失败".into())
+        })?;
     let roles: Vec<String> = roles
         .into_iter()
         .filter(|role| administrator || role != "admin")
@@ -1483,7 +1619,10 @@ async fn api_sso(
     let role = sso_role(&roles, req.role_code.as_deref(), administrator)
         .map_err(|_| err(StatusCode::FORBIDDEN, "所选角色不可用".into()))?;
     let token = auth::issue_from(login_name.clone(), role.clone(), auth::SessionSource::DmsSso)
-        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "会话服务暂不可用".into()))?;
+        .map_err(|e| {
+            tracing::warn!("SSO 会话签发失败: {e}");
+            err(StatusCode::SERVICE_UNAVAILABLE, "会话服务暂不可用".into())
+        })?;
     Ok(Json(serde_json::json!({
         "token": token,
         "login_name": login_name,
@@ -1544,6 +1683,13 @@ async fn api_wework_login(
         }
         response
     };
+    // per-IP 令牌桶（与 api_sso/api_login 同一闸）：回调的 code 枚举面不设限就是敞开暴力试
+    if !auth::ip_rate_allow(&auth::client_ip(&headers)) {
+        return clear((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "请求过于频繁，请稍后再试" })),
+        ).into_response());
+    }
     if !wework::consume_oauth_state(
         &q.state,
         cookie_value(&headers, wework::OAUTH_STATE_COOKIE),
@@ -1583,11 +1729,7 @@ async fn api_wework_login(
                     Json(serde_json::json!({ "error": "该账号无可用角色" })),
                 ).into_response());
             }
-            let active = match roles.len() {
-                1 => Some(roles[0].clone()),
-                0 if administrator => Some("admin".into()),
-                _ => None,
-            };
+            let active = auto_active_role(&roles, administrator);
             let token = match auth::issue_from(login_name, active, auth::SessionSource::Wework) {
                 Ok(token) => token,
                 Err(_) => return clear((
@@ -1623,22 +1765,31 @@ async fn api_login(
     if !auth::ip_rate_allow(&auth::client_ip(&headers)) {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后再试"));
     }
-    if auth::normalized_login(&req.login_name).is_none() || req.password.is_empty() || req.password.len() > 256 {
+    if auth::normalized_login(&req.login_name).is_none() || req.password.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "请输入账号和密码"));
+    }
+    if req.password.len() > 256 {
+        return Err(err(StatusCode::BAD_REQUEST, "密码超长（上限 256 字节），请确认后重试"));
     }
     if !auth::login_allowed(&req.login_name) {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "登录失败次数过多，请 5 分钟后重试"));
     }
     let verified = auth::verify_password(&st.auth_mysql, &req.login_name, &req.password)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "登录服务暂不可用"))?;
+        .map_err(|e| {
+            tracing::warn!("密码校验服务失败: {e}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "登录服务暂不可用")
+        })?;
     auth::record_login(&req.login_name, verified.is_some());
     let Some((login_name, administrator)) = verified else {
         return Err(err(StatusCode::UNAUTHORIZED, "账号或密码错误，账号已禁用或密码已过期"));
     };
     let roles = principal::list_roles(&st.auth_mysql, &login_name)
         .await
-        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "读取 DMS 角色失败"))?;
+        .map_err(|e| {
+            tracing::warn!("读取 DMS 角色失败: {e}");
+            err(StatusCode::SERVICE_UNAVAILABLE, "读取 DMS 角色失败")
+        })?;
     let roles: Vec<String> = roles
         .into_iter()
         .filter(|role| administrator || role != "admin")
@@ -1646,13 +1797,12 @@ async fn api_login(
     if roles.is_empty() && !administrator {
         return Err(err(StatusCode::FORBIDDEN, "该账号无可用角色"));
     }
-    let active = match roles.len() {
-        1 => Some(roles[0].clone()),
-        0 if administrator => Some("admin".into()),
-        _ => None,
-    };
+    let active = auto_active_role(&roles, administrator);
     let token = auth::issue(login_name.clone(), active.clone())
-        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "会话服务暂不可用"))?;
+        .map_err(|e| {
+            tracing::warn!("登录会话签发失败: {e}");
+            err(StatusCode::SERVICE_UNAVAILABLE, "会话服务暂不可用")
+        })?;
     Ok(Json(serde_json::json!({
         "token": token, "login_name": login_name, "roles": roles, "active": active,
     })))
@@ -1727,7 +1877,6 @@ struct AskReq {
     refs: Option<Vec<String>>,
 }
 
-/// 从 header/body 解析身份（Bearer 会话 token 优先，回退 login_name）
 /// 请求身份：**Bearer 会话 token 是唯一可信来源**。
 ///
 /// 🔴 `login_name` 回退默认**关**（`Settings::insecure_login_fallback`）。开着等于没有认证：
@@ -1788,9 +1937,12 @@ async fn api_llm_capabilities(
         "vision": effective_vision.is_some(),
         "vision_model": effective_vision.as_ref().map(|v| v.model.clone()),
         "vision_provider": effective_vision.as_ref().map(|v| v.provider.clone()),
-        "vision_fallback": effective_vision.as_ref().map(|v| v.fallback).unwrap_or(false),
+        "vision_fallback": effective_vision.as_ref().is_some_and(|v| v.fallback),
     })))
 }
+
+/// 推荐位条数：语料召回与兜底补齐共用同一个数（两处写死 = 改一忘一）
+const SUGGEST_LIMIT: i64 = 6;
 
 /// 【A15】冷启动推荐：人工复核过（enabled）的真实问句，不足时兜底固定四条。
 /// 不需要 LLM：它们既是真实问法又背着「问过、对过」两层验证（`suggest_questions` 的注释）。
@@ -1809,13 +1961,13 @@ async fn api_suggest(
         .await
         .map_err(|_| err(StatusCode::FORBIDDEN, "当前账号或角色不可用".into()))?;
     let mut qs =
-        dms_semantic::registry::exemplar::suggest_questions(st.owned.pool(), ds_reg::DMS_DS_ID, 6)
+        dms_semantic::registry::exemplar::suggest_questions(st.owned.pool(), ds_reg::DMS_DS_ID, SUGGEST_LIMIT)
             .await;
     // 语料不足时兜底（冷启动第一天语料库是空的，推荐位不能也是空的）
     const FALLBACK: &[&str] =
         &["本月销售额是多少", "销售额按省份", "有多少订单", "今年退款额是多少"];
     for f in FALLBACK {
-        if qs.len() >= 6 {
+        if qs.len() >= SUGGEST_LIMIT as usize {
             break;
         }
         if !qs.iter().any(|x| x == f) {
@@ -1836,16 +1988,10 @@ async fn api_ask(
     let p = principal::load_principal(&st.auth_mysql, &login_name, role_code.as_deref())
         .await
         .map_err(|_| err(StatusCode::FORBIDDEN, "当前账号或角色不可用".into()))?;
-    // 会话归属校验：非属主禁止读写（防越权借他人 conv_id 泄露上一问/写入消息）
+    // 会话归属校验：非属主禁止读写（防越权借他人 conv_id 泄露上一问/写入消息）——
+    // 判据与文案收口在 `chat::ensure_owner`（api_conv_msgs/steer 同一闸）
     if let Some(cid) = req.conv_id {
-        match chat::conv_owner(st.owned.pool(), cid).await {
-            Ok(Some(owner)) if owner == login_name => {}
-            Ok(_) => return Err(err(StatusCode::FORBIDDEN, "无权访问该会话".into())),
-            Err(_) => return Err(err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "会话状态读取失败，请稍后重试".into(),
-            )),
-        }
+        chat::ensure_owner(st.owned.pool(), cid, &login_name).await?;
     }
     // 多轮追问改写用的上一轮 (问句, 那一轮执行的 SQL)（同会话）。
     // SQL 那一半是新加的载荷：上一轮的口径（哪张表/哪个时间列/哪个过滤）只在 SQL 里。
@@ -1885,8 +2031,8 @@ async fn api_ask(
                 &req.question,
                 prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice())),
                 req.ds.as_deref(),
-                // 会话 id 透传到 `query_log` 与三张日志表 —— `chat.rs:117` 的亏就是
-                // 「query_log 没有 conv_id，从它拿不回本会话上一轮」
+                // 会话 id 透传到 `query_log` 与三张日志表 —— `chat.rs` 的亏就是
+                // 「query_log 当年没有 conv_id，从它拿不回本会话上一轮」
                 req.conv_id.map(|c| c.to_string()).as_deref(),
                 // 【深度模式】SC 抬到 ≥3：多数派投票是现成的「AI 深度参与生成」件
                 //（配置 sc_samples 已 ≥3 时不降 —— max 不是 overwrite）
@@ -1908,7 +2054,7 @@ async fn api_ask(
                     )
                 }
             })?;
-            serde_json::to_value(&r).unwrap()
+            serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败")
         }
         // `Answer` 带 `kind:"text"`，前端 K2 的 `KbAnswer` 分支按它分派；`route` 是 `"knowledge"`
         triage::Intent::Knowledge => {
@@ -1918,13 +2064,14 @@ async fn api_ask(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "暂时无法完成知识检索，请稍后重试".into(),
                 ))?;
-            serde_json::to_value(&a).unwrap()
+            serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败")
         }
     };
-    // 存会话消息（用户问 + AI 结果），首问顺手设标题
+    // 存会话消息（用户问 + AI 结果），首问顺手设标题。失败 warn 留痕后吞掉：
+    // 消息丢失不允许无声，但也不炸主链路（纪律见 `chat::save_msg_logged`）
     if let Some(cid) = req.conv_id {
-        let _ = chat::save_msg(st.owned.pool(), cid, "user", &req.question, None).await;
-        let _ = chat::save_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+        chat::save_msg_logged(st.owned.pool(), cid, chat::ROLE_USER, &req.question, None).await;
+        chat::save_msg_logged(st.owned.pool(), cid, chat::ROLE_AI, "", Some(&payload)).await;
     }
     Ok(Json(payload))
 }
@@ -1956,7 +2103,7 @@ async fn ask(
     prev: Option<dms_agent::ask::PrevTurn<'_>>,
     explicit_ds: Option<&str>,
     // 会话 id（`chat.msg.conv_id`）。HTTP 聊天有它时透传到 `query_log` 与三张日志表 ——
-    // `chat.rs:117` 的亏就是「query_log 没有 conv_id，从它拿不回本会话上一轮」。
+    // `chat.rs` 的亏就是「query_log 当年没有 conv_id，从它拿不回本会话上一轮」。
     // CLI / `mcp_api::tool_ask` 无会话概念恒传 `None`（与 `explicit_ds` 同一个约定）。
     conv_id: Option<&str>,
     sc_samples: usize,
@@ -1969,12 +2116,13 @@ async fn ask(
     let trace = query_log::Trace::default();
     // 🔴 一次问答一个 `trace_id`（三表共用）+ 一次会话一个 `conv_id`。
     // `correction_log` / `failure_log` / `query_log` 三张表原来各记一段、拼不回同一次问答 —
-    // 「数字错了是模型写错还是校正器改坏」查不出来（`chat.rs:117` 已吃过一次这个亏）。
+    // 「数字错了是模型写错还是校正器改坏」查不出来（`chat.rs` 已吃过一次这个亏）。
     let trace_id = uuid::Uuid::new_v4().to_string();
     // HTTP 有 `conv_id` 用它；CLI 没有会话概念时与 `trace_id` 相同（单轮即单会话）。
     let conv_id = conv_id.map(str::to_string).unwrap_or_else(|| trace_id.clone());
     trace.set_trace(&trace_id, &conv_id);
-    tracing::info!(trace_id = %trace_id, conv_id = %conv_id, "一次问答的关联键已生成");
+    // debug 而非 info：每次问答一条是纯噪声（trace_id 已进 query_log 三表，那里才是一手台账）
+    tracing::debug!(trace_id = %trace_id, conv_id = %conv_id, "一次问答的关联键已生成");
     // `AskCtx.llm` 要 `&Arc<dyn ChatModel>`（语料复核与失败复盘要 `tokio::spawn`）。
     // `LlmClient::clone` 共享同一个底层 HTTP 连接池（见 `llm.rs`），这次装箱不多出第二个客户端。
     // 门禁 ④「server 的 HTTP 客户端只许出现在身份面文件」不过滤注释行 —— 那个库名连写在
@@ -2086,7 +2234,11 @@ async fn api_convs(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (login, _) = resolve_identity(&st, &headers, &q.login_name, &None)
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "未认证" }))))?;
-    let convs = chat::list_convs(st.owned.pool(), &login).await.unwrap_or_default();
+    let convs = chat::list_convs(st.owned.pool(), &login)
+        .await
+        // PG 挂了报「空会话列表」会掩盖故障 —— 降级照降，但必须留痕
+        .inspect_err(|e| tracing::warn!(login = %login, "会话列表读取失败，按空列表降级: {e}"))
+        .unwrap_or_default();
     Ok(Json(serde_json::json!({ "convs": convs })))
 }
 
@@ -2114,12 +2266,13 @@ async fn api_conv_msgs(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (login, _) = resolve_identity(&st, &headers, &q.login_name, &None)
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "未认证" }))))?;
-    // 会话归属校验（防越权读他人会话）
-    match chat::conv_owner(st.owned.pool(), id).await {
-        Ok(Some(owner)) if owner == login => {}
-        _ => return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "无权访问该会话" })))),
-    }
-    let msgs = chat::conv_msgs(st.owned.pool(), id).await.unwrap_or_default();
+    // 会话归属校验（防越权读他人会话）—— 判据与文案收口在 `chat::ensure_owner`（api_ask/steer 同一闸）；
+    // 属主查询 DB 错映 500（并进 403 会把故障藏成「无权」，与 api_ask 同一口径）
+    chat::ensure_owner(st.owned.pool(), id, &login).await?;
+    let msgs = chat::conv_msgs(st.owned.pool(), id)
+        .await
+        .inspect_err(|e| tracing::warn!(conv_id = id, "会话消息读取失败，按空会话降级: {e}"))
+        .unwrap_or_default();
     Ok(Json(serde_json::json!({ "msgs": msgs })))
 }
 
@@ -2131,7 +2284,13 @@ async fn api_conv_delete(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (login, _) = resolve_identity(&st, &headers, &q.login_name, &None)
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "未认证" }))))?;
-    let _ = chat::delete_conv(st.owned.pool(), id, &login).await;
+    chat::delete_conv(st.owned.pool(), id, &login)
+        .await
+        .inspect_err(|e| tracing::warn!(conv_id = id, "会话删除失败: {e}"))
+        .map_err(|_| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "删除会话失败，请稍后重试" })),
+        ))?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -2148,7 +2307,14 @@ async fn api_conv_branch(
     match chat::branch_conv(st.owned.pool(), id, &login, req.from_seq).await {
         Ok(Some((conv_id, copied))) => Ok(Json(serde_json::json!({ "conv_id": conv_id, "copied": copied }))),
         Ok(None) => Err((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "无权访问该会话" })))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))),
+        // 原始错误只进服务端 warn：把内部错误原文吐给客户端会外泄细节，且与其他端点口径不一
+        Err(e) => {
+            tracing::warn!(conv_id = id, "分支会话失败: {e}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "分支会话失败，请稍后重试" })),
+            ))
+        }
     }
 }
 
@@ -2187,15 +2353,17 @@ async fn graph_sync_and_record(st: &AppState) {
     let assets = warehouse_graph_specs();
     let msg = match dms_connector::graph::sync(&st.mysql, st.owned.pool(), &docs, &assets).await {
         Ok((c, g, e)) => {
-            format!("ok {} customers={c} goods={g} edges={e}", chrono::Local::now().format("%F %T"))
+            let msg =
+                format!("ok {} customers={c} goods={g} edges={e}", chrono::Local::now().format("%F %T"));
+            tracing::info!("graph sync 完成：{msg}");
+            msg
         }
-        Err(_) => format!("fail {} graph_sync_failed", chrono::Local::now().format("%F %T")),
+        Err(e) => {
+            // 失败原因只进 warn：status 串是健康面 wire（health 的 graph_sync 字段），形状保持不变
+            tracing::warn!("graph sync 失败（次日重试）: {e}");
+            format!("fail {} graph_sync_failed", chrono::Local::now().format("%F %T"))
+        }
     };
-    if msg.starts_with("ok") {
-        tracing::info!("graph sync 完成：{msg}");
-    } else {
-        tracing::warn!("graph sync 失败（次日重试）：{msg}");
-    }
     *st.graph_status.lock().unwrap() = msg;
 }
 
@@ -2377,7 +2545,7 @@ mod tests {
             .split("// M3 子命令：ask")
             .next()
             .unwrap();
-        let loop_at = branch.find("for line in stdin.lock().lines()").expect("NDJSON 驻留循环不见了");
+        let loop_at = branch.find("lines.next_line().await").expect("NDJSON 驻留循环不见了");
         for once in [
             "owned_store(&cfg)",
             "dms_source(&cfg, &owned)",
@@ -2434,8 +2602,184 @@ mod tests {
         assert!((60..=24 * 3600).contains(&s), "{s}");
     }
 
+    /// 配置无效走 `Err` 而不是 `panic!`：`main` 返回 `anyhow::Result`，启动失败不许两种风格混用
+    #[test]
+    fn llm_client_returns_result_instead_of_panicking() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn llm_client(")
+            .nth(1)
+            .expect("llm_client 没了 —— 顺手把这条判据一起改")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(!body.contains("panic!"), "配置无效 panic 没有上下文链，必须返回 Err：{body}");
+        assert!(
+            src.contains(concat!("fn llm_client(cfg: &db::Settings) -> anyhow::Result<", "llm::LlmClient>")),
+            "llm_client 必须返回 Result"
+        );
+    }
+
+    /// `datamap-calibrate [days]` 的天数位：宽容解析 = 假绿（敲 `abc` 静默按 30 天跑）
+    #[test]
+    fn calibrate_days_is_strict() {
+        assert_eq!(super::parse_calibrate_days(None).unwrap(), 30, "缺省 30 天");
+        assert_eq!(super::parse_calibrate_days(Some("7")).unwrap(), 7);
+        for bad in ["abc", "0", "-3", "1.5", ""] {
+            assert!(super::parse_calibrate_days(Some(bad)).is_err(), "{bad:?} 该报错却被接受了");
+        }
+    }
+
+    /// 位置参数空串过滤（`serve.ps1 -Cmd` 按空格切参会产出空 token）：空串 = 该位缺省。
+    /// `Some("")` 当 role_code 会让 `load_principal` 去查一个不存在的角色。
+    #[test]
+    fn empty_argv_slot_is_absent() {
+        let argv: Vec<String> = ["ask", "u", "q", ""].iter().map(|s| s.to_string()).collect();
+        assert_eq!(super::arg_slot(&argv, 3), None, "空串必须当缺省");
+        assert_eq!(super::arg_slot(&argv, 9), None, "越界位是 None");
+        let argv2: Vec<String> = ["scope", "u", "city_manager"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(super::arg_slot(&argv2, 2), Some("city_manager"));
+    }
+
+    /// `audit-exemplars` 只认 `--fix` 且只扫子命令位：未知 flag 静默忽略 = 宽容解析 = 假绿
+    #[test]
+    fn audit_exemplars_args_are_strict() {
+        assert!(!super::parse_audit_exemplars_args(&[]).unwrap());
+        assert!(super::parse_audit_exemplars_args(&["--fix".to_string()]).unwrap());
+        assert!(super::parse_audit_exemplars_args(&["--wat".to_string()]).is_err(), "未知 flag 必须报错");
+        assert!(super::parse_audit_exemplars_args(&["x".to_string()]).is_err(), "位置参数没有含义");
+    }
+
+    /// 「单角色自动选、零角色 admin 兜底」：login/wework/sso 未指定角色分支共用同一判据
+    #[test]
+    fn auto_active_role_single_or_admin_fallback() {
+        let one = vec!["city_manager".to_string()];
+        assert_eq!(super::auto_active_role(&one, false).as_deref(), Some("city_manager"));
+        let many = vec!["admin".to_string(), "city_manager".to_string()];
+        assert_eq!(super::auto_active_role(&many, false), None, "多角色必须显式选，不替用户默认");
+        assert_eq!(super::auto_active_role(&[], true).as_deref(), Some("admin"), "零角色 admin 兜底");
+        assert_eq!(super::auto_active_role(&[], false), None);
+    }
+
+    /// `lineage-build` stdout 必须是 JSON（其他子命令全是 JSON，判官/脚本要解析），不许 Debug dump
+    #[test]
+    fn lineage_build_prints_json_not_debug() {
+        let src = include_str!("main.rs");
+        let branch = src
+            .split("args[2] == \"lineage-build\"")
+            .nth(1)
+            .expect("lineage-build 分支没了 —— 顺手把这条判据一起改")
+            .split("return Ok(());")
+            .next()
+            .unwrap();
+        assert!(!branch.contains(concat!("println!(\"{r:", "?}\")")), "stdout 不许用 Debug 格式");
+        assert!(branch.contains("serde_json::json!"), "lineage-build 必须输出 JSON");
+    }
+
+    /// 🔴 未知子命令不许静默落入服务启动（判官/脚本会把一个服务器挂在那）：
+    /// 兜底必须在服务启动段之前，打印用法并退 2（与 why-not-compose 参数错误同码）。
+    #[test]
+    fn unknown_subcommand_never_falls_into_server_boot() {
+        let src = include_str!("main.rs");
+        let guard = src.find("未知子命令").expect("未知子命令兜底没了");
+        let boot = src.find("chat::migrate(owned.pool()).await?;").expect("服务启动段没了");
+        assert!(guard < boot, "兜底必须在服务启动段之前");
+        let tail = &src[guard..boot];
+        assert!(tail.contains("std::process::exit(2)"), "参数错误要退 2：{tail}");
+    }
+
+    /// argv 走 `args_os` + 显式报错：`std::env::args()` 遇非 UTF-8 参数直接 panic
+    #[test]
+    fn args_are_read_as_os_strings() {
+        let src = include_str!("main.rs");
+        assert!(src.contains(concat!("std::env::args_", "os()")), "argv 必须走 args_os");
+        assert!(!src.contains(concat!("std::env::args()", ".collect")), "args() 遇非 UTF-8 会 panic");
+    }
+
+    /// 启动序列：bind 成功才报 listening（先报后绑 = bind 失败时日志谎称在监听）；
+    /// `axum::serve` 必须接 Ctrl-C 优雅停机（不掐断在途 ask 与观测 INSERT）。
+    #[test]
+    fn server_binds_before_logging_and_shuts_down_gracefully() {
+        let src = include_str!("main.rs");
+        let bind = src.find("tokio::net::TcpListener::bind").expect("bind 没了");
+        let log = src.find("dms-ai server listening on").expect("监听日志没了");
+        assert!(bind < log, "必须先 bind 成功再报 listening");
+        assert!(src.contains(concat!("with_graceful", "_shutdown")), "axum::serve 没有接优雅停机");
+    }
+
+    /// 会话属主闸唯一事实源：api_ask 与 api_conv_msgs 都走 `chat::ensure_owner`
+    ///（判据/文案一字不动；第三处调用点在 chat.rs 的 steer）
+    #[test]
+    fn conv_owner_gate_is_shared() {
+        let src = include_str!("main.rs");
+        assert_eq!(
+            src.matches(concat!("chat::ensure", "_owner(")).count(),
+            2,
+            "api_ask/api_conv_msgs 必须共用 ensure_owner（各写一份判据必漂）"
+        );
+    }
+
+    /// 会话端点失败口径：删除/分支的 DB 错映 500 通用文案并 warn 留痕
+    ///（不恒 `ok:true`、不把内部错误原文吐给客户端）
+    #[test]
+    fn conv_endpoints_map_db_errors_to_generic_500() {
+        let src = include_str!("main.rs");
+        let del = src
+            .split("async fn api_conv_delete")
+            .nth(1)
+            .expect("api_conv_delete 没了 —— 顺手把这条判据一起改")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(del.contains("StatusCode::INTERNAL_SERVER_ERROR") && del.contains("tracing::warn!"),
+            "删除失败不许恒 ok:true（要 500 + warn）：{del}");
+        let br = src
+            .split("async fn api_conv_branch")
+            .nth(1)
+            .expect("api_conv_branch 没了 —— 顺手把这条判据一起改")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(!br.contains("e.to_string()"), "branch 500 不许把内部错误原文吐给客户端");
+        assert!(br.contains("tracing::warn!"), "branch 失败必须 warn 留痕");
+    }
+
+    /// 企微回调与 sso/login 同一道 per-IP 限流闸（回调的 code 枚举面不设限 = 敞开暴力试）
+    #[test]
+    fn wework_callback_has_ip_rate_limit() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("async fn api_wework_login")
+            .nth(1)
+            .expect("api_wework_login 没了 —— 顺手把这条判据一起改")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let gate = body.find("ip_rate_allow").expect("企微回调缺 per-IP 限流");
+        let state = body.find("consume_oauth_state").expect("state 校验没了");
+        assert!(gate < state, "限流必须在 state/code 校验之前（先截流量再验票据）：{body}");
+    }
+
+    /// stdin 持续 IO 错误：回一行错误后必须 break —— 原地续跑只会无限刷错误行灌满下游；
+    /// stdin 走 tokio 异步读（同步 `lock().lines()` 题间阻塞占住一个 runtime worker）。
+    #[test]
+    fn eval_batch_stdin_error_breaks_the_loop() {
+        let src = include_str!("main.rs");
+        let branch = src
+            .split(concat!("if args.len() >= 2 && args[1] == ", "\"eval-batch\""))
+            .nth(1)
+            .expect("eval-batch CLI 分支不见了")
+            .split("// M3 子命令：ask")
+            .next()
+            .unwrap();
+        assert!(branch.contains(concat!("tokio::io::", "stdin()")), "stdin 必须走 tokio 异步读");
+        let err_arm = branch.split("stdin: {e}").nth(1).expect("stdin 错误分支不见了");
+        let window = &err_arm[..err_arm.len().min(400)];
+        assert!(window.contains("break"), "stdin 读取出错必须 break 退出循环：{window}");
+    }
+
     /// 🔴 **三表必须共用同一个 `trace_id`** —— `correction_log` / `failure_log` / `query_log`
-    /// 原来各记一段、拼不回同一次问答（`chat.rs:117` 的亏：「数字错了是模型写错还是
+    /// 原来各记一段、拼不回同一次问答（`chat.rs` 的亏：「数字错了是模型写错还是
     /// 校正器改坏」查不出来）。这条钉的是「`trace_id` 真的透传到了三张表」：
     /// `AskCtx`（agent 侧）、`log_correction_traced` / `log_failure_traced`（semantic 侧）、
     /// `query_log::insert`（server 侧）三处各一处引用，缺一处就拼不回。

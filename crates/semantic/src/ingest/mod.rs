@@ -36,15 +36,39 @@ pub const ORIGIN_UPLOAD: &str = "upload";
 /// 就成了被文档背书、绕开全部 untrusted 机制的指令。
 ///
 /// 剥：控制字符与换行（折成空格）、`<` `>`（HTML/标签形态）、`【⚠️`（我们自己的警告前缀，
-/// 外部文本冒用即冒充口径警告）、`##`（markdown 小标题，能在 prompt 里另起一节）；截 120 字。
-/// 我们自己播种的 `table_doc.warn` 不经此函数 —— 那是内部语料，`【⚠️` 正是它的载荷。
+/// 外部文本冒用即冒充口径警告 —— 只剥这个**前缀**本身；孤立残留的 `】` 刻意保留，
+/// 它不带指令语义，再剥会误伤正常括号文本）、`##`（markdown 小标题，能在 prompt 里另起一节）；
+/// 截 120 字。我们自己播种的 `table_doc.warn` 不经此函数 —— 那是内部语料，`【⚠️` 正是它的载荷。
 pub fn sanitize_comment(raw: &str) -> String {
-    let flat: String = raw
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .filter(|c| !matches!(c, '<' | '>'))
-        .collect();
-    flat.replace("【⚠️", "").replace("##", "").trim().chars().take(120).collect()
+    // 单趟完成（原 map→filter→collect→replace×2→trim→take→collect 共 4 次 String 分配）；
+    // take(120) 之后再 trim_end：截断点恰落在空白前时不留尾空格
+    let mut out = String::with_capacity(raw.len().min(128));
+    let mut it = raw.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '<' | '>' => {}
+            '#' => {
+                if it.peek() == Some(&'#') {
+                    it.next();
+                } else {
+                    out.push('#');
+                }
+            }
+            '【' => {
+                // 与 replace("【⚠️", "") 逐字同义：只剥完整三字符形态（含变体选择符）
+                let mut probe = it.clone();
+                if probe.next() == Some('⚠') && probe.next() == Some('\u{fe0f}') {
+                    it.next();
+                    it.next();
+                } else {
+                    out.push('【');
+                }
+            }
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out.trim().chars().take(120).collect::<String>().trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -63,5 +87,34 @@ mod tests {
         assert_eq!(sanitize_comment("订单状态：0 暂存 108 无效"), "订单状态：0 暂存 108 无效");
         // 超长注释截 120 字（prompt 预算 + 长注释多是码值枚举）
         assert_eq!(sanitize_comment(&"啊".repeat(300)).chars().count(), 120);
+    }
+
+    /// 边界：空进空出、纯空白归零、120 不截、121 截到 120、截断点不留尾空格。
+    #[test]
+    fn sanitize_edge_cases() {
+        assert_eq!(sanitize_comment(""), "");
+        assert_eq!(sanitize_comment("  \n\t "), "");
+        assert_eq!(sanitize_comment(&"啊".repeat(120)).chars().count(), 120, "120 不截");
+        assert_eq!(sanitize_comment(&"啊".repeat(121)).chars().count(), 120, "121 截到 120");
+        // 截断点恰落在空白前：take 后再 trim_end
+        let s = sanitize_comment(&format!("{} 尾", "啊".repeat(119)));
+        assert!(!s.ends_with(' '), "截断后不许留尾空格：{s:?}");
+        // 不完整的警告前缀（缺变体选择符）不剥
+        assert!(sanitize_comment("【⚠测试").contains("【⚠"), "残缺前缀原样保留");
+    }
+
+    /// ponytail 牵引：`column_doc.origin` 列进 DDL 那天本测试必须红 —— 回来给写入侧加 bind
+    /// （取值必须用本文件两个常量，别写字面量）。今天列还没进 DDL，本测试恒绿。
+    #[test]
+    fn origin_column_landing_drags_the_write_path() {
+        let ddl = include_str!("../ddl.rs");
+        let landed = ddl.contains("meta.column_doc ADD COLUMN IF NOT EXISTS origin");
+        if landed {
+            let sync = include_str!("schema_sync.rs");
+            assert!(
+                sync.contains("ORIGIN_INFORMATION_SCHEMA"),
+                "origin 列已进 DDL，schema_sync 写入侧还没用本文件常量"
+            );
+        }
     }
 }

@@ -11,6 +11,7 @@ use crate::registry::{catalog_allows_column, ds_pred, table_asset_live_pred_at};
 use sqlx::PgPool;
 
 /// 业务术语（meta.term 行）
+#[derive(Debug)]
 pub struct TermDef {
     pub term: String,
     pub definition: String,
@@ -18,6 +19,9 @@ pub struct TermDef {
 }
 
 /// 值链接码表（meta.value_map 行）。`match_kind`：eq=等值换码 / like=组合值列须 LIKE '%码%'
+/// （与 `model::ValueRef` 同表同字段的另一份行类型：字段名不同，合并要动 server 侧消费点
+/// —— 欠账，两处注释互指。）
+#[derive(Debug)]
 pub struct ValueMap {
     pub table_name: String,
     pub column_name: String,
@@ -29,6 +33,7 @@ pub struct ValueMap {
 /// 实体名值域声明（meta.value_domain 行）：这一列的取值是**业务实体名**，不是码值。
 /// **取值不在这张表里**：由 `meta autodiscover` 的名称型探针灌进 `meta.value_map`
 /// （`name = code = 取值`，复用码值表不新建 —— 重跑即自适应），读取见 `load_domain_values`。
+#[derive(Debug)]
 pub struct ValueDomain {
     pub table_name: String,
     pub column_name: String,
@@ -42,8 +47,10 @@ pub async fn load_value_domains(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<Val
         crate::registry::ds_pred(1),
         table_asset_live_pred_at("", 1)
     );
+    // ORDER BY 钉死行序：caliber 的 domain_rules 产出规则序不随物理行序漂
     let rows: Vec<(String, String, String)> = sqlx::query_as(&format!(
-        "SELECT table_name, column_name, note FROM meta.value_domain WHERE 1 = 1{ds_pred}",
+        "SELECT table_name, column_name, note FROM meta.value_domain WHERE 1 = 1{ds_pred}
+         ORDER BY table_name, column_name",
     ))
     .bind(ds)
     .fetch_all(pg)
@@ -73,7 +80,8 @@ pub async fn load_domain_values(
         "SELECT v.table_name, v.column_name, v.name FROM meta.value_map v
          JOIN meta.value_domain d ON d.table_name = v.table_name
            AND d.column_name = v.column_name AND d.ds_id IN (v.ds_id, '*')
-         WHERE 1 = 1{ds_pred}",
+         WHERE 1 = 1{ds_pred}
+         ORDER BY v.table_name, v.column_name, v.name",
     ))
     .bind(ds)
     .fetch_all(pg)
@@ -97,11 +105,24 @@ pub fn longest_value_hit<'a>(
     question: &str,
     values: impl IntoIterator<Item = &'a str>,
 ) -> Option<&'a str> {
-    let mut vs: Vec<&str> = values.into_iter().filter(|v| v.chars().count() >= 2).collect();
-    vs.sort_by_key(|v| std::cmp::Reverse(v.chars().count()));
-    vs.into_iter().find(|v| question.contains(*v))
+    // 长度键随收集预算一次（原来 sort_by_key 的 key 在 O(n log n) 次比较里重算 chars().count()）
+    let mut vs: Vec<(usize, &str)> = values
+        .into_iter()
+        .filter_map(|v| {
+            let n = v.chars().count();
+            (n >= 2).then_some((n, v))
+        })
+        .collect();
+    // 早退判空：空取值集不进 sort/find
+    if vs.is_empty() {
+        return None;
+    }
+    vs.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    vs.into_iter().find(|(_, v)| question.contains(*v)).map(|(_, v)| v)
 }
 
+/// 术语加载。无 asset-live 谓词的豁免说明：term 不挂物理表（纯文本知识，无表活性可判），
+/// 刻意只按 status/ds 过滤 —— 漂移守卫（grep 谓词）读到这里别当漏网。
 pub async fn load_terms(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<TermDef>> {
     let rows: Vec<(String, String, Vec<String>)> = sqlx::query_as(&format!(
         "SELECT term, definition, aliases FROM meta.term WHERE status = 'active'{ds_pred}",
@@ -116,6 +137,10 @@ pub async fn load_terms(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<TermDef>> {
         .collect())
 }
 
+/// 命中侧码值全量加载。
+/// 🔴 与 `model::load_value_map` 同表两份加载：过滤口径（`catalog_allows_column` vs
+/// `catalog_allows_table`）、返回类型都不同 —— 各自服务不同判据，改一边先看另一边。
+/// ORDER BY 与 model 侧同序（确定性：同名多列的卡序/码查找不随物理行序漂）。
 pub async fn load_value_maps(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<ValueMap>> {
     let ds_pred = format!(
         "{}{}",
@@ -124,7 +149,7 @@ pub async fn load_value_maps(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<ValueM
     );
     let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(&format!(
         "SELECT table_name, column_name, name, code, match_kind
-         FROM meta.value_map WHERE 1 = 1{ds_pred}",
+         FROM meta.value_map WHERE 1 = 1{ds_pred} ORDER BY name, table_name, column_name",
     ))
     .bind(ds)
     .fetch_all(pg)

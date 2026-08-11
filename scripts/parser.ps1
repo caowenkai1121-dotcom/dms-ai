@@ -11,7 +11,7 @@
 #
 # 端口为什么默认 8078 而不是 8077：宿主机 8077 上的 embed 服务**正在跑**（主线程在用它测量），
 # 抢端口会打断它。8078 是 8077 的**完全替身**：/parse 与 /chunk 本地做（全格式），
-# /embed 与 /health 透传给宿主机 8077。切过去只改 settings.json 的 `service_url`，
+# /embed 与 /health 透传给宿主机 8077。切过去只改 settings.docker.json 的 `service_url`，
 # Rust 侧一行不改（`service_url` 是单一键，embed 与文档服务同址 —— 裁决 V1）。
 #
 # 🔴 凭据：不传任何凭据给容器，也不挂 settings.json —— 本服务只解析文件、不连库。
@@ -24,6 +24,7 @@
 param(
     [ValidateSet('build', 'up', 'down', 'probe')]
     [string]$Action = 'up',
+    [ValidateRange(1,65535)]
     [int]$Port = 8078
 )
 $ErrorActionPreference = 'Stop'
@@ -46,8 +47,9 @@ $mounts = @(
     '-v', 'D:\kbdata:/kbdata',
     '--add-host', 'host.docker.internal:host-gateway',
     # /embed 透传给宿主机 embed 服务：fastembed + 95MB 模型没必要再进本镜像一份。
-    # ⚠️ 宿主机 embed_service.serve 绑的是 127.0.0.1 —— 从容器连不上，需要它改绑 0.0.0.0
-    # （那是 tools/ 的一行，不在本轮范围，见交付说明的 needs_from_others）。
+    # ⚠️ 宿主机 embed_service.serve 默认绑 127.0.0.1 —— 从容器连不上；serve 有 host 参数，
+    # 建议绑 172.17.0.1（docker 网桥，只放本机容器进），不要绑 0.0.0.0（会把解析/向量面
+    # 暴露给整个网段，与 embed_service.py 自己的警告口径一致）。
     # 没配通也不会静默：/embed 会回 503 明说，不是回空向量。
     '-e', 'EMBED_UPSTREAM=http://host.docker.internal:8077'
 )

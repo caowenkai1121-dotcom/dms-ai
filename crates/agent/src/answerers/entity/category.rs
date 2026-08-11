@@ -2,16 +2,19 @@
 
 use dms_kernel::present::{Kpi, Semantic};
 
-use super::{
-    build_card, candidate_card, esc, fetch_rows, prefix_hint, AskCtx, AskResult, Candidate, Kind,
-};
+use super::{build_card, candidate_card, esc, fetch_rows, AskCtx, AskResult, Candidate, Kind};
 
-pub(super) async fn card(cx: &AskCtx<'_>, name: &str) -> anyhow::Result<Option<AskResult>> {
+/// 「精确行」的判定与 SQL 侧 `=`（ci 校对）同口径：trim + ASCII 大小写不敏感。
+fn name_eq(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+pub(super) async fn card(cx: &AskCtx<'_>, name: &str, explicit: bool) -> anyhow::Result<Option<AskResult>> {
     // 分类**经营指标**仍未进默认销售合同（事实内分类列未验收，fail-closed 不变）；
     // 分类主档（商品数/清单）与事实合同无关：生产读 `t_goods.goods_category_name`，
     // 数仓镜像该列为空，改读已验证的 `DW.dim_sku.class2`（与商品卡同一来源）。
+    // `explicit` 由调用方透传（它手里就有 parsed.kind）—— 别再第三次完整 parse 问句。
     let warehouse = cx.source.is_warehouse();
-    let explicit = prefix_hint(cx.question) == Some(Kind::Category);
     let n = esc(name);
     let found_sql = if warehouse {
         let pred = if explicit {
@@ -46,7 +49,9 @@ pub(super) async fn card(cx: &AskCtx<'_>, name: &str) -> anyhow::Result<Option<A
     let exact_row = found.rows.iter().find(|row| {
         row.first()
             .and_then(|value| value.as_str())
-            .is_some_and(|value| value.trim() == name.trim())
+            // SQL 侧 `=`（ci 校对）大小写不敏感，Rust 侧同口径：否则 SQL 认为精确命中的行
+            // 在这里认不出，落进候选分支
+            .is_some_and(|value| name_eq(value, name))
     });
     if exact_row.is_none() && found.rows.len() > 1 {
         let candidates = found
@@ -54,11 +59,9 @@ pub(super) async fn card(cx: &AskCtx<'_>, name: &str) -> anyhow::Result<Option<A
             .iter()
             .filter_map(|row| {
                 let name = row.first()?.as_str()?.trim().to_string();
-                (!name.is_empty()).then(|| Candidate {
-                    kind: Kind::Category,
-                    code: row.get(1).and_then(|value| value.as_str()).unwrap_or_default().to_string(),
-                    name,
-                })
+                // 候选卡的「编码」列不塞字段名（'class2'/'goods_category_name' 是给引擎看的，
+                // 不是给用户看的编码）—— 展示语义错位，给空串
+                (!name.is_empty()).then(|| Candidate { kind: Kind::Category, code: String::new(), name })
             })
             .collect::<Vec<_>>();
         if candidates.len() > 1 {
@@ -66,7 +69,7 @@ pub(super) async fn card(cx: &AskCtx<'_>, name: &str) -> anyhow::Result<Option<A
         }
     }
     let selected = exact_row.unwrap_or(&found.rows[0]);
-    let category = selected[0].as_str().unwrap_or_default().trim().to_string();
+    let category = selected.first().and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
     if category.is_empty() {
         return Ok(None);
     }
@@ -74,10 +77,15 @@ pub(super) async fn card(cx: &AskCtx<'_>, name: &str) -> anyhow::Result<Option<A
         .get(2)
         .and_then(crate::answerers::hits::cell_num)
         .unwrap_or(0.0);
+    // 同分类多行理论上去重过，但 dim 脏数据可重复 —— 去重；全空白名字不出坏建议
+    let mut seen_others = std::collections::HashSet::new();
     let others: Vec<String> = found.rows
         .iter()
-        .filter(|row| row.first().and_then(|value| value.as_str()).is_some_and(|value| value.trim() != category))
-        .map(|r| format!("试试：商品分类{}", r[0].as_str().unwrap_or_default().trim()))
+        .filter_map(|r| r.first()?.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && *v != category.as_str())
+        .filter(|v| seen_others.insert(v.to_string()))
+        .map(|v| format!("试试：商品分类{v}"))
         .collect();
     let c = esc(&category);
     let goods_sql = if warehouse {
@@ -92,7 +100,10 @@ pub(super) async fn card(cx: &AskCtx<'_>, name: &str) -> anyhow::Result<Option<A
                AND goods_category_name = '{c}' ORDER BY goods_name LIMIT 20"
         )
     };
-    let Some(goods) = fetch_rows(cx, &goods_sql).await? else { return Ok(None) };
+    // 清单查询失败不丢整卡：分类名与商品数已在手，降级出无清单卡（空 RowSet 走正常拼装）
+    let goods = fetch_rows(cx, &goods_sql)
+        .await?
+        .unwrap_or_else(|| dms_connector::source::RowSet { columns: vec![], rows: vec![], redacted: vec![] });
     let items = vec![
         Kpi { label: "商品分类".into(), value: serde_json::Value::from(category.clone()), semantic: Semantic::Goods, delta: None },
         Kpi { label: "分类商品数".into(), value: serde_json::Value::from(goods_n), semantic: Semantic::Count, delta: None },
@@ -103,12 +114,23 @@ pub(super) async fn card(cx: &AskCtx<'_>, name: &str) -> anyhow::Result<Option<A
         format!("{category}销售额按省区"),
         format!("买过{category}的客户有哪些"),
     ]);
+    // 展示 SQL 两条都留（分类命中 + 商品清单 —— hits.rs 的「头查询；明细」同族）
     Ok(Some(build_card(
-        &format!("{found_sql}; 商品分类总览卡"),
-        &category,
+        &format!("{found_sql};\n\n-- 商品清单\n{goods_sql}"),
         items,
         goods,
         drill,
         cx,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    /// 「精确行」与 SQL 侧 `=`（ci 校对）同口径：trim + ASCII 大小写不敏感
+    #[test]
+    fn exact_row_matching_is_case_insensitive_like_mysql_ci() {
+        assert!(super::name_eq(" 烤肠 ", "烤肠"));
+        assert!(super::name_eq("SKU", "sku"));
+        assert!(!super::name_eq("烤肠", "烤肠王"));
+    }
 }

@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{SetExpr, Statement, TableFactor};
+use sqlparser::ast::{Query, SetExpr, Statement, TableFactor};
 use sqlparser::parser::Parser;
 
 use crate::errors::GuardError;
@@ -32,7 +32,7 @@ pub fn is_safe_select_with(sql: &str, d: &dyn Dialect, sensitive: &[&str]) -> Re
         Err(e) => {
             // parser 拒收的方言形态（如 `INTO OUTFILE`）：仍要落到红线原因，
             // 不能只剩一句含糊的「语法不合法」。剥字面量后按词边界扫写操作词。
-            let stripped = strip_literals_and_comments(sql).to_lowercase();
+            let stripped = lowered_stripped(sql);
             if let Some(tok) = forbidden_token(&stripped) {
                 return Err(GuardError::WriteToken(tok.to_string()));
             }
@@ -40,12 +40,15 @@ pub fn is_safe_select_with(sql: &str, d: &dyn Dialect, sensitive: &[&str]) -> Re
         }
     };
     if stmts.len() != 1 {
+        // 0 条（空 SQL）也报 MultiStatement：语义是「不是恰好一条」，不单开变体
         return Err(GuardError::MultiStatement);
     }
     if !matches!(stmts[0], Statement::Query(_)) {
         return Err(GuardError::NotSelect);
     }
-    // MySQL 可执行注释（/*! */、/*+ */）会被 sqlparser 当注释忽略但 MySQL 照跑——直接拒
+    // MySQL 可执行注释（/*! */、/*+ */）会被 sqlparser 当注释忽略但 MySQL 照跑——直接拒。
+    // 查的是原文：`'价格 /*! 说明'` 这类字符串字面量里的同款子串也会被误拒
+    // （多拒方向，可接受但未精细剥字面量 —— 剥了再判会放过真注释，两害取多拒）。
     if sql.contains("/*!") || sql.contains("/*+") {
         return Err(GuardError::ExecutableComment);
     }
@@ -56,7 +59,12 @@ pub fn is_safe_select_with(sql: &str, d: &dyn Dialect, sensitive: &[&str]) -> Re
     // 注：REPLACE 不入列（REPLACE() 是合法字符串函数；REPLACE INTO 语句已被 AST 层拒）。
     // `FOR UPDATE`/`FOR SHARE` 是合法 SELECT 的行锁子句：先从扫描文本剔除，
     // 由调用方在 AST 层按「行锁」拒绝（锁语义比「写操作词」准确，测试钉的正是前者）。
-    let stripped = strip_literals_and_comments(sql).to_lowercase();
+    let stripped = lowered_stripped(sql);
+    debug_assert!(
+        sensitive.iter().all(|c| c.bytes().all(|b| !b.is_ascii_uppercase())),
+        "敏感列词表必须全小写（stripped 已 lowercase，混入大写条目会静默漏拦）"
+    );
+    // 两次 replace 两个临时 String：量级可忍（SQL 文本 KB 级、每次校验一次），不为它写手写扫描
     let stripped = stripped.replace("for update", " ").replace("for share", " ");
     if let Some(tok) = forbidden_token(&stripped) {
         return Err(GuardError::WriteToken(tok.to_string()));
@@ -76,6 +84,19 @@ pub fn is_safe_select_with(sql: &str, d: &dyn Dialect, sensitive: &[&str]) -> Re
     Ok(())
 }
 
+/// 剥字面量/注释 + 小写化（主路径与 parse 失败分支共用一份）
+fn lowered_stripped(sql: &str) -> String {
+    strip_literals_and_comments(sql).to_lowercase()
+}
+
+/// 危险词表（`forbidden_token` 用）。**必须保持字典序**（binary_search），
+/// 本文件 tests 里有排序断言兜底。
+const FORBIDDEN_TOKENS: &[&str] = &[
+    "alter", "create", "delete", "drop", "dumpfile", "grant", "insert", "load_file",
+    "merge", "outfile", "pg_ls_dir", "pg_read_file", "revoke", "truncate", "update",
+    "utl_file", "xp_cmdshell",
+];
+
 /// 写操作词（按词边界扫剥掉字面量后的文本）。REPLACE 不入列：REPLACE() 是合法字符串函数，
 /// REPLACE INTO 语句已被 AST 层拒。
 ///
@@ -85,14 +106,9 @@ pub fn is_safe_select_with(sql: &str, d: &dyn Dialect, sensitive: &[&str]) -> Re
 /// 要么报权限错要么真的读到文件。词边界扫描天然兼容（下划线保在 token 里，
 /// `upload_time` 这类业务列不受影响）。
 fn forbidden_token(stripped: &str) -> Option<&'static str> {
-    const FORBIDDEN: &[&str] = &[
-        "insert", "update", "delete", "drop", "alter", "truncate",
-        "create", "merge", "grant", "revoke", "outfile", "dumpfile",
-        "load_file", "pg_read_file", "pg_ls_dir", "xp_cmdshell", "utl_file",
-    ];
     stripped
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .find_map(|tok| FORBIDDEN.iter().find(|f| **f == tok).copied())
+        .find_map(|tok| FORBIDDEN_TOKENS.binary_search(&tok).ok().map(|i| FORBIDDEN_TOKENS[i]))
 }
 
 /// 系统库/元数据库引用：业务问答绝无必要，而它们是「读别人的东西」的通道
@@ -125,6 +141,9 @@ fn sensitive_ref(stripped: &str, sensitive: &[&str]) -> Option<String> {
 
 /// 占位符幻觉防线（旧项目实证：LLM 会编 '__ORDER_CODE__'/'xxx_PLACEHOLDER' 恒空自信答 0）。
 /// 占位符藏在字面量里，须查原文而非 stripped。
+/// 已知误伤方向（刻意，多拒）：`is_placeholder`/`placeholder_flag` 这类合法列名含
+/// `_placeholder` 子串会被拒；注释段里的 `__X__` 同样触发（剥注释再判会放过来路不明的
+/// 占位符，两害取多拒）。
 fn placeholder_issue(sql: &str) -> Option<GuardError> {
     let lower = sql.to_lowercase();
     if lower.contains("__") && lower.contains('\'') {
@@ -184,17 +203,18 @@ fn constant_projection(stmt: &Statement) -> bool {
     match stmt {
         // 顶层有 FROM → 立刻放行（快路径，且保住既有语义）；
         // 顶层没有 → 再问「任意层级引了真表吗」，引了就放行
-        Statement::Query(q) => !body_has_from(&q.body) && !references_any_table(stmt),
+        Statement::Query(q) => !body_has_from(&q.body) && !references_any_table(q),
         _ => false,
     }
 }
 
-/// 整条语句里**任意层级**有没有引用一张具名表（`TableFactor::Table`）。
+/// 任意层级有没有引用一张具名表（`TableFactor::Table`）。
 /// 派生表/常量表不算（它们是 `Derived`/`TableFunction` 等别的变体）。
 ///
 /// 用 sqlparser 自己的 `Visit` 遍历，写法照 `caliber.rs` 的 `pre_visit_table_factor` ——
 /// 手写递归会漏变体，而漏一个变体在这里的后果是把正确 SQL 判成试探（AS04 那种硬失败）。
-fn references_any_table(stmt: &Statement) -> bool {
+/// 入参直接收 `Query`（调用点已确认是 Query）：visit 查询体，少包一层 Statement 遍历。
+fn references_any_table(q: &Query) -> bool {
     use sqlparser::ast::{Visit, Visitor};
     struct Seek(bool);
     impl Visitor for Seek {
@@ -208,11 +228,11 @@ fn references_any_table(stmt: &Statement) -> bool {
         }
     }
     let mut s = Seek(false);
-    let _ = stmt.visit(&mut s);
+    let _ = q.visit(&mut s);
     s.0
 }
 
-/// LIMIT 护栏：非纯聚合且无 LIMIT → 追加 LIMIT max_rows
+/// LIMIT 护栏：无 LIMIT/FETCH → 追加 LIMIT max_rows（聚合判定不在本层，见调用方注释）
 pub fn ensure_limit_with(sql: &str, d: &dyn Dialect, max_rows: usize) -> String {
     // AST 判定是否已有 LIMIT/FETCH——字面量含 "limit" 不再误判为已限流（漏判=无界扫描）
     let has_limit = Parser::parse_sql(d.parser(), sql)
@@ -222,9 +242,21 @@ pub fn ensure_limit_with(sql: &str, d: &dyn Dialect, max_rows: usize) -> String 
             Statement::Query(q) => q.limit.is_some() || q.fetch.is_some(),
             _ => true,
         })
+        // parse 失败的文本兜底：字面量/注释里的 "LIMIT" 也会被误判为已限流
+        // （漏判=无界扫描）。注意这条保证只覆盖 AST 主路径，兜底分支不享受。
         .unwrap_or_else(|| sql.to_uppercase().contains("LIMIT"));
     if has_limit {
         return sql.to_string();
     }
     format!("{} LIMIT {}", sql.trim().trim_end_matches(';'), max_rows)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn forbidden_tokens_stay_sorted_for_binary_search() {
+        let mut sorted = super::FORBIDDEN_TOKENS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, super::FORBIDDEN_TOKENS, "FORBIDDEN_TOKENS 必须保持字典序");
+    }
 }
