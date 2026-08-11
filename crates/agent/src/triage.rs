@@ -233,6 +233,27 @@ pub fn hybrid_clauses(question: &str) -> Option<(String, String)> {
     Some((doc.join("；"), data.join("；")))
 }
 
+/// 【混合查询·整句级】意图不明确的 both-hit（2026-08-11 用户裁决：「意图不很明确时问数与
+/// 知识库一起查，综合输出」）：文档词与问数信号**共现于同一句**、切不出明确两半
+/// （`hybrid_clauses` 不收）、也不是强文档意图单句（`rule_decide` 翻 Knowledge 的那条
+/// AX104 裁决不动）——这种句子不再二选一，由入口层整句喂两路。
+///
+/// 四份判据全部复用本模块既有的（一份都不新造，新造必与路由层漂开）：
+/// - `kb_hit`：文档词命中；
+/// - `question_data_hit`：问数信号命中（时间词/完整业务问句/表名/单号）；
+/// - `!strong_doc_intent`：强文档意图单句仍走纯知识库（「市场费用的报销政策是什么」）；
+/// - `!analytical_question_hit`：已构成**完整业务问句**（对象 × 查询目标）的意图已明确
+///   是问数 —— 「合同金额最高的客户是谁」的「合同」是限定词不是文档请求，不双查。
+///
+/// 判定只发生在 HTTP/xcx 入口层（`triage()` 返回值语义不变，`both_hit_goes_to_data`
+/// 的钉板不动）；与 `hybrid_clauses` 同层，同样吃用户原问句（不做错别字归一）。
+pub fn unclear_both_hit(question: &str) -> bool {
+    kb_hit(question)
+        && question_data_hit(question)
+        && !strong_doc_intent(question)
+        && !analytical_question_hit(question)
+}
+
 /// 完整业务分析问句的零 IO 判据。它只确认“对象 + 查询目标”已经齐全，不替代指标召回，
 /// 也不负责生成 SQL；`ask::need_intent_reply` 与分诊共用，避免两处对同一句话作出相反判断。
 pub fn analytical_question_hit(question: &str) -> bool {
@@ -550,6 +571,21 @@ mod tests {
         assert_eq!(super::hybrid_clauses("本月销售额，上月销售额"), None);
         // 纯文档多子句不收
         assert_eq!(super::hybrid_clauses("报销政策是什么，差旅标准有哪些"), None);
+    }
+
+    /// 整句级 both-hit（2026-08-11 用户裁决：意图不明确时问数 + 知识库双查、综合输出）：
+    /// 文档词 × 问数信号共现、且两端都不"明确"（非强文档意图、未构成完整业务问句）才双查。
+    /// 判定的落点在入口层 —— `triage()` 与 `rule_decide` 的 both-hit 语义一字不变。
+    #[test]
+    fn unclear_both_hit_only_when_intent_is_genuinely_ambiguous() {
+        // 时间词 × 文档名词、无询问词：意图不明 → 双查
+        assert!(super::unclear_both_hit("本月报销制度"));
+        // 强文档意图单句：仍走纯知识库（AX104 裁决不动），不双查
+        assert!(!super::unclear_both_hit("市场费用的报销政策是什么"));
+        // 纯问数：kb 词不命中 → 不双查
+        assert!(!super::unclear_both_hit("本月销售额"));
+        // 「合同」是限定词不是文档请求：完整业务问句（客户 × 最高）= 意图已明确是问数，不双查
+        assert!(!super::unclear_both_hit("合同金额最高的客户是谁"));
     }
 
     /// forced 覆盖规则：前端 chip 选了知识库，问句再像问数也走知识库。

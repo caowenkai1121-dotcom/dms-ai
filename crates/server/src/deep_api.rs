@@ -5,6 +5,8 @@
 //! 🔴 口径铁律：销售经营板块只使用 `semantic::sales_fact` 的字段、维度与指标合同；
 //! 时间、实体和 `storecode` 权限谓词复用主查询已经过闸门的 WHERE。非销售板块仍走同一条
 //! `ask()` 管线。这样既不复制事实口径，也不让二次自然语言问数丢失主查询过滤条件。
+//! 小程序下单事实（`sales_dw.dws_mkt_app_place_order_dnf`）同一纪律：板块只编译该表
+//! 确有的客户维度与当月/当日列族，WHERE 整段透传主查询，绝不交 LLM 重写。
 //!
 //! DWS 销售标量、结构和趋势都补齐总值、同比/环比、结构、趋势与经营明细；其它结果
 //! （实体卡/单号卡/普通明细）照样出 artifact：主表 + 视图图 + SQL + AI 收尾。
@@ -45,6 +47,10 @@ fn identity_err(login: &str, e: impl std::fmt::Display) -> ApiErr {
 
 const DETAIL_SQL_SEPARATOR: &str = ";\n\n-- 明细\n";
 const DWS_SALES_FACT: &str = dms_semantic::sales_fact::TABLE;
+/// 小程序下单事实（统计日×客户的当日/当月累计快照）。深度板块的谓词透传判据，
+/// 与 `DWS_SALES_FACT` 同一纪律：板块 SQL 不交 LLM 重写 —— 实测模型子问会把主查询的
+/// 快照日/region 限定丢掉（200 行混进外省客户），甚至跨 data_date 求和破快照口径。
+const MINI_PROGRAM_ORDER_FACT: &str = "dws_mkt_app_place_order_dnf";
 type SalesMeasure = dms_semantic::sales_fact::Metric;
 
 fn sales_measure_from_text(text: &str) -> Option<SalesMeasure> {
@@ -1314,6 +1320,65 @@ fn with_primary_sales_where(template: &str, primary_sql: &str) -> Option<String>
     with_sales_where(template, scoped_sales_where(primary_sql)?)
 }
 
+fn uses_mini_program_order_fact(sql: &str) -> bool {
+    sql.to_ascii_lowercase().contains(MINI_PROGRAM_ORDER_FACT)
+}
+
+/// 与 `scoped_sales_where` 同一判据形态：只接受单表、无 JOIN 的小程序事实 SELECT
+///（该表查询无 `sf` 别名约定）；复杂包裹或换表直接拒绝补板块，宁可少展示也不猜过滤条件。
+fn scoped_mini_program_where(sql: &str) -> Option<sqlparser::ast::Expr> {
+    use sqlparser::ast::{SetExpr, Statement, TableFactor};
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+
+    let main = sql.split(DETAIL_SQL_SEPARATOR).next().unwrap_or(sql).trim().trim_end_matches(';');
+    if !uses_mini_program_order_fact(main) {
+        return None;
+    }
+    let mut statements = Parser::parse_sql(&MySqlDialect {}, main).ok()?;
+    let Statement::Query(query) = statements.pop()? else { return None };
+    if !statements.is_empty() {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else { return None };
+    let [from] = select.from.as_slice() else { return None };
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &from.relation else { return None };
+    let table = name.to_string().replace('`', "").to_ascii_lowercase();
+    if table != format!("sales_dw.{MINI_PROGRAM_ORDER_FACT}") {
+        return None;
+    }
+    select.selection.clone()
+}
+
+/// 小程序事实唯一的受信拆解是客户（store_code/store_name）：快照表没有逐日趋势
+///（跨 data_date 求和即破口径），带区域限定时按 region 分组又是退化板块，一律不出。
+/// 列族沿用主查询已执行的当月/当日列；WHERE 由 `scoped_mini_program_where` 整段透传
+///（最新快照 + region/时间限定 + 权限谓词一个不落）。
+fn mini_program_section_sql(primary_sql: &str) -> Option<String> {
+    let monthly = primary_sql.contains("tomonth_");
+    let daily = primary_sql.contains("today_") || primary_sql.contains("todaty_");
+    // 当月/当日列族认不出（或混用）→ 板块缺席，不猜列
+    if monthly == daily {
+        return None;
+    }
+    let (count, amount, p) = if monthly {
+        ("tomonth_order_count", "tomonth_amount", "本月")
+    } else {
+        ("today_order_count", "today_amount", "今日")
+    };
+    let template = format!(
+        "SELECT store_code AS `客户编码`, store_name AS `客户`, \
+         SUM({count}) AS `{p}下单数量`, SUM({amount}) AS `{p}下单金额` \
+         FROM sales_dw.{MINI_PROGRAM_ORDER_FACT} \
+         WHERE data_date = (SELECT MAX(data_date) FROM sales_dw.{MINI_PROGRAM_ORDER_FACT}) \
+         GROUP BY store_code, store_name ORDER BY `{p}下单金额` DESC LIMIT 200"
+    );
+    with_sales_where(&template, scoped_mini_program_where(primary_sql)?)
+}
+
 fn parse_sales_predicate(predicate: &str) -> Option<sqlparser::ast::Expr> {
     use sqlparser::ast::{SetExpr, Statement};
     use sqlparser::dialect::MySqlDialect;
@@ -1484,7 +1549,22 @@ async fn execute_plan_section(
     section: &PlanSection,
     ds: Option<&str>,
     primary_sales_sql: Option<&str>,
+    primary_mini_program_sql: Option<&str>,
 ) -> Option<Section> {
+    if let Some(primary_sql) = primary_mini_program_sql {
+        // 小程序事实板块：维度/列族由计划编译定死，这里只做主查询 WHERE 透传；
+        // 透传不成（主 SQL 形态不认）= 板块缺席，绝不回落可能丢限定的 LLM 子问。
+        let sql = mini_program_section_sql(primary_sql)?;
+        let (columns, rows, sql) = fetch_sales_sql(st, p, &sql, &section.title).await?;
+        return Some(Section {
+            title: section.title.clone(),
+            question: section.question.clone(),
+            kind: "bar",
+            columns,
+            rows,
+            sql,
+        });
+    }
     if let Some(primary_sql) = primary_sales_sql {
         let text = format!("{} {}", section.title, section.question);
         if let Some(measure) = sales_measure_from_text(&text) {
@@ -1528,6 +1608,7 @@ async fn execute_plan_sections(
     sections: &[PlanSection],
     ds: Option<&str>,
     primary_sales_sql: Option<&str>,
+    primary_mini_program_sql: Option<&str>,
     rid: &str,
     run: Option<&RunCtx>,
     restored: Option<&[Option<RestoredSection>]>,
@@ -1545,7 +1626,7 @@ async fn execute_plan_sections(
                 }
                 note_section_state(rid, index, "running", None);
                 let started = std::time::Instant::now();
-                let out = execute_plan_section(st, p, section, ds, primary_sales_sql).await;
+                let out = execute_plan_section(st, p, section, ds, primary_sales_sql, primary_mini_program_sql).await;
                 let state = if out.is_some() { "done" } else { "failed" };
                 let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 note_section_state(rid, index, state, Some(ms));
@@ -2926,6 +3007,25 @@ fn compile_sales_plan(
         .collect()
 }
 
+/// 小程序事实的深度板块计划：模型规划的方向（逐日趋势/订单类型占比…）这张「当日+当月
+/// 累计」快照表兑现不了，一律压成客户结构一个板块；维度与列族在编译期定死，执行层
+/// 由 `mini_program_section_sql` 把主查询 WHERE 整段透传进来，模型一个字都插不上。
+/// 列族认不出 = 空计划（板块缺席），不猜。
+fn compile_mini_program_plan(primary_sql: &str) -> Vec<PlanSection> {
+    let monthly = primary_sql.contains("tomonth_");
+    let daily = primary_sql.contains("today_") || primary_sql.contains("todaty_");
+    if monthly == daily {
+        return vec![];
+    }
+    let p = if monthly { "本月" } else { "今日" };
+    vec![PlanSection {
+        question: format!("{p}小程序下单数量和金额按客户"),
+        chart: "bar".into(),
+        title: format!("客户{p}下单结构"),
+        assertion: None,
+    }]
+}
+
 #[derive(serde::Deserialize, Debug)]
 struct Plan {
     /// 模型对用户问题的理解（先思考、再开始 —— 业主要的「深度思考问题」那一段）
@@ -3981,6 +4081,10 @@ async fn compose_inner(
     // 主指标只认一次（内部含 SQL compact 与多指标扫描）：下方 analysis_plan 与
     // sales_report 判据共用这同一份结果，两个 expect 的不变量也由单点保证
     let sales_measure = primary_sales_measure(&execution_question, &primary);
+    // 小程序下单事实主查询（direct-agg 模板或 LLM 落到该表）：板块走确定性编译 +
+    // 主查询 WHERE 透传（compile_mini_program_plan / mini_program_section_sql），
+    // LLM 规划的板块子问会把 region/快照限定丢掉（线上实证：200 行混进外省客户）。
+    let mini_program_report = uses_mini_program_order_fact(&primary.sql);
     let analysis_plan = dms_agent::analysis::plan(
         &execution_question,
         dms_agent::AnalysisShape {
@@ -4039,7 +4143,12 @@ async fn compose_inner(
             let sales_report = sales_measure.is_some();
             // 续跑的板块是账本里的**最终计划**：编译/去重/理解重写早已定稿，一律不再重放
             let compile_plan = resume.is_none() && sales_report && !is_weekly_report(&req.question);
-            let plan_secs = if compile_plan {
+            // 小程序事实与销售事实同一纪律：模型规划的板块一律重编译为受信板块，
+            // 谓词透传在执行层完成（primary_mini_program_sql），不许模型自己写 SQL。
+            let compile_mini_program = resume.is_none() && mini_program_report;
+            let plan_secs = if compile_mini_program {
+                compile_mini_program_plan(&primary.sql)
+            } else if compile_plan {
                 compile_sales_plan(
                     &req.question,
                     sales_measure.expect("sales_report 已确认指标"),
@@ -4096,6 +4205,7 @@ async fn compose_inner(
                 &plan_secs,
                 Some(&report_ds),
                 sales_report.then_some(primary.sql.as_str()),
+                mini_program_report.then_some(primary.sql.as_str()),
                 &rid,
                 run_tracking.as_ref().map(|(ctx, _)| ctx),
                 resume.as_ref().map(|rc| rc.done.as_slice()),
@@ -4169,6 +4279,8 @@ async fn compose_inner(
                     &defaults,
                     Some(&report_ds),
                     Some(primary.sql.as_str()),
+                    // enrich 只可能命中 DWS 销售事实（should_enrich 含销售指标判据），无小程序板块
+                    None,
                     &rid,
                     run_tracking.as_ref().map(|(ctx, _)| ctx),
                     None,
@@ -4346,6 +4458,28 @@ async fn compose_inner(
         .await;
         comparisons.extend(extra);
         sql_entries.extend(comparison_sqls);
+    }
+    // 空报告 fail-closed：所有板块来源到此已定稿，主结果零行时连「查询结果」兜底板块
+    // 都没有 —— 此时深度页只能是空壳（KPI/对比/证据全数无源），不许产出 artifact。
+    // 回退主结果本身（反问卡/实体卡/0 行结果前端按 lite 渲染），与 need-intent 不起
+    // 模型板块同一降级纪律（线上实证：0 行反问卡却「深度分析页已生成 · 0 个分析板块」）。
+    if sections.is_empty() && detail.is_none() {
+        if let Some((ctx, _)) = &run_tracking {
+            // 账本不能停在 running：无产物可指，终态按失败落（resume 会重走同一判定）
+            if let Err(e) =
+                deep_run_finish(&ctx.pool, &ctx.rid, "failed", None, "空报告不产出深度页").await
+            {
+                tracing::warn!(err = %e, "D4 空报告终态落账失败（不影响响应）");
+            }
+        }
+        note(&rid, ProgressStage::Done);
+        let result = serde_json::to_value(&primary).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(cid) = req.conv_id {
+            save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
+            let payload = serde_json::json!({ "result": result });
+            save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+        }
+        return Ok(Json(serde_json::json!({ "result": result })));
     }
     let sqls = sql_entries.iter().map(|(_, sql)| sql.clone()).collect::<Vec<_>>();
     let evidence = evidence_items(
@@ -6383,5 +6517,79 @@ mod tests {
         let user2 = spy2.0.lock().unwrap()[1].clone();
         assert!(user2.contains("只输出最终分析："), "{user2}");
         assert!(!user2.contains("验收断言") && !user2.contains("verdicts"), "无断言不许出现断言指令：{user2}");
+    }
+
+    #[test]
+    fn mini_program_sections_inherit_the_primary_where() {
+        // 线上实证：LLM 板块子问丢掉主查询的 region 限定（200 行混进长沙/广东/天津客户），
+        // 甚至跨 data_date 求和破快照口径。小程序事实的板块只允许谓词透传。
+        let primary = "-- 小程序下单口径\nSELECT SUM(tomonth_amount) AS `本月下单金额`, MAX(data_date) AS `数据日期` \
+            FROM sales_dw.dws_mkt_app_place_order_dnf \
+            WHERE data_date = (SELECT MAX(data_date) FROM sales_dw.dws_mkt_app_place_order_dnf) \
+            AND region IN ('山东省区','山东战区','山东大区','山东') LIMIT 200";
+        let sql = mini_program_section_sql(primary).expect("客户结构板块必须能编译");
+        // 主查询的限定一个不许丢：最新快照 + region 探值形态全覆盖
+        assert!(sql.contains("MAX(data_date)"), "快照口径不许丢：{sql}");
+        assert!(sql.contains("region IN ("), "region 谓词必须透传：{sql}");
+        for form in ["'山东省区'", "'山东战区'", "'山东大区'", "'山东'"] {
+            assert!(sql.contains(form), "region 探值形态不许丢：{sql}");
+        }
+        // 板块只出该表确有的列：客户维度 + 当月列族；战区列编造禁止（表里没有 war_zone）
+        assert!(sql.contains("store_code") && sql.contains("store_name"), "{sql}");
+        assert!(sql.contains("tomonth_order_count") && sql.contains("tomonth_amount"), "{sql}");
+        assert!(!sql.contains("war_zone"), "该表无战区列，禁止编造：{sql}");
+        assert!(!sql.to_ascii_lowercase().contains("t_sales_order"), "不许换表：{sql}");
+
+        // 当日列族同样透传（今日账余列的物理拼写 todaty_ 也算当日族）
+        let daily = "SELECT SUM(today_order_count) AS `今日下单数量` FROM sales_dw.dws_mkt_app_place_order_dnf \
+            WHERE data_date = (SELECT MAX(data_date) FROM sales_dw.dws_mkt_app_place_order_dnf) \
+            AND region IN ('山东省区','山东战区','山东大区','山东')";
+        let sql = mini_program_section_sql(daily).expect("当日列族板块必须能编译");
+        assert!(sql.contains("today_order_count") && sql.contains("今日下单数量"), "{sql}");
+        assert!(sql.contains("region IN ("), "region 谓词必须透传：{sql}");
+
+        // 不敢透传的一律缺席：JOIN、换表、列族混用
+        let join = "SELECT a.tomonth_amount FROM sales_dw.dws_mkt_app_place_order_dnf a \
+            JOIN t_sales_order o ON 1 = 1 WHERE a.data_date = '2026-08-11'";
+        assert!(mini_program_section_sql(join).is_none(), "JOIN 主查询不许补板块");
+        let other_table = "SELECT SUM(sf.amount) FROM sales_dw.dws_off_offline_sale_dfn sf \
+            WHERE sf.order_date >= '2026-08-01'";
+        assert!(mini_program_section_sql(other_table).is_none(), "换表不许补板块");
+        let mixed = "SELECT tomonth_order_count, today_amount FROM sales_dw.dws_mkt_app_place_order_dnf \
+            WHERE data_date = '2026-08-11'";
+        assert!(mini_program_section_sql(mixed).is_none(), "列族混用不猜列");
+    }
+
+    #[test]
+    fn mini_program_plan_compiles_to_the_only_trusted_slice() {
+        // 当月/当日列族各编一个客户结构板块；列族认不出 = 空计划（板块缺席，不猜）
+        let monthly = compile_mini_program_plan(
+            "SELECT SUM(tomonth_amount) FROM sales_dw.dws_mkt_app_place_order_dnf WHERE data_date = '2026-08-11'",
+        );
+        assert_eq!(monthly.len(), 1);
+        assert_eq!(monthly[0].title, "客户本月下单结构");
+        assert_eq!(monthly[0].chart, "bar");
+        let daily = compile_mini_program_plan(
+            "SELECT SUM(today_amount) FROM sales_dw.dws_mkt_app_place_order_dnf WHERE data_date = '2026-08-11'",
+        );
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].title, "客户今日下单结构");
+        assert!(compile_mini_program_plan("SELECT 1").is_empty());
+    }
+
+    #[test]
+    fn empty_report_never_produces_an_artifact_page() {
+        // 线上实证：「线下-潍坊程祥商贸有限公司，本月的数据」0 行 + 反问卡，却产出
+        // 「深度分析页已生成 · 0 个分析板块」的空 artifact。钉死：空报告守卫必须早于
+        // 页面渲染与 artifact 落库（源码位置钉，同 progress_endpoint_requires_ownership）。
+        let src = include_str!("deep_api.rs");
+        let compose = src.split("async fn compose_inner(").nth(1).expect("compose_inner 必须在");
+        let guard = compose
+            .find("sections.is_empty() && detail.is_none()")
+            .expect("空报告守卫被删了：0 板块不许产出空深度页");
+        let render = compose.find("bi_page(").expect("bi_page 调用必须在");
+        let save = compose.find("crate::artifact_api::save_artifact").expect("save_artifact 调用必须在");
+        assert!(guard < render, "空报告守卫必须早于页面渲染，否则空壳页还会产出");
+        assert!(guard < save, "空报告守卫必须早于 artifact 落库");
     }
 }

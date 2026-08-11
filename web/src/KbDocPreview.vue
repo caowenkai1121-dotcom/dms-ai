@@ -1,15 +1,29 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import type { CellObject, ColInfo, WorkSheet } from 'xlsx'
 import { escHtml, sessionHeaders } from './panel-utils'
 
 interface ChunkRow {
   ord: number; page?: number | null; heading?: string; text: string
 }
 type PreviewTab = 'file' | 'markdown' | 'chunks'
-/** 原件预览分派种类（kindOf 的闭集）。office = Word/Excel/PPT：浏览器内嵌不了，渲染解析后的内容。 */
-type FileKind = 'image' | 'pdf' | 'csv' | 'markdown' | 'json' | 'text' | 'html' | 'office' | 'none'
+/** 原件预览分派种类（kindOf 的闭集）。office = Word/PPT：浏览器内嵌不了，走服务端转换 PDF；
+ *  excel = Excel 表格：转 PDF 样式失真（用户投诉），改前端 SheetJS 解析后自绘表格。 */
+type FileKind = 'image' | 'pdf' | 'csv' | 'markdown' | 'json' | 'text' | 'html' | 'excel' | 'office' | 'none'
 /** 目录条目（renderMarkdown 顺手收集，供目录跳转）。 */
 interface TocEntry { id: string; level: number; text: string }
+/** Excel 预览单元格视图：covered = 被合并区吸收的占位格（渲染时跳过）。 */
+interface ExcelCellView { text: string; rowspan: number; colspan: number; covered: boolean }
+/** Excel 单 sheet 视图：grid 只含截断窗口内的行列；totalXxx 记原始尺寸供截断提示。 */
+interface ExcelSheetView {
+  name: string; grid: ExcelCellView[][]; colWidths: (number | undefined)[]
+  totalRows: number; totalCols: number; shownRows: number; shownCols: number
+}
+// Excel 预览保护阈值：单 sheet 最多渲染 2000 行 / 200 列，总单元格再封顶（防 2000×200 满格表卡死渲染）；
+// 超出部分截断并在表下提示「仅预览前 N 行」，完整数据走下载。
+const EXCEL_MAX_ROWS = 2000
+const EXCEL_MAX_COLS = 200
+const EXCEL_MAX_CELLS = 120_000
 
 // initialPage：引用带进来的命中页码，仅 pdf 类预览（pdf 原件 / office 转换版 PDF，
 // 两者页码一致）在加载时直挂 #page=N；txt/md/csv/图片等非 pdf 类忽略。
@@ -28,6 +42,10 @@ const fileKind = ref<FileKind>('none')
 const fileText = ref('')
 const csvRows = ref<string[][]>([])
 const csvTruncated = ref(false)
+const excelSheets = ref<ExcelSheetView[]>([])
+const excelSheetIdx = ref(0)
+const excelFreezeRow = ref(true)
+const excelErr = ref('')
 const fileFailed = ref(false)
 const fileErr = ref('')
 const pdfFrag = ref('')
@@ -82,7 +100,8 @@ function extOf(name: string): string {
 // 原件预览分派：扩展名优先（上传白名单保证它存在），mime 兜底（服务端下载已按扩展名白名单改写）。
 // 🔴 svg 刻意不收（可执行脚本的 XSS 面）；tif/tiff 浏览器解不了 → 落 none 走下载提示；
 // html 不按标记渲染，只展示转义后的原文（安全转文本）；
-// Office（Word/Excel/PPT）归 office：优先服务端转换的 PDF 直链，转换不可用才回落到解析内容渲染。
+// Word/PPT 归 office：优先服务端转换的 PDF 直链，转换不可用才回落到解析内容渲染；
+// Excel（xls/xlsx/xlsm）归 excel：转 PDF 样式失真，前端 SheetJS 解析后自绘表格。
 function kindOf(name: string, mime: string): FileKind {
   const ext = extOf(name)
   if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif'].includes(ext)) return 'image'
@@ -92,7 +111,8 @@ function kindOf(name: string, mime: string): FileKind {
   if (ext === 'json') return 'json'
   if (['txt', 'log'].includes(ext)) return 'text'
   if (ext === 'html') return 'html'
-  if (['doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'xlsm'].includes(ext)) return 'office'
+  if (['doc', 'docx', 'ppt', 'pptx'].includes(ext)) return 'office'
+  if (['xls', 'xlsx', 'xlsm'].includes(ext)) return 'excel'
   const type = mime.split(';')[0].trim().toLowerCase()
   if (/^image\/(png|jpeg|webp|gif|bmp|avif)$/.test(type)) return 'image'
   if (type === 'application/pdf') return 'pdf'
@@ -100,7 +120,9 @@ function kindOf(name: string, mime: string): FileKind {
   if (type === 'application/json') return 'json'
   if (type === 'text/markdown') return 'markdown'
   if (type === 'text/plain') return 'text'
-  if (type === 'application/msword' || type === 'application/vnd.ms-excel' || type === 'application/vnd.ms-powerpoint'
+  if (type === 'application/vnd.ms-excel' || type === 'application/vnd.ms-excel.sheet.macroenabled.12'
+    || type.startsWith('application/vnd.openxmlformats-officedocument.spreadsheetml')) return 'excel'
+  if (type === 'application/msword' || type === 'application/vnd.ms-powerpoint'
     || type.startsWith('application/vnd.openxmlformats-officedocument.')) return 'office'
   return 'none'
 }
@@ -181,6 +203,93 @@ function parseCsv(text: string): { rows: string[][]; truncated: boolean } {
 /** 表体行预计算：模板里 slice(1) 每次渲染都新建数组。 */
 const csvBodyRows = computed(() => csvRows.value.slice(1))
 
+// SheetJS 体积大，走动态 import 按需加载（不进首包）：首次打开 Excel 预览时拉取并缓存。
+// utils 句柄在加载完成后填充；sheetToView 只在加载完成后被调用。
+let xlsxModule: Promise<typeof import('xlsx')> | null = null
+let XLSXUtils: (typeof import('xlsx'))['utils']
+function loadXlsx(): Promise<typeof import('xlsx')> {
+  if (!xlsxModule) {
+    xlsxModule = import('xlsx').then((mod) => {
+      XLSXUtils = mod.utils
+      return mod
+    })
+  }
+  return xlsxModule
+}
+
+// Excel 原件预览（SheetJS 解析 → 自绘表格，不转 PDF）。保真口径：
+// 显示值用格式化文本 cell.w（日期/百分比/千分位与 Excel 界面一致，前端不做二次格式化）；
+// 合并单元格（!merges）按 colspan/rowspan 还原，跨截断边界的合并裁剪到可见窗口；
+// 列宽（!cols）wpx 直用、wch 按 Excel 口径（字符宽 × 7px + 5px 边距）换算；
+// 全空的首尾行列裁掉（!ref 常圈进大片仅格式区），中间空行空列保留（承载版式，不丢数据）；
+// 隐藏列照常渲染（预览是数据面，藏起来反而丢数据）。
+function sheetToView(ws: WorkSheet, name: string): ExcelSheetView {
+  const empty: ExcelSheetView = { name, grid: [], colWidths: [], totalRows: 0, totalCols: 0, shownRows: 0, shownCols: 0 }
+  if (!ws['!ref']) return empty
+  // 有效边界：有内容的单元格 ∪ 合并区（仅格式的空白不进窗口）
+  let minR = Infinity
+  let minC = Infinity
+  let maxR = -1
+  let maxC = -1
+  for (const key of Object.keys(ws)) {
+    if (key.startsWith('!')) continue
+    const cell = ws[key] as CellObject | undefined
+    if (!cell || cell.v === undefined || cell.v === '') continue
+    const addr = XLSXUtils.decode_cell(key)
+    if (addr.r < minR) minR = addr.r
+    if (addr.r > maxR) maxR = addr.r
+    if (addr.c < minC) minC = addr.c
+    if (addr.c > maxC) maxC = addr.c
+  }
+  for (const merge of ws['!merges'] ?? []) {
+    minR = Math.min(minR, merge.s.r); minC = Math.min(minC, merge.s.c)
+    maxR = Math.max(maxR, merge.e.r); maxC = Math.max(maxC, merge.e.c)
+  }
+  if (maxR < 0) return empty
+  const totalRows = maxR - minR + 1
+  const totalCols = maxC - minC + 1
+  let shownRows = Math.min(totalRows, EXCEL_MAX_ROWS)
+  const shownCols = Math.min(totalCols, EXCEL_MAX_COLS)
+  // 行列都没超限时不再收总格数；超限场景优先保列宽（表格横向结构比行数更难补）
+  if (shownRows * shownCols > EXCEL_MAX_CELLS) shownRows = Math.max(1, Math.floor(EXCEL_MAX_CELLS / shownCols))
+  const grid: ExcelCellView[][] = Array.from({ length: shownRows }, () =>
+    Array.from({ length: shownCols }, () => ({ text: '', rowspan: 1, colspan: 1, covered: false })))
+  for (let r = 0; r < shownRows; r++) {
+    for (let c = 0; c < shownCols; c++) {
+      const cell = ws[XLSXUtils.encode_cell({ r: minR + r, c: minC + c })] as CellObject | undefined
+      if (!cell) continue
+      grid[r][c].text = cell.w ?? (cell.v === undefined ? '' : String(cell.v))
+    }
+  }
+  for (const merge of ws['!merges'] ?? []) {
+    const r1 = merge.s.r - minR
+    const c1 = merge.s.c - minC
+    if (r1 < 0 || c1 < 0 || r1 >= shownRows || c1 >= shownCols) continue
+    const r2 = Math.min(merge.e.r - minR, shownRows - 1)
+    const c2 = Math.min(merge.e.c - minC, shownCols - 1)
+    if (r2 <= r1 && c2 <= c1) continue
+    grid[r1][c1].rowspan = r2 - r1 + 1
+    grid[r1][c1].colspan = c2 - c1 + 1
+    for (let r = r1; r <= r2; r++) {
+      for (let c = c1; c <= c2; c++) {
+        if (r !== r1 || c !== c1) grid[r][c].covered = true
+      }
+    }
+  }
+  const colInfos = (ws['!cols'] ?? []) as ColInfo[]
+  const colWidths = Array.from({ length: shownCols }, (_, i) => {
+    const info = colInfos[minC + i]
+    if (!info) return undefined
+    if (info.wpx) return Math.max(24, Math.round(info.wpx))
+    if (info.wch) return Math.max(24, Math.round(info.wch * 7 + 5))
+    return undefined
+  })
+  return { name, grid, colWidths, totalRows, totalCols, shownRows, shownCols }
+}
+
+/** 当前页签对应的 sheet 视图（excelSheets 为空时为 null，模板走降级分支）。 */
+const activeExcelSheet = computed(() => excelSheets.value[excelSheetIdx.value] ?? null)
+
 /** 预览票据：直链改走 ticket（120s 有效），iframe/img 才能绕开 Authorization 头直挂 URL。 */
 async function previewTicket(): Promise<string> {
   const response = await fetch(`/api/kb/doc/${encodeURIComponent(props.docId)}/preview-ticket`, {
@@ -241,6 +350,9 @@ async function loadFile() {
   fileText.value = ''
   csvRows.value = []
   csvTruncated.value = false
+  excelSheets.value = []
+  excelSheetIdx.value = 0
+  excelErr.value = ''
   const kind = kindOf(props.docName, props.mime || '')
   fileKind.value = kind
   // 不可内嵌的格式（tif/svg 等）不浪费一次下载：直接落「下载 + Markdown 页签」提示
@@ -261,6 +373,35 @@ async function loadFile() {
       if (kind === 'pdf' && initialPdfPage.value) pdfFrag.value = `#page=${initialPdfPage.value}`
       // 个别浏览器的内嵌 PDF 查看器不触发 iframe load：兜底撤 loading，不能把人锁在加载页
       window.setTimeout(() => { if (epoch === previewEpoch) embedLoading.value = false }, 8000)
+      return
+    }
+    // excel：不转 PDF（样式失真投诉）——票据换直链拉原件二进制，SheetJS 解析后自绘表格；
+    // 拉取/解析任何一步失败（损坏/加密 xlsx 等）都回落到「解析内容渲染」降级层（与 office 同口径）
+    if (kind === 'excel') {
+      try {
+        const ticket = await previewTicket()
+        if (epoch !== previewEpoch) return
+        const response = await fetch(directFileUrl(ticket))
+        if (epoch !== previewEpoch) return
+        if (!response.ok) throw new Error(await errorText(response))
+        const buf = await response.arrayBuffer()
+        const XLSX = await loadXlsx()
+        if (epoch !== previewEpoch) return
+        // cellStyles:true：SheetJS 只有开它才解析 !cols（列宽），不开列宽全丢（实测 0.18.5）
+        const workbook = XLSX.read(buf, { type: 'array', cellStyles: true })
+        const sheets: ExcelSheetView[] = []
+        for (const name of workbook.SheetNames) {
+          const ws = workbook.Sheets[name]
+          if (ws) sheets.push(sheetToView(ws, name))
+        }
+        if (!sheets.length) throw new Error('未解析出有效的工作表内容')
+        excelSheets.value = sheets
+        excelSheetIdx.value = 0
+      } catch (e) {
+        if (epoch !== previewEpoch) return
+        excelErr.value = e instanceof Error ? e.message : ''
+        if (!markdownRan.value && !markdownLoading.value) void loadMarkdown()
+      }
       return
     }
     // office：先探测转换版 PDF（Range 1 字节，206 才有）；404 office_pdf_unavailable 等
@@ -629,6 +770,64 @@ void loadFile()
             </table>
             <p v-if="csvTruncated" class="kdp-note">仅预览前 {{ CSV_PREVIEW_ROWS }} 行数据；完整内容请下载原件，或切换到 Markdown 页签查看解析结果。</p>
           </div>
+          <!-- Excel 原件预览：SheetJS 解析后自绘表格（不转 PDF）；多 sheet 页签 + 合并/列宽还原 -->
+          <div v-else-if="fileKind === 'excel'" class="kdp-excel">
+            <template v-if="activeExcelSheet">
+              <div class="kdp-excel-bar">
+                <nav v-if="excelSheets.length > 1" class="kdp-excel-tabs" aria-label="工作表切换">
+                  <button
+                    v-for="(sheet, si) in excelSheets" :key="sheet.name" type="button"
+                    :class="{ active: si === excelSheetIdx }" :aria-pressed="si === excelSheetIdx"
+                    @click="excelSheetIdx = si"
+                  >{{ sheet.name }}</button>
+                </nav>
+                <span v-else class="kdp-excel-name">{{ activeExcelSheet.name }}</span>
+                <label class="kdp-excel-freeze"><input v-model="excelFreezeRow" type="checkbox">冻结首行</label>
+              </div>
+              <div class="kdp-excel-wrap">
+                <template v-if="activeExcelSheet.grid.length">
+                  <table class="kdp-excel-table">
+                    <colgroup>
+                      <col v-for="(w, ci) in activeExcelSheet.colWidths" :key="ci" :style="w ? { width: `${w}px` } : undefined">
+                    </colgroup>
+                    <tbody>
+                      <tr v-for="(row, ri) in activeExcelSheet.grid" :key="ri">
+                        <template v-for="(cell, ci) in row" :key="ci">
+                          <td
+                            v-if="!cell.covered"
+                            :rowspan="cell.rowspan > 1 ? cell.rowspan : undefined"
+                            :colspan="cell.colspan > 1 ? cell.colspan : undefined"
+                            :class="{ frozen: excelFreezeRow && ri === 0 }"
+                          >{{ cell.text }}</td>
+                        </template>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <p
+                    v-if="activeExcelSheet.shownRows < activeExcelSheet.totalRows || activeExcelSheet.shownCols < activeExcelSheet.totalCols"
+                    class="kdp-note"
+                  >仅预览前 {{ activeExcelSheet.shownRows }} 行<template v-if="activeExcelSheet.shownCols < activeExcelSheet.totalCols">、前 {{ activeExcelSheet.shownCols }} 列</template>（共 {{ activeExcelSheet.totalRows }} 行 × {{ activeExcelSheet.totalCols }} 列）；完整内容请下载原件查看。</p>
+                </template>
+                <div v-else class="kdp-state">
+                  <strong>空工作表</strong>
+                  <span>该工作表没有内容；可切换到其他工作表或下载原件查看。</span>
+                </div>
+              </div>
+            </template>
+            <!-- 拉取/解析失败（损坏/加密 xlsx 等）：与 office 转换不可用同口径，落解析内容渲染 -->
+            <template v-else>
+              <p class="kdp-note kdp-office-note">Excel 原件解析失败{{ excelErr ? `：${excelErr}` : '' }}，以下按解析后的内容预览；原始排版请下载原件查看。</p>
+              <div v-if="markdownLoading" class="kdp-state" role="status">
+                <strong>正在解析内容</strong><span>Office 文档解析需要几秒钟。</span>
+              </div>
+              <article v-else-if="markdownHtml" class="kdp-markdown" v-html="markdownHtml"></article>
+              <div v-else class="kdp-state">
+                <strong>未能解析出可预览的内容</strong>
+                <span>{{ markdownFailed ? (markdownErr || '解析失败，请稍后重试。') : '该文档没有解析出文本内容。' }}可下载原件后用本地应用打开。</span>
+                <button class="primary-btn" type="button" :disabled="downloading" @click="downloadOriginal">下载原件</button>
+              </div>
+            </template>
+          </div>
           <article v-else-if="fileKind === 'markdown' && fileText" class="kdp-markdown" v-html="fileMarkdownHtml"></article>
           <pre v-else-if="(fileKind === 'text' || fileKind === 'json' || fileKind === 'html') && fileText" class="kdp-text">{{ fileText }}</pre>
           <div v-else-if="fileKind === 'office'" class="kdp-office">
@@ -786,6 +985,33 @@ void loadFile()
   position: sticky; top: 0; z-index: 1; background: var(--bg-main);
   color: var(--text-primary); font-weight: 700;
 }
+/* Excel 原件预览：白底细线表格，贴 Excel 视觉；容器为 flex 列（bar 固定 + 表格区滚动） */
+.kdp-excel { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.kdp-excel-bar {
+  flex: none; display: flex; align-items: center; gap: 10px; padding: 7px 14px;
+  border-bottom: 1px solid var(--divider); background: var(--bg-main);
+}
+.kdp-excel-tabs { display: flex; gap: 4px; overflow-x: auto; }
+.kdp-excel-tabs button {
+  flex: none; height: 26px; padding: 0 12px; border: 1px solid var(--border); border-radius: 5px;
+  background: var(--bg-card); color: var(--text-muted); cursor: pointer; font: inherit; font-size: 12px; white-space: nowrap;
+}
+.kdp-excel-tabs button:hover { border-color: var(--primary); color: var(--primary); }
+.kdp-excel-tabs button.active { border-color: var(--primary); background: var(--primary-light); color: var(--primary); font-weight: 700; }
+.kdp-excel-name { overflow: hidden; color: var(--text-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.kdp-excel-freeze {
+  margin-left: auto; display: flex; align-items: center; gap: 4px;
+  color: var(--text-muted); font-size: 11.5px; white-space: nowrap; cursor: pointer;
+}
+.kdp-excel-wrap { flex: 1; min-height: 0; overflow: auto; padding: 12px 16px; background: #fff; }
+.kdp-excel-table { border-collapse: collapse; color: var(--text-regular); font-size: 12px; }
+.kdp-excel-table td {
+  min-width: 24px; max-width: 320px; height: 20px; padding: 2px 8px; overflow: hidden;
+  border: 1px solid var(--border); background: #fff;
+  text-align: left; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 冻结首行：贴顶 + 底色压住滚动上来的行（不开冻结时首行与普通行无差异，保真优先） */
+.kdp-excel-table td.frozen { position: sticky; top: 0; z-index: 1; background: var(--bg-main); }
 .kdp-note { margin: 10px 2px 0; color: var(--text-muted); font-size: 11.5px; }
 /* Office 预览：file 页签容器是 overflow:hidden（为 iframe 定的），解析内容要自己开滚动 */
 .kdp-office { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }

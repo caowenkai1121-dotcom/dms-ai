@@ -42,7 +42,7 @@ interface UploadRow {
   id: number; name: string
   state: 'doing' | 'ok' | 'partial' | 'fail'
   msg: string; destination?: string; ds?: Ds | null
-  /** 同名并存预警（上传前按目标文件夹内同名检出，不阻断上传）；终态后仍保留在行上 */
+  /** 同名替换提示（上传前按目标文件夹内同名检出，不阻断上传——服务端会用新文件替换同名旧文档）；终态后仍保留在行上 */
   warn?: string
   /** 上传阶段进度（0-100），仅 phase='upload' 时有值；进入解析或终态后清空 */
   progress?: number | null
@@ -414,11 +414,11 @@ function pillText(d: Doc): string {
 }
 /** pill 可点 = 主操作（重新处理）：失败/空内容/待向量/采集失败这类「处理动作能解决」的档。 */
 function pillClickable(d: Doc): boolean {
-  return !!currentSpace.value?.writable && !!attentionInfo(d)?.actionable
+  return canWrite.value && !!attentionInfo(d)?.actionable
 }
 /** 各状态档的「该怎么处理」指引（pill hover 与原因行同源）：每个非就绪档都要有明确动作。 */
 function statusGuidance(d: Doc): string {
-  const writable = !!currentSpace.value?.writable
+  const writable = canWrite.value
   if (d.status === 'failed') {
     return writable ? '点击本状态重新处理；反复失败请检查原文件后重新上传' : '处理失败，请联系空间管理员重新处理'
   }
@@ -727,6 +727,9 @@ async function saveMetadata() {
 }
 
 const currentSpace = computed(() => spaces.value.find((space) => space.space_id === spaceId.value) ?? null)
+/** 写操作显隐闸：kb_manager（全局管理授权）+ 当前空间可写，两者齐备才露上传/重处理/删除等写按钮。
+ *  隐藏只是体验对齐，安全闸在服务端各管理端点（fail-closed）。 */
+const canWrite = computed(() => kbManager.value && !!currentSpace.value?.writable)
 const switchingDisabled = computed(() => busy.value || creating.value || folderCreating.value || folderEditing.value
   || !!folderDeletingId.value || !!docMovingId.value || metadataSaving.value || granting.value
   || !!revokingGrant.value || !!deletingId.value || !!reprocessingId.value || !!stateChangingId.value
@@ -815,8 +818,8 @@ function folderLabel(folder: Folder): string {
   if (explicit.includes('/') || !folder.parent_id) return explicit || derived || folder.name
   return derived || explicit || folder.name
 }
-/** 同名判定键：目标文件夹 + 小写文件名（大小写不敏感；根目录/未分类的 folder_id 为空串） */
-const sameNameKey = (name: string, folderId: string) => `${folderId}\x00${name.trim().toLocaleLowerCase()}`
+/** 同名判定键：目标文件夹 + 文件名（与服务端 `find_by_name_in_folder` 同口径：精确匹配、大小写敏感；根目录/未分类的 folder_id 为空串） */
+const sameNameKey = (name: string, folderId: string) => `${folderId}\x00${name}`
 const filteredRoleOptions = computed(() => {
   const needle = roleSearch.value.trim().toLocaleLowerCase()
   if (!needle) return roleOptions.value
@@ -1451,7 +1454,7 @@ function toggleCheckPage(on: boolean) {
 
 /** 批量操作逐条走既有单文档端点（契约不变）：失败计数汇总提示，成功仍整刷空间。 */
 async function batchReprocessChecked() {
-  if (batchBusy.value || !currentSpace.value?.writable) return
+  if (batchBusy.value || !canWrite.value) return
   const targets = docs.value.filter((d) => checkedSet.value.has(d.doc_id))
   if (!targets.length) return
   const requestSpace = spaceId.value
@@ -1611,10 +1614,11 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
   }
   const requestFolder = targetFolder?.folder_id ?? ''
   const destination = targetFolder ? folderLabel(targetFolder) : '根目录 / 未分类'
-  // 同名并存预警（Yuxi FileUploadModal 同款）：服务端只按内容 hash 去重，同名不同内容的文件
-  // 会静默并存成两篇同名文档。上传前按「目标文件夹内同名」（大小写不敏感，根目录/未分类的
-  // folder_id 为空串）检出并在队列行上提示，不阻断上传。集合随本批逐个登记：目录批量上传时
-  // 同批先到的同名文件也算「已有」，后到的同样命中提示。
+  // 同名替换提示（裁决：重复上传＝替换原文件）：服务端按「同空间 + 同目录 + 同名」命中后用新内容
+  // 原地重建既有 doc_id（引用它的会话/预览链接不失效），不会产生第二份同名文档。上传前按
+  // 「目标文件夹内同名」（与服务端同口径：精确匹配、大小写敏感，根目录/未分类的 folder_id 为空串）
+  // 检出并在队列行上提示，不阻断上传。集合随本批逐个登记：目录批量上传时同批先到的同名文件
+  // 也算「已有」，后到的同样命中提示。
   const seenDocNames = new Set(docs.value.map((doc) => sameNameKey(doc.name, doc.folder_id || '')))
   // 记录是否发生过实际上传：全部预校验失败（无一发起请求）时不整刷空间
   let attempted = false
@@ -1639,7 +1643,7 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
       attempted = true
       const dupKey = sameNameKey(file.name, fileFolder)
       const warn = seenDocNames.has(dupKey)
-        ? `已有同名文档《${file.name}》，本次将作为新文档并存`
+        ? `已有同名文档《${file.name}》，本次上传将替换原文件`
         : undefined
       seenDocNames.add(dupKey)
       const row: UploadRow = {
@@ -2189,7 +2193,7 @@ void loadSpaces(props.initialSpace)
             <div class="folder-tree-head">
               <div><strong>资料目录</strong><span>{{ folders.length }} 个文件夹</span></div>
               <button
-                v-if="currentSpace?.writable" class="icon-btn" type="button"
+                v-if="canWrite" class="icon-btn" type="button"
                 :disabled="switchingDisabled || folderApiAvailable === false"
                 :title="folderApiAvailable === false ? '服务端尚未启用目录接口' : '新建文件夹'"
                 aria-label="新建文件夹" @click="folderCreateOpen = true"
@@ -2248,7 +2252,7 @@ void loadSpaces(props.initialSpace)
                 <strong>{{ counts.all }}</strong><span>全部文档</span>
               </button>
             </div>
-        <section v-if="currentSpace?.writable" class="upload-section" aria-label="上传文档">
+        <section v-if="canWrite" class="upload-section" aria-label="上传文档">
           <div class="upload-destination">
             <label for="kb-upload-folder">上传到</label>
             <select id="kb-upload-folder" v-model="uploadFolderId" :disabled="busy || folderApiAvailable === false">
@@ -2342,7 +2346,7 @@ void loadSpaces(props.initialSpace)
                   <span aria-hidden="true">/</span><strong>未分类</strong>
                 </template>
               </div>
-              <div v-if="selectedFolder && currentSpace?.writable" class="folder-commands">
+              <div v-if="selectedFolder && canWrite" class="folder-commands">
                 <button class="text-btn" type="button" :disabled="switchingDisabled" @click="openFolderEdit">改名/移动</button>
                 <button class="text-btn danger" type="button" :disabled="switchingDisabled" @click="deleteSelectedFolder">{{ folderDeletingId ? '删除中' : '删除' }}</button>
               </div>
@@ -2383,7 +2387,7 @@ void loadSpaces(props.initialSpace)
           <div v-else-if="!docs.length" class="list-state empty">
             <strong>知识库还是空的</strong>
             <span>上传制度、产品资料、合同模板或业务表格后，即可在对话中检索和引用。</span>
-            <button v-if="currentSpace?.writable" class="primary-btn" type="button" :disabled="busy" @click="openFilePicker">上传第一份文档</button>
+            <button v-if="canWrite" class="primary-btn" type="button" :disabled="busy" @click="openFilePicker">上传第一份文档</button>
           </div>
           <div v-else-if="!visibleDocs.length" class="list-state empty">
             <strong>没有匹配的文档</strong>
@@ -2394,7 +2398,7 @@ void loadSpaces(props.initialSpace)
             <!-- 批量条：勾选后出现；批量操作逐条走既有单文档端点 -->
             <div v-if="checkedIds.length" class="batch-bar" aria-live="polite">
               <span>已选 {{ checkedIds.length }} 项</span>
-              <template v-if="currentSpace?.writable">
+              <template v-if="canWrite">
                 <button type="button" class="text-btn" :disabled="batchBusy" @click="batchReprocessChecked">批量重新处理</button>
                 <button type="button" class="text-btn danger" :disabled="batchBusy" @click="batchDeleteOpen = true">批量删除</button>
               </template>
@@ -2430,7 +2434,7 @@ void loadSpaces(props.initialSpace)
                         <!-- 需处理/有提示的文档把原因亮在名字下（比描述重要），可处理的档带内联动作；其余才看描述行 -->
                         <span v-if="issueText(d)" class="doc-issue-line" :class="{ attention: !!attentionInfo(d) }" :title="issueTitle(d)">
                           {{ issueText(d) }}<button
-                            v-if="attentionInfo(d)?.actionable && currentSpace?.writable" type="button" class="issue-act"
+                            v-if="attentionInfo(d)?.actionable && canWrite" type="button" class="issue-act"
                             :disabled="!!reprocessingId" @click.stop="reprocess(d)"
                           >{{ reprocessingId === d.doc_id ? '处理中' : '点这里处理' }}</button>
                         </span>
@@ -2457,7 +2461,7 @@ void loadSpaces(props.initialSpace)
                     <div v-if="menuDocId === d.doc_id" class="ops-menu" role="menu">
                       <button type="button" role="menuitem" @click="previewDoc = d; menuDocId = ''">预览</button>
                       <button type="button" role="menuitem" @click="downloadDoc(d.doc_id, d.name); menuDocId = ''">下载原件</button>
-                      <template v-if="currentSpace?.writable">
+                      <template v-if="canWrite">
                         <button type="button" role="menuitem" :disabled="folderApiAvailable === false" @click="openMoveDialog(d); menuDocId = ''">移动至…</button>
                         <button type="button" role="menuitem" @click="openMetadata(d); menuDocId = ''">元数据</button>
                         <button

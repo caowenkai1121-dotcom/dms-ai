@@ -626,14 +626,11 @@ pub async fn reprocess(
         return Err(err(StatusCode::FORBIDDEN, format!("无权重处理空间 {} 的文档", row.space_id)));
     }
     // 本地改写：一次小写化 + 字面量后缀比较（原形态每次调用 4 次 format! 分配）
+    // 表格文档不再 409 挡路（裁决：重处理＝同内容的替换重建）——Overwrite 影子链把
+    // 知识索引与问数表两条通道的旧数据都清理重建，切换前任何失败旧版本原样保留，
+    // 不存在「覆盖仍可用数据」的窗口。
     let lower_name = row.name.to_ascii_lowercase();
     let is_tabular = [".csv", ".xls", ".xlsx", ".xlsm"].iter().any(|ext| lower_name.ends_with(ext));
-    if is_tabular {
-        return Err(err(
-            StatusCode::CONFLICT,
-            "表格文档包含知识索引与问数表两条通道；为避免覆盖仍可用的数据，请直接上传新版本并停用旧版本",
-        ));
-    }
     let path = stored_file(&st.kb_cfg.root, &row.doc_id)
         .await
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "原始文件已不存在，请重新上传"))?;
@@ -649,17 +646,21 @@ pub async fn reprocess(
     ingest::classify(&row.name, bytes.len() as u64, st.kb_cfg.max_bytes).map_err(kb_err)?;
     // 影子重建是重活（parse→chunk→embed），后台跑——同步 await 会被超时断连取消，
     // 与 upload 同一个坑。响应立即返回当前行（影子链不完成，线上版本不动），前端轮询。
-    let job = ingest::IngestJob::Rebuild {
-        req: ingest::OwnedUploadReq {
-            space_id: row.space_id.clone(),
-            folder_id: row.folder_id.clone(),
-            file_name: row.name.clone(),
-            mime: row.mime.clone(),
-            bytes,
-            // 重处理不保留原分块策略（恒 general）：preset 未持久化到 doc 行，当前是有意的
-            // 简化——按 qa/laws 等策略上传的文档重处理会回到 general 分块，恢复策略需先落库。
-            preset: None,
-        },
+    let req = ingest::OwnedUploadReq {
+        space_id: row.space_id.clone(),
+        folder_id: row.folder_id.clone(),
+        file_name: row.name.clone(),
+        mime: row.mime.clone(),
+        bytes,
+        // 重处理不保留原分块策略（恒 general）：preset 未持久化到 doc 行，当前是有意的
+        // 简化——按 qa/laws 等策略上传的文档重处理会回到 general 分块，恢复策略需先落库。
+        preset: None,
+    };
+    // 表格走覆盖链（旧物理表/数据源登记随新结构重建，无需重传文件）；其余原地重建。
+    let job = if is_tabular {
+        ingest::IngestJob::Overwrite { req }
+    } else {
+        ingest::IngestJob::Rebuild { req }
     };
     spawn_ingest_job(st.clone(), v, row.doc_id.clone(), row.name.clone(), job, permit);
     Ok(Json(doc_json(&row, chrono::Local::now().date_naive())))
@@ -1801,7 +1802,7 @@ async fn register_source(
             &st.owned,
             v,
             doc_id,
-            "表格已入知识库，问数数据源登记失败，请重新上传",
+            "表格已入知识库，问数数据源登记失败，请重新处理",
         )
         .await;
         tracing::warn!(ds_id = %src.ds_id, doc_id, reason = "datasource_register_failed", "上传表格已建表，但登记数据源失败");
@@ -1813,7 +1814,7 @@ async fn register_source(
             &st.owned,
             v,
             doc_id,
-            "表格已入知识库，问数结构采集失败，请重新上传",
+            "表格已入知识库，问数结构采集失败，请重新处理",
         )
         .await;
         return false;
@@ -4142,6 +4143,25 @@ mod tests {
         let permit = body.find("UPLOAD_GATE.try_acquire").unwrap();
         let read = body.find("tokio::fs::read").unwrap();
         assert!(permit < read, "先占许可再读文件: {body}");
+    }
+
+    /// 表格文档重处理＝替换语义（裁决：旧数据清理后重建）：409 甩锅文案退役，
+    /// 表格走 Overwrite 影子链（知识索引 + 问数表两条通道都随切换重建，失败保留旧版本），
+    /// 非表格仍走 Rebuild。结构采集/数据源登记的降级提示统一指路「重新处理」（重传不再是唯一出路）。
+    #[test]
+    fn reprocess_dispatches_tabular_to_overwrite_chain() {
+        let src = include_str!("kb_api.rs");
+        assert!(!src.contains(concat!("请直接上传", "新版本")), "甩锅文案必须退役");
+        assert!(src.contains("问数结构采集失败，请重新处理"), "降级提示必须指路重处理");
+        assert!(src.contains("问数数据源登记失败，请重新处理"), "降级提示必须指路重处理");
+        let body = src.split("pub async fn reprocess").nth(1).unwrap();
+        let body = body.split("pub async fn set_doc_state").next().unwrap();
+        assert!(!body.contains("StatusCode::CONFLICT"), "表格文档不许再被 409 挡在重处理门外: {body}");
+        assert!(body.contains("ingest::IngestJob::Overwrite"), "表格重处理必须走覆盖链: {body}");
+        assert!(body.contains("ingest::IngestJob::Rebuild"), "非表格重处理仍走影子重建: {body}");
+        let tab = body.find("is_tabular").unwrap();
+        let job = body.find("ingest::IngestJob::Overwrite").unwrap();
+        assert!(tab < job, "必须先判表格再分派覆盖链: {body}");
     }
 
     /// spaces 读端点：先列后建（常见路径省一次幂等 INSERT）

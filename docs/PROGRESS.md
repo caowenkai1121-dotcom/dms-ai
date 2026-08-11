@@ -2046,3 +2046,34 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
   市场费用口径）+ 政策资料带 [^3] 引用 + 综合「本月市场费用为 366,097.18 元。根据知识库
   资料，线下市场费用报销自 2026 年起需统一通过 DMS…」一段正确。workspace 1743 全绿，
   vue-tsc 0 错误。
+
+## AX107（2026-08-11 深夜，11 项实测反馈 swarm 落地：小程序渲染/Excel 原样/战区谓词/空深度页/导图重做/KB 替换/混合扩展）
+- **小程序 ai-chat（xh-xcx 仓）**：markdown 原生块渲染（零依赖解析器 + MarkdownView 组件，
+  [^n] 角标 badge 点按出来源）；数据答案卡片化（KPI 大数卡 ≥1万压缩两位小数 + 表格卡）；
+  等待期进度轮播（理解→查询→核口径→生成）；混合查询 kb/insight 双卡。AGENTS.md 触摸区
+  overflow:hidden 禁令遵守（零残留），uni build mp-weixin 通过。
+- **Excel 原样预览（web）**：xls/xlsx/xlsm 不再 soffice→PDF（样式失真），前端 SheetJS
+  （动态 import 不进首包）解析原文件自绘：cell.w 格式化文本、!merges 合并还原、!cols 列宽、
+  多 sheet 页签、冻结首行、2000×200 + 120k 单元格截断保险、解析失败回落解析内容层不白屏。
+  doc/ppt 的 PDF 路径一字未动。
+- **小程序下单深分析谓词丢失（生产 200 行外省客户事故）**：深度页板块 SQL 谓词透传只认
+  dws_off_offline_sale_dfn，小程序事实表（dws_mkt_app_place_order_dnf）整体跌进 LLM 重编
+  （跨快照求和/换表/丢 region 三样全错）。修复：scoped_mini_program_where + 唯一受信拆解
+  （客户结构）编译期锁定，with_sales_where 整段透传（快照日+region+权限一个不落）；
+  问句点名「战区」时口径注释明示「该表无战区字段，按省区统计」（不许拿 region 冒充）。
+- **空深度页**：主结果 0 行（反问卡）时照样 save_artifact 出「0 个分析板块」空壳页——
+  修复为 sections 空且无明细时不产 artifact、回退主结果（反问/实体卡），账本落 failed 可续跑。
+- **知识导图重做**：展收语义反转（默认只展根+一级，圆形 +/− 钮点击才展开，hover 不触发，
+  展开集合按空间记忆）；横向树 pastel 分支色 + 胶囊节点 + 类型图标；无限画布（拖拽平移/
+  滚轮锚点缩放 0.2–3x/适应屏幕/复位）；摘要卡/重生成/导出 PNG/SVG 全保留。
+- **KB 上传与权限**：reprocess 对表格文档退役 409 甩锅文案、分派 Overwrite 影子链
+  （双通道旧数据清理重建、失败保旧版）；同名上传前端文案对齐既有替换语义（精确同名，
+  doc_id 不变）；全部写按钮仅 kb_manager 可见（canWrite 收口），后端 20 个写端点本就在闸内。
+  本机 settings 补 pg_ro_url（问数结构采集失败的真根因）；service_url 指 8077 宿主机解析。
+- **纯表头 xlsx 入库失败**：embed_service._fill_table 对 0 数据行的表一个块都不发 →
+  「没有可索引的文本」。修：rows 空也发「标题+表头」块（字段清单就是模板表的内容）。
+- **混合查询扩展（意图不明双查）**：triage.unclear_both_hit（kb 词×问数信号×非强文档×
+  非完整业务问句，四判据全复用）→ 整句喂两路；web 两入口 + xcx 两入口全接上（xcx 错误壳
+  映回小程序协议）；「报销政策是什么」单句仍纯 KB、「本月销售额」仍纯问数（钉板钉住）。
+- 验证矩阵（本机 8100 实测 7 题）：库存/小程序山东/客户 0.00/纯政策/混合双路/意图不明双查/
+  纯销售额全部符合预期；workspace 1749 全绿；vue-tsc 0 错；web build 通过。

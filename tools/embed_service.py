@@ -1034,6 +1034,10 @@ def _fill_table(chunks, prefix, rows, hp, page, tc):
         cur_len += need
     if cur:
         _emit(chunks, prefix + '\n' + '\n'.join(cur), hp, page)
+    elif not rows and prefix.strip():
+        # 纯表头表（0 数据行的表单模板/空表）：表头本身就是内容（字段清单就是用户会问的），
+        # 这里不发块 = 整份文档 0 块、入库报「没有可索引的文本」（实测《巡店记录表单-模板.xlsx》）。
+        _emit(chunks, prefix, hp, page)
 
 def chunk_blocks(blocks, target_tokens=TARGET_TOKENS, overlap=OVERLAP):
     overlap = max(0, min(overlap, MAX_TOKENS // 4))

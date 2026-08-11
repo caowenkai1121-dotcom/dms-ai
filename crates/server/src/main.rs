@@ -2043,20 +2043,36 @@ async fn ask_data_payload(
     req: &AskReq,
     gate: &AskGate,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let r = ask_data_run(st, req, gate, &req.question).await?;
+    let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
+    let r = ask_data_run(
+        st,
+        &gate.p,
+        gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice())),
+        req.ds.as_deref(),
+        req.conv_id.map(|c| c.to_string()).as_deref(),
+        // 【深度模式】SC 抬到 ≥3：多数派投票是现成的「AI 深度参与生成」件
+        //（配置 sc_samples 已 ≥3 时不降 —— max 不是 overwrite）
+        if req.mode.as_deref() == Some("deep") { st.sc_samples.max(3) } else { st.sc_samples },
+        &req.question,
+    )
+    .await?;
     Ok(serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"))
 }
 
 /// 问数半的执行体（`AskResult` 本体，未序列化）：`ask_data_payload` 与混合查询编排共用，
-/// 错误映射（403 无权 / 422 问数失败）只有这一份。
+/// 错误映射（403 无权 / 422 问数失败）只有这一份。入参是拆开的字段而不是 `AskReq`/`AskGate`
+/// —— 小程序（`xcx_api`）的混合查询也走这里，它没有 web 那两个请求结构。
+#[allow(clippy::too_many_arguments)] // 形参 = 原来 `AskReq`/`AskGate` 里实际被读的那几样
 async fn ask_data_run(
     st: &AppState,
-    req: &AskReq,
-    gate: &AskGate,
+    p: &principal::Principal,
+    prev: Option<dms_agent::ask::PrevTurn<'_>>,
+    ds: Option<&str>,
+    conv_id: Option<&str>,
+    sc_samples: usize,
     question: &str,
 ) -> Result<dms_agent::AskResult, (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
-    let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
     let (r, _log) = ask(
         &st.llm,
         &st.auth_mysql,
@@ -2064,16 +2080,14 @@ async fn ask_data_run(
         &st.sources,
         st.owned.pool(),
         &st.embed,
-        &gate.p,
+        p,
         question,
-        gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice())),
-        req.ds.as_deref(),
+        prev,
+        ds,
         // 会话 id 透传到 `query_log` 与三张日志表 —— `chat.rs` 的亏就是
         // 「query_log 当年没有 conv_id，从它拿不回本会话上一轮」
-        req.conv_id.map(|c| c.to_string()).as_deref(),
-        // 【深度模式】SC 抬到 ≥3：多数派投票是现成的「AI 深度参与生成」件
-        //（配置 sc_samples 已 ≥3 时不降 —— max 不是 overwrite）
-        if req.mode.as_deref() == Some("deep") { st.sc_samples.max(3) } else { st.sc_samples },
+        conv_id,
+        sc_samples,
     )
     .await;
     // 服务侧 fire-and-forget：`_log` 句柄直接丢弃，HTTP 主链路一个 `.await` 都不多
@@ -2094,22 +2108,47 @@ async fn ask_data_run(
     Ok(r)
 }
 
+/// 【混合查询】编排入参：web（`AskReq`/`AskGate`）与小程序（`XcxAskGate`）各自拼一份 ——
+/// `hybrid_payload` 只吃这几样字段，不为任何一侧的协议结构所累（两套应答形状各改各的，互不拖）。
+pub(crate) struct HybridAsk<'a> {
+    /// 用户原问：AI 综合（`hybrid_summary`）与 warn 留痕用；喂给两路的是 kb_q/data_q 两半
+    pub(crate) question: &'a str,
+    pub(crate) p: &'a principal::Principal,
+    /// 上一轮（问句, 那一轮执行的 SQL, 证据引用）：与 `ask` 的 `prev` 同一类型
+    pub(crate) prev: Option<dms_agent::ask::PrevTurn<'a>>,
+    /// 显式选源；小程序恒 None（后端选源）
+    pub(crate) ds: Option<&'a str>,
+    /// 会话 id（透传 `query_log` 三表）
+    pub(crate) conv_id: Option<&'a str>,
+    /// 显式知识空间；缺省 = 不限空间（小程序恒 None）
+    pub(crate) space_id: Option<&'a str>,
+    pub(crate) sc_samples: usize,
+}
+
+/// 【混合查询】两级判据（web 与小程序同一份，判据两处必漂）：子句级命中（明确的两半
+/// 问句）→ 两半各喂一路；否则整句级 both-hit（意图不明确，2026-08-11 用户裁决：问数与
+/// 知识库一起查、综合输出）→ 整句喂两路。都不命中 = `None`，单路分诊照旧。
+pub(crate) fn hybrid_split(question: &str) -> Option<(String, String)> {
+    triage::hybrid_clauses(question)
+        .or_else(|| triage::unclear_both_hit(question).then(|| (question.to_string(), question.to_string())))
+}
+
 /// 【混合查询】问数 + 知识库两路并行（`tokio::join!` 总耗时 = 两路较大者，不相加），
 /// AI 综合落 `view.insight`、知识库答案落 `kb` 键（老前端 serde 兼容：多出的键被忽略）。
 /// 一路挂了不拖死另一路：退化为单路答案（warn 留痕），与复合子问「失败不算整体失败」同族。
-async fn hybrid_payload(
+/// `pub(crate)`：小程序（`xcx_api`）复用同一编排，应答形状由各自入口包。
+pub(crate) async fn hybrid_payload(
     st: &AppState,
-    req: &AskReq,
-    gate: &AskGate,
+    h: &HybridAsk<'_>,
     kb_q: &str,
     data_q: &str,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let data = ask_data_run(st, req, gate, data_q);
-    let kb = kb_answer(st, &gate.p, req.space_id.as_deref(), kb_q);
+    let data = ask_data_run(st, h.p, h.prev, h.ds, h.conv_id, h.sc_samples, data_q);
+    let kb = kb_answer(st, h.p, h.space_id, kb_q);
     let (data_r, kb_r) = tokio::join!(data, kb);
     match (data_r, kb_r) {
         (Ok(r), Ok(a)) => {
-            let summary = dms_agent::compound::hybrid_summary(&st.llm, &req.question, &r, &a).await;
+            let summary = dms_agent::compound::hybrid_summary(&st.llm, h.question, &r, &a).await;
             let mut v =
                 serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
             if let Some(s) = summary {
@@ -2119,15 +2158,41 @@ async fn hybrid_payload(
             Ok(v)
         }
         (Ok(r), Err(e)) => {
-            tracing::warn!(err = %e, question = %req.question, "混合查询知识库路失败 → 退化纯问数");
+            tracing::warn!(err = %e, question = %h.question, "混合查询知识库路失败 → 退化纯问数");
             Ok(serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"))
         }
         (Err(_), Ok(a)) => {
-            tracing::warn!(question = %req.question, "混合查询问数路失败 → 退化纯知识库");
+            tracing::warn!(question = %h.question, "混合查询问数路失败 → 退化纯知识库");
             Ok(serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败"))
         }
         (Err(e), Err(_)) => Err(e),
     }
+}
+
+/// `api_ask` 与 `api_ask_stream` 共用的混合查询前段：自动模式（未点 chip）且 `hybrid_split`
+/// 命中 → `Some(两路编排结果)`；点了 chip 或两级判据都不命中 → `None`（单路分诊照旧）。
+async fn hybrid_branch(
+    st: &AppState,
+    req: &AskReq,
+    gate: &AskGate,
+) -> Option<Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)>> {
+    if req.intent.is_some() {
+        return None;
+    }
+    let (kb_q, data_q) = hybrid_split(&req.question)?;
+    let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
+    let conv_id = req.conv_id.map(|c| c.to_string());
+    let h = HybridAsk {
+        question: &req.question,
+        p: &gate.p,
+        prev: gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice())),
+        ds: req.ds.as_deref(),
+        conv_id: conv_id.as_deref(),
+        space_id: req.space_id.as_deref(),
+        // 深度模式的 SC 抬档与问数单路同一口径（见 `ask_data_payload`）
+        sc_samples: if req.mode.as_deref() == Some("deep") { st.sc_samples.max(3) } else { st.sc_samples },
+    };
+    Some(hybrid_payload(st, &h, &kb_q, &data_q).await)
 }
 
 /// 存会话消息（用户问 + AI 结果），首问顺手设标题。失败 warn 留痕后吞掉：
@@ -2145,14 +2210,13 @@ async fn api_ask(
     Json(req): Json<AskReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let gate = ask_gate(&st, &headers, &req).await?;
-    // 【混合查询】自动模式（未点「问数/知识库」chip）且问句横跨「文档 + 取数」两半时：
-    // 两路并行 + AI 综合（`hybrid_payload`），不再二选一丢掉另一半。
-    if req.intent.is_none() {
-        if let Some((kb_q, data_q)) = triage::hybrid_clauses(&req.question) {
-            let payload = hybrid_payload(&st, &req, &gate, &kb_q, &data_q).await?;
-            ask_persist(&st, req.conv_id, &req.question, &payload).await;
-            return Ok(Json(payload));
-        }
+    // 【混合查询】自动模式（未点「问数/知识库」chip）：子句级两半各喂一路，整句级
+    // both-hit（意图不明确）整句喂两路 —— 两路并行 + AI 综合（`hybrid_payload`），
+    // 不再二选一丢掉另一半。
+    if let Some(payload) = hybrid_branch(&st, &req, &gate).await {
+        let payload = payload?;
+        ask_persist(&st, req.conv_id, &req.question, &payload).await;
+        return Ok(Json(payload));
     }
     // 【K5】意图分诊。`ds` 用主源：判据只读 `meta.metric/dimension/term`（谓词 `IN (ds,'*')`），
     // 而选源发生在 `dms_agent::ask` 内部——分诊只决定「问数还是查文档」，不决定问哪个源。
@@ -2192,14 +2256,12 @@ async fn api_ask_stream(
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     use axum::response::IntoResponse;
     let gate = ask_gate(&st, &headers, &req).await?;
-    // 【混合查询】与 `/api/ask` 同一判据：命中即回普通 JSON（前端按 handleSync 处理，
-    // 与 Data 臂同一个传输约定，SSE 协议一字不动）。
-    if req.intent.is_none() {
-        if let Some((kb_q, data_q)) = triage::hybrid_clauses(&req.question) {
-            let payload = hybrid_payload(&st, &req, &gate, &kb_q, &data_q).await?;
-            ask_persist(&st, req.conv_id, &req.question, &payload).await;
-            return Ok(Json(payload).into_response());
-        }
+    // 【混合查询】与 `/api/ask` 同一判据（`hybrid_branch` 一处收口）：命中即回普通 JSON
+    //（前端按 handleSync 处理，与 Data 臂同一个传输约定，SSE 协议一字不动）。
+    if let Some(payload) = hybrid_branch(&st, &req, &gate).await {
+        let payload = payload?;
+        ask_persist(&st, req.conv_id, &req.question, &payload).await;
+        return Ok(Json(payload).into_response());
     }
     let intent =
         triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &req.question, req.intent.as_deref())

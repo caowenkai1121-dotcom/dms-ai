@@ -2257,8 +2257,14 @@ fn mini_program_order_agg(question: &str) -> Option<DirectHit> {
         })
         .unwrap_or_default();
     let snapshot = "data_date = (SELECT MAX(data_date) FROM sales_dw.dws_mkt_app_place_order_dnf)";
-    let note = "-- 小程序下单口径（最新快照 data_date，快照日见「数据日期」列；\
-                同行当月/当日累计，禁止跨快照日求和）\n";
+    // 问句点名「战区」必须明示口径：该表没有 war_zone 列，region 是省区口径 ——
+    // 不许静默拿 region 冒充战区（「战区/大区」只是 region 列的存储形态探值，不是层级）。
+    let war_zone_note =
+        if question.contains("战区") { "该表无「战区」字段，按省区（region）统计；" } else { "" };
+    let note = format!(
+        "-- 小程序下单口径（{war_zone_note}最新快照 data_date，快照日见「数据日期」列；\
+         同行当月/当日累计，禁止跨快照日求和）\n"
+    );
     let select_cols =
         cols.iter().map(|(expr, label)| format!("{expr} AS `{label}`")).collect::<Vec<_>>().join(", ");
     if ["按客户", "各客户"].iter().any(|w| question.contains(w)) {
@@ -3765,6 +3771,19 @@ mod tests {
             compose.contains("mini_program_order_agg(cx.question).is_some()"),
             "小程序下单必须进 compose 让路门，不许被装配成丢限定的 SQL"
         );
+    }
+
+    #[test]
+    fn mini_program_war_zone_wording_discloses_region_caliber() {
+        // 问句点名「战区」：口径注释必须明示该表无战区字段、按省区（region）统计 ——
+        // 不许静默拿 region 冒充战区
+        let h = mini_program_order_agg("按客户进行展示山东战区本月小程序的下单数量和金额")
+            .expect("战区问句应走快照模板");
+        assert!(h.sql.contains("该表无「战区」字段，按省区（region）统计"), "{}", h.sql);
+        assert!(!h.sql.contains("war_zone"), "该表无战区列，SQL 里不许出现：{}", h.sql);
+        // 没点名的问句不带这句（注释不刷屏）
+        let s = mini_program_order_agg("本月小程序下单数量和金额").expect("标量小程序下单");
+        assert!(!s.sql.contains("该表无「战区」字段"), "{}", s.sql);
     }
 
     #[test]

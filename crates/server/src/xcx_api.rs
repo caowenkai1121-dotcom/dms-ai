@@ -454,6 +454,12 @@ pub async fn ask(
     Json(req): Json<XcxAskReq>,
 ) -> Result<Json<Value>, ApiErr> {
     let gate = ask_gate(&st, &headers, &req).await?;
+    // 【混合查询】小程序无 chip、恒自动模式，与 `/api/ask` 同一份两级判据（`hybrid_split`）：
+    // 命中走两路并行 + AI 综合，payload 带 `kb` 键（老客户端按未知键忽略，向后兼容）。
+    if let Some((kb_q, data_q)) = crate::hybrid_split(&gate.question) {
+        let payload = xcx_hybrid_payload(&st, &gate, &kb_q, &data_q).await?;
+        return Ok(ask_finish(&st, &gate, payload).await);
+    }
     // 分诊（同 api_ask：无强制 chip，主源元数据判 Data/Knowledge；分诊内部不失败）
     let intent = triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &gate.question, None).await;
     let payload = match intent {
@@ -487,6 +493,12 @@ pub async fn ask_stream(
 ) -> Result<axum::response::Response, ApiErr> {
     use axum::response::IntoResponse;
     let gate = ask_gate(&st, &headers, &req).await?;
+    // 【混合查询】与 `/api/xcx/ask` 同一判据：命中即回普通 JSON（协议与 Data 臂逐字相同，
+    // 客户端按 content-type 分派），SSE 协议一字不动。
+    if let Some((kb_q, data_q)) = crate::hybrid_split(&gate.question) {
+        let payload = xcx_hybrid_payload(&st, &gate, &kb_q, &data_q).await?;
+        return Ok(ask_finish(&st, &gate, payload).await.into_response());
+    }
     let intent = triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &gate.question, None).await;
     match intent {
         triage::Intent::Data => {
@@ -624,6 +636,35 @@ async fn ask_data_payload(st: &AppState, gate: &XcxAskGate) -> Result<Value, Api
         tracing::warn!(conv_id = gate.conv_id, reason = %e, "AskResult 序列化失败，回空对象（客户端会看到空白答案）");
         json!({})
     }))
+}
+
+/// 【混合查询】小程序侧编排：与 web 同一个 `crate::hybrid_payload`（两路并行 + AI 综合 +
+/// `kb` 键），入参从 `XcxAskGate` 拼（无选源、无知识空间、无深度模式 —— 与 `ask_data_payload`
+/// 同口径）；错误体映回小程序协议：Err 只可能来自「双路全挂」，而问数路只产 403/422 两种
+/// （见 `ask_data_payload` 的映射），web 的 `{"error":…}` 壳小程序拦截器不认。
+async fn xcx_hybrid_payload(
+    st: &AppState,
+    gate: &XcxAskGate,
+    kb_q: &str,
+    data_q: &str,
+) -> Result<Value, ApiErr> {
+    let conv_id = gate.conv_id.to_string();
+    let h = crate::HybridAsk {
+        question: &gate.question,
+        p: &gate.p,
+        prev: gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[][..])),
+        ds: None, // 小程序侧不提供选源，后端选源（同 `ask_data_payload`）
+        conv_id: Some(conv_id.as_str()),
+        space_id: None,
+        sc_samples: st.sc_samples,
+    };
+    crate::hybrid_payload(st, &h, kb_q, data_q).await.map_err(|(status, _)| {
+        if status == StatusCode::FORBIDDEN {
+            fail(status, 403, "当前账号无权访问该数据源")
+        } else {
+            fail(status, 422, "暂时无法完成本次问数，请调整问题后重试")
+        }
+    })
 }
 
 /// `ask` / `ask_stream` 共用的收尾（问数分支；知识库流式的持久化在工人里做）：
