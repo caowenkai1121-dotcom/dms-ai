@@ -199,7 +199,7 @@ async fn summarize(
         ));
     }
     user.push_str("\n请汇总成结论：");
-    insight::fast_guarded(llm, system, &user, "复合汇总").await
+    insight::fast_guarded_checked(llm, system, &user, "复合汇总").await
 }
 
 
@@ -226,7 +226,7 @@ pub async fn hybrid_summary(
     let user = format!("{}
 原问题：{question}
 请综合成结论：", wrap_untrusted(&hits));
-    insight::fast_guarded(llm, system, &user, "混合查询综合").await
+    insight::fast_guarded_checked(llm, system, &user, "混合查询综合").await
 }
 
 #[cfg(test)]

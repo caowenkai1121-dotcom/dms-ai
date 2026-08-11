@@ -2107,3 +2107,18 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
   base64 兜底）→ 服务器 docker 构建 → `_restart_server.sh` 重启（内置健康探针）→
   刷 web 产物 → /api/health 自检。`_deploy.py` 补 DEPLOY_PORT（路由器映射非 22 端口时用）。
   用法：`DEPLOY_PW=… DEPLOY_HOST=119.39.97.141 DEPLOY_PORT=2222 bash tools/deploy_update.sh`。
+
+## AX110（2026-08-12，准确向迭代：AI 文案数字断言对账——DF validation 相位平移）
+对照 datafoundry 验收驱动闭环（protocols/data-analysis.ts 的 ANALYSIS_CLAIM_VALUE_MISMATCH），
+我方 LLM 文案（AI 解读/复合汇总/混合综合/深度解读/日报点评）的数字此前零校验——模型写错数
+用户无感，是信任杀手。落地 claim check：
+- `insight::unmatched_claims`（纯函数）：抽取文本数字断言（千分位/小数/万/亿/%/元等单位，
+  单位可隔一个空白），与素材全部数字按 1% 相对容差 + 万×1e4/亿×1e8/%×100 换算对账。
+  不抽日期时间片段/列表序号/序数（第 N）/派生比率（倍·成）/散文小计数（<100 无单位、
+  <10 纯计数单位）——误伤面实测收敛。钉板覆盖全部分支（含「每天上限 100 元」抓错数）。
+- `fast_guarded_checked`（生成侧默认入口）：对不上 → 错数列清单精确重试一次 → 仍对不上
+  → 丢弃 AI 文案（宁缺勿错，与既有网址守卫/推断守卫同一条「重试再丢」纪律）。
+  接线：Reading::insight（精简解读）、insight_deep_for（深度解读，Precise 档）、
+  compound::summarize（复合汇总）、compound::hybrid_summary（混合综合）四处全换。
+- 实测：本月销售额 AI 解读「约为 8008.94 万元」对账通过无重试；混合查询综合照常出。
+  workspace 1751 全绿。

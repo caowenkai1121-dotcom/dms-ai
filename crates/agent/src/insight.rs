@@ -151,7 +151,7 @@ impl Reading<'_> {
         // 换来的是「回传的串永远进不了 prompt 的可信段」这条不用讨论的边界。
         let hits = self.briefing_hits(BRIEF_ROWS);
         let user = format!("{}\n原问题：{}\n\n请按要求解读：", wrap_untrusted(&hits), self.question);
-        fast_guarded(llm, SYSTEM, &user, "结果解读").await
+        fast_guarded_checked(llm, SYSTEM, &user, "结果解读").await
     }
 
     /// 【深度模式】深度解读：**Precise 档** + 短结论/证据表/行动表 +
@@ -181,7 +181,20 @@ impl Reading<'_> {
         );
         let first = guarded(llm, system, &user, "深度解读", ModelTier::Precise).await?;
         if !has_unsupported_business_inference(self.question, &first) {
-            return Some(first);
+            // 无推断问题后再过数字断言对账（同一道「重试一次再丢」纪律，换 claim 清单作约束）
+            let bad = unmatched_claims(&first, &user);
+            if bad.is_empty() {
+                return Some(first);
+            }
+            tracing::warn!(claims = ?bad, "深度解读含与数据对不上的数字 → 列清单精确重试一次");
+            let retry = format!(
+                "{user}\n上一次输出里这些数字与给出的素材对不上：{}。\
+                 只许使用素材里出现过的数字（万/亿/%/元的单位换算允许）；对不上账的数字就不要写。请重新输出。",
+                bad.join("、")
+            );
+            return guarded(llm, system, &retry, "深度解读数字重试", ModelTier::Precise)
+                .await
+                .filter(|s| unmatched_claims(s, &user).is_empty());
         }
         tracing::warn!("深度解读含无数据支撑的业务推断 → 精确约束后重试一次");
         let retry = format!(
@@ -278,6 +291,150 @@ fn unescape_newlines(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+// ═══════════ 数字断言对账（DF validation 相位平移：claim 容差比对，对不上驳回）═══════════
+//
+// AI 文案（解读/汇总/综合）里的数字必须能在喂给模型的素材里找到出处：抽取数字断言，
+// 与素材全部数字按「1% 相对容差 + 万/亿/% 单位换算」对账。对不上 = 模型在编数（或记错），
+// 走 fast_guarded_checked 的「精确重试一次 → 仍对不上就丢」。
+
+/// 数字断言的尾附单位（影响换算）。`倍/成` 是派生比率——素材里本就没有，不抽。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ClaimUnit {
+    None,
+    Wan,  // 万 ×1e4
+    Yi,   // 亿 ×1e8
+    Pct,  // % 或 ％：素材可能是比值（×100 对账）也可能已是百分数
+    Bare, // 元/个/单/家/件/条/次/块/位/名 等纯计数单位：直接比对
+}
+
+/// 从文本抽数字断言（纯函数）。跳过：日期/时间片段（数字紧邻 `-` `:` `/` 或 年月日时分）、
+/// 列表序号（数字后跟 `.`、`、`）、序数（紧跟「第」）、比率（后跟 倍/成）、
+/// 无单位且无小数点/千分位的小整数（<100 的散文计数，如「2 个板块」——素材对不上是常态）。
+fn extract_claims(text: &str) -> Vec<(f64, ClaimUnit, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut seen_dot = false;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit() || chars[i] == ',' || (chars[i] == '.' && !seen_dot))
+        {
+            if chars[i] == '.' {
+                // 小数点后面必须还是数字，否则是列表序号/句号边界（「3.」「版本 2.0」的第二个点）
+                if i + 1 >= chars.len() || !chars[i + 1].is_ascii_digit() {
+                    break;
+                }
+                seen_dot = true;
+            }
+            i += 1;
+        }
+        let raw: String = chars[start..i].iter().collect();
+        let next = chars.get(i).copied();
+        let prev = start.checked_sub(1).map(|j| chars[j]);
+        // 单位允许隔一个空白（「100 元」「36.6 万」是常见行文）
+        let unit_at = match next {
+            Some(' ') => chars.get(i + 1).copied(),
+            other => other,
+        };
+        // 序号/日期/时间/序数/比率跳过
+        let date_like = matches!(next, Some('-' | ':' | '/' | '年' | '月' | '日' | '时' | '分'))
+            || matches!(prev, Some('-' | ':' | '/' | '第'));
+        let list_marker = matches!(next, Some('.' | '、'));
+        let ratio = matches!(unit_at, Some('倍' | '成'));
+        if date_like || list_marker || ratio {
+            continue;
+        }
+        let unit = match unit_at {
+            Some('万') => ClaimUnit::Wan,
+            Some('亿') => ClaimUnit::Yi,
+            Some('%') | Some('％') => ClaimUnit::Pct,
+            Some('元' | '块' | '个' | '单' | '家' | '件' | '条' | '次' | '位' | '名') => ClaimUnit::Bare,
+            _ => ClaimUnit::None,
+        };
+        let normalized: String = raw.chars().filter(|c| *c != ',').collect();
+        let Ok(v) = normalized.parse::<f64>() else {
+            continue;
+        };
+        // 无单位纯小整数（散文计数）不抽；带小数点/千分位或 ≥100 的才够「数字断言」的格
+        if unit == ClaimUnit::None && !seen_dot && !raw.contains(',') && v.abs() < 100.0 {
+            continue;
+        }
+        // 纯计数单位的小数目（「3 个板块」「2 大客户」）是散文结构不是取数断言，不抽
+        if unit == ClaimUnit::Bare && v.abs() < 10.0 {
+            continue;
+        }
+        out.push((v, unit, raw));
+    }
+    out
+}
+
+/// 相对容差 1%（数量级无关）；素材值与断言值都可能是 0 的情况由 max 兜底。
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 0.01 * b.abs().max(1e-9)
+}
+
+/// 一条断言是否与素材数字对得上账（含单位换算档）。
+fn claim_matches(v: f64, unit: ClaimUnit, material: &[f64]) -> bool {
+    material.iter().any(|m| {
+        close(v, *m)
+            || match unit {
+                ClaimUnit::Wan => close(v * 1e4, *m),
+                ClaimUnit::Yi => close(v * 1e8, *m),
+                ClaimUnit::Pct => close(v, m * 100.0),
+                _ => false,
+            }
+    })
+}
+
+/// 对账：返回 AI 文本里**对不上素材**的数字断言原文（空 = 全部有出处）。
+/// `material` 用调用方的完整 user prompt（简报 + 原问题都在里面，宁宽勿漏）。
+fn unmatched_claims(text: &str, material: &str) -> Vec<String> {
+    let material_nums: Vec<f64> = extract_claims(material).iter().map(|(v, _, _)| *v).collect();
+    extract_claims(text)
+        .iter()
+        .filter(|(v, unit, _)| !claim_matches(*v, *unit, &material_nums))
+        .map(|(_, unit, raw)| {
+            let suffix = match unit {
+                ClaimUnit::Wan => "万",
+                ClaimUnit::Yi => "亿",
+                ClaimUnit::Pct => "%",
+                _ => "",
+            };
+            format!("{raw}{suffix}")
+        })
+        .collect()
+}
+
+/// `fast_guarded` 的数字断言加固版（**生成侧默认入口**）：先照常生成，再对账；
+/// 对不上 → 把错数列清单精确重试一次 → 仍对不上 → None（宁可没有 AI 文案，不留错数字）。
+/// 素材即 `user`（简报在里头），调用方一个参数都不用多传。
+pub(crate) async fn fast_guarded_checked(
+    llm: &dyn ChatModel,
+    system: &str,
+    user: &str,
+    what: &str,
+) -> Option<String> {
+    let first = fast_guarded(llm, system, user, what).await?;
+    let bad = unmatched_claims(&first, user);
+    if bad.is_empty() {
+        return Some(first);
+    }
+    tracing::warn!(claims = ?bad, "{what}含与数据对不上的数字 → 列清单精确重试一次");
+    let retry = format!(
+        "{user}\n上一次输出里这些数字与给出的素材对不上：{}。\
+         只许使用素材里出现过的数字（万/亿/%/元的单位换算允许）；对不上账的数字就不要写。请重新输出。",
+        bad.join("、")
+    );
+    fast_guarded(llm, system, &retry, what)
+        .await
+        .filter(|s| unmatched_claims(s, user).is_empty())
 }
 
 /// 模型产物不许含网址（**纯函数**，不变量 I5 的可执行版）。
@@ -894,5 +1051,26 @@ mod tests {
             "同一个表达式只说一次"
         );
         assert!(distinct_exprs("SELECT SUM(amount) FROM t_a").is_empty());
+    }
+
+    /// 数字断言对账：万/亿/千分位/百分数换算全认，日期/序号/序数/比率不抽，错数能抓出来
+    #[test]
+    fn claim_check_accepts_unit_conversions_and_ignores_prose_numbers() {
+        let material = "查询结果
+销售额 | 销量 | 毛利率
+80089404.9300 | 381100.0 | 0.1963
+共 1 行";
+        // 万换算 + 千分位 + 百分数 ×100：全对得上
+        assert!(unmatched_claims("本月销售额 8008.94万，毛利率 19.6%", material).is_empty());
+        assert!(unmatched_claims("销售额 80,089,404.93 元", material).is_empty());
+        // 日期/序数/列表序号/比率/散文计数：不抽，不会因它们误伤
+        assert!(unmatched_claims("截至 2026-08-11，第 1 名客户；分 2 点看：1. 量级 2. 结构，高 2 倍", material).is_empty());
+        // 错数抓得住（素材里没有 100）
+        let bad = unmatched_claims("每天上限 100 元", material);
+        assert_eq!(bad, vec!["100".to_string()]);
+        // 亿换算
+        assert!(unmatched_claims("总库存 1.03亿", "102751191.098").is_empty());
+        // 容差外照样抓（差 30%）
+        assert_eq!(unmatched_claims("销售额 5000万", material).len(), 1);
     }
 }
