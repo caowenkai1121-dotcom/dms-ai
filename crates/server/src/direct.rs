@@ -3264,8 +3264,9 @@ async fn ods_derive(cx: &dms_agent::AskCtx<'_>) -> Option<DirectHit> {
     if !derive_eligible(cx) {
         return None;
     }
-    let pool =
+    let mut pool =
         dms_semantic::recall::ods_candidate_tables(cx.pg, cx.ds, cx.question, DERIVE_TOP_K).await;
+    derive_pool_winc_guard(&mut pool, cx.question);
     if pool.is_empty() {
         tracing::info!(question = %cx.question, "推导无候选 ODS 表 → 回落「不可计算」卡");
         return None;
@@ -3332,6 +3333,22 @@ async fn ods_derive(cx: &dms_agent::AskCtx<'_>) -> Option<DirectHit> {
     None
 }
 
+/// 营销通/经销商上报专属表不进默认推导候选池：目录合同里的「禁止用本表推导」是写给 LLM
+/// 看的文字，管不住表选择 —— 2026-08-11 实测「X客户本月销售额」被推导到 t_winc_sale_report，
+/// 过滤一空就是单行全 NULL（同题不同答的根因之一）。用户点名 WinC/营销通/经销商上报/进销存
+/// 时才放行；池被滤空 = 合同未覆盖语义不变，照旧回落原卡。纯函数，无库可单测。
+fn derive_pool_winc_guard(pool: &mut Vec<&'static str>, question: &str) {
+    const WINC_ONLY_TABLES: &[&str] = &[
+        "t_winc_sale_report", "t_winc_stock_report", "t_winc_sale_transfer", "t_winc_stock_transfer",
+    ];
+    let winc_asked = ["winc", "WinC", "WINC", "营销通", "经销商上报", "进销存"]
+        .iter()
+        .any(|w| question.contains(w));
+    if !winc_asked {
+        pool.retain(|t| !WINC_ONLY_TABLES.contains(t));
+    }
+}
+
 /// 一轮推导尝试（组 SQL → 用表校验 → 双语义闸 → 闸门 → 预执行）。
 async fn derive_attempt(
     cx: &dms_agent::AskCtx<'_>,
@@ -3391,7 +3408,13 @@ async fn derive_attempt(
     // 而不是把失败交给 `land` 跌进后面的 LLM 全目录路径。
     // 零行不报错但报「空」—— 调用方换候选表再来一轮（有表无数据 ≠ 答不出）。
     match cx.source.fetch(&scoped, dms_agent::MAX_ROWS, dms_agent::EXEC_TIMEOUT).await {
-        Ok(rs) if rs.rows.is_empty() => {
+        // 聚合查询零命中时返回的是「单行全 NULL」（SUM 恒出一行），不是零行 —— 同样算「空」，
+        // 否则「有表无数据」换表机制对聚合题永远失效（实测：t_winc_sale_report 过滤一空
+        // 出 [[null,null]]，被当成命中落了地）。
+        Ok(rs)
+            if rs.rows.is_empty()
+                || rs.rows.iter().all(|row| row.iter().all(|v| v.is_null())) =>
+        {
             // 试过的表 = 候选集里名字出现在 SQL 中的那些（table_names_of 会把库名限定
             // 解析成「dms_ods」，排除失效 —— 实测）。候选名足够独特，子串匹配即可。
             // 整条 SQL 只小写化一次（原来每张候选表都在 filter 闭包里各算一遍）
@@ -3425,9 +3448,35 @@ fn customer_name_fragment(question: &str) -> Option<String> {
             name = name.replace(extra, "");
         }
     }
-    for w in dms_kernel::nl::lexicon::STRIP_WORDS {
-        name = name.replace(w, "");
+    // 🔴 STRIP_WORDS 不许全局 replace：单字虚词（有/和/一/个…）是公司名肚子里的合法字
+    // —— 「有」被剥掉，「…商贸有限公司」变成「…商贸限公司」，主档探库必空，整题跌进 ODS
+    // 推导出单行 NULL（2026-08-11 实测「线下-潍坊程祥商贸有限公司本月销售额」）。名字在
+    // 问句里是连续一段：只从两头剥虚词/标点，中间一个字都不动。
+    let mut edge_words: Vec<&str> = dms_kernel::nl::lexicon::STRIP_WORDS.to_vec();
+    // 「怎么样/如何」是纯语气尾词（answerable_tail_words 同一份），全局词表不收，边剥补上。
+    edge_words.extend(["怎么样", "如何"]);
+    edge_words.sort_by_key(|w| std::cmp::Reverse(w.chars().count()));
+    let mut name = name.trim().to_string();
+    loop {
+        let before = name.clone();
+        name = name
+            .trim_matches(|c: char| c.is_whitespace() || RESIDUAL_PUNCT.contains(c))
+            .to_string();
+        for w in &edge_words {
+            if let Some(rest) = name.strip_prefix(w) {
+                name = rest.trim_start().to_string();
+                break;
+            }
+            if let Some(rest) = name.strip_suffix(w) {
+                name = rest.trim_end().to_string();
+                break;
+            }
+        }
+        if name == before {
+            break;
+        }
     }
+    let name = name.as_str();
     let name = name.trim_matches(|c: char| c.is_whitespace() || RESIDUAL_PUNCT.contains(c));
     let hanzi = name.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
     if hanzi < 2 {
@@ -3832,7 +3881,7 @@ mod tests {
         let sale14 = try_direct_for("今年每个月的销售额趋势", true)
             .expect("SALE14 应走 DWS 月度趋势");
         assert!(sale14.sql.contains("DATE_FORMAT(sf.order_date,'%Y-%m') AS `月份`"), "{}", sale14.sql);
-        assert!(sale14.sql.contains("SUM(sf.amount) AS `销售额`"), "{}", sale14.sql);
+        assert!(sale14.sql.contains("COALESCE(SUM(sf.amount),0) AS `销售额`"), "{}", sale14.sql);
         assert!(sale14.sql.contains("sf.order_date < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"), "{}", sale14.sql);
         assert!(!sale14.sql.contains("sf.order_date < CURDATE()"), "DWS 不得继承发货截止昨天口径：{}", sale14.sql);
         assert!(sale14.sql.contains("ORDER BY DATE_FORMAT(sf.order_date,'%Y-%m') ASC"), "{}", sale14.sql);
@@ -4166,7 +4215,7 @@ mod tests {
     fn month_sales_uses_dws_fact_not_the_order_template() {
         let h = warehouse_sales_fact("本月销售额是多少").unwrap();
         assert!(h.sql.contains(dms_semantic::sales_fact::TABLE), "{}", h.sql);
-        assert!(h.sql.contains("SUM(sf.amount) AS `销售额`"), "{}", h.sql);
+        assert!(h.sql.contains("COALESCE(SUM(sf.amount),0) AS `销售额`"), "{}", h.sql);
         assert!(h.sql.contains("sf.order_date >= DATE_FORMAT(CURDATE(),'%Y-%m-01')"), "{}", h.sql);
         assert!(!h.sql.contains("UNION ALL") && !h.sql.contains("t_sales_order_logistics"), "{}", h.sql);
         assert!(agg_template("本月销售额是多少").is_none());
@@ -4193,10 +4242,10 @@ mod tests {
             assert!(context.contains(&format!("WHERE {window}")),
                     "{question} 补充时间窗/谓词 ≠ 主查询：{context}");
             for select in [
-                "SUM(sf.amount) AS `销售额`",
-                "SUM(sf.cost_excluding_tax) AS `不含税成本`",
-                "SUM(sf.revenue_excluding_tax) AS `不含税收入`",
-                "SUM(sf.gross_profit) AS `毛利额`",
+                "COALESCE(SUM(sf.amount),0) AS `销售额`",
+                "COALESCE(SUM(sf.cost_excluding_tax),0) AS `不含税成本`",
+                "COALESCE(SUM(sf.revenue_excluding_tax),0) AS `不含税收入`",
+                "COALESCE(SUM(sf.gross_profit),0) AS `毛利额`",
                 "SUM(sf.gross_profit)/NULLIF(SUM(sf.revenue_excluding_tax),0) AS `毛利率`",
             ] {
                 assert!(context.contains(select), "{question} 补充缺 {select}：{context}");
@@ -4272,7 +4321,7 @@ mod tests {
         // 「同比多少」：剥尾词后走标量事实，且**点名的同比占主 delta 位**（prev = 同比窗口）
         let yoy = warehouse_sales_fact("上月销售额同比增长多少")
             .expect("同比问法应命中标量事实，不该落不可计算卡");
-        assert!(yoy.sql.contains("SUM(sf.amount) AS `销售额`"), "{}", yoy.sql);
+        assert!(yoy.sql.contains("COALESCE(SUM(sf.amount),0) AS `销售额`"), "{}", yoy.sql);
         let (prev_sql, prev_label) = yoy.prev.as_ref().expect("同比问法必须有主 delta");
         assert_eq!(prev_label, "同比", "点名的同比必须在 KPI 第一比较位：{prev_sql}");
         assert!(prev_sql.contains("INTERVAL 1 YEAR"), "同比窗口必须是去年同期：{prev_sql}");
@@ -4288,14 +4337,14 @@ mod tests {
 
         // 「怎么样」：纯语气尾词
         let tone = warehouse_sales_fact("昨天的销量怎么样").expect("语气尾词不该挡路");
-        assert!(tone.sql.contains("SUM(sf.qty) AS `销量`"), "{}", tone.sql);
+        assert!(tone.sql.contains("COALESCE(SUM(sf.qty),0) AS `销量`"), "{}", tone.sql);
         assert!(tone.sql.contains("sf.order_date >= CURDATE() - INTERVAL 1 DAY"), "{}", tone.sql);
 
         // 「其中 X 占多少」：X 在合同里无可验证谓词、compound 只接极值词族 ——
         // 按裁决以 KPI+delta 形态答总量（scalar 命中，自带 prev/同比/明细/同窗补充）
         let share = warehouse_sales_fact("上月销售额，其中直营占多少")
             .expect("占比族按 KPI+delta 形态答总量");
-        assert!(share.sql.contains("SUM(sf.amount) AS `销售额`"), "{}", share.sql);
+        assert!(share.sql.contains("COALESCE(SUM(sf.amount),0) AS `销售额`"), "{}", share.sql);
         assert!(share.prev.is_some(), "总量答案自带环比 delta");
 
         // 整条同步链（try_direct_for）同一结论：四句实测题一律不再出「不可计算」卡
@@ -6207,5 +6256,50 @@ mod tests {
             &[edge("`dms_ods`.`t_goods`", "goods_code", "`dms_ods`.`t_winc_sale_report`", "sku_code")]
         )
         .is_none());
+    }
+
+    /// 客户名片段不许被通用虚词表吃掉肚子里的字：「有/和/一/个」在公司名里合法。
+    /// 2026-08-11 实测：全局 replace 把「…商贸有限公司」剥成「…商贸限公司」，主档探库必空，
+    /// 「线下-潍坊程祥商贸有限公司本月销售额」整题跌进 ODS 推导、被 t_winc_sale_report 出 NULL。
+    #[test]
+    fn customer_name_fragment_keeps_inner_chars() {
+        assert_eq!(
+            customer_name_fragment("线下-潍坊程祥商贸有限公司本月销售额和销量是多少？"),
+            Some("线下-潍坊程祥商贸有限公司".to_string())
+        );
+        assert_eq!(
+            customer_name_fragment("恒众餐饮本月买了多少"),
+            Some("恒众餐饮".to_string())
+        );
+        // 两头虚词照旧剥掉；领头类别词照旧剥掉
+        assert_eq!(
+            customer_name_fragment("客户董会琴本月的销售额"),
+            Some("董会琴".to_string())
+        );
+        // 剥完是类别词的照旧拒（分类问句不许错配成名称探库）
+        assert_eq!(customer_name_fragment("线下客户本月销售额"), None);
+        // 探明片段交给共享事实合同：DWS 事实表 + storename 过滤
+        let frag = customer_name_fragment("线下-潍坊程祥商贸有限公司本月销售额和销量是多少？");
+        let h = warehouse_sales_fact_predicated(
+            "线下-潍坊程祥商贸有限公司本月销售额和销量是多少？",
+            frag.as_deref(),
+        )
+        .expect("客户名+销售额必须能落到共享 DWS 合同");
+        assert_eq!(h.route, "direct-agg");
+        assert!(h.sql.contains("dws_off_offline_sale_dfn"), "{}", h.sql);
+        assert!(h.sql.contains("storename"), "{}", h.sql);
+        assert!(h.sql.contains("潍坊程祥商贸有限公司"), "{}", h.sql);
+    }
+
+    /// 推导候选池守卫：没点名 WinC/营销通/经销商上报/进销存 时，营销通专属表不许进池。
+    #[test]
+    fn derive_pool_winc_guard_drops_report_tables_unless_asked() {
+        let mut pool: Vec<&'static str> =
+            vec!["t_winc_sale_report", "t_sales_order", "t_winc_stock_report"];
+        derive_pool_winc_guard(&mut pool, "线下-潍坊程祥商贸有限公司本月销售额和销量是多少？");
+        assert_eq!(pool, vec!["t_sales_order"]);
+        let mut asked: Vec<&'static str> = vec!["t_winc_sale_report", "t_sales_order"];
+        derive_pool_winc_guard(&mut asked, "营销通里经销商上报的销售流水");
+        assert_eq!(asked, vec!["t_winc_sale_report", "t_sales_order"], "点名营销通必须放行");
     }
 }

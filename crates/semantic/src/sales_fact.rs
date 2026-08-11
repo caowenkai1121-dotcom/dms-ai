@@ -194,13 +194,16 @@ impl Metric {
     }
 
     /// 注册表使用的无别名聚合表达式。
+    /// SUM 一律 COALESCE 到 0：零命中行时 SUM 出 NULL，KPI 卡上屏是空白 —— 「本月没卖」
+    /// 的业务答案就是 0，不是空（2026-08-11 实测客户本月无销售出 [[null,null]]）。
+    /// 毛利率保持 NULL：无销售时比值无定义，不谎称 0%。
     pub const fn expression(self) -> &'static str {
         match self {
-            Self::SalesAmount => "SUM(amount)",
-            Self::SalesQuantity => "SUM(qty)",
-            Self::CostExcludingTax => "SUM(cost_excluding_tax)",
-            Self::RevenueExcludingTax => "SUM(revenue_excluding_tax)",
-            Self::GrossProfit => "SUM(gross_profit)",
+            Self::SalesAmount => "COALESCE(SUM(amount),0)",
+            Self::SalesQuantity => "COALESCE(SUM(qty),0)",
+            Self::CostExcludingTax => "COALESCE(SUM(cost_excluding_tax),0)",
+            Self::RevenueExcludingTax => "COALESCE(SUM(revenue_excluding_tax),0)",
+            Self::GrossProfit => "COALESCE(SUM(gross_profit),0)",
             Self::GrossMargin => "SUM(gross_profit)/NULLIF(SUM(revenue_excluding_tax),0)",
         }
     }
@@ -208,11 +211,11 @@ impl Metric {
     /// 本合同 SQL builder 使用的别名限定表达式。
     pub const fn sql_expression(self) -> &'static str {
         match self {
-            Self::SalesAmount => "SUM(sf.amount)",
-            Self::SalesQuantity => "SUM(sf.qty)",
-            Self::CostExcludingTax => "SUM(sf.cost_excluding_tax)",
-            Self::RevenueExcludingTax => "SUM(sf.revenue_excluding_tax)",
-            Self::GrossProfit => "SUM(sf.gross_profit)",
+            Self::SalesAmount => "COALESCE(SUM(sf.amount),0)",
+            Self::SalesQuantity => "COALESCE(SUM(sf.qty),0)",
+            Self::CostExcludingTax => "COALESCE(SUM(sf.cost_excluding_tax),0)",
+            Self::RevenueExcludingTax => "COALESCE(SUM(sf.revenue_excluding_tax),0)",
+            Self::GrossProfit => "COALESCE(SUM(sf.gross_profit),0)",
             Self::GrossMargin => "SUM(sf.gross_profit)/NULLIF(SUM(sf.revenue_excluding_tax),0)",
         }
     }
@@ -243,6 +246,19 @@ impl Metric {
             Self::GrossMargin => "ratio",
             _ => "",
         }
+    }
+}
+
+/// 合同表达式的「裸 SUM」旧形（入参须已是 compact 形）：2026-08-11 起聚合表达式包
+/// COALESCE(…,0)（零命中行 SUM 出 NULL 的展示修复），而 LLM/历史 SQL 里的裸 SUM 是同一
+/// 口径 —— 合同匹配门（深度报告/exemplar 两处）新旧两形都认。未包 COALESCE 的表达式
+/// （毛利率）原样返回：盲目剥 ",0)" 会把 NULLIF 的除零保护也「认」掉。
+pub fn legacy_contract_form(compact_expr: &str) -> String {
+    if compact_expr.contains("coalesce(") {
+        // coalesce(sum(x),0) → sum(x)：整段 ",0)" 去掉（换成 ")" 会留下 "sum(x))" 双括号）
+        compact_expr.replace("coalesce(", "").replace(",0)", "")
+    } else {
+        compact_expr.to_string()
     }
 }
 
@@ -784,8 +800,8 @@ mod tests {
         let aliases = Metric::SalesQuantity.aliases();
         assert!(!aliases.contains(&"出货量"));
         assert!(!aliases.contains(&"发货量"));
-        assert_eq!(Metric::SalesQuantity.expression(), "SUM(qty)");
-        assert_eq!(Metric::SalesQuantity.sql_expression(), "SUM(sf.qty)");
+        assert_eq!(Metric::SalesQuantity.expression(), "COALESCE(SUM(qty),0)");
+        assert_eq!(Metric::SalesQuantity.sql_expression(), "COALESCE(SUM(sf.qty),0)");
     }
 
     #[test]
@@ -894,10 +910,10 @@ mod tests {
         );
         let sql = aggregate_sql_many(CONTEXT_METRICS, &[], ":begin", ":end");
         for select in [
-            "SUM(sf.amount) AS `销售额`",
-            "SUM(sf.cost_excluding_tax) AS `不含税成本`",
-            "SUM(sf.revenue_excluding_tax) AS `不含税收入`",
-            "SUM(sf.gross_profit) AS `毛利额`",
+            "COALESCE(SUM(sf.amount),0) AS `销售额`",
+            "COALESCE(SUM(sf.cost_excluding_tax),0) AS `不含税成本`",
+            "COALESCE(SUM(sf.revenue_excluding_tax),0) AS `不含税收入`",
+            "COALESCE(SUM(sf.gross_profit),0) AS `毛利额`",
             "SUM(sf.gross_profit)/NULLIF(SUM(sf.revenue_excluding_tax),0) AS `毛利率`",
         ] {
             assert!(sql.contains(select), "同窗补充缺 {select}: {sql}");

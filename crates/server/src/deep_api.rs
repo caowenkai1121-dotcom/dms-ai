@@ -70,8 +70,22 @@ fn compact_sql(sql: &str) -> String {
 }
 
 /// 指标合同表达式的 compact 形态（每指标常量，调用方预算一次后复用，不在循环里重算）。
-fn measure_contract_compact(measure: SalesMeasure) -> [String; 2] {
-    [measure.expression(), measure.sql_expression()].map(|expression| compact_sql(expression))
+/// 2026-08-11 起合同表达式包 COALESCE(…,0)（零命中行 SUM 出 NULL 的展示修复）；门要新旧
+/// 两形都认：LLM/历史 SQL 里的裸 SUM 是同一口径，不许因此拒答。未包 COALESCE 的表达式
+/// （毛利率）只产一形 —— 盲目剥 ",0)" 会把 NULLIF 的除零保护也「认」掉。
+fn measure_contract_compact(measure: SalesMeasure) -> Vec<String> {
+    [measure.expression(), measure.sql_expression()]
+        .into_iter()
+        .flat_map(|expression| {
+            let compact = compact_sql(expression);
+            let legacy = dms_semantic::sales_fact::legacy_contract_form(&compact);
+            if legacy != compact {
+                vec![compact, legacy]
+            } else {
+                vec![compact]
+            }
+        })
+        .collect()
 }
 
 /// 指标不仅要来自 DWS 表，聚合表达式也必须与 `sales_fact` 合同一致。
@@ -5785,9 +5799,9 @@ mod tests {
         for (index, (_, _, sql)) in queries.iter().enumerate() {
             let compact = compact_sql(sql);
             assert!(compact.contains(DWS_SALES_FACT), "{sql}");
-            assert!(compact.contains("sum(sf.amount)as销售额"), "{sql}");
-            assert!(compact.contains("sum(sf.qty)as销量"), "{sql}");
-            assert!(compact.contains("sum(sf.gross_profit)as毛利额"), "{sql}");
+            assert!(compact.contains("coalesce(sum(sf.amount),0)as销售额"), "{sql}");
+            assert!(compact.contains("coalesce(sum(sf.qty),0)as销量"), "{sql}");
+            assert!(compact.contains("coalesce(sum(sf.gross_profit),0)as毛利额"), "{sql}");
             assert!(compact.contains("sum(sf.gross_profit)/nullif(sum(sf.revenue_excluding_tax),0)as毛利率"), "{sql}");
             assert!(compact.contains("sf.region='湖南省'"), "{sql}");
             assert!(compact.contains("sf.storecodein('c001','c002')"), "{sql}");

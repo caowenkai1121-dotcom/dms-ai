@@ -81,18 +81,31 @@ fn default_sales_sql_allowed(sql: &str, metrics: &[crate::sales_fact::Metric]) -
             !compact.contains("sum(")
         } else {
             metrics.iter().all(|metric| {
-                compact.contains(compact_metric_expression(*metric))
+                compact_metric_expressions(*metric)
+                    .iter()
+                    .any(|form| compact.contains(form))
             })
         }
 }
 
 /// 各默认销售指标表达式的 compact 形态：METRICS 是静态表，进程内只算一次
 /// （原来每次调用对每个指标重算一遍 compact）。
-fn compact_metric_expression(metric: crate::sales_fact::Metric) -> &'static str {
-    static EXPRS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+/// 各默认销售指标表达式的 compact 形态：METRICS 是静态表，进程内只算一次
+/// （原来每次调用对每个指标重算一遍 compact）。新旧两形都产：合同表达式
+/// 2026-08-11 起包 COALESCE(…,0)，人工/LLM 写的裸 SUM 样例是同一口径，不许因此拒收。
+fn compact_metric_expressions(metric: crate::sales_fact::Metric) -> &'static [String] {
+    static EXPRS: std::sync::LazyLock<Vec<Vec<String>>> = std::sync::LazyLock::new(|| {
         crate::sales_fact::METRICS
             .iter()
-            .map(|m| crate::registry::compact_contract_expr(m.expression()))
+            .map(|m| {
+                let compact = crate::registry::compact_contract_expr(m.expression());
+                let legacy = crate::sales_fact::legacy_contract_form(&compact);
+                if legacy != compact {
+                    vec![compact, legacy]
+                } else {
+                    vec![compact]
+                }
+            })
             .collect()
     });
     let i = crate::sales_fact::METRICS

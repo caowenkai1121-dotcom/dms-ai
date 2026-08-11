@@ -9,8 +9,8 @@ fn dws_sales_contract_has_only_confirmed_metrics_and_dimensions() {
         sales_fact::METRICS.iter().map(|metric| metric.name()).collect::<Vec<_>>(),
         ["销售额", "销量", "不含税成本", "不含税收入", "毛利额", "毛利率"]
     );
-    assert_eq!(Metric::SalesAmount.expression(), "SUM(amount)");
-    assert_eq!(Metric::SalesQuantity.expression(), "SUM(qty)");
+    assert_eq!(Metric::SalesAmount.expression(), "COALESCE(SUM(amount),0)");
+    assert_eq!(Metric::SalesQuantity.expression(), "COALESCE(SUM(qty),0)");
     assert_eq!(
         Metric::GrossMargin.expression(),
         "SUM(gross_profit)/NULLIF(SUM(revenue_excluding_tax),0)"
@@ -49,7 +49,7 @@ fn trusted_builder_owns_fact_filters_sort_and_limit() {
     assert!(sql.contains("FROM sales_dw.dws_off_offline_sale_dfn sf"), "{sql}");
     assert!(sql.contains("sf.order_date >= :begin AND sf.order_date < :end"), "{sql}");
     assert!(sql.contains("sf.storename"), "客户必须取 storename：{sql}");
-    assert!(sql.contains("ORDER BY SUM(sf.amount) DESC LIMIT 20"), "{sql}");
+    assert!(sql.contains("ORDER BY COALESCE(SUM(sf.amount),0) DESC LIMIT 20"), "{sql}");
     assert!(!sql.to_uppercase().contains("COUNT("), "订单数不得按事实行数推算：{sql}");
 }
 

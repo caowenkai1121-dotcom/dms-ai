@@ -2625,7 +2625,7 @@ mod tests {
         assert!(hit.sql.contains("FROM sales_dw.dws_off_offline_sale_dfn sf"), "{}", hit.sql);
         assert!(hit.sql.contains("sf.war_zone") && hit.sql.contains("= '直营'"), "谓词必须落在战区列：{}", hit.sql);
         assert!(!hit.sql.contains("storename"), "不许再错配客户名列：{}", hit.sql);
-        assert!(hit.sql.contains("SUM(sf.amount) AS `销售额`"), "{}", hit.sql);
+        assert!(hit.sql.contains("COALESCE(SUM(sf.amount),0) AS `销售额`"), "{}", hit.sql);
         assert!(hit.sql.contains("sf.order_date >="), "时间窗必须带上：{}", hit.sql);
         assert_eq!(hit.route, "direct-agg");
         assert!(hit.prev.is_some(), "上月必须有环比基期");

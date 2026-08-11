@@ -1886,7 +1886,7 @@ mod tests {
         assert!(customer_goods.contains("sf.storecode"), "{customer_goods}");
         assert!(customer_goods.contains("sf.skucode") && customer_goods.contains("sf.skuname"), "{customer_goods}");
         assert!(customer_goods.contains("SUM(sf.qty)") && customer_goods.contains("SUM(sf.amount)"), "{customer_goods}");
-        assert!(customer_goods.contains("ORDER BY SUM(sf.amount) DESC LIMIT 10"), "{customer_goods}");
+        assert!(customer_goods.contains("ORDER BY COALESCE(SUM(sf.amount),0) DESC LIMIT 10"), "{customer_goods}");
         assert!(!customer_goods.contains(" JOIN "), "关联商品只能走共享 DWS 单表：{customer_goods}");
         for retired in [concat!("UNION", " ALL"), "t_sales_order", "t_sales_order_detail", "t_order_logistics"] {
             assert!(!customer_goods.contains(retired), "关联商品不得回退旧发货/订单事实 {retired}：{customer_goods}");

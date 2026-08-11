@@ -1994,3 +1994,32 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
   （pill hover 与原因行同源）+ 原因行内联「点这里处理」；问答 errMsg 对网关 HTML 页折叠。
 - 验证：cargo 21 测试目标全绿零警告（1699+ 用例）；判官回归 78/78；vue-tsc 0 错误；
   服务器全量部署。
+
+## AX105（2026-08-11，同题不同答根因三连修 + 客户名虚词剥离 + 聚合零值保真）
+实测反馈「同一问题两次答案不一样 / 客户本月销售额出 NULL / 死循环」逐条定位修复：
+- **根因①（客户名片段被虚词表吃字）**：`customer_name_fragment` 对 STRIP_WORDS 做全局
+  replace，单字虚词「有」把「线下-潍坊程祥商贸**有**限公司」剥成「…商贸限公司」——主档探库
+  必空，`customer_filtered_sales` 静默 None，整题跌进 ODS 推导。修复：虚词只从**两头**剥
+  （名字在问句里恒为连续一段，中间一字不动），顺带剥「怎么样/如何」纯语气尾词。
+- **根因②（推导选表非确定）**：目录合同里「DMS 销售问题禁止用 t_winc_sale_report 推导」
+  是写给 LLM 的文字，管不住选表——推导池抽到它就出营销通口径。修复：
+  `derive_pool_winc_guard`（纯函数）——问句没点名 WinC/营销通/经销商上报/进销存 时，
+  t_winc_sale_report/t_winc_stock_report/t_winc_sale_transfer/t_winc_stock_transfer
+  一律不进推导候选池；滤空照旧回落原「不可计算」卡（fail-closed 语义不变）。
+- **根因③（聚合单行全 NULL 不算空）**：SUM 零命中返回的是「单行全 NULL」不是零行，
+  `derive_attempt` 的空结果换表机制（两轮换候选）对聚合题永远失效，[[null,null]] 被当命中
+  落地。修复：`rows.is_empty() || 全行全 NULL` 都算 Empty，触发换候选表再来一轮。
+- **聚合零值保真**：sales_fact 五个 SUM 指标表达式包 `COALESCE(…,0)`——「本月没卖」的
+  业务答案是 0 不是空白（KPI 卡 null 渲染为空字符串，看起来像坏了）。毛利率保持 NULL
+  （无销售时比值无定义，不谎称 0%）。合同匹配门（deep_api `measure_contract_compact` /
+  exemplar `compact_metric_expressions`）新旧两形都认：LLM/历史 SQL 的裸 SUM 是同一口径，
+  共享 `sales_fact::legacy_contract_form` 剥形助手（不许误剥 NULLIF 的除零保护）。
+- **链路验证**（本机 8100 + 公网 Doris）：「线下-潍坊程祥商贸有限公司本月销售额和销量」
+  连续两次同 SQL 同结果（direct-agg · dws_off_offline_sale_dfn · storename INSTR · 本月窗），
+  该客户本月确实无销售（DWS 最新数据 2026-08-11），答 0.00 而非 NULL；反问死循环题
+  （菜单路径粘贴长句）出 4 个干净候选（销售表现/销售明细/业绩对比/客户资料），点候选
+  一题直达 direct-agg；KB 政策题 route=knowledge 带引用流式回答；库存走中台
+  ywzt_ods.scm_warehous_manage（ZP 正品口径）；小程序下单模板带最新快照+省区谓词。
+- 验证：workspace 1742/1742 全绿（新增钉板：`customer_name_fragment_keeps_inner_chars`、
+  `derive_pool_winc_guard_drops_report_tables_unless_asked`，9 处旧钉板按 COALESCE 新形
+  同步）；20 个 SQL 金文件按新表达式重 bless。
