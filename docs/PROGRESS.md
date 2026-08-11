@@ -2093,3 +2093,17 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
 - **确定性复验**：同一客户销售额题连问 3 次，route/SQL/行集字节一致。
 - 遗留（已记录不挡路）：小程序真机渲染未过（无微信开发者工具）；xcx 双端点 hybrid 需
   有效 token 环境复测；导图导出 PNG/SVG 未真点；远端部署待路由器 SSH 映射。
+
+## AX109（2026-08-12，导图「展不开」根因修复 + 图片含义 + 一键部署脚本）
+- **导图节点展不开**：章节懒加载原是「单飞拒绝 + fetch 无超时」——一个文档的章节请求
+  挂起后，之后所有文档节点的点击都被「请稍候」永久挡掉（用户实测「很多节点展不开」）。
+  修复：新点击 abort 旧请求抢占（不是拒绝）、AbortController 20s 超时、被抢占的旧响应
+  静默丢弃、空间切换时在飞请求一并中止。5180 的 web 容器直挂 web/dist，硬刷新即生效。
+- **图片含义**（AX107 用户三问之二）：入库图片在 OCR 正文前加「图片含义」块（视觉模型
+  一句话语义描述），导图首节点即「这张图是什么」；ImageOcr.describe 默认 None 不扰降级链。
+- **KB 评测复跑**：KB07 通过；KB13（近似无命中措辞题）按题集自带记录属噪声带判据，
+  不是新问题；14 题夹具阻塞（夹具上传需会话环境，与本轮改动无关）。
+- **一键部署脚本** `tools/deploy_update.sh`：git archive 源码 → bput 上传（SFTP 坏走
+  base64 兜底）→ 服务器 docker 构建 → `_restart_server.sh` 重启（内置健康探针）→
+  刷 web 产物 → /api/health 自检。`_deploy.py` 补 DEPLOY_PORT（路由器映射非 22 端口时用）。
+  用法：`DEPLOY_PW=… DEPLOY_HOST=119.39.97.141 DEPLOY_PORT=2222 bash tools/deploy_update.sh`。

@@ -16,7 +16,8 @@ def client():
         sys.exit("DEPLOY_PW 环境变量未设置")
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(HOST, username=USER, password=pw, timeout=20, banner_timeout=20)
+    c.connect(HOST, username=USER, password=pw, port=int(os.environ.get("DEPLOY_PORT", "22")),
+              timeout=20, banner_timeout=20)
     return c
 
 
