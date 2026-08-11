@@ -1913,3 +1913,25 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
   精确 token ILIKE 路替代恒 0 的中文 FTS；表格行感知分块（表头重复）；图谱实体归并去 label+
   抽取 stoplist+关系受控词表（需重建生效）；空结果兜底带检索范围。
 - 验证：21 测试目标全绿零警告；判官回归 76/76 通过 0 失败；服务器全量部署实测。
+
+## AX102（2026-08-11，3348 条优化盘点落地 + 部署事故四连修复）
+六角色评审 + 两波全仓审计 swarm 产出 **3348 条优化点**（docs/OPTIMIZATION-BACKLOG.md，
+含 DMS 后端源码校准项、Yuxi/datafoundry 开源差距、小程序集成点），15 路实施代理落实：
+- **覆盖面**：direct.rs/deep_api.rs/kb_api.rs 等大文件各落实 34-60+ 条（safe/test 级全落，
+  会改口径值的 scope_filter 类一律未动，需业务确认+回归重签）；DMS 源码校准 value_map 补全
+  （order_status 有证据三档+正名 108=已取消/199=已删除、order_type 六值、paid_status、
+  after_sales_status 九档、item_type 正名「正品」——只落有源码证据的档位）。
+- **web**：App.vue/ResultPanel/format.ts 及全部面板 ~536 条；panel-utils.ts 抽共享；
+  补 vue-tsc 零错误基线（dbTest/llmTest 文案兜底、Citation.folder_path 放宽 null）。
+- **KB 两项插队需求**：文件夹上传按源目录层级原样建 KB 文件夹树（webkitRelativePath 逐级
+  「找到或创建」，path 缓存去重，send() 加 per-file route）；预览新增 office 种类
+  （doc/docx/ppt/pptx/xls/xlsx/xlsm 渲染解析后内容），renderMarkdown 补 GFM 表格渲染
+  （xlsx 解析产物可直接显示）。
+- **部署事故四连**（本批改动引入或触发，全部当日修复并沉淀注释防再犯）：
+  ① Dockerfile 被加 BuildKit cache mount，服务器无 buildx 走 legacy builder 直接炸 → 回退单行 RUN；
+  ② _build.sh 的 rsproxy sed 未锚定行首，把注释里的同款字面量也替换 → sed 加 `^` 锚定 +
+  Dockerfile 注释不再出现该字面量；③ deb.debian.org 拉源列表卡死 6 分钟 → apt 切阿里云镜像；
+  ④ scope_binding.customer_kind 批处理改成 Global/Via 落 NULL 但列是 NOT NULL →
+  **生产启动崩溃循环**，DDL 加 `DROP NOT NULL` 迁移（读侧本就忽略该列）。
+- 验证：21 测试目标全绿零警告；vue-tsc 0 错误；判官回归 76/76 通过 0 失败（1 跳过取值缺失，
+  同基线）；服务器全量部署后容器 healthy 无重启循环。
