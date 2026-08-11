@@ -295,13 +295,15 @@ impl Dimension {
 
     pub const fn aliases(self) -> &'static [&'static str] {
         match self {
-            Self::OrderDate => &["日期", "按日", "每日", "每天"],
+            Self::OrderDate => &["日期", "按日", "每日", "每天", "按天"],
             Self::CustomerCode => &["客户代码", "客户编号", "经销商编码"],
             Self::Customer => &["客户名称", "客户名", "经销商"],
             Self::SkuCode => &["SKU编码", "商品代码", "SKU代码"],
-            Self::Goods => &["商品名称", "单品", "SKU"],
+            Self::Goods => &["商品名称", "单品", "SKU", "产品", "货品"],
             Self::WarZone => &["销售战区", "大战区"],
-            Self::Region => &["销售省区", "区域", "销售区域", "片区"],
+            // 「省份」与「省区」同指业务确认字段 region（合同纪律：不得改用 state）——
+            // 少了它「销售额按省份」整题跌进 ODS 推导、被营销通 t_winc_sale_report 截胡（2026-08-11 实测）
+            Self::Region => &["销售省区", "区域", "销售区域", "片区", "省份", "销售省份"],
             Self::Month => &["按月", "每月", "每个月", "按月份", "各月", "月度"],
         }
     }

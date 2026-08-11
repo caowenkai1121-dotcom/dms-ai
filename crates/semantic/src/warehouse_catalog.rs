@@ -325,7 +325,9 @@ pub const ASSETS: &[Asset] = &[
     asset!("dms_ods", "t_winc_sale_report", "ODS", "经销商销售上报", "上报日期×客户×门店×商品",
         "按问题使用 stat_date 或 bill_date，不可互换",
         "经销商 sell-through 数量、金额和客户/门店结构",
-        "禁止与 DMS sell-in 默认销售额相加或混称；禁止自动猜日期语义",
+        "禁止与 DMS sell-in 默认销售额相加或混称；禁止自动猜日期语义；\
+         DMS 销售问题（销售额/销量/按省区按客户等）禁止用本表推导——口径不同源：推导走 t_sales_order(+t_sales_order_detail)，\
+         本表仅在用户明确问 WinC/营销通/经销商上报流水时使用",
         "条件允许：明确同一日期语义后做同比/环比"),
     asset!("dms_ods", "t_customer", "ODS", "客户主数据", "一客户一 customer_code",
         "当前主数据，无经营时间轴",

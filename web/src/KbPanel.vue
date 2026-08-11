@@ -42,6 +42,8 @@ interface UploadRow {
   id: number; name: string
   state: 'doing' | 'ok' | 'partial' | 'fail'
   msg: string; destination?: string; ds?: Ds | null
+  /** 同名并存预警（上传前按目标文件夹内同名检出，不阻断上传）；终态后仍保留在行上 */
+  warn?: string
   /** 上传阶段进度（0-100），仅 phase='upload' 时有值；进入解析或终态后清空 */
   progress?: number | null
   /** doing 的细分阶段：upload=网络传输中（行内百分比），parse=服务端秒回后后台解析中（轮询跟踪） */
@@ -73,10 +75,12 @@ const DATE_FMT = new Intl.DateTimeFormat('zh-CN', {
 // 扩展名集合（与 UPLOAD_ACCEPT 同一份清单）：文件夹选择器不认 accept，前端按它逐个预过滤
 const UPLOAD_EXTS = new Set(UPLOAD_ACCEPT.split(',').map((ext) => ext.trim().toLowerCase()))
 interface Grant {
-  grantee_kind: 'login' | 'role'; grantee: string; grantee_name?: string | null
+  grantee_kind: 'login' | 'role' | 'dept'; grantee: string; grantee_name?: string | null
   perm: 'read' | 'write'
 }
 interface RoleOption { role_code: string; role_name: string }
+/** 部门目录项（share_config v2 部门授权）：dept_id 是 t_department.department_id 的字符串形 */
+interface DeptOption { dept_id: string; dept_name: string }
 type Filter = 'all' | 'ready' | 'processing' | 'attention' | 'disabled'
 type WorkbenchTab = 'documents' | 'retrieval' | 'graph' | 'mindmap' | 'eval'
 interface SearchHit {
@@ -168,12 +172,15 @@ const grants = ref<Grant[]>([])
 const grantsLoading = ref(false)
 const granting = ref(false)
 const revokingGrant = ref('')
-const grantKind = ref<'login' | 'role'>('login')
+const grantKind = ref<'login' | 'role' | 'dept'>('login')
 const grantTarget = ref('')
 const grantPerm = ref<'read' | 'write'>('read')
 const roleOptions = ref<RoleOption[]>([])
 const roleSearch = ref('')
 const selectedRoleCodes = ref<string[]>([])
+// 部门授权（share_config v2）：目录由 space_grants 随授权清单同包下发，dept_id 即提交的 grantee
+const deptOptions = ref<DeptOption[]>([])
+const grantDeptId = ref('')
 const grantBatchLimit = ref(100)
 const grantFeedback = ref('')
 const grantFeedbackError = ref(false)
@@ -409,20 +416,45 @@ function pillText(d: Doc): string {
 function pillClickable(d: Doc): boolean {
   return !!currentSpace.value?.writable && !!attentionInfo(d)?.actionable
 }
-/** pill 悬浮说明：原因直接可见；可处理的档给出点击动作，处理中明示「点了也没用」。 */
+/** 各状态档的「该怎么处理」指引（pill hover 与原因行同源）：每个非就绪档都要有明确动作。 */
+function statusGuidance(d: Doc): string {
+  const writable = !!currentSpace.value?.writable
+  if (d.status === 'failed') {
+    return writable ? '点击本状态重新处理；反复失败请检查原文件后重新上传' : '处理失败，请联系空间管理员重新处理'
+  }
+  if (d.status === PARTIAL) {
+    return writable
+      ? '文本已入库（可关键词检索），向量索引未建、语义召回偏弱：点击本状态补建，或等系统自动补'
+      : '向量索引未建、语义召回偏弱，请联系空间管理员重新处理'
+  }
+  switch (d.quality?.label ?? '') {
+    case '无可检索内容': return '文档没有解析出文本：扫描件请确认 OCR 可用后重新处理，或检查原文件是否损坏'
+    case '待生效': return '有效期未开始：⋯ 菜单「元数据」里调整生效日期，或到期自动生效'
+    case '已失效': return '有效期已过、不参与检索：⋯ 菜单「元数据」里调整或清除失效日期'
+    case '状态待确认': return '服务端状态未能确认：点击本状态重新处理一次试试'
+    default:
+      if (/失败|请重新|重试|不可用/.test(d.error || d.notice || '')) {
+        return writable ? '点击本状态重新处理；仍失败请按提示调整后重新上传' : '请联系空间管理员处理'
+      }
+      return ''
+  }
+}
+/** pill 悬浮说明：原因直接可见 + 该怎么处理；处理中明示「点了也没用」。 */
 function pillTitle(d: Doc): string {
   const state = pillState(d)
   if (state === 'processing') return '正在处理，完成后自动转为可检索'
   const info = attentionInfo(d)
-  if (info) {
-    const why = info.reason || '未知原因'
-    return info.actionable && currentSpace.value?.writable ? `${why}（点击重新处理）` : why
-  }
+  if (info) return [info.reason || '未知原因', statusGuidance(d)].filter(Boolean).join('；')
   return [statusHint(d), d.quality?.label].filter(Boolean).join(' · ')
 }
-/** 文件名下的原因行：需处理文档亮原因（错误>提示>质量标签）；已消化的提示淡色留痕。 */
+/** 文件名下的原因行：需处理文档亮原因（错误>提示>质量标签），hover 给完整处理指引；
+ *  已消化的提示淡色留痕。 */
 function issueText(d: Doc): string {
   return attentionInfo(d)?.reason ?? (d.notice || d.error || '')
+}
+/** 原因行的悬浮：原因 + 处理指引（与 pill hover 同一份）。 */
+function issueTitle(d: Doc): string {
+  return [issueText(d), statusGuidance(d)].filter(Boolean).join('；')
 }
 function dateInputValue(value?: string | null): string {
   return value ? value.slice(0, 10) : ''
@@ -783,6 +815,8 @@ function folderLabel(folder: Folder): string {
   if (explicit.includes('/') || !folder.parent_id) return explicit || derived || folder.name
   return derived || explicit || folder.name
 }
+/** 同名判定键：目标文件夹 + 小写文件名（大小写不敏感；根目录/未分类的 folder_id 为空串） */
+const sameNameKey = (name: string, folderId: string) => `${folderId}\x00${name.trim().toLocaleLowerCase()}`
 const filteredRoleOptions = computed(() => {
   const needle = roleSearch.value.trim().toLocaleLowerCase()
   if (!needle) return roleOptions.value
@@ -853,6 +887,7 @@ function resetGrantDraft() {
   grantPerm.value = 'read'
   roleSearch.value = ''
   selectedRoleCodes.value = []
+  grantDeptId.value = ''
   grantFeedback.value = ''
   grantFeedbackError.value = false
 }
@@ -888,13 +923,20 @@ function closeGrants(force = false) {
   revokingGrant.value = ''
   grants.value = []
   roleOptions.value = []
+  deptOptions.value = []
   grantBatchLimit.value = 100
   resetGrantDraft()
 }
 function grantName(g: Grant): string {
-  if (g.grantee_kind !== 'role') return g.grantee
-  const name = g.grantee_name || roleOptions.value.find((role) => role.role_code === g.grantee)?.role_name
-  return name ? `${name} · ${g.grantee}` : g.grantee
+  if (g.grantee_kind === 'role') {
+    const name = g.grantee_name || roleOptions.value.find((role) => role.role_code === g.grantee)?.role_name
+    return name ? `${name} · ${g.grantee}` : g.grantee
+  }
+  if (g.grantee_kind === 'dept') {
+    const name = g.grantee_name || deptOptions.value.find((dept) => dept.dept_id === g.grantee)?.dept_name
+    return name ? `${name} · ${g.grantee}` : g.grantee
+  }
+  return g.grantee
 }
 
 const counts = computed(() => {
@@ -1569,6 +1611,11 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
   }
   const requestFolder = targetFolder?.folder_id ?? ''
   const destination = targetFolder ? folderLabel(targetFolder) : '根目录 / 未分类'
+  // 同名并存预警（Yuxi FileUploadModal 同款）：服务端只按内容 hash 去重，同名不同内容的文件
+  // 会静默并存成两篇同名文档。上传前按「目标文件夹内同名」（大小写不敏感，根目录/未分类的
+  // folder_id 为空串）检出并在队列行上提示，不阻断上传。集合随本批逐个登记：目录批量上传时
+  // 同批先到的同名文件也算「已有」，后到的同样命中提示。
+  const seenDocNames = new Set(docs.value.map((doc) => sameNameKey(doc.name, doc.folder_id || '')))
   // 记录是否发生过实际上传：全部预校验失败（无一发起请求）时不整刷空间
   let attempted = false
   busy.value = true
@@ -1590,9 +1637,14 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
         continue
       }
       attempted = true
+      const dupKey = sameNameKey(file.name, fileFolder)
+      const warn = seenDocNames.has(dupKey)
+        ? `已有同名文档《${file.name}》，本次将作为新文档并存`
+        : undefined
+      seenDocNames.add(dupKey)
       const row: UploadRow = {
         id: ++uploadId, name: displayName, state: 'doing',
-        msg: '等待上传',
+        msg: '等待上传', warn,
         destination: fileDestination, progress: 0, phase: 'upload',
       }
       pushUpload(row)
@@ -1603,7 +1655,11 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
         })
         if (status === 401) emit('auth-expired')
         if (status < 200 || status >= 300) {
-          updateUpload(rowId, { state: 'fail', msg: data.error ?? `HTTP ${status}`, progress: null, phase: undefined })
+          // 失败原因必须说清：服务端 JSON 错误原文优先；网关/反代 HTML 或空体折叠成可行动文案
+          const why = data.error ?? (status >= 500
+            ? `服务暂时不可用（网关错误 ${status}），请稍后重试`
+            : `请求未成功（HTTP ${status}），请重试`)
+          updateUpload(rowId, { state: 'fail', msg: why, progress: null, phase: undefined })
           continue
         }
         if (isTerminalIngest(data)) {
@@ -1875,12 +1931,17 @@ async function refreshGrants(space: string, requestId: number, epoch: number) {
   if (requestId !== grantsRequestId || !contextIsCurrent(epoch, space) || !grantOpen.value) return false
   grants.value = data.grants ?? []
   roleOptions.value = data.roles ?? []
+  deptOptions.value = Array.isArray(data.departments) ? data.departments : []
   const limit = Number(data.limits?.batch_grants)
   grantBatchLimit.value = Number.isInteger(limit) && limit > 0 ? limit : 100
   const available = new Set(roleOptions.value.map((role) => role.role_code))
   selectedRoleCodes.value = selectedRoleCodes.value
     .filter((code) => available.has(code))
     .slice(0, grantBatchLimit.value)
+  // 目录刷新后被停用/删除的部门不能残留为待提交的选中项
+  if (grantDeptId.value && !deptOptions.value.some((dept) => dept.dept_id === grantDeptId.value)) {
+    grantDeptId.value = ''
+  }
   return true
 }
 async function openGrants() {
@@ -1891,6 +1952,7 @@ async function openGrants() {
   resetGrantDraft()
   grants.value = []
   roleOptions.value = []
+  deptOptions.value = []
   grantBatchLimit.value = 100
   grantOpen.value = true
   grantsLoading.value = true
@@ -1910,7 +1972,9 @@ async function openGrants() {
 async function saveGrant() {
   const grantee = grantTarget.value.trim()
   const roles = [...new Set(selectedRoleCodes.value)].slice(0, grantBatchLimit.value)
-  if (granting.value || revokingGrant.value || (grantKind.value === 'login' ? !grantee : !roles.length)) return
+  const deptId = grantDeptId.value
+  const targetMissing = grantKind.value === 'login' ? !grantee : grantKind.value === 'dept' ? !deptId : !roles.length
+  if (granting.value || revokingGrant.value || targetMissing) return
   const requestId = ++grantsRequestId
   const requestSpace = spaceId.value
   const requestEpoch = contextEpoch
@@ -1921,7 +1985,7 @@ async function saveGrant() {
   try {
     const body: Record<string, unknown> = {
       grantee_kind: grantKind.value,
-      grantee: grantKind.value === 'login' ? grantee : '',
+      grantee: grantKind.value === 'login' ? grantee : grantKind.value === 'dept' ? deptId : '',
       role_codes: grantKind.value === 'role' ? roles : [],
       perm: grantPerm.value,
     }
@@ -1945,8 +2009,13 @@ async function saveGrant() {
         .map((item: any) => String(item.role_code || ''))
         .filter((code: string) => code && available.has(code))
     } else {
-      grantFeedback.value = grantKind.value === 'role' ? `已更新 ${succeeded} 个角色的共享权限` : '账号共享权限已更新'
+      grantFeedback.value = grantKind.value === 'role'
+        ? `已更新 ${succeeded} 个角色的共享权限`
+        : grantKind.value === 'dept'
+          ? '部门共享权限已更新'
+          : '账号共享权限已更新'
       grantTarget.value = ''
+      grantDeptId.value = ''
       selectedRoleCodes.value = []
     }
     // 复用 refreshGrants（grants/roles/batch limit 一把刷，失败 codes 重选逻辑不被冲掉）
@@ -2242,6 +2311,7 @@ void loadSpaces(props.initialSpace)
                   role="progressbar" :aria-valuenow="u.progress" aria-valuemin="0" aria-valuemax="100"
                 ><i :style="{ width: `${u.progress}%` }"></i></div>
                 <span v-if="u.destination" class="queue-destination">目标目录：{{ u.destination }}</span>
+                <span v-if="u.warn" class="queue-warn" role="note">⚠ {{ u.warn }}</span>
                 <div v-if="u.ds" class="data-source-note">
                   已生成 {{ u.ds.tables.length }} 张可问数表
                   <span v-for="t in u.ds.tables" :key="t.table">{{ t.sheet }} · {{ t.rows }} 行</span>
@@ -2356,8 +2426,13 @@ void loadSpaces(props.initialSpace)
                       <span class="file-type" aria-hidden="true">{{ extOf(d.name) }}</span>
                       <div class="doc-name-main">
                         <button type="button" class="doc-name-link" :title="nameTitle(d)" @click.stop="previewDoc = d">{{ d.name }}</button>
-                        <!-- 需处理/有提示的文档把原因亮在名字下（比描述重要），其余才看描述行 -->
-                        <span v-if="issueText(d)" class="doc-issue-line" :class="{ attention: !!attentionInfo(d) }" :title="issueText(d)">{{ issueText(d) }}</span>
+                        <!-- 需处理/有提示的文档把原因亮在名字下（比描述重要），可处理的档带内联动作；其余才看描述行 -->
+                        <span v-if="issueText(d)" class="doc-issue-line" :class="{ attention: !!attentionInfo(d) }" :title="issueTitle(d)">
+                          {{ issueText(d) }}<button
+                            v-if="attentionInfo(d)?.actionable && currentSpace?.writable" type="button" class="issue-act"
+                            :disabled="!!reprocessingId" @click.stop="reprocess(d)"
+                          >{{ reprocessingId === d.doc_id ? '处理中' : '点这里处理' }}</button>
+                        </span>
                         <span v-else-if="d.description" class="doc-desc-line" :title="d.description">{{ d.description }}</span>
                       </div>
                     </div>
@@ -2556,11 +2631,19 @@ void loadSpaces(props.initialSpace)
               <select v-model="grantKind" :disabled="granting || !!revokingGrant">
                 <option value="login">用户账号</option>
                 <option value="role">DMS 角色</option>
+                <option value="dept">DMS 部门</option>
               </select>
             </label>
             <label v-if="grantKind === 'login'" class="grant-target">
               <span>登录账号</span>
               <input v-model="grantTarget" maxlength="64" required placeholder="输入 DMS 登录账号" :disabled="granting || !!revokingGrant" />
+            </label>
+            <label v-if="grantKind === 'dept'" class="grant-target">
+              <span>部门</span>
+              <select v-model="grantDeptId" :disabled="granting || !!revokingGrant">
+                <option value="" disabled>{{ deptOptions.length ? '选择要授权的部门' : 'DMS 当前没有可共享的部门' }}</option>
+                <option v-for="dept in deptOptions" :key="dept.dept_id" :value="dept.dept_id">{{ dept.dept_name }}（{{ dept.dept_id }}）</option>
+              </select>
             </label>
             <label>
               <span>权限</span>
@@ -2573,6 +2656,10 @@ void loadSpaces(props.initialSpace)
               v-if="grantKind === 'login'" class="primary-btn" type="submit"
               :disabled="granting || !grantTarget.trim()"
             >{{ granting ? '授权中' : '添加账号' }}</button>
+            <button
+              v-if="grantKind === 'dept'" class="primary-btn" type="submit"
+              :disabled="granting || !grantDeptId"
+            >{{ granting ? '授权中' : '添加部门' }}</button>
           </div>
           <section v-if="grantKind === 'role'" class="role-picker" aria-label="DMS 角色多选">
             <div class="role-picker-head">
@@ -2615,10 +2702,10 @@ void loadSpaces(props.initialSpace)
           </div>
           <div class="grant-list" :aria-busy="grantsLoading">
             <div v-if="grantsLoading" class="grant-empty">正在读取权限</div>
-            <div v-else-if="!grants.length" class="grant-empty">尚未共享给其他用户或角色</div>
+            <div v-else-if="!grants.length" class="grant-empty">尚未共享给其他用户、角色或部门</div>
             <template v-else>
               <div v-for="g in grants" :key="`${g.grantee_kind}:${g.grantee}:${g.perm}`" class="grant-row">
-                <span class="grant-kind">{{ g.grantee_kind === 'login' ? '用户' : '角色' }}</span>
+                <span class="grant-kind">{{ g.grantee_kind === 'login' ? '用户' : g.grantee_kind === 'dept' ? '部门' : '角色' }}</span>
                 <strong>{{ grantName(g) }}</strong>
                 <span>{{ g.perm === 'write' ? '可编辑' : '只读' }}</span>
                 <button class="text-btn danger" type="button" :disabled="!!revokingGrant" @click="revokeGrant(g)">
@@ -2962,6 +3049,7 @@ void loadSpaces(props.initialSpace)
 .queue-main > strong { overflow: hidden; color: var(--text-primary); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .queue-main > span { color: var(--text-muted); font-size: 11.5px; }
 .queue-main > .queue-destination { color: var(--text-faint); font-size: 10.5px; }
+.queue-main > .queue-warn { color: var(--warning-text); font-size: 10.5px; }
 .data-source-note { margin-top: 3px; color: var(--text-muted); font-size: 11px; }
 .data-source-note span { display: inline-block; margin-left: 6px; padding: 1px 5px; border: 1px solid var(--border); }
 .data-source-note .warn { color: var(--warning-text); }
@@ -3135,6 +3223,10 @@ td.col-ops { position: relative; overflow: visible; }
 /* 原因行：默认淡色留痕（已消化的提示）；需处理档亮 warning 色直接可见 */
 .doc-issue-line { overflow: hidden; color: var(--text-faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .doc-issue-line.attention { color: var(--warning-text); }
+/* 原因行内的处理动作：链接态小号字，row 点击（开预览）由 @click.stop 隔开 */
+.issue-act { margin-left: 6px; padding: 0; border: 0; background: none; color: var(--primary); cursor: pointer; font: inherit; font-size: 11px; }
+.issue-act:hover:not(:disabled) { text-decoration: underline; }
+.issue-act:disabled { cursor: not-allowed; opacity: .55; }
 /* 状态 pill（24px）：可检索绿 / 处理中蓝 / 需处理黄 / 已停用灰 / 失败红；失败可点 = 重新处理 */
 .status-pill {
   display: inline-flex; align-items: center; height: 24px; padding: 0 8px; border: 0; border-radius: 6px;

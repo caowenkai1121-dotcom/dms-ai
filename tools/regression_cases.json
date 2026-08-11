@@ -212,6 +212,38 @@
       "note": "显式省区问法使用默认销售事实确认字段 region；不得偷换为省份语义。"
     },
     {
+      "name": "B01S-销售额按省份",
+      "login": "admin",
+      "q": "销售额按省份",
+      "route": "direct-agg",
+      "sql_contains": [
+        "sales_dw.dws_off_offline_sale_dfn",
+        "sf.region",
+        "SUM(sf.amount)"
+      ],
+      "sql_not_contains": [
+        "t_winc",
+        "state"
+      ],
+      "view0": "chart",
+      "note": "省份=省区（region，业务确认字段）：2026-08-11 前「省份」被判未支持语义 → ODS 推导被营销通 t_winc_sale_report（sale_amount/province 列名太像）截胡答错口径。"
+    },
+    {
+      "name": "B01T-客户名带类别前缀",
+      "login": "admin",
+      "q": "客户董会琴本月的销售额",
+      "route": "direct-agg",
+      "sql_contains": [
+        "sales_dw.dws_off_offline_sale_dfn",
+        "董会琴",
+        "INSTR"
+      ],
+      "sql_not_contains": [
+        "t_winc"
+      ],
+      "note": "领头类别词「客户」不是名称一部分：剥掉后探针才探得到「线下-董会琴」（2026-08-11 实测整词探库必空 → 错走 ODS 推导）。"
+    },
+    {
       "name": "B02-本月不含税收入",
       "sql_golden": true,
       "login": "admin",

@@ -1423,7 +1423,9 @@ const WAREHOUSE_SALES_UNSUPPORTED: &[&str] = &[
     "品牌", "牌子", "门店", "店铺", "终端", "店号", "门店编码", "门店名称",
     "客户分类", "客户类别", "客户类型", "业务员", "销售员", "负责人", "区域经理",
     // 「manger」是当年拼错的收录；补上正确的「manager」同档拦（多拦一类问句进失败关闭卡）
-    "大区经理", "大区负责人", "经理", "manger", "manager", "省份", "商品分类",
+    // 「省份」已从本清单移除：业务确认它=省区（region 字段），现由 Region 别名接管
+    // （2026-08-11 裁决：「销售额按省份」必须答，不许再跌进 ODS 推导被营销通表截胡）。
+    "大区经理", "大区负责人", "经理", "manger", "manager", "商品分类",
     "商品类型", "二级分类", "末级分类", "品类", "TYPE", "销售类型", "城市",
     "价格组", "来源订单类型", "订单类型", "订单", "退货", "发货", "出库", "物流", "应收",
     "损益", "财务",
@@ -3194,6 +3196,24 @@ fn customer_name_fragment(question: &str) -> Option<String> {
     // 拿它去探主档会把分类问句错配成「名称含这两个字的客户」。
     const CLASS_WORDS: &[&str] = &["客户", "门店", "商品", "产品", "经销商", "分类", "类型", "类别", "省区", "省份", "战区"];
     if CLASS_WORDS.iter().any(|w| name.ends_with(w)) {
+        return None;
+    }
+    // 领头的类别词同样不是名字：「客户董会琴」的「客户」是限定词，整词探库必空
+    // （2026-08-11 实测漏接「线下-董会琴」）。剥完不足两个汉字 = 本来就是纯类别词，交回上面判 None。
+    // 只剥客户系领头词：门店/商品领头的残词去探客户主档是跨域乱探，不剥。
+    const CLASS_PREFIXES: &[&str] = &["客户", "经销商", "供应商"];
+    let mut stripped = name;
+    for prefix in CLASS_PREFIXES {
+        if let Some(rest) = stripped.strip_prefix(prefix) {
+            stripped = rest;
+            break;
+        }
+    }
+    if stripped.len() != name.len() {
+        let rest_hanzi = stripped.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+        if rest_hanzi >= 2 {
+            return Some(stripped.to_string());
+        }
         return None;
     }
     Some(name.to_string())

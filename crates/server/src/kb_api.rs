@@ -97,14 +97,24 @@ fn no_space_read(space_id: &str) -> ApiErr {
 }
 
 /// Principal 现查的统一 403 映射（`load_viewer`/`manager_principal` 共用；底层错误不透出）。
+/// 【share_config v2 · 部门支路】拿到 Principal 后顺手把 login→部门 映射刷进 PG
+/// （`kb.user_dept` 是 dept 授权可见性 SQL 的求值底座，见 knowledge/acl.rs 头注）：
+/// 先同步再放行，本请求随后的全部 ACL 判定用的就是这一刻现算的部门归属。
+/// 同步失败只留痕不拒请求——映射滞留最坏是 dept 支路按旧值求值，
+/// login/role 两路不该为一张映射表的抖动陪葬。
 async fn principal_or_403(
     st: &AppState,
     login: &str,
     role: Option<&str>,
 ) -> Result<crate::dms_policy_core::Principal, ApiErr> {
-    crate::auth::load_principal(&st.auth_mysql, login, role)
+    let p = crate::auth::load_principal(&st.auth_mysql, login, role)
         .await
-        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))
+        .map_err(|_| err(StatusCode::FORBIDDEN, "当前 DMS 身份或角色不可用"))?;
+    let dept = p.department_id.map(|d| d.to_string());
+    if let Err(e) = acl::sync_viewer_dept(&st.owned, &p.login_name, dept.as_deref()).await {
+        tracing::warn!(login = %p.login_name, reason = %e, "KB 部门映射刷新失败（dept 授权按既有映射求值）");
+    }
+    Ok(p)
 }
 
 /// `KbError` → HTTP。只公开可操作的业务错误；数据库与文档服务错误可能携带
@@ -524,12 +534,20 @@ pub async fn spaces(
     let v = Viewer::new(p.login_name, vec![p.role_code]);
     // 读端点上每次必写太亏：先列，缺个人空间再幂等建并重列（常见路径省一次 INSERT）
     let rows = store::list_spaces(&st.owned, &v.login, &v.roles).await.map_err(kb_err)?;
-    let rows = if rows.iter().any(|s| s.space_id == v.login) {
+    let mut rows = if rows.iter().any(|s| s.space_id == v.login) {
         rows
     } else {
         store::ensure_space(&st.owned, &v.login, &v.login).await.map_err(kb_err)?;
         store::list_spaces(&st.owned, &v.login, &v.roles).await.map_err(kb_err)?
     };
+    // 【share_config v2 · 部门支路】store::list_spaces 的手写内联判据只认 owner/login/role
+    // （store.rs 本轮属另一路改动窗口），dept 授权带来的可见空间在这里并上——
+    // 纯增量合并：按 space_id 去重，不删减既有任何一行。
+    let dept_rows = acl::dept_visible_spaces(&st.owned, &v.login).await.map_err(kb_err)?;
+    if !dept_rows.is_empty() {
+        let mut seen: HashSet<String> = rows.iter().map(|s| s.space_id.clone()).collect();
+        rows.extend(dept_rows.into_iter().filter(|s| seen.insert(s.space_id.clone())));
+    }
     Ok(Json(serde_json::json!({
         "is_admin": is_admin,
         "kb_manager": true,
@@ -1135,6 +1153,7 @@ mod ops_pack {
 
     /// 摘录 SQL。文档已过 `doc_for_viewer` + 空间写闸，这里仍内联一次空间级读谓词——
     /// 撤权若发生在两步之间，本语句一行都返不出（同 `retrieve`/usage_api 两步内联的理由）。
+    /// grantee 三路（login/role/dept）与 `acl::space_acl_sql!` 逐字同口径。
     const DESC_EXCERPT_SQL: &str =
         "SELECT c.text FROM kb.chunk c JOIN kb.doc d ON d.doc_id = c.doc_id
          WHERE c.doc_id = $1
@@ -1144,7 +1163,9 @@ mod ops_pack {
                WHERE a.scope = 'space' AND a.target_id = s.space_id
                  AND a.perm IN ('read','write')
                  AND ((a.grantee_kind = 'login' AND a.grantee = $2)
-                   OR (a.grantee_kind = 'role' AND a.grantee = ANY($3::text[]))))))
+                   OR (a.grantee_kind = 'role' AND a.grantee = ANY($3::text[]))
+                   OR (a.grantee_kind = 'dept' AND a.grantee =
+                       (SELECT m.dept FROM kb.user_dept m WHERE m.login = $2))))))
          ORDER BY c.ord LIMIT $4";
 
     #[derive(serde::Deserialize, Default)]
@@ -1406,23 +1427,34 @@ pub async fn space_grants(
 ) -> Result<ApiOk, ApiErr> {
     manager_principal(&st, &headers, &q.login_name, &q.role_code).await?;
     ensure_space_exists(&st, &id).await?;
-    let roles = dms_role_options(&st).await?;
+    // 角色与部门两份目录互不依赖：并发发出（授权对话框的下拉候选同源）
+    let (roles, departments) = tokio::join!(dms_role_options(&st), dms_dept_options(&st));
+    let roles = roles?;
+    let departments = departments?;
     let role_names: HashMap<&str, &str> = roles
         .iter()
         .map(|r| (r.role_code.as_str(), r.role_name.as_str()))
         .collect();
+    let dept_names: HashMap<&str, &str> = departments
+        .iter()
+        .map(|d| (d.dept_id.as_str(), d.dept_name.as_str()))
+        .collect();
     let rows = acl::list_target(&st.owned, acl::AclScope::Space, &id).await.map_err(kb_err)?;
     Ok(Json(serde_json::json!({
         "grants": rows.into_iter().map(|r| {
-            let grantee_name = (r.grantee_kind == "role")
-                .then(|| role_names.get(r.grantee.as_str()).copied())
-                .flatten();
+            let grantee_name = match r.grantee_kind.as_str() {
+                "role" => role_names.get(r.grantee.as_str()).copied(),
+                "dept" => dept_names.get(r.grantee.as_str()).copied(),
+                _ => None,
+            };
             serde_json::json!({
                 "grantee_kind": r.grantee_kind, "grantee": r.grantee, "perm": r.perm,
                 "grantee_name": grantee_name,
             })
         }).collect::<Vec<_>>()
         ,"roles": roles,
+        // 部门目录随授权清单同包下发（管理面闸已覆盖本端点），前端下拉免增新路由
+        "departments": departments,
         "limits": { "batch_grants": MAX_BATCH_GRANTS }
     })))
 }
@@ -1442,6 +1474,22 @@ pub async fn grant_space(
 
     let entry = space_acl_entry(&id, &req)?;
     validate_grantee(&st, &entry.grantee).await?;
+    if let acl::Grantee::Dept(_) = &entry.grantee {
+        // store 层空间授权函数的 kind 白名单本轮仍只有 login|role（store.rs 属另一路
+        // 改动窗口），部门授权走 acl 层同语义两步：先撤反向档再落新档，保持
+        // 「同一对象只保留一个权限档」；revoke 在前——中途失败只会丢授权（fail-closed），
+        // 不会留下 read+write 双档。
+        let opposite = match entry.perm {
+            acl::Perm::Read => acl::Perm::Write,
+            acl::Perm::Write => acl::Perm::Read,
+        };
+        let clear = acl::AclEntry { perm: opposite, ..entry.clone() };
+        acl::revoke(&st.owned, &clear).await.map_err(kb_err)?;
+        acl::grant(&st.owned, &entry).await.map_err(kb_err)?;
+        return Ok(Json(serde_json::json!({
+            "ok": true, "updated": true, "succeeded": 1, "failed": []
+        })));
+    }
     store::grant_space_acl(
         &st.owned,
         &id,
@@ -1530,7 +1578,12 @@ pub async fn revoke_space(
     manager_principal(&st, &headers, &req.login_name, &req.role_code).await?;
     ensure_space_exists(&st, &id).await?;
     let entry = space_acl_entry(&id, &req)?;
-    // 撤权不要求对象仍存在于 DMS；否则角色被删除后会留下永远无法清理的历史 ACL。
+    // 撤权不要求对象仍存在于 DMS；否则角色/部门被删除后会留下永远无法清理的历史 ACL。
+    // store 层撤权函数的 kind 白名单同样只认 login|role，dept 走 acl 层同语义删除。
+    if let acl::Grantee::Dept(_) = &entry.grantee {
+        acl::revoke(&st.owned, &entry).await.map_err(kb_err)?;
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
     store::revoke_space_acl(
         &st.owned,
         &id,
@@ -1545,11 +1598,14 @@ pub async fn revoke_space(
 
 fn space_acl_entry(id: &str, req: &SpaceGrantReq) -> Result<acl::AclEntry, ApiErr> {
     let grantee_id = req.grantee.trim();
-    let grantee = acl::Grantee::parse(&req.grantee_kind, grantee_id)
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "grantee_kind 只能是 login 或 role"))?;
+    // KB 共享面用 `parse_shareable`（login|role|dept）；ds 面的严格 parse 不收 dept，勿混用
+    let grantee = acl::Grantee::parse_shareable(&req.grantee_kind, grantee_id)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "grantee_kind 只能是 login、role 或 dept"))?;
     let max = match &grantee {
         acl::Grantee::Login(_) => MAX_LOGIN_NAME,
         acl::Grantee::Role(_) => MAX_ROLE_CODE,
+        // department_id 的字符串形（i64 至多 20 位）：与 login 同一条长度闸已足够
+        acl::Grantee::Dept(_) => MAX_LOGIN_NAME,
     };
     if grantee_id.is_empty() || grantee_id.chars().count() > max {
         return Err(err(StatusCode::BAD_REQUEST, format!("授权对象不能为空且不超过 {max} 字")));
@@ -1592,6 +1648,27 @@ async fn validate_grantee(st: &AppState, grantee: &acl::Grantee) -> Result<(), A
                 return Err(err(StatusCode::BAD_REQUEST, "DMS 角色不存在"));
             }
         }
+        acl::Grantee::Dept(dept) => {
+            // grantee 存 department_id 的字符串形：非数字直接 400，不落永远匹配不上的垃圾行
+            let Ok(dept_id) = dept.parse::<i64>() else {
+                return Err(err(StatusCode::BAD_REQUEST, "部门授权对象必须是 DMS 部门 ID"));
+            };
+            // 与角色同 idiom 的点查（部门目录同样走 LIMIT 截断，存在性判定不许拉全表）
+            let exists = st
+                .auth_mysql
+                .fixed(
+                    "SELECT 1 FROM t_department \
+                     WHERE department_id=? AND status=1 AND deleted_flag=0 LIMIT 1",
+                )
+                .bind(dept_id)
+                .fetch_optional::<(i64,)>()
+                .await
+                .map_err(|_| err(StatusCode::BAD_GATEWAY, "DMS 部门目录暂时不可用"))?
+                .is_some();
+            if !exists {
+                return Err(err(StatusCode::BAD_REQUEST, "DMS 部门不存在或已停用"));
+            }
+        }
     }
     Ok(())
 }
@@ -1618,6 +1695,41 @@ async fn dms_role_options(st: &AppState) -> Result<Vec<RoleOption>, ApiErr> {
     for (role_code, role_name) in &rows {
         if seen.insert(role_code.as_str()) {
             out.push(RoleOption { role_code: role_code.clone(), role_name: role_name.clone() });
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone, serde::Serialize)]
+struct DeptOption {
+    /// `t_department.department_id` 的字符串形：与 `kb.acl.grantee`/`kb.user_dept.dept` 同型，
+    /// 前端下拉值直接当 grantee 提交，免一次类型换算
+    dept_id: String,
+    dept_name: String,
+}
+
+/// 与角色目录同口径的有界枚举：有效部门（status=1 且未删除），单表、显式字段。
+/// 过滤条件与 policy 层 `self_and_children_departments` 的全表扫描口径一致。
+const DMS_DEPT_OPTIONS_SQL: &str =
+    "SELECT department_id, TRIM(name) \
+     FROM t_department \
+     WHERE status = 1 AND deleted_flag = 0 \
+       AND name IS NOT NULL AND TRIM(name)<>'' \
+     ORDER BY TRIM(name), department_id \
+     LIMIT 500";
+
+async fn dms_dept_options(st: &AppState) -> Result<Vec<DeptOption>, ApiErr> {
+    let rows: Vec<(i64, String)> = st
+        .auth_mysql
+        .fixed(DMS_DEPT_OPTIONS_SQL)
+        .fetch_all()
+        .await
+        .map_err(|_| err(StatusCode::BAD_GATEWAY, "DMS 部门目录暂时不可用"))?;
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for (dept_id, dept_name) in rows {
+        if seen.insert(dept_id) {
+            out.push(DeptOption { dept_id: dept_id.to_string(), dept_name });
         }
     }
     Ok(out)
@@ -1784,8 +1896,27 @@ pub async fn docs(
         store::list_docs(&st.owned, &v, &space_id),
         store::list_folders(&st.owned, &v, &space_id),
     );
-    let rows = rows.map_err(kb_err)?;
-    let folders = folders.map_err(kb_err)?;
+    let mut rows = rows.map_err(kb_err)?;
+    let mut folders = folders.map_err(kb_err)?;
+    // 【share_config v2 · 部门支路】store 两份清单的内联判据不认 dept（另一路窗口）：
+    // 并上 dept 授权的可见增量（纯增量，按主键去重，不删减既有任何一行）。
+    // 与上方空间读闸的口径差由 acl::dept_visible_* 的注释兜底说明。
+    {
+        let (extra_docs, extra_folders) = tokio::join!(
+            acl::dept_visible_docs(&st.owned, &v.login, &space_id),
+            acl::dept_visible_folders(&st.owned, &v.login, &space_id),
+        );
+        let extra_docs = extra_docs.map_err(kb_err)?;
+        if !extra_docs.is_empty() {
+            let mut seen: HashSet<String> = rows.iter().map(|d| d.doc_id.clone()).collect();
+            rows.extend(extra_docs.into_iter().filter(|d| seen.insert(d.doc_id.clone())));
+        }
+        let extra_folders = extra_folders.map_err(kb_err)?;
+        if !extra_folders.is_empty() {
+            let mut seen: HashSet<String> = folders.iter().map(|f| f.folder_id.clone()).collect();
+            folders.extend(extra_folders.into_iter().filter(|f| seen.insert(f.folder_id.clone())));
+        }
+    }
     let today = chrono::Local::now().date_naive();
     let docs: Vec<serde_json::Value> = rows.iter().map(|d| doc_json(d, today)).collect();
     Ok(Json(serde_json::json!({
@@ -1821,7 +1952,13 @@ pub async fn folders(
     if !acl::space_readable(&st.owned, &v, &space_id).await.map_err(kb_err)? {
         return Err(no_space_read(&space_id));
     }
-    let rows = store::list_folders(&st.owned, &v, &space_id).await.map_err(kb_err)?;
+    let mut rows = store::list_folders(&st.owned, &v, &space_id).await.map_err(kb_err)?;
+    // dept 支路的可见增量并集（与 docs 端点同一口径，纯增量不删减）
+    let extra = acl::dept_visible_folders(&st.owned, &v.login, &space_id).await.map_err(kb_err)?;
+    if !extra.is_empty() {
+        let mut seen: HashSet<String> = rows.iter().map(|f| f.folder_id.clone()).collect();
+        rows.extend(extra.into_iter().filter(|f| seen.insert(f.folder_id.clone())));
+    }
     Ok(Json(serde_json::json!({
         "space_id": space_id,
         "folders": rows.iter().map(folder_json).collect::<Vec<_>>(),
@@ -3146,6 +3283,83 @@ mod tests {
         let e = space_acl_entry("enterprise-sales", &req).unwrap();
         assert_eq!(e.scope, acl::AclScope::Space);
         assert_eq!(e.perm, acl::Perm::Read);
+    }
+
+    /// 【share_config v2 · 部门支路】grant 端点参数校验：dept 一支的收/拒与长度闸
+    #[test]
+    fn space_grant_accepts_dept_kind() {
+        let req = SpaceGrantReq {
+            grantee_kind: "dept".into(), grantee: " 42 ".into(), ..Default::default()
+        };
+        let e = space_acl_entry("enterprise-sales", &req).unwrap();
+        assert_eq!(e.grantee, acl::Grantee::Dept("42".into()), "外围空白应被归一");
+        assert_eq!(e.perm, acl::Perm::Read, "缺省 perm 仍为 read");
+
+        // 非法 kind 的拒绝文案要带上三种合法值
+        let bad = SpaceGrantReq {
+            grantee_kind: "group".into(), grantee: "x".into(), ..Default::default()
+        };
+        let (_, Json(body)) = space_acl_entry("s", &bad).unwrap_err();
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("login") && msg.contains("role") && msg.contains("dept"), "{msg}");
+
+        // 长度闸复用 MAX_LOGIN_NAME（department_id 字符串形至多 20 位，64 足够）
+        let long = SpaceGrantReq {
+            grantee_kind: "dept".into(), grantee: "9".repeat(MAX_LOGIN_NAME + 1), ..Default::default()
+        };
+        assert!(space_acl_entry("s", &long).is_err(), "超长部门标识必须拒");
+        let ok = SpaceGrantReq {
+            grantee_kind: "dept".into(), grantee: "9".repeat(MAX_LOGIN_NAME), ..Default::default()
+        };
+        assert!(space_acl_entry("s", &ok).is_ok());
+    }
+
+    /// dept 授权落库走 acl 层（store 层授权/撤权函数的 kind 白名单本轮仍只认
+    /// login|role）；且「先撤反向档再落新档」——顺序反了中途失败会留双档
+    #[test]
+    fn dept_grants_route_through_acl_layer_with_fail_closed_order() {
+        let src = include_str!("kb_api.rs");
+        let grant = src.split("pub async fn grant_space").nth(1).unwrap();
+        let grant = grant.split("\n}\n").next().unwrap();
+        assert!(grant.contains("space_acl_entry"), "{grant}");
+        let dept_arm = grant.split("if let acl::Grantee::Dept(_)").nth(1)
+            .unwrap_or_else(|| panic!("grant_space 缺 dept 支路: {grant}"));
+        // 锚定到支路收尾的 return：支路之后是 login/role 的 store 层落库，不属于本支路
+        let dept_arm = dept_arm.split("return Ok").next().unwrap();
+        assert!(
+            dept_arm.find("acl::revoke").unwrap() < dept_arm.find("acl::grant").unwrap(),
+            "必须先撤反向档再落新档（fail-closed）: {dept_arm}"
+        );
+        assert!(!dept_arm.contains("store::grant_space_acl"), "dept 不能走 store 白名单函数");
+        let revoke = src.split("pub async fn revoke_space").nth(1).unwrap();
+        let revoke = revoke.split("\n}\n").next().unwrap();
+        let dept_arm = revoke.split("if let acl::Grantee::Dept(_)").nth(1)
+            .unwrap_or_else(|| panic!("revoke_space 缺 dept 支路: {revoke}"));
+        let dept_arm = dept_arm.split("return Ok").next().unwrap();
+        assert!(dept_arm.contains("acl::revoke"));
+        assert!(!dept_arm.contains("store::revoke_space_acl"), "dept 不能走 store 白名单函数");
+    }
+
+    /// 部门目录与存在性判定的 SQL 形态：有界枚举 + 点查（与角色目录同 idiom）
+    #[test]
+    fn dept_catalog_and_existence_sql_shapes() {
+        assert!(DMS_DEPT_OPTIONS_SQL.contains("FROM t_department"));
+        assert!(DMS_DEPT_OPTIONS_SQL.contains("status = 1 AND deleted_flag = 0"));
+        assert!(DMS_DEPT_OPTIONS_SQL.contains("LIMIT 500"), "部门目录必须有界");
+        let src = include_str!("kb_api.rs");
+        let body = src.split("acl::Grantee::Dept(dept) =>").nth(1).unwrap();
+        let body = body.split("\n    }\n").next().unwrap();
+        assert!(
+            body.contains("SELECT 1 FROM t_department") && body.contains("LIMIT 1"),
+            "部门存在性判定必须是点查: {body}"
+        );
+        assert!(body.contains("parse::<i64>()"), "dept grantee 必须是数字形部门 ID: {body}");
+        // 摘录复核 SQL 与 acl 宏同口径（三路 grantee）。常量住在 ops_pack 模块里，
+        // 测试模块够不到，按源码文本锚（与本文件其它锚点测试同 idiom）
+        let exc = src.split("DESC_EXCERPT_SQL: &str =").nth(1).unwrap();
+        let exc = exc.split("ORDER BY c.ord").next().unwrap();
+        assert!(exc.contains("a.grantee_kind = 'dept'"), "摘录复核丢了部门支路");
+        assert!(exc.contains("kb.user_dept"), "摘录复核没走部门映射");
     }
 
     #[test]

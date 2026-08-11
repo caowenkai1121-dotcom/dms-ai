@@ -24,6 +24,7 @@ pub async fn seed(pg: &PgPool) -> anyhow::Result<()> {
     seed_ops_caliber(pg).await?;
     invalidate_stale_exemplars(pg).await?;
     seed_join_edges(pg).await?;
+    seed_curated_lineage(pg).await?;
     seed_table_scopes(pg).await?;
     // 顺序即行为：**手写的先插**，这一步才 `ON CONFLICT DO NOTHING` 地补剩下的。
     // 反过来会让手写的业务口径（订单表的「有效订单」）被一条 deleted_flag = 0 抢占。
@@ -567,6 +568,39 @@ async fn seed_join_edges(pg: &PgPool) -> anyhow::Result<()> {
     .bind(&rcs)
     .bind(&cards)
     .bind(&notes)
+    .bind(DMS_DS_ID)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
+/// 人工确认的血缘边（幂等）：推断作业（`lineage::build`）靠命名/列重叠信号连不出
+/// `dws_off_offline_sale_dfn ← t_sales_order` 这类真上游（name_match 判否，有测试钉着），
+/// 缺了它 direct-derive 的血缘加权就是零 —— 2026-08-11 实测「销售额按省份」被推导到
+/// 营销通 t_winc_sale_report（列名太像），这就是那张缺边的代价。
+/// 只收**业务核对过**的边；status 恒 'accepted'（推断重跑只刷 confidence/evidence，不动 status，
+/// 人工结论不会被冲掉）。lineage_boost 对方向不敏感，统一 left=DWS/ADS、right=ODS。
+async fn seed_curated_lineage(pg: &PgPool) -> anyhow::Result<()> {
+    // (dws_table, ods_table, evidence)
+    const EDGES: &[(&str, &str, &str)] = &[
+        ("dws_off_offline_sale_dfn", "t_sales_order",
+         "人工确认：线下销售事实的 ODS 上游订单头（order_date/客户/省区部门来源）"),
+        ("dws_off_offline_sale_dfn", "t_sales_order_detail",
+         "人工确认：线下销售事实的 ODS 上游订单明细（qty/amount/sku 来源；detail 有 2x 重复行须去重）"),
+    ];
+    let dws: Vec<&str> = EDGES.iter().map(|e| e.0).collect();
+    let ods: Vec<&str> = EDGES.iter().map(|e| e.1).collect();
+    let evd: Vec<&str> = EDGES.iter().map(|e| e.2).collect();
+    sqlx::query(
+        "INSERT INTO meta.datamap_edge(ds_id, kind, left_table, left_col, right_table, right_col, confidence, evidence, status)
+         SELECT $4, 'lineage', u.lt, '', u.rt, '', 1.0, u.ev, 'accepted'
+         FROM unnest($1::text[], $2::text[], $3::text[]) AS u(lt, rt, ev)
+         ON CONFLICT (ds_id, kind, left_table, left_col, right_table, right_col) DO UPDATE SET
+           confidence = 1.0, evidence = EXCLUDED.evidence, status = 'accepted', updated_at = now()",
+    )
+    .bind(&dws)
+    .bind(&ods)
+    .bind(&evd)
     .bind(DMS_DS_ID)
     .execute(pg)
     .await?;

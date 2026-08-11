@@ -39,13 +39,13 @@
 //! - 两个都过 `acl::doc_for_viewer`：**不存在与不可见统一 403**（现有 kb_api 惯例，
 //!   不泄露他人文档的存在性）。
 //!
-//! ## ③ 内容级导图（章节分桶；已在 `main.rs` 注册，见上）
+//! ## ③ 内容级导图（多级章节树；已在 `main.rs` 注册，见上）
 //! - `GET /api/kb/doc/{id}/sections` → `{ "doc_id", "doc_name", "sections": [
-//!   { "section", "chunk_count", "first_ord", "page", "excerpt" } ] }`。
-//!   章节＝`kb.chunk.heading_path` 的**顶层段**（`" > "` 分隔，与 ingest 写入同口径）分桶；
-//!   `excerpt`＝该节首块文本的空白压缩摘录（≤160 字），`page`/`first_ord` 同取首块；
-//!   桶序＝首块出现顺序（即 `ord` 序，确定性，不依赖 LLM）。空文档/无章节结构给
-//!   `sections: []` 或单个「未分节」桶，不 404。
+//!   { "section", "chunk_count", "first_ord", "page", "excerpt", "children": [...同形...] } ] }`。
+//!   章节树＝`kb.chunk.heading_path` 按 `" > "` 逐段建树（与 ingest 写入同口径），同路径段
+//!   跨位置归并、块数子树累计；`excerpt`＝该节子树首块文本的空白压缩摘录（≤160 字），
+//!   `page`/`first_ord` 同取首块；节序＝首块出现顺序（即 `ord` 序，确定性，不依赖 LLM）。
+//!   空文档/无章节结构给 `sections: []` 或单个「未分节」节，不 404。
 //! - 权限＝文档读：`doc_for_viewer` 闸 + 语句内联空间级读谓词双保险（与 `kb_api`
 //!   摘录 SQL 同一模子：撤权若发生在两步之间，内联谓词让结果一行都返不出）。
 //!
@@ -536,6 +536,73 @@ mod content_pack {
     /// 空 heading_path（扫描件/图片 OCR 等无标题结构）的桶名
     const NO_SECTION: &str = "未分节";
 
+    /// 一节的内容级投影：标题 + 块数徽标（**子树累计**）+ 首块定位（ord/页码）+ 首块摘录 + 子章节
+    struct SectionNode {
+        section: String,
+        chunk_count: usize,
+        first_ord: i32,
+        page: Option<i32>,
+        excerpt: String,
+        children: Vec<SectionNode>,
+    }
+
+    /// heading_path **多级章节树**（纯函数，单测钉住）：`"A > B > C"` 逐段建树；同路径段
+    /// 跨位置归并（按全路径前缀匹配，如 `A>x` 与 `A>y` 合挂 A 下）；块数 = 子树累计；
+    /// 摘录/定位取子树内按 ord 的首块（输入必须按 ord 序，SQL 保证）。总节点数达
+    /// MAX_SECTIONS 后不再新建（已存在的路径继续累计块数）——导图节点有界闸，截断不报错。
+    fn section_tree(chunks: &[PreviewChunk]) -> Vec<SectionNode> {
+        let mut total = 0usize;
+        let mut roots: Vec<SectionNode> = Vec::new();
+        'chunks: for c in chunks {
+            let mut segs: Vec<&str> = c
+                .heading_path
+                .split(" > ")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if segs.is_empty() {
+                segs.push(NO_SECTION);
+            }
+            let mut level = &mut roots;
+            for seg in segs {
+                let node = match level.iter().position(|n| n.section == seg) {
+                    Some(i) => &mut level[i],
+                    None => {
+                        if total >= MAX_SECTIONS {
+                            // 满闸后只往已存在的路径累计（父级在下行前已 +=1），不再开新节点
+                            continue 'chunks;
+                        }
+                        total += 1;
+                        level.push(SectionNode {
+                            section: seg.to_string(),
+                            chunk_count: 0,
+                            first_ord: c.ord,
+                            page: c.page,
+                            excerpt: clip_excerpt(&c.text),
+                            children: Vec::new(),
+                        });
+                        level.last_mut().expect("刚 push 的节点必在")
+                    }
+                };
+                node.chunk_count += 1;
+                level = &mut node.children;
+            }
+        }
+        roots
+    }
+
+    /// 递归序列化：每节带 `children`（叶子为空数组），前端按同形递归嫁接进导图
+    fn section_json(node: &SectionNode) -> serde_json::Value {
+        serde_json::json!({
+            "section": node.section,
+            "chunk_count": node.chunk_count,
+            "first_ord": node.first_ord,
+            "page": node.page,
+            "excerpt": node.excerpt,
+            "children": node.children.iter().map(section_json).collect::<Vec<_>>(),
+        })
+    }
+
     /// 章节 SQL。调用方已过 `doc_for_viewer`，这里仍内联一次空间级读谓词——撤权若发生在
     /// 两步之间，本语句一行都返不出（同 `kb_api` 描述摘录 SQL 的两步内联理由）。
     const SECTIONS_SQL: &str =
@@ -548,12 +615,6 @@ mod content_pack {
                  AND ((a.grantee_kind = 'login' AND a.grantee = $2)
                    OR (a.grantee_kind = 'role' AND a.grantee = ANY($3::text[]))))))
          ORDER BY c.ord";
-
-    /// 顶层章节段：`"A > B > C"` → `"A"`；空路径归「未分节」桶
-    fn top_section(heading_path: &str) -> &str {
-        let top = heading_path.split(" > ").next().unwrap_or("").trim();
-        if top.is_empty() { NO_SECTION } else { top }
-    }
 
     /// 首块摘录：压缩一切空白串为单个空格（块文本里的换行/缩进对摘要卡只是噪音），
     /// 封顶 `SECTION_EXCERPT_CHARS` 字符。
@@ -575,40 +636,6 @@ mod content_pack {
             len += 1;
             if len >= SECTION_EXCERPT_CHARS {
                 break;
-            }
-        }
-        out
-    }
-
-    /// 一节的内容级投影：标题 + 块数徽标 + 首块定位（ord/页码）+ 首块摘录
-    struct SectionBucket {
-        section: String,
-        chunk_count: usize,
-        first_ord: i32,
-        page: Option<i32>,
-        excerpt: String,
-    }
-
-    /// 顶层 heading 分桶（纯函数，单测钉住）：输入必须按 `ord` 序（SQL 保证），
-    /// 桶序＝首块出现顺序；同名顶层段跨位置合并（`A > x`、`B > y`、再有 `A > z` 仍归一桶，
-    /// 摘录与定位始终取该节的**第一块**）。
-    fn bucket_sections(chunks: &[PreviewChunk]) -> Vec<SectionBucket> {
-        let mut out: Vec<SectionBucket> = Vec::new();
-        for c in chunks {
-            let top = top_section(&c.heading_path);
-            // 满 MAX_SECTIONS 桶后不再新建（结果本就截断到这里），只累计已有桶——
-            // 继续建新桶纯吃内存，对截断后结果零影响（先取出来：match 期间 out 被借用）
-            let capped = out.len() >= MAX_SECTIONS;
-            match out.iter_mut().find(|b| b.section == top) {
-                Some(b) => b.chunk_count += 1,
-                None if !capped => out.push(SectionBucket {
-                    section: top.to_string(),
-                    chunk_count: 1,
-                    first_ord: c.ord,
-                    page: c.page,
-                    excerpt: clip_excerpt(&c.text),
-                }),
-                None => {}
             }
         }
         out
@@ -645,17 +672,11 @@ mod content_pack {
                 end_char_pos: None,
             })
             .collect();
-        let sections = bucket_sections(&chunks);
+        let sections = section_tree(&chunks);
         Ok(Json(serde_json::json!({
             "doc_id": row.doc_id,
             "doc_name": row.name,
-            "sections": sections.iter().map(|s| serde_json::json!({
-                "section": s.section,
-                "chunk_count": s.chunk_count,
-                "first_ord": s.first_ord,
-                "page": s.page,
-                "excerpt": s.excerpt,
-            })).collect::<Vec<_>>(),
+            "sections": sections.iter().map(section_json).collect::<Vec<_>>(),
         })))
     }
 
@@ -674,25 +695,35 @@ mod content_pack {
             }
         }
 
-        /// 章节分桶：顶层段归组、桶序＝首块出现序、同名顶层跨位置合并、计数与定位取首块
+        /// 章节树：按路径段分层、节序＝首块出现序、同路径跨位置归并、块数子树累计、定位取首块
         #[test]
-        fn sections_bucket_by_top_heading_in_first_seen_order() {
+        fn sections_build_nested_tree_in_first_seen_order() {
             let chunks = vec![
                 hchunk(0, "总则 > 目的", "总则首块。", Some(1)),
                 hchunk(1, "总则 > 适用范围", "总则第二块。", Some(1)),
                 hchunk(2, "报销流程 > 申请", "报销首块。", Some(3)),
                 hchunk(3, "总则 > 附则", "总则第三块（跨位置仍归总则）。", Some(9)),
+                hchunk(4, "报销流程 > 审批 > 店长", "审批首块。", Some(4)),
+                hchunk(5, "报销流程 > 审批 > 区经", "审批第二块。", Some(5)),
             ];
-            let secs = bucket_sections(&chunks);
+            let secs = section_tree(&chunks);
             assert_eq!(secs.len(), 2);
             assert_eq!(secs[0].section, "总则");
-            assert_eq!(secs[0].chunk_count, 3);
+            assert_eq!(secs[0].chunk_count, 3, "父节块数 = 子树累计");
             assert_eq!(secs[0].first_ord, 0);
             assert_eq!(secs[0].page, Some(1));
-            assert_eq!(secs[0].excerpt, "总则首块。", "摘录必须取自该节首块");
+            assert_eq!(secs[0].excerpt, "总则首块。", "摘录必须取自子树首块");
+            let names: Vec<&str> = secs[0].children.iter().map(|c| c.section.as_str()).collect();
+            assert_eq!(names, ["目的", "适用范围", "附则"], "二级节按首块序、跨位置归并");
             assert_eq!(secs[1].section, "报销流程");
-            assert_eq!(secs[1].chunk_count, 1);
-            assert!(bucket_sections(&[]).is_empty());
+            assert_eq!(secs[1].chunk_count, 3);
+            assert_eq!(secs[1].children.len(), 2, "申请 + 审批");
+            let approve = &secs[1].children[1];
+            assert_eq!(approve.section, "审批");
+            assert_eq!(approve.chunk_count, 2);
+            let deep: Vec<&str> = approve.children.iter().map(|c| c.section.as_str()).collect();
+            assert_eq!(deep, ["店长", "区经"], "三级节同样展开（用户核心诉求：有节点就能展）");
+            assert!(section_tree(&[]).is_empty());
         }
 
         /// 空 heading（扫描件/OCR）归「未分节」；摘录压缩空白且按字符封顶
@@ -700,21 +731,33 @@ mod content_pack {
         fn sections_fallback_and_excerpt_clipping() {
             let long = format!("{}　\n\n  {}", "甲".repeat(200), "乙".repeat(50));
             let chunks = vec![hchunk(0, "", &long, None), hchunk(1, "  ", "第二块", None)];
-            let secs = bucket_sections(&chunks);
+            let secs = section_tree(&chunks);
             assert_eq!(secs.len(), 1);
             assert_eq!(secs[0].section, NO_SECTION);
             assert_eq!(secs[0].chunk_count, 2);
+            assert!(secs[0].children.is_empty());
             assert_eq!(secs[0].excerpt.chars().count(), SECTION_EXCERPT_CHARS);
             assert!(!secs[0].excerpt.contains(char::is_whitespace), "摘录不许带空白: {}", secs[0].excerpt);
         }
 
-        /// 有界闸：顶层节数封顶 `MAX_SECTIONS`（截断不报错）
+        /// 有界闸：总节点数封顶 `MAX_SECTIONS`（截断不报错；满闸后已有路径仍累计块数）
         #[test]
         fn sections_are_capped() {
+            fn node_count(nodes: &[SectionNode]) -> usize {
+                nodes.iter().map(|n| 1 + node_count(&n.children)).sum()
+            }
             let chunks: Vec<PreviewChunk> = (0..(MAX_SECTIONS + 20))
                 .map(|i| hchunk(i as i32, &format!("第{i}章"), "文", None))
                 .collect();
-            assert_eq!(bucket_sections(&chunks).len(), MAX_SECTIONS);
+            assert_eq!(section_tree(&chunks).len(), MAX_SECTIONS);
+            let mut chunks: Vec<PreviewChunk> = (0..MAX_SECTIONS)
+                .map(|i| hchunk(i as i32, &format!("第{i}章 > 节"), "文", None))
+                .collect();
+            chunks.push(hchunk(999, "第0章 > 节", "回头块", None));
+            let secs = section_tree(&chunks);
+            assert_eq!(node_count(&secs), MAX_SECTIONS, "多级路径下封顶的是总节点数");
+            assert_eq!(secs[0].chunk_count, 2, "满闸后已有路径继续累计");
+            assert_eq!(secs[0].children[0].chunk_count, 2, "子节同样累计");
         }
 
         /// 端点顺序闸（源码级）：doc_sections 必须先过 `doc_for_viewer` 再执行章节 SQL

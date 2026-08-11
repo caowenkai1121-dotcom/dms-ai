@@ -374,10 +374,30 @@ interface SettingsCatalog {
   fallback_vision_provider?: string
   vision_candidates?: { name: string; supports_vision: boolean; vision_model: string | null; key_ready: boolean; selectable: boolean }[]
   effective_vision?: { provider: string; model: string; fallback: boolean } | null
+  /** KB 管理入口授权（设置页「知识库入口权限」卡片初值；两个名单都空 = 仅管理员） */
+  kb_manager_grants?: { roles: string[]; logins: string[] }
 }
 const settingsCat = ref<SettingsCatalog | null>(null)
 const fallbackVisionSaving = ref(false)
 const fallbackVisionProvider = ref('')
+// 知识库入口权限卡片的输入态：逗号/顿号/空格/换行分隔的名单文本，保存时才解析成数组
+const kbGrantsText = ref({ roles: '', logins: '' })
+const kbGrantsSaving = ref(false)
+/** 名单文本 → 数组（分隔符：逗号/顿号/分号/空白/换行；空段丢弃，服务端还做一道去重与卫生闸） */
+function parseGrantList(text: string): string[] {
+  return text.split(/[,，、;；\s]+/).map((s) => s.trim()).filter(Boolean)
+}
+async function saveKbGrants() {
+  if (kbGrantsSaving.value) return
+  kbGrantsSaving.value = true
+  try {
+    await postSettings('/api/admin/settings/kb-manager-grants', {
+      roles: parseGrantList(kbGrantsText.value.roles),
+      logins: parseGrantList(kbGrantsText.value.logins),
+      login_name: sessionToken.value ? null : loginName.value,
+    }, '知识库入口权限已保存并即时生效')
+  } finally { kbGrantsSaving.value = false }
+}
 interface QualityData {
   days: number
   summary: { total: number; success_rate: number; p50_ms: number; p95_ms: number; llm_rate: number; cache_rate: number; avg_tokens: number; feedback_count: number; error_count: number }
@@ -405,6 +425,11 @@ async function loadSettingsCatalog() {
     if (r.ok) {
       settingsCat.value = j
       fallbackVisionProvider.value = j.fallback_vision_provider ?? ''
+      // KB 入口授权名单回填（数组 → 逗号分隔文本；缺省/空 = 仅管理员，输入框留空即是该语义）
+      kbGrantsText.value = {
+        roles: (j.kb_manager_grants?.roles ?? []).join(', '),
+        logins: (j.kb_manager_grants?.logins ?? []).join(', '),
+      }
     } else handleSettingsDenied(r.status)
   } catch { /* 老服务端没有，静默 */ }
 }
@@ -1378,10 +1403,18 @@ async function readBody(resp: Response): Promise<[unknown, string]> {
 
 /** 非 2xx 的统一用户提示；401 引导回到账号密码登录。 */
 function errMsg(resp: Response, body: unknown, raw: string): string {
-  const msg = (body as { error?: string } | null)?.error || raw.trim().slice(0, 200) || `HTTP ${resp.status}`
-  return resp.status === 401
-    ? `未登录或登录已过期（${msg}）。请重新登录。`
-    : msg
+  const serverMsg = (body as { error?: string } | null)?.error?.trim()
+  if (serverMsg) {
+    return resp.status === 401 ? `未登录或登录已过期（${serverMsg}）。请重新登录。` : serverMsg
+  }
+  const trimmed = raw.trim()
+  // 网关/反代的 HTML 错误页（502/504 等）原样展出 = 一屏 `<html><head>…` 垃圾（实测）——
+  // 折叠成一句可行动的文案；空体同此。非 HTML 的短文本照旧透传（纯文本错误有其信息量）。
+  const friendly = resp.status >= 500
+    ? `服务暂时不可用（网关错误 ${resp.status}），请稍后重试`
+    : `请求未成功（HTTP ${resp.status}）`
+  const msg = !trimmed || /^<(!doctype|html)/i.test(trimmed) ? friendly : trimmed.slice(0, 200)
+  return resp.status === 401 ? `未登录或登录已过期（${msg}）。请重新登录。` : msg
 }
 
 /** 会话面四处 fetch 的**唯一**响应闸。返回 `null` = 已经报过错了，调用方直接 return。
@@ -2342,8 +2375,10 @@ function exportSupplementalCsv(t: Turn) {
       <div class="sec">
         <div class="sec-t">会话 <button class="btn-sm" @click="newSession">+ 新建</button></div>
       </div>
-      <div class="sec">
-        <div class="sec-t">知识库 <button v-if="kbManager" class="btn-sm" @click="openKnowledge">📁 上传/管理</button></div>
+      <!-- 知识库管理入口：整节按 kb_manager 显隐（设置页可配角色/人员名单，缺省仅管理员）；
+           不过闸的人连「知识库」标签都不见，不留一个点了没反应的死入口 -->
+      <div class="sec" v-if="kbManager">
+        <div class="sec-t">知识库 <button class="btn-sm" @click="openKnowledge">📁 上传/管理</button></div>
       </div>
       <!-- 今日经营日报：服务端 feed=daily 只返回当天生成的一份。 -->
       <div class="sec" v-if="hasAdminAccess && digests.length">
@@ -2579,6 +2614,28 @@ function exportSupplementalCsv(t: Turn) {
               </div>
             </div>
           </template>
+        </section>
+
+        <!-- ═══ 知识库入口权限 ═══ -->
+        <section class="set-card">
+          <div class="set-hd">
+            <span class="set-bar"></span>
+            <div><b>知识库入口权限</b><span class="set-sub">侧栏「知识库」与上传/管理面对谁开放；检索问答不受此限</span></div>
+          </div>
+          <div class="set-note">
+            两个名单是「或」的关系，<b>都留空 = 仅管理员可见</b>（缺省）。角色码即 DMS 角色编码（如 kb_admin），登录名逐人开放；保存即生效，被移除的人刷新后入口消失。
+          </div>
+          <div class="f-grid">
+            <label class="f-item f-w2"><span>按角色开放（角色码，逗号分隔）</span>
+              <input v-model="kbGrantsText.roles" placeholder="如 kb_admin, ops_manager；留空不按角色开放" />
+            </label>
+            <label class="f-item f-w2"><span>按人员开放（登录名，逗号分隔）</span>
+              <input v-model="kbGrantsText.logins" placeholder="如 zhangsan, lisi；留空不按人员开放" />
+            </label>
+          </div>
+          <div class="f-actions">
+            <button class="btn primary" :disabled="kbGrantsSaving" @click="saveKbGrants">{{ kbGrantsSaving ? '保存中…' : '保存' }}</button>
+          </div>
         </section>
 
         <!-- ═══ 质量控制面 ═══ -->

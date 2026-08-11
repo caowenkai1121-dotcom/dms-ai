@@ -1399,6 +1399,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/settings/fallback-vision", post(settings_api::set_fallback_vision))
         // 【Y3】RRF 四路辅助召回权重页内编辑（admin 门禁，保存即热生效）
         .route("/api/admin/settings/kb-rrf-weights", post(settings_api::put_kb_rrf_weights))
+        .route("/api/admin/settings/kb-manager-grants", post(settings_api::put_kb_manager_grants))
         // 【AI 解读】按需拉取：前端点了才调 fast 模型。**刻意不并进 `/api/ask`** ——
         // 评测/回归的 p95 基线不许为一笔与判分无关的 LLM 调用买单（理由在 `insight_api.rs` 文件头）。
         .route("/api/analysis", post(insight_api::analysis))

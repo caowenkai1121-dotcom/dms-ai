@@ -90,9 +90,11 @@ pub enum Intent {
 const LLM_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 知识库侧关键词：制度/流程类问法 + 三个文件扩展名（用户常直接贴文件名）。
+/// 「政策/规范/手册/指南/sop」与制度同类（2026-08-11 实测「报销政策是什么」一个词都不命中、
+/// 被指标词抢去问数）。「资料」刻意不收：「客户资料」是实体/问数语境。
 const KB_WORDS: &[&str] = &[
-    "制度", "规定", "流程", "怎么办", "如何", "标准", "模板", "合同", "办法", "须知", ".pdf",
-    ".docx", ".xlsx",
+    "制度", "规定", "流程", "怎么办", "如何", "标准", "模板", "合同", "办法", "须知",
+    "政策", "规范", "手册", "指南", "sop", ".pdf", ".docx", ".xlsx",
 ];
 
 /// 分诊入口。`ds` = 注册表召回的数据源（今天恒主源，见 `api_ask` 的注释）。
@@ -159,18 +161,44 @@ fn question_data_hit(question: &str) -> bool {
         || doc_code_hit(question)
 }
 
-/// 命中合成 → 路由裁决。`question` 只用于 both-hit 的排障日志（「哪句话两侧都命中」
-/// 是分诊排障最需要的信息），不参与判定。
+/// 命中合成 → 路由裁决。`question` 两个用途：both-hit 的强文档意图仲裁（见下）与排障日志。
 fn rule_decide(data: bool, kb_hit: bool, question: &str) -> Option<Intent> {
     match (data, kb_hit) {
         (true, true) => {
-            tracing::info!(question, "triage: both-hit → data（hybrid 待真实样本）");
-            Some(Intent::Data)
+            // 强文档意图翻 KB（2026-08-11 实测：「市场费用的报销政策是什么」被指标词
+            // 「市场费用」抢去聚合费用总额）。除此之外维持 v1 纪律：两侧都命中归 Data。
+            if strong_doc_intent(question) {
+                tracing::info!(question, "triage: both-hit 但强文档意图 → knowledge");
+                Some(Intent::Knowledge)
+            } else {
+                tracing::info!(question, "triage: both-hit → data（hybrid 待真实样本）");
+                Some(Intent::Data)
+            }
         }
         (true, false) => Some(Intent::Data),
         (false, true) => Some(Intent::Knowledge),
         (false, false) => None,
     }
+}
+
+/// 强文档意图：**文档名词 × 询问词**共现才成立 —— 单个指标词命中不许把制度类问句抢去问数。
+/// 词表与钉板的口径：`本月报销制度`（无询问词）与「销售额如何统计」（无文档名词）都仍归 Data。
+fn strong_doc_intent(q: &str) -> bool {
+    const DOC_NOUNS: &[&str] = &[
+        "政策", "制度", "规定", "流程", "规范", "办法", "须知", "手册", "指南", "合同", "模板", "标准", "sop",
+    ];
+    const ASK_WORDS: &[&str] = &[
+        "是什么", "是啥", "什么", "有哪些", "哪些", "怎么", "如何", "内容", "介绍", "讲讲", "说明",
+    ];
+    let mut lower: Option<String> = None;
+    let has_noun = DOC_NOUNS.iter().any(|w| {
+        if w.is_ascii() {
+            lower.get_or_insert_with(|| q.to_ascii_lowercase()).contains(w)
+        } else {
+            q.contains(w)
+        }
+    });
+    has_noun && ASK_WORDS.iter().any(|w| q.contains(w))
 }
 
 /// 完整业务分析问句的零 IO 判据。它只确认“对象 + 查询目标”已经齐全，不替代指标召回，
@@ -431,14 +459,36 @@ mod tests {
         assert_eq!(rule_intent("报销制度是什么", false, kb_hit("报销制度是什么")), Some(Intent::Knowledge));
         assert!(kb_hit("差旅标准"));
         assert!(kb_hit("看看 合同模板.DOCX"), "扩展名大小写不敏感");
+        assert!(kb_hit("报销政策"), "政策是制度类词");
+        assert!(kb_hit("皇家小虎巡店SOP"), "sop 大小写不敏感");
+        assert!(kb_hit("陈列手册") && kb_hit("操作指南"));
+        assert!(!kb_hit("客户资料"), "资料不收：实体/问数语境");
         assert!(!kb_hit("本月销售额是多少"));
     }
 
-    /// v1 不做 hybrid：两侧都命中一律归 Data（存量问数不许被知识库抢走）
+    /// v1 不做 hybrid：两侧都命中一律归 Data（存量问数不许被知识库抢走）——
+    /// 唯一例外是**强文档意图**（文档名词 × 询问词共现），那条翻 Knowledge。
     #[test]
     fn both_hit_goes_to_data() {
         assert_eq!(rule_intent("本月报销制度", false, true), Some(Intent::Data));
         assert_eq!(rule_intent("销售额如何统计", true, true), Some(Intent::Data));
+    }
+
+    /// 强文档意图仲裁（2026-08-11「报销政策是什么」被抢去问数的事故钉）：
+    /// 文档名词 × 询问词共现 → both-hit 翻 Knowledge；缺任一族维持 Data。
+    #[test]
+    fn strong_doc_intent_flips_both_hit_to_knowledge() {
+        assert_eq!(
+            rule_intent("市场费用的报销政策是什么", true, true),
+            Some(Intent::Knowledge),
+            "政策 × 是什么 必须翻知识库"
+        );
+        assert_eq!(rule_intent("巡店SOP有哪些内容", true, true), Some(Intent::Knowledge));
+        assert_eq!(rule_intent("退货流程怎么走", true, true), Some(Intent::Knowledge));
+        // 缺询问词 / 缺文档名词：维持 both-hit → Data 的 v1 纪律
+        assert!(!super::strong_doc_intent("本月报销制度"));
+        assert!(!super::strong_doc_intent("销售额如何统计"));
+        assert!(!super::strong_doc_intent("合同金额最高的客户是谁"), "谁 不是文档询问词");
     }
 
     /// 都不命中 → None：由 `triage` 交给 fast LLM（规则不许瞎猜）

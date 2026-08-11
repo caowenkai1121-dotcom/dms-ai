@@ -237,6 +237,12 @@ function normalizeSections(input: unknown): MNode[] {
   const list = Array.isArray((input as Record<string, unknown>)?.sections)
     ? (input as Record<string, unknown>).sections as unknown[]
     : []
+  return sectionNodes(list)
+}
+
+/** 章节节点递归映射（服务端 children 同形嵌套——多级标题逐级可展）；
+ *  0 块章节不进树（否则节点语义/样式/行为三处矛盾）。 */
+function sectionNodes(list: unknown[]): MNode[] {
   const out: MNode[] = []
   for (const raw of list) {
     if (!raw || typeof raw !== 'object') continue
@@ -244,11 +250,10 @@ function normalizeSections(input: unknown): MNode[] {
     const name = String(item.section ?? item.name ?? '').trim()
     if (!name) continue
     const chunkCount = Number(item.chunk_count) || 0
-    // 0 块章节没有内容可看：不进树（否则节点语义/样式/行为三处矛盾）
     if (!chunkCount) continue
     out.push({
       name,
-      children: [],
+      children: Array.isArray(item.children) ? sectionNodes(item.children) : [],
       chunkCount,
       excerpt: String(item.excerpt ?? ''),
       page: typeof item.page === 'number' ? item.page : null,
@@ -304,7 +309,18 @@ async function toggleDoc(node: LayoutNode) {
   expandedDocs.value = [...expandedDocs.value, docId]
 }
 
-function openSection(node: LayoutNode, doc: LayoutNode | undefined) {
+/** 章节所在文档的祖先节点（嵌套章节的直接父级可能是章节不是文档）：摘要卡要 docId/docName。 */
+function docAncestorOf(node: LayoutNode): LayoutNode | undefined {
+  let cur: LayoutNode | undefined = node
+  while (cur) {
+    if (cur.docId) return cur
+    cur = layout.value.nodes.find((n) => n.key === cur?.parentKey)
+  }
+  return undefined
+}
+
+function openSection(node: LayoutNode) {
+  const doc = docAncestorOf(node)
   activeSection.value = {
     docId: doc?.docId ?? '',
     docName: doc?.name ?? '',
@@ -317,13 +333,16 @@ function openSection(node: LayoutNode, doc: LayoutNode | undefined) {
   void nextTick(() => cardCloseBtn.value?.focus())
 }
 
-// 节点点击路由：章节→摘要卡；文档→展开/收起章节；分支/根→折叠记忆（原有行为）
-function onNodeClick(node: LayoutNode) {
-  if (node.chunkCount) {
-    const parent = layout.value.nodes.find((n) => n.key === node.parentKey)
-    openSection(node, parent)
-    return
-  }
+// 点击路由分两层（用户核心诉求：有节点就能展开）——
+// 圆点 = 展开/收起（有子级时）；文字 = 主动作（章节出摘要卡 / 文档展收章节 / 分支折叠）。
+// 带子级的章节两个动作都够得着：点圆点展子章节、点文字看摘要。
+function onDotClick(node: LayoutNode) {
+  if (node.docId) { void toggleDoc(node); return }
+  if (node.hasChildren) { toggle(node.key); return }
+  if (node.chunkCount) openSection(node)
+}
+function onLabelClick(node: LayoutNode) {
+  if (node.chunkCount) { openSection(node); return }
   if (node.docId) { void toggleDoc(node); return }
   if (node.hasChildren) toggle(node.key)
 }
@@ -332,10 +351,11 @@ function onNodeClick(node: LayoutNode) {
 function isClickable(node: LayoutNode): boolean {
   return node.hasChildren || !!node.docId || !!node.chunkCount
 }
-function nodeActionLabel(node: LayoutNode): string {
-  if (node.chunkCount) return `查看章节 ${node.name} 摘要`
+function dotActionLabel(node: LayoutNode): string {
   if (node.docId) return `${expandedDocs.value.includes(node.docId) ? '收起' : '展开'}文档 ${node.name} 的章节`
-  return node.collapsed ? `展开 ${node.name}` : `折叠 ${node.name}`
+  if (node.hasChildren) return node.collapsed ? `展开 ${node.name}` : `折叠 ${node.name}`
+  if (node.chunkCount) return `查看章节 ${node.name} 摘要`
+  return node.name
 }
 
 function branchColor(branch: number): string {
@@ -591,15 +611,16 @@ onBeforeUnmount(() => { mindmapEpoch++ })
               :fill="node.collapsed || (!node.hasChildren && !node.docId) ? (node.depth === 0 ? 'var(--primary)' : branchColor(node.branch)) : 'var(--bg-card)'"
               :r="node.chunkCount ? 3.5 : 4.5"
             />
-            <!-- 透明命中圆：圆点 r=4.5 点击目标过小，交互/键盘/ARIA 都挂这层 -->
+            <!-- 透明命中圆：圆点 r=4.5 点击目标过小，交互/键盘/ARIA 都挂这层；
+                 圆点=展开/收起（有子级），文字=主动作（摘要卡等），两层分工见 onDotClick/onLabelClick -->
             <circle
               v-if="isClickable(node)" class="mm-hit" r="12" role="button" tabindex="0"
-              :aria-label="nodeActionLabel(node)"
-              @click="onNodeClick(node)" @keydown.enter.prevent="onNodeClick(node)" @keydown.space.prevent="onNodeClick(node)"
+              :aria-label="dotActionLabel(node)"
+              @click="onDotClick(node)" @keydown.enter.prevent="onDotClick(node)" @keydown.space.prevent="onDotClick(node)"
             />
             <text
               class="mm-label" :class="{ root: node.depth === 0, clickable: isClickable(node) }"
-              x="11" y="4" @click="onNodeClick(node)"
+              x="11" y="4" @click="onLabelClick(node)"
             >{{ node.label }}<title v-if="node.label !== node.name">{{ node.name }}</title></text>
             <g v-if="node.docCount" class="mm-badge" :transform="`translate(${16 + node.labelW}, 0)`">
               <rect

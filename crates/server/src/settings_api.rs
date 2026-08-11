@@ -384,6 +384,12 @@ pub async fn catalog(State(st): State<Arc<AppState>>, h: HeaderMap, Query(q): Qu
             "kg": cfg.kb_rrf_weights.kg,
             "ext_kb": cfg.kb_rrf_weights.ext_kb,
         },
+        // 【KB 管理入口】当前生效的授权名单（设置页展示初值；缺省/空 = 仅管理员，
+        // 判定在 kb_api::kb_manager_allowed）。改它走 `put_kb_manager_grants`。
+        "kb_manager_grants": {
+            "roles": cfg.kb_manager_grants.as_ref().map(|g| g.roles.clone()).unwrap_or_default(),
+            "logins": cfg.kb_manager_grants.as_ref().map(|g| g.logins.clone()).unwrap_or_default(),
+        },
         "vision_candidates": vision_candidates,
         "effective_vision": effective_vision.map(|v| serde_json::json!({
             "provider": v.provider, "model": v.model, "fallback": v.fallback,
@@ -1270,6 +1276,107 @@ pub async fn put_kb_rrf_weights(
     })))
 }
 
+/// 【KB 管理入口】页内编辑的请求体：两个名单都可缺省——缺省**保留现值**；
+/// 给空数组 = 清空该名单；两个名单都为空 = 删键回「仅管理员」缺省（与不配等价，
+/// 见 `db::Settings::kb_manager_grants` 的语义注释）。
+#[derive(serde::Deserialize)]
+pub struct KbManagerGrantsReq {
+    roles: Option<Vec<String>>,
+    logins: Option<Vec<String>>,
+    login_name: Option<String>,
+    role_code: Option<String>,
+}
+
+/// 名单归一（纯函数，单测直接钉）：trim、丢空、保序去重；单条 ≤64 字符、单名单 ≤200 条。
+/// 匹配语义（精确比对、无大小写折叠）在 `kb_api::kb_manager_allowed` 那边钉，这里只管卫生。
+fn normalize_grant_list(field: &str, list: Vec<String>) -> Result<Vec<String>, String> {
+    if list.len() > 200 {
+        return Err(format!("{field} 名单最多 200 条（收到 {} 条）", list.len()));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(list.len());
+    for raw in list {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item.chars().count() > 64 {
+            return Err(format!("{field} 名单条目过长（≤64 字符）：{item:.20}…"));
+        }
+        if !out.iter().any(|seen| seen == item) {
+            out.push(item.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// `POST /api/admin/settings/kb-manager-grants` —— 配置知识库**管理面**入口对哪些角色/人员开放，保存即生效。
+///
+/// 接线契约（同本包纪律：**不注册进 main.rs**，编排方统一接；登记形态如下）：
+/// ```text
+/// .route("/api/admin/settings/kb-manager-grants", post(settings_api::put_kb_manager_grants))
+/// ```
+/// - body：`{"roles":["kb_admin"],"logins":["zhangsan"]}`（均可缺省，缺省名单保留现值；
+///   两个都给空数组 = 回「仅管理员」缺省）+ 身份字段（同其他 settings 端点）。
+/// - 200 `{"ok":true,"kb_manager_grants":{"roles":[...],"logins":[...]},"hot":true}`：
+///   落盘 + `st.cfg()` 热更新，下一个请求起入口显隐与管理面闸同步生效。
+/// - 400：名单超限（条数/长度）；403：非 DMS 管理员。
+/// 当前生效值的读取面：`GET /api/admin/settings-catalog` 响应的 `kb_manager_grants` 键。
+pub async fn put_kb_manager_grants(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Json(req): Json<KbManagerGrantsReq>,
+) -> ApiRes {
+    crate::admin_api::settings_admin_only(&st, &h, (&req.login_name, &req.role_code)).await?;
+    let _settings_write = st.settings_write.lock().await;
+    // 只读两个名单：读锁内 Clone 出来（KbManagerGrants 就两个小 Vec），不克隆整份 Settings
+    let current = st
+        .cfg
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .kb_manager_grants
+        .clone()
+        .unwrap_or_default();
+    // 两个名单都缺省 = 只想读现值：直接回报，跳过无操作的文件写与热更（同 RRF 短路纪律）
+    if req.roles.is_none() && req.logins.is_none() {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "kb_manager_grants": { "roles": current.roles, "logins": current.logins },
+            "hot": true,
+        })));
+    }
+    // 先验后写：名单卫生问题 400 带字段名；patch_settings 里还有反序列化整校兜底
+    let roles = match req.roles {
+        Some(list) => normalize_grant_list("roles", list).map_err(|e| err(StatusCode::BAD_REQUEST, e))?,
+        None => current.roles,
+    };
+    let logins = match req.logins {
+        Some(list) => normalize_grant_list("logins", list).map_err(|e| err(StatusCode::BAD_REQUEST, e))?,
+        None => current.logins,
+    };
+    // 双空 = 回缺省：键整体摘除（None 与空名单同语义，但文件里不留「配了又像没配」的猜测空间）
+    let clear = roles.is_empty() && logins.is_empty();
+    patch_settings(&st, |v| {
+        let obj = v.as_object_mut().ok_or("settings.json 顶层不是对象")?;
+        if clear {
+            obj.remove("kb_manager_grants");
+        } else {
+            // 两名册全量写：文件里始终能看到完整生效面（同 RRF 四路全量写的纪律）
+            obj.insert(
+                "kb_manager_grants".into(),
+                serde_json::json!({ "roles": roles, "logins": logins }),
+            );
+        }
+        Ok(())
+    })
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, SETTINGS_WRITE_GUIDANCE))?;
+    tracing::info!(roles = ?roles, logins = ?logins, "KB 管理入口授权已热更新");
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "kb_manager_grants": { "roles": roles, "logins": logins },
+        "hot": true,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     /// patch_settings 的落盘红线：完整校验后原地单次写，绝不生成凭据副本，随后同步 cfg。
@@ -1776,5 +1883,48 @@ mod tests {
         let write = body.find("patch_settings(&st").expect("权重端点没有走统一落盘链");
         assert!(short_circuit < write, "全 None 短路必须在落盘之前：{body}");
         assert!(!body.contains("st.cfg().kb_rrf_weights"), "读 4 个权重不该克隆整份 Settings：{body}");
+    }
+
+    /// 【KB 管理入口】端点三道锚点：管理员门禁 → 名单归一先验（400）→ patch_settings 落盘热更；
+    /// 双 None 只读短路必须在落盘之前。
+    #[test]
+    fn kb_manager_grants_endpoint_gates_before_persist() {
+        let src = include_str!("settings_api.rs");
+        let body = src
+            .split("pub async fn put_kb_manager_grants(")
+            .nth(1)
+            .expect("put_kb_manager_grants 没了")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(body.contains("settings_admin_only"), "授权端点丢了管理员门禁：{body}");
+        let normalize = body.find("normalize_grant_list(").expect("授权端点没有名单归一");
+        let write = body.find("patch_settings(&st").expect("授权端点没有走统一落盘链");
+        assert!(normalize < write, "必须先归一/校验后落盘：{body}");
+        let short_circuit = body
+            .find("req.roles.is_none() && req.logins.is_none()")
+            .expect("双 None 只读短路没了");
+        assert!(short_circuit < write, "双 None 短路必须在落盘之前：{body}");
+        assert!(body.contains("obj.remove(\"kb_manager_grants\")"), "双空回缺省的摘键没了：{body}");
+        // 读取面：catalog 必须透出当前生效名单（设置页初值）
+        let catalog = src.split("pub async fn catalog(").nth(1).unwrap();
+        assert!(catalog.contains("\"kb_manager_grants\""), "catalog 丢了 kb_manager_grants 键");
+    }
+
+    /// 名单归一的纯函数分支：trim/丢空/保序去重/长度与条数闸。
+    #[test]
+    fn normalize_grant_list_cleans_and_caps() {
+        use super::normalize_grant_list;
+        let out = normalize_grant_list("roles", vec![
+            " kb_admin ".into(), "sales".into(), "kb_admin".into(), "".into(), "  ".into(),
+        ])
+        .unwrap();
+        assert_eq!(out, vec!["kb_admin".to_string(), "sales".to_string()], "trim+丢空+保序去重");
+        assert!(normalize_grant_list("roles", vec!["x".repeat(65)]).is_err(), "单条超 64 必须 400 语义");
+        assert!(
+            normalize_grant_list("logins", (0..201).map(|i| format!("u{i}")).collect()).is_err(),
+            "超 200 条必须拒"
+        );
+        assert!(normalize_grant_list("roles", vec![]).unwrap().is_empty(), "空名单合法（= 清空该名册）");
     }
 }

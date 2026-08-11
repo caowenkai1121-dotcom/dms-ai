@@ -371,16 +371,36 @@ CREATE INDEX IF NOT EXISTS idx_kb_chunk_ts  ON kb.chunk USING gin (ts);
 CREATE INDEX IF NOT EXISTS idx_kb_chunk_trgm ON kb.chunk USING gin (text gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_kb_chunk_heading_trgm ON kb.chunk USING gin (heading_path gin_trgm_ops);
 
+-- 词级稀疏召回（第 9 路，对照 Yuxi 的 BM25 半）：jieba 精确模式分词的词集合。
+-- 分词只在 Rust 侧（store::terms_of 单一事实源：写入/查询/回填三处共用），PG 不引分词扩展。
+-- NULL = 还没过分词器（待回填：启动任务 terms_backfill 按库内现有 text 直接重算，不要求重传），
+-- {} = 分过了但没留下词（纯标点块等）。GIN 不收录 NULL 行，回填期查询自动只扫已填部分。
+ALTER TABLE kb.chunk ADD COLUMN IF NOT EXISTS terms text[];
+CREATE INDEX IF NOT EXISTS idx_kb_chunk_terms ON kb.chunk USING gin (terms);
+
 -- 文档/空间/数据源的可见性与写权限。
 -- perm 分 read/write：没有它连「可读不可写」都表达不了（→ 对他人知识库的投毒写）。
 -- scope='ds' 的行给 K4 上传表格建出的数据源用（私有台账不该被别人 NL2SQL 查到）。
 CREATE TABLE IF NOT EXISTS kb.acl(
   scope        text NOT NULL,                    -- space | doc | ds
   target_id    text NOT NULL,
-  grantee_kind text NOT NULL,                    -- login | role
+  grantee_kind text NOT NULL,                    -- login | role | dept
   grantee      text NOT NULL,
   perm         text NOT NULL DEFAULT 'read',     -- read | write
   created_at   timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY(scope, target_id, grantee_kind, grantee, perm)
 );
 CREATE INDEX IF NOT EXISTS idx_kb_acl_grantee ON kb.acl(grantee_kind, grantee);
+
+-- 【share_config v2 · 部门支路】login → 部门 的 PG 侧映射。
+-- 部门归属的真相在 MySQL t_employee.department_id，而可见性 SQL 全部在 PG 内求值：
+-- 要让 dept 授权与 login/role 授权在同一条 SQL 里取并集（不做按行 N+1 反查），
+-- 必须有一份 PG 内按键可查的映射。KB 端点每次请求按现算的 Principal 幂等刷新
+-- （knowledge/acl.rs::sync_viewer_dept），无部门即删行。
+-- 映射缺失或滞留只会让 dept 支路不命中/按旧值求值（fail-closed 方向），
+-- 不会放宽 login/role 两路的任何既有判定。
+CREATE TABLE IF NOT EXISTS kb.user_dept(
+  login       text PRIMARY KEY,
+  dept        text NOT NULL,                 -- t_department.department_id 的字符串形，与 kb.acl.grantee 同型比较
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
