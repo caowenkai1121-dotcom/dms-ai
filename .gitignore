@@ -56,3 +56,7 @@ htmlcov/
 # 部署种子快照（含业务字典值，私下传递，不进仓库）
 /tools/registry_snapshot.json
 registry_snapshot.json
+
+# 部署产物（本地打包，随时重建）
+tools/web-dist.tar.gz
+target/tmp/
