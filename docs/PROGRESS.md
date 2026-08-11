@@ -1935,3 +1935,31 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
   **生产启动崩溃循环**，DDL 加 `DROP NOT NULL` 迁移（读侧本就忽略该列）。
 - 验证：21 测试目标全绿零警告；vue-tsc 0 错误；判官回归 76/76 通过 0 失败（1 跳过取值缺失，
   同基线）；服务器全量部署后容器 healthy 无重启循环。
+
+## AX103（2026-08-11，KB 异步入库 + 预览票据/Range + Office 转 PDF 保真 + 列表 Yuxi 化）
+针对「上传卡解析中 / 预览等很久 / Office 预览要保真 / 列表太杂乱」四项实测反馈，对照 Yuxi 源码调研改造：
+- **根因与修复（上传卡死）**：upload 原在请求内同步 await ingest，46 页 PDF 带 4 页 OCR 超 50s，
+  浏览器/nginx 断连后 axum drop handler → 任务腰斩、文档永卡 parsing（服务器日志 BrokenPipe 实锤）。
+  ingest 拆 `prepare()`（请求内快路径：校验/去重/建行/落盘/绑目录）+ `run_job()`（spawn 后台
+  parse→chunk→embed），upload/reprocess/ingest-url 三入口全部异步，UPLOAD_GATE 许可随任务持有。
+- **启动自愈**（Yuxi recover_pending 同款）：启动扫 parsing/chunked/pending 超 10 分钟的文档，
+  按 has_chunks 分派首入/重建链、以空间 owner 身份串行重跑。部署后自动救活已卡死的
+  《操作手册-DMS市场费用报销核销》（embedded，70 块 46 页）。
+- **预览提速**：新增 `POST /api/kb/doc/{id}/preview-ticket`（HMAC-SHA256 单文档 15 分钟票据，
+  DMS_SECRET_KEY 既有派钥，常量时间校验）；`GET /api/kb/doc/{id}/file` 支持 ticket 鉴权 +
+  `inline=1` + Range 单区间（206/416/Accept-Ranges，seek 分段读不整载入内存）。前端 iframe
+  直挂直链，浏览器 PDF 查看器滚动到哪页拉哪页，不再整文件等下载。票据 15 分钟而非 120s：
+  渐进阅读后半程 Range 请求会撞过期 401。
+- **Office 保真预览**（Yuxi 同架构）：soffice headless 转 PDF + 磁盘缓存
+  （doc_id+mtime+size 键、tmp 目录 rename 原子落缓存、per-doc 锁去重、全局 2 并发闸、
+  90s 超时 kill_on_drop）；覆盖 doc/docx/ppt/pptx/xls/xlsx/xlsm（比 Yuxi 多 xlsx）；
+  转换不可用统一 404 office_pdf_unavailable，前端回落解析内容渲染（AX102 的降级层保留）。
+  Dockerfile 装 libreoffice-writer/calc/impress + wqy 中文字体（不装中文变方块）。
+- **文档列表 Yuxi 化**（web KbPanel 净删 ~100 行）：操作全部收进单个 ⋯ 竖排菜单
+  （预览/下载/移动至/元数据/生成描述/停用/重新处理/删除）；可点状态 pill 兼主操作
+  （失败点它=重新处理）；整行点击开预览；面包屑+幽灵按钮工具条（筛选/刷新）；四张统计卡；
+  20/50/100 客户端分页；复选批量条（批量重新处理/删除）。功能无一删减。
+- **上传体验**：XHR `upload.onprogress` 行内百分比 + 进度条；秒回后进行态文档 2s 轮询
+  （5 分钟上限，epoch/space 防护）；≥10 文件时队列头部聚合卡（总计/上传中/解析中/失败）。
+- 验证：21 测试目标全绿零警告（新增 10+ 单测：票据签验/Range 解析/自愈 SQL/异步分派）；
+  vue-tsc 0 错误；服务器全量部署后容器 healthy，自愈/票据/soffice 三项实测通过。
