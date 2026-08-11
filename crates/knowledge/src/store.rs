@@ -22,6 +22,71 @@ pub fn chunk_embedding_text(name: &str, folder_path: &str, heading_path: &str, b
     )
 }
 
+/// jieba 实例全局只建一次（词典编译进二进制，加载是一次性成本；实例本身无状态）。
+/// 这是纯函数备忘表，不是配置/文件单例 —— 同一输入恒同一输出，不破坏检索的纯函数式纪律。
+static JIEBA: std::sync::OnceLock<jieba_rs::Jieba> = std::sync::OnceLock::new();
+
+fn jieba() -> &'static jieba_rs::Jieba {
+    JIEBA.get_or_init(jieba_rs::Jieba::new)
+}
+
+/// 问句语法词（纯疑问/客套词）：匹配价值为零，**对称**剔除（存/查过同一个 `terms_of`，
+/// 两侧都见不到这些词，匹配结果不变，只省噪声）。任何带实体语义的词进这张表就是丢召回。
+const TERMS_STOPWORDS: &[&str] = &[
+    "请问", "麻烦", "一下", "什么", "怎么", "怎样", "怎么样", "如何", "多少", "哪些", "哪个",
+    "哪几", "为什么", "为啥", "有没有", "是不是", "能不能",
+];
+
+/// 词级稀疏召回（第 9 路）的分词**单一事实源**：写入（`insert_chunks`/`replace_chunks`）、
+/// 查询（`retrieve` 词级路）、存量回填（`terms_backfill`）三处共用 —— 两侧各写一份，
+/// 存储列与查询词就对不齐。
+///
+/// 口径（与 `retrieve::normalize_query` 对齐的那半必须逐字一致）：
+/// - 先做全角折叠（\u{3000}→空格、FF01-FF5E→半角）：块正文没归一化，不折会让
+///   全角型号「ＤＨＴ１５０」配不上问句里的半角「dht150」；
+/// - jieba 精确模式 + HMM（未登录词发现：公司黑话/新词不在词典也切得出）；
+/// - 词内去控制字符（`\x01` 是落库线格式的分隔符，见 `terms_blob`）、小写化；
+/// - 只留 **≥2 个字符且含字母/数字/汉字**的词：单字词几乎全是语法字（的/了/吗/呢），
+///   判别力极弱，留着只会把词级路变成噪声放大器；纯标点词同理丢弃；
+/// - 去重保序（与 `retrieve::exact_tokens` 同约）。
+pub fn terms_of(text: &str) -> Vec<String> {
+    let folded: String = text
+        .chars()
+        .map(|c| match c {
+            '\u{3000}' => ' ',
+            '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xfee0).unwrap_or(c),
+            _ => c,
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for tok in jieba().cut(&folded, true) {
+        let w: String =
+            tok.word.chars().filter(|c| !c.is_control()).flat_map(char::to_lowercase).collect();
+        let w = w.trim();
+        if w.chars().count() < 2 {
+            continue;
+        }
+        if !w.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        if TERMS_STOPWORDS.contains(&w) {
+            continue;
+        }
+        if !out.iter().any(|x| x == w) {
+            out.push(w.to_string());
+        }
+    }
+    out
+}
+
+/// terms 的落库线格式：`\x01` 分隔的单串（`terms_of` 已保证词内无控制字符），
+/// SQL 侧 `string_to_array(?, chr(1))` 还原。为什么不绑 `text[][]`：PG 的 `unnest`
+/// 会把多维数组**拍平**成一维（各块的词界全丢），这是 PG 数组的著名坑；
+/// 分隔符串让两条落块语句的 `unnest` 平行数组模式继续成立。空词表落 `''` → `{}`。
+fn terms_blob(terms: &[String]) -> String {
+    terms.join("\u{1}")
+}
+
 #[derive(Debug, Clone)]
 pub struct ChunkEmbeddingJob {
     pub chunk_id: i64,
@@ -96,6 +161,9 @@ pub async fn migrate(store: &OwnedStore) -> Result<(), KbError> {
         }
     }
     tx.commit().await?;
+    // 词级路存量回填：列建好后挂后台任务（terms IS NULL 游标，幂等可续跑）。
+    // 必须排在 commit 之后 —— 任务另起连接读表，事务没提交它看不到新列。
+    spawn_terms_backfill(store.clone());
     Ok(())
 }
 
@@ -1409,6 +1477,8 @@ pub async fn replace_chunks(
     let tokens: Vec<i32> = chunks.iter().map(|c| c.tokens).collect();
     let starts: Vec<Option<i32>> = spans.iter().map(|s| s.map(|x| x.start)).collect();
     let ends: Vec<Option<i32>> = spans.iter().map(|s| s.map(|x| x.end)).collect();
+    // 词列与正文同一条语句重写（影子索引重建 = 正文变了，词列必须同语句跟着变）
+    let term_blobs: Vec<String> = chunks.iter().map(|c| terms_blob(&terms_of(&c.text))).collect();
     let written = store
         .fixed(
             "WITH locked AS (SELECT d.doc_id,d.name,d.folder_path FROM kb.doc d JOIN kb.space s ON s.space_id=d.space_id \
@@ -1417,19 +1487,20 @@ pub async fn replace_chunks(
                     AND ((a.grantee_kind='login' AND a.grantee=$15) OR \
                          (a.grantee_kind='role' AND a.grantee=ANY($16::text[]))))) FOR UPDATE), \
              upserted AS ( \
-               INSERT INTO kb.chunk(doc_id,ord,text,heading_path,folder_path,page,tokens,embedding_text,embedding_recipe,embedding,start_char_pos,end_char_pos) \
+               INSERT INTO kb.chunk(doc_id,ord,text,heading_path,folder_path,page,tokens,embedding_text,embedding_recipe,embedding,start_char_pos,end_char_pos,terms) \
                SELECT $1,u.ord,u.txt,u.heading,l.folder_path,u.page,u.tokens, \
                       kb.chunk_embedding_text(l.name,l.folder_path,u.heading,u.txt),$14, \
                       CASE WHEN u.expected=kb.chunk_embedding_text(l.name,l.folder_path,u.heading,u.txt) \
-                           THEN u.embedding::vector ELSE NULL END,u.cstart,u.cend \
-               FROM unnest($2::int[],$3::text[],$4::text[],$5::int[],$6::int[],$7::text[],$8::text[],$17::int[],$18::int[]) \
-                    AS u(ord,txt,heading,page,tokens,expected,embedding,cstart,cend) CROSS JOIN locked l \
+                           THEN u.embedding::vector ELSE NULL END,u.cstart,u.cend, \
+                      string_to_array(u.tblob, chr(1)) \
+               FROM unnest($2::int[],$3::text[],$4::text[],$5::int[],$6::int[],$7::text[],$8::text[],$17::int[],$18::int[],$19::text[]) \
+                    AS u(ord,txt,heading,page,tokens,expected,embedding,cstart,cend,tblob) CROSS JOIN locked l \
                ON CONFLICT (doc_id,ord) DO UPDATE SET text=EXCLUDED.text, \
                  heading_path=EXCLUDED.heading_path,folder_path=EXCLUDED.folder_path, \
                  page=EXCLUDED.page,tokens=EXCLUDED.tokens, \
                  embedding_text=EXCLUDED.embedding_text,embedding_recipe=EXCLUDED.embedding_recipe, \
                  embedding=EXCLUDED.embedding,start_char_pos=EXCLUDED.start_char_pos, \
-                 end_char_pos=EXCLUDED.end_char_pos RETURNING embedding IS NULL AS missing), trimmed AS ( \
+                 end_char_pos=EXCLUDED.end_char_pos,terms=EXCLUDED.terms RETURNING embedding IS NULL AS missing), trimmed AS ( \
                DELETE FROM kb.chunk WHERE doc_id=$1 AND ord >= $13 \
                  AND EXISTS (SELECT 1 FROM upserted) RETURNING 1) \
              UPDATE kb.doc SET status=CASE WHEN EXISTS(SELECT 1 FROM upserted WHERE missing) \
@@ -1455,6 +1526,7 @@ pub async fn replace_chunks(
         .bind(&viewer.roles)
         .bind(&starts)
         .bind(&ends)
+        .bind(&term_blobs)
         .execute()
         .await?;
     if written == 0 {
@@ -1549,13 +1621,17 @@ pub async fn insert_chunks(
     let tokens: Vec<i32> = chunks.iter().map(|c| c.tokens).collect();
     let starts: Vec<Option<i32>> = spans.iter().map(|s| s.map(|x| x.start)).collect();
     let ends: Vec<Option<i32>> = spans.iter().map(|s| s.map(|x| x.end)).collect();
+    // 词列与正文同一条语句落库：terms 是 text 的纯函数（`terms_of` 单一事实源），
+    // 不许出现「正文已换、词列还是旧文算的」的中间态。
+    let term_blobs: Vec<String> = chunks.iter().map(|c| terms_blob(&terms_of(&c.text))).collect();
     let written = store
         .fixed(
-            "INSERT INTO kb.chunk(doc_id,ord,text,heading_path,folder_path,page,tokens,embedding_text,embedding_recipe,start_char_pos,end_char_pos) \
+            "INSERT INTO kb.chunk(doc_id,ord,text,heading_path,folder_path,page,tokens,embedding_text,embedding_recipe,start_char_pos,end_char_pos,terms) \
              SELECT $1,u.ord,u.txt,u.heading,d.folder_path,u.page,u.tokens, \
-                    kb.chunk_embedding_text(d.name,d.folder_path,u.heading,u.txt),$7,u.cstart,u.cend \
-             FROM unnest($2::int[], $3::text[], $4::text[], $5::int[], $6::int[], $10::int[], $11::int[]) \
-                  AS u(ord,txt,heading,page,tokens,cstart,cend) CROSS JOIN kb.doc d \
+                    kb.chunk_embedding_text(d.name,d.folder_path,u.heading,u.txt),$7,u.cstart,u.cend, \
+                    string_to_array(u.tblob, chr(1)) \
+             FROM unnest($2::int[], $3::text[], $4::text[], $5::int[], $6::int[], $10::int[], $11::int[], $12::text[]) \
+                  AS u(ord,txt,heading,page,tokens,cstart,cend,tblob) CROSS JOIN kb.doc d \
              JOIN kb.space s ON s.space_id=d.space_id WHERE d.doc_id=$1 AND \
                (s.owner=$8 OR EXISTS (SELECT 1 FROM kb.acl a WHERE a.scope='space' \
                  AND a.target_id=s.space_id AND a.perm='write' AND \
@@ -1574,6 +1650,7 @@ pub async fn insert_chunks(
         .bind(&viewer.roles)
         .bind(&starts)
         .bind(&ends)
+        .bind(&term_blobs)
         .execute()
         .await?;
     if written == 0 {
@@ -1710,6 +1787,114 @@ pub async fn flip_embedded_docs(store: &OwnedStore) -> Result<u64, KbError> {
         .execute()
         .await?;
     Ok(n)
+}
+
+/// 【词级路回填】待补词列的块。`terms IS NULL` = 还没过分词器（待回填）；
+/// `{}` = 分过了但没留下词（纯标点块等）—— 两者必须可分，否则回填游标无处可钉。
+/// 不按 doc 状态过滤：terms 不进状态机，检索侧的 doc 谓词（enabled/status/有效期）
+/// 已经把不可见块挡在召回外，这里多抄一份谓词只会跟着漂。
+pub async fn null_terms_chunks(store: &OwnedStore, limit: i64) -> Result<Vec<(i64, String)>, KbError> {
+    Ok(store
+        .fixed("SELECT chunk_id,text FROM kb.chunk WHERE terms IS NULL ORDER BY chunk_id LIMIT $1")
+        .bind(limit)
+        .fetch_all::<(i64, String)>()
+        .await?)
+}
+
+/// 词列回填写回：`chunk_id + 正文 CAS + terms IS NULL` 三重收口。并发重建（影子索引）
+/// 把正文改写过时 CAS 失配 = 0 行，下轮按新正文重算 —— 与 `set_chunk_embedding` 同一条纪律，
+/// 旧任务绝不能把旧正文的词覆盖到新块上。一条 UNNEST 语句写一批，不做 N 次往返。
+pub async fn set_chunk_terms(store: &OwnedStore, rows: &[(i64, String, String)]) -> Result<u64, KbError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let blobs: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+    let texts: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    let n = store
+        .fixed(
+            "UPDATE kb.chunk c SET terms=string_to_array(v.blob, chr(1)) \
+             FROM unnest($1::bigint[],$2::text[],$3::text[]) AS v(id,blob,txt) \
+             WHERE c.chunk_id=v.id AND c.text=v.txt AND c.terms IS NULL",
+        )
+        .bind(&ids)
+        .bind(&blobs)
+        .bind(&texts)
+        .execute()
+        .await?;
+    Ok(n)
+}
+
+/// 词级路存量回填的调度参数（对齐 `server::embed_fill` 的模式：启动即跑一轮 + 周期补漏）。
+/// 与向量回填的不对称：terms 是 `text` 的**纯函数**、不依赖向量/解析服务，读库内现有
+/// text 直接重算 —— 存量**不许要求重传**。
+const TERMS_FILL_BATCH: i64 = 500;
+/// advisory lock 键（多实例只跑一个；与 embed_fill 的 7_720_031 不撞即可）
+const TERMS_FILL_LOCK: i64 = 7_720_057;
+/// 两轮间隔：收敛后每轮只是一句「还有没有 NULL」的计数，成本可忽略
+const TERMS_FILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// 启动任务挂点（`migrate` 末尾调用）。幂等：进程半途死了，下次启动按 `terms IS NULL`
+/// 续跑；一次性 CLI（exec-sql 之类）进程随即退出、任务跟着死，也无碍 —— 服务启动会补完。
+pub fn spawn_terms_backfill(store: OwnedStore) {
+    tokio::spawn(async move {
+        loop {
+            match terms_backfill_round(&store).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("词级路回填：本轮补回 {n} 块"),
+                Err(e) => tracing::warn!("词级路回填本轮失败（下轮重试）: {e:#}"),
+            }
+            tokio::time::sleep(TERMS_FILL_INTERVAL).await;
+        }
+    });
+}
+
+async fn terms_backfill_round(store: &OwnedStore) -> Result<u64, KbError> {
+    // 锁必须握在同一条连接上（会话级锁；换连接 unlock 解的是空气）—— embed_fill 同款注释
+    let mut conn = store.pool().acquire().await.map_err(KbError::from)?;
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(TERMS_FILL_LOCK)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !locked {
+        tracing::debug!("词级路回填：advisory 锁由其他实例持有，本轮跳过");
+        return Ok(0);
+    }
+    let r = terms_backfill_all(store).await;
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(TERMS_FILL_LOCK)
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::warn!("词级路回填：advisory 解锁失败，该连接将带锁还回池: {e:#}");
+    }
+    r
+}
+
+async fn terms_backfill_all(store: &OwnedStore) -> Result<u64, KbError> {
+    let mut filled = 0u64;
+    loop {
+        let rows = null_terms_chunks(store, TERMS_FILL_BATCH).await?;
+        if rows.is_empty() {
+            return Ok(filled);
+        }
+        // 分词是 CPU 活（一批 ≈ 几十万字符内）：在 web worker 上连续算会卡住请求线程
+        let jobs: Vec<(i64, String, String)> = rows
+            .into_iter()
+            .map(|(id, text)| {
+                let blob = terms_blob(&terms_of(&text));
+                (id, blob, text)
+            })
+            .collect();
+        let n = set_chunk_terms(store, &jobs).await?;
+        if n == 0 {
+            // 整批 CAS 失配 = 并发重建正在重写同一批行；原地空转只会互踩，本轮收工，
+            // 下一轮（或重建完成后的轮次）按新正文重算
+            tracing::warn!("词级路回填：整批 CAS 失配（疑似并发重建），本轮提前收工");
+            return Ok(filled);
+        }
+        filled += n;
+    }
 }
 
 pub async fn promote_doc_if_ready(
@@ -2563,5 +2748,145 @@ mod tests {
         let replace = src.split("pub async fn replace_chunks").nth(1).unwrap();
         let replace = replace.split("pub async fn ").next().unwrap();
         assert!(replace.contains("remap_shadow_embeddings"), "影子构建不许把旧文本的向量贴到合并块上");
+    }
+
+    // ==================== 词级稀疏召回（第 9 路）：分词 / 落库 / 回填 ====================
+
+    /// 分词口径钉样例：这些断言是**行为合同**，改 `terms_of` 的过滤规则前先想清召回影响。
+    /// （切词结果本身由 jieba 词典决定，断言写的是 0.10 实测输出 —— 升级 jieba 要重量一遍。）
+    #[test]
+    fn terms_of_segments_chinese_at_word_level() {
+        // 词级命中正是这一路存在的理由：「打车费/限额」是**词**，trgm 给不出这种切口
+        let t = terms_of("差旅打车费每天限额多少");
+        assert!(t.contains(&"限额".to_string()), "{t:?}");
+        assert!(t.contains(&"车费".to_string()), "打车费 → 打(单字滤掉)+车费：{t:?}");
+        assert!(!t.contains(&"多少".to_string()), "疑问词进停用词表：{t:?}");
+        // 单字语法字不进词表
+        assert!(t.iter().all(|w| w.chars().count() >= 2), "单字词必须滤净：{t:?}");
+        // 型号整体保留且小写化（全角同口径折叠）
+        assert!(terms_of("DHT150-6 的报销比例").contains(&"dht150-6".to_string()));
+        assert_eq!(terms_of("ＤＨＴ１５０－６"), terms_of("dht150-6"), "全角折叠与 normalize_query 同口径");
+        // 数字词保留（「住宿 500 元/晚」的 500 是判据词）
+        assert!(terms_of("发票开具后15个工作日内提交").contains(&"15".to_string()));
+        // 纯标点/空串 → 空词表（查询侧据此早退，省一次可见块全扫）
+        assert!(terms_of("？？？…").is_empty());
+        assert!(terms_of("").is_empty());
+        // 幂等：归一化问句再过一次 terms_of 结果不变（查询侧输入是 normalize_query 的产物）
+        let q = terms_of("一线城市住宿费用标准是多少");
+        assert_eq!(terms_of(&q.join(" ")), q);
+    }
+
+    /// 去重保序 + 控制字符防御（`\x01` 是落库分隔符，词里绝不允许出现）
+    #[test]
+    fn terms_of_dedups_in_order_and_strips_control_chars() {
+        // jieba 把「报销制度」切成「报销/制度」两个词（词级切口的实测样例）
+        let t = terms_of("报销 报销 报销制度");
+        assert_eq!(t.iter().filter(|w| *w == "报销").count(), 1, "重复词去重：{t:?}");
+        let first = t.iter().position(|w| w == "报销").unwrap();
+        let second = t.iter().position(|w| w == "制度").unwrap();
+        assert!(first < second, "保序：{t:?}");
+        // 控制字符被剥掉，分隔符完整性不受输入影响
+        assert!(terms_of("报\u{1}销\u{2}制度").iter().all(|w| !w.contains('\u{1}')));
+    }
+
+    /// 写读往返：blob 线格式与 SQL 侧 `string_to_array(?, chr(1))` 互逆。
+    /// PG 语义钉两条：`string_to_array('a\x01b', chr(1)) = {a,b}`、`string_to_array('', chr(1)) = {}`
+    /// （连库评测时已实测复核 —— 改线格式前先把这两条在真库里再敲一遍）。
+    #[test]
+    fn terms_blob_round_trips_through_the_wire_format() {
+        let terms = terms_of("一线城市住宿费用标准是多少");
+        assert!(!terms.is_empty());
+        let blob = terms_blob(&terms);
+        // 模拟 PG string_to_array：按 \x01 切；空串 → 空数组
+        let back: Vec<String> = if blob.is_empty() { Vec::new() } else { blob.split('\u{1}').map(str::to_string).collect() };
+        assert_eq!(back, terms, "blob 往返必须无损");
+        assert!(terms_blob(&[]).is_empty(), "空词表落 ''（SQL 侧还原成空数组，不是单空串元素）");
+    }
+
+    /// terms 列 + GIN 索引在 0020（kb schema 唯一 DDL 真相源），且切句器切得干净
+    #[test]
+    fn terms_column_and_gin_index_are_migrated() {
+        let stmts: Vec<&str> = statements(KB_DDL).collect();
+        // 语句碎片带前导注释行（切句器按 `;` 切，注释跟着下一条语句走），故用 contains
+        assert!(
+            stmts.iter().any(|s| s.contains("ALTER TABLE kb.chunk ADD COLUMN IF NOT EXISTS terms text[]")),
+            "0020 缺 terms 列迁移（独立成句，幂等）"
+        );
+        assert!(
+            stmts.iter().any(|s| s.trim_start().starts_with("CREATE INDEX IF NOT EXISTS idx_kb_chunk_terms ON kb.chunk USING gin (terms)")),
+            "0020 缺 terms 的 GIN 索引"
+        );
+        // 列必须在索引之前（migrate 逐句顺序执行，反了当场 42703）
+        let at = |needle: &str| KB_DDL.find(needle).unwrap_or_else(|| panic!("0020 里没有：{needle}"));
+        assert!(
+            at("ADD COLUMN IF NOT EXISTS terms text[]") < at("idx_kb_chunk_terms"),
+            "terms 加列必须排在它的 GIN 索引之前"
+        );
+    }
+
+    /// 两条落块语句都必须同语句写词列（正文与词列不许有中间态），bind 序在既有参数之后追加
+    #[test]
+    fn chunk_writes_carry_terms() {
+        let src = include_str!("store.rs");
+        let insert = src.split("pub async fn insert_chunks").nth(1).unwrap();
+        let insert = insert.split("pub async fn ").next().unwrap();
+        assert!(insert.contains("start_char_pos,end_char_pos,terms"), "insert 列清单缺 terms");
+        assert!(insert.contains("string_to_array(u.tblob, chr(1))"), "insert 缺线格式还原");
+        assert!(insert.contains("$12::text[]"), "terms blob 数组只能追加在既有 bind 之后");
+        assert!(insert.contains("cstart,cend,tblob"), "insert 的 unnest 别名缺 tblob");
+
+        let replace = src.split("pub async fn replace_chunks").nth(1).unwrap();
+        let replace = replace.split("pub async fn ").next().unwrap();
+        assert!(replace.contains("end_char_pos,terms)"), "replace 列清单缺 terms");
+        assert!(replace.contains("terms=EXCLUDED.terms"), "影子重建必须同语句重写词列");
+        assert!(replace.contains("$19::text[]"), "terms blob 数组只能追加在既有 bind 之后");
+        assert!(replace.contains("cstart,cend,tblob"), "replace 的 unnest 别名缺 tblob");
+    }
+
+    /// 回填两条 SQL 的合同：游标谓词（terms IS NULL）+ 三重收口 CAS
+    #[test]
+    fn terms_backfill_sql_contracts() {
+        let src = include_str!("store.rs");
+        let nulls = src.split("pub async fn null_terms_chunks").nth(1).unwrap();
+        let nulls = nulls.split("pub async fn ").next().unwrap();
+        assert!(nulls.contains("WHERE terms IS NULL"), "回填游标就是 terms IS NULL");
+        assert!(nulls.contains("ORDER BY chunk_id LIMIT $1"), "键集分批（与 null_vec_chunks 同约）");
+        assert!(!nulls.contains("kb.doc"), "不按 doc 状态过滤（检索侧谓词已收口，别抄一份跟着漂）");
+
+        let set = src.split("pub async fn set_chunk_terms").nth(1).unwrap();
+        let set = set.split("\n}\n").next().unwrap();
+        assert!(set.contains("c.chunk_id=v.id AND c.text=v.txt AND c.terms IS NULL"), "三重收口 CAS 变了");
+        assert!(set.contains("string_to_array(v.blob, chr(1))"), "回写缺线格式还原");
+    }
+
+    /// 🔴 回填任务的三个坑全在源码层（无库单测碰不到）—— 与 embed_fill 同一族判据：
+    /// ① try 锁（阻塞锁会把替补实例睡死）；② 锁与解锁同一条连接；③ 失败路径也解锁。
+    /// 外加：spawn 必须排在 migrate 的事务 **commit 之后**（任务另起连接读表，没提交看不到新列）。
+    #[test]
+    fn terms_backfill_lock_is_try_same_conn_and_always_unlocked() {
+        let src = include_str!("store.rs");
+        let body = src.split("async fn terms_backfill_round(").nth(1).expect("terms_backfill_round 没了");
+        let body = body.split("\nasync fn ").next().unwrap();
+        assert!(body.contains("pg_try_advisory_lock"), "阻塞锁会把替补实例睡死：{body}");
+        assert!(body.contains("pg_advisory_unlock"), "没有解锁：{body}");
+        assert_eq!(body.matches(".acquire()").count(), 1, "锁与解锁不在同一条连接上：{body}");
+        let fill = body.find("terms_backfill_all(store).await").expect("terms_backfill_all 调用没了");
+        let unlock = body.find("pg_advisory_unlock").unwrap();
+        assert!(fill < unlock, "失败路径不解锁会终身占锁：{body}");
+
+        let migrate = src.split("pub async fn migrate").nth(1).unwrap();
+        let migrate = migrate.split("\n}\n").next().unwrap();
+        let commit = migrate.find("tx.commit().await?").expect("migrate 的 commit 没了");
+        let spawn = migrate.find("spawn_terms_backfill(store.clone())").expect("migrate 没挂回填任务");
+        assert!(commit < spawn, "回填任务必须排在事务 commit 之后：{migrate}");
+    }
+
+    /// 回填循环的防空转闸：整批 CAS 失配必须收工（并发重建重写同一批行时原地空转只会互踩）
+    #[test]
+    fn terms_backfill_aborts_a_fully_cas_mismatched_batch() {
+        let src = include_str!("store.rs");
+        let body = src.split("async fn terms_backfill_all(").nth(1).expect("terms_backfill_all 没了");
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("if n == 0"), "整批 0 行要写必须有提前收工闸：{body}");
     }
 }

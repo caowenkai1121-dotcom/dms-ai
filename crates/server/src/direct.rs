@@ -3739,8 +3739,9 @@ mod tests {
         assert!(agg_template("本月各省成交客户数").is_none(), "带维度词不该被模板接走");
         // ④ 默认销售额已经退出业务 MySQL 模板；DWS 路径由 `warehouse_sales_fact`
         //    抢在注册表组合器前处理，业务源不允许靠 `try_direct` 生成旧销售 SQL。
+        //    省份已并入省区（region，2026-08-11 业务裁决）：DWS 路径必须接住而非回落。
         assert!(try_direct("本月销售额按省份").is_none());
-        assert!(warehouse_sales_fact("本月销售额按省份").is_none());
+        assert!(warehouse_sales_fact("本月销售额按省份").is_some(), "省份=省区（region），DWS 路径必须接住");
         assert!(agg_template("本月销售额按省份").is_none());
     }
 
@@ -4011,7 +4012,9 @@ mod tests {
 
     #[test]
     fn sales_breakdown_top_n() {
-        assert!(sales_breakdown("本月销售额前5的省份").is_none());
+        // 省份已并入省区（region，业务确认字段）：前 N 语义照常兑现
+        let h0 = sales_breakdown("本月销售额前5的省份").expect("省份=省区（region），必须命中");
+        assert!(h0.sql.contains("LIMIT 5") && h0.sql.contains("sf.region"), "{}", h0.sql);
         let h = sales_breakdown("本月销售额前5的客户").unwrap();
         assert!(h.sql.contains("LIMIT 5"), "{}", h.sql);
         let h2 = sales_breakdown("本月销售额按客户").unwrap();
@@ -4029,6 +4032,8 @@ mod tests {
             ("本月销售额按商品编码", "sf.skucode"),
             ("本月销售额按战区", "sf.war_zone"),
             ("本月销售额按区域", "sf.region"),
+            // 省份=省区（region）：2026-08-11 业务裁决后从「必须回落」挪进受信维度
+            ("本月销售额按省份", "sf.region"),
             ("今年每月销售额", "DATE_FORMAT(sf.order_date,'%Y-%m')"),
             ("本月每日销售额", "DATE(sf.order_date)"),
         ] {
@@ -4046,7 +4051,6 @@ mod tests {
             "本月销售额按业务员",
             "本月销售额按区域经理",
             "本月销售额按客户分类",
-            "本月销售额按省份",
             "本月销售额按TYPE",
             "本月销售额按商品类型",
             "本月销售额按二级分类",

@@ -307,10 +307,12 @@ fn strip_internal_codes(line: &str) -> String {
         };
         let end = start + 1 + end;
         let code = &rest[start + 1..end];
-        // 零分配的大小写不敏感前缀比较（原 `to_ascii_uppercase` 每个 `[...]` 片段分配一次）
+        // 零分配的大小写不敏感前缀比较（原 `to_ascii_uppercase` 每个 `[...]` 片段分配一次）。
+        // `get(..)` 而不是直接切片：`[表头…]` 这类 CJK 内容在第 4 字节不是 char 边界，
+        // 裸 `code[..4]` 会当场 panic（2026-08-11 词级路评测实弹抓获）
         if !["KPI-", "SEC-", "CON-"]
             .iter()
-            .any(|prefix| code.len() >= prefix.len() && code[..prefix.len()].eq_ignore_ascii_case(prefix))
+            .any(|prefix| code.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
         {
             out.push_str(&rest[start..=end]);
         }
@@ -335,9 +337,11 @@ fn strip_bare_internal_codes(line: &str) -> String {
             break;
         };
         let rest = &line[start..];
+        // `get(..)` 而不是裸切片：K/S/C 后接 CJK（如「Co表」「c 部门」）时第 4 字节
+        // 落在多字节字符内部，裸 `rest[..4]` 直接 panic —— 词级路评测实弹抓获（KB06）
         let Some(prefix_len) = ["KPI-", "SEC-", "CON-"]
             .iter()
-            .find(|p| rest.len() >= p.len() && rest[..p.len()].eq_ignore_ascii_case(p))
+            .find(|p| rest.get(..p.len()).is_some_and(|head| head.eq_ignore_ascii_case(p)))
             .map(|p| p.len())
         else {
             out.push_str(&line[at..start + 1]);
@@ -1802,6 +1806,24 @@ mod tests {
         assert!(out.contains("## 关键要点") && out.contains("按制度执行[^1]"), "{out}");
         assert!(!out.to_ascii_uppercase().contains("SEC-") && !out.contains("CON-") && !out.contains("证据详情"), "{out}");
         assert!(!is_internal_heading("证据材料要求"), "正常业务标题不得被证据清洗误删");
+    }
+
+    /// 🔴 K/S/C 字母后接 CJK 时前缀比较不许 panic（字节窗口跨 char 边界）。
+    /// 由来（2026-08-11 词级路评测实弹）：KB06 的回答文本含「c 部门」式片段，
+    /// `rest[..4]` 正好切在「部」的字节中间 → tokio worker panic → 客户端 HTTP 0。
+    /// 清洗语义不变：真内部码照剥，含 CJK 的疑似片段原样保留。
+    #[test]
+    fn internal_codes_stripping_never_panics_on_cjk_boundaries() {
+        // 逐字节穷举这类片段的每一种对齐：前缀窗（4 字节）落在双/三字节字符内部的所有形态
+        for s in ["c 部门报表", "Co表", "s表头", "K计划中", "See表", "con计划", "c表", "[表头] 内容", "[部] KPI-9"] {
+            let _ = strip_internal_codes(s); // 不 panic 即过（断言语义见下两条）
+        }
+        // 真内部码照剥（含大小写混合与裸写两种形态）
+        assert_eq!(strip_internal_codes("上限见 [SEC-01] 执行"), "上限见  执行");
+        assert_eq!(strip_internal_codes("风险 con-risk_2 已核"), "风险  已核");
+        // CJK 疑似片段原样保留（不是内部码，一个字节都不许吃）
+        assert_eq!(strip_internal_codes("c 部门报表"), "c 部门报表");
+        assert_eq!(strip_internal_codes("[表头] 内容"), "[表头] 内容");
     }
 
     /// 🔴 多份资料互相矛盾时，**必须把冲突说出来**，不许静默挑一份。

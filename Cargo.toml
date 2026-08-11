@@ -18,6 +18,14 @@ anyhow = "1"
 # （rustls/sqlx 的传递依赖），这里只是把直接依赖摆明 —— 锁树零新增第三方包。
 ring = "0.17"
 base64 = "0.22"
+# 【D6 破例 · 中文词级切分】知识库词级稀疏召回路（kb.chunk.terms）的分词器。
+# 不可替代理由：词级切分 = 词典 + 切词算法，锁树逐表核对无任何 NLP/分词组件，
+# 开既有依赖的 feature 变不出这个词典；PG 侧 zhparser 要动 docker/age 镜像（系统级
+# 扩展 + 镜像重建，运维面被否）；embed_service.py 无 jieba 且不为它引 Python 依赖
+# （问句侧分词会变成每次检索一次 HTTP，服务挂则该路必哑）。jieba-rs 是纯 Rust
+# （无 C 依赖，windows-gnu 可构建）、中文分词事实标准（2026-07 仍在发版）。
+# 分词只发生在 Rust 侧：写入/查询/存量回填三处共用 store::terms_of 一个事实源。
+jieba-rs = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

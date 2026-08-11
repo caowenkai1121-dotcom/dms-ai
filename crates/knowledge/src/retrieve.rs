@@ -1,4 +1,4 @@
-//! 混合检索：**ACL 先行**（可见 doc 子查询内联进检索 SQL）→ 向量/精确 token/正文 trgm/标题/元数据各自 top
+//! 混合检索：**ACL 先行**（可见 doc 子查询内联进检索 SQL）→ 向量/精确 token/正文 trgm/词级词命中/标题/元数据各自 top
 //! → 目录/文档关系扩展 + 图谱召回（Yuxi B6：实体种子 → 1~2 hop 扩散 → 幂迭代 PPR，
 //! `DMS_KG_RETRIEVAL=off` 整体关闭）+ 外部只读 KB（Yuxi B9：Dify 数据集检索，
 //! `DMS_EXT_KB_*` 未配齐即关闭，关闭时零 IO）→ RRF 融合 → 同文档相邻块合并、去重 → 来源多样化截断。
@@ -51,6 +51,26 @@ const KG_TOP: usize = 10;
 const EXT_KB_WEIGHT: f32 = 0.2;
 /// 外部路从远程取回的块数：远程排序质量不透明，宁少勿滥。
 const EXT_KB_TOP: usize = 4;
+/// 词级稀疏召回路（第 9 路，对照 Yuxi 稠密+BM25 混合检索的 BM25 半）：jieba 词命中。
+/// trgm 是**模糊相似**不是「词命中」，短口语化问句（小程序场景）排序粗；词级路把问句与
+/// 块正文过**同一个分词器**（`store::terms_of` 单一事实源），按命中的不同问句词数排序。
+/// 权重恒 1.0：它是正文直接命中路，与四路正文同一条「字面量钉死、配置够不着」的纪律。
+const TERMS_WEIGHT: f32 = 1.0;
+/// 词级路的候选上限：与 TRGM_TOP 同档（同是正文路，名额不膨胀）。
+const TERMS_TOP: i64 = 10;
+/// 问句参与词级路的词数上限（防爆闸，与 `EXACT_MAX_TOKENS` 同族；正常问句 ≤10 个词，
+/// 评测集最大 9—— 闸对语料零影响，防的是「把整篇文档粘进问句」的病态输入）。
+/// 🔴 只能用在**查询侧**：块正文的词表必须全量落库（写侧截断 = 词级路召回缺臂）。
+const TERMS_MAX_QUERY_TERMS: usize = 32;
+/// 词级路入选门：至少命中几个**不同**问句词。标定值 —— 2026-08-11 连真库量的分布
+/// （kb_eval 夹具 14 篇 / 每题「问句词 × 各块命中数」全表，钉下来的几个值见 `TERMS_MEASURED`）：
+/// 判据块全部 ≥2（最低的是 KB02 的 2/4），而远域 nohit（KB07「月球基地」）的最高噪声只有 1 ——
+/// 门取 2 把远域 nohit 整路清空，判据块一个不掉。
+/// 🔴 它做不到的事（与 `VEC_MAX_DIST` 同一族）：**近域** nohit 分不出来 —— KB13「差旅打车费」
+/// 的最高噪声块（体检尾块）命中 4/7 个问句词，比一半判据块都高；任何能挡住它的门都会先打死
+/// 正向题。那道题由 `answer::keep_cited_only` 兜，不是由命中数门兜。
+/// 问句词数不足时按问句词数收口（`terms_min_hits`），单词问句不变哑。
+const TERMS_MIN_HITS: i64 = 2;
 
 /// 【Y3】RRF 四路**辅助**召回的权重（settings.json `kb_rrf_weights`）。缺省 = 上面四个
 /// 编译期常量，与引入本项前**逐路字节级等价**（有单测钉着）。正文直接命中的四路恒 1.0，
@@ -280,7 +300,7 @@ pub struct Hit {
     pub merged: u32,
 }
 
-/// 一次检索的可观测数据。数值直接来自五路内容召回、一路结构扩展、一路图谱召回和一路外部 KB 召回，不参与阈值判定。
+/// 一次检索的可观测数据。数值直接来自六路内容召回、一路结构扩展、一路图谱召回和一路外部 KB 召回，不参与阈值判定。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchStats {
     pub visible_docs: usize,
@@ -294,6 +314,9 @@ pub struct SearchStats {
     pub relation_candidates: usize,
     pub kg_candidates: usize,
     pub ext_kb_candidates: usize,
+    /// 词级稀疏召回路（第 9 路）的候选数。kb_api 诊断 JSON 的键集是既有契约，
+    /// 本字段只进服务端日志/评测，不加那边（那个文件本轮不在改动范围）。
+    pub terms_candidates: usize,
     pub fused_candidates: usize,
 }
 
@@ -427,26 +450,39 @@ pub async fn search_report(
             }
         }
     };
-    // 第 8 路外部只读 KB（B9）也是一条独立 HTTP，与上面五路同批发出（不占额外尾延迟）；
+    // 第 8 路外部只读 KB（B9）也是一条独立 HTTP，与上面六路同批发出（不占额外尾延迟）；
     // 未配置时 `from_env` 为 None → 这一路恒空、零 IO，与接入前逐字节一致。
     let ext_client = ExtKbClient::from_env();
-    let (vector, exact, trgm, title, metadata, ext_kb) = tokio::join!(
+    let (vector, exact, trgm, title, metadata, terms, ext_kb) = tokio::join!(
         vector,
         exact_ids(store, &docs, &query),
         trgm_ids(store, &docs, &query),
         title_ids(store, &docs, &query),
         metadata_ids(store, &docs, &query),
+        terms_ids(store, &docs, &query, terms_route_enabled()),
         ext_kb_route(ext_client.as_ref(), &query),
     );
     let (vec_ids, vec_down) = vector?;
+    let terms = terms?;
     // 固定五个槽位，向量降级时也保留空 vec：诊断日志不会把精确路数量误记成向量数量。
     let mut lists = vec![vec_ids, exact?, trgm?, title?, metadata?];
     // 槽位序 = 「向量/精确/正文/标题 | 元数据」：push 序就是语义序，`auxiliary[0]` 恒为
-    // 元数据路——在 metadata 前插一路会静默指错，先钉死
+    // 元数据路——在 metadata 前插一路会静默指错，先钉死。
+    // 词级路（第 9 路）的槽位钉死在**末尾**（见下方 push 序）：CHANNEL_NAMES 前八槽被
+    // 既有测试逐字钉住，插位等于改旧路语义；它参与「直接命中」靠下方显式并行数组。
     debug_assert_eq!(lists.len(), 5, "lists 槽位序变了，auxiliary[0] 不再是元数据路");
     let (direct, auxiliary) = lists.split_at_mut(4);
-    keep_auxiliary_votes_on_direct_hits(direct, &mut auxiliary[0]);
-    let direct_ranked = rrf_weighted(&lists, &routes[..5]);
+    // 直接命中 = 前四路 + 词级路：元数据票只许落在直接命中上（词级是正文词命中，同属直接命中）
+    keep_auxiliary_votes_on_direct_hits(
+        &[&direct[0], &direct[1], &direct[2], &direct[3], &terms],
+        &mut auxiliary[0],
+    );
+    // 第一遍融合：五路直接命中 + 元数据票。词级路的 lists 槽位在末尾，这里按显式并行
+    // 数组喂（first_pass 路序与 first_weights 一一对应）；词级路为空时与接入前逐字节等价。
+    let first_weights = [routes[0], routes[1], routes[2], routes[3], routes[4], TERMS_WEIGHT];
+    let mut first_pass = lists.clone();
+    first_pass.push(terms.clone());
+    let direct_ranked = rrf_weighted(&first_pass, &first_weights);
     let direct_ids: Vec<i64> = direct_ranked.iter().take(CANDIDATE_K).map(|(id, _)| *id).collect();
     // 第 6/7 路互不依赖（关系扩展吃直接命中，图谱吃向量路种子），并行发出。
     // 图谱路永不返 Err：图没建 / 查询失败 / env 关闭都是「这一路缺席」—— 降级 warn 留痕走原路，
@@ -473,9 +509,16 @@ pub async fn search_report(
         .map(|(i, record)| (ext_kb_synthetic_id(i), record))
         .collect();
     lists.push(ext_kb_map.iter().map(|(id, _)| *id).collect());
+    // 第 9 路词级召回：槽位**钉死在末尾**（前八槽的通道名被既有测试逐字钉住）。
+    lists.push(terms);
 
-    let ranked = rrf_weighted(&lists, &routes);
-    debug_assert_eq!(lists.len(), 8, "lists 槽位序变了，下方 stats/通道名按硬下标取数会错位");
+    // 词级路权重是编译期字面量（TERMS_WEIGHT，与四路正文同钉死），不进 settings：
+    // 「辅助路不许压过正文路」与「正文直接命中恒 1.0」都由字面量守，配置够不着。
+    let mut weights9 = [0.0f32; 9];
+    weights9[..8].copy_from_slice(&routes);
+    weights9[8] = TERMS_WEIGHT;
+    let ranked = rrf_weighted(&lists, &weights9);
+    debug_assert_eq!(lists.len(), 9, "lists 槽位序变了，下方 stats/通道名按硬下标取数会错位");
     let stats = SearchStats {
         visible_docs: visible_n,
         vector_candidates: lists[0].len(),
@@ -486,6 +529,7 @@ pub async fn search_report(
         relation_candidates: lists[5].len(),
         kg_candidates: lists[6].len(),
         ext_kb_candidates: lists[7].len(),
+        terms_candidates: lists[8].len(),
         fused_candidates: ranked.len(),
     };
     let mut ids: Vec<i64> = ranked.iter().take(CANDIDATE_K).map(|(id, _)| *id).collect();
@@ -525,8 +569,9 @@ pub async fn search_report(
             relation = stats.relation_candidates,
             kg = stats.kg_candidates,
             ext_kb = stats.ext_kb_candidates,
+            terms = stats.terms_candidates,
             merged = stats.fused_candidates,
-            "检索零命中：各路召回数（vec=向量 exact=单号/型号精确 trgm=正文相似 title=标题/文件名 metadata=元数据 relation=结构关联 kg=图谱 ext_kb=外部知识库 merged=RRF 后）"
+            "检索零命中：各路召回数（vec=向量 exact=单号/型号精确 trgm=正文相似 title=标题/文件名 metadata=元数据 relation=结构关联 kg=图谱 ext_kb=外部知识库 terms=词级 merged=RRF 后）"
         );
         return Ok(SearchReport {
             normalized_query: query,
@@ -832,6 +877,64 @@ const TRGM_SQL: &str = "SELECT chunk_id FROM kb.chunk \
 
 async fn trgm_ids(store: &OwnedStore, docs: &[String], q: &str) -> Result<Vec<i64>, KbError> {
     ids(store.fixed(TRGM_SQL).bind(docs).bind(q).bind(TRGM_MIN).bind(TRGM_TOP)).await
+}
+
+/// 词级稀疏召回（第 9 路）：`terms && $2` 先由 GIN 收口「至少中一词」，`hits >= $3`
+/// 再按**不同问句词命中数**过滤；排序 = 命中词数降序、chunk_id 决胜（可复现）。
+/// `terms IS NULL`（回填未完成）的行天然不在 GIN 索引里，`&&` 直接不命中 —— 无特判。
+const TERMS_SQL: &str = "SELECT chunk_id, hits FROM ( \
+                         SELECT c.chunk_id, (SELECT count(*) FROM unnest($2::text[]) AS q(w) \
+                                             WHERE q.w = ANY(c.terms)) AS hits \
+                         FROM kb.chunk c \
+                         WHERE c.doc_id = ANY($1::text[]) AND c.terms && $2::text[] \
+                         ) s WHERE hits >= $3 \
+                         ORDER BY hits DESC, chunk_id LIMIT $4";
+
+/// 词级路开关（A/B 对照与应急回退用）：`DMS_KB_TERMS=off` 整体关闭，关闭时零 IO，
+/// 与接入前逐字节一致 —— 与图谱路 `DMS_KG_RETRIEVAL` 同一个闸形。
+fn terms_route_enabled() -> bool {
+    terms_route_enabled_env(std::env::var("DMS_KB_TERMS").ok().as_deref())
+}
+
+fn terms_route_enabled_env(v: Option<&str>) -> bool {
+    !matches!(v, Some(s) if s.trim().eq_ignore_ascii_case("off"))
+}
+
+/// 词级路的有效命中词数门：`min(TERMS_MIN_HITS, 问句词数)` —— 问句词数低于门槛时
+/// 按问句词数收口，单词问句（「报销」）不因全局门槛变哑。
+fn terms_min_hits(query_terms: usize) -> i64 {
+    TERMS_MIN_HITS.min(query_terms.max(1) as i64)
+}
+
+async fn terms_ids(
+    store: &OwnedStore,
+    docs: &[String],
+    q: &str,
+    enabled: bool,
+) -> Result<Vec<i64>, KbError> {
+    if !enabled {
+        return Ok(Vec::new()); // env 关闭：一条查询都不发（闸形与图谱路一致）
+    }
+    let qterms = crate::store::terms_of(q);
+    if qterms.is_empty() {
+        // 纯标点/单字问句分不出词：省一次可见块全扫（与 exact_ids 的早退同约）
+        return Ok(Vec::new());
+    }
+    let mut qterms = qterms;
+    qterms.truncate(TERMS_MAX_QUERY_TERMS);
+    // 问句词数低于门槛时按问句词数收口：单词问句（「报销」）不因全局门槛变哑
+    let min_hits = terms_min_hits(qterms.len());
+    let rows = store
+        .fixed(TERMS_SQL)
+        .bind(docs)
+        .bind(&qterms)
+        .bind(min_hits)
+        .bind(TERMS_TOP)
+        .fetch_all::<(i64, i64)>()
+        .await?;
+    // 词级路是标定数据来源：连库评测时按 debug 日志取「问句词 → 各块命中数」分布
+    tracing::debug!(query = %q, terms = ?qterms, min_hits, candidates = ?rows, "词级路候选");
+    Ok(rows.into_iter().map(|(id, _)| id).collect())
 }
 
 /// 标题/文件名辅助召回：每篇文档只给最高相似块一个名额，防止文件名命中后整篇块铺满候选。
@@ -1357,8 +1460,8 @@ fn ext_kb_hit(chunk_id: i64, ord: i32, record: &ExtKbRecord) -> Hit {
 
 /// 八路召回的通道名，顺序 = `lists` 槽位序（`search_report` 里 `debug_assert_eq!(lists.len(), 8)`
 /// 钉住对齐）。`match_channels` 的 zip 对更短的输入静默截断——测试只给 6 路是刻意的。
-const CHANNEL_NAMES: [&str; 8] =
-    ["向量", "精确匹配", "正文相似", "标题", "元数据", "结构关联", "图谱", "外部知识库"];
+const CHANNEL_NAMES: [&str; 9] =
+    ["向量", "精确匹配", "正文相似", "标题", "元数据", "结构关联", "图谱", "外部知识库", "词级"];
 
 /// 测试专用的通道名查询（生产路径在 `search_report` 里用离线建好的 `channel_map` 查表）。
 /// zip 对更短的输入静默截断——测试只给 6 路是刻意的。
@@ -1372,10 +1475,12 @@ fn match_channels(chunk_id: i64, lists: &[Vec<i64>]) -> Vec<String> {
         .collect()
 }
 
-/// 元数据只能增强已由四路直接命中（向量/精确/正文/标题）召回的块，
+/// 元数据只能增强已由直接命中路（向量/精确/正文/标题/词级）召回的块，
 /// 不能凭标签或业务域单独制造答案候选。
-fn keep_auxiliary_votes_on_direct_hits(direct: &[Vec<i64>], auxiliary: &mut Vec<i64>) {
-    auxiliary.retain(|id| direct.iter().any(|route| route.contains(id)));
+/// 泛型是为词级路让位：它的 lists 槽位钉死在末尾（通道名表前八槽被既有测试钉住），
+/// 「直接命中」集合在调用点按引用并行数组传入，这里不再假设槽位连续。
+fn keep_auxiliary_votes_on_direct_hits<S: AsRef<[i64]>>(direct: &[S], auxiliary: &mut Vec<i64>) {
+    auxiliary.retain(|id| direct.iter().any(|route| route.as_ref().contains(id)));
 }
 
 /// 取最终正文时重放 ACL、启用状态和空间条件。直接命中仍须当前有效；仅同族版本和显式
@@ -2853,5 +2958,150 @@ mod tests {
         assert_eq!(match_channels(-1, &lists), ["外部知识库"]);
         assert_eq!(match_channels(7, &lists), ["向量", "图谱"]);
         assert_eq!(match_channels(8, &lists), Vec::<String>::new());
+    }
+
+    // ==================== 词级稀疏召回路（第 9 路，对照 Yuxi BM25 半） ====================
+
+    /// 词级路开关：默认开，`DMS_KB_TERMS=off` 关闭（闸形与图谱路逐字同款）。
+    #[test]
+    fn terms_route_env_gate_defaults_on_and_honors_off() {
+        assert!(terms_route_enabled_env(None), "未配置默认开");
+        assert!(terms_route_enabled_env(Some("on")));
+        assert!(!terms_route_enabled_env(Some("off")));
+        assert!(!terms_route_enabled_env(Some(" OFF ")), "大小写/空白不敏感");
+        assert!(terms_route_enabled_env(Some("0")), "只认 off（与 DMS_KG_RETRIEVAL 同约）");
+    }
+
+    /// 词级路 SQL 的合同：ACL 内联（$1）+ GIN 重叠收口（$2）+ 命中词数门（$3）+ 名额（$4）。
+    /// 排序 = 命中词数降序、chunk_id 决胜 —— 检索结果必须可复现。
+    #[test]
+    fn terms_route_sql_contract() {
+        assert!(TERMS_SQL.contains("c.doc_id = ANY($1::text[])"), "ACL 可见集合必须内联：{TERMS_SQL}");
+        assert!(TERMS_SQL.contains("c.terms && $2::text[]"), "GIN 重叠收口（至少中一词）：{TERMS_SQL}");
+        assert!(TERMS_SQL.contains("WHERE hits >= $3"), "命中词数门走 bind（标定值不写死）：{TERMS_SQL}");
+        assert!(TERMS_SQL.contains("ORDER BY hits DESC, chunk_id LIMIT $4"), "排序与决胜键：{TERMS_SQL}");
+        assert!(TERMS_SQL.contains("q.w = ANY(c.terms)"), "命中词数按「不同问句词」计：{TERMS_SQL}");
+        // 防爆闸只许截查询侧：truncate 必须出现在 terms_ids（查询）而不许碰 terms_of（写读共用）
+        let src = include_str!("retrieve.rs");
+        let body = src.split("async fn terms_ids").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(body.contains("truncate(TERMS_MAX_QUERY_TERMS)"), "查询侧缺防爆闸：{body}");
+        let shared = include_str!("store.rs");
+        let tof = shared.split("pub fn terms_of").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(!tof.contains("truncate"), "写侧词表不许截断（截断 = 召回缺臂）：{tof}");
+    }
+
+    /// 有效门槛：全局门槛与问句词数取小（单词问句不变哑）；词数≥门槛时门槛生效。
+    #[test]
+    fn terms_min_hits_clamps_to_query_term_count() {
+        assert_eq!(terms_min_hits(1), 1, "单词问句恒按 1 收口，与全局门槛无关");
+        assert_eq!(terms_min_hits(5), TERMS_MIN_HITS.min(5));
+        assert_eq!(terms_min_hits(0), 1, "调用方空词表早退，这里只防御不返 0");
+    }
+
+    /// 词级路命中数门的定标数据：2026-08-11 连真库量（kb_eval 主题集夹具 + 4 篇既有真实文档，
+    /// 逐题取「问句词 × 全语料各块命中数」分布；词级路候选经 `词级路候选` debug 日志全量核对）。
+    /// 三元组 = (块, 命中词数, 问句词数)；`true` = 该块该入选（命中数 ≥ 有效门）。
+    ///
+    /// 分离度一句话：判据块最低 2（KB02），远域 nohit 噪声最高 1（KB07）—— 门 2 落在缝里。
+    /// 近域 nohit（KB13）噪声 4 门管不到（同 `VEC_MAX_DIST` 的那条「近域分不出来」），答案层兜。
+    const TERMS_MEASURED: &[(&str, i64, usize, bool)] = &[
+        ("KB07 远域 nohit 最高噪声块（操作手册/品牌专区/体检/通讯，并列 4 块）", 1, 8, false),
+        ("KB13 近域 nohit 最高噪声块（体检尾块 248）—— 近域门管不到，keep_cited_only 兜", 4, 7, true),
+        ("KB02 判据块「发票 15 个工作日」（判据块里最低的）", 2, 4, true),
+        ("KB03 判据块「5000 元总经理审批」", 3, 5, true),
+        ("KB01 判据块「一线城市住宿 500 元/晚」", 4, 5, true),
+        ("KB08 判据块「境外补贴 1250」", 3, 4, true),
+        ("KB09 判据块「五项报销材料」", 4, 5, true),
+        ("KB11 判据块「入职 170 天」（跨块的前一块）", 7, 9, true),
+        ("KB11 判据块「自选 860」（跨块的后一块）", 7, 9, true),
+        ("KB12 判据块「销售岗 430」", 4, 4, true),
+        ("KB15 判据块「线下签字」", 5, 7, true),
+        ("KB16 判据块「通讯补贴四档」", 4, 6, true),
+        ("KB10 判据块「新版 9000」", 3, 7, true),
+        ("KB10 判据块「旧版 4000」", 3, 7, true),
+        // KB06 判据块只有 1 个问句词命中（CSV 表格块）—— 它一向靠向量路兜
+        //（trgm 也只有 0.0714，见 TRGM_MEASURED），词级路收它进来才是噪声门失守
+        ("KB06 判据块（CSV 表格块，词级路本就不该收）", 1, 4, false),
+    ];
+
+    /// 🔴 词级路命中数门必须同时满足两头：收住全部实测判据块、挡住远域 nohit 的噪声。
+    #[test]
+    fn terms_min_hits_matches_the_measured_distribution() {
+        for (what, hits, n_terms, want) in TERMS_MEASURED {
+            assert_eq!(
+                *hits >= terms_min_hits(*n_terms),
+                *want,
+                "{what}：实测命中 {hits}/{n_terms} 与门 {TERMS_MIN_HITS} 的关系变了（改门前先连库重量一遍）"
+            );
+        }
+        // 门只能通过 `$3` 进 SQL —— 写死字面量就没法被上面这张表管住了
+        assert!(TERMS_SQL.contains("WHERE hits >= $3"), "{TERMS_SQL}");
+    }
+
+    /// 🔴 槽位纪律：词级路钉死在第 9 槽，前八槽通道名逐字不变（既有测试钉着前八槽）。
+    #[test]
+    fn terms_route_is_the_ninth_slot_and_keeps_the_first_eight_names() {
+        assert_eq!(CHANNEL_NAMES.len(), 9);
+        assert_eq!(CHANNEL_NAMES[8], "词级");
+        assert_eq!(
+            &CHANNEL_NAMES[..8],
+            ["向量", "精确匹配", "正文相似", "标题", "元数据", "结构关联", "图谱", "外部知识库"]
+        );
+        // 词级路权重与四路正文同一个钉死档（1.0）：正文直接命中，不进 settings 可调区
+        assert_eq!(TERMS_WEIGHT, 1.0);
+        assert_eq!(RrfWeights::default().route_array()[0], TERMS_WEIGHT);
+    }
+
+    /// 词级路为空 = 与接入前**逐字节**等价（A/B 对照的干净基线）；
+    /// 词级路非空时以 1.0 权重进 RRF —— 与向量路同 rank 同分。
+    #[test]
+    fn terms_route_empty_is_byte_equivalent_to_the_original_eight_routes() {
+        let lists8: Vec<Vec<i64>> =
+            vec![vec![1, 2], vec![3], vec![2, 4], vec![], vec![2], vec![5], vec![], vec![-1]];
+        let w8 = RrfWeights::default().route_array();
+        let base = rrf_weighted(&lists8, &w8);
+        let mut lists9 = lists8.clone();
+        lists9.push(Vec::new()); // 词级路缺席（env 关 / 问句分不出词）
+        let mut w9 = [0.0f32; 9];
+        w9[..8].copy_from_slice(&w8);
+        w9[8] = TERMS_WEIGHT;
+        assert_eq!(rrf_weighted(&lists9, &w9), base, "空词级路不许改变任何旧路的融合结果");
+
+        // 词级路命中：与向量路同 rank 同权 → 同分（1.0 钉死档），两路共识者排前
+        let mut lists9 = lists8;
+        lists9.push(vec![2, 9]); // 词级路：2 是 rank1（它同时命中向量 rank2/正文 rank1）
+        let out = rrf_weighted(&lists9, &w9);
+        assert_eq!(out[0].0, 2, "三路共识必须排第一：{out:?}");
+        let terms_only = out.iter().find(|(id, _)| *id == 9).expect("词级命中不能丢");
+        let vec_rank1 = out.iter().find(|(id, _)| *id == 1).unwrap();
+        assert!(
+            (terms_only.1 - TERMS_WEIGHT / (RRF_K + 2.0)).abs() < 1e-6,
+            "词级 rank2 的分必须是 1.0/(60+2)：{terms_only:?}"
+        );
+        assert!((vec_rank1.1 - 1.0 / (RRF_K + 1.0)).abs() < 1e-6);
+    }
+
+    /// 词级命中算**直接命中**：元数据票可以落在它上面（与四路正文同等待遇）。
+    #[test]
+    fn terms_hit_counts_as_a_direct_hit_for_metadata_votes() {
+        let direct: [&Vec<i64>; 5] = [&vec![7], &vec![], &vec![], &vec![], &vec![42]]; // 42 仅词级命中
+        let mut metadata = vec![42, 99];
+        keep_auxiliary_votes_on_direct_hits(&direct, &mut metadata);
+        assert_eq!(metadata, vec![42], "仅词级命中的块仍应被元数据增强；99 无直接命中必须剔");
+    }
+
+    /// 词级路的通道解释性：channels 里能说出「词级」。
+    #[test]
+    fn terms_channel_is_explainable() {
+        let lists = vec![vec![7], vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![7, 8]];
+        assert_eq!(match_channels(7, &lists), ["向量", "词级"]);
+        assert_eq!(match_channels(8, &lists), ["词级"]);
+    }
+
+    /// SearchStats 的第 9 路计数：default 是显式零基线的一部分
+    #[test]
+    fn search_stats_carry_terms_candidates() {
+        let s = SearchStats::default();
+        assert_eq!(s.terms_candidates, 0);
     }
 }
