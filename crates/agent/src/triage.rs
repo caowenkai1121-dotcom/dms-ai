@@ -201,6 +201,38 @@ fn strong_doc_intent(q: &str) -> bool {
     has_noun && ASK_WORDS.iter().any(|w| q.contains(w))
 }
 
+/// 【混合查询】子句级识别（纯函数）：问句切成子句后，至少一条是强文档意图、且至少另有一条
+/// 携带问数信号（时间词/完整业务问句/表名/单号）→ `Some((文档子句, 问数子句))`，调用方两路并行。
+///
+/// 整句级共现**不收**：「合同客户的销售额」的「合同」是限定词不是文档请求（强文档意图的
+/// 名词×询问词判据把它挡在 doc 侧之外）；单句不收：切不出两半的句子维持单路裁决一字不变。
+/// 返回的两半各自拼回完整问法喂给两路 —— 子句原文保留用户措辞，不做改写。
+pub fn hybrid_clauses(question: &str) -> Option<(String, String)> {
+    let clauses: Vec<&str> = question
+        .split(|c: char| matches!(c, '，' | ',' | '；' | ';' | '。' | '？' | '?' | '、' | '\n'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clauses.len() < 2 {
+        return None;
+    }
+    let doc: Vec<&str> = clauses
+        .iter()
+        .copied()
+        .filter(|c| strong_doc_intent(c))
+        .collect();
+    // 文档子句不许同时进问数半（「报销政策是什么」可能被完整问句判据认领）——两半必须互斥
+    let data: Vec<&str> = clauses
+        .iter()
+        .copied()
+        .filter(|c| !strong_doc_intent(c) && question_data_hit(c))
+        .collect();
+    if doc.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((doc.join("；"), data.join("；")))
+}
+
 /// 完整业务分析问句的零 IO 判据。它只确认“对象 + 查询目标”已经齐全，不替代指标召回，
 /// 也不负责生成 SQL；`ask::need_intent_reply` 与分诊共用，避免两处对同一句话作出相反判断。
 pub fn analytical_question_hit(question: &str) -> bool {
@@ -496,6 +528,28 @@ mod tests {
     fn neither_hit_is_undecided() {
         assert_eq!(rule_intent("你好", false, false), None);
         assert_eq!(rule_intent("帮我看看那个东西", false, false), None);
+    }
+
+    /// 混合查询识别（子句级）：文档半 × 问数半都成立才两路并行；
+    /// 整句共现/单句/纯问数/纯文档一律不收（维持单路裁决）。
+    #[test]
+    fn hybrid_clauses_split_only_when_both_halves_present() {
+        assert_eq!(
+            super::hybrid_clauses("市场费用的报销政策是什么，本月市场费用花了多少"),
+            Some(("市场费用的报销政策是什么".to_string(), "本月市场费用花了多少".to_string()))
+        );
+        assert_eq!(
+            super::hybrid_clauses("退货流程怎么走？本月退货金额是多少"),
+            Some(("退货流程怎么走".to_string(), "本月退货金额是多少".to_string()))
+        );
+        // 单句不收（强文档意图单句照旧走 Knowledge 单路）
+        assert_eq!(super::hybrid_clauses("市场费用的报销政策是什么"), None);
+        // 限定词里的文档名词不算文档半（「合同」是客户的限定，不是要查文档）
+        assert_eq!(super::hybrid_clauses("合同客户的销售额是多少，本月订单数"), None);
+        // 纯问数多子句不收（那是 compound 的地盘）
+        assert_eq!(super::hybrid_clauses("本月销售额，上月销售额"), None);
+        // 纯文档多子句不收
+        assert_eq!(super::hybrid_clauses("报销政策是什么，差旅标准有哪些"), None);
     }
 
     /// forced 覆盖规则：前端 chip 选了知识库，问句再像问数也走知识库。

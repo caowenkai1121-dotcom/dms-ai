@@ -70,6 +70,9 @@ interface AskResult {
   /** 意图不明时后端给的候选问法（chip 与「换个维度看」同款，点击 = 把 question 原样发出）。
    *  字段缺席 = 现状不变（老服务端不带这个键也不崩）。 */
   clarify_options?: { label: string; question: string }[]
+  /** 【混合查询】问数结果携带的知识库答案（自动模式「文档+取数」双半问句两路并行）；
+   *  老服务端不带这个键 = 纯问数，渲染分支不出现。AI 综合落在 `view.insight`。 */
+  kb?: AskResult
   scope_note?: string
   trust?: {
     level: 'verified' | 'high' | 'review'; trace_id: string; source: string; route: string
@@ -3038,6 +3041,23 @@ function exportSupplementalCsv(t: Turn) {
               </template>
               <!-- 单结果 -->
               <ResultPanel v-else-if="!t.page" :result="t.result" @drill="(d: string) => drill(d, t.question || '', t.convId)" @pick="(q: string) => send(q, { targetConvId: t.convId })" />
+
+              <!-- 【混合查询】数据面板之下挂知识库回答（两路并行那一路的产物） -->
+              <div v-if="t.result?.kb" class="ai-panel hybrid-kb-panel">
+                <div class="ai-hd"><span class="ai-mark">📚</span> 知识库资料<span class="ai-hint">同一问题的资料侧回答</span></div>
+                <KbAnswer
+                  :result="knowledgePresentation(t.result.kb)"
+                  :token="sessionToken"
+                  :login="loginName"
+                  :trace-id="t.result.kb.trace_id"
+                  @auth-expired="handleSessionExpired"
+                />
+              </div>
+              <!-- 混合查询的 AI 综合（数据 + 资料两段结论合一），位置与复合汇总同规 -->
+              <div v-if="t.result?.kb && t.result.view?.insight" class="ai-panel deep-insight">
+                <div class="ai-hd"><span class="ai-mark">AI</span> 综合分析<span class="ai-hint">基于上方数据与资料，聚焦关联与行动</span></div>
+                <KbAnswer :result="{ markdown: userFacingMarkdown(t.result.view.insight) }" />
+              </div>
 
               <!-- 所有深度/复合数据渲染完成后，AI 分析统一收尾。 -->
               <div v-if="t.page?.insight" class="ai-panel deep-insight">

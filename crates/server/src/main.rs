@@ -2043,6 +2043,18 @@ async fn ask_data_payload(
     req: &AskReq,
     gate: &AskGate,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let r = ask_data_run(st, req, gate, &req.question).await?;
+    Ok(serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"))
+}
+
+/// 问数半的执行体（`AskResult` 本体，未序列化）：`ask_data_payload` 与混合查询编排共用，
+/// 错误映射（403 无权 / 422 问数失败）只有这一份。
+async fn ask_data_run(
+    st: &AppState,
+    req: &AskReq,
+    gate: &AskGate,
+    question: &str,
+) -> Result<dms_agent::AskResult, (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
     let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
     let (r, _log) = ask(
@@ -2053,7 +2065,7 @@ async fn ask_data_payload(
         st.owned.pool(),
         &st.embed,
         &gate.p,
-        &req.question,
+        question,
         gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice())),
         req.ds.as_deref(),
         // 会话 id 透传到 `query_log` 与三张日志表 —— `chat.rs` 的亏就是
@@ -2079,7 +2091,43 @@ async fn ask_data_payload(
             )
         }
     })?;
-    Ok(serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"))
+    Ok(r)
+}
+
+/// 【混合查询】问数 + 知识库两路并行（`tokio::join!` 总耗时 = 两路较大者，不相加），
+/// AI 综合落 `view.insight`、知识库答案落 `kb` 键（老前端 serde 兼容：多出的键被忽略）。
+/// 一路挂了不拖死另一路：退化为单路答案（warn 留痕），与复合子问「失败不算整体失败」同族。
+async fn hybrid_payload(
+    st: &AppState,
+    req: &AskReq,
+    gate: &AskGate,
+    kb_q: &str,
+    data_q: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let data = ask_data_run(st, req, gate, data_q);
+    let kb = kb_answer(st, &gate.p, req.space_id.as_deref(), kb_q);
+    let (data_r, kb_r) = tokio::join!(data, kb);
+    match (data_r, kb_r) {
+        (Ok(r), Ok(a)) => {
+            let summary = dms_agent::compound::hybrid_summary(&st.llm, &req.question, &r, &a).await;
+            let mut v =
+                serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+            if let Some(s) = summary {
+                v["view"]["insight"] = serde_json::json!(s);
+            }
+            v["kb"] = serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+            Ok(v)
+        }
+        (Ok(r), Err(e)) => {
+            tracing::warn!(err = %e, question = %req.question, "混合查询知识库路失败 → 退化纯问数");
+            Ok(serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"))
+        }
+        (Err(_), Ok(a)) => {
+            tracing::warn!(question = %req.question, "混合查询问数路失败 → 退化纯知识库");
+            Ok(serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败"))
+        }
+        (Err(e), Err(_)) => Err(e),
+    }
 }
 
 /// 存会话消息（用户问 + AI 结果），首问顺手设标题。失败 warn 留痕后吞掉：
@@ -2097,6 +2145,15 @@ async fn api_ask(
     Json(req): Json<AskReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let gate = ask_gate(&st, &headers, &req).await?;
+    // 【混合查询】自动模式（未点「问数/知识库」chip）且问句横跨「文档 + 取数」两半时：
+    // 两路并行 + AI 综合（`hybrid_payload`），不再二选一丢掉另一半。
+    if req.intent.is_none() {
+        if let Some((kb_q, data_q)) = triage::hybrid_clauses(&req.question) {
+            let payload = hybrid_payload(&st, &req, &gate, &kb_q, &data_q).await?;
+            ask_persist(&st, req.conv_id, &req.question, &payload).await;
+            return Ok(Json(payload));
+        }
+    }
     // 【K5】意图分诊。`ds` 用主源：判据只读 `meta.metric/dimension/term`（谓词 `IN (ds,'*')`），
     // 而选源发生在 `dms_agent::ask` 内部——分诊只决定「问数还是查文档」，不决定问哪个源。
     // 分诊不会失败（内部一律降级 Data），故这里没有 `?`：存量问数链路一步不变。
@@ -2135,6 +2192,15 @@ async fn api_ask_stream(
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     use axum::response::IntoResponse;
     let gate = ask_gate(&st, &headers, &req).await?;
+    // 【混合查询】与 `/api/ask` 同一判据：命中即回普通 JSON（前端按 handleSync 处理，
+    // 与 Data 臂同一个传输约定，SSE 协议一字不动）。
+    if req.intent.is_none() {
+        if let Some((kb_q, data_q)) = triage::hybrid_clauses(&req.question) {
+            let payload = hybrid_payload(&st, &req, &gate, &kb_q, &data_q).await?;
+            ask_persist(&st, req.conv_id, &req.question, &payload).await;
+            return Ok(Json(payload).into_response());
+        }
+    }
     let intent =
         triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &req.question, req.intent.as_deref())
             .await;

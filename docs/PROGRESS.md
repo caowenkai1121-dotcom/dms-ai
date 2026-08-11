@@ -2023,3 +2023,26 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
 - 验证：workspace 1742/1742 全绿（新增钉板：`customer_name_fragment_keeps_inner_chars`、
   `derive_pool_winc_guard_drops_report_tables_unless_asked`，9 处旧钉板按 COALESCE 新形
   同步）；20 个 SQL 金文件按新表达式重 bless。
+
+## AX106（2026-08-11，自动模式混合查询：KB+问数并行 → AI 综合）
+「报销政策是什么，本月费用花了多少」这类横跨文档与取数的问句，过去二选一必丢一半
+（强文档意图翻 KB 丢数据半，both-hit 归 Data 丢政策半）。本轮把混合查询落到自动模式：
+- **识别（纯函数零成本）**：`triage::hybrid_clauses` 子句级判据 —— 至少一条子句是强文档
+  意图（文档名词×询问词共现，与 both-hit 翻 KB 同一份词表）且至少另有一条带问数信号
+  （时间词/完整业务问句/表名/单号），两半互斥。整句共现不收（「合同客户的销售额」的
+  「合同」是限定词）、单句不收、纯问数多子句不收（那是 compound 的地盘）、显式 chip
+  （问数/知识库）不收 —— 存量单路裁决一字不变。钉板 5 组。
+- **编排（server）**：`api_ask` / `api/ask/stream` 在分诊前先过 hybrid 判据，命中则
+  `tokio::join!` 并行问数（`ask_data_run`，从 `ask_data_payload` 拆出的执行体，错误映射
+  403/422 仍一份）与知识库（`kb_answer`）；一路挂退化为另一路单路答案（warn 留痕），
+  两路都挂才报错。SSE 端回普通 JSON，前端 handleSync 既有通道零改动。
+- **AI 综合**：`compound::hybrid_summary`（与复合汇总同一份 `insight::fast_guarded` 降级、
+  同一条 `wrap_untrusted` I5 边界）：数据简报 + KB 正文（截 1200 字）→ fast LLM 2-3 句
+  「先数据结论、再资料口径」；失败 None 不塌双路结果。
+- **wire/前端**：AskResult 序列化后挂 `kb` 键（Answer 原样）+ 综合落 `view.insight`
+  （老前端忽略多出的键，serde 兼容）；App.vue 数据面板下新增「知识库资料」卡
+  （KbAnswer 复用，带角标/来源）+「AI 综合分析」面板。xcx 端暂走单路（已知边界）。
+- 实测「市场费用的报销政策是什么，本月市场费用花了多少」：数据 366,097.18（direct-agg
+  市场费用口径）+ 政策资料带 [^3] 引用 + 综合「本月市场费用为 366,097.18 元。根据知识库
+  资料，线下市场费用报销自 2026 年起需统一通过 DMS…」一段正确。workspace 1743 全绿，
+  vue-tsc 0 错误。
