@@ -1663,9 +1663,10 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
           continue
         }
         if (isTerminalIngest(data)) {
-          // 终态（同步处理完/失败/带降级文案的 chunked）：按原口径落行
+          // 终态（同步处理完/失败/带降级文案的 chunked）：按原口径落行；同名覆盖带「已覆盖旧版本」
+          const coverNote = data.replaced ? ' · 已覆盖旧版本' : ''
           updateUpload(rowId, {
-            state: uploadState(String(data.status ?? '')), msg: ingestOutcomeText(data),
+            state: uploadState(String(data.status ?? '')), msg: ingestOutcomeText(data) + coverNote,
             ds: data.datasource ?? null, progress: null, phase: undefined,
           })
         } else {

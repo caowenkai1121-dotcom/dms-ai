@@ -11,7 +11,9 @@ type FileKind = 'image' | 'pdf' | 'csv' | 'markdown' | 'json' | 'text' | 'html' 
 /** 目录条目（renderMarkdown 顺手收集，供目录跳转）。 */
 interface TocEntry { id: string; level: number; text: string }
 
-const props = defineProps<{ token?: string; docId: string; docName: string; mime?: string }>()
+// initialPage：引用带进来的命中页码，仅 pdf 类预览（pdf 原件 / office 转换版 PDF，
+// 两者页码一致）在加载时直挂 #page=N；txt/md/csv/图片等非 pdf 类忽略。
+const props = defineProps<{ token?: string; docId: string; docName: string; mime?: string; initialPage?: number }>()
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'auth-expired'): void
@@ -45,6 +47,12 @@ const downloading = ref(false)
 const downloadErr = ref('')
 const dialogEl = ref<HTMLElement | null>(null)
 let previewEpoch = 0
+
+/** 入口页码归一化：只认正整数页（0/负数/小数/缺省都按「不跳页」）。 */
+const initialPdfPage = computed(() => {
+  const page = props.initialPage
+  return typeof page === 'number' && Number.isInteger(page) && page > 0 ? page : 0
+})
 
 // 错误文案以服务端 `{"error": msg}` 为准（404「原始文件已不存在」与「暂无解析文本」是两种病，
 // 笼统的「接口暂不可用」会把用户引到错的等待上）
@@ -249,6 +257,8 @@ async function loadFile() {
       if (epoch !== previewEpoch) return
       embedLoading.value = true
       fileUrl.value = directFileUrl(ticket)
+      // 引用跳页：与 jumpToPdfPage 同机制（iframe :key=pdfFrag），直链 + #page=N 一次到位
+      if (kind === 'pdf' && initialPdfPage.value) pdfFrag.value = `#page=${initialPdfPage.value}`
       // 个别浏览器的内嵌 PDF 查看器不触发 iframe load：兜底撤 loading，不能把人锁在加载页
       window.setTimeout(() => { if (epoch === previewEpoch) embedLoading.value = false }, 8000)
       return
@@ -262,7 +272,8 @@ async function loadFile() {
         const probe = await fetch(directFileUrl(ticket, true), { headers: { Range: 'bytes=0-0' } })
         if (epoch !== previewEpoch) return
         if (probe.status === 206) {
-          officePdfUrl.value = directFileUrl(ticket, true)
+          // office 转换版 PDF 的页码与原件一致：引用页码同样直挂 #page=N
+          officePdfUrl.value = directFileUrl(ticket, true) + (initialPdfPage.value ? `#page=${initialPdfPage.value}` : '')
           return
         }
       } catch { /* 票据/探测失败都按转换不可用处理 */ }

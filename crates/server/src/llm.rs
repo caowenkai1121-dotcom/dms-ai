@@ -327,6 +327,80 @@ impl LlmClient {
         Ok((text, read_usage(&v["usage"])))
     }
 
+    /// `chat_with_conf` 的流式变体（KB 流式问答）：同一条 `/chat/completions`，body 只多
+    /// `stream`/`stream_options` 两键。增量（剥思考段**之前**的原文）边收边推 `on_delta` ——
+    /// 仅供预览；返回的累计全文仍过 `strip_thinking`，content 口径与非流式逐字一致。
+    /// 吞错纪律同款：reqwest/serde 真因只进 tracing，错误链保持笼统文案。
+    async fn chat_stream_with_conf(
+        &self,
+        c: &Conf,
+        model: &str,
+        system: &str,
+        user: &str,
+        on_delta: &mut (dyn FnMut(&str) + Send),
+    ) -> anyhow::Result<(String, dms_kernel::llm::Usage)> {
+        let body = build_stream_body(model, system, user, &c.extra);
+        let mut resp = self
+            .http
+            .post(format!("{}/chat/completions", c.base_url))
+            .bearer_auth(&c.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(err = %e, "LLM 流式请求发送失败");
+                anyhow::anyhow!("LLM 请求失败")
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, body = %detail.chars().take(512).collect::<String>(), "LLM 流式非 2xx 响应");
+            anyhow::bail!("LLM 请求失败（HTTP {status}）");
+        }
+        let mut lines = SseLines::default();
+        let mut full = String::new();
+        let mut usage = dms_kernel::llm::Usage::default();
+        let mut take = |line: String,
+                        full: &mut String,
+                        usage: &mut dms_kernel::llm::Usage|
+         -> anyhow::Result<()> {
+            match parse_stream_line(&line) {
+                StreamLine::Delta(piece) => {
+                    full.push_str(&piece);
+                    if full.len() > MAX_LLM_RESPONSE_BYTES {
+                        anyhow::bail!("LLM 响应格式无效");
+                    }
+                    on_delta(&piece);
+                }
+                StreamLine::Usage(u) => *usage = u,
+                StreamLine::Done | StreamLine::Ignore => {}
+            }
+            Ok(())
+        };
+        loop {
+            let Some(chunk) = resp.chunk().await.map_err(|e| {
+                tracing::warn!(err = %e, "LLM 流式响应读取失败");
+                anyhow::anyhow!("LLM 响应格式无效")
+            })?
+            else {
+                break;
+            };
+            for line in lines.feed(&chunk)? {
+                take(line, &mut full, &mut usage)?;
+            }
+        }
+        // 流尾残余（无换行收尾的最后一行）同样过一解析
+        if let Some(line) = lines.finish() {
+            take(line, &mut full, &mut usage)?;
+        }
+        // 与 `content_text` 同一条判据：剥完思考段只剩空白 = 无内容
+        let text = strip_thinking(&full);
+        if text.is_empty() {
+            anyhow::bail!("LLM 响应缺 content");
+        }
+        Ok((text, usage))
+    }
+
     /// OpenAI-compatible 多模态调用的统一出口。图片/OCR/企微拍照都应调用本方法，
     /// 不能自己猜 qwen 或复制 key。`image_url` 支持 data URL 与 https URL。
     pub async fn vision_chat(
@@ -626,6 +700,106 @@ fn build_body(
     body
 }
 
+/// 流式请求体 = `build_body` + 两个流式键（`stream` 是 extra 的 forbidden 键，
+/// `stream_options` 在 extra 之后写死 —— 配置面无论如何关不掉/抢不走流式）。
+/// `include_usage`：OpenAI/DeepSeek/千问兼容端点都在末块回 usage，拿不到时记 0 不报错
+/// （与 `read_usage` 的缺段纪律同款；观测缺一格不把问答变失败）。
+fn build_stream_body(
+    model: &str,
+    system: &str,
+    user: &str,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = build_body(model, system, user, extra);
+    if let Some(o) = body.as_object_mut() {
+        o.insert("stream".to_string(), serde_json::Value::Bool(true));
+        o.insert(
+            "stream_options".to_string(),
+            serde_json::json!({ "include_usage": true }),
+        );
+    }
+    body
+}
+
+/// OpenAI 兼容流式响应的一行解析结果（纯函数，形态由判据测试钉死）。
+#[derive(Debug, PartialEq, Eq)]
+enum StreamLine {
+    /// `data: [DONE]` —— 流正常收尾
+    Done,
+    /// `data: {...}` 里的正文增量（`choices[0].delta.content`）
+    Delta(String),
+    /// 末块携带的用量（`usage` 对象）；与正文增量同块时**增量优先**（见 parse_stream_line）
+    Usage(dms_kernel::llm::Usage),
+    /// 空行 / `event:` / 注释 / 无增量块 / 半行坏 JSON：跳过（流式解析纪律 = 容错向前）
+    Ignore,
+}
+
+/// 解析单行。只认 `data:` 前缀；`data.trim()` 一并吃掉 `\r\n` 尾巴与 OWS。
+fn parse_stream_line(line: &str) -> StreamLine {
+    let Some(data) = line.strip_prefix("data:") else {
+        return StreamLine::Ignore;
+    };
+    let data = data.trim();
+    if data.is_empty() {
+        return StreamLine::Ignore;
+    }
+    if data == "[DONE]" {
+        return StreamLine::Done;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+        return StreamLine::Ignore;
+    };
+    // 增量优先于 usage：正常供应商不同块，真同块时丢用量只是观测缺格，丢正文是答案缺字
+    if let Some(piece) = v["choices"][0]["delta"]["content"].as_str() {
+        if !piece.is_empty() {
+            return StreamLine::Delta(piece.to_string());
+        }
+    }
+    if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+        return StreamLine::Usage(read_usage(u));
+    }
+    StreamLine::Ignore
+}
+
+/// SSE 行装配器：喂字节块，吐出完整行（跨块半行留缓冲）。
+/// 按 `\n`（0x0A）切安全：UTF-8 多字节序列的字节都 ≥0x80，绝不等于 0x0A ——
+/// 中文跨块切开不会污染行边界（判据测试钉这条）。
+#[derive(Default)]
+struct SseLines {
+    buf: Vec<u8>,
+}
+
+impl SseLines {
+    fn feed(&mut self, chunk: &[u8]) -> anyhow::Result<Vec<String>> {
+        self.buf.extend_from_slice(chunk);
+        // 无换行洪泛闸：上游/代理回一条永不换行的流时，缓冲不许无界涨
+        if self.buf.len() > MAX_LLM_RESPONSE_BYTES {
+            anyhow::bail!("LLM 响应格式无效");
+        }
+        let mut out = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..pos).collect();
+            self.buf.drain(..1); // 吃掉 \n 本身
+            // 完整行必是完整 UTF-8（见上）；真收到非法字节跳过该行，不炸整条流
+            if let Ok(s) = std::str::from_utf8(&line) {
+                out.push(s.strip_suffix('\r').unwrap_or(s).to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// 流尾残余（供应商没以换行收尾的最后一行）；空缓冲 = None
+    fn finish(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let rest = std::mem::take(&mut self.buf);
+        std::str::from_utf8(&rest)
+            .ok()
+            .map(|s| s.strip_suffix('\r').unwrap_or(s).to_string())
+    }
+}
+
 /// 从 OpenAI 兼容响应里取正文：缺 content、或剥完思考段只剩空白，都按「无内容」处理。
 /// 文本与视觉两条出口同一判据 —— 空串不该一路流到 `extract_sql` 才变成「无 SQL」。
 fn content_text(v: &serde_json::Value) -> Option<String> {
@@ -671,6 +845,29 @@ impl dms_kernel::ChatModel for LlmClient {
             let (system, user) = split_roles(&req.messages);
             let (content, usage) = self
                 .chat_with_conf(&c, &model, &system, &user)
+                .await
+                .map_err(|e| dms_kernel::LlmError::Transport(e.to_string()))?;
+            Ok(dms_kernel::ChatReply { content: Some(content), usage })
+        })
+    }
+
+    /// 流式覆盖（KB 流式问答）：真 SSE 边收边推 `on_delta`（剥思考段前的原文预览）。
+    /// content/usage 语义与 `chat` 逐字一致 —— 最终全文过同一条 `strip_thinking`，
+    /// 供应商末块不回 usage 时记 0（`stream_options.include_usage` 已请求，不回不报错）。
+    fn chat_stream<'a>(
+        &'a self,
+        req: dms_kernel::ChatRequest,
+        mut on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> dms_kernel::BoxFut<'a, Result<dms_kernel::ChatReply, dms_kernel::LlmError>> {
+        Box::pin(async move {
+            let c = self.conf();
+            let model = match req.tier {
+                dms_kernel::ModelTier::Fast => c.model_fast.clone(),
+                dms_kernel::ModelTier::Precise => c.model_precise.clone(),
+            };
+            let (system, user) = split_roles(&req.messages);
+            let (content, usage) = self
+                .chat_stream_with_conf(&c, &model, &system, &user, &mut *on_delta)
                 .await
                 .map_err(|e| dms_kernel::LlmError::Transport(e.to_string()))?;
             Ok(dms_kernel::ChatReply { content: Some(content), usage })
@@ -809,6 +1006,73 @@ mod tests {
         let mut ok = serde_json::Map::new();
         ok.insert("enable_thinking".into(), serde_json::Value::Bool(false));
         let _ = LlmClient::with_extra("http://x", "k", "f", "p", ok);
+    }
+
+    // ---------------- 流式（K2 流式问答）----------------
+
+    /// 流式 body = 非流式三键 + stream/stream_options；extra 照常合并，
+    /// 且 extra 抢不走流式开关（`stream` 本就在 forbidden 名单，`stream_options` 后写死）。
+    #[test]
+    fn stream_body_adds_stream_keys_on_top_of_build_body() {
+        let mut e = serde_json::Map::new();
+        e.insert("enable_thinking".into(), serde_json::Value::Bool(false));
+        let got = build_stream_body("m1", "sys", "usr", &e);
+        assert_eq!(got["stream"], serde_json::json!(true));
+        assert_eq!(got["stream_options"], serde_json::json!({ "include_usage": true }));
+        assert_eq!(got["model"], "m1");
+        assert_eq!(got["enable_thinking"], serde_json::json!(false));
+        assert_eq!(got["messages"][0]["content"], "sys");
+    }
+
+    /// 行解析形态钉死：增量 / [DONE] / usage / 该跳过的（空行、event:、注释、半行坏 JSON、
+    /// 无 content 的角色块）。增量与 usage 同块时增量优先（丢用量只是观测缺格，丢正文是答案缺字）。
+    #[test]
+    fn parse_stream_line_shapes() {
+        assert_eq!(
+            parse_stream_line("data: {\"choices\":[{\"delta\":{\"content\":\"报销\"}}]}"),
+            StreamLine::Delta("报销".into())
+        );
+        assert_eq!(parse_stream_line("data: [DONE]"), StreamLine::Done);
+        // CRLF 尾巴 / OWS 都吃掉
+        assert_eq!(parse_stream_line("data:[DONE]\r"), StreamLine::Done);
+        assert_eq!(
+            parse_stream_line("data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3},\"choices\":[]}"),
+            StreamLine::Usage(dms_kernel::llm::Usage { prompt_tokens: 7, completion_tokens: 3 })
+        );
+        // 增量与 usage 同块：增量赢
+        assert_eq!(
+            parse_stream_line(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}],\"usage\":{\"prompt_tokens\":1}}"
+            ),
+            StreamLine::Delta("x".into())
+        );
+        for ignored in [
+            "",
+            "event: message",
+            ": ping",
+            "data:",
+            "data: {not json",
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}",
+        ] {
+            assert_eq!(parse_stream_line(ignored), StreamLine::Ignore, "该行该跳过：{ignored:?}");
+        }
+    }
+
+    /// 行装配边界：一条事件跨多块、一块多行、CRLF、流尾无换行、
+    /// 中文字符跨块切开（\n 切分不受多字节影响）。
+    #[test]
+    fn sse_lines_split_across_chunks() {
+        let mut lines = SseLines::default();
+        // 中文「报」= E6 8A A5，故意从中间切开喂
+        assert_eq!(lines.feed(b"data: {\"a\":\"\xE6").unwrap(), Vec::<String>::new());
+        assert_eq!(lines.feed(b"\x8A\xA5\"}\r\nda").unwrap(), vec!["data: {\"a\":\"报\"}".to_string()]);
+        assert_eq!(lines.feed(b"ta: 1\ndata: 2\n").unwrap(), vec!["data: 1".to_string(), "data: 2".to_string()]);
+        assert_eq!(lines.finish(), None);
+        // 流尾残余（无换行收尾）
+        assert_eq!(lines.feed(b"data: tail").unwrap(), Vec::<String>::new());
+        assert_eq!(lines.finish(), Some("data: tail".to_string()));
+        assert_eq!(lines.finish(), None, "残余只吐一次");
     }
 
     /// 【双供应商】热切换：下一次调用用新配置（保存即生效）；forbidden 键在运行时

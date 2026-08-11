@@ -68,17 +68,17 @@ pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
          "",
          "【ODS 申请退款口径，需明确退款定义】当前为 dms_ods.t_after_sales_order_header.refund_amount 申请退款额；不是 actual_refund_amount 实际退款额，也不是实退入库金额。三类事件尚无已验收的统一 DWS/ADS 等价公式；默认销售事实已含退货负数，禁止再次从销售额冲减", ""),
         ("stock_qty", "库存量", &["库存数量", "存货量", "库存"],
-         "t_winc_stock_report", "SUM(stock_quantity)",
-         "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)",
+         "scm_warehous_manage", "SUM(in_stock_quantity)",
+         "inventory_status = 'ZP'",
          "",
          "",
-         "【ODS 库存快照口径】物理来源 dms_ods.t_winc_stock_report；必须取 product_stock_date 全表最大日期，直接 SUM 多天会把库存虚增几十倍。当前库存 DWS 等价资产及同日重复版本规则均未验收，不能用其他相似库存表 fallback", ""),
+         "【中台库存口径】物理来源 ywzt_ods.scm_warehous_manage（业务中台 WMS 现行库存，2026-08-11 用户指定）。默认且只计 inventory_status='ZP' 正品在库数量；残损/报损/调出/过期/临期/滞销各状态须用户点名才计。actual_quantity（实际数量）与在库差着锁定/冻结/在途，不许混称。现行表无快照时间轴，同比/环比不可算；本表无金额列，库存金额不许从本表推算；门店/经销商进销存口径请用 t_winc_stock_report", ""),
         ("stock_amount", "库存金额", &["库存额", "存货金额", "库存价值"],
          "t_winc_stock_report", "SUM(stock_amount)",
          "product_stock_date = (SELECT MAX(product_stock_date) FROM t_winc_stock_report)",
          "",
          "",
-         "【ODS 库存快照口径】物理来源 dms_ods.t_winc_stock_report；必须取 product_stock_date 全表最大日期，禁止跨日期累加。当前库存 DWS 等价资产及同日重复版本规则均未验收，不能用应收、订单额或其他库存表替代", ""),
+         "【营销通门店进销存金额口径】物理来源 dms_ods.t_winc_stock_report（门店/经销商侧，非公司仓库存价值——中台库存表 scm_warehous_manage 无金额列，公司总库存价值未接入）；必须取 product_stock_date 全表最大日期，禁止跨日期累加", ""),
         // 「赠品箱数」与上面的销量**只差一个码值**（item_type '2' vs '1'），来源/聚合/去重键
         // /时间列逐字相同 —— 与 GOODS14 的 gold 结构完全一致。补成指标之前它是「① 指标不命中」，
         // 整题只能交 LLM，实测答 75,840 而 gold 是 127,211。

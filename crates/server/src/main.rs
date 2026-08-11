@@ -1357,6 +1357,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/wework/login", get(api_wework_login))
         .route("/api/session/role", post(api_session_role))
         .route("/api/ask", post(api_ask))
+        // 【SSE 流式】KB 问答边生成边推（分诊落 Data 时回普通 JSON，与 /api/ask 同 wire）
+        .route("/api/ask/stream", post(api_ask_stream))
         // 【S1】可信结果反馈 + 管理员质量控制面。反馈只绑定本人 trace，统计在 PG 内聚合。
         .route("/api/feedback", post(quality_api::feedback))
         .route("/api/admin/quality", get(quality_api::quality))
@@ -1450,6 +1452,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/kb/doc/{id}/metadata", post(kb_api::update_doc_metadata))
         // 【K2】问答 + 引用原文回查。ACL 都在 knowledge 侧的 SQL 里，这里只接线。
         .route("/api/kb/ask", post(kb_api::ask))
+        // 【SSE 流式】ask 的流式变体（事件协议见 kb_api「SSE 流式问答」段头注）
+        .route("/api/kb/ask/stream", post(kb_api::ask_stream))
         .route("/api/kb/search", post(kb_api::search))
         .route("/api/kb/chunk/{id}", get(kb_api::chunk))
         .route("/api/kb/sample-questions", get(usage_api::sample_questions))
@@ -1521,6 +1525,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/mcp", post(mcp_api::mcp))
         // 【小程序接入】x-access-token 桥接校验 + 问答（契约见 xcx_api.rs 文件头）
         .route("/api/xcx/ask", post(xcx_api::ask))
+        // 【小程序流式】KB 问答 SSE（分诊落 Data 时回普通 JSON，与 /api/xcx/ask 同协议）
+        .route("/api/xcx/ask/stream", post(xcx_api::ask_stream))
         .route("/api/xcx/me", get(xcx_api::me))
         .with_state(state);
 
@@ -1985,13 +1991,25 @@ async fn api_suggest(
     Ok(Json(serde_json::json!({ "suggestions": qs })))
 }
 
-async fn api_ask(
-    State(st): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<AskReq>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+/// `/api/ask` 与 `/api/ask/stream` 共用的前段：认证 → Principal → 会话属主 → 上一轮 →
+/// refs。两条端点在这些判定上必须逐字同语义 —— 同一处代码，不是两份会漂的拷贝。
+struct AskGate {
+    p: principal::Principal,
+    /// 多轮追问改写用的上一轮 (问句, 那一轮执行的 SQL)（同会话）。
+    /// 取不到就当首问（不失败）；但**必须留痕**：静默丢上下文的症状是「追问答得像换了
+    /// 个问题」，用户看不出、日志里也查不到（AS5 审计条目）。降级可接受，不可见不行。
+    prev: Option<(String, Option<String>)>,
+    /// 【证据引用】追问携带的上轮结果片段（截断/剥控制字符/段数上限在 agent 侧收口）。
+    refs: Vec<String>,
+}
+
+async fn ask_gate(
+    st: &AppState,
+    headers: &axum::http::HeaderMap,
+    req: &AskReq,
+) -> Result<AskGate, (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
-    let (login_name, role_code) = resolve_identity(&st, &headers, &req.login_name, &req.role_code)
+    let (login_name, role_code) = resolve_identity(&st, headers, &req.login_name, &req.role_code)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name".into()))?;
     let p = principal::load_principal(&st.auth_mysql, &login_name, role_code.as_deref())
         .await
@@ -2001,10 +2019,6 @@ async fn api_ask(
     if let Some(cid) = req.conv_id {
         chat::ensure_owner(st.owned.pool(), cid, &login_name).await?;
     }
-    // 多轮追问改写用的上一轮 (问句, 那一轮执行的 SQL)（同会话）。
-    // SQL 那一半是新加的载荷：上一轮的口径（哪张表/哪个时间列/哪个过滤）只在 SQL 里。
-    // 取不到就当首问（不失败）；但**必须留痕**：静默丢上下文的症状是「追问答得像换了个问题」，
-    // 用户看不出、日志里也查不到（AS5 审计条目）。降级可接受，不可见不行。
     let prev = match req.conv_id {
         Some(cid) => chat::last_turn(st.owned.pool(), cid)
             .await
@@ -2018,8 +2032,71 @@ async fn api_ask(
     // 【证据引用】追问携带的上轮结果片段，打包进 `PrevTurn` 第三位随改写透传。
     // 没有上一轮（首问/新会话）时引用无处附着，随 `prev = None` 一起不落 ——
     // 「上轮结果引用」本就以上轮为前提，这是刻意而不是丢数据。
-    // 截断/剥控制字符/段数上限都在 agent 侧收口（`refs_section_of`），这里只透传原文。
-    let refs: Vec<&str> = req.refs.as_deref().unwrap_or(&[]).iter().map(String::as_str).collect();
+    let refs: Vec<String> = req.refs.clone().unwrap_or_default();
+    Ok(AskGate { p, prev, refs })
+}
+
+/// `/api/ask` 与 `/api/ask/stream` 共用的问数分支：`crate::ask` → 错误映射 → payload。
+/// 「无权访问数据源」是权限拒绝 → 403，其余 422（与迁移前逐字一致）。
+async fn ask_data_payload(
+    st: &AppState,
+    req: &AskReq,
+    gate: &AskGate,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
+    let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
+    let (r, _log) = ask(
+        &st.llm,
+        &st.auth_mysql,
+        &st.mysql,
+        &st.sources,
+        st.owned.pool(),
+        &st.embed,
+        &gate.p,
+        &req.question,
+        gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice())),
+        req.ds.as_deref(),
+        // 会话 id 透传到 `query_log` 与三张日志表 —— `chat.rs` 的亏就是
+        // 「query_log 当年没有 conv_id，从它拿不回本会话上一轮」
+        req.conv_id.map(|c| c.to_string()).as_deref(),
+        // 【深度模式】SC 抬到 ≥3：多数派投票是现成的「AI 深度参与生成」件
+        //（配置 sc_samples 已 ≥3 时不降 —— max 不是 overwrite）
+        if req.mode.as_deref() == Some("deep") { st.sc_samples.max(3) } else { st.sc_samples },
+    )
+    .await;
+    // 服务侧 fire-and-forget：`_log` 句柄直接丢弃，HTTP 主链路一个 `.await` 都不多
+    let r = r
+    // 「无权访问数据源」是权限拒绝，必须 403 而不是 422：前者前端提示「联系管理员授权」，
+    // 后者会被当成「这个问题问不出来」，用户永远不知道是权限问题。
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("无权访问数据源") {
+            err(StatusCode::FORBIDDEN, "当前账号无权访问该数据源".into())
+        } else {
+            err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "暂时无法完成本次问数，请调整问题后重试".into(),
+            )
+        }
+    })?;
+    Ok(serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"))
+}
+
+/// 存会话消息（用户问 + AI 结果），首问顺手设标题。失败 warn 留痕后吞掉：
+/// 消息丢失不允许无声，但也不炸主链路（纪律见 `chat::save_msg_logged`）。
+async fn ask_persist(st: &AppState, conv_id: Option<i64>, question: &str, payload: &serde_json::Value) {
+    if let Some(cid) = conv_id {
+        chat::save_msg_logged(st.owned.pool(), cid, chat::ROLE_USER, question, None).await;
+        chat::save_msg_logged(st.owned.pool(), cid, chat::ROLE_AI, "", Some(payload)).await;
+    }
+}
+
+async fn api_ask(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<AskReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let gate = ask_gate(&st, &headers, &req).await?;
     // 【K5】意图分诊。`ds` 用主源：判据只读 `meta.metric/dimension/term`（谓词 `IN (ds,'*')`），
     // 而选源发生在 `dms_agent::ask` 内部——分诊只决定「问数还是查文档」，不决定问哪个源。
     // 分诊不会失败（内部一律降级 Data），故这里没有 `?`：存量问数链路一步不变。
@@ -2027,61 +2104,64 @@ async fn api_ask(
         triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &req.question, req.intent.as_deref())
             .await;
     let payload = match intent {
-        triage::Intent::Data => {
-            let (r, _log) = ask(
-                &st.llm,
-                &st.auth_mysql,
-                &st.mysql,
-                &st.sources,
-                st.owned.pool(),
-                &st.embed,
-                &p,
-                &req.question,
-                prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice())),
-                req.ds.as_deref(),
-                // 会话 id 透传到 `query_log` 与三张日志表 —— `chat.rs` 的亏就是
-                // 「query_log 当年没有 conv_id，从它拿不回本会话上一轮」
-                req.conv_id.map(|c| c.to_string()).as_deref(),
-                // 【深度模式】SC 抬到 ≥3：多数派投票是现成的「AI 深度参与生成」件
-                //（配置 sc_samples 已 ≥3 时不降 —— max 不是 overwrite）
-                if req.mode.as_deref() == Some("deep") { st.sc_samples.max(3) } else { st.sc_samples },
-            )
-            .await;
-            // 服务侧 fire-and-forget：`_log` 句柄直接丢弃，HTTP 主链路一个 `.await` 都不多
-            let r = r
-            // 「无权访问数据源」是权限拒绝，必须 403 而不是 422：前者前端提示「联系管理员授权」，
-            // 后者会被当成「这个问题问不出来」，用户永远不知道是权限问题。
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("无权访问数据源") {
-                    err(StatusCode::FORBIDDEN, "当前账号无权访问该数据源".into())
-                } else {
-                    err(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "暂时无法完成本次问数，请调整问题后重试".into(),
-                    )
-                }
-            })?;
-            serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败")
-        }
+        triage::Intent::Data => ask_data_payload(&st, &req, &gate).await?,
         // `Answer` 带 `kind:"text"`，前端 K2 的 `KbAnswer` 分支按它分派；`route` 是 `"knowledge"`
         triage::Intent::Knowledge => {
-            let a = kb_answer(&st, &p, req.space_id.as_deref(), &req.question)
+            let a = kb_answer(&st, &gate.p, req.space_id.as_deref(), &req.question)
                 .await
-                .map_err(|_| err(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "暂时无法完成知识检索，请稍后重试".into(),
-                ))?;
+                .map_err(|_| {
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(serde_json::json!({ "error": "暂时无法完成知识检索，请稍后重试" })),
+                    )
+                })?;
             serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败")
         }
     };
-    // 存会话消息（用户问 + AI 结果），首问顺手设标题。失败 warn 留痕后吞掉：
-    // 消息丢失不允许无声，但也不炸主链路（纪律见 `chat::save_msg_logged`）
-    if let Some(cid) = req.conv_id {
-        chat::save_msg_logged(st.owned.pool(), cid, chat::ROLE_USER, &req.question, None).await;
-        chat::save_msg_logged(st.owned.pool(), cid, chat::ROLE_AI, "", Some(&payload)).await;
-    }
+    ask_persist(&st, req.conv_id, &req.question, &payload).await;
     Ok(Json(payload))
+}
+
+/// `POST /api/ask/stream` —— `/api/ask` 的流式变体（事件协议见 `kb_api` 的
+/// 「SSE 流式问答」段头注）。分诊落 **Data**：照常同步跑完，回普通 JSON（Content-Type
+/// 与 `/api/ask` 相同，客户端按既有路径处理，wire 一字不变）；落 **Knowledge**：
+/// 回 `text/event-stream`（meta → delta×N → done/error）。
+/// 认证/属主/上一轮/持久化与 `/api/ask` 同一条代码（ask_gate / ask_data_payload /
+/// ask_persist），不是第二份拷贝。
+async fn api_ask_stream(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<AskReq>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    use axum::response::IntoResponse;
+    let gate = ask_gate(&st, &headers, &req).await?;
+    let intent =
+        triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &req.question, req.intent.as_deref())
+            .await;
+    match intent {
+        triage::Intent::Data => {
+            let payload = ask_data_payload(&st, &req, &gate).await?;
+            ask_persist(&st, req.conv_id, &req.question, &payload).await;
+            Ok(Json(payload).into_response())
+        }
+        triage::Intent::Knowledge => {
+            // `Principal` → `Viewer` 与同步分支同一个映射（`kb_answer` 内部也是它）
+            let v = dms_agent::answerers::knowledge::viewer(&gate.p);
+            let mut extra = serde_json::Map::new();
+            if let Some(cid) = req.conv_id {
+                extra.insert("conv_id".into(), serde_json::json!(cid));
+            }
+            if let Some(sp) = req.space_id.as_deref() {
+                extra.insert("space_id".into(), serde_json::json!(sp));
+            }
+            // 持久化在工人里做（答案落定后存 user/ai 两条，与同步分支同一条 save_msg_logged）；
+            // 错误文案与同步 Knowledge 分支的 422 同一句
+            let rx = kb_api::spawn_kb_worker(&st, v, req.space_id.clone(), &req.question, req.conv_id, |_| {
+                "暂时无法完成知识检索，请稍后重试".to_string()
+            });
+            Ok(kb_api::sse_response(rx, extra).into_response())
+        }
+    }
 }
 
 /// 一次问答的**服务端唯一入口**：观测出口（`Trace` + 查询日志）+ 依赖注入 → `dms_agent::ask`。

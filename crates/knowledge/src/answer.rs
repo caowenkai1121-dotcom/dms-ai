@@ -114,6 +114,85 @@ pub async fn answer(
     })
 }
 
+/// 流式问答的进展事件（`answer_stream` 经回调推出）。序列化形态由 server 层定（SSE 帧），
+/// 本层只出结构化事实。`Delta` 是**模型原始增量**：未过口径后处理，只许当预览 ——
+/// 最终答案以 `answer_stream` 返回值的 `Answer` 为准（与 `answer` 同一套后处理）。
+#[derive(Debug)]
+pub enum AnswerEvent {
+    /// 检索完成、生成开始前推一次（用户先看到命中文档，再看着正文长出来）
+    Meta(AnswerMeta),
+    /// 正文原始增量（预览；攒批/节流是消费方的事）
+    Delta(String),
+}
+
+/// `AnswerEvent::Meta` 的载荷：候选引用是**全部命中**（未按正文引用压缩 —— 压缩发生在
+/// 生成之后，最终引用以 `Answer.citations` 为准）；trace_id 与落账/反馈的是同一个。
+#[derive(Debug)]
+pub struct AnswerMeta {
+    pub trace_id: String,
+    pub citations: Vec<Citation>,
+    /// 本次实际检索的可见文档数；None = 没真正检索（归一化后为空的问题）
+    pub searched_docs: Option<usize>,
+}
+
+/// `answer` 的流式变体：同一入口纪律（校验/trace_id/落账逐字一致），只在两个时点经
+/// `on_event` 推进展 —— 检索完（`Meta`）与生成中（`Delta`）。返回值恒为过完同一套
+/// 后处理的最终 `Answer`：推送只是预览，回答协议（角标/冲突披露/压缩）一个字不变。
+#[allow(clippy::too_many_arguments)] // 与 `answer` 同一张形参表 + 事件回调，刻意同形
+pub async fn answer_stream(
+    store: &OwnedStore,
+    embed: &EmbedClient,
+    llm: &dyn ChatModel,
+    v: &Viewer,
+    space: Option<&str>,
+    question: &str,
+    weights: &retrieve::RrfWeights,
+    on_event: &(dyn Fn(AnswerEvent) + Send + Sync),
+) -> Result<Answer, KbError> {
+    let q = question.trim();
+    if q.is_empty() {
+        return Err(KbError::BadInput("问题为空".into()));
+    }
+    if q.chars().count() > MAX_QUESTION_CHARS {
+        return Err(KbError::BadInput(format!("问题超过 {MAX_QUESTION_CHARS} 字上限")));
+    }
+    let t0 = std::time::Instant::now();
+    // 一次 KB 问答一个 trace_id（与 `answer` 同一个 uuid v4 口径）
+    let trace_id = uuid::Uuid::new_v4().to_string();
+    let (out, obs) = match retrieve::search_report(store, embed, v, space, q, weights).await {
+        Ok(report) => {
+            // 空结果兜底文案的范围（KB 审查⑥）：归一化后为空的问题其实没检索过，不带范围
+            let searched =
+                (!report.normalized_query.is_empty()).then_some(report.stats.visible_docs);
+            // 生成开始前先发 Meta：前端先渲染「命中文档」，正文随后经 Delta 长出来
+            on_event(AnswerEvent::Meta(AnswerMeta {
+                trace_id: trace_id.clone(),
+                citations: citations(report.hits.iter()),
+                searched_docs: searched,
+            }));
+            respond_stream(
+                llm,
+                &report.hits,
+                q,
+                t0,
+                report.vector_degraded,
+                space,
+                searched,
+                &trace_id,
+                on_event,
+            )
+            .await
+        }
+        Err(e) => (Err(e), qa_log::Obs::default()),
+    };
+    // 答案落定才落账；`finish` 内部 spawn 异步写、失败只 warn —— 主链一个 `.await` 都不多
+    qa_log::finish(store, &v.login, q, &out, &obs, t0.elapsed().as_millis() as u64, &trace_id);
+    out.map(|mut a| {
+        a.trace_id = Some(trace_id);
+        a
+    })
+}
+
 /// 原 `answer` 主体（检索 → 编排）。观测产出（`Obs`）随结果一起回，不许事后二次推导。
 /// `trace_id` 只用于诊断日志（拼回当次问答），不进任何判定。
 async fn run(
@@ -153,20 +232,8 @@ async fn respond(
     searched_docs: Option<usize>,
     trace_id: &str,
 ) -> (Result<Answer, KbError>, qa_log::Obs) {
-    let ms = |t: std::time::Instant| t.elapsed().as_millis();
-    if vec_down {
-        tracing::warn!(
-            trace_id,
-            space = space.unwrap_or("*"),
-            hits = hits.len(),
-            "知识库向量召回降级；仅记录服务端诊断，不向业务答案泄露检索实现"
-        );
-    }
-    if hits.is_empty() {
-        return (
-            Ok(Answer::text(no_hit_text(space, searched_docs), vec![], ms(t0))),
-            qa_log::Obs::default(),
-        );
+    if let Some(out) = no_hit_outcome(hits, t0, vec_down, space, searched_docs, trace_id) {
+        return (out, qa_log::Obs::default());
     }
     let req =
         ChatRequest::text(ModelTier::Precise, SYSTEM, &user_prompt(hits, question), Some(ANSWER_TEMPERATURE));
@@ -184,7 +251,87 @@ async fn respond(
     let Some(raw) = reply.content else {
         return (Err(KbError::Upstream("大模型没有返回内容".into())), obs);
     };
-    let md = keep_supported_only(&strip_internal_diagnostics(&raw), hits);
+    (finalize_markdown(&raw, hits, t0, trace_id), obs)
+}
+
+/// `respond` 的流式变体（`answer_stream` 用）：LLM 改走 `chat_stream`，原始增量经
+/// `on_event` 实时推出（仅预览）；拿全全文后仍过同一条 `finalize_markdown` —— 口径一个字符不变。
+#[allow(clippy::too_many_arguments)] // 与 `respond` 同一张形参表 + 事件回调，刻意同形
+async fn respond_stream(
+    llm: &dyn ChatModel,
+    hits: &[Hit],
+    question: &str,
+    t0: std::time::Instant,
+    vec_down: bool,
+    space: Option<&str>,
+    searched_docs: Option<usize>,
+    trace_id: &str,
+    on_event: &(dyn Fn(AnswerEvent) + Send + Sync),
+) -> (Result<Answer, KbError>, qa_log::Obs) {
+    if let Some(out) = no_hit_outcome(hits, t0, vec_down, space, searched_docs, trace_id) {
+        return (out, qa_log::Obs::default());
+    }
+    let req =
+        ChatRequest::text(ModelTier::Precise, SYSTEM, &user_prompt(hits, question), Some(ANSWER_TEMPERATURE));
+    let reply = match llm
+        .chat_stream(
+            req,
+            Box::new(|piece: &str| on_event(AnswerEvent::Delta(piece.to_string()))),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                Err(KbError::Upstream(format!("大模型：{e}"))),
+                qa_log::Obs::called(), // 失败那发的钱也花了，用量拿不到记 0
+            );
+        }
+    };
+    let mut obs = qa_log::Obs::called();
+    obs.usage = reply.usage;
+    let Some(raw) = reply.content else {
+        return (Err(KbError::Upstream("大模型没有返回内容".into())), obs);
+    };
+    (finalize_markdown(&raw, hits, t0, trace_id), obs)
+}
+
+/// `respond`/`respond_stream` 共用前段：降级留痕 + 无命中早退。
+/// Some = 已落定（无命中，不调 LLM），None = 继续走 LLM。
+fn no_hit_outcome(
+    hits: &[Hit],
+    t0: std::time::Instant,
+    vec_down: bool,
+    space: Option<&str>,
+    searched_docs: Option<usize>,
+    trace_id: &str,
+) -> Option<Result<Answer, KbError>> {
+    if vec_down {
+        tracing::warn!(
+            trace_id,
+            space = space.unwrap_or("*"),
+            hits = hits.len(),
+            "知识库向量召回降级；仅记录服务端诊断，不向业务答案泄露检索实现"
+        );
+    }
+    hits.is_empty().then(|| {
+        Ok(Answer::text(
+            no_hit_text(space, searched_docs),
+            vec![],
+            t0.elapsed().as_millis(),
+        ))
+    })
+}
+
+/// 拿到模型原文后的口径尾段（`respond` 与 `respond_stream` 同一条，改这里 = 两条路一起变）：
+/// 剥内部诊断 → 剔无角标断言 → 近域 nohit 判「没有」→ 版本披露 → 角标压缩重编号。
+fn finalize_markdown(
+    raw: &str,
+    hits: &[Hit],
+    t0: std::time::Instant,
+    trace_id: &str,
+) -> Result<Answer, KbError> {
+    let md = keep_supported_only(&strip_internal_diagnostics(raw), hits);
     if !has_supported_content(&md) {
         // 这条路专治**近域** nohit：`retrieve::VEC_MAX_DIST` 那个相关度下限只挡得住远域
         // （实测 KB07「月球基地」最近块 0.6020 被挡住；而 KB13「差旅打车费每天限额」库里没规定，
@@ -192,18 +339,15 @@ async fn respond(
         // 所以「库里有没有」最后还是模型判：一句带角标的结论都给不出 → 等价于没命中，
         // `citations` 也不许留（留着就是「有引用」的假象，且会让越权题看起来引用了他人文档名）。
         tracing::warn!(trace_id, hits = hits.len(), "模型未给出带角标的结论 → 按「没有」回答");
-        return (Ok(Answer::text(NO_HIT.to_string(), vec![], ms(t0))), obs);
+        return Ok(Answer::text(NO_HIT.to_string(), vec![], t0.elapsed().as_millis()));
     }
     let md = disclose_versioned_sources(&md, hits);
     let (md, used) = compact_refs(&md, hits.len());
-    (
-        Ok(Answer::text(
-            md,
-            citations(used.iter().map(|k| &hits[k - 1])),
-            ms(t0),
-        )),
-        obs,
-    )
+    Ok(Answer::text(
+        md,
+        citations(used.iter().map(|k| &hits[k - 1])),
+        t0.elapsed().as_millis(),
+    ))
 }
 
 fn user_prompt(hits: &[Hit], question: &str) -> String {
@@ -1207,6 +1351,109 @@ mod tests {
     /// `respond` 新增参数时只改这一处，不再全测试面逐个改
     async fn call(f: &Fake, hits: &[Hit], q: &str) -> (Result<Answer, KbError>, qa_log::Obs) {
         respond(f, hits, q, std::time::Instant::now(), false, None, None, "tid-test").await
+    }
+
+    /// `respond_stream` 的同款默认调用 + 事件收集（Mutex：回调是同步 Fn）。
+    async fn call_stream(
+        f: &dyn ChatModel,
+        hits: &[Hit],
+        q: &str,
+    ) -> (Result<Answer, KbError>, qa_log::Obs, Vec<AnswerEvent>) {
+        let events = std::sync::Mutex::new(Vec::new());
+        let (a, obs) = respond_stream(
+            f,
+            hits,
+            q,
+            std::time::Instant::now(),
+            false,
+            None,
+            None,
+            "tid-test",
+            &|ev| events.lock().unwrap().push(ev),
+        )
+        .await;
+        (a, obs, events.into_inner().unwrap())
+    }
+
+    fn deltas_of(events: &[AnswerEvent]) -> String {
+        events
+            .iter()
+            .map(|ev| match ev {
+                AnswerEvent::Delta(t) => t.as_str(),
+                AnswerEvent::Meta(_) => panic!("respond_stream 不产 Meta（那是 answer_stream 的检索后时点）"),
+            })
+            .collect()
+    }
+
+    /// 流式与同步**同一份最终答案**：Fake 只实现 `chat`（走 trait 默认流式回退），
+    /// delta 恰一条 = 模型原文；Answer 与 `respond` 逐字段相同 —— 口径没有第二条路。
+    #[tokio::test]
+    async fn stream_matches_sync_final_answer() {
+        let reply = "## 直接结论\n报销上限 800 元[^1]。\n\n## 关键要点\n- 住宿另算[^1]";
+        let (a, obs, events) = call_stream(&Fake::new(reply), &[hit("报销上限 800 元")], "上限").await;
+        let streamed = deltas_of(&events);
+        assert_eq!(streamed, reply, "默认回退只推一条全量增量");
+        assert_eq!(obs.llm_calls, 1);
+        let (md, n) = text_of(&a.unwrap());
+        let f2 = Fake::new(reply);
+        let (sync_md, sync_n) = text_of(&call(&f2, &[hit("报销上限 800 元")], "上限").await.0.unwrap());
+        assert_eq!((md, n), (sync_md, sync_n), "流式的最终答案必须与同步逐字一致");
+    }
+
+    /// 无命中：流式同样零 LLM 调用、零 delta，文案与同步同一条。
+    #[tokio::test]
+    async fn stream_no_hit_never_calls_llm() {
+        let f = Fake::new("不该被调用");
+        let (a, obs, events) = call_stream(&f, &[], "q").await;
+        assert_eq!(f.calls.load(Ordering::Relaxed), 0, "无命中不许调 LLM");
+        assert_eq!(obs.llm_calls, 0);
+        assert!(events.is_empty(), "无命中没有生成，就不许有增量");
+        assert_eq!(text_of(&a.unwrap()), (NO_HIT.to_string(), 0));
+    }
+
+    /// 真流式桩：覆盖 `chat_stream` 分多块推 —— 增量必须按序拼回原文，
+    /// 最终 Answer 仍是过完后处理的那份（不是增量的拼接）。
+    #[tokio::test]
+    async fn stream_deltas_concatenate_in_order() {
+        struct Chunked;
+        impl ChatModel for Chunked {
+            fn chat<'a>(
+                &'a self,
+                _req: ChatRequest,
+            ) -> dms_kernel::BoxFut<'a, Result<dms_kernel::ChatReply, dms_kernel::LlmError>> {
+                unimplemented!("流式路径不调 chat")
+            }
+            fn chat_stream<'a>(
+                &'a self,
+                _req: ChatRequest,
+                mut on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+            ) -> dms_kernel::BoxFut<'a, Result<dms_kernel::ChatReply, dms_kernel::LlmError>> {
+                Box::pin(async move {
+                    for piece in ["报销上限", " 800 元", "[^1]。"] {
+                        on_delta(piece);
+                    }
+                    Ok(dms_kernel::ChatReply {
+                        content: Some("报销上限 800 元[^1]。".into()),
+                        usage: Default::default(),
+                    })
+                })
+            }
+        }
+        let (a, _, events) = call_stream(&Chunked, &[hit("报销上限 800 元")], "上限").await;
+        assert_eq!(deltas_of(&events), "报销上限 800 元[^1]。");
+        let (md, n) = text_of(&a.unwrap());
+        assert_eq!(n, 1, "角标 [^1] 合法，引用保留");
+        assert!(md.contains("报销上限 800 元[^1]"), "{md}");
+    }
+
+    /// 模型没给角标：流式照样按「没有」回答且不留 citations（近域 nohit 那条防线
+    /// 对流式不许开口子）——但 delta 预览已经推过原文，最终答案以返回值为准。
+    #[tokio::test]
+    async fn stream_uncited_reply_falls_back_to_no_hit() {
+        let (a, obs, events) = call_stream(&Fake::new("我猜上限大概是 5000 元。"), &[hit(" irrelevant ")], "上限").await;
+        assert_eq!(obs.llm_calls, 1);
+        assert_eq!(deltas_of(&events), "我猜上限大概是 5000 元。");
+        assert_eq!(text_of(&a.unwrap()), (NO_HIT.to_string(), 0));
     }
 
     /// 纪律 1 的锁：无命中 → 定文案 + 零引用 + **一次 LLM 都不调**（观测也随之全 0）

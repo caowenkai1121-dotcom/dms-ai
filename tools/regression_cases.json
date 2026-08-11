@@ -893,15 +893,19 @@
       ]
     },
     {
-      "name": "E10-库存取最新快照",
+      "name": "E10-库存取中台现行库存",
       "login": "admin",
       "q": "现在库存量是多少",
       "route": "direct-agg",
       "sql_contains": [
-        "SUM(stock_quantity)",
-        "product_stock_date = (SELECT MAX(product_stock_date)",
-        "GROUP BY COALESCE(NULLIF(product_type,''),'未分类')"
-      ]
+        "ywzt_ods.scm_warehous_manage",
+        "SUM(in_stock_quantity)",
+        "inventory_status = 'ZP'"
+      ],
+      "sql_not_contains": [
+        "t_winc_stock_report"
+      ],
+      "note": "默认库存源=业务中台 WMS 现行库存（2026-08-11 用户指定「库存表用中台的」）；营销通快照是门店/经销商进销存口径，仅金额/省份问法保留。"
     },
     {
       "name": "E11-库存金额表",

@@ -329,6 +329,13 @@ pub const ASSETS: &[Asset] = &[
          DMS 销售问题（销售额/销量/按省区按客户等）禁止用本表推导——口径不同源：推导走 t_sales_order(+t_sales_order_detail)，\
          本表仅在用户明确问 WinC/营销通/经销商上报流水时使用",
         "条件允许：明确同一日期语义后做同比/环比"),
+    // 业务中台 WMS 库存（2026-08-11 用户指定：「库存表用中台的」——ywzt_ods 域唯一资产，
+    // 替代 t_winc_stock_report 成为默认库存源；后者退居「门店/经销商进销存」专属）
+    asset!("ywzt_ods", "scm_warehous_manage", "ODS", "中台仓库存", "货主×SKU×仓库×库位×批次现行行",
+        "现行库存表无经营时间轴；warehous_date=入库时间、invalid_date=效期只按明确事件使用",
+        "库存量=SUM(in_stock_quantity)（默认且只计 inventory_status='ZP' 正品）；锁定量=SUM(lock_quantity)；冻结量=SUM(freeze_quantity)；实际数量=SUM(actual_quantity)（与在库差着锁定/冻结/在途，不许与 in_stock 混称）；批次/效期结构",
+        "禁止跨 inventory_status 混加（TS/BS/CC/GQ/LQ/XS 各是残损/报损/调出/过期/临期/滞销，点名才加）；禁止把 actual_quantity 当在库量；禁止与营销通门店进销存（t_winc_stock_report）相加或混称；本表无金额列，禁止推算库存金额",
+        "禁止默认同比/环比：现行表无快照轴，历史比较需专门快照资产"),
     asset!("dms_ods", "t_customer", "ODS", "客户主数据", "一客户一 customer_code",
         "当前主数据，无经营时间轴",
         "客户档案、类型、分类、渠道、区域和启停状态",
@@ -1014,7 +1021,7 @@ mod tests {
             assert!(matches!(asset.layer, "ODS" | "DWD" | "DWS" | "ADS"));
             assert!(matches!(
                 database_of(asset),
-                "sales_dw" | "sales_ads" | "fin_dw" | "fin_ads" | "hr_dw" | "dms_ods"
+                "sales_dw" | "sales_ads" | "fin_dw" | "fin_ads" | "hr_dw" | "dms_ods" | "ywzt_ods"
             ));
             assert!(!asset.grain.is_empty());
             assert!(!asset.time_rule.is_empty());
@@ -1029,7 +1036,7 @@ mod tests {
             assert!(comment.contains(&format!("{}.{}", asset.database, asset.table)));
             assert!(comment.contains("必须使用完整库表名"));
         }
-        assert_eq!(ASSETS.len(), 57, "运行时白名单数量变化必须同步资产文档");
+        assert_eq!(ASSETS.len(), 58, "运行时白名单数量变化必须同步资产文档");
         assert_eq!(metadata_assets().len(), ASSETS.len());
         for (database, expected) in [
             ("sales_dw", 21usize),
@@ -1038,6 +1045,8 @@ mod tests {
             ("fin_ads", 5),
             ("hr_dw", 1),
             ("dms_ods", 16),
+            // 业务中台域首表（2026-08-11 用户指定库存源）：ywzt_ods.scm_warehous_manage
+            ("ywzt_ods", 1),
         ] {
             assert_eq!(
                 ASSETS.iter().filter(|asset| asset.database == database).count(),

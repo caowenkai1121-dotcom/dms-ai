@@ -11,6 +11,7 @@ import SqlAuditPanel from './SqlAuditPanel.vue'
 import TracePanel from './TracePanel.vue'
 import { fmt, semanticForLabel, toNum, uuid, type Semantic } from './format'
 import { ANALYSIS_URL, ANALYSIS_REPORT_URL } from './api'
+import { SseParser, parseEventData } from './kb-stream'
 
 const BiChart = defineAsyncComponent(() => import('./BiChart.vue'))
 
@@ -31,9 +32,10 @@ interface SupplementalResult {
   truncated: boolean; view: ViewSpec
 }
 interface SubResult { question: string; result: AskResult }
+/** 与 KbAnswer.vue 的本地 Citation 双份声明：字段增减两边同步（来源行位置徽标口径在 citation.ts）。 */
 interface Citation {
   doc_id: string; doc_name: string; chunk_id: number
-  page?: number | null; heading_path?: string; score?: number
+  page?: number | null; heading_path?: string | string[]; score?: number
   relations?: string[]
   tags?: string[]; business_domain?: string | null
   effective_from?: string | null; effective_to?: string | null; source_uri?: string | null
@@ -112,6 +114,9 @@ interface Turn {
   page?: DeepPage
   /** 该轮发送时的模式快照；用户之后切模式不应改变正在运行气泡的样式/解析。 */
   mode?: 'deep' | 'lite'
+  /** 【SSE 流式】知识库回答生成中：result 里是增量预览（meta 的候选引用 + delta 拼的正文），
+   *  done 事件到达时整体替换成过完口径后处理的最终 Answer。 */
+  streaming?: boolean
   /** 周报错误重试必须保留完整提示词与强制深度参数，不能拿短展示标题重新查询。 */
   retryQuestion?: string
   retryOptions?: SendOptions
@@ -1417,6 +1422,76 @@ function errMsg(resp: Response, body: unknown, raw: string): string {
   return resp.status === 401 ? `未登录或登录已过期（${msg}）。请重新登录。` : msg
 }
 
+/** 【SSE 流式】读 `/api/ask/stream` 的知识库事件流（协议见 `kb-stream.ts` 头注）：
+ *  meta  → 出半成品气泡（候选引用先挂上，用户先看到命中文档）；
+ *  delta → 追加正文预览（KbAnswer 本来就渲半成品 markdown；未过口径后处理）；
+ *  done  → 整体替换成过完口径后处理的最终 Answer（最终 citations/trace_id 在这里才挂）；
+ *  error → 服务端已收口的友好文案，直接透出（重试同错，不回退）；
+ *  返回 'fallback' 只发生在**传输级失败且内容还没出来**（调用方回退老端点重试一次）；
+ *  已有内容后断流 = 半成品不作数，出友好错误。返回 'done' = 终态已写好，调用方不再处理。 */
+async function consumeAskStream(resp: Response, aiTurn: Turn): Promise<'done' | 'fallback'> {
+  const reader = resp.body?.getReader()
+  if (!reader) return 'fallback' // 响应体不可流（老浏览器/代理整段缓冲）：回退同步
+  const parser = new SseParser()
+  const decoder = new TextDecoder()
+  let draft = ''
+  let started = false // meta 到达 = 内容面已开始（这之前的失败才能回退同步）
+  /** 半成品预览不作数：最终答案只有过完口径后处理的那份（角标/冲突披露不许有第二形态） */
+  const failWith = (msg: string): 'done' => {
+    aiTurn.error = msg
+    aiTurn.streaming = false
+    aiTurn.result = undefined
+    return 'done'
+  }
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      const events = done ? parser.end() : parser.feed(decoder.decode(value, { stream: true }))
+      for (const ev of events) {
+        const data = parseEventData(ev)
+        if (!data) continue // 坏帧跳过，不炸整条流
+        if (ev.event === 'meta') {
+          started = true
+          aiTurn.loading = false
+          aiTurn.streaming = true
+          aiTurn.result = {
+            kind: 'text', route: 'knowledge', elapsed_ms: 0,
+            sql: '', columns: [], rows: [], row_count: 0, truncated: false,
+            markdown: '',
+            citations: (Array.isArray(data.citations) ? data.citations : []) as Citation[],
+            trace_id: typeof data.trace_id === 'string' ? data.trace_id : undefined,
+          }
+        } else if (ev.event === 'delta') {
+          const piece = typeof data.text === 'string' ? data.text : ''
+          if (piece && aiTurn.result) {
+            draft += piece
+            // 新对象触发响应式（KbAnswer 按 answerKey 监听内容变化）
+            aiTurn.result = { ...aiTurn.result, markdown: draft }
+          }
+        } else if (ev.event === 'done') {
+          const answer = data.answer as AskResult | undefined
+          if (!answer || typeof answer !== 'object') return failWith('服务响应异常，请稍后重试')
+          aiTurn.result = answer
+          aiTurn.streaming = false
+          return 'done'
+        } else if (ev.event === 'error') {
+          const msg = typeof data.message === 'string' ? data.message.trim() : ''
+          return failWith(msg || '暂时无法完成知识检索，请稍后重试')
+        }
+      }
+      if (done) break
+    }
+    // 流结束却没有 done/error 终止帧 = 断流
+    if (!started && !draft) return 'fallback'
+    return failWith('回答生成中断，请重试')
+  } catch {
+    // 网络断流 / 超时 abort：内容没出来回退同步（abort 时同步那次也会立刻失败，
+    // 由外层 catch 落成「查询超时」文案）；已有内容出错误
+    if (!started && !draft) return 'fallback'
+    return failWith('回答生成中断，请重试')
+  }
+}
+
 /** 会话面四处 fetch 的**唯一**响应闸。返回 `null` = 已经报过错了，调用方直接 return。
  *
  *  🔴 修的是同一个根因、四处症状：这四处原来都是 `await (await fetch(...)).json()` ——
@@ -1882,44 +1957,45 @@ async function send(q?: string, options: SendOptions = {}) {
     const sendRefs = options.refs ?? (isPlainAsk ? pendingRefs.value.splice(0) : [])
     // 重试快照补上引用：chip 区在首次发送时已清空，不回填的话失败后点「重试」引用静默丢失
     if (aiTurn.retryOptions) aiTurn.retryOptions.refs = sendRefs
-    const url = isDeep ? '/api/deep/compose' : '/api/ask'
-    const resp = await fetch(url, {
+    const bodyFields = {
+      question: text,
+      ...(displayText !== text ? { display_question: displayText } : {}),
+      login_name: sessionToken.value ? null : loginName.value,
+      role_code: roleCode.value || null,
+      conv_id: convId,
+      // 强制意图：auto 传 null 交给后端分诊（K5 之前后端忽略该字段，多传无害）
+      intent: requestedIntent === 'auto' ? null : requestedIntent,
+      space_id: usesKnowledgeSpace ? selectedSpaceId : null,
+      // 深度模式：服务端 SC 抬到 ≥3（生成侧深度参与）；缺省精简，body 与老前端同形
+      mode: isDeep ? 'deep' : null,
+      // 思维过程轮询 id（缺省 null = 不登记，后端零变化）
+      rid: rid || null,
+      // 【引用上轮】引用快照（后端把每条当作上轮上下文素材）；空 = null，与老前端同形
+      refs: sendRefs.length ? sendRefs : null,
+    }
+    const post = (url: string) => fetch(url, {
       method: 'POST', headers: authHeaders(), signal: ctrl.signal,
-      body: JSON.stringify({
-        question: text,
-        ...(displayText !== text ? { display_question: displayText } : {}),
-        login_name: sessionToken.value ? null : loginName.value,
-        role_code: roleCode.value || null,
-        conv_id: convId,
-        // 强制意图：auto 传 null 交给后端分诊（K5 之前后端忽略该字段，多传无害）
-        intent: requestedIntent === 'auto' ? null : requestedIntent,
-        space_id: usesKnowledgeSpace ? selectedSpaceId : null,
-        // 深度模式：服务端 SC 抬到 ≥3（生成侧深度参与）；缺省精简，body 与老前端同形
-        mode: isDeep ? 'deep' : null,
-        // 思维过程轮询 id（缺省 null = 不登记，后端零变化）
-        rid: rid || null,
-        // 【引用上轮】引用快照（后端把每条当作上轮上下文素材）；空 = null，与老前端同形
-        refs: sendRefs.length ? sendRefs : null,
-      }),
+      body: JSON.stringify(bodyFields),
     })
-    // 🔴 `/api/ask` 走同一套 `readBody`/`errMsg`，与会话面四处一致：
+    // 🔴 同步响应走同一套 `readBody`/`errMsg`，与会话面四处一致：
     // 原来是 `await resp.json()` + `data.error || '请求失败'` —— 两个洞。
     // ① 401 只显示服务端那三个字「未认证」，用户不知道该做什么，而认证本轮改成默认拒、
     //    这里是全站最常走的端点（每次提问都过），比会话面四处更常见。
     // ② 网关 502 / 兜底 404 是空体或 HTML → `.json()` 抛 `Unexpected end of JSON input`，
     //    被下面的 catch 抓成 `String(e)`，气泡里是这句 SyntaxError（同 `toggleAnalysis` 的坑）。
-    const [body, raw] = await readBody(resp)
-    if (!resp.ok) {
-      aiTurn.error = errMsg(resp, body, raw)
-      // 多角色账号被 fail-closed 拒（那是**正确**的安全行为，不许放宽）——
-      // 角色选择由 `/api/roles` 提供，选择后服务端重新校验角色归属并换签。
-      if (aiTurn.error.includes(ROLE_AMBIGUOUS)) await offerRoles(aiTurn)
-    } else if (!body) {
-      // 200 但空体/非 JSON：渲染一个空结果气泡就是又一次静默吞错（本轮要杀的形态本身）
-      aiTurn.error = '服务端返回了空响应（HTTP 200 但没有 JSON 结果）'
-    } else {
-      // 【深度模式】compose 端点回 {result, artifact, page}；精简端点回 AskResult 本体
-      if (isDeep) {
+    // 本函数同时是：深度模式的唯一路径、流式端点分诊落 data 的普通 JSON 路径、流式失败后的兜底重试。
+    const handleSync = async (resp: Response) => {
+      const [body, raw] = await readBody(resp)
+      if (!resp.ok) {
+        aiTurn.error = errMsg(resp, body, raw)
+        // 多角色账号被 fail-closed 拒（那是**正确**的安全行为，不许放宽）——
+        // 角色选择由 `/api/roles` 提供，选择后服务端重新校验角色归属并换签。
+        if (aiTurn.error.includes(ROLE_AMBIGUOUS)) await offerRoles(aiTurn)
+      } else if (!body) {
+        // 200 但空体/非 JSON：渲染一个空结果气泡就是又一次静默吞错（本轮要杀的形态本身）
+        aiTurn.error = '服务端返回了空响应（HTTP 200 但没有 JSON 结果）'
+      } else if (isDeep) {
+        // 【深度模式】compose 端点回 {result, artifact, page}；精简端点回 AskResult 本体
         const d = body as { result: AskResult; artifact?: { preview_url: string; title: string }; page?: DeepPage }
         aiTurn.result = d.result
         aiTurn.page = d.page
@@ -1927,6 +2003,23 @@ async function send(q?: string, options: SendOptions = {}) {
           aiTurn.artifact = { url: d.artifact.preview_url, title: d.artifact.title }
         }
       } else aiTurn.result = body as AskResult
+    }
+    if (isDeep) {
+      await handleSync(await post('/api/deep/compose'))
+    } else {
+      // 【SSE 流式】KB 问答走流式端点：分诊落 knowledge 回 text/event-stream（边收边渲），
+      // 落 data 回普通 JSON（与 /api/ask 同 wire，走 handleSync）。
+      const resp = await post('/api/ask/stream')
+      const contentType = resp.headers.get('content-type') ?? ''
+      if (resp.ok && contentType.includes('text/event-stream')) {
+        // 传输级失败且内容还没出来 → 'fallback'：回退老端点重试一次（用户无感）
+        if ((await consumeAskStream(resp, aiTurn)) === 'fallback') await handleSync(await post('/api/ask'))
+      } else if (resp.status === 404 || resp.status === 405) {
+        // 服务端/反代还没有流式路由（版本错位）：静默回退同步端点
+        await handleSync(await post('/api/ask'))
+      } else {
+        await handleSync(resp)
+      }
     }
   } catch (e) {
     aiTurn.error = ctrl.signal.aborted ? '查询超时，请重试或换个问法' : '查询失败（网络），请重试'
@@ -2768,7 +2861,7 @@ function exportSupplementalCsv(t: Turn) {
             <div v-else-if="t.result" class="bubble ai" :class="{ 'knowledge-bubble': t.result.kind === 'text', 'result-bubble': t.result.kind !== 'text' && t.mode !== 'deep' }">
               <div class="res-meta">
                 <!-- 知识库只展示面向业务的回答与关联资料概览，不暴露内部引用编号/调试计数。 -->
-                <span v-if="t.result.kind === 'text'">已关联资料</span>
+                <span v-if="t.result.kind === 'text'">{{ t.streaming ? '已命中资料，正在生成…' : '已关联资料' }}</span>
                 <template v-else>
                   <!-- 🔴 **不写具体行数上限**。这里原来是 `'·截断200'` —— 那是全仓第**四**处 200
                    字面量，与后端 `agent::gate::MAX_ROWS` 零连接、零判据；
@@ -2939,6 +3032,7 @@ function exportSupplementalCsv(t: Turn) {
                   :token="sessionToken"
                   :login="loginName"
                   :trace-id="t.result.trace_id"
+                  :streaming="t.streaming === true"
                   @auth-expired="handleSessionExpired"
                 />
               </template>

@@ -75,6 +75,9 @@ pub fn builtin_rules() -> HashMap<String, TableRule> {
     // 只由精确单号通道先裁决头表，再按同一单号读取明细。
     // 数仓市场费用按客户汇总；`store_code` 实际承载 DMS customer_code。
     m.insert("ads_off_sales_cost_customer_dnf".into(), b("store_code", None, Ids));
+    // 小程序下单快照（2026-08-11 接入）：粒度统计日×客户，`store_code` 同样承载
+    // DMS customer_code —— 与上面市场费用同一先例；受限身份映射不到客户编码时恒假（fail-closed）。
+    m.insert("dws_mkt_app_place_order_dnf".into(), b("store_code", None, Ids));
     // BI 线下销售宽表没有稳定员工 ID，只按 DMS customer_codes → storecode 隔离。
     // 受限身份若映射不到客户编码，RequiredCodes 会注入恒假条件。
     m.insert(
@@ -108,6 +111,9 @@ pub fn builtin_rules() -> HashMap<String, TableRule> {
         "t_regions",
         // Doris 数仓设备维表：只含设备分类与 SKU 主数据，无用户归属，供设备订单构成下钻。
         "dim_device",
+        // 业务中台 WMS 现行库存（ywzt_ods）：公司仓库存是无归属运营数据，
+        // 与 t_winc_stock_report（门店进销存）同档全量可见（2026-08-11 用户指定默认库存源）。
+        "scm_warehous_manage",
     ] {
         m.insert(t.into(), TableRule::Global);
     }
@@ -118,15 +124,21 @@ pub fn builtin_rules() -> HashMap<String, TableRule> {
 mod tests {
     use super::*;
 
-    /// 三类档案的条数是契约（39 表 / scoped 17 / via 7 / global 15）。
+    /// 三类档案的条数是契约（41 表 / scoped 18 / via 7 / global 16）。
     /// 少一张 scoped 表 = 该表对受限用户从「注入条件」变成「fail-closed 拒绝」或反之，静默改权限面。
     #[test]
     fn thirty_nine_tables_by_kind() {
         let m = builtin_rules();
-        assert_eq!(m.len(), 39);
-        assert_eq!(m.values().filter(|r| matches!(r, TableRule::Scoped(_))).count(), 17);
+        assert_eq!(m.len(), 41);
+        assert_eq!(m.values().filter(|r| matches!(r, TableRule::Scoped(_))).count(), 18);
         assert_eq!(m.values().filter(|r| matches!(r, TableRule::Via { .. })).count(), 7);
-        assert_eq!(m.values().filter(|r| matches!(r, TableRule::Global)).count(), 15);
+        assert_eq!(m.values().filter(|r| matches!(r, TableRule::Global)).count(), 16);
+        // 2026-08-11 新增：小程序下单快照按客户编码 scoped；中台库存表 global（无归属运营数据）
+        let Some(TableRule::Scoped(app)) = m.get("dws_mkt_app_place_order_dnf") else {
+            panic!("小程序下单快照必须按客户编码受限");
+        };
+        assert_eq!(app.customer_col.as_deref(), Some("store_code"));
+        assert!(matches!(m.get("scm_warehous_manage"), Some(TableRule::Global)));
         // 省份解码字典必须在 global（ship_dim 省份 JOIN 它；缺了受限用户整批被拒）
         assert!(matches!(m.get("t_regions"), Some(TableRule::Global)));
         assert!(matches!(m.get("dim_device"), Some(TableRule::Global)));

@@ -1290,6 +1290,9 @@ fn try_direct_warehouse(question: &str) -> Option<DirectHit> {
         .or_else(|| warehouse_sales_fact(question))
         .or_else(|| warehouse_sales_semantics_unavailable(question))
         .or_else(|| relation_rows(question))
+        // 小程序下单必须拦在 sales_order_rows 前面：后者没有渠道过滤能力（t_sales_order
+        // 全表 source_platform_code='DMS'），让它先接就是静默丢「小程序」限定
+        .or_else(|| mini_program_order_agg(question))
         .or_else(|| sales_order_rows(question))
         .or_else(|| balance_ranking(question))
         .or_else(|| stock_snapshot(question))
@@ -1998,15 +2001,10 @@ fn stock_snapshot(question: &str) -> Option<DirectHit> {
     if !["库存", "存货"].iter().any(|w| question.contains(w)) {
         return None;
     }
-    let (column, label) = if ["金额", "货值", "库存额"].iter().any(|w| question.contains(w)) {
-        ("stock_amount", "库存金额")
-    } else if ["量", "数量", "多少", "库存"].iter().any(|w| question.contains(w)) {
-        ("stock_quantity", "库存量")
-    } else {
+    let wants_amount = ["金额", "货值", "库存额"].iter().any(|w| question.contains(w));
+    if !wants_amount && !["量", "数量", "多少", "库存"].iter().any(|w| question.contains(w)) {
         return None;
-    };
-    let latest = "product_stock_date = (SELECT MAX(product_stock_date) \
-                  FROM t_winc_stock_report WHERE deleted_flag = 0)";
+    }
     let grouped_province = ["各省", "各省份", "按省", "按省份", "省份分别", "省区分别"]
         .iter()
         .any(|word| question.contains(word));
@@ -2019,6 +2017,55 @@ fn stock_snapshot(question: &str) -> Option<DirectHit> {
             || question.to_lowercase().contains("top")
             || detect_top_n(question) < 200);
     let province = if grouped_province { None } else { stock_province_predicate(question).ok()? };
+
+    // 默认库存源 = 业务中台 WMS 现行库存（ywzt_ods.scm_warehous_manage，2026-08-11 用户指定：
+    // 「库存表用中台的」）。但它**无金额列、无省份列**——金额与省份两类问法仍走营销通
+    // 门店进销存快照（那两类语义本属门店/经销商侧，总行与合计不许跨源混加）。
+    if !wants_amount && !grouped_province && province.is_none() {
+        const ZT_FROM: &str = "ywzt_ods.scm_warehous_manage";
+        // 只计正品在库；残损/临期等其余 inventory_status 须点名才计（合同卡同口径）
+        const ZT_WHERE: &str = "inventory_status = 'ZP'";
+        if grouped_warehouse {
+            // 仓库码表（t_warehouse）未镜像进数仓，按码与库位出（名称接入后再换名）
+            return Some(hit(
+                format!(
+                    "SELECT wms_code AS `仓库编码`, location AS `库位`, \
+                            SUM(in_stock_quantity) AS `库存量` \
+                     FROM {ZT_FROM} WHERE {ZT_WHERE} \
+                     GROUP BY wms_code, location \
+                     ORDER BY `库存量` {} LIMIT {}",
+                    rank_direction(question),
+                    ranking_limit(question)
+                ),
+                "direct-agg",
+            ));
+        }
+        return Some(DirectHit {
+            detail: Some(format!(
+                "SELECT sku_code AS `商品编码`, sku_name AS `商品`, \
+                        SUM(in_stock_quantity) AS `库存量` \
+                 FROM {ZT_FROM} WHERE {ZT_WHERE} \
+                 GROUP BY sku_code, sku_name \
+                 ORDER BY `库存量` DESC LIMIT 20"
+            )),
+            ..hit(
+                format!(
+                    "SELECT COALESCE(SUM(in_stock_quantity),0) AS `库存量` \
+                     FROM {ZT_FROM} WHERE {ZT_WHERE}"
+                ),
+                "direct-agg",
+            )
+        });
+    }
+
+    // ── 营销通门店进销存快照路径（金额/省份限定专用；库存量的默认源已是中台表）──
+    let (column, label) = if wants_amount {
+        ("stock_amount", "库存金额")
+    } else {
+        ("stock_quantity", "库存量")
+    };
+    let latest = "product_stock_date = (SELECT MAX(product_stock_date) \
+                  FROM t_winc_stock_report WHERE deleted_flag = 0)";
     let where_sql = match province {
         Some(p) => format!("deleted_flag = 0 AND {latest} AND {p}"),
         None => format!("deleted_flag = 0 AND {latest}"),
@@ -2067,6 +2114,180 @@ fn stock_snapshot(question: &str) -> Option<DirectHit> {
     })
 }
 
+/// 问句里的「{省名}战区 / {省名}省区」限定值 → (省名词干, 原词)。
+/// Ok(None)=没有区域限定；Err=有区域词但兑现不了（多个限定值、或词干不在省名表，
+/// 如「华北战区」「直营战区」「各省区」）—— 调用方必须不接，不许静默丢限定。
+/// 值形态已探库（2026-08-11）：数仓 region 列与 ODS province_department_name 列
+/// 都用「山东省区/山东战区」这类「省名+后缀」存储。
+fn province_region_qualifier(question: &str) -> Result<Option<(&'static str, String)>, ()> {
+    let mut hit: Option<(&'static str, String)> = None;
+    for &(_code, name) in dms_semantic::present::PROVINCE_LABELS {
+        for suffix in ["省区", "战区"] {
+            let phrase = format!("{name}{suffix}");
+            if question.contains(&phrase) {
+                if hit.as_ref().is_some_and(|(_, p)| *p != phrase) {
+                    return Err(()); // 多个区域限定值，等值谓词表达不了
+                }
+                hit = Some((name, phrase));
+            }
+        }
+    }
+    if hit.is_none() && ["战区", "省区", "大区"].iter().any(|w| question.contains(w)) {
+        return Err(());
+    }
+    Ok(hit)
+}
+
+/// 小程序下单事实：`sales_dw.dws_mkt_app_place_order_dnf`（统计日×客户的当日/当月累计快照）。
+/// t_sales_order.source_platform_code 全表只有 'DMS'，小程序订单不在里面 —— 2026-08-11 实测
+/// 「按客户展示山东战区本月小程序的下单数量和金额」被 `sales_order_rows` 劫走，
+/// 「山东战区」「小程序」两个限定一个条件都没进 SQL。本模板拦在它前面。
+/// 合同纪律（warehouse_catalog 钉着）：必须按 data_date 取最新快照；同行 tomonth_* 已是
+/// 当月累计，禁止跨 data_date SUM 累计列、禁止混加当日与月累计 —— 所以一条 SQL 只选一个
+/// 时间列族，快照日用「数据日期」列透出。
+fn mini_program_order_agg(question: &str) -> Option<DirectHit> {
+    if !question.contains("小程序")
+        || (!question.contains("下单") && !question.contains("订单"))
+        || question.contains("设备订单")
+    {
+        return None;
+    }
+    // 时间 → 列族：今天/今日 = 当日列；本月/这个月/当月 = 当月累计列；缺省 = 当月累计。
+    // 其他时间词（昨天/上月/今年…）这张「当日+当月累计」快照表没有对应列 → 不接，让位 LLM。
+    let monthly = if ["今天", "今日"].iter().any(|w| question.contains(w)) {
+        false
+    } else if ["本月", "这个月", "当月"].iter().any(|w| question.contains(w)) {
+        true
+    } else if time_predicate(question).is_some() {
+        return None;
+    } else {
+        true
+    };
+    let wants_wx = question.contains("微信");
+    let wants_zy = question.contains("账余");
+    let wants_cancel = question.contains("取消");
+    let wants_count = ["数量", "单量", "多少单", "几单", "订单数", "单数"]
+        .iter()
+        .any(|w| question.contains(w));
+    let wants_amount = question.contains("金额");
+    let vague = question.contains("多少"); // 只说「多少」= 数量金额都要
+    if !(wants_wx || wants_zy || wants_cancel || wants_count || wants_amount || vague) {
+        return None;
+    }
+    // 取消只有单数列、没有金额列：问「取消的金额」兑现不了 → 不接
+    if wants_cancel && wants_amount {
+        return None;
+    }
+    // 列族（同行同周期，绝不混加当日与月累计；今日账余列的物理拼写就是 todaty_，原样照抄）
+    let p = if monthly { "本月" } else { "今日" };
+    let (count, amount) = if monthly {
+        ("tomonth_order_count", "tomonth_amount")
+    } else {
+        ("today_order_count", "today_amount")
+    };
+    let (wx_count, wx_amount) = if monthly {
+        ("tomonth_wxorder_count", "tomonth_wxorder_amount")
+    } else {
+        ("today_wxorder_count", "today_wxorder_amount")
+    };
+    let (zy_count, zy_amount) = if monthly {
+        ("tomonth_zyorder_count", "tomonth_zyorder_amount")
+    } else {
+        ("todaty_zyorder_count", "todaty_zyorder_amount")
+    };
+    let cancel = if monthly { "tomonth_cancel_order" } else { "today_cancel_order" };
+    let mut cols: Vec<(String, String)> = vec![]; // (聚合表达式, 中文列名)
+    let mut push = |col: &str, label: String| cols.push((format!("SUM({col})"), label));
+    if wants_wx || wants_zy || wants_cancel {
+        if wants_count {
+            push(count, format!("{p}下单数量"));
+        }
+        if wants_wx {
+            if wants_count || !wants_amount {
+                push(wx_count, format!("{p}微信下单数量"));
+            }
+            if wants_amount || !wants_count {
+                push(wx_amount, format!("{p}微信下单金额"));
+            }
+        }
+        if wants_zy {
+            if wants_count || !wants_amount {
+                push(zy_count, format!("{p}账余下单数量"));
+            }
+            if wants_amount || !wants_count {
+                push(zy_amount, format!("{p}账余下单金额"));
+            }
+        }
+        if wants_cancel {
+            push(cancel, format!("{p}取消订单数"));
+        }
+    } else if wants_count && !wants_amount && !vague {
+        push(count, format!("{p}下单数量"));
+    } else if wants_amount && !wants_count && !vague {
+        push(amount, format!("{p}下单金额"));
+    } else {
+        // 数量+金额都要（或只说「多少」）：两列都给，微信/账余分列透出构成
+        push(count, format!("{p}下单数量"));
+        push(amount, format!("{p}下单金额"));
+        push(wx_count, format!("{p}微信下单数量"));
+        push(wx_amount, format!("{p}微信下单金额"));
+        push(zy_count, format!("{p}账余下单数量"));
+        push(zy_amount, format!("{p}账余下单金额"));
+    }
+    // 区域限定：认得出省名词干就按该表 region 列的存储形态写谓词；认不出/多个 → 不接
+    let region = match province_region_qualifier(question) {
+        Ok(v) => v,
+        Err(()) => return None,
+    };
+    // 残留守卫：只剥本模板兑现了的词；剥完还有实义残留（商品/门店/渠道/实体名…）→ 让位
+    let mut consumed: Vec<&str> = vec![
+        "小程序", "下单", "订单", "数量", "单量", "多少单", "几单", "订单数", "单数", "金额",
+        "取消", "微信支付", "微信", "账余", "支付", "客户", "当月", "情况", "进行", "展示",
+    ];
+    if let Some((_, phrase)) = &region {
+        consumed.push(phrase);
+    }
+    if !residual_text(question, &consumed).is_empty() {
+        return None;
+    }
+    let region_sql = region
+        .map(|(stem, _)| {
+            // 探值形态「山东省区」；词干+惯用后缀全覆盖（同 dimension_probe_values 的思路）
+            format!(" AND region IN ('{stem}省区','{stem}战区','{stem}大区','{stem}')")
+        })
+        .unwrap_or_default();
+    let snapshot = "data_date = (SELECT MAX(data_date) FROM sales_dw.dws_mkt_app_place_order_dnf)";
+    let note = "-- 小程序下单口径（最新快照 data_date，快照日见「数据日期」列；\
+                同行当月/当日累计，禁止跨快照日求和）\n";
+    let select_cols =
+        cols.iter().map(|(expr, label)| format!("{expr} AS `{label}`")).collect::<Vec<_>>().join(", ");
+    if ["按客户", "各客户"].iter().any(|w| question.contains(w)) {
+        // ORDER BY 取金额列（没有金额列就取首个指标列），与「按金额 DESC」的约定一致
+        let order = cols
+            .iter()
+            .find(|(_, label)| label.contains("金额"))
+            .unwrap_or_else(|| &cols[0]);
+        return Some(hit(
+            format!(
+                "{note}SELECT store_code AS `客户编码`, store_name AS `客户`, {select_cols}, \
+                        MAX(data_date) AS `数据日期` \
+                 FROM sales_dw.dws_mkt_app_place_order_dnf \
+                 WHERE {snapshot}{region_sql} \
+                 GROUP BY store_code, store_name ORDER BY `{}` DESC LIMIT 200",
+                order.1
+            ),
+            "direct-agg",
+        ));
+    }
+    Some(hit(
+        format!(
+            "{note}SELECT {select_cols}, MAX(data_date) AS `数据日期` \
+             FROM sales_dw.dws_mkt_app_place_order_dnf WHERE {snapshot}{region_sql}"
+        ),
+        "direct-agg",
+    ))
+}
+
 /// 销售订单列表：明细问法直接返回业务列与中文状态，不让 LLM 自由挑表/列。
 fn sales_order_rows(question: &str) -> Option<DirectHit> {
     let wants_rows = ["订单明细", "订单清单", "销售单明细", "销售订单明细"]
@@ -2091,6 +2312,23 @@ fn sales_order_rows(question: &str) -> Option<DirectHit> {
     if (!wants_rows && !wants_customers) || question.contains("设备订单") {
         return None;
     }
+    // 🔴 「小程序」限定本模板兑现不了：t_sales_order.source_platform_code 全表只有 'DMS'，
+    // 小程序订单不在里面，两个分支都没有渠道过滤能力 —— 接了就是静默丢限定
+    // （2026-08-11 实测：「山东战区+小程序」双限定一个条件都没进 SQL）。让位：
+    // 数仓侧由 mini_program_order_agg（dws_mkt_app_place_order_dnf）接，其余落 LLM。
+    if question.contains("小程序") {
+        return None;
+    }
+    // 战区/省区限定：province_department_name（省区部门名称）已探值含「山东战区/山东省区」
+    // 形态，认得出就补等值谓词；认不出（多值/非省名词干）就不接 —— 同一纪律：
+    // 识别到却兑现不了的限定词，不许静默丢。
+    let region = match province_region_qualifier(question) {
+        Ok(v) => v,
+        Err(()) => return None,
+    };
+    let region_sql = region
+        .map(|(_, phrase)| format!(" AND o.province_department_name = '{phrase}'"))
+        .unwrap_or_default();
     let pred = time_predicate(question)?;
     let time = fill_time_col(&pred, "o.order_time");
     if wants_customers {
@@ -2099,7 +2337,7 @@ fn sales_order_rows(question: &str) -> Option<DirectHit> {
                 "SELECT o.customer_name AS `客户`, COUNT(DISTINCT o.sales_order_code) AS `订单数`, \
                         SUM(o.total_amount) AS `订单金额`, MAX(o.order_time) AS `最近下单时间` \
                  FROM t_sales_order o \
-                 WHERE o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND {time} \
+                 WHERE o.deleted_flag = 0 AND o.order_status NOT IN ('0','108','199') AND {time}{region_sql} \
                  GROUP BY o.customer_name ORDER BY `订单金额` DESC, `订单数` DESC LIMIT 200"
             ),
             "direct-doc",
@@ -2116,7 +2354,7 @@ fn sales_order_rows(question: &str) -> Option<DirectHit> {
              FROM t_sales_order o \
              LEFT JOIN t_employee e ON e.employee_id = o.owner_manager AND e.deleted_flag = 0 \
              LEFT JOIN t_dict_value d ON d.dict_key_id = '67' AND d.value_code = o.order_type \
-             WHERE o.deleted_flag = 0 AND {time} ORDER BY o.order_time DESC LIMIT 200",
+             WHERE o.deleted_flag = 0 AND {time}{region_sql} ORDER BY o.order_time DESC LIMIT 200",
             sales_status_sql("o.order_status")
         ),
         "direct-doc",
@@ -2465,6 +2703,9 @@ pub fn compose_hit<'a>(cx: &'a dms_agent::AskCtx<'a>) -> dms_kernel::BoxFut<'a, 
             || balance_ranking(cx.question).is_some()
             || warehouse_sales_question(cx.question)
             || (cx.source.is_warehouse() && warehouse_finance(cx.question).is_some())
+            // 小程序下单有专用 DWS 快照模板（mini_program_order_agg）：组合器的注册表
+            // 装配兑现不了「小程序」这个渠道限定，必须让路，不许装出一份丢限定的 SQL
+            || (cx.source.is_warehouse() && mini_program_order_agg(cx.question).is_some())
         {
             return None;
         }
@@ -3293,14 +3534,18 @@ mod tests {
 
     #[test]
     fn stock_and_order_detail_use_verified_business_shapes() {
-        let qty = try_direct("现在库存量是多少").expect("库存应走最新快照模板");
+        // 库存量默认源=业务中台 WMS 现行库存（2026-08-11 用户指定）；营销通快照只剩金额/省份问法
+        let qty = try_direct("现在库存量是多少").expect("库存量应走中台现行库存模板");
         assert_eq!(qty.route, "direct-agg");
-        assert!(qty.sql.contains("SUM(stock_quantity)"), "{}", qty.sql);
-        assert!(qty.sql.contains("SELECT MAX(product_stock_date)"), "{}", qty.sql);
-        assert!(qty.detail.as_deref().unwrap_or_default().contains("product_type"));
+        assert!(qty.sql.contains("ywzt_ods.scm_warehous_manage"), "{}", qty.sql);
+        assert!(qty.sql.contains("SUM(in_stock_quantity)"), "{}", qty.sql);
+        assert!(qty.sql.contains("inventory_status = 'ZP'"), "{}", qty.sql);
+        assert!(!qty.sql.contains("t_winc_stock_report"), "默认库存量不许再走营销通快照：{}", qty.sql);
+        assert!(qty.detail.as_deref().unwrap_or_default().contains("sku_name"));
 
-        let amount = try_direct("库存金额").expect("库存金额应走同一快照模板");
+        let amount = try_direct("库存金额").expect("库存金额应走营销通快照模板（中台表无金额列）");
         assert!(amount.sql.contains("SUM(stock_amount)"), "{}", amount.sql);
+        assert!(amount.sql.contains("SELECT MAX(product_stock_date)"), "{}", amount.sql);
 
         let orders = try_direct("昨天销售订单明细").expect("订单明细应走业务模板");
         assert_eq!(orders.route, "direct-doc");
@@ -3399,6 +3644,117 @@ mod tests {
             assert!(sales_order_rows(q).is_none(), "其他客户业务意图不许套销售订单：{q}");
         }
         assert!(sales_order_rows("客户信息").is_none());
+    }
+
+    #[test]
+    fn mini_program_orders_use_the_dws_snapshot_fact() {
+        // 实测错答案的那句：按客户 + 战区 + 本月 + 数量金额，一个限定都不许丢
+        let h = try_direct_for("按客户进行展示山东战区本月小程序的下单数量和金额", true)
+            .expect("小程序下单应走 DWS 快照模板");
+        assert_eq!(h.route, "direct-agg");
+        assert!(h.sql.starts_with("-- 小程序下单口径"), "{}", h.sql);
+        assert!(h.sql.contains("FROM sales_dw.dws_mkt_app_place_order_dnf"), "{}", h.sql);
+        assert!(h.sql.contains(
+            "data_date = (SELECT MAX(data_date) FROM sales_dw.dws_mkt_app_place_order_dnf)"),
+            "必须按 data_date 取最新快照：{}", h.sql);
+        // 探值形态「山东省区」；词干+惯用后缀候选（dimension_probe_values 同一思路）
+        assert!(h.sql.contains("region IN ('山东省区','山东战区','山东大区','山东')"), "{}", h.sql);
+        assert!(h.sql.contains("SUM(tomonth_order_count) AS `本月下单数量`"), "{}", h.sql);
+        assert!(h.sql.contains("SUM(tomonth_amount) AS `本月下单金额`"), "{}", h.sql);
+        assert!(h.sql.contains("SUM(tomonth_wxorder_count) AS `本月微信下单数量`"), "{}", h.sql);
+        assert!(h.sql.contains("SUM(tomonth_wxorder_amount) AS `本月微信下单金额`"), "{}", h.sql);
+        assert!(h.sql.contains("SUM(tomonth_zyorder_count) AS `本月账余下单数量`"), "{}", h.sql);
+        assert!(h.sql.contains("SUM(tomonth_zyorder_amount) AS `本月账余下单金额`"), "{}", h.sql);
+        assert!(h.sql.contains("MAX(data_date) AS `数据日期`"), "快照日必须透出：{}", h.sql);
+        assert!(h.sql.contains("GROUP BY store_code, store_name"), "{}", h.sql);
+        assert!(h.sql.contains("ORDER BY `本月下单金额` DESC LIMIT 200"), "{}", h.sql);
+        assert!(!h.sql.contains("today_order_count"), "当月问句不许混当日列：{}", h.sql);
+
+        // 标量形态（无「按客户」）：单行合计，不 GROUP BY
+        let s = try_direct_for("本月小程序下单数量和金额", true).expect("标量小程序下单");
+        assert_eq!(s.route, "direct-agg");
+        assert!(s.sql.contains("SUM(tomonth_order_count) AS `本月下单数量`"), "{}", s.sql);
+        assert!(s.sql.contains("SUM(tomonth_amount) AS `本月下单金额`"), "{}", s.sql);
+        assert!(!s.sql.contains("GROUP BY"), "{}", s.sql);
+
+        // 今天 → today_* 列族；今日账余列的物理拼写就是 todaty_（原样照抄，钉住）
+        let t = mini_program_order_agg("今天小程序下单数量").expect("今天应走当日列族");
+        assert!(t.sql.contains("SUM(today_order_count) AS `今日下单数量`"), "{}", t.sql);
+        assert!(!t.sql.contains("tomonth_"), "当日问句不许混月累计列：{}", t.sql);
+        let zy = mini_program_order_agg("今天小程序账余下单").expect("账余列族");
+        assert!(zy.sql.contains("SUM(todaty_zyorder_count)"), "todaty_ 是物理拼写：{}", zy.sql);
+        // 微信支付/取消列族；缺省时间词 → 当月累计并透出快照日
+        let wx = mini_program_order_agg("本月小程序微信下单金额").expect("微信支付列族");
+        assert!(wx.sql.contains("SUM(tomonth_wxorder_amount) AS `本月微信下单金额`"), "{}", wx.sql);
+        assert!(!wx.sql.contains("tomonth_order_count"), "只问微信支付不许带总下单列：{}", wx.sql);
+        let c = mini_program_order_agg("本月小程序取消订单数").expect("取消列族");
+        assert!(c.sql.contains("SUM(tomonth_cancel_order) AS `本月取消订单数`"), "{}", c.sql);
+        let d = mini_program_order_agg("小程序下单金额").expect("缺省时间按当月累计");
+        assert!(d.sql.contains("SUM(tomonth_amount)"), "{}", d.sql);
+        assert!(d.sql.contains("MAX(data_date) AS `数据日期`"), "{}", d.sql);
+
+        // 兑现不了的一律不接（让位 LLM，不许静默丢限定）
+        for q in [
+            "昨天小程序下单金额",   // 快照表没有「昨天」列
+            "上月小程序下单数量",   // 没有「上月」列
+            "山东战区和江苏战区本月小程序下单金额", // 多区域值
+            "华北战区本月小程序下单金额",  // 非省名词干，探值表里没有
+            "本月小程序下单金额按商品",   // 商品维度兑现不了
+            "本月小程序取消订单金额",    // 取消只有单数列，没有金额列
+            "小程序商城",           // 不是下单问句
+            "本月小程序订单",         // 无指标词（明细/聚合不明）
+        ] {
+            assert!(mini_program_order_agg(q).is_none(), "兑现不了的不许接：{q}");
+        }
+        // 业务 MySQL 源没有这张数仓表：整条链都不许接（落 LLM）
+        assert!(try_direct_for("本月小程序下单数量和金额", false).is_none(), "非数仓源不接小程序下单");
+
+        // 组合器让路门（源码钉，同 balance_ranking 那条）：小程序问句不许被注册表装配劫走
+        let src = include_str!("direct.rs");
+        let compose = body_between(src, "pub fn compose_hit", "pub fn direct_hit");
+        assert!(
+            compose.contains("mini_program_order_agg(cx.question).is_some()"),
+            "小程序下单必须进 compose 让路门，不许被装配成丢限定的 SQL"
+        );
+    }
+
+    #[test]
+    fn sales_order_rows_narrows_channel_and_region_qualifiers() {
+        // 「小程序」两个分支都不许接：t_sales_order 全表 source_platform_code='DMS'，
+        // 没有渠道过滤能力，接了就是静默丢限定
+        for q in [
+            "昨天小程序下单的客户有哪些",
+            "昨天小程序订单明细",
+            "按客户进行展示山东战区本月小程序的下单数量和金额",
+        ] {
+            assert!(sales_order_rows(q).is_none(), "含小程序的问句不许套 t_sales_order：{q}");
+        }
+        // 战区/省区限定值已探值（province_department_name 存「山东战区/山东省区」）→ 补等值谓词
+        let h = sales_order_rows("山东战区昨天有哪些客户下单").expect("战区限定应补谓词后接");
+        assert!(h.sql.contains("o.province_department_name = '山东战区'"), "{}", h.sql);
+        assert!(h.sql.contains("DATE(o.order_time) = CURDATE() - INTERVAL 1 DAY"), "{}", h.sql);
+        let d = sales_order_rows("山东省区昨天销售订单明细").expect("省区限定应补谓词后接");
+        assert!(d.sql.contains("o.province_department_name = '山东省区'"), "{}", d.sql);
+        // 兑现不了的区域限定 → 不接（让位，不许静默丢）
+        for q in [
+            "山东战区和江苏战区昨天有哪些客户下单", // 多值
+            "华北战区昨天有哪些客户下单",          // 非省名词干
+            "各省区昨天有哪些客户下单",            // 分组问法，本模板表达不了
+        ] {
+            assert!(sales_order_rows(q).is_none(), "区域限定兑现不了不许静默丢：{q}");
+        }
+        // 老行为一个字不变：无区域限定的问句不多任何一个字符
+        let old = sales_order_rows("昨天下单的有哪些客户").expect("老问句照旧接");
+        assert!(!old.sql.contains("province_department_name"), "{}", old.sql);
+        assert!(
+            old.sql.contains("AND DATE(o.order_time) = CURDATE() - INTERVAL 1 DAY GROUP BY"),
+            "{}", old.sql);
+        // 「昨天+小程序」两个模板都兑现不了（快照表没有昨日列）→ 整链不接、落 LLM 路，
+        // 不许变成新的「不可计算」卡，更不许被 sales_order_rows 静默丢限定后接走
+        assert!(
+            try_direct_for("昨天小程序下单的客户有哪些", true).is_none(),
+            "兑现不了的时间词必须让位 LLM"
+        );
     }
 
     #[test]

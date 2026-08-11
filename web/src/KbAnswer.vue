@@ -2,11 +2,14 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { escHtml, sessionHeaders } from './panel-utils'
 import { uuid } from './format'
+import { dedupeFirstIndex, dedupeKey, locationParts } from './citation'
+import KbDocPreview from './KbDocPreview.vue'
 
+// 与 App.vue 的 interface Citation 双份声明：字段增减两边同步（位置徽标口径在 citation.ts）
 interface Citation {
   doc_id: string; doc_name: string; chunk_id: number
-  page?: number | null; heading_path?: string
-  folder_path?: string | null
+  page?: number | null; heading_path?: string | string[] | null
+  folder_path?: string | null; directory_path?: string | null
   span?: number | null
   effective_from?: string | null; effective_to?: string | null
   document_family?: string | null; document_revision?: string | null
@@ -14,7 +17,7 @@ interface Citation {
 }
 interface TextResult { markdown?: string; citations?: Citation[] }
 
-const props = defineProps<{ result: TextResult; token?: string; login?: string; traceId?: string }>()
+const props = defineProps<{ result: TextResult; token?: string; login?: string; traceId?: string; streaming?: boolean }>()
 const emit = defineEmits<{ (e: 'auth-expired'): void }>()
 const citations = computed<Citation[]>(() => props.result.citations ?? [])
 const sourceDocs = computed(() => new Set(citations.value.map((c) => c.doc_id)).size)
@@ -62,6 +65,26 @@ const sourcesEl = ref<HTMLElement | null>(null)
 /** 组件实例唯一串：aria-controls 的 id 前缀（同页多个回答卡片不撞 id）。 */
 const uid = uuid().slice(0, 8)
 let answerGeneration = 0
+
+// 来源行：相同 (doc_id + 页 + 章节) 的重复命中去重，同一文档不同位置仍分行。
+// n = 该去重组首个命中的原始 1-based 序号 —— opened/loading/errors/highlight 全部按它键控，
+// 正文 [^n] 角标点击时先经 canonicalN 归一到这一组的行。
+interface SourceRow { c: Citation; n: number }
+const sourceRows = computed<SourceRow[]>(() =>
+  dedupeFirstIndex(citations.value).map((i) => ({ c: citations.value[i], n: i + 1 })))
+function canonicalN(n: number): number {
+  const c = citations.value[n - 1]
+  if (!c) return n
+  const key = dedupeKey(c)
+  return sourceRows.value.find((row) => dedupeKey(row.c) === key)?.n ?? n
+}
+
+// 「查看原文」= 原件样式预览（KbDocPreview 固定遮罩，盖在问答流上）：
+// docId/docName 取自 citation，pdf 类（pdf 原件 / office 转 PDF）由 initialPage 自动跳命中页
+const previewSource = ref<Citation | null>(null)
+function openOriginal(c: Citation) {
+  previewSource.value = c
+}
 
 const answerKey = computed(() => JSON.stringify({
   markdown: props.result.markdown ?? '',
@@ -131,6 +154,7 @@ watch([answerKey, () => props.token, () => props.login, () => props.traceId], ()
   downloading.value = {}
   highlighted.value = 0
   sourcesOpen.value = false
+  previewSource.value = null
   // 在途反馈请求的 finally 幂等复位，这里一并清，避免旧 busy 误禁用新答案的按钮
   feedbackBusy.value = false
   loadFeedback()
@@ -313,10 +337,6 @@ const presented = computed(() => presentation(displayMarkdown.value))
 const summaryHtml = computed(() => inline(escHtml(presented.value.summary)))
 const html = computed(() => render(presented.value.body))
 
-function locationOf(c: Citation): string {
-  const folderPath = c.folder_path?.trim()
-  return [folderPath && folderPath !== '/' ? `目录 ${folderPath}` : '', c.heading_path, c.page ? `第 ${c.page} 页` : ''].filter(Boolean).join(' · ') || '文档正文'
-}
 function spanOf(c: Citation): number {
   return c.span && c.span > 1 ? c.span : 1
 }
@@ -368,6 +388,7 @@ function setEvidenceEl(n: number, el: unknown) {
 }
 
 async function focusEvidence(n: number) {
+  n = canonicalN(n)
   sourcesOpen.value = true
   await nextTick()
   sourcesEl.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
@@ -381,7 +402,10 @@ async function focusEvidence(n: number) {
 
 async function show(n: number, focusOnly = false) {
   const c = citations.value[n - 1]
-  if (!c || loading.value[n]) return
+  if (!c) return
+  // 正文 [^n] 角标可能落在被去重合并的行上：定位到该组的首行（片段按点击的那条 citation 取）
+  n = canonicalN(n)
+  if (loading.value[n]) return
   if (opened.value[n]) {
     if (focusOnly) {
       await focusEvidence(n)
@@ -466,8 +490,15 @@ function onSourcesToggle(e: Event) {
       </div>
     </template>
     <div v-else class="answer-empty">
-      <strong>暂无回答</strong>
-      <span>本次未生成可展示内容，请换一种问法重试。</span>
+      <!-- 流式生成中：meta 已到、首个 delta 未到的空窗 = 命中资料待生成，不是「暂无回答」 -->
+      <template v-if="streaming">
+        <strong>正在生成回答…</strong>
+        <span>已命中上方资料，正文生成中。</span>
+      </template>
+      <template v-else>
+        <strong>暂无回答</strong>
+        <span>本次未生成可展示内容，请换一种问法重试。</span>
+      </template>
     </div>
 
     <div v-if="hasVersionRisk" class="evidence-alert version" role="status">
@@ -486,35 +517,54 @@ function onSourcesToggle(e: Event) {
 
       <div class="evidence-list" role="list" aria-label="回答来源">
         <article
-          v-for="(c, i) in citations" :key="`${c.doc_id}-${c.chunk_id}-${i}`"
-          :ref="(el) => setEvidenceEl(i + 1, el)"
-          class="evidence-row" :class="{ highlighted: highlighted === i + 1 }" role="listitem"
+          v-for="row in sourceRows" :key="`${row.c.doc_id}-${row.n}`"
+          :ref="(el) => setEvidenceEl(row.n, el)"
+          class="evidence-row" :class="{ highlighted: highlighted === row.n }" role="listitem"
         >
-          <button class="evidence-toggle" type="button" :aria-expanded="!!opened[i + 1]" :aria-controls="`kb-src-${uid}-${i + 1}`" @click="show(i + 1)">
+          <!-- 主按钮 = 查看原文（原件样式预览）；命中片段展开收进 governance 行的次要入口 -->
+          <button class="evidence-toggle" type="button" :title="`查看 ${row.c.doc_name} 原件`" @click="openOriginal(row.c)">
             <span class="source-mark" aria-hidden="true"></span>
             <span class="source-main">
-              <strong :title="c.doc_name">{{ c.doc_name }}</strong>
-              <span>{{ locationOf(c) }}</span>
+              <strong :title="row.c.doc_name">{{ row.c.doc_name }}</strong>
+              <!-- 位置徽标组：目录 / 章节 / 页码，有才显示；全无则降级为纯文档名 -->
+              <span v-if="locationParts(row.c).length" class="source-loc">
+                <span
+                  v-for="part in locationParts(row.c)" :key="part.kind"
+                  class="loc-badge" :class="part.kind" :title="part.full"
+                >{{ part.text }}</span>
+              </span>
             </span>
-            <span class="source-action">{{ loading[i + 1] ? '加载中' : opened[i + 1] ? '收起' : '查看原文' }}</span>
+            <span class="source-action">查看原文</span>
           </button>
           <div class="source-governance">
-            <span v-if="effectiveOf(c)">{{ effectiveOf(c) }}</span>
-            <span v-if="versionOf(c)">{{ versionOf(c) }}</span>
-            <button type="button" :disabled="!!downloading[c.doc_id]" @click="downloadSource(c)">{{ downloading[c.doc_id] ? '下载中' : '下载原件' }}</button>
+            <span v-if="effectiveOf(row.c)">{{ effectiveOf(row.c) }}</span>
+            <span v-if="versionOf(row.c)">{{ versionOf(row.c) }}</span>
+            <button type="button" :aria-expanded="!!opened[row.n]" :aria-controls="`kb-src-${uid}-${row.n}`" @click="show(row.n)">{{ loading[row.n] ? '加载中' : opened[row.n] ? '收起片段' : '看命中片段' }}</button>
+            <button type="button" :disabled="!!downloading[row.c.doc_id]" @click="downloadSource(row.c)">{{ downloading[row.c.doc_id] ? '下载中' : '下载原件' }}</button>
           </div>
-          <div v-if="errors[i + 1]" class="source-error" role="alert">
-            <span>{{ errors[i + 1] }}</span>
-            <button v-if="!stale[i + 1]" type="button" @click="show(i + 1)">重试</button>
+          <div v-if="errors[row.n]" class="source-error" role="alert">
+            <span>{{ errors[row.n] }}</span>
+            <button v-if="!stale[row.n]" type="button" @click="show(row.n)">重试</button>
           </div>
-          <div v-if="opened[i + 1]" :id="`kb-src-${uid}-${i + 1}`" class="source-preview">
-            <div class="preview-label">引用原文</div>
-            <pre>{{ opened[i + 1] }}</pre>
+          <div v-if="opened[row.n]" :id="`kb-src-${uid}-${row.n}`" class="source-preview">
+            <div class="preview-label">命中片段</div>
+            <pre>{{ opened[row.n] }}</pre>
           </div>
         </article>
       </div>
       <div v-if="downloadError" class="source-error download-error" role="alert">{{ downloadError }}</div>
     </details>
+
+    <!-- 原件预览：.kdp-mask 是 fixed 遮罩直接盖问答流（本页无 transform 祖先，定位安全） -->
+    <KbDocPreview
+      v-if="previewSource"
+      :token="token"
+      :doc-id="previewSource.doc_id"
+      :doc-name="previewSource.doc_name"
+      :initial-page="previewSource.page ?? undefined"
+      @close="previewSource = null"
+      @auth-expired="emit('auth-expired')"
+    />
   </section>
 </template>
 
@@ -615,9 +665,15 @@ function onSourcesToggle(e: Event) {
 }
 .evidence-toggle:hover { background: var(--bg-hover); }
 .source-mark { width: 6px; height: 6px; border-radius: 50%; background: var(--primary); }
-.source-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.source-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .source-main strong { overflow: hidden; color: var(--text-primary); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.source-main span { overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.source-loc { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.loc-badge {
+  max-width: 100%; padding: 1px 6px; overflow: hidden; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--bg-main); color: var(--text-muted); font-size: 10px; line-height: 1.5;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.loc-badge.page { border-color: rgba(var(--primary-rgb), .3); background: var(--primary-bg); color: var(--primary); font-weight: 650; }
 .source-action { min-width: 50px; color: var(--primary); font-size: 11px; text-align: right; white-space: nowrap; }
 .source-governance {
   display: flex; align-items: center; flex-wrap: wrap; gap: 5px; padding: 0 10px 8px 31px;

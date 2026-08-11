@@ -400,6 +400,7 @@ mod tests {
             comparisons: vec![],
             subs: vec![],
             caliber_note: None,
+            reinterpret_note: None,
             truncation_note: None,
             redacted: vec![],
             scope_note: None,

@@ -1963,3 +1963,34 @@ month 键（正反两支各插 `DATE_FORMAT(时间列) AS m`，`GROUP BY u.m, u.
   （5 分钟上限，epoch/space 防护）；≥10 文件时队列头部聚合卡（总计/上传中/解析中/失败）。
 - 验证：21 测试目标全绿零警告（新增 10+ 单测：票据签验/Range 解析/自愈 SQL/异步分派）；
   vue-tsc 0 错误；服务器全量部署后容器 healthy，自愈/票据/soffice 三项实测通过。
+
+## AX104（2026-08-11，问数准确度三连修复 + KB 权限/部门授权/词级检索/导图多级展开）
+- **问数准确度（最高优先级，实测「销售额问到营销通表」事故）**：
+  ①「省份」原在 WAREHOUSE_SALES_UNSUPPORTED（历史 fail-closed 防误用 state 列），整题跌进
+  ODS 推导后被 t_winc_sale_report（sale_amount/province 列名太像）截胡答错口径——按业务裁决
+  「省份=省区（region）」移出未支持清单、进 Region 别名；② 客户名领头类别词（客户/经销商/
+  供应商）剥离——「客户董会琴本月的销售额」整词探库必空的问题修复；③ 血缘人工种子
+  （dws_off_offline_sale_dfn ← t_sales_order(+_detail)，status=accepted）补上推断作业
+  name_match 连不出的真上游，derive 候选血缘加权从零变有；t_winc_sale_report 合同警告加
+  「DMS 销售问题禁止用本表推导」。回归新增 B01S/B01T 两题钉死，direct.rs 三个过时钉板按
+  新裁决更新，全量 78/78 通过 0 失败。
+- **自动分诊精化**：KB 词表补 政策/规范/手册/指南/sop；both-hit 时「文档名词×询问词」共现
+  翻 Knowledge——「市场费用的报销政策是什么」不再被指标词抢去聚合费用总额（v1 不做 hybrid
+  的其余纪律不变，两个旧钉板保留）。
+- **KB 入口权限可配（web）**：侧栏知识库整节按 kb_manager 显隐（不再只藏按钮留死标签）；
+  设置页新增「知识库入口权限」卡片 + `POST /api/admin/settings/kb-manager-grants`
+  （管理员闸/名单卫生校验/落盘热更/双空回仅管理员缺省，锚点测试钉住）。
+- **部门维度授权**（Yuxi share_config 差距融合）：Grantee::Dept + kb.user_dept 映射表 +
+  visible_docs!/space_acl_sql! 宏支路（内联点零改动自动获得部门语义）+ 清单端点并集 +
+  授权对话框部门下拉；dept=write 的 store 内联写复核与 export 并集是已知边界（fail-closed 方向）。
+- **同名文件冲突提示**：上传前按目录判定同名，队列行 ⚠ 预警不阻断（纯前端）。
+- **中文词级稀疏检索第 9 路**（Yuxi BM25 混合检索差距融合）：jieba-rs（D6 破例，锁树无分词
+  组件）+ kb.chunk.terms GIN + RRF 第 9 槽权重 1.0；hits>=2 门是先量后定（判据块最低 2/远域
+  噪声最高 1）；存量启动回填（ advisory-lock，读库内 text 重算）；DMS_KB_TERMS=off 可关；
+  kb_eval 夹具 11/14→12/14 且无回退；顺带修 answer.rs CJK 边界切片 panic。
+- **知识导图多级展开**：sections 端点从顶层分桶改 heading_path 逐级建树（跨位置归并/子树
+  累计/100 节点闸）；前端圆点=展收、文字=摘要卡双层分工，嵌套章节摘要卡向上找文档祖先。
+- **上传与错误体验**：上传失败 502/HTML 折叠成可行动文案；状态档「该怎么处理」指引
+  （pill hover 与原因行同源）+ 原因行内联「点这里处理」；问答 errMsg 对网关 HTML 页折叠。
+- 验证：cargo 21 测试目标全绿零警告（1699+ 用例）；判官回归 78/78；vue-tsc 0 错误；
+  服务器全量部署。

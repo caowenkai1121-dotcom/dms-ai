@@ -251,6 +251,7 @@ mod tests {
             supplemental: None,
             comparisons: vec![],
             subs: vec![],
+            reinterpret_note: None,
             caliber_note: None,
             truncation_note: None,
             redacted: vec![],

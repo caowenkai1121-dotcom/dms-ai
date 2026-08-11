@@ -120,6 +120,15 @@ pub struct AskResult {
     /// 具体注入了哪些条件不在这里说（那是 `insight.rs` 的 `caliber` 干的活，它读已执行的 SQL）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope_note: Option<String>,
+    /// 「已按理解为你想问：X」的透出（`ask.rs` 的 AI 重新理解层重试**命中**时）：
+    /// 问句先出了「不可计算」卡，fast 归一成标准问法后重试命中 —— 这个字段说明
+    /// 答案对应的是归一后的问法，不是用户原句。
+    /// 🔴 不借道 `caliber_note`：ResultPanel 对数据类 route 的 caliber_note 首屏只显示
+    /// 固定句「当前结果未通过业务口径复核」（web/src/ResultPanel.vue:534，原文折叠进
+    /// 核查详情）—— 那会把一次成功的归一命中误报成口径违规。
+    /// 同样 `skip_serializing_if`：不重理解整键不上线，前端与两个判官脚本的形状不变。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reinterpret_note: Option<String>,
     /// 本次结果的可核查可信凭证。等级只依据路由、口径判据、截断与权限事实计算，
     /// 不接受 LLM 自评概率。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,6 +251,7 @@ impl AskResult {
             view: dms_semantic::present::build(&[], &[]),
             supplemental: None,
             comparisons: vec![],
+            reinterpret_note: None,
             subs,
             // 容器本身没有 SQL 可判；每个子结果各自带着自己的标注
             caliber_note: None,
@@ -289,6 +299,7 @@ pub fn table_answer(
         view,
         supplemental: None,
         comparisons: vec![],
+        reinterpret_note: None,
         subs: vec![],
         caliber_note: None,
         truncation_note: truncation_note(wire, row_count),
@@ -848,6 +859,7 @@ mod tests {
             elapsed_ms: 1,
             route: "llm".into(),
             view: dms_semantic::present::build(&[], &[]),
+            reinterpret_note: None,
             supplemental: None,
             comparisons: vec![],
             subs: vec![],
@@ -875,6 +887,8 @@ mod tests {
         assert!(j.get("value_labels").is_none(), "空 value_labels 不许上线：{j}");
         // 销售同窗补充同理：None = 整键不上线（非销售 KPI 答案形状一字不变）
         assert!(j.get("sales_context").is_none(), "无同窗补充时 sales_context 不许上线：{j}");
+        // AI 重新理解的透出同理：未重理解 = 整键不上线
+        assert!(j.get("reinterpret_note").is_none(), "未重理解时 reinterpret_note 不许上线：{j}");
         // 命中时形状 = {columns, rows}（单行五值，列序＝合同 CONTEXT_METRICS）
         r.sales_context = Some(SalesContextResult {
             columns: vec!["销售额".into(), "不含税成本".into(), "不含税收入".into(), "毛利额".into(), "毛利率".into()],
@@ -887,6 +901,13 @@ mod tests {
         assert!(j["sales_context"].get("view").is_none() && j["sales_context"].get("row_count").is_none(),
                 "同窗补充刻意比 supplemental 窄，不带 view/row_count：{j}");
         r.sales_context = None;
+        // reinterpret_note 非空才上线，且是原文（与 caliber_note 同一 wire 纪律）
+        r.reinterpret_note = Some("已按理解为你想问：「销售额按省份按商品」".into());
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["reinterpret_note"],
+            "已按理解为你想问：「销售额按省份按商品」"
+        );
+        r.reinterpret_note = None;
         // 有标注时才出现，且是原文（前端按它显示「数字不可信」的提示）
         r.caliber_note = Some("口径复核未通过：下方结果不可信".into());
         assert_eq!(
@@ -929,6 +950,7 @@ mod tests {
             elapsed_ms: 1,
             route: "need-intent".into(),
             view: dms_semantic::present::build(&[], &[]),
+            reinterpret_note: None,
             supplemental: None,
             comparisons: vec![],
             subs: vec![],

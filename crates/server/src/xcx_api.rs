@@ -453,7 +453,77 @@ pub async fn ask(
     headers: HeaderMap,
     Json(req): Json<XcxAskReq>,
 ) -> Result<Json<Value>, ApiErr> {
-    let id = require_identity(&st, &headers).await?;
+    let gate = ask_gate(&st, &headers, &req).await?;
+    // 分诊（同 api_ask：无强制 chip，主源元数据判 Data/Knowledge；分诊内部不失败）
+    let intent = triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &gate.question, None).await;
+    let payload = match intent {
+        triage::Intent::Data => ask_data_payload(&st, &gate).await?,
+        triage::Intent::Knowledge => {
+            let a = crate::kb_answer(&st, &gate.p, None, &gate.question).await.map_err(|_| {
+                fail(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    422,
+                    "暂时无法完成知识检索，请稍后重试",
+                )
+            })?;
+            serde_json::to_value(&a).unwrap_or_else(|e| {
+                tracing::warn!(conv_id = gate.conv_id, reason = %e, "知识检索结果序列化失败，回空对象");
+                json!({})
+            })
+        }
+    };
+    Ok(ask_finish(&st, &gate, payload).await)
+}
+
+/// `POST /api/xcx/ask/stream` —— `/api/xcx/ask` 的流式变体（事件协议见 `kb_api` 的
+/// 「SSE 流式问答」段头注）。鉴权沿用 `x-access-token` 同一套（`require_identity` 一道闸不少）。
+/// 分诊落 **Data**：回普通 JSON（`Content-Type: application/json`，协议与 `/api/xcx/ask`
+/// 逐字相同，客户端按 content-type 分派）；落 **Knowledge**：回 `text/event-stream`
+/// （meta 带 `conv_id` → delta×N → done/error）。小程序端 `wx.request enableChunked` 消费。
+pub async fn ask_stream(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<XcxAskReq>,
+) -> Result<axum::response::Response, ApiErr> {
+    use axum::response::IntoResponse;
+    let gate = ask_gate(&st, &headers, &req).await?;
+    let intent = triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &gate.question, None).await;
+    match intent {
+        triage::Intent::Data => {
+            let payload = ask_data_payload(&st, &gate).await?;
+            Ok(ask_finish(&st, &gate, payload).await.into_response())
+        }
+        triage::Intent::Knowledge => {
+            // `Principal` → `Viewer` 与同步分支同一个映射（`kb_answer` 内部也是它）
+            let v = dms_agent::answerers::knowledge::viewer(&gate.p);
+            let mut extra = serde_json::Map::new();
+            extra.insert("conv_id".into(), json!(gate.conv_id));
+            // 持久化在工人里做（答案落定后存 user/ai 两条）；错误文案与同步分支的 422 同一句
+            let rx = crate::kb_api::spawn_kb_worker(&st, v, None, &gate.question, Some(gate.conv_id), |_| {
+                "暂时无法完成知识检索，请稍后重试".to_string()
+            });
+            Ok(crate::kb_api::sse_response(rx, extra).into_response())
+        }
+    }
+}
+
+/// `ask` / `ask_stream` 共用的前段：require_identity → 入参校验 → Principal → 会话
+/// （属主校验或新开）→ 上一轮上下文。两个端点在这些判定上必须逐字同语义 —— 同一处代码。
+struct XcxAskGate {
+    p: principal::Principal,
+    conv_id: i64,
+    /// 已 trim 的问题（限长校验也过了）
+    question: String,
+    /// 上一轮 (问句, 那一轮执行的 SQL)：显式 prev_question 优先，否则续会话时取服务端历史
+    prev: Option<(String, Option<String>)>,
+}
+
+async fn ask_gate(
+    st: &AppState,
+    headers: &HeaderMap,
+    req: &XcxAskReq,
+) -> Result<XcxAskGate, ApiErr> {
+    let id = require_identity(st, headers).await?;
     let question = req.question.trim();
     if question.is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, 400, "question 不能为空"));
@@ -513,79 +583,70 @@ pub async fn ask(
             .flatten(),
         None => None, // 刚开的空会话没有上一轮，不空查一库
     };
-    let prev_turn = prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[][..]));
-    // 分诊（同 api_ask：无强制 chip，主源元数据判 Data/Knowledge；分诊内部不失败）
-    let intent = triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, question, None).await;
-    let conv_id_str = conv_id.to_string();
-    let payload = match intent {
-        triage::Intent::Data => {
-            let (r, _log) = crate::ask(
-                &st.llm,
-                &st.auth_mysql,
-                &st.mysql,
-                &st.sources,
-                st.owned.pool(),
-                &st.embed,
-                &p,
-                question,
-                prev_turn,
-                None, // ds：小程序侧不提供选源，后端选源（可见源只有一个时直通主源）
-                Some(&conv_id_str),
-                st.sc_samples,
+    Ok(XcxAskGate { p, conv_id, question: question.to_string(), prev })
+}
+
+/// `ask` / `ask_stream` 共用的问数分支：`crate::ask` → 错误映射（403/422 逐字同 api_ask
+/// 口径）→ payload。观测写入句柄丢弃（fire-and-forget，同 api_ask / mcp_api）。
+async fn ask_data_payload(st: &AppState, gate: &XcxAskGate) -> Result<Value, ApiErr> {
+    let conv_id_str = gate.conv_id.to_string();
+    let prev_turn = gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[][..]));
+    let (r, _log) = crate::ask(
+        &st.llm,
+        &st.auth_mysql,
+        &st.mysql,
+        &st.sources,
+        st.owned.pool(),
+        &st.embed,
+        &gate.p,
+        &gate.question,
+        prev_turn,
+        None, // ds：小程序侧不提供选源，后端选源（可见源只有一个时直通主源）
+        Some(&conv_id_str),
+        st.sc_samples,
+    )
+    .await;
+    let r = r.map_err(|e| {
+        // 「无权访问数据源」是权限拒绝 → 403，同 api_ask 的语义（见那里的注释）。
+        // 文案子串匹配是有损分类：上游措辞一改就静默降级成 422 —— 措辞由
+        // `ds_acl_denial_wording_is_pinned_upstream` 钉着，改文案的人当场撞红
+        if e.to_string().contains("无权访问数据源") {
+            fail(StatusCode::FORBIDDEN, 403, "当前账号无权访问该数据源")
+        } else {
+            fail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                422,
+                "暂时无法完成本次问数，请调整问题后重试",
             )
-            .await;
-            // 观测写入句柄丢弃（fire-and-forget，同 api_ask / mcp_api）
-            let r = r.map_err(|e| {
-                // 「无权访问数据源」是权限拒绝 → 403，同 api_ask 的语义（见那里的注释）。
-                // 文案子串匹配是有损分类：上游措辞一改就静默降级成 422 —— 措辞由
-                // `ds_acl_denial_wording_is_pinned_upstream` 钉着，改文案的人当场撞红
-                if e.to_string().contains("无权访问数据源") {
-                    fail(StatusCode::FORBIDDEN, 403, "当前账号无权访问该数据源")
-                } else {
-                    fail(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        422,
-                        "暂时无法完成本次问数，请调整问题后重试",
-                    )
-                }
-            })?;
-            serde_json::to_value(&r).unwrap_or_else(|e| {
-                tracing::warn!(conv_id, reason = %e, "AskResult 序列化失败，回空对象（客户端会看到空白答案）");
-                json!({})
-            })
         }
-        triage::Intent::Knowledge => {
-            let a = crate::kb_answer(&st, &p, None, question).await.map_err(|_| {
-                fail(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    422,
-                    "暂时无法完成知识检索，请稍后重试",
-                )
-            })?;
-            serde_json::to_value(&a).unwrap_or_else(|e| {
-                tracing::warn!(conv_id, reason = %e, "知识检索结果序列化失败，回空对象");
-                json!({})
-            })
-        }
-    };
+    })?;
+    Ok(serde_json::to_value(&r).unwrap_or_else(|e| {
+        tracing::warn!(conv_id = gate.conv_id, reason = %e, "AskResult 序列化失败，回空对象（客户端会看到空白答案）");
+        json!({})
+    }))
+}
+
+/// `ask` / `ask_stream` 共用的收尾（问数分支；知识库流式的持久化在工人里做）：
+/// 存会话（用户问 + AI 结果，写库失败只丢历史不拦响应）→ data 注入 `conv_id` → 包协议。
+async fn ask_finish(st: &AppState, gate: &XcxAskGate, payload: Value) -> Json<Value> {
     // 存会话（用户问 + AI 结果），同 api_ask：写库失败只丢历史，不拦响应 —— 但不再静默吞错
-    if let Err(e) = chat::save_msg(st.owned.pool(), conv_id, "user", question, None).await {
-        tracing::debug!(conv_id, reason = %e, "会话历史写入失败（user 轮）");
+    if let Err(e) = chat::save_msg(st.owned.pool(), gate.conv_id, "user", &gate.question, None).await {
+        tracing::debug!(conv_id = gate.conv_id, reason = %e, "会话历史写入失败（user 轮）");
     }
-    if let Err(e) = chat::save_msg(st.owned.pool(), conv_id, "ai", "", Some(&payload)).await {
-        tracing::debug!(conv_id, reason = %e, "会话历史写入失败（ai 轮）");
+    if let Err(e) = chat::save_msg(st.owned.pool(), gate.conv_id, "ai", "", Some(&payload)).await {
+        tracing::debug!(conv_id = gate.conv_id, reason = %e, "会话历史写入失败（ai 轮）");
     }
     // data = AskResult/Answer 全字段（前端自己拆）+ conv_id：客户端拿着它追问才能串起多轮。
     // AskResult 自身没有 conv_id 字段，注入不撞键（有撞键那天这个 insert 会静默盖掉它 ——
     // 所以这里断言式说明：注入键是协议增量，不是覆盖）。
     let mut data = payload;
     if let Some(m) = data.as_object_mut() {
-        m.insert("conv_id".to_string(), json!(conv_id));
+        m.insert("conv_id".to_string(), json!(gate.conv_id));
     } else {
         // payload 恒为 object（AskResult/Answer 序列化）；真到这儿说明序列化形状变了
-        tracing::debug!(conv_id, "ask 结果非 object，conv_id 未注入（多轮将串不起来）");
+        tracing::debug!(conv_id = gate.conv_id, "ask 结果非 object，conv_id 未注入（多轮将串不起来）");
     }
-    Ok(ok(data))
+    ok(data)
 }
 
 /// `GET /api/xcx/me`：进 AI 页时的登录态探活。只验 token 不落 Principal ——

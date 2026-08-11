@@ -793,6 +793,29 @@ pub async fn find_by_sha(
         .map(|(id,)| id))
 }
 
+/// 同名覆盖命中：同空间、同目录下 `name` 精确匹配（`=`，大小写敏感）的文档 id。
+/// `folder_id = None` ＝根目录（`IS NOT DISTINCT FROM` 让 NULL ↔ NULL 成立，绑定侧不用分叉）。
+/// 历史数据可能多篇同名并存——只取**最近更新**的那篇覆盖，其余原样保留（不替用户删数据）。
+/// 内部查找不带 ACL：调用方（ingest 快路径）已过空间写闸，真正的写入各自在写语句内联复核。
+pub async fn find_by_name_in_folder(
+    store: &OwnedStore,
+    space_id: &str,
+    folder_id: Option<&str>,
+    name: &str,
+) -> Result<Option<String>, KbError> {
+    Ok(store
+        .fixed(
+            "SELECT doc_id FROM kb.doc WHERE space_id=$1 AND name=$2 \
+             AND folder_id IS NOT DISTINCT FROM $3 ORDER BY updated_at DESC, doc_id LIMIT 1",
+        )
+        .bind(space_id)
+        .bind(name)
+        .bind(folder_id)
+        .fetch_optional::<(String,)>()
+        .await?
+        .map(|(id,)| id))
+}
+
 /// `insert_doc` 的结果：新行 id，或同 `(space_id, sha256)` 已被并发上传抢占（秒传去重的原子兜底）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocInsert {
@@ -1438,9 +1461,20 @@ fn remap_shadow_embeddings<'a>(
         .collect()
 }
 
+/// 同名覆盖切换时随索引**同一条语句**替换的文件元数据（`None` ＝ 纯重建，三列原样保留）。
+/// 必须与分块切换同语句：拆成两条会在「sha 已新、块仍旧」的两半状态里毒化秒传去重
+/// （同内容重传被 `find_by_sha` 命中弹回，旧块永无自愈）。
+pub struct DocFileMeta<'a> {
+    pub sha256: &'a str,
+    pub bytes: i64,
+    pub mime: &'a str,
+}
+
 /// 重处理前清空旧块与状态。数据修改 CTE 保证两步同一条语句完成，避免半清理。
 /// 影子解析完成后一次性替换正文索引与文档状态。任何错误都会让旧 chunks 原样保留。
 /// `spans` 与 `chunks` 等长平行（B3 字符偏移），语义同 `insert_chunks`。
+/// `file_meta` 仅同名覆盖链传入：sha256/bytes/mime 随索引同语句切换（`COALESCE($2x,…)` 形，
+/// `None` 时三列原样保留，重建链语义不变）。
 #[allow(clippy::too_many_arguments)]
 pub async fn replace_chunks(
     store: &OwnedStore,
@@ -1454,6 +1488,7 @@ pub async fn replace_chunks(
     status: DocStatus,
     error: &str,
     notice: &str,
+    file_meta: Option<&DocFileMeta<'_>>,
 ) -> Result<(), KbError> {
     if chunks.is_empty()
         || chunks.len() != embedding_texts.len()
@@ -1505,6 +1540,8 @@ pub async fn replace_chunks(
                  AND EXISTS (SELECT 1 FROM upserted) RETURNING 1) \
              UPDATE kb.doc SET status=CASE WHEN EXISTS(SELECT 1 FROM upserted WHERE missing) \
                                             THEN 'chunked' ELSE $9 END,error=$10,notice=$11,page_count=$12, \
+                               sha256=COALESCE($20::text,sha256),bytes=COALESCE($21::bigint,bytes), \
+                               mime=COALESCE($22::text,mime), \
                                chunk_count=(SELECT count(*) FROM upserted),updated_at=now() \
              WHERE doc_id=$1 AND EXISTS (SELECT 1 FROM upserted)",
         )
@@ -1527,6 +1564,9 @@ pub async fn replace_chunks(
         .bind(&starts)
         .bind(&ends)
         .bind(&term_blobs)
+        .bind(file_meta.map(|m| m.sha256))
+        .bind(file_meta.map(|m| m.bytes))
+        .bind(file_meta.map(|m| m.mime))
         .execute()
         .await?;
     if written == 0 {
@@ -2472,6 +2512,36 @@ mod tests {
         assert!(body.contains("DELETE FROM kb.chunk WHERE doc_id=$1 AND ord >= $13"));
         assert!(body.contains("INSERT INTO kb.chunk"));
         assert!(body.contains("UPDATE kb.doc SET status=CASE WHEN EXISTS(SELECT 1 FROM upserted WHERE missing)"));
+    }
+
+    /// 同名覆盖的文件元数据（sha256/bytes/mime）必须与分块**同一条语句**切换——拆两条语句
+    /// 会在「sha 已新、块仍旧」的两半状态里毒化秒传去重。`COALESCE($2x,列)` 形让重建链
+    /// （`file_meta = None`）三列原样保留。既有 bind 编号（$15..$19）不许漂。
+    #[test]
+    fn shadow_replace_switches_file_meta_in_the_same_statement() {
+        let src = include_str!("store.rs");
+        let body = src.split("pub async fn replace_chunks").nth(1).unwrap();
+        let body = body.split("pub async fn ").next().unwrap();
+        assert!(body.contains("file_meta: Option<&DocFileMeta"), "replace_chunks 必须接收可选文件元数据: {body}");
+        assert!(body.contains("sha256=COALESCE($20::text,sha256)"), "sha256 同语句 COALESCE 切换: {body}");
+        assert!(body.contains("bytes=COALESCE($21::bigint,bytes)"), "bytes 同语句 COALESCE 切换: {body}");
+        assert!(body.contains("mime=COALESCE($22::text,mime)"), "mime 同语句 COALESCE 切换: {body}");
+        assert!(body.contains("s.owner=$15"), "既有写复核 bind 编号不许漂: {body}");
+        assert!(body.contains("$19::text[]"), "既有词列 bind 编号不许漂: {body}");
+    }
+
+    /// 同名覆盖命中的 SQL 合同（连库前的源码钉住）：同空间 + `name` 精确匹配 +
+    /// 目录限定（`folder_id` NULL 根目录经 `IS NOT DISTINCT FROM` 命中）+
+    /// 历史多同名只取最近更新的一篇（其余原样保留，不替用户删数据）。
+    #[test]
+    fn find_by_name_in_folder_sql_contract() {
+        let src = include_str!("store.rs");
+        let body = src.split("pub async fn find_by_name_in_folder").nth(1).unwrap();
+        let body = body.split("pub enum ").next().unwrap();
+        assert!(body.contains("space_id=$1 AND name=$2"), "必须同空间 + name 精确匹配: {body}");
+        assert!(body.contains("folder_id IS NOT DISTINCT FROM $3"), "目录限定必须覆盖根目录 NULL: {body}");
+        assert!(body.contains("ORDER BY updated_at DESC"), "多同名必须取最近更新: {body}");
+        assert!(body.contains("LIMIT 1"), "只取一篇覆盖，其余不动: {body}");
     }
 
     #[test]

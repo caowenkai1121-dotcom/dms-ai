@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(cx.limit, 6, "cx 仅为召回上下文形状样例");
         assert!(catalog_table(DMS_DS_ID, "dws_off_offline_sale_dfn"));
         assert!(!catalog_table(DMS_DS_ID, "dws_mkt_app_distribution_inventory_dfn"));
-        assert_eq!(catalog_table_filter(DMS_DS_ID).unwrap().len(), 57);
+        assert_eq!(catalog_table_filter(DMS_DS_ID).unwrap().len(), 58);
         assert_eq!(
             warehouse_qualified_table("dws_off_offline_sale_dfn").as_deref(),
             Some("sales_dw.dws_off_offline_sale_dfn")

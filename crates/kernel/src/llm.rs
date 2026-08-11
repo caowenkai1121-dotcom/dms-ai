@@ -46,7 +46,7 @@ impl ChatRequest {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -82,6 +82,25 @@ impl Error for LlmError {}
 /// 对话模型。`&'a self` + `BoxFut<'a, _>`：实现侧持 http 客户端，调用侧可放 `Arc<dyn ChatModel>`。
 pub trait ChatModel: Send + Sync {
     fn chat<'a>(&'a self, req: ChatRequest) -> BoxFut<'a, Result<ChatReply, LlmError>>;
+
+    /// 流式变体：支持 SSE 的供应商边收边把**原始增量**推进 `on_delta`（增量未过调用方
+    /// 任何后处理，只许当预览；最终内容以返回的 `ChatReply` 为准）。
+    /// 默认实现回退非流式：拿到全文一次性推一条增量 —— 只实现 `chat` 的存量实现
+    /// （含全部测试桩）因此零改动获得流式入口，只是没有边收边推的效果。
+    /// 回调是同步 `FnMut`（在读流循环里同步调用）：批量刷/节流由消费方做，kernel 不引 tokio。
+    fn chat_stream<'a>(
+        &'a self,
+        req: ChatRequest,
+        mut on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> BoxFut<'a, Result<ChatReply, LlmError>> {
+        Box::pin(async move {
+            let reply = self.chat(req).await?;
+            if let Some(text) = reply.content.as_deref() {
+                on_delta(text);
+            }
+            Ok(reply)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -109,5 +128,52 @@ mod tests {
             "LLM 429: {\"e\":1}"
         );
         assert_eq!(LlmError::MissingContent.to_string(), "LLM 响应缺 content");
+    }
+
+    /// 默认 `chat_stream` 回退非流式：只实现 `chat` 的桩也能走流式入口 ——
+    /// 增量恰一条（全文）、返回值原样（usage 不丢）。这是全部存量测试桩的兼容契约。
+    #[test]
+    fn default_chat_stream_falls_back_to_chat() {
+        struct Stub;
+        impl ChatModel for Stub {
+            fn chat<'a>(&'a self, _req: ChatRequest) -> BoxFut<'a, Result<ChatReply, LlmError>> {
+                Box::pin(async {
+                    Ok(ChatReply {
+                        content: Some("完整回答".into()),
+                        usage: Usage { prompt_tokens: 7, completion_tokens: 3 },
+                    })
+                })
+            }
+        }
+        // 手写一个一次性 block_on：kernel 不引 tokio（硬规则），本测试只需跑完一个 ready future
+        let deltas: std::sync::Mutex<Vec<String>> = Vec::new().into();
+        let fut = Stub.chat_stream(
+            ChatRequest::text(ModelTier::Fast, "s", "u", None),
+            Box::new(|piece: &str| deltas.lock().unwrap().push(piece.to_string())),
+        );
+        let reply = futures_lite_block_on(fut).unwrap();
+        assert_eq!(reply.content.as_deref(), Some("完整回答"));
+        assert_eq!(reply.usage.prompt_tokens, 7);
+        assert_eq!(deltas.into_inner().unwrap(), vec!["完整回答".to_string()]);
+    }
+
+    /// 极简 block_on：标准库组件拼一个空 waker 轮询（本 crate 的 future 都不真挂起）。
+    fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn no_op(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        let waker: Waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                // 本 crate 的 future 要么立即 Ready，要么真 IO（测试里不会出现）；空转即 panic 防死等
+                Poll::Pending => panic!("测试 future 不该挂起"),
+            }
+        }
     }
 }

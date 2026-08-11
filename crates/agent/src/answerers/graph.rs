@@ -175,6 +175,7 @@ pub async fn try_graph(pg: &PgPool, rel: &Relation, t0: Instant) -> Option<AskRe
         comparisons: vec![],
         subs: vec![],
         caliber_note: None, // 图查询不产 SQL，没有可判的口径
+        reinterpret_note: None,
         // 图查询走 AGE、不过 connector 的敏感列防线（列是 code/name/amount 三个固定列）
         redacted: vec![],
         // 图查询不过行权限注入器（走的是 AGE 的 Cypher，不是 ScopedSql）

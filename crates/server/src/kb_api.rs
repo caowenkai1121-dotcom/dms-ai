@@ -8,6 +8,7 @@
 use crate::AppState;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::sse::{Event, Sse};
 use axum::Json;
 use dms_kernel::{ChatModel, ChatRequest, ModelTier};
 use dms_knowledge::store::DocRow;
@@ -126,12 +127,17 @@ fn kb_err(e: KbError) -> ApiErr {
         KbError::NotFound(_) => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    let message = match &e {
+    err(code, kb_err_msg(&e))
+}
+
+/// `kb_err` 的文案半段（状态码映射的同款判定）：流式端点的 error 帧只有文案没有状态码，
+/// 两处共用一份，不许各写各的收敛规则。
+fn kb_err_msg(e: &KbError) -> String {
+    match e {
         KbError::BadInput(_) | KbError::Forbidden(_) | KbError::NotFound(_) => e.to_string(),
         KbError::Upstream(_) => "文档处理服务暂时不可用，请稍后重试".to_string(),
         KbError::Db(_) => MSG_KB_UNAVAILABLE.to_string(),
-    };
-    err(code, message)
+    }
 }
 
 /// 知识库端点共用的 query。上传 multipart 只接收空间/目录，身份只认会话 header。
@@ -399,7 +405,7 @@ pub async fn upload(
     .await
     .map_err(kb_err)?;
     let row = acl::doc_for_viewer(&st.owned, &v, &prepared.doc_id).await.map_err(kb_err)?;
-    Ok(Json(doc_json(&row, chrono::Local::now().date_naive())))
+    Ok(Json(upload_doc_json(&row, prepared.replaced.as_deref())))
 }
 
 /// 后台跑入库重活：许可 move 进任务、持有到重活结束（闸门防的内存就活在这段期间）。
@@ -418,8 +424,10 @@ fn spawn_ingest_job(
 
 /// 重活执行 + 结果收尾：在线上传的后台任务与启动自愈共用这一条。
 /// - 通道②数据源登记依赖重活产物（`source`），只能在这里完成——请求早已返回；
-/// - Fresh 的失败文案 `run_job` 已落库（文档列表可见），Rebuild 失败保留线上版本，
-///   两条链在这里都只欠一条日志。
+/// - Fresh 的失败文案 `run_job` 已落库（文档列表可见），Rebuild/Overwrite 失败保留线上版本，
+///   三条链在这里都只欠一条日志；
+/// - Overwrite 的通道②收尾看新内容：有表 → 重新登记/同步结构（登记是 upsert，ds_id 由
+///   doc_id 派生不变）；无表 → 旧版本登记过的数据源必须随之退役（幂等三步清理）。
 async fn run_ingest_job_logged(
     st: &AppState,
     v: &Viewer,
@@ -429,16 +437,23 @@ async fn run_ingest_job_logged(
     _permit: tokio::sync::SemaphorePermit<'_>,
 ) {
     let ocr = RuntimeImageOcr { llm: st.llm.clone() };
+    let is_overwrite = matches!(&job, ingest::IngestJob::Overwrite { .. });
     match ingest::run_job(&st.owned, &st.doc, &st.embed, v, &st.kb_cfg, doc_id, job, Some(&ocr))
         .await
     {
         Ok(source) => {
             if let Some(src) = source {
                 register_source(st, v, doc_name, doc_id, &src).await;
+            } else if is_overwrite {
+                // 覆盖后的新内容没有表格：旧版本若登记过数据源必须退役（否则问数拿旧版本的
+                // 数据答新版本的文档）。三步幂等清理，失败只留日志（重传同名文件可收敛）。
+                if let Err(e) = cleanup_source(st, doc_id).await {
+                    tracing::warn!(doc_id, error = %e.1.0, "同名覆盖后旧数据源退役清理失败");
+                }
             }
         }
         Err(e) => {
-            tracing::warn!(doc_id, error = %e, "入库重活失败（Fresh 已落失败文案；Rebuild 保留线上版本）");
+            tracing::warn!(doc_id, error = %e, "入库重活失败（Fresh 已落失败文案；Rebuild/Overwrite 保留线上版本）");
         }
     }
 }
@@ -799,7 +814,7 @@ mod ops_pack {
             tracing::warn!(doc_id = %prepared.doc_id, err = %e, "URL 已入库，来源地址回写失败");
         }
         let row = acl::doc_for_viewer(&st.owned, &v, &prepared.doc_id).await.map_err(kb_err)?;
-        Ok(Json(doc_json(&row, chrono::Local::now().date_naive())))
+        Ok(Json(upload_doc_json(&row, prepared.replaced.as_deref())))
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2396,8 +2411,10 @@ fn is_office_ext(path: &std::path::Path) -> bool {
 
 /// 缓存键带源文件指纹（mtime 秒 + size）：重传/重建换了文件自动失效，旧缓存成为惰性孤儿
 ///（重启自愈或人工清理回收，不影响正确性）。
+/// `v2` = 转换参数代际：xls* 族 2026-08-11 起用 SinglePageSheets（宽表不再断列），
+/// 不改代际号会让旧分页产物一直命中（缓存键不含转换参数，参数变了必须换名）。
 fn office_pdf_cache_path(root: &std::path::Path, doc_id: &str, mtime_secs: u64, size: u64) -> std::path::PathBuf {
-    root.join(".preview_cache").join(format!("{doc_id}-{mtime_secs}-{size}.pdf"))
+    root.join(".preview_cache").join(format!("{doc_id}-{mtime_secs}-{size}-v2.pdf"))
 }
 
 /// Office 原件 → 缓存 PDF 路径。缓存命中直接返回；未命中做 per-doc 去重的转换
@@ -2493,12 +2510,24 @@ async fn convert_office_to_pdf(src: &std::path::Path, cache: &std::path::Path) -
 /// 返回 soffice 产物路径（`<work>/<源文件stem>.pdf`）。
 async fn convert_office_in(src: &std::path::Path, work: &std::path::Path) -> Result<std::path::PathBuf, ()> {
     let profile = reqwest::Url::from_file_path(work.join("profile")).map_err(|_| ())?;
+    // 电子表格启用 SinglePageSheets（每 sheet 一整页）：默认分页会把宽表从列中间切成好几页
+    //（2026-08-11 实测 4 页断列），用户要求与源文件一致。LO ≥7.4 支持该 filter option。
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let convert_to = if matches!(ext.as_str(), "xls" | "xlsx" | "xlsm") {
+        "pdf:calc_pdf_Export:{\"SinglePageSheets\":{\"type\":\"boolean\",\"value\":true}}"
+    } else {
+        "pdf"
+    };
     // kill_on_drop：超时被 timeout 丢掉的 output() future 必须把 soffice 子进程一起带走，
     // 否则每次超时泄漏一个几百 MB 的僵尸进程
     let mut cmd = tokio::process::Command::new("soffice");
     cmd.args(["--headless", "--nologo", "--nodefault"])
         .arg(format!("-env:UserInstallation={profile}"))
-        .args(["--convert-to", "pdf", "--outdir"])
+        .args(["--convert-to", convert_to, "--outdir"])
         .arg(work)
         .arg(src)
         .stdin(std::process::Stdio::null())
@@ -2824,6 +2853,242 @@ pub async fn chunk(
     })))
 }
 
+// ---------------------------------------------------------------- SSE 流式问答
+//
+// 协议 `kb-ask-stream v1`（`POST /api/kb/ask/stream` 首发，`/api/ask/stream` 与
+// `/api/xcx/ask/stream` 两个会话型变体复用同一装配）。每帧 `data:` 是**单行 JSON**
+// （serde_json 转义换行，帧格式恒一 data 行）：
+//
+// - `event: meta`   —— 检索完成、生成开始前发一次：
+//     `{"trace_id","citations":[Citation…],"searched_docs":N|null, …端点附加键}`。
+//     citations 是**候选命中**（未按正文引用压缩，最终引用以 done 为准）；
+//     端点附加键：`/api/ask/stream`、`/api/xcx/ask/stream` 带 `conv_id`，本端点带 `space_id`。
+// - `event: delta`  —— 正文增量**预览** `{"text":"…"}`，可多次。攒批（ChunkedEventWriter
+//     口径）：≥512 字立即发，否则 100ms 一拍冲掉。增量是模型原文、未过口径后处理，
+//     客户端必须在 done 时整体替换。
+// - `event: done`   —— 成功终止：`{"answer":{Answer}}`，Answer 与 `POST /api/kb/ask`
+//     同步端点的 wire 逐字同形（route/kind/markdown/citations/elapsed_ms/trace_id）。
+// - `event: error`  —— 失败终止：`{"message":"固定友好文案"}`，真因只进服务端日志。
+//
+// 零命中路径不调 LLM：meta（citations 空）→ done（「知识库里没有相关内容…」），无 delta。
+// 认证/入参错误（401/400）在 SSE 开始之前以普通 JSON 错误返回，不进事件流。
+
+/// delta 攒批口径：攒够 512 字立即发，否则 100ms 一拍冲掉。「字」= Unicode 字符数
+/// （中文一字一符），不是字节 —— 按字节会把中文的阈值悄悄压低到 1/3。
+const DELTA_FLUSH_CHARS: usize = 512;
+const DELTA_FLUSH_MS: u64 = 100;
+
+/// 工人异常消失（panic）时泵补给客户端的终止帧文案：不留白流尾，客户端按失败走降级。
+const MSG_STREAM_BROKEN: &str = "回答生成中断，请重试";
+
+/// 流式问答的内部通道项：knowledge 的 `AnswerEvent`（Meta/Delta）+ server 自加的终止项。
+pub(crate) enum SseItem {
+    Meta(dms_knowledge::answer::AnswerMeta),
+    Delta(String),
+    /// 最终答案（与同步端点逐字同口径），`elapsed_ms`/`trace_id` 已钉好
+    Done(Box<dms_kernel::Answer>),
+    /// 失败终止帧；文案由端点给（各自的收敛口径不同），真因已留痕
+    Fail(String),
+}
+
+/// meta 帧载荷。extra 先插、基础键后插：端点附加键（conv_id 等）撞名也盖不掉协议键。
+fn meta_payload(
+    m: &dms_knowledge::answer::AnswerMeta,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut o = extra.clone();
+    o.insert("trace_id".into(), serde_json::json!(m.trace_id));
+    o.insert(
+        "citations".into(),
+        serde_json::to_value(&m.citations).expect("Citation 是纯数据 struct，序列化不失败"),
+    );
+    o.insert(
+        "searched_docs".into(),
+        m.searched_docs.map_or(serde_json::Value::Null, |n| serde_json::json!(n)),
+    );
+    serde_json::to_string(&o).expect("JSON map 序列化不失败")
+}
+
+fn delta_payload(text: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "text": text })).expect("JSON map 序列化不失败")
+}
+
+fn done_payload(a: &dms_kernel::Answer) -> String {
+    serde_json::to_string(&serde_json::json!({ "answer": a })).expect("Answer 是纯数据 struct，序列化不失败")
+}
+
+fn error_payload(msg: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "message": msg })).expect("JSON map 序列化不失败")
+}
+
+fn sse_event(name: &'static str, payload: String) -> Event {
+    Event::default().event(name).data(payload)
+}
+
+/// delta 攒批器：`push` 攒到 ≥512 字立即吐，`flush` 把不足一拍的残余吐掉
+/// （100ms 那一拍由 `pump_sse` 的 interval 驱动）。
+#[derive(Default)]
+struct DeltaBatcher {
+    buf: String,
+}
+
+impl DeltaBatcher {
+    fn push(&mut self, piece: &str) -> Option<String> {
+        self.buf.push_str(piece);
+        (self.buf.chars().count() >= DELTA_FLUSH_CHARS).then(|| std::mem::take(&mut self.buf))
+    }
+    fn flush(&mut self) -> Option<String> {
+        (!self.buf.is_empty()).then(|| std::mem::take(&mut self.buf))
+    }
+}
+
+/// 事件泵：工人通道 → SSE 帧。meta/done/error 到达前先冲掉未发 delta（事件序 = 产生序）；
+/// `tx` 是有界 mpsc，客户端消费慢时背压自然传到攒批器。send 失败 = 客户端断流，泵即收工
+/// （工人在生成侧继续跑完 —— 与同步路径一样，断流不撤销已发起的生成，落账照常）。
+async fn pump_sse(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<SseItem>,
+    extra: serde_json::Map<String, serde_json::Value>,
+    tx: tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>,
+) {
+    let mut batcher = DeltaBatcher::default();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(DELTA_FLUSH_MS));
+    // 攒批期间工人狂推时跳拍（Skip）：连发几拍补帧只会把同一缓冲切成两半，没有意义
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            item = rx.recv() => match item {
+                Some(SseItem::Delta(t)) => {
+                    if let Some(chunk) = batcher.push(&t) {
+                        if tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await.is_err() { return; }
+                    }
+                }
+                Some(other) => {
+                    if let Some(chunk) = batcher.flush() {
+                        if tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await.is_err() { return; }
+                    }
+                    let (name, payload, terminal) = match other {
+                        SseItem::Meta(m) => ("meta", meta_payload(&m, &extra), false),
+                        SseItem::Done(a) => ("done", done_payload(&a), true),
+                        SseItem::Fail(msg) => ("error", error_payload(&msg), true),
+                        SseItem::Delta(_) => unreachable!("delta 已在上个分支收走"),
+                    };
+                    if tx.send(Ok(sse_event(name, payload))).await.is_err() { return; }
+                    if terminal { return; }
+                }
+                // 工人异常消失（通道无终止帧就关了）：冲掉残余后补 error 帧，客户端不傻等
+                None => {
+                    if let Some(chunk) = batcher.flush() {
+                        let _ = tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await;
+                    }
+                    let _ = tx.send(Ok(sse_event("error", error_payload(MSG_STREAM_BROKEN)))).await;
+                    return;
+                }
+            },
+            _ = tick.tick() => {
+                if let Some(chunk) = batcher.flush() {
+                    if tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await.is_err() { return; }
+                }
+            }
+        }
+    }
+}
+
+/// 三条流式端点共用的 SSE 装配：事件泵 spawn + 15s keep-alive 注释帧（防反代掐空闲连接）。
+pub(crate) fn sse_response(
+    rx: tokio::sync::mpsc::UnboundedReceiver<SseItem>,
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let (tx, out) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(pump_sse(rx, extra, tx));
+    let stream = futures::stream::unfold(out, |mut out| async move {
+        out.recv().await.map(|item| (item, out))
+    });
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+/// 三条流式端点共用的问答工人：`answer_stream` 的事件转进通道；落定后可选会话持久化
+/// （user/ai 两条，与 `/api/ask` 同一条 `save_msg_logged`），再发终止帧。
+/// `fail_msg` 由各端点给（文案收敛口径不同）；真因只进 tracing。
+pub(crate) fn spawn_kb_worker(
+    st: &Arc<AppState>,
+    v: Viewer,
+    space: Option<String>,
+    question: &str,
+    conv_id: Option<i64>,
+    fail_msg: fn(&KbError) -> String,
+) -> tokio::sync::mpsc::UnboundedReceiver<SseItem> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
+    let st = st.clone();
+    let question = question.to_string();
+    tokio::spawn(async move {
+        let on_event = |ev: dms_knowledge::answer::AnswerEvent| {
+            let item = match ev {
+                dms_knowledge::answer::AnswerEvent::Meta(m) => SseItem::Meta(m),
+                dms_knowledge::answer::AnswerEvent::Delta(t) => SseItem::Delta(t),
+            };
+            // 客户端断流后 send 失败：丢弃预览增量，答案仍生成完并落账（与同步路径一致）
+            let _ = tx.send(item);
+        };
+        let cfg = st.cfg();
+        let out = dms_knowledge::answer::answer_stream(
+            &st.owned,
+            &st.embed,
+            &st.llm,
+            &v,
+            space.as_deref(),
+            &question,
+            &cfg.kb_rrf_weights,
+            &on_event,
+        )
+        .await;
+        match out {
+            Ok(a) => {
+                // 会话型端点：与 /api/ask 同口径存 user/ai 两条（写库失败只丢历史，不拦响应）
+                if let Some(cid) = conv_id {
+                    let payload = serde_json::to_value(&a).unwrap_or_else(|e| {
+                        tracing::warn!(conv_id = cid, reason = %e, "流式问答结果序列化失败，会话内落空对象");
+                        serde_json::json!({})
+                    });
+                    crate::chat::save_msg_logged(st.owned.pool(), cid, crate::chat::ROLE_USER, &question, None).await;
+                    crate::chat::save_msg_logged(st.owned.pool(), cid, crate::chat::ROLE_AI, "", Some(&payload)).await;
+                }
+                let _ = tx.send(SseItem::Done(Box::new(a)));
+            }
+            Err(e) => {
+                let msg = fail_msg(&e);
+                tracing::warn!(reason = %e, "KB 流式问答失败（客户端收固定文案，细节只留痕）");
+                let _ = tx.send(SseItem::Fail(msg));
+            }
+        }
+    });
+    rx
+}
+
+/// `POST /api/kb/ask/stream` —— `ask` 的 SSE 流式变体（协议见本文件「SSE 流式问答」段头注）。
+/// 同步端点契约一字不动：老客户端零影响；认证/校验与 `ask` 同序同文案 —— 401/400 在
+/// SSE 开始之前以普通 JSON 错误返回，不进事件流。
+pub async fn ask_stream(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<AskKbReq>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiErr> {
+    let v = viewer(&st, &headers, &req.q).await?;
+    // 与 search/ask 同一条边缘校验（同族端点同文案）；knowledge 层的 BadInput 仍是兜底防线
+    let question = nonempty_question(&req.question)?;
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "space_id".into(),
+        req.q.space_id.clone().map_or(serde_json::Value::Null, serde_json::Value::String),
+    );
+    // 无会话概念（与 `ask` 一致）：conv_id = None 不做持久化
+    let rx = spawn_kb_worker(&st, v, req.q.space_id.clone(), question, None, kb_err_msg);
+    Ok(sse_response(rx, extra))
+}
+
 struct Form {
     q: KbQuery,
     /// (原始文件名, content-type, 字节)
@@ -2963,6 +3228,20 @@ fn doc_json(d: &DocRow, today: chrono::NaiveDate) -> serde_json::Value {
         "created_at": d.created_at,
         "updated_at": d.updated_at,
     })
+}
+
+/// 上传/URL 入库的响应：`doc_json` 之上叠加同名覆盖标记——覆盖命中时前端上传队列行据
+/// `replaced` + `replaced_doc_name` 显示「已覆盖旧版本」；非覆盖恒为 `false`/`null`
+/// （字段恒在，前端不做存在性分支）。
+fn upload_doc_json(d: &DocRow, replaced: Option<&str>) -> serde_json::Value {
+    let mut body = doc_json(d, chrono::Local::now().date_naive());
+    let obj = body.as_object_mut().expect("doc_json 恒为 JSON 对象");
+    obj.insert("replaced".into(), serde_json::json!(replaced.is_some()));
+    obj.insert(
+        "replaced_doc_name".into(),
+        replaced.map_or(serde_json::Value::Null, serde_json::Value::from),
+    );
+    body
 }
 
 fn folder_json(f: &store::FolderRow) -> serde_json::Value {
@@ -3514,7 +3793,7 @@ mod tests {
         assert!(is_office_ext(std::path::Path::new("d/f.DOCX")));
 
         let p = office_pdf_cache_path(std::path::Path::new("data/kb"), "doc1", 123, 456);
-        assert_eq!(p, std::path::Path::new("data/kb/.preview_cache/doc1-123-456.pdf"));
+        assert_eq!(p, std::path::Path::new("data/kb/.preview_cache/doc1-123-456-v2.pdf"));
         // 指纹变了键就变（重传/重建自动失效）
         assert_ne!(p, office_pdf_cache_path(std::path::Path::new("data/kb"), "doc1", 124, 456));
         assert_ne!(p, office_pdf_cache_path(std::path::Path::new("data/kb"), "doc1", 123, 457));
@@ -3558,6 +3837,70 @@ mod tests {
         let re = src.split("pub async fn reprocess").nth(1).unwrap();
         let re = re.split("pub async fn set_doc_state").next().unwrap();
         assert!(re.contains("spawn_ingest_job(") && !re.contains("ingest::run_job("), "reprocess 重活同样后台化: {re}");
+    }
+
+    fn doc_row_fixture() -> DocRow {
+        DocRow {
+            doc_id: "d1".into(),
+            space_id: "kb-hr".into(),
+            folder_id: Some("f1".into()),
+            folder_path: "/制度".into(),
+            name: "制度.pdf".into(),
+            mime: "application/pdf".into(),
+            bytes: 123,
+            sha256: "a".repeat(64),
+            status: "embedded".into(),
+            enabled: true,
+            tags: vec![],
+            business_domain: None,
+            effective_from: None,
+            effective_to: None,
+            source_uri: None,
+            document_family: None,
+            document_revision: None,
+            error: String::new(),
+            notice: String::new(),
+            description: String::new(),
+            page_count: 1,
+            chunk_count: 3,
+            uploaded_by: "zhangsan".into(),
+            created_at: "2026-08-01 00:00:00".into(),
+            updated_at: "2026-08-01 00:00:00".into(),
+        }
+    }
+
+    /// 同名覆盖的响应透出（前端上传队列行据 `replaced`/`replaced_doc_name` 显示
+    /// 「已覆盖旧版本」）：覆盖命中 → true + 文档名；非覆盖 → false/null，两字段恒在。
+    #[test]
+    fn upload_response_carries_replaced_flag() {
+        let row = doc_row_fixture();
+        let hit = upload_doc_json(&row, Some("制度.pdf"));
+        assert_eq!(hit["replaced"], serde_json::json!(true));
+        assert_eq!(hit["replaced_doc_name"], serde_json::json!("制度.pdf"));
+        assert_eq!(hit["doc_id"], serde_json::json!("d1"), "覆盖复用既有 doc_id");
+        let fresh = upload_doc_json(&row, None);
+        assert_eq!(fresh["replaced"], serde_json::json!(false));
+        assert_eq!(fresh["replaced_doc_name"], serde_json::Value::Null);
+    }
+
+    /// 同名覆盖的接线合同（源码钉住）：两个入库入口的响应都经 `upload_doc_json` 透出
+    /// replaced 标记；覆盖任务的通道②收尾（有表重新登记 / 无表退役清理）在后台任务里
+    /// 分派——`cleanup_source` 必须挂在 Overwrite 臂上，Rebuild（自愈会重建表格文档，
+    /// 旧数据源原样保留）不许被误挂清理。
+    #[test]
+    fn overwrite_is_wired_into_upload_responses_and_job_finale() {
+        let src = include_str!("kb_api.rs");
+        let up = src.split("pub async fn upload").nth(1).unwrap();
+        let up = up.split("\n}\n").next().unwrap();
+        assert!(up.contains("upload_doc_json(&row, prepared.replaced.as_deref())"), "upload 响应必须透出 replaced: {up}");
+        let url = src.split("pub async fn ingest_url").nth(1).unwrap();
+        let url = url.split("enum FetchedKind").next().unwrap();
+        assert!(url.contains("upload_doc_json(&row, prepared.replaced.as_deref())"), "ingest_url 响应必须透出 replaced: {url}");
+        let job = src.split("async fn run_ingest_job_logged").nth(1).unwrap();
+        let job = job.split("\n}\n").next().unwrap();
+        assert!(job.contains("ingest::IngestJob::Overwrite"), "覆盖任务必须走通道②收尾分派: {job}");
+        assert!(job.contains("register_source("), "新内容有表必须重新登记: {job}");
+        assert!(job.contains("cleanup_source("), "新内容无表必须退役旧数据源: {job}");
     }
 
     /// 启动自愈结构断言（源码钉住）：main.rs 挂了自愈 spawn；分派键是分块存在性；
@@ -3872,5 +4215,129 @@ mod tests {
         assert!(check < sync, "先查存在性再同步");
         assert!(body.contains("tracing::warn!"), "同步失败只 warn: {body}");
         assert!(src.contains("文档状态已变更"), "set_doc_state 的同步失败文案变了");
+    }
+
+    // ---------------- SSE 流式问答：攒批与帧形态 ----------------
+
+    /// 攒批边界：512 字阈值按**字符**计（中文一字一符，不是字节 —— 按字节会把中文阈值
+    /// 悄悄压低到 1/3）。跨多次 push 累计，够线即吐且吐的是**全部**累积。
+    #[test]
+    fn delta_batcher_char_boundary() {
+        let mut b = DeltaBatcher::default();
+        assert_eq!(b.flush(), None, "空缓冲冲不出东西");
+        // 511 个汉字（1533 字节）不到线：按字节算早该吐了
+        let piece = "报".repeat(DELTA_FLUSH_CHARS - 1);
+        assert_eq!(b.push(&piece), None);
+        assert_eq!(b.push("销"), Some("报".repeat(DELTA_FLUSH_CHARS - 1) + "销"), "第 512 字到线即吐");
+        assert_eq!(b.flush(), None, "吐完缓冲已空");
+        // 单块超线：整块原样吐出（不在字符中间切）
+        let big = "x".repeat(DELTA_FLUSH_CHARS * 2);
+        assert_eq!(b.push(&big), Some(big));
+        // 残余靠 flush
+        assert_eq!(b.push("半截"), None);
+        assert_eq!(b.flush(), Some("半截".into()));
+        assert_eq!(b.flush(), None, "flush 只吐一次");
+    }
+
+    /// 帧载荷形态钉死：单行 JSON（SSE 一帧一 data 行的前提），协议键齐全，
+    /// 端点附加键撞名盖不掉协议键。
+    #[test]
+    fn sse_payload_shapes() {
+        let meta = dms_knowledge::answer::AnswerMeta {
+            trace_id: "t-1".into(),
+            citations: vec![],
+            searched_docs: Some(7),
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("conv_id".into(), serde_json::json!(42));
+        extra.insert("trace_id".into(), serde_json::json!("伪造"),);
+        let p = meta_payload(&meta, &extra);
+        assert!(!p.contains('\n'), "帧载荷必须单行: {p}");
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["trace_id"], "t-1", "附加键不许盖掉协议键");
+        assert_eq!(v["conv_id"], 42);
+        assert_eq!(v["searched_docs"], 7);
+        assert_eq!(v["citations"], serde_json::json!([]));
+        // searched_docs = None（没真正检索）也上线为 null —— 与 Citation.page 的「null 也上线」同款理由：
+        // 客户端不猜键缺席的含义
+        let meta_none = dms_knowledge::answer::AnswerMeta { trace_id: "t-2".into(), citations: vec![], searched_docs: None };
+        let v: serde_json::Value = serde_json::from_str(&meta_payload(&meta_none, &serde_json::Map::new())).unwrap();
+        assert!(v.get("searched_docs").is_some_and(serde_json::Value::is_null));
+
+        let d: serde_json::Value = serde_json::from_str(&delta_payload("正文\n增量")).unwrap();
+        assert_eq!(d, serde_json::json!({ "text": "正文\n增量" }), "换行进 \\n 转义，不拆帧");
+        let e: serde_json::Value = serde_json::from_str(&error_payload("固定文案")).unwrap();
+        assert_eq!(e, serde_json::json!({ "message": "固定文案" }));
+        assert!(!error_payload("x").contains('\n'));
+
+        let a = dms_kernel::Answer::text("正文[^1]".into(), vec![], 12);
+        let done: serde_json::Value = serde_json::from_str(&done_payload(&a)).unwrap();
+        assert_eq!(done["answer"]["kind"], "text", "done 的 Answer 与同步端点同 wire");
+        assert_eq!(done["answer"]["route"], "knowledge");
+        assert_eq!(done["answer"]["markdown"], "正文[^1]");
+    }
+
+    /// 事件帧组装：event 名与单行 data。axum `Event` 不带公开读取口，走 Debug 形态钉 —
+    /// 钉的是「帧里确实有 event: meta 且 data 单行」，不是 Debug 格式本身。
+    #[test]
+    fn sse_event_frame_names() {
+        for (name, payload) in [
+            ("meta", meta_payload(&dms_knowledge::answer::AnswerMeta { trace_id: "t".into(), citations: vec![], searched_docs: None }, &serde_json::Map::new())),
+            ("delta", delta_payload("x")),
+            ("done", done_payload(&dms_kernel::Answer::text("m".into(), vec![], 1))),
+            ("error", error_payload("固定文案")),
+        ] {
+            assert!(!payload.contains('\n'), "{name} 载荷多行会拆帧: {payload}");
+            let frame = format!("{:?}", sse_event(name, payload));
+            assert!(frame.contains(name), "{name} 帧缺 event 名: {frame}");
+        }
+    }
+
+    /// 事件泵端到端：低于阈值的 delta 攒住 → Meta 到达前先冲残余（事件序 = 产生序）→
+    /// Done 终止后泵收工。不依赖时间拍（全部走「终止/元事件到达先冲」那条确定性路径）。
+    /// 载荷用 ASCII：axum `Event` 的 Debug 对非 ASCII 字节转义，断言要看得懂。
+    #[tokio::test]
+    async fn pump_flushes_pending_delta_before_meta_and_done() {
+        let (wtx, wrx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
+        let (otx, mut orx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(pump_sse(wrx, serde_json::Map::new(), otx));
+        wtx.send(SseItem::Delta("part-1".into())).unwrap();
+        wtx.send(SseItem::Meta(dms_knowledge::answer::AnswerMeta {
+            trace_id: "t-1".into(),
+            citations: vec![],
+            searched_docs: Some(2),
+        }))
+        .unwrap();
+        wtx.send(SseItem::Delta("part-2".into())).unwrap();
+        wtx.send(SseItem::Done(Box::new(dms_kernel::Answer::text("final".into(), vec![], 3)))).unwrap();
+        drop(wtx);
+        let mut frames = Vec::new();
+        while let Some(Ok(ev)) = orx.recv().await {
+            frames.push(format!("{ev:?}"));
+        }
+        assert_eq!(frames.len(), 4, "delta冲帧 + meta + delta冲帧 + done: {frames:?}");
+        assert!(frames[0].contains("delta") && frames[0].contains("part-1"), "{}", frames[0]);
+        assert!(frames[1].contains("meta") && frames[1].contains("t-1"), "{}", frames[1]);
+        assert!(frames[2].contains("part-2"), "{}", frames[2]);
+        assert!(frames[3].contains("done") && frames[3].contains("final"), "{}", frames[3]);
+    }
+
+    /// 工人通道无终止帧就关闭（panic 路径）：泵冲掉残余 delta 后必须补 error 帧 ——
+    /// 客户端拿它走降级，不傻等。
+    #[tokio::test]
+    async fn pump_emits_error_when_worker_vanishes() {
+        let (wtx, wrx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
+        let (otx, mut orx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(pump_sse(wrx, serde_json::Map::new(), otx));
+        wtx.send(SseItem::Delta("partial".into())).unwrap();
+        drop(wtx); // 工人没了
+        let mut frames = Vec::new();
+        while let Some(Ok(ev)) = orx.recv().await {
+            frames.push(format!("{ev:?}"));
+        }
+        assert_eq!(frames.len(), 2, "残余 delta + error: {frames:?}");
+        assert!(frames[0].contains("partial"), "{}", frames[0]);
+        // error 帧必到（文案本身由 sse_payload_shapes 钉；Event Debug 对中文转义，这里只认事件名）
+        assert!(frames[1].contains("error"), "{}", frames[1]);
     }
 }

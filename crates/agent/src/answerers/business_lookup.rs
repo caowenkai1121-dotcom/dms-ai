@@ -744,6 +744,7 @@ fn result(
         comparisons: vec![],
         subs: vec![],
         caliber_note: None,
+        reinterpret_note: None,
         truncation_note: None,
         redacted,
         scope_note: (!cx.scope.unrestricted_by_role())

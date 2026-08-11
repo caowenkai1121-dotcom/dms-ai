@@ -3,6 +3,7 @@
 //! 逐行搬 `server/src/pipeline.rs:372-401`（`is_followup` / `rewrite_followup`）、
 //! `534-603`（`ask` / `ask_traced`）、`608-627`（`open_source`）与 `629-711`（`ask_single` 的分派骨架）。
 //! **顺序即行为**：权限集合 → 多轮改写 → 选源 → 开源 → 复合拆解 → 单问 Router 遍历 → LLM 兜底。
+//! 单问出口另挂一层「不可计算卡 → AI 归一问法 → 重试一次 → 仍出卡则澄清」（`reinterpret_question` 一节）。
 //!
 //! HTTP / CLI / 定时任务三入口共用这一个 `ask()`（server 侧那层薄包装只负责 `Trace` 与查询日志）。
 //!
@@ -170,41 +171,316 @@ pub async fn ask(
     let members = router(d.embed, d.detect, d.compose_hit, d.direct_hit, d.correctors, d.sc_samples);
     let members = &members;
     let one = |q: String| async move {
-        let cx = AskCtx {
-            p,
-            scope,
-            question: &q,
-            ds,
-            source_name,
-            source,
-            auth_source: d.auth,
-            pg: d.pg,
-            llm: d.llm,
-            ds_global,
-            // 单问的 `t0` 是**单问入口**（拆分前 `pipeline.rs:641`），不是整轮入口。
-            // 放进 `AskCtx` 之后，成员再也不用各自 `Instant::now()`——那会让排在后面的成员
-            // 把自己之前的耗时丢掉（缓存那处实测偏小十几毫秒）。
-            t0: Instant::now(),
-            trace_id: trace_id.clone(),
-            conv_id: conv_id.clone(),
-            on_usage: d.on_usage,
-        };
-        // 结果出口统一过一道呈现中文化（列名中文 + 码值翻名）：所有路由共用这一个收口，
-        // 内部全降级（词表加载不到/译不动就原样），绝不让增强把一次成功取数变成失败。
-        let mut r = ask_single(&cx, members).await?;
-        // 【判官实测·问题 3】空结果 + 出界主题无注册表覆盖 → 换 no-topic 文案
-        // （「请确认筛选条件」对「主题根本不存在」不对症）。在 localize 之前整份换掉。
-        if let Some(nt) = out_of_scope_empty_reply(&cx, &mut r).await {
-            r = nt;
+        // 单问的 `t0` 是**单问入口**（拆分前 `pipeline.rs:641`），不是整轮入口。
+        // 放进 `AskCtx` 之后，成员再也不用各自 `Instant::now()`——那会让排在后面的成员
+        // 把自己之前的耗时丢掉（缓存那处实测偏小十几毫秒）。
+        // 【AI 重新理解】提到循环外：首轮 + 归一重试抡共用同一个起点 ——
+        // elapsed_ms 要覆盖用户实际等待的全程（含归一那次 fast 往返）。
+        let t0 = Instant::now();
+        // 防递归标记：`None` = 首轮；`Some(归一问法)` = 本轮已是重试 —— 重试再出卡
+        // 直接澄清，不再改写。标记放在调用点而不是 `AskCtx`：重试在本闭包内直接再跑
+        // `ask_single`，结构上到不了第二次改写，`AskCtx` 因此零新增字段。
+        let mut retry_of: Option<String> = None;
+        // 首轮的不可计算卡留底：重试抡硬失败时回落到它（见循环内 `ask_single` 的 Err 分支）
+        let mut first_card: Option<AskResult> = None;
+        let original = q;
+        let mut current = original.clone();
+        loop {
+            let cx = AskCtx {
+                p,
+                scope,
+                question: &current,
+                ds,
+                source_name,
+                source,
+                auth_source: d.auth,
+                pg: d.pg,
+                llm: d.llm,
+                ds_global,
+                t0,
+                trace_id: trace_id.clone(),
+                conv_id: conv_id.clone(),
+                on_usage: d.on_usage,
+            };
+            // 结果出口统一过一道呈现中文化（列名中文 + 码值翻名）：所有路由共用这一个收口，
+            // 内部全降级（词表加载不到/译不动就原样），绝不让增强把一次成功取数变成失败。
+            // 🔴 重试抡的硬失败（闸门/取数 Err）不许顶替原卡：原问句本来能拿到一张卡，
+            // 不能因我们的重试变成一次 500 —— 回落首张卡（记 warn）。首轮的 Err 原样上抛
+            // （主链 fail-closed 行为一字不变）。
+            let mut r = match ask_single(&cx, members).await {
+                Ok(r) => r,
+                Err(e) => {
+                    if let Some(card) = first_card {
+                        tracing::warn!(err = %e, "归一重试抡失败 → 回落首张不可计算卡");
+                        return Ok(card);
+                    }
+                    return Err(e);
+                }
+            };
+            // 【判官实测·问题 3】空结果 + 出界主题无注册表覆盖 → 换 no-topic 文案
+            // （「请确认筛选条件」对「主题根本不存在」不对症）。在 localize 之前整份换掉。
+            if let Some(nt) = out_of_scope_empty_reply(&cx, &mut r).await {
+                r = nt;
+            }
+            crate::localize::localize_result(&cx, &mut r).await;
+            // ── 【AI 重新理解层】只有「不可计算」卡触发；合同能答的问句一行行为不变 ──
+            if !is_unavailable_card_result(&r) {
+                // 重试命中（任何非卡结果都算）：透出「已按理解为你想问：X」
+                if let Some(rewritten) = &retry_of {
+                    r.reinterpret_note = Some(format!(
+                        "原问句未能直接解析，已按理解为你想问：「{rewritten}」，以上是该问法的结果。"
+                    ));
+                }
+                return Ok(r);
+            }
+            match retry_of.take() {
+                // 首轮出卡 → fast 归一问法后**重试一次**；改不出/校验不过/模型失败 = 原卡照出
+                None => match reinterpret_question(&**d.llm, d.on_usage, &current).await {
+                    Some(rewritten) => {
+                        tracing::info!(original = %current, rewritten = %rewritten,
+                            "不可计算卡 → AI 归一问法，重试一次");
+                        first_card = Some(r); // 留底：重试抡硬失败时回落到它
+                        retry_of = Some(rewritten.clone());
+                        current = rewritten;
+                    }
+                    None => return Ok(r),
+                },
+                // 重试仍出卡 → 澄清型回答（「我理解为 X 但没答出来」+ 候选问法），不是死卡
+                Some(rewritten) => {
+                    return Ok(reinterpret_clarify_reply(
+                        &**d.llm,
+                        d.on_usage,
+                        &original,
+                        &rewritten,
+                        cx.t0,
+                        std::mem::take(&mut r.steps),
+                    )
+                    .await);
+                }
+            }
         }
-        crate::localize::localize_result(&cx, &mut r).await;
-        Ok(r)
     };
     if let Some(r) = compound::try_compound(&**d.llm, &rewritten, t0, &one).await {
         return Ok(r);
     }
     one(rewritten).await
 }
+
+// ─────────────────────── 【判官实测 2026-08-11】「不可计算」卡的 AI 重新理解层 ───────────────────────
+//
+// 实测：「销售额度按照省份按照商品」因口语残留「度」字被判「解析失败」出不可计算卡。
+// 用户问题的拆解让 AI 参与一次：fast 把问句**归一成标准问法**（不是生成 SQL！）→ 安全校验 →
+// 用归一后的问句重跑一次主链 → 命中即答（透出 `reinterpret_note`）；仍出卡 → 澄清型回答
+// （route = need-intent，候选进 `clarify_options` 与 `view.interact.drill`）。
+//
+// 纪律（与任务裁决逐条对应）：
+// - 只有 `is_unavailable_card_result` 认出的卡触发本层，合同能答的问句一行行为不变；
+// - 改写/校验/模型任何一步失败都静默回落原卡（记 warn）——本层是补救路径，它自己挂了
+//   不许把问答拖死（与 `need_intent_reply` ③ 的降级同一纪律）；
+// - 重试走的就是 `ask_single`，fail-closed 闸门/口径复核在重试抡照常全跑，改写句没有任何特权；
+// - 开票/对账卡今天进不了重试：校验④要求命中销售合同指标，而「本月开票金额」族不命中 ——
+//   那是刻意的收窄：它们不是口语残留族，放行改写等于给 LLM 自由发挥面。
+
+/// 「不可计算」卡的唯一识别口径：**镜像** `server/src/direct.rs` 的 `is_unavailable_card`
+/// （那是 crate 私有 fn，agent 不许反向引 server —— 同一识别串在此守一份镜像）。
+/// 投影头来自 direct.rs 的 `sales_fact_unavailable`（销售维度/语义、开票、对账三张卡共用）。
+/// 漂移双端锁：direct.rs 侧测试断言产出的卡能被它自己的 `is_unavailable_card` 认出；
+/// 本文件测试用 `include_str!` 直扫 direct.rs，投影头改一个字那边当场红
+/// （跨 crate 扫源有先例：server/main.rs 扫 agent/ctx.rs、direct.rs 扫 semantic/ods.rs）。
+fn is_unavailable_card_result(r: &AskResult) -> bool {
+    r.sql.contains("'不可计算' AS `数据状态`")
+}
+
+/// 归一改写的 fast 超时：与 triage.rs 的 `LLM_TIMEOUT`（8s）同档（任务裁决 2026-08-11）。
+/// 比本文件 `FAST_CALL_TIMEOUT`（4s）长是刻意的：改写是这张卡的唯一出路，多等几秒换一个
+/// 能答的问法；澄清候选仍是 4s（那是补救里的增强，不是出路）。
+const REINTERPRET_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 归一结果的字符上限（校验判据之一，单测钉住）：标准问法不可能比原句长太多。
+const REINTERPRET_MAX_CHARS: usize = 100;
+
+/// 归一提示词：few-shot 全是「口语形态 → 标准问法」。规则写死「不许新增/替换指标、维度、
+/// 时间、实体」—— 但请求不算约束，真正的护栏是结果侧的 `validate_reinterpret`。
+const REINTERPRET_SYSTEM: &str = "你是 DMS 数据问答的问句归一助手。用户的问题带口语残留、多余助词或缺省说法，导致系统解析失败。\
+请把问题归一成标准问法：只去掉口语残留/多余助词、补齐明显省略；\
+不许新增或替换原句没有的指标、维度、时间或实体；拿不准就原样输出。\n\
+示例：\n原句：销售额度按照省份按照商品\n改写：销售额按省份按商品\n\
+原句：董会琴这个月卖了多少\n改写：客户董会琴本月的销售额\n\
+原句：上个月各个省区卖的怎么样\n改写：上月销售额按省区\n\
+只输出改写后的问句一行，不要解释、不要引号、不要 SQL。";
+
+/// fast 把出卡问句归一成标准问法。**任何失败 = `None`**（调用方回落原卡）：
+/// 模型失败/超时、答非所问、空串、校验不过，全部记 warn 后返回 None。
+async fn reinterpret_question(
+    llm: &dyn ChatModel,
+    on_usage: &(dyn Fn(&Usage) + Send + Sync),
+    question: &str,
+) -> Option<String> {
+    let user = format!("原句：{question}\n改写：");
+    // 温度 0：归一是确定性任务，温度抖动是纯噪音（与三词意图门同一本账）
+    let mut req = ChatRequest::text(ModelTier::Fast, REINTERPRET_SYSTEM, &user, Some(0.0));
+    req.max_tokens = Some(48);
+    let reply = match tokio::time::timeout(REINTERPRET_TIMEOUT, llm.chat(req)).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => {
+            tracing::warn!(err = %e, "问句归一 fast 调用失败 → 原卡照出");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("问句归一 fast 调用超时 → 原卡照出");
+            return None;
+        }
+    };
+    on_usage(&reply.usage);
+    let rewritten = parse_reinterpret(reply.content.as_deref()?)?;
+    if validate_reinterpret(question, &rewritten) {
+        Some(rewritten)
+    } else {
+        // 校验不过 = 没改（严禁 LLM 改写引入新语义；判据全在纯函数里，分支有单测）
+        tracing::warn!(original = %question, rewritten = %rewritten, "归一结果未过安全校验 → 放弃重试，原卡照出");
+        None
+    }
+}
+
+/// 归一回复解析（**纯函数**）：只取首行（多行 = 模型开始解释，解释不是协议），
+/// 剥槽位标签「改写：」与直/弯引号、书名号、句末句号（剥法与 `parse_gate_verdict` 对齐）。
+fn parse_reinterpret(reply: &str) -> Option<String> {
+    let line = reply.trim().lines().next()?.trim();
+    let line = line
+        .strip_prefix("改写：")
+        .or_else(|| line.strip_prefix("改写:"))
+        .unwrap_or(line)
+        .trim();
+    let line = line
+        .trim_matches(|c: char| matches!(c, '"' | '“' | '”' | '「' | '」' | '。' | '`'))
+        .trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(line.to_string())
+}
+
+/// 归一结果的安全校验（**纯函数**，分支全有单测）。任一不过 = 没改：
+/// ① 非空且与原句不同（原样输出是提示词给的 fail-closed 出口，重试它等于原地踏步）；
+/// ② 长度护栏：≤100 字且 ≤ 原句 2 倍（标准问法不可能比原句长太多）；
+/// ③ 不是 SQL（模型把提示词里的「SQL」字样当任务抄出来时，`looks_like_sql` 接住）；
+/// ④ 仍命中销售合同指标、且至少一个与原句命中的**相同**（`run::sales_contract_metrics`）——
+///    「销售额…」被改成纯毛利问句就是引入新语义，本条把它拦下。
+fn validate_reinterpret(original: &str, rewritten: &str) -> bool {
+    if rewritten.is_empty() || rewritten == original {
+        return false;
+    }
+    let n = rewritten.chars().count();
+    if n > REINTERPRET_MAX_CHARS || n > original.chars().count() * 2 {
+        return false;
+    }
+    if looks_like_sql(rewritten) {
+        return false;
+    }
+    let before: Vec<dms_semantic::sales_fact::Metric> =
+        crate::run::sales_contract_metrics(original).into_iter().map(|(m, _)| m).collect();
+    let after: Vec<dms_semantic::sales_fact::Metric> =
+        crate::run::sales_contract_metrics(rewritten).into_iter().map(|(m, _)| m).collect();
+    !after.is_empty() && after.iter().any(|m| before.contains(m))
+}
+
+/// 重试仍失败时的**合同模板候选**（纯函数）：只用问句自己命中的合同指标/维度拼标准问法 ——
+/// 候选必须答得出来，再围着没覆盖的维度生成就是二次误导（与 `topic_system` 同一纪律）。
+/// `failed` 是刚失败过的归一问句、`original` 是用户原句：与两者逐字相同的候选都不许再推荐
+/// （刚失败过的问法再推荐一次 = 死循环引导）。
+fn contract_candidates(original: &str, failed: &str) -> Vec<ClarifyOption> {
+    let metrics = crate::run::sales_contract_metrics(failed);
+    let Some((metric, _)) = metrics.first() else {
+        return vec![];
+    };
+    // 时间词继承问句自己的表面词（归一句优先），都没有才落「本月」（合同装配器的默认窗）
+    let time = dms_kernel::nl::time::time_phrase_of(failed)
+        .or_else(|| dms_kernel::nl::time::time_phrase_of(original))
+        .unwrap_or("本月");
+    let mut out: Vec<ClarifyOption> = vec![];
+    for d in dms_semantic::sales_fact::DIMENSIONS {
+        // 时间维度作分组轴是趋势题（「按月」），与分类维度问法形态不同，不在模板里混
+        if matches!(
+            d,
+            dms_semantic::sales_fact::Dimension::OrderDate | dms_semantic::sales_fact::Dimension::Month
+        ) {
+            continue;
+        }
+        let hit = std::iter::once(d.name())
+            .chain(d.aliases().iter().copied())
+            .any(|w| failed.contains(w) || original.contains(w));
+        if !hit {
+            continue;
+        }
+        out.push(ClarifyOption {
+            label: format!("按{}", d.name()),
+            question: format!("{time}{}按{}", metric.name(), d.name()),
+        });
+    }
+    // 标量总览恒在（合同内一定能答的入口）
+    out.push(ClarifyOption {
+        label: format!("{}总览", metric.name()),
+        question: format!("{time}{}是多少", metric.name()),
+    });
+    out.retain(|o| o.question != failed && o.question != original);
+    out.truncate(CLARIFY_MAX_OPTIONS);
+    out
+}
+
+/// 澄清候选的 LLM 增强 system：围绕「系统已理解但答不出的那句」给**更常见**的问法。
+/// 与 `CLARIFY_SYSTEM` 分工不同：那边是「意图不明」，这边是「理解了但没答出来」。
+/// `rewritten` 进提示词前剥控制字符（不可信文本同 refs 段纪律：换行能伪造段头）。
+fn reinterpret_clarify_system(rewritten: &str) -> String {
+    let clean: String = rewritten.chars().filter(|c| !c.is_control()).collect();
+    format!(
+        "你是 DMS 数据问答的引导助手。用户想问「{clean}」，但系统按这个问法也没查出结果。\
+         给出 2 到 3 个用户可能想改问的、更常见更具体的完整问句，每行一个，格式：短标签|完整问句。\
+         短标签不超过 6 个汉字。问句必须具体、可直接执行（带指标或明细目标），\
+         不许复述「{clean}」本身，不要解释、不要编号外的文字。"
+    )
+}
+
+/// 重试仍出卡的澄清回答（route = need-intent）：文案说清「我理解为 X 但没答出来」，
+/// 候选 = ①合同模板（确定答得出，在前）+ ②fast 顺出的问法（增强，失败 = 只用 ①）。
+/// 响应形状与 `intent_reply` 同一份契约：`caliber_note` 正文 + `clarify_options`（App.vue
+/// chip 区）+ `view.interact.drill`（ResultPanel ask-card 的选项按钮）—— 前端零改动。
+/// `steps` 带着重试抡的分步留痕：「走过哪些路才到这里」是排障材料（与出界换文案同一纪律）。
+async fn reinterpret_clarify_reply(
+    llm: &dyn ChatModel,
+    on_usage: &(dyn Fn(&Usage) + Send + Sync),
+    original: &str,
+    rewritten: &str,
+    t0: Instant,
+    steps: Vec<Step>,
+) -> AskResult {
+    let mut options = contract_candidates(original, rewritten);
+    let llm_options =
+        clarify_options_with(llm, on_usage, original, &reinterpret_clarify_system(rewritten)).await;
+    for o in llm_options {
+        if options.len() >= CLARIFY_MAX_OPTIONS {
+            break;
+        }
+        if o.question == original || o.question == rewritten || options.iter().any(|x| x.question == o.question) {
+            continue;
+        }
+        options.push(o);
+    }
+    let mut r = empty_reply(
+        NEED_INTENT,
+        t0.elapsed().as_millis(),
+        format!(
+            "我把「{}」理解为「{}」，但按这个问法也没查出结果。可以点一个最接近的问法，或换个说法再试。",
+            clip_user_text(original),
+            clip_user_text(rewritten)
+        ),
+    );
+    r.clarify_options = options;
+    // ask-card 的选项按钮读 drill（ResultPanel 既有契约）；chip 区读 clarify_options（App.vue）
+    r.view.interact.drill = r.clarify_options.iter().map(|o| o.question.clone()).collect();
+    r.steps = steps;
+    r
+}
+
 
 /// 🔴 破坏性词表（`need_intent_reply` ① 的前置门；模块级 = 生产判据与单测共用一份）。
 /// Fast 也会把「删除所有订单」判成 answer（它有明确目标），但破坏性请求不得借疑问词或
@@ -542,6 +818,7 @@ fn empty_reply(route: &str, elapsed_ms: u128, note: String) -> AskResult {
         comparisons: vec![],
         subs: vec![],
         caliber_note: Some(note),
+        reinterpret_note: None,
         truncation_note: None,
         redacted: vec![],
         scope_note: None,
@@ -2459,5 +2736,188 @@ mod tests {
             "必须复用 no_topic_reply（另抄一份文案必漂）：{body}"
         );
         assert!(body.contains("std::mem::take(&mut r.steps)"), "分步留痕必须带过去：{body}");
+    }
+
+    // ─────────────────────── 【判官实测 2026-08-11】AI 重新理解层 ───────────────────────
+
+    /// 卡识别：与 direct.rs `is_unavailable_card` 同一识别串（镜像）；普通 SQL/空 SQL 不误判。
+    /// 🔴 镜像漂移锁：`include_str!` 直扫 direct.rs —— 投影头改一个字，这里当场红
+    /// （跨 crate 扫源先例：server/main.rs 扫 agent/ctx.rs、direct.rs 扫 semantic/ods.rs）。
+    #[test]
+    fn unavailable_card_mark_mirrors_direct_rs() {
+        const MARK: &str = "'不可计算' AS `数据状态`";
+        let direct = include_str!("../../server/src/direct.rs");
+        assert!(
+            direct.contains(MARK),
+            "direct.rs 的卡投影头变了 —— 本镜像识别串同步失效，重理解层会静默不触发"
+        );
+        let mut r = empty_reply("direct-agg", 0, String::new());
+        r.sql = format!("SELECT {MARK}, '门店' AS `未确认范围` FROM dms_ods.t_dict_value LIMIT 1");
+        assert!(is_unavailable_card_result(&r));
+        r.sql = "SELECT SUM(sf.amount) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf".into();
+        assert!(!is_unavailable_card_result(&r), "正常合同 SQL 不得误判成卡");
+        r.sql = String::new();
+        assert!(!is_unavailable_card_result(&r), "need-intent 空 SQL 不得误判成卡");
+    }
+
+    /// 归一回复解析（纯函数）：剥槽位标签/引号/句号、只取首行、空 → None。
+    #[test]
+    fn reinterpret_reply_parsing_strips_labels_quotes_and_extra_lines() {
+        assert_eq!(parse_reinterpret("销售额按省份按商品").as_deref(), Some("销售额按省份按商品"));
+        assert_eq!(parse_reinterpret("改写：销售额按省份按商品").as_deref(), Some("销售额按省份按商品"));
+        assert_eq!(parse_reinterpret("改写:销售额按省份按商品。").as_deref(), Some("销售额按省份按商品"));
+        assert_eq!(parse_reinterpret("  「客户董会琴本月的销售额」  ").as_deref(), Some("客户董会琴本月的销售额"));
+        // 多行 = 模型开始解释：只取首行（解释不是协议）
+        assert_eq!(parse_reinterpret("销售额按省份按商品\n因为「度」是残留").as_deref(), Some("销售额按省份按商品"));
+        assert_eq!(parse_reinterpret("   "), None);
+        assert_eq!(parse_reinterpret("“”"), None);
+    }
+
+    /// 归一校验的全分支（纯函数）：判官原案与「董会琴」案必须过；
+    /// 原样/空串/SQL 泄漏/超长/指标漂移/指标丢失 各拦一条。
+    #[test]
+    fn reinterpret_validation_rejects_drift_and_keeps_normalized_forms() {
+        // 判官原案：口语残留「度」归一 → 过
+        assert!(validate_reinterpret("销售额度按照省份按照商品", "销售额按省份按商品"));
+        // 客户名问法补全 → 过
+        assert!(validate_reinterpret("董会琴这个月卖了多少", "客户董会琴本月的销售额"));
+        // 原样输出 = 没改（提示词的 fail-closed 出口，重试它等于原地踏步）
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", "销售额度按照省份按照商品"));
+        // 空串
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", ""));
+        // SQL 泄漏
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", "SELECT SUM(amount) FROM sales_dw.dws"));
+        // 长度 2 倍规则（4 字原句 → 9 字改写，唯一触发的是 2 倍护栏）
+        assert!(!validate_reinterpret("销售额度", "销售额按省份按商品"), "超过原句 2 倍");
+        // 长度 100 字规则（101 字 ≤ 原句 2 倍、仍命中指标 —— 唯一触发的是 100 字护栏）
+        let long = format!("销售额按省份按商品{}", "析".repeat(92));
+        assert_eq!(long.chars().count(), 101);
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", &long), "超 100 字");
+        // 指标漂移：销售额 → 纯毛利（引入新语义）
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", "本月毛利按省份"));
+        // 指标丢失：改写成没有合同指标的话
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", "今天天气怎么样"));
+    }
+
+    /// 合同模板候选（纯函数）：只用问句自己命中的合同维度 + 恒在的标量总览；
+    /// 失败句与原句不许再推荐；时间词继承问句表面词。
+    #[test]
+    fn contract_candidates_stay_inside_the_contract() {
+        let opts = contract_candidates("销售额度按照省份按照商品", "销售额按省份按商品");
+        let qs: Vec<&str> = opts.iter().map(|o| o.question.as_str()).collect();
+        // 「省份」归一到合同维度名「省区」（别名命中、模板用合同名）
+        assert!(qs.contains(&"本月销售额按省区"), "{qs:?}");
+        assert!(qs.contains(&"本月销售额按商品"), "{qs:?}");
+        assert!(qs.contains(&"本月销售额是多少"), "标量总览恒在：{qs:?}");
+        // 刚失败过的问法与用户原句都不许再推荐
+        assert!(!qs.contains(&"销售额按省份按商品"), "{qs:?}");
+        assert!(!qs.contains(&"销售额度按照省份按照商品"), "{qs:?}");
+        // 时间词继承：「上月」不许被冲成默认「本月」；门店不在合同维度 → 只剩标量
+        let opts = contract_candidates("上月销售额按门店", "销售额按门店");
+        assert_eq!(opts.len(), 1, "门店不在合同维度里 → 只剩标量：{opts:?}");
+        assert_eq!(opts[0].question, "上月销售额是多少");
+        // 客户名案：归一句命中「客户」维度 → 按客户拆解 + 标量
+        let opts = contract_candidates("董会琴这个月卖了多少", "客户董会琴本月的销售额");
+        let qs: Vec<&str> = opts.iter().map(|o| o.question.as_str()).collect();
+        assert!(qs.contains(&"本月销售额按客户"), "{qs:?}");
+        assert!(qs.contains(&"本月销售额是多少"), "{qs:?}");
+    }
+
+    /// 归一调用的端到端（假模型）：正常归一 → Some；原样返回/模型挂了/吐 SQL/指标漂移 → None。
+    #[tokio::test]
+    async fn reinterpret_question_rewrites_validates_and_fails_closed() {
+        let ok = Fake::new(Some("销售额按省份按商品"));
+        assert_eq!(
+            reinterpret_question(&ok, &|_| {}, "销售额度按照省份按照商品").await.as_deref(),
+            Some("销售额按省份按商品")
+        );
+        // 模型拿不准原样返回 → None（= 没改，调用方回落原卡）
+        let same = Fake::new(Some("销售额度按照省份按照商品"));
+        assert_eq!(reinterpret_question(&same, &|_| {}, "销售额度按照省份按照商品").await, None);
+        // 模型挂了 → None
+        let boom = Fake::new(None);
+        assert_eq!(reinterpret_question(&boom, &|_| {}, "销售额度按照省份按照商品").await, None);
+        // 模型吐了 SQL → None
+        let sql = Fake::new(Some("SELECT SUM(amount) FROM sales_dw.dws_off_offline_sale_dfn"));
+        assert_eq!(reinterpret_question(&sql, &|_| {}, "销售额度按照省份按照商品").await, None);
+        // 指标漂移 → None（销售额被改成纯毛利）
+        let drift = Fake::new(Some("本月毛利按省份"));
+        assert_eq!(reinterpret_question(&drift, &|_| {}, "销售额度按照省份按照商品").await, None);
+    }
+
+    /// 归一的用量必须进 `on_usage`（K6-B 同一本账：查询日志 token 列不能少算这一次）；
+    /// 调用失败没有 usage 可报。
+    #[tokio::test]
+    async fn reinterpret_reports_usage_like_every_other_llm_call() {
+        let usages = AtomicUsize::new(0);
+        let count = |_: &Usage| {
+            usages.fetch_add(1, Ordering::SeqCst);
+        };
+        let ok = Fake::new(Some("销售额按省份按商品"));
+        reinterpret_question(&ok, &count, "销售额度按照省份按照商品").await;
+        assert_eq!(usages.load(Ordering::SeqCst), 1, "归一成功必须报一次用量");
+        let boom = Fake::new(None);
+        reinterpret_question(&boom, &count, "销售额度按照省份按照商品").await;
+        assert_eq!(usages.load(Ordering::SeqCst), 1, "失败没有 usage，不该回调");
+    }
+
+    /// 重试仍失败的澄清回答：route = need-intent、文案点名「理解为 X 但没答出来」、
+    /// 候选 = 合同模板在前 + LLM 补充（去重、不含失败句）；drill 与 clarify_options 同问句
+    /// （前端两处渲染契约）；LLM 挂了 → 只剩合同模板，回答照常成立。
+    #[tokio::test]
+    async fn reinterpret_clarify_reply_shows_understanding_and_candidates() {
+        let m = Seq::of(&[Some("按战区|上月销售额按战区\n按客户|上月销售额按客户")]);
+        let r = reinterpret_clarify_reply(&m, &|_| {}, "上月销售额按门店", "销售额按门店", Instant::now(), vec![]).await;
+        assert_eq!(r.route, NEED_INTENT);
+        assert!(r.sql.is_empty() && r.rows.is_empty(), "澄清不产 SQL/数据");
+        let note = r.caliber_note.as_deref().expect("澄清文案必须在");
+        assert!(note.contains("上月销售额按门店") && note.contains("销售额按门店"), "{note}");
+        assert!(note.contains("没查出结果"), "{note}");
+        // 合同模板在前，LLM 候选补充在后
+        let qs: Vec<&str> = r.clarify_options.iter().map(|o| o.question.as_str()).collect();
+        assert_eq!(qs[0], "上月销售额是多少", "合同模板必须在前：{qs:?}");
+        assert!(qs.contains(&"上月销售额按战区") && qs.contains(&"上月销售额按客户"), "{qs:?}");
+        assert!(!qs.contains(&"销售额按门店") && !qs.contains(&"上月销售额按门店"), "失败句/原句不许再推荐：{qs:?}");
+        assert!(qs.len() <= CLARIFY_MAX_OPTIONS, "{qs:?}");
+        // drill 与 clarify_options 同问句（ResultPanel ask-card 读 drill，App.vue chip 区读 clarify_options）
+        assert_eq!(
+            r.view.interact.drill,
+            r.clarify_options.iter().map(|o| o.question.clone()).collect::<Vec<_>>()
+        );
+        // LLM 挂了 → 只剩合同模板（降级纪律与 clarify_options_for 同一份）
+        let down = Seq::of(&[None]);
+        let r = reinterpret_clarify_reply(&down, &|_| {}, "上月销售额按门店", "销售额按门店", Instant::now(), vec![]).await;
+        assert_eq!(r.clarify_options.len(), 1, "{:?}", r.clarify_options);
+    }
+
+    /// 🔴 接线判据（源码扫描）：重理解层挂在 `one` 闭包里、`ask_single`/`localize` 之后；
+    /// 防递归标记在场；重试仍出卡的澄清出口在卡识别之后；命中透出 `reinterpret_note`。
+    /// 这些是接线事实，纯函数判据够不着 —— 删掉其中任何一行，行为判据一条都不红。
+    #[test]
+    fn reinterpret_layer_is_wired_once_after_the_card_check() {
+        let src = include_str!("ask.rs");
+        let one = src
+            .split("let one = |q: String|")
+            .nth(1)
+            .expect("one 闭包没了")
+            .split("if let Some(r) = compound::try_compound")
+            .next()
+            .expect("one 闭包边界没了");
+        let single = one.find("ask_single(&cx, members)").expect("ask_single 调用没了");
+        let loc = one.find("localize_result(&cx").expect("localize 收口没了");
+        let card = one
+            .find(concat!("is_unavailable_card_", "result(&r)"))
+            .expect("卡识别没接线 —— 重理解层永不触发");
+        assert!(single < card && loc < card, "重理解层必须在 ask_single/localize 之后：{one}");
+        // 防递归：重试标记必须在场（take 走 Some 后本轮不再改写）
+        assert!(one.contains(concat!("retry_", "of.take()")), "防递归标记没了 —— 重试会无限改写");
+        let clarify = one
+            .find(concat!("reinterpret_clarify_", "reply("))
+            .expect("重试仍失败的澄清出口没了");
+        assert!(card < clarify, "澄清出口必须在卡识别之后：{one}");
+        // 重试命中的透出（用户得知道答案对应的是归一后的问法）
+        assert!(one.contains("reinterpret_note"), "命中透出没了");
+        // 重试抡硬失败的回落：首轮的 Err 原样上抛、重试抡的 Err 回落首张卡
+        assert!(one.contains(concat!("first_", "card")), "重试抡失败回落没了 —— 重试 Err 会把原卡顶成 500");
     }
 }

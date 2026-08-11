@@ -271,13 +271,16 @@ impl OwnedUploadReq {
 
 /// `prepare` 的产物。`doc_id` 立即可回给前端轮询；`job = None` ＝ 去重秒传复用
 ///（那次上传已入库或正在跑，没有重活要跑，物理表数据源也在那次登记过）。
+/// `replaced` ＝ 同名覆盖命中文档名（同目录同名不同内容）：既有 doc_id 原地重建，
+/// 前端上传队列行据它显示「已覆盖旧版本」；非覆盖恒 `None`。
 pub struct Prepared {
     pub doc_id: String,
     pub job: Option<IngestJob>,
+    pub replaced: Option<String>,
 }
 
 /// 入库重活（parse → chunk → embed → 状态推进）的全部上下文，owning 形态可直接 move 进
-/// `tokio::spawn`。两个变体对应本文件既有的两条链，语义与各链的同步执行逐字一致。
+/// `tokio::spawn`。三个变体对应本文件既有的三条链，语义与各链的同步执行逐字一致。
 pub enum IngestJob {
     /// 新文档首入：`run` 链（解析 → 分块 → 向量 → 通道②）；失败文案落库。
     Fresh { req: OwnedUploadReq, kind: FileKind },
@@ -285,6 +288,10 @@ pub enum IngestJob {
     /// 失败时线上版本原样保留。kind 不随任务走——`reprocess` 内部会再 `classify` 一次
     ///（类型白名单只有那一处实现，信任边界上不抄第二份）。
     Rebuild { req: OwnedUploadReq },
+    /// 同名覆盖（同目录同名不同内容）：`overwrite` 影子链——新内容灌进既有 doc_id，
+    /// 目录归属/授权/标签/元数据全部保留；文件与索引先建后切，失败时旧版本保持可检索；
+    /// 通道②物理表随新内容重建（旧数据源退役由 server 在任务收尾完成）。
+    Overwrite { req: OwnedUploadReq },
 }
 
 /// 上传入库快路径（请求内同步完成）：校验 → 建目录 → 空间/写权限 → 目录解析 → sha 去重 →
@@ -313,6 +320,15 @@ pub async fn prepare(
     let sha = store::sha256_hex(st, req.bytes).await?;
     if let Some(existing) = store::find_by_sha(st, req.space_id, &sha).await? {
         return dedup_dispatch(st, &req, existing).await;
+    }
+    // 同名覆盖（「文件相同时，可以覆盖之前的文件」）：目标目录内已有同名文档且内容不同 →
+    // 新内容灌进既有 doc_id（影子链原地重建），不产生第二篇同名文档。顺序刻意排在 sha 去重
+    // 之后：同内容（哪怕落在别的目录/别的名下）维持秒传复用——(space_id, sha256) 唯一约束
+    // 下，同内容全空间只能有一篇，这是唯一不撞唯一约束的走向。
+    if let Some(existing) =
+        store::find_by_name_in_folder(st, req.space_id, folder_id.as_deref(), req.file_name).await?
+    {
+        return overwrite_dispatch(st, &req, existing).await;
     }
     let new = NewDoc {
         space_id: req.space_id,
@@ -346,12 +362,15 @@ pub async fn prepare(
     Ok(Prepared {
         doc_id,
         job: Some(IngestJob::Fresh { req: OwnedUploadReq::from_req(&req), kind }),
+        replaced: None,
     })
 }
 
 /// 入库重活分派（后台任务里跑）。`Fresh` 失败把文案落库（用户在文档列表里看得见）；
-/// `Rebuild` 走影子构建，失败时线上版本原样保留（`reprocess` 语义），错误由调用方记日志。
-/// 返回通道②数据源（仅 Fresh 且真是表格时非空）——登记/授权是 server 侧的事，随任务后台化。
+/// `Rebuild`/`Overwrite` 走影子构建，失败时线上版本原样保留（`reprocess`/`overwrite` 语义），
+/// 错误由调用方记日志。
+/// 返回通道②数据源（Fresh/Overwrite 且新内容真是表格时非空）——登记/授权是 server 侧的事，
+/// 随任务后台化。Overwrite 返回 `None` 表示新内容无表：旧版本登记过的数据源由调用方退役。
 pub async fn run_job(
     st: &OwnedStore,
     doc: &DocService,
@@ -379,6 +398,9 @@ pub async fn run_job(
         }
         IngestJob::Rebuild { req } => {
             reprocess(st, doc, embed, v, cfg, req.as_req(), doc_id, image_ocr).await.map(|_| None)
+        }
+        IngestJob::Overwrite { req } => {
+            overwrite(st, doc, embed, v, cfg, req.as_req(), doc_id, image_ocr).await
         }
     }
 }
@@ -413,10 +435,11 @@ async fn dedup_dispatch(
     };
     match dedup_action(Some(row.status.as_str())) {
         // 那次上传已登记过物理表数据源，这边没有重活要跑
-        DedupAction::Reuse => Ok(Prepared { doc_id: existing, job: None }),
+        DedupAction::Reuse => Ok(Prepared { doc_id: existing, job: None, replaced: None }),
         DedupAction::Reprocess => Ok(Prepared {
             doc_id: existing,
             job: Some(IngestJob::Rebuild { req: OwnedUploadReq::from_req(req) }),
+            replaced: None,
         }),
     }
 }
@@ -432,6 +455,49 @@ fn dedup_action(status: Option<&str>) -> DedupAction {
     match status.and_then(DocStatus::parse) {
         Some(DocStatus::Embedded | DocStatus::Pending | DocStatus::Parsing) => DedupAction::Reuse,
         _ => DedupAction::Reprocess,
+    }
+}
+
+/// 同名不同内容命中的统一分派（覆盖上传）。
+/// 进行态（pending/parsing）说明该文档的首入链还在跑——此时覆盖会与在跑的 `insert_chunks`
+/// 互踩（那条链 `ON CONFLICT` 不重入），拒绝并要求稍后重试；其余状态一律 `Overwrite`
+/// （影子构建原地重建，失败时旧版本原样保留；`failed` 文档由此获得「重传同名文件」的
+/// 自然重试路径）。
+async fn overwrite_dispatch(
+    st: &OwnedStore,
+    req: &UploadReq<'_>,
+    existing: String,
+) -> Result<Prepared, KbError> {
+    let row = store::get_doc(st, &existing).await?;
+    // 与 dedup_dispatch 同一个并发删除窗口：命中后文档没了直接 NotFound
+    let Some(row) = row else {
+        return Err(KbError::NotFound(format!("文档 {existing} 已不存在")));
+    };
+    match overwrite_action(Some(row.status.as_str())) {
+        OverwriteAction::Conflict => Err(KbError::BadInput(format!(
+            "同名文档「{}」正在入库中，请待其完成后重试",
+            req.file_name
+        ))),
+        OverwriteAction::Overwrite => Ok(Prepared {
+            doc_id: existing,
+            job: Some(IngestJob::Overwrite { req: OwnedUploadReq::from_req(req) }),
+            replaced: Some(req.file_name.to_string()),
+        }),
+    }
+}
+
+/// 同名命中文档的处置。进行态 `Conflict`；其余（含未知/缺失状态）一律 `Overwrite`——
+/// 覆盖链是全量影子切换，对任何起始状态都安全。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverwriteAction {
+    Overwrite,
+    Conflict,
+}
+
+fn overwrite_action(status: Option<&str>) -> OverwriteAction {
+    match status.and_then(DocStatus::parse) {
+        Some(DocStatus::Pending | DocStatus::Parsing) => OverwriteAction::Conflict,
+        _ => OverwriteAction::Overwrite,
     }
 }
 
@@ -458,12 +524,7 @@ pub async fn reprocess(
     let stage_id = uuid::Uuid::new_v4().to_string();
     let staged_path = doc_path(cfg, &stage_id, req.file_name);
     let staged = build_shadow(doc, embed, &req, &current, &staged_path, image_ocr, kind).await;
-    if let Err(e) = tokio::fs::remove_file(&staged_path).await {
-        // 文件可能根本没写出来（build_shadow 在写盘前就失败）：NotFound 不算事，其余留诊断
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(doc_id, error = %e, "staged 临时文件删除失败（会遗留 stage 文件）");
-        }
-    }
+    remove_staged_file(&staged_path, doc_id).await;
     let built = match staged {
         Ok(v) => v,
         Err(e) => return Err(e),
@@ -480,10 +541,116 @@ pub async fn reprocess(
         built.status,
         &built.error,
         &built.notice,
+        // 纯重建：文件元数据三列（sha256/bytes/mime）原样保留
+        None,
     )
     .await?;
     try_apply_inferred_version(st, viewer, doc_id, req.file_name).await;
     Ok(())
+}
+
+/// staged 临时文件的收尾清理：文件可能根本没写出来（build_shadow 在写盘前就失败），
+/// NotFound 不算事，其余留诊断。
+async fn remove_staged_file(path: &std::path::Path, doc_id: &str) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(doc_id, error = %e, "staged 临时文件删除失败（会遗留 stage 文件）");
+        }
+    }
+}
+
+/// 覆盖链「换文件 → 切库 → 通道②」临界区的进程内互斥：连续重传同名文件的修正版会产
+/// 生两个并发的 Overwrite 任务，它们的 rename 与 replace_chunks 一旦交错，就会把
+/// 「A 任务的 sha + B 任务的文件」钉成两半状态（此后同内容重传被 sha 去重弹回，不再自愈）。
+/// 临界区只有 一次 rename + 一条 SQL +（表格时）建表灌数，且上传闸本就只放 4 并发，
+/// 全局串行的代价可忽略。Rebuild 链不换文件、不带文件元数据，不在此锁内。
+static OVERWRITE_SWITCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 同名覆盖的后台重建（`IngestJob::Overwrite`）：影子构建 → 换文件 → 一条语句切换索引与
+/// 文件元数据 → 通道②随新内容重建。与 `reprocess` 同族的失败语义：影子切换之前任何一步
+/// 失败，旧版本的文件/索引/数据源全都原样保留、保持可检索。
+///
+/// 与 `reprocess` 的差异全在「内容变了」：磁盘文件要换（同目录 rename 原子替换）、
+/// sha256/bytes/mime 要随索引同语句切换、通道②物理表要按新内容重建。
+/// 返回通道②新数据源（新内容无表时 `None`，旧数据源由 server 在任务收尾退役）。
+async fn overwrite(
+    st: &OwnedStore,
+    doc: &DocService,
+    embed: &EmbedClient,
+    viewer: &Viewer,
+    cfg: &IngestCfg,
+    req: UploadReq<'_>,
+    doc_id: &str,
+    image_ocr: Option<&dyn ImageOcr>,
+) -> Result<Option<TabularSource>, KbError> {
+    let kind = classify(req.file_name, req.bytes.len() as u64, cfg.max_bytes)?;
+    // 落盘根目录在入口统一建一次（build_shadow 内不再重建）
+    tokio::fs::create_dir_all(&cfg.root).await.map_err(io_err)?;
+    // CAS 口径同 reprocess：expected 按**库内** name/folder_path 生成（覆盖不动目录归属）
+    let current = store::get_doc(st, doc_id)
+        .await?
+        .ok_or_else(|| KbError::NotFound(format!("文档 {doc_id} 不存在")))?;
+    let stage_id = uuid::Uuid::new_v4().to_string();
+    let staged_path = doc_path(cfg, &stage_id, req.file_name);
+    let staged = build_shadow(doc, embed, &req, &current, &staged_path, image_ocr, kind).await;
+    let built = match staged {
+        Ok(v) => v,
+        Err(e) => {
+            // 影子构建失败：旧版本分毫未动，只欠临时文件清理
+            remove_staged_file(&staged_path, doc_id).await;
+            return Err(e);
+        }
+    };
+    // 切换前两步都可以失败，失败后旧版本仍完整：sha 先算（此刻 live 文件还是旧内容，
+    // 库内文件元数据也还是旧值，两半一致）；文件先换（同目录 rename 原子）再切库——
+    // 顺序不许反：先切库会把「新 sha + 旧文件」钉进库里，同内容重传被 sha 去重秒传弹回，
+    // 旧文件永无自愈；先换文件时切换若失败（撤权/抖动），库内仍是旧 sha，
+    // 重传同名文件再走一遍覆盖链即收敛。
+    let sha = store::sha256_hex(st, req.bytes).await?;
+    // 临界区全程互斥（并发覆盖同一文档的交错防护，见锁定义注释）；守卫随作用域/早退释放
+    let _switch_guard = OVERWRITE_SWITCH_LOCK.lock().await;
+    let live_path = doc_path(cfg, doc_id, req.file_name);
+    if let Err(e) = tokio::fs::rename(&staged_path, &live_path).await {
+        remove_staged_file(&staged_path, doc_id).await;
+        return Err(io_err(e));
+    }
+    let meta = store::DocFileMeta { sha256: &sha, bytes: req.bytes.len() as i64, mime: req.mime };
+    store::replace_chunks(
+        st,
+        viewer,
+        doc_id,
+        &built.chunks,
+        &built.embedding_texts,
+        &built.embeddings,
+        &built.spans,
+        built.page_count,
+        built.status,
+        &built.error,
+        &built.notice,
+        Some(&meta),
+    )
+    .await?;
+    // 通道② 排在索引切换之后：切换失败时旧数据源必须还在服役（旧版本保持可检索/可问数）。
+    // 版本元数据不重新推断——覆盖保留原文档元数据，名字没变，推断结果也不会变。
+    overwrite_tabular(st, viewer, &current.space_id, doc_id, &built.sheets).await
+}
+
+/// 覆盖的通道②收尾：旧物理表（schema `up_<doc_id>`）随旧版本退役——`drop_source` 幂等，
+/// 旧版本非表格时是 no-op；新内容有 sheet 才重建（`tabular_channel` 自带写权限复核与
+/// 「建表失败只降级」的 notice 语义，与 Fresh 同一条）。
+async fn overwrite_tabular(
+    st: &OwnedStore,
+    viewer: &Viewer,
+    space_id: &str,
+    doc_id: &str,
+    sheets: &[Sheet],
+) -> Result<Option<TabularSource>, KbError> {
+    if let Err(e) = tabular::drop_source(st, doc_id).await {
+        // drop 失败不挡主链：后续建表撞同名表会走 tabular_channel 的降级 notice，
+        // 孤儿 schema 留给运维（与 materialize 半途失败的清场同级）
+        tracing::warn!(doc_id, error = %e, "同名覆盖：旧物理表清理失败（孤儿 schema 待回收）");
+    }
+    tabular_channel(st, viewer, space_id, doc_id, sheets).await
 }
 
 struct ShadowBuild {
@@ -495,6 +662,9 @@ struct ShadowBuild {
     status: DocStatus,
     error: String,
     notice: String,
+    /// 解析出的表格（通道②素材）：`reprocess` 不用它（已登记数据源原样保留），
+    /// `overwrite` 靠它按新内容重建物理表。
+    sheets: Vec<Sheet>,
 }
 
 /// 重处理的影子构建：不改 `kb.doc/kb.chunk`，失败时线上版本完全不动。
@@ -513,7 +683,8 @@ async fn build_shadow(
     let parsed = parse_input(doc, path, req, image_ocr, kind).await?;
     let notice = parsed.notes.join("；");
     let mut blocks = parsed.blocks;
-    blocks.extend(tabular::sheet_blocks(&parsed.sheets));
+    let sheets = parsed.sheets;
+    blocks.extend(tabular::sheet_blocks(&sheets));
     let spanned = chunk_with_preset(doc, resolve_preset(req.preset), &blocks).await?;
     if spanned.chunks.is_empty() {
         return Err(KbError::BadInput("文档里没有可索引的文本".into()));
@@ -549,6 +720,7 @@ async fn build_shadow(
         status: DocStatus::Embedded,
         error: String::new(),
         notice,
+        sheets,
     })
 }
 
@@ -1848,6 +2020,84 @@ mod tests {
         assert_eq!(dedup_action(None), DedupAction::Reprocess);
     }
 
+    /// 同名覆盖命中分派：进行态（pending/parsing）的旧版本首入链还在跑，此时覆盖会与在跑的
+    /// `insert_chunks` 互踩（那条链 `ON CONFLICT` 不重入）→ Conflict 拒绝；其余状态
+    /// （含 failed/未知）一律 Overwrite——影子切换是全量替换，对任何起始状态都安全，
+    /// failed 文档由此获得「重传同名文件」的自然重试路径。
+    #[test]
+    fn overwrite_action_conflicts_only_with_in_flight_ingest() {
+        assert_eq!(overwrite_action(Some("embedded")), OverwriteAction::Overwrite);
+        assert_eq!(overwrite_action(Some("chunked")), OverwriteAction::Overwrite);
+        assert_eq!(overwrite_action(Some("failed")), OverwriteAction::Overwrite);
+        assert_eq!(overwrite_action(Some("未来新状态")), OverwriteAction::Overwrite);
+        assert_eq!(overwrite_action(None), OverwriteAction::Overwrite);
+        assert_eq!(overwrite_action(Some("pending")), OverwriteAction::Conflict);
+        assert_eq!(overwrite_action(Some("parsing")), OverwriteAction::Conflict);
+    }
+
+    /// 覆盖命中判定的分派顺序（源码钉住）：sha 去重 → 同名查找 → 新建。
+    /// - 同内容（无论落在哪个目录/哪篇名下）先被 `find_by_sha` 秒传复用——
+    ///   (space_id, sha256) 唯一约束下同内容全空间只能有一篇；
+    /// - 同目录同名不同内容走 `overwrite_dispatch`（`IngestJob::Overwrite`）；
+    /// - 目录口径是请求解析出的目标目录（空 = 根目录）——不同目录的同名文档查不到，
+    ///   落到新建，不产生覆盖。
+    #[test]
+    fn prepare_dispatches_sha_dedup_then_name_overwrite_then_fresh() {
+        let src = include_str!("ingest.rs");
+        let prep = src.split("pub async fn prepare").nth(1).unwrap();
+        let prep = prep.split("/// 入库重活分派").next().unwrap();
+        let sha = prep.find("store::find_by_sha(").expect("prepare 缺 sha 去重");
+        let name = prep.find("store::find_by_name_in_folder(").expect("prepare 缺同名覆盖分派");
+        let insert = prep.find("store::insert_doc(").expect("prepare 缺新建");
+        assert!(sha < name && name < insert, "分派顺序必须是 sha 去重 → 同名覆盖 → 新建: {prep}");
+        assert!(prep.contains("overwrite_dispatch("), "同名命中必须走覆盖分派: {prep}");
+        // 目录口径随请求解析值传入（folder_id 空 = 根目录），不是全空间查找
+        assert!(prep.contains("folder_id.as_deref()"), "同名查找必须限定目标目录: {prep}");
+        // 覆盖分派的产物：Overwrite 任务 + replaced 透出标记
+        let od = src.split("async fn overwrite_dispatch").nth(1).unwrap();
+        let od = od.split("\n}\n").next().unwrap();
+        assert!(od.contains("IngestJob::Overwrite"), "覆盖分派必须产 Overwrite 任务: {od}");
+        assert!(od.contains("replaced: Some("), "覆盖分派必须置 replaced 标记: {od}");
+    }
+
+    /// 覆盖链的失败方向（源码钉住）：先建后切——影子构建成功前旧版本的文件/索引/数据源
+    /// 分毫不动；换文件（rename）必须排在切库（replace_chunks）之前（反了会把
+    /// 「新 sha + 旧文件」钉死进库，秒传去重被毒化、旧文件永无自愈）；通道②退役/重建
+    /// 排在索引切换之后（切换失败时旧数据源还在服役）。
+    #[test]
+    fn overwrite_switches_shadow_first_and_retires_tabular_last() {
+        let src = include_str!("ingest.rs");
+        let body = src.split("async fn overwrite(").nth(1).unwrap();
+        let body = body.split("/// 覆盖的通道②收尾").next().unwrap();
+        let build = body.find("build_shadow(").expect("覆盖必须走影子构建");
+        let rename = body.find("tokio::fs::rename").expect("覆盖必须原子换文件");
+        let switch = body.find("store::replace_chunks(").expect("覆盖必须走影子切换");
+        let tabular = body.find("overwrite_tabular(").expect("覆盖必须重建通道②");
+        assert!(
+            build < rename && rename < switch && switch < tabular,
+            "覆盖链顺序必须是 影子构建 → 换文件 → 切库 → 通道②: {body}"
+        );
+        assert!(!body.contains("insert_chunks("), "覆盖链不许走首入链落块（ON CONFLICT 不重入）: {body}");
+        assert!(body.contains("Some(&meta)"), "文件元数据必须随索引同语句切换: {body}");
+        // 并发覆盖同一文档：rename→切库→通道② 的临界区必须互斥（两半状态不自愈，见锁注释）
+        let lock = body.find("OVERWRITE_SWITCH_LOCK").expect("覆盖临界区必须持互斥锁");
+        assert!(lock < rename, "锁必须在换文件之前拿: {body}");
+        // 覆盖保留原文档元数据（需求语义）——名字没变，版本推断结果也不会变，不许顺手重推
+        assert!(!body.contains("try_apply_inferred_version"), "覆盖保留既有版本元数据: {body}");
+    }
+
+    /// 覆盖的通道②（源码钉住）：旧物理表先退役（drop 幂等，旧版本非表格时 no-op），
+    /// 重建复用 Fresh 同一条 `tabular_channel`（写权限复核 + 建表失败只降级的语义不养第二份）。
+    #[test]
+    fn overwrite_tabular_drops_old_source_then_reuses_the_fresh_channel() {
+        let src = include_str!("ingest.rs");
+        let body = src.split("async fn overwrite_tabular").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        let drop = body.find("tabular::drop_source(").expect("旧物理表必须先退役");
+        let rebuild = body.find("tabular_channel(").expect("重建必须复用 tabular_channel");
+        assert!(drop < rebuild, "先退役旧表再建新表: {body}");
+    }
+
     /// 并发删除窗口（锚点）：find_by_sha 命中后 get_doc 为 None 时必须直接 NotFound，
     /// 不许走 Rebuild 落一个「写权限已失效」的误导文案
     #[test]
@@ -1888,7 +2138,7 @@ mod tests {
     /// - `prepare` 只做快路径（不含 parse/chunk/embed 调用），且把状态推进到 parsing、完成落盘——
     ///   响应的进行态与「doc 行可见即文件可读」都靠这两行；
     /// - `run_job` 的 Fresh 臂失败必须落 `failed`（不许静默），Rebuild 臂必须走 `reprocess`
-    ///   影子链（失败不动线上版本）。
+    ///   影子链、Overwrite 臂必须走 `overwrite` 覆盖链（两者失败都不动线上版本）。
     #[test]
     fn prepare_is_fast_path_and_run_job_owns_heavy_work() {
         let src = include_str!("ingest.rs");
@@ -1906,6 +2156,8 @@ mod tests {
         assert!(fresh.contains("DocStatus::Failed"), "Fresh 失败文案必须落库: {fresh}");
         let rebuild = job.split("IngestJob::Rebuild").nth(1).unwrap();
         assert!(rebuild.contains("reprocess("), "Rebuild 必须走影子重建链: {rebuild}");
+        let overwrite = job.split("IngestJob::Overwrite").nth(1).unwrap();
+        assert!(overwrite.contains("overwrite("), "Overwrite 必须走同名覆盖链: {overwrite}");
     }
 
     /// 落库形状契约：Rust preset 的 chunks 与 spans 等长平行，tokens 按统一口径估算
