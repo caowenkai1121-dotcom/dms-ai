@@ -1344,6 +1344,9 @@ async fn main() -> anyhow::Result<()> {
     // 【A9】向量自愈：启动即跑一轮 + 每 10 分钟扫 `embedding IS NULL` 补齐（启动批量 embed
     // 会拖慢启动 ⇒ 后台 spawn + 失败只 warn；多实例由 PG advisory lock 选一个跑）
     embed_fill::spawn(state.clone());
+    // 【入库自愈】重活后台化之后，进程重启仍会留下「进行中」僵尸文档——启动扫一遍重跑
+    // （Yuxi recover_pending 同款；同样后台 spawn 不阻塞启动，细节见 kb_api::spawn_recover_pending）
+    kb_api::spawn_recover_pending(state.clone());
     // 【S5】经营日报：同 A9 的调度模子（lock + 10min + kv 标记），产物写 meta.artifact
     daily_digest::spawn(state.clone());
     let app = Router::new()
@@ -1433,6 +1436,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/kb/doc/{id}", get(kb_api::doc).delete(kb_api::delete))
         .route("/api/kb/doc/{id}/folder", post(kb_api::move_doc))
         .route("/api/kb/doc/{id}/download", get(kb_api::download_doc))
+        // 预览面：票据签发（会话+ACL 收口）与流式文件端点（ticket/inline/Range/office_pdf
+        // 都在 download_doc 一个 handler 里，/file 是它的预览语义别名，/download 保持兼容）
+        .route("/api/kb/doc/{id}/preview-ticket", post(kb_api::preview_ticket))
+        .route("/api/kb/doc/{id}/file", get(kb_api::download_doc))
         .route("/api/kb/doc/{id}/reprocess", post(kb_api::reprocess))
         // 【Y12/Y7】KB 运营：URL 抓取入库（SSRF 护栏）/ 空间导出 / AI 生成文档描述
         .route("/api/kb/ingest-url", post(kb_api::ingest_url))

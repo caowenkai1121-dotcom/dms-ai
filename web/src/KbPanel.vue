@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import KbDocPreview from './KbDocPreview.vue'
 import KbEval from './KbEval.vue'
 import KbGraph from './KbGraph.vue'
@@ -42,6 +42,10 @@ interface UploadRow {
   id: number; name: string
   state: 'doing' | 'ok' | 'partial' | 'fail'
   msg: string; destination?: string; ds?: Ds | null
+  /** 上传阶段进度（0-100），仅 phase='upload' 时有值；进入解析或终态后清空 */
+  progress?: number | null
+  /** doing 的细分阶段：upload=网络传输中（行内百分比），parse=服务端秒回后后台解析中（轮询跟踪） */
+  phase?: 'upload' | 'parse'
 }
 
 // 上传支持清单：与服务端 `ingest::EXTS`（23 项）同口径——这里只做选择器过滤与提前反馈，
@@ -57,6 +61,11 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 const MAX_RELATED = 50
 // 上传队列上限：队列只增不清，批量上传大目录时行数封顶（保留最近 N 条）
 const UPLOAD_QUEUE_MAX = 200
+// 上传秒回后的轮询节奏：每 2s 重拉列表按 doc_id 对状态，5 分钟未落定即停（防无限轮询）
+const UPLOAD_POLL_MS = 2000
+const UPLOAD_POLL_TIMEOUT_MS = 5 * 60 * 1000
+// 上传队列聚合卡的启用阈值：少于 10 个文件时逐行状态已足够清楚（Yuxi 双模式思路）
+const UPLOAD_AGG_MIN = 10
 // 模块级单例 formatter：文档行多时每行渲染都过 dateText，不能一格 new 一个
 const DATE_FMT = new Intl.DateTimeFormat('zh-CN', {
   month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
@@ -183,6 +192,16 @@ const metadataRelationReady = ref(false)
 const metadataRelations = ref<DocRelation[]>([])
 const metadataRelatedIds = ref<string[]>([])
 const metadataRelationSearch = ref('')
+// 文档列表（Yuxi 对齐）：客户端分页 / 复选框多选 / 行内 ⋯ 菜单 / 筛选下拉 / 移动对话框
+const page = ref(0)
+const pageSize = ref(20)
+const checkedIds = ref<string[]>([])
+const menuDocId = ref('')
+const filterMenuOpen = ref(false)
+const moveDocTarget = ref<Doc | null>(null)
+const moveTargetFolderId = ref('')
+const batchBusy = ref(false)
+const batchDeleteOpen = ref(false)
 let uploadId = 0
 let contextEpoch = 0
 let spacesRequestId = 0
@@ -309,32 +328,37 @@ function pushUpload(row: UploadRow) {
   uploads.value.unshift(row)
   if (uploads.value.length > UPLOAD_QUEUE_MAX) uploads.value.length = UPLOAD_QUEUE_MAX
 }
-function sizeText(n?: number | null): string {
-  if (typeof n !== 'number') return '-'
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`
-  return `${(n / 1024 / 1024).toFixed(1)} MB`
-}
 function extOf(name: string): string {
   const ext = name.split('.').pop()
   return ext && ext !== name ? ext.toUpperCase().slice(0, 5) : 'FILE'
-}
-function typeText(d: Doc): string {
-  const ext = extOf(d.name)
-  // 与 UPLOAD_ACCEPT 清单同口径（accept 无 .htm，这里也不单列 HTM）
-  const groups: Record<string, string> = {
-    DOC: 'Word', DOCX: 'Word', XLS: 'Excel', XLSX: 'Excel', XLSM: 'Excel', CSV: 'CSV',
-    PPT: 'PPT', PPTX: 'PPT', PDF: 'PDF', TXT: '文本', LOG: '文本', MD: 'Markdown', MARKDOWN: 'Markdown',
-    HTML: '网页', JSON: 'JSON', XML: 'XML',
-    PNG: '图片', JPG: '图片', JPEG: '图片', WEBP: '图片', GIF: '图片', BMP: '图片', TIF: '图片', TIFF: '图片',
-  }
-  return groups[ext] ?? ext
 }
 function dateText(value?: string): string {
   if (!value) return '-'
   const d = new Date(value)
   if (Number.isNaN(d.getTime())) return value.slice(0, 16).replace('T', ' ')
   return DATE_FMT.format(d)
+}
+/** 列表时间列固定 MM-DD HH:mm（DATE_FMT 是 zh-CN 斜杠风格，检索命中等处仍在用，不动它）。 */
+function docTimeText(value?: string): string {
+  if (!value) return '-'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return value.slice(0, 16).replace('T', ' ')
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+/** 内容量列：切片数为主、页数有的就带；datasource 表格文档按行数/表数说话更直观。 */
+function contentText(d: Doc): string {
+  if (d.datasource?.tables?.length) {
+    const rows = d.datasource.tables.reduce((sum, t) => sum + (t.rows || 0), 0)
+    return `${rows} 行 · ${d.datasource.tables.length} 表`
+  }
+  return `${d.page_count ? `${d.page_count} 页 · ` : ''}${d.chunk_count ?? 0} 切片`
+}
+/** 文件名悬浮提示：目录与上传人不再占行（旧版第二行 lineage 的信息收口到这里）。 */
+function nameTitle(d: Doc): string {
+  const parts = [d.name, `目录：${folderPath(d) || '根目录 / 未分类'}`]
+  if (d.uploaded_by) parts.push(`上传人：${d.uploaded_by}`)
+  return parts.join('\n')
 }
 function hitLocation(hit: SearchHit): string {
   const parts: string[] = []
@@ -348,23 +372,31 @@ function hitLocation(hit: SearchHit): string {
   if (typeof hit.page === 'number') parts.push(`第 ${hit.page} 页`)
   return parts.join(' · ') || '未标注章节或页码'
 }
-function qualityClass(level?: string): string {
-  return ['danger', 'warning', 'good', 'processing'].includes(level ?? '') ? (level ?? '') : ''
-}
 function displayState(d: Doc): 'ready' | 'processing' | 'attention' | 'disabled' {
   if (d.enabled === false) return 'disabled'
   if (d.quality?.level === 'processing') return 'processing'
   if (d.quality?.level === 'good') return 'ready'
   return 'attention'
 }
+type PillState = 'ready' | 'processing' | 'attention' | 'disabled' | 'failed'
+/** 状态 pill 配色态：失败从「需处理」里单独染红（可点=重新处理），其余沿用 displayState 口径。 */
+function pillState(d: Doc): PillState {
+  if (d.enabled === false) return 'disabled'
+  if (d.status === 'failed') return 'failed'
+  return displayState(d)
+}
+/** pill 的悬浮说明：旧版状态行下的 hint 文字收口到这里；处理中明示「点了也没用」。 */
+function pillTitle(d: Doc): string {
+  const state = pillState(d)
+  if (state === 'processing') return '正在处理，完成后自动转为可检索'
+  if (state === 'failed') {
+    const why = d.error || '未知错误'
+    return currentSpace.value?.writable ? `处理失败：${why}（点击重新处理）` : `处理失败：${why}`
+  }
+  return [statusHint(d), d.quality?.label].filter(Boolean).join(' · ')
+}
 function dateInputValue(value?: string | null): string {
   return value ? value.slice(0, 10) : ''
-}
-function effectiveText(d: Doc): string {
-  if (d.effective_from && d.effective_to) return `${dateInputValue(d.effective_from)} 至 ${dateInputValue(d.effective_to)}`
-  if (d.effective_from) return `${dateInputValue(d.effective_from)} 起`
-  if (d.effective_to) return `有效至 ${dateInputValue(d.effective_to)}`
-  return ''
 }
 function resetRetrieval() {
   retrievalErr.value = ''
@@ -408,6 +440,13 @@ function resetSpaceScopedState() {
   deletingId.value = ''
   newFolderName.value = ''
   newFolderParentId.value = ''
+  page.value = 0
+  checkedIds.value = []
+  menuDocId.value = ''
+  filterMenuOpen.value = false
+  moveDocTarget.value = null
+  batchBusy.value = false
+  batchDeleteOpen.value = false
   resetRetrieval()
   retrievalLoading.value = false
   sampleQuestions.value = []
@@ -416,7 +455,7 @@ function resetSpaceScopedState() {
 }
 
 function governanceText(hit: SearchHit): string {
-  // 与文档行 effectiveText 同口径：截到日期，不拼完整 ISO
+  // 与文档行同口径：截到日期，不拼完整 ISO
   if (hit.effective_from && hit.effective_to) return `${dateInputValue(hit.effective_from)} 至 ${dateInputValue(hit.effective_to)}`
   if (hit.effective_from) return `${dateInputValue(hit.effective_from)} 起生效`
   if (hit.effective_to) return `有效至 ${dateInputValue(hit.effective_to)}`
@@ -630,7 +669,7 @@ const currentSpace = computed(() => spaces.value.find((space) => space.space_id 
 const switchingDisabled = computed(() => busy.value || creating.value || folderCreating.value || folderEditing.value
   || !!folderDeletingId.value || !!docMovingId.value || metadataSaving.value || granting.value
   || !!revokingGrant.value || !!deletingId.value || !!reprocessingId.value || !!stateChangingId.value
-  || urlBusy.value || !!descGeneratingId.value)
+  || urlBusy.value || !!descGeneratingId.value || batchBusy.value)
 const folderRows = computed<FolderRow[]>(() => {
   const byParent = new Map<string, Folder[]>()
   for (const folder of folders.value) {
@@ -862,6 +901,33 @@ const visibleDocs = computed(() => {
       d.business_domain, d.source_uri, d.document_family, d.document_revision, folderPath(d), ...(d.tags ?? [])]
       .some((v) => String(v ?? '').toLocaleLowerCase().includes(needle))
   })
+})
+// 客户端分页：数据本就不分页拉取，切片即可；筛选/搜索/目录/页大小变化时回到第一页
+const pageCount = computed(() => Math.max(1, Math.ceil(visibleDocs.value.length / pageSize.value)))
+const pagedDocs = computed(() =>
+  visibleDocs.value.slice(page.value * pageSize.value, (page.value + 1) * pageSize.value))
+watch([search, filter, selectedFolderId, pageSize], () => { page.value = 0 })
+// 列表变短（删除/刷新）后页码可能越界：钳回最后一页
+watch(pageCount, (count) => { if (page.value > count - 1) page.value = count - 1 })
+// 刷新后已删文档的勾选项不能残留
+watch(docs, (list) => {
+  const alive = new Set(list.map((d) => d.doc_id))
+  checkedIds.value = checkedIds.value.filter((id) => alive.has(id))
+})
+const checkedSet = computed(() => new Set(checkedIds.value))
+const pageCheckedCount = computed(() => pagedDocs.value.filter((d) => checkedSet.value.has(d.doc_id)).length)
+const pageAllChecked = computed(() => pagedDocs.value.length > 0 && pageCheckedCount.value === pagedDocs.value.length)
+const currentFilterLabel = computed(() =>
+  filters.value.find((item) => item.value === filter.value)?.label ?? '全部')
+/** 上传队列聚合计数：≥UPLOAD_AGG_MIN 个文件时替代逐行扫读（Yuxi 双模式思路）。 */
+const uploadAgg = computed(() => {
+  const agg = { total: uploads.value.length, uploading: 0, parsing: 0, failed: 0 }
+  for (const u of uploads.value) {
+    if (u.state === 'fail') agg.failed++
+    else if (u.state === 'doing' && u.phase === 'parse') agg.parsing++
+    else if (u.state === 'doing') agg.uploading++
+  }
+  return agg
 })
 async function load(space: string, requestId: number, epoch: number): Promise<boolean | null> {
   if (!space) return null
@@ -1273,6 +1339,193 @@ async function moveDoc(d: Doc, folderId: string) {
   }
 }
 
+/** 行内 ⋯ 菜单：同一时刻只开一个，且与筛选下拉互斥；document 级点击统一关闭。 */
+function toggleRowMenu(docId: string) {
+  menuDocId.value = menuDocId.value === docId ? '' : docId
+  filterMenuOpen.value = false
+}
+function closeMenus() {
+  menuDocId.value = ''
+  filterMenuOpen.value = false
+}
+
+/** 「移动至…」改走对话框（旧版行内下拉在 64px 操作列里放不下）：选择后仍调既有 moveDoc。 */
+function openMoveDialog(d: Doc) {
+  moveDocTarget.value = d
+  moveTargetFolderId.value = d.folder_id || ''
+}
+function closeMoveDialog() {
+  if (docMovingId.value) return
+  moveDocTarget.value = null
+}
+async function confirmMoveDoc() {
+  const d = moveDocTarget.value
+  if (!d || docMovingId.value) return
+  const folderId = moveTargetFolderId.value
+  moveDocTarget.value = null
+  await moveDoc(d, folderId)
+}
+
+function toggleCheck(docId: string, on: boolean) {
+  checkedIds.value = on
+    ? [...checkedIds.value, docId]
+    : checkedIds.value.filter((id) => id !== docId)
+}
+function toggleCheckPage(on: boolean) {
+  const pageIds = new Set(pagedDocs.value.map((d) => d.doc_id))
+  checkedIds.value = on
+    ? [...new Set([...checkedIds.value, ...pageIds])]
+    : checkedIds.value.filter((id) => !pageIds.has(id))
+}
+
+/** 批量操作逐条走既有单文档端点（契约不变）：失败计数汇总提示，成功仍整刷空间。 */
+async function batchReprocessChecked() {
+  if (batchBusy.value || !currentSpace.value?.writable) return
+  const targets = docs.value.filter((d) => checkedSet.value.has(d.doc_id))
+  if (!targets.length) return
+  const requestSpace = spaceId.value
+  const requestEpoch = contextEpoch
+  batchBusy.value = true
+  actionErr.value = ''
+  let failed = 0
+  try {
+    for (const d of targets) {
+      try {
+        const response = await fetch(`/api/kb/doc/${encodeURIComponent(d.doc_id)}/reprocess`, {
+          method: 'POST', headers: { ...headers(), 'Content-Type': 'application/json' }, body: '{}',
+        })
+        const data = await responseJson(response)
+        if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`)
+      } catch { failed++ }
+      if (!contextIsCurrent(requestEpoch, requestSpace)) return
+    }
+    checkedIds.value = []
+    if (failed) actionErr.value = `${failed} 份文档重新处理发起失败，其余已进入处理队列。`
+    await loadSpaces(requestSpace)
+  } finally {
+    if (contextIsCurrent(requestEpoch, requestSpace)) batchBusy.value = false
+  }
+}
+
+async function removeCheckedConfirmed() {
+  if (batchBusy.value) return
+  const targets = docs.value.filter((d) => checkedSet.value.has(d.doc_id))
+  if (!targets.length) {
+    batchDeleteOpen.value = false
+    return
+  }
+  const requestSpace = spaceId.value
+  const requestEpoch = contextEpoch
+  batchBusy.value = true
+  actionErr.value = ''
+  let failed = 0
+  try {
+    for (const d of targets) {
+      try {
+        const resp = await fetch(`/api/kb/doc/${encodeURIComponent(d.doc_id)}${spaceQuery(requestSpace)}`, {
+          method: 'DELETE', headers: headers(),
+        })
+        const data = await responseJson(resp)
+        if (!resp.ok) throw new Error(data.error ?? `HTTP ${resp.status}`)
+      } catch { failed++ }
+      if (!contextIsCurrent(requestEpoch, requestSpace)) return
+    }
+    checkedIds.value = []
+    batchDeleteOpen.value = false
+    if (failed) actionErr.value = `${failed} 份文档删除失败，其余已删除。`
+    await loadSpaces(requestSpace)
+  } finally {
+    if (contextIsCurrent(requestEpoch, requestSpace)) batchBusy.value = false
+  }
+}
+
+interface UploadResponse { status: number; data: Record<string, any> }
+/** XHR 版上传：fetch 拿不到 upload.onprogress，行内百分比只能靠 XHR。鉴权/表单字段与原 fetch 版一致。 */
+function uploadViaXhr(file: File, space: string, folderId: string, onProgress: (pct: number) => void): Promise<UploadResponse> {
+  const token = props.token?.trim()
+  if (!token) {
+    emit('auth-expired')
+    return Promise.reject(new Error('登录会话已失效，请重新登录。'))
+  }
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/api/kb/upload')
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && e.total) onProgress(Math.min(100, Math.round((e.loaded / e.total) * 100)))
+    }
+    xhr.onload = () => {
+      let data: Record<string, any> = {}
+      try { data = xhr.responseText ? JSON.parse(xhr.responseText) : {} } catch { /* 非 JSON 错误体按空处理 */ }
+      resolve({ status: xhr.status, data })
+    }
+    xhr.onerror = () => reject(new Error('网络连接失败，上传中断'))
+    xhr.onabort = () => reject(new Error('上传已中断'))
+    const form = new FormData()
+    form.append('file', file, file.name)
+    form.append('space_id', space)
+    if (folderId) form.append('folder_id', folderId)
+    xhr.send(form)
+  })
+}
+
+/** 上传/文档详情的公共字段子集（秒回响应与列表行都按这个口径读）。 */
+interface IngestOutcome {
+  status?: string; chunk_count?: number | null; page_count?: number | null
+  error?: string | null; notice?: string | null
+}
+/** 是否终态：embedded/failed 直接落定；chunked 带降级文案（error/notice）也算落定——无文案说明向量还在补。 */
+function isTerminalIngest(source: IngestOutcome): boolean {
+  if (source.status === OK || source.status === 'failed') return true
+  return source.status === PARTIAL && !!(source.error || source.notice)
+}
+/** 终态行的统一文案：与异步化之前同步处理的展示口径一致（状态 + 切片/页数 + 降级文案）。 */
+function ingestOutcomeText(source: IngestOutcome): string {
+  const parts = [statusText(source.status), `${source.chunk_count ?? 0} 个切片`]
+  if (source.page_count) parts.push(`${source.page_count} 页`)
+  if (source.error) parts.push(String(source.error))
+  else if (source.notice) parts.push(String(source.notice))
+  return parts.join(' · ')
+}
+
+const uploadPollTimers = new Set<number>()
+/** 秒回（parsing 等进行态）后的轮询：每 2s 复用列表加载按 doc_id 对状态，终态落定或 5 分钟超时即停。
+ *  epoch/space 防护与组件内其他异步同款：切空间/卸载后不再续 poll（contextEpoch 单调递增）。 */
+function pollUploadDoc(rowId: number, docId: string, space: string, epoch: number) {
+  const deadline = Date.now() + UPLOAD_POLL_TIMEOUT_MS
+  const schedule = () => {
+    const timer = window.setTimeout(() => {
+      uploadPollTimers.delete(timer)
+      void tick()
+    }, UPLOAD_POLL_MS)
+    uploadPollTimers.add(timer)
+  }
+  const tick = async () => {
+    if (!contextIsCurrent(epoch, space)) return
+    if (Date.now() > deadline) {
+      updateUpload(rowId, {
+        state: 'partial', phase: undefined,
+        msg: '后台处理超过 5 分钟未落定：可能仍在处理，请稍后刷新列表查看。',
+      })
+      return
+    }
+    try {
+      await loadKnowledgeAssets(space, epoch)
+      if (!contextIsCurrent(epoch, space)) return
+      const doc = docs.value.find((item) => item.doc_id === docId)
+      if (doc && isTerminalIngest(doc)) {
+        updateUpload(rowId, {
+          state: uploadState(doc.status), msg: ingestOutcomeText(doc),
+          ds: doc.datasource ?? null, phase: undefined,
+        })
+        return
+      }
+    } catch { /* 本轮拉取失败：下趟再试，不当作上传失败 */ }
+    schedule()
+  }
+  schedule()
+}
+
 // route：按文件给出目标文件夹与目的地文案（文件夹层级上传用）；不传则全部进 uploadFolderId 当前选择
 async function send(files: File[], route?: (file: File) => { folderId: string; destination: string } | undefined) {
   if (!files.length || busy.value || !spaceId.value) return
@@ -1310,34 +1563,35 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
       attempted = true
       const row: UploadRow = {
         id: ++uploadId, name: displayName, state: 'doing',
-        msg: '正在上传并建立索引',
-        destination: fileDestination,
+        msg: '等待上传',
+        destination: fileDestination, progress: 0, phase: 'upload',
       }
       pushUpload(row)
       const rowId = row.id
       try {
-        const form = new FormData()
-        form.append('file', file, file.name)
-        form.append('space_id', requestSpace)
-        if (fileFolder) form.append('folder_id', fileFolder)
-        const resp = await fetch('/api/kb/upload', {
-          method: 'POST', headers: headers(), body: form,
+        const { status, data } = await uploadViaXhr(file, requestSpace, fileFolder, (pct) => {
+          updateUpload(rowId, { progress: pct, msg: pct >= 100 ? '等待服务端响应' : `上传中 ${pct}%` })
         })
-        const data = await responseJson(resp)
-        if (!resp.ok) {
-          updateUpload(rowId, { state: 'fail', msg: data.error ?? `HTTP ${resp.status}` })
+        if (status === 401) emit('auth-expired')
+        if (status < 200 || status >= 300) {
+          updateUpload(rowId, { state: 'fail', msg: data.error ?? `HTTP ${status}`, progress: null, phase: undefined })
           continue
         }
-        const parts = [statusText(data.status), `${data.chunk_count ?? 0} 个切片`]
-        if (data.page_count) parts.push(`${data.page_count} 页`)
-        if (data.error) parts.push(data.error)
-        updateUpload(rowId, {
-          state: uploadState(data.status),
-          msg: parts.join(' · '),
-          ds: data.datasource ?? null,
-        })
+        if (isTerminalIngest(data)) {
+          // 终态（同步处理完/失败/带降级文案的 chunked）：按原口径落行
+          updateUpload(rowId, {
+            state: uploadState(String(data.status ?? '')), msg: ingestOutcomeText(data),
+            ds: data.datasource ?? null, progress: null, phase: undefined,
+          })
+        } else {
+          // 进行态（秒回 parsing / 无降级文案的 chunked）：行挂「解析中」，轮询跟踪到终态
+          const docId = String(data.doc_id ?? data.id ?? '')
+          updateUpload(rowId, { msg: '解析中…（后台建立索引）', progress: null, phase: 'parse' })
+          if (docId) pollUploadDoc(rowId, docId, requestSpace, requestEpoch)
+          else updateUpload(rowId, { state: 'partial', phase: undefined, msg: '已提交后台处理：服务端未返回文档标识，请稍后刷新列表查看结果。' })
+        }
       } catch (e) {
-        updateUpload(rowId, { state: 'fail', msg: errorText(e) })
+        updateUpload(rowId, { state: 'fail', msg: errorText(e), progress: null, phase: undefined })
       }
     }
   } finally {
@@ -1740,11 +1994,19 @@ onBeforeUnmount(() => {
   metadataRequestId++
   grantsRequestId++
   uploadRequestId++
+  // 在途的轮询定时器也要清：epoch 防护只能阻止续 poll，已在队列的 setTimeout 仍会空发一次
+  for (const timer of uploadPollTimers) window.clearTimeout(timer)
+  uploadPollTimers.clear()
+  document.removeEventListener('click', closeMenus)
 })
 
 /** 主对话框打开即聚焦（aria-modal 的键盘起点；section 本身 tabindex=-1 可聚焦）。 */
 const panelEl = ref<HTMLElement>()
-onMounted(() => panelEl.value?.focus())
+onMounted(() => {
+  panelEl.value?.focus()
+  // ⋯ 菜单与筛选下拉的点外关闭：按钮自身 @click.stop，落到这里的都是「点在外面」
+  document.addEventListener('click', closeMenus)
+})
 
 /** WAI Tabs：←/→ 在 tab 间切换并移动焦点（自动激活模式）。 */
 function onTabKeydown(e: KeyboardEvent) {
@@ -1872,26 +2134,21 @@ void loadSpaces(props.initialSpace)
             <p v-if="folderApiAvailable === false" class="folder-contract">当前服务端尚未启用目录接口；现有文档仍按“全部文档”管理。</p>
           </aside>
           <div class="folder-content">
-            <nav class="folder-breadcrumb" aria-label="当前目录" :title="selectedFolderName">
-              <span class="breadcrumb-label">当前位置</span>
-              <div class="breadcrumb-path">
-                <button type="button" @click="selectFolder('')">全部文档</button>
-                <template v-if="selectedFolder">
-                  <template v-for="folder in selectedFolderTrail" :key="folder.folder_id">
-                    <span aria-hidden="true">/</span>
-                    <button type="button" :class="{ current: folder.folder_id === selectedFolderId }" :aria-current="folder.folder_id === selectedFolderId ? 'page' : undefined" @click="selectFolder(folder.folder_id)">{{ folder.name }}</button>
-                  </template>
-                </template>
-                <template v-else-if="selectedFolderId === '__unfiled__'">
-                  <span aria-hidden="true">/</span><strong>未分类</strong>
-                </template>
-              </div>
-              <small>{{ visibleDocs.length }} 份文档</small>
-              <div v-if="selectedFolder && currentSpace?.writable" class="folder-commands">
-                <button class="text-btn" type="button" :disabled="switchingDisabled" @click="openFolderEdit">改名/移动</button>
-                <button class="text-btn danger" type="button" :disabled="switchingDisabled" @click="deleteSelectedFolder">{{ folderDeletingId ? '删除中' : '删除' }}</button>
-              </div>
-            </nav>
+            <!-- 页头统计卡：点击卡片即按对应状态筛选（Yuxi 的可点统计卡思路），与工具条筛选下拉同源 -->
+            <div v-if="docs.length" class="stat-cards" aria-label="文档状态统计">
+              <button type="button" class="stat-card" :class="{ active: filter === 'ready' }" @click="filter = 'ready'">
+                <strong>{{ counts.ready }}</strong><span>可检索</span>
+              </button>
+              <button type="button" class="stat-card" :class="{ active: filter === 'processing' }" @click="filter = 'processing'">
+                <strong>{{ counts.processing }}</strong><span>处理中</span>
+              </button>
+              <button type="button" class="stat-card" :class="{ active: filter === 'attention' }" @click="filter = 'attention'">
+                <strong>{{ counts.attention }}</strong><span>需处理</span>
+              </button>
+              <button type="button" class="stat-card" :class="{ active: filter === 'all' }" @click="filter = 'all'">
+                <strong>{{ counts.all }}</strong><span>全部文档</span>
+              </button>
+            </div>
         <section v-if="currentSpace?.writable" class="upload-section" aria-label="上传文档">
           <div class="upload-destination">
             <label for="kb-upload-folder">上传到</label>
@@ -1939,11 +2196,22 @@ void loadSpaces(props.initialSpace)
               <strong>本次处理</strong>
               <button type="button" class="text-btn" :disabled="!uploadsDoneCount" @click="uploads = uploads.filter((u) => u.state === 'doing')">清除已结束</button>
             </div>
+            <!-- 大批量时逐行扫读不现实：≥10 个文件加聚合卡（少于 10 个逐行状态已足够） -->
+            <div v-if="uploads.length >= UPLOAD_AGG_MIN" class="queue-agg">
+              <span>总计 {{ uploadAgg.total }}</span>
+              <span>上传中 {{ uploadAgg.uploading }}</span>
+              <span>解析中 {{ uploadAgg.parsing }}</span>
+              <span :class="{ bad: uploadAgg.failed }">失败 {{ uploadAgg.failed }}</span>
+            </div>
             <div v-for="u in uploads" :key="u.id" class="queue-row" :class="u.state">
               <span class="queue-state" aria-hidden="true">{{ u.state === 'doing' ? '···' : u.state === 'ok' ? '✓' : u.state === 'partial' ? '!' : '×' }}</span>
               <div class="queue-main">
                 <strong :title="u.name">{{ u.name }}</strong>
                 <span>{{ u.msg }}</span>
+                <div
+                  v-if="u.state === 'doing' && u.phase === 'upload' && u.progress != null" class="queue-progress"
+                  role="progressbar" :aria-valuenow="u.progress" aria-valuemin="0" aria-valuemax="100"
+                ><i :style="{ width: `${u.progress}%` }"></i></div>
                 <span v-if="u.destination" class="queue-destination">目标目录：{{ u.destination }}</span>
                 <div v-if="u.ds" class="data-source-note">
                   已生成 {{ u.ds.tables.length }} 张可问数表
@@ -1959,28 +2227,48 @@ void loadSpaces(props.initialSpace)
         <div v-if="actionErr" class="action-error" role="alert">{{ actionErr }}</div>
 
         <section class="library-section" aria-label="文档列表">
-          <div class="library-head">
-            <div>
-              <h3>文档资产</h3>
-              <span>{{ counts.ready }} 份可检索 · {{ counts.attention }} 份需处理</span>
-            </div>
-            <div class="library-tools">
+          <!-- 工具条：左面包屑（可点回退，复用文件夹逻辑），右搜索 + 筛选下拉 + 刷新（幽灵按钮） -->
+          <div class="doc-toolbar">
+            <nav class="folder-breadcrumb" aria-label="当前目录" :title="selectedFolderName">
+              <div class="breadcrumb-path">
+                <button type="button" @click="selectFolder('')">全部文档</button>
+                <template v-if="selectedFolder">
+                  <template v-for="folder in selectedFolderTrail" :key="folder.folder_id">
+                    <span aria-hidden="true">/</span>
+                    <button type="button" :class="{ current: folder.folder_id === selectedFolderId }" :aria-current="folder.folder_id === selectedFolderId ? 'page' : undefined" @click="selectFolder(folder.folder_id)">{{ folder.name }}</button>
+                  </template>
+                </template>
+                <template v-else-if="selectedFolderId === '__unfiled__'">
+                  <span aria-hidden="true">/</span><strong>未分类</strong>
+                </template>
+              </div>
+              <div v-if="selectedFolder && currentSpace?.writable" class="folder-commands">
+                <button class="text-btn" type="button" :disabled="switchingDisabled" @click="openFolderEdit">改名/移动</button>
+                <button class="text-btn danger" type="button" :disabled="switchingDisabled" @click="deleteSelectedFolder">{{ folderDeletingId ? '删除中' : '删除' }}</button>
+              </div>
+            </nav>
+            <div class="doc-toolbar-tools">
               <label class="search-box">
                 <span class="sr-only">搜索文档</span>
-                <input v-model="search" type="text" placeholder="搜索文档（名称、标签、目录、状态等）" />
+                <input v-model="search" type="text" placeholder="搜索文档（名称、标签、目录等）" />
                 <button v-if="search" type="button" title="清空搜索" aria-label="清空搜索" @click="search = ''">×</button>
               </label>
-              <button class="icon-btn" type="button" title="刷新列表" aria-label="刷新列表" :disabled="loading || switchingDisabled" @click="loadSpaces(spaceId)">↻</button>
+              <div class="ghost-drop">
+                <button
+                  class="ghost-btn" type="button" :class="{ on: filter !== 'all' }"
+                  :aria-expanded="filterMenuOpen" aria-haspopup="menu" title="按状态筛选"
+                  @click.stop="filterMenuOpen = !filterMenuOpen; menuDocId = ''"
+                ><span aria-hidden="true">▽</span>{{ currentFilterLabel }}</button>
+                <div v-if="filterMenuOpen" class="ghost-menu" role="menu" aria-label="文档状态筛选">
+                  <button
+                    v-for="item in filters" :key="item.value" type="button" role="menuitemradio"
+                    :aria-checked="filter === item.value" :class="{ active: filter === item.value }"
+                    @click="filter = item.value; filterMenuOpen = false"
+                  >{{ item.label }} <span>{{ item.count }}</span></button>
+                </div>
+              </div>
+              <button class="ghost-btn" type="button" title="刷新列表" aria-label="刷新列表" :disabled="loading || switchingDisabled" @click="loadSpaces(spaceId)">↻</button>
             </div>
-          </div>
-
-          <div class="filter-bar" aria-label="文档状态筛选">
-            <button
-              v-for="item in filters" :key="item.value" type="button"
-              :class="{ active: filter === item.value }" :aria-pressed="filter === item.value" @click="filter = item.value"
-            >
-              {{ item.label }} <span>{{ item.count }}</span>
-            </button>
           </div>
 
           <div v-if="listErr" class="list-state error" role="alert">
@@ -2002,78 +2290,108 @@ void loadSpaces(props.initialSpace)
             <span>调整关键词或切换状态筛选。</span>
             <button class="secondary-btn" type="button" @click="search = ''; filter = 'all'; selectFolder('')">清除筛选</button>
           </div>
-          <div v-else class="doc-table">
-            <div class="doc-table-head" aria-hidden="true">
-              <span>文档</span><span>类型</span><span>大小</span><span>内容</span><span>更新时间</span><span>状态与操作</span>
+          <template v-else>
+            <!-- 批量条：勾选后出现；批量操作逐条走既有单文档端点 -->
+            <div v-if="checkedIds.length" class="batch-bar" aria-live="polite">
+              <span>已选 {{ checkedIds.length }} 项</span>
+              <template v-if="currentSpace?.writable">
+                <button type="button" class="text-btn" :disabled="batchBusy" @click="batchReprocessChecked">批量重新处理</button>
+                <button type="button" class="text-btn danger" :disabled="batchBusy" @click="batchDeleteOpen = true">批量删除</button>
+              </template>
+              <button type="button" class="text-btn" @click="checkedIds = []">清空选择</button>
             </div>
-            <article v-for="d in visibleDocs" :key="d.doc_id" class="doc-row" :class="[stateOf(d.status), { disabled: d.enabled === false }]">
-              <div class="doc-name-cell">
-                <span class="file-type">{{ extOf(d.name) }}</span>
-                <div>
-                  <strong :title="d.name">{{ d.name }}</strong>
-                  <span class="doc-lineage">
-                    <template v-if="folderPath(d)">目录：{{ folderPath(d) }} · </template><template v-if="d.uploaded_by">上传人：{{ d.uploaded_by }}</template>
-                  </span>
-                   <div v-if="d.business_domain || d.document_family || d.document_revision || d.tags?.length || effectiveText(d)" class="doc-governance">
-                    <span v-if="d.business_domain" class="domain-tag">{{ d.business_domain }}</span>
-                    <span v-if="d.document_family">{{ d.document_family }}</span>
-                    <span v-if="d.document_revision" class="revision-tag">{{ d.document_revision }}</span>
-                    <span v-for="tag in d.tags" :key="tag">{{ tag }}</span>
-                    <span v-if="effectiveText(d)" class="effective-tag">{{ effectiveText(d) }}</span>
-                  </div>
-                  <div v-if="d.description" class="doc-desc" :title="d.description">{{ d.description }}</div>
-                </div>
+            <!-- 整行可点 = 打开预览；复选框/⋯ 菜单/文件名链接各自 @click.stop 拦截 -->
+            <table class="doc-table">
+              <thead>
+                <tr>
+                  <th class="col-check">
+                    <input
+                      type="checkbox" :checked="pageAllChecked" aria-label="选择本页全部文档"
+                      @change="toggleCheckPage(($event.target as HTMLInputElement).checked)"
+                    />
+                  </th>
+                  <th>文件名</th>
+                  <th class="col-content">内容量</th>
+                  <th class="col-status">状态</th>
+                  <th class="col-time">时间</th>
+                  <th class="col-ops"><span class="sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="d in pagedDocs" :key="d.doc_id" class="doc-tr" :class="{ disabled: d.enabled === false }" @click="previewDoc = d">
+                  <td class="col-check" @click.stop>
+                    <input type="checkbox" :checked="checkedSet.has(d.doc_id)" :aria-label="`选择 ${d.name}`" @change="toggleCheck(d.doc_id, ($event.target as HTMLInputElement).checked)" />
+                  </td>
+                  <td class="col-name">
+                    <div class="doc-name-cell">
+                      <span class="file-type" aria-hidden="true">{{ extOf(d.name) }}</span>
+                      <div class="doc-name-main">
+                        <button type="button" class="doc-name-link" :title="nameTitle(d)" @click.stop="previewDoc = d">{{ d.name }}</button>
+                        <span v-if="d.description" class="doc-desc-line" :title="d.description">{{ d.description }}</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="col-content" :title="contentText(d)">{{ contentText(d) }}</td>
+                  <td class="col-status">
+                    <!-- 状态 pill 兼主操作：仅失败态可点（=重新处理），处理中点不动但 title 有说明 -->
+                    <button
+                      v-if="pillState(d) === 'failed' && currentSpace?.writable" type="button"
+                      class="status-pill failed clickable" :title="pillTitle(d)" :disabled="!!reprocessingId"
+                      @click.stop="reprocess(d)"
+                    >{{ reprocessingId === d.doc_id ? '处理中' : '处理失败' }}</button>
+                    <span v-else class="status-pill" :class="pillState(d)" :title="pillTitle(d)">{{ docStatusText(d) }}</span>
+                  </td>
+                  <td class="col-time">{{ docTimeText(d.updated_at || d.created_at) }}</td>
+                  <td class="col-ops" @click.stop>
+                    <button
+                      type="button" class="ops-btn" :aria-expanded="menuDocId === d.doc_id" aria-haspopup="menu"
+                      :aria-label="`打开 ${d.name} 的操作菜单`" @click.stop="toggleRowMenu(d.doc_id)"
+                    >⋯</button>
+                    <div v-if="menuDocId === d.doc_id" class="ops-menu" role="menu">
+                      <button type="button" role="menuitem" @click="previewDoc = d; menuDocId = ''">预览</button>
+                      <button type="button" role="menuitem" @click="downloadDoc(d.doc_id, d.name); menuDocId = ''">下载原件</button>
+                      <template v-if="currentSpace?.writable">
+                        <button type="button" role="menuitem" :disabled="folderApiAvailable === false" @click="openMoveDialog(d); menuDocId = ''">移动至…</button>
+                        <button type="button" role="menuitem" @click="openMetadata(d); menuDocId = ''">元数据</button>
+                        <button
+                          type="button" role="menuitem" :disabled="!!descGeneratingId"
+                          title="AI 按文档开头生成一段描述并写回（覆盖已有描述，参与检索召回）"
+                          @click="generateDescription(d); menuDocId = ''"
+                        >{{ descGeneratingId === d.doc_id ? '生成中' : '生成描述' }}</button>
+                        <button
+                          type="button" role="menuitem" :disabled="!!stateChangingId"
+                          :title="d.enabled === false ? '恢复参与知识检索' : '暂时从知识检索中移除'"
+                          @click="toggleState(d); menuDocId = ''"
+                        >{{ d.enabled === false ? '启用' : '停用' }}</button>
+                        <button
+                          v-if="stateOf(d.status) !== 'ready'" type="button" role="menuitem"
+                          :disabled="!!reprocessingId" title="使用服务器保存的原文件重新解析并建立索引"
+                          @click="reprocess(d); menuDocId = ''"
+                        >重新处理</button>
+                        <button type="button" role="menuitem" class="danger" :disabled="deletingId === d.doc_id" @click="openDeleteConfirm(d); menuDocId = ''">删除</button>
+                      </template>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="doc-pager">
+              <span class="doc-pager-total">共 {{ visibleDocs.length }} 项</span>
+              <div class="doc-pager-controls">
+                <label>每页
+                  <select v-model.number="pageSize" aria-label="每页条数">
+                    <option :value="20">20</option>
+                    <option :value="50">50</option>
+                    <option :value="100">100</option>
+                  </select>
+                  条
+                </label>
+                <button type="button" :disabled="page <= 0" @click="page--">上一页</button>
+                <span class="doc-pager-pages">{{ page + 1 }} / {{ pageCount }}</span>
+                <button type="button" :disabled="page >= pageCount - 1" @click="page++">下一页</button>
               </div>
-              <span class="doc-type" data-label="类型">{{ typeText(d) }}</span>
-              <span data-label="大小">{{ sizeText(d.bytes) }}</span>
-              <span data-label="内容">{{ d.page_count ? `${d.page_count} 页 · ` : '' }}{{ d.chunk_count ?? 0 }} 切片</span>
-              <span data-label="更新时间">{{ dateText(d.updated_at || d.created_at) }}</span>
-              <div class="doc-status-cell">
-                <div class="status-line">
-                  <span class="status-dot" aria-hidden="true"></span>
-                  <!-- strong 只放状态文案：quality.label 由同行的 badge 渲染，不重复两遍 -->
-                  <strong>{{ docStatusText(d) }}</strong>
-                  <span v-if="d.quality?.label" class="quality-badge" :class="qualityClass(d.quality.level)">{{ d.quality.label }}</span>
-                </div>
-                <span class="status-hint" :class="{ notice: d.notice && !d.error }" :title="statusHint(d)">{{ statusHint(d) }}</span>
-                <div class="row-actions">
-                  <button type="button" class="text-btn" @click="previewDoc = d">预览</button>
-                  <button type="button" class="text-btn" @click="downloadDoc(d.doc_id, d.name)">下载原件</button>
-                  <template v-if="currentSpace?.writable">
-                    <label class="doc-move" :title="`当前目录：${folderPath(d) || '根目录 / 未分类'}`">
-                      <span>移动至</span>
-                      <select
-                        class="doc-folder-select" :value="d.folder_id || ''" :disabled="!!docMovingId || folderApiAvailable === false"
-                        :aria-label="`移动《${d.name}》到文件夹`"
-                        @change="moveDoc(d, ($event.target as HTMLSelectElement).value)"
-                      >
-                        <option value="">根目录 / 未分类</option>
-                        <option v-for="row in folderRows" :key="row.folder.folder_id" :value="row.folder.folder_id">{{ '　'.repeat(row.depth) }}{{ folderLabel(row.folder) }}</option>
-                      </select>
-                    </label>
-                    <span v-if="docMovingId === d.doc_id" class="moving-note" role="status">移动中…</span>
-                    <button
-                      v-if="stateOf(d.status) !== 'ready'" type="button" class="text-btn"
-                      :disabled="!!reprocessingId" title="使用服务器保存的原文件重新解析并建立索引"
-                      @click="reprocess(d)"
-                    >{{ reprocessingId === d.doc_id ? '处理中' : '重新处理' }}</button>
-                    <button
-                      type="button" class="text-btn" :disabled="!!stateChangingId"
-                      :title="d.enabled === false ? '恢复参与知识检索' : '暂时从知识检索中移除'"
-                      @click="toggleState(d)"
-                    >{{ stateChangingId === d.doc_id ? '处理中' : d.enabled === false ? '启用' : '停用' }}</button>
-                    <button type="button" class="text-btn" @click="openMetadata(d)">元数据</button>
-                    <button
-                      type="button" class="text-btn" :disabled="!!descGeneratingId"
-                      title="AI 按文档开头生成一段描述并写回（覆盖已有描述，参与检索召回）"
-                      @click="generateDescription(d)"
-                    >{{ descGeneratingId === d.doc_id ? '生成中' : '生成描述' }}</button>
-                    <button type="button" class="text-btn danger" :disabled="deletingId === d.doc_id" @click="openDeleteConfirm(d)">删除</button>
-                  </template>
-                </div>
-              </div>
-            </article>
-          </div>
+            </div>
+          </template>
         </section>
           </div>
         </section>
@@ -2433,6 +2751,37 @@ void loadSpaces(props.initialSpace)
         </div>
       </div>
 
+      <div v-if="moveDocTarget" class="confirm-mask" @click.self="closeMoveDialog()">
+        <form class="confirm-box folder-create-box" role="dialog" aria-modal="true" aria-labelledby="move-doc-title" @submit.prevent="confirmMoveDoc" @keydown.esc.stop="closeMoveDialog()">
+          <h3 id="move-doc-title">移动文档</h3>
+          <p :title="moveDocTarget.name">《{{ moveDocTarget.name }}》</p>
+          <label>
+            <span>目标文件夹</span>
+            <select v-model="moveTargetFolderId" :disabled="!!docMovingId">
+              <option value="">根目录 / 未分类</option>
+              <option v-for="row in folderRows" :key="row.folder.folder_id" :value="row.folder.folder_id">{{ '　'.repeat(row.depth) }}{{ folderLabel(row.folder) }}</option>
+            </select>
+          </label>
+          <div class="confirm-actions">
+            <button class="secondary-btn" type="button" :disabled="!!docMovingId" @click="closeMoveDialog()">取消</button>
+            <button class="primary-btn" type="submit" :disabled="!!docMovingId">{{ docMovingId ? '移动中' : '移动' }}</button>
+          </div>
+        </form>
+      </div>
+
+      <div v-if="batchDeleteOpen" class="confirm-mask" @click.self="!batchBusy && (batchDeleteOpen = false)">
+        <div class="confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="batch-delete-title" @keydown.esc.stop="!batchBusy && (batchDeleteOpen = false)">
+          <h3 id="batch-delete-title">删除所选文档？</h3>
+          <p>已选 {{ checkedIds.length }} 份文档的原文件、切片和检索索引将一并删除，且无法撤销。</p>
+          <div class="confirm-actions">
+            <button class="secondary-btn" type="button" :disabled="batchBusy" @click="batchDeleteOpen = false">取消</button>
+            <button class="danger-btn" type="button" :disabled="batchBusy" @click="removeCheckedConfirmed">
+              {{ batchBusy ? '删除中' : '确认删除' }}
+            </button>
+          </div>
+        </div>
+      </div>
+
       <KbDocPreview
         v-if="previewDoc" :token="token" :doc-id="previewDoc.doc_id" :doc-name="previewDoc.name" :mime="previewDoc.mime"
         @close="previewDoc = null" @auth-expired="emit('auth-expired')"
@@ -2520,14 +2869,12 @@ void loadSpaces(props.initialSpace)
 .folder-contract { margin: 0; padding: 10px; color: var(--text-muted); background: var(--bg-main); font-size: 10.5px; line-height: 1.55; }
 .folder-content { min-width: 0; }
 .folder-breadcrumb { min-height: 40px; display: flex; align-items: center; gap: 8px; margin-bottom: 8px; padding: 7px 10px; border: 1px solid var(--divider); background: var(--bg-main); font-size: 11px; }
-.breadcrumb-label { flex: none; color: var(--text-faint); font-size: 10px; }
 .breadcrumb-path { min-width: 0; display: flex; align-items: center; gap: 6px; overflow-x: auto; scrollbar-width: thin; }
-.breadcrumb-path span, .folder-breadcrumb small { color: var(--text-muted); }
+.breadcrumb-path span { color: var(--text-muted); }
 .breadcrumb-path button { min-width: 0; max-width: 180px; flex: 0 1 auto; overflow: hidden; padding: 0; border: 0; background: transparent; color: var(--text-muted); cursor: pointer; font: inherit; text-overflow: ellipsis; white-space: nowrap; }
 .breadcrumb-path button:hover { color: var(--primary); text-decoration: underline; }
 .breadcrumb-path button.current { color: var(--text-primary); font-weight: 700; text-decoration: none; }
 .breadcrumb-path strong { min-width: 0; overflow: hidden; color: var(--text-primary); text-overflow: ellipsis; white-space: nowrap; }
-.folder-breadcrumb small { margin-left: auto; white-space: nowrap; }
 .folder-commands { display: flex; align-items: center; gap: 7px; margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--divider); }
 .upload-destination { display: grid; grid-template-columns: auto minmax(180px, 280px) minmax(0, 1fr); align-items: center; gap: 8px; margin-bottom: 8px; color: var(--text-muted); font-size: 11px; }
 .url-ingest { display: flex; gap: 8px; margin-top: 8px; }
@@ -2538,7 +2885,6 @@ void loadSpaces(props.initialSpace)
 .dir-upload { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
 .dir-upload .secondary-btn { flex: 0 0 auto; height: 32px; }
 .dir-hint { min-width: 0; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
-.doc-desc { margin-top: 4px; color: var(--text-muted); font-size: 11px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .upload-destination label { color: var(--text-primary); font-weight: 650; }
 .upload-destination select, .folder-create-box select { height: 32px; min-width: 0; padding: 0 28px 0 8px; border: 1px solid var(--border); border-radius: 6px; outline: 0; background: var(--bg-card); color: var(--text-primary); font: inherit; font-size: 11.5px; }
 .upload-destination select:focus, .folder-create-box select:focus { border-color: var(--primary); box-shadow: var(--ring); }
@@ -2564,6 +2910,14 @@ void loadSpaces(props.initialSpace)
   border-bottom: 1px solid var(--divider); background: var(--bg-main); font-size: 11.5px;
 }
 .queue-head .text-btn { margin-left: auto; }
+.queue-agg {
+  display: flex; align-items: center; gap: 14px; padding: 7px 10px;
+  border-bottom: 1px solid var(--divider); background: var(--bg-main);
+  color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.queue-agg .bad { color: var(--error-text); }
+.queue-progress { height: 4px; margin-top: 5px; overflow: hidden; border-radius: 999px; background: var(--bg-sunken); }
+.queue-progress i { display: block; height: 100%; border-radius: 999px; background: var(--primary); transition: width .2s ease; }
 .queue-row { display: flex; gap: 10px; padding: 9px 10px; border-top: 1px solid var(--divider); }
 .queue-row:first-of-type { border-top: 0; }
 .queue-state {
@@ -2650,18 +3004,55 @@ void loadSpaces(props.initialSpace)
   color: var(--text-regular); font: 12px/1.7 var(--font-sans); overflow-wrap: anywhere;
 }
 .library-section { margin-top: 22px; }
-/* 特异性要压过 .doc-name-cell span:not(.file-type)（0,2,1），否则空 lineage 占位仍留 margin-top 缝隙 */
-.doc-name-cell .doc-lineage:empty { display: none; }
 .folder-create-box { width: min(460px, calc(100% - 32px)); }
 .folder-create-box > label { display: block; margin-top: 12px; }
 .folder-create-box > label > span { display: block; margin-bottom: 5px; color: var(--text-primary); font-size: 11.5px; font-weight: 650; }
 .folder-create-box input, .folder-create-box select { width: 100%; }
 .folder-create-box input { height: 34px; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; outline: 0; background: var(--bg-card); color: var(--text-primary); font: inherit; font-size: 12px; }
 .folder-create-box input:focus { border-color: var(--primary); box-shadow: var(--ring); }
-.library-head { display: flex; align-items: flex-end; gap: 20px; }
-.library-head h3 { color: var(--text-primary); font-size: 14px; }
-.library-head > div > span { display: block; margin-top: 3px; color: var(--text-muted); font-size: 11.5px; }
-.library-tools { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+/* 页头统计卡：点击即筛选（Yuxi 可点统计卡思路） */
+.stat-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px; }
+.stat-card {
+  display: flex; align-items: baseline; gap: 7px; padding: 8px 12px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg-card); cursor: pointer; font: inherit; text-align: left;
+}
+.stat-card:hover { border-color: var(--primary); background: var(--primary-light); }
+.stat-card.active { border-color: var(--primary); background: var(--primary-light); box-shadow: inset 0 0 0 1px var(--primary); }
+.stat-card strong { color: var(--text-primary); font-size: 17px; font-variant-numeric: tabular-nums; }
+.stat-card span { color: var(--text-muted); font-size: 11px; }
+/* 列表工具条：左面包屑、右搜索 + 筛选下拉 + 刷新（幽灵按钮） */
+.doc-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.doc-toolbar .folder-breadcrumb { flex: 1; min-width: 0; min-height: 0; margin: 0; padding: 0; border: 0; background: transparent; }
+.doc-toolbar-tools { display: flex; align-items: center; gap: 6px; }
+.doc-toolbar .search-box { width: min(230px, 30vw); }
+.doc-toolbar .search-box input { height: 28px; }
+.doc-toolbar .search-box button { top: 2px; }
+.ghost-btn {
+  height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 0 8px;
+  border: 1px solid transparent; border-radius: 6px; background: transparent;
+  color: var(--text-muted); cursor: pointer; font: inherit; font-size: 11.5px;
+}
+.ghost-btn:hover:not(:disabled) { border-color: var(--border); background: var(--bg-main); color: var(--text-primary); }
+.ghost-btn.on { color: var(--primary); background: var(--primary-light); }
+.ghost-drop { position: relative; }
+.ghost-menu {
+  position: absolute; top: 32px; right: 0; z-index: 6; min-width: 128px; padding: 4px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); box-shadow: var(--shadow-lg);
+}
+.ghost-menu button {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 6px 9px; border: 0; border-radius: 5px; background: transparent;
+  color: var(--text-regular); cursor: pointer; font: inherit; font-size: 12px; text-align: left;
+}
+.ghost-menu button:hover { background: var(--primary-light); color: var(--primary); }
+.ghost-menu button.active { color: var(--primary); font-weight: 700; }
+.ghost-menu button span { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+/* 批量条：复选框勾选后出现 */
+.batch-bar {
+  display: flex; align-items: center; gap: 14px; margin-bottom: 6px; padding: 5px 10px;
+  border: 1px solid rgba(var(--primary-rgb), .25); border-radius: 6px; background: var(--primary-light);
+  color: var(--text-regular); font-size: 11.5px;
+}
 .search-box { position: relative; width: min(330px, 38vw); }
 .search-box input {
   width: 100%; height: 32px; padding: 0 30px 0 10px; border: 1px solid var(--border);
@@ -2672,72 +3063,86 @@ void loadSpaces(props.initialSpace)
   position: absolute; right: 4px; top: 4px; width: 24px; height: 24px;
   border: 0; background: transparent; color: var(--text-muted); cursor: pointer;
 }
-.filter-bar { display: flex; gap: 2px; margin: 12px 0 8px; border-bottom: 1px solid var(--divider); }
-.filter-bar button {
-  height: 30px; padding: 0 10px; border: 0; border-bottom: 2px solid transparent;
-  background: transparent; color: var(--text-muted); cursor: pointer; font-size: 12px;
+/* 文档表：Yuxi small 密度（th 8px 10px / td 7px 10px / 13px），整行可点、hover 淡主色底 */
+.doc-table { width: 100%; table-layout: fixed; border-collapse: collapse; border: 1px solid var(--border); font-size: 13px; }
+.doc-table th {
+  padding: 8px 10px; border-bottom: 1px solid var(--border); background: var(--bg-main);
+  color: var(--text-muted); font-size: 11px; font-weight: 600; text-align: left;
 }
-.filter-bar button span { margin-left: 3px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
-.filter-bar button:hover { color: var(--text-primary); }
-.filter-bar button.active { border-bottom-color: var(--primary); color: var(--primary); font-weight: 650; }
-.doc-table { border: 1px solid var(--border); overflow: hidden; }
-.doc-table-head, .doc-row {
-  display: grid; grid-template-columns: minmax(180px, 1.7fr) 60px 70px 88px 96px minmax(180px, 1.35fr);
-  align-items: center; column-gap: 12px;
+.doc-table td {
+  padding: 7px 10px; overflow: hidden; border-top: 1px solid var(--divider);
+  color: var(--text-muted); text-overflow: ellipsis; white-space: nowrap;
 }
-.doc-table-head {
-  min-height: 36px; padding: 0 12px; background: var(--bg-main); border-bottom: 1px solid var(--border);
-  color: var(--text-muted); font-size: 11px; font-weight: 600;
-}
-.doc-row { min-height: 78px; padding: 10px 12px; border-top: 1px solid var(--divider); font-size: 12px; }
-.doc-row:first-of-type { border-top: 0; }
-.doc-row:hover { background: var(--bg-hover); }
+.doc-table tbody tr:first-child td { border-top: 0; }
+.doc-tr { cursor: pointer; }
+.doc-tr:hover { background: var(--primary-light); }
+.doc-tr.disabled { opacity: .62; }
+/* 特异性要压过 .doc-table th/td（0,1,1），否则复选框列不居中 */
+.doc-table th.col-check, .doc-table td.col-check { width: 32px; text-align: center; }
+.col-check input { width: 14px; height: 14px; accent-color: var(--primary); cursor: pointer; }
+.col-content { width: 110px; font-variant-numeric: tabular-nums; }
+.col-status { width: 104px; }
+.col-time { width: 96px; font-variant-numeric: tabular-nums; }
+.col-ops { width: 64px; text-align: center; }
+/* ⋯ 菜单挂在单元格上：position 需要 relative，且不能继承 td 的 overflow:hidden */
+td.col-ops { position: relative; overflow: visible; }
 .doc-name-cell { min-width: 0; display: flex; align-items: center; gap: 9px; }
 .file-type {
   flex: 0 0 38px; height: 42px; display: grid; place-items: center;
   border: 1px solid var(--border); border-radius: 5px; background: var(--bg-main);
   color: var(--primary); font-size: 9px; font-weight: 800;
 }
-.doc-name-cell > div { min-width: 0; }
-.doc-name-cell strong { display: block; overflow: hidden; color: var(--text-primary); text-overflow: ellipsis; white-space: nowrap; }
-.doc-name-cell span:not(.file-type) { display: block; margin-top: 4px; color: var(--text-faint); font-size: 10.5px; }
-.doc-governance { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px; }
-.doc-name-cell .doc-governance > span {
-  display: inline-block; margin-top: 0; padding: 1px 5px; border: 1px solid var(--border); border-radius: 999px;
-  color: var(--text-muted); background: var(--bg-main); font-size: 9.5px; line-height: 1.45;
+.doc-table .file-type { flex: 0 0 30px; height: 32px; font-size: 8.5px; }
+.doc-name-main { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.doc-name-link {
+  display: block; max-width: 100%; overflow: hidden; padding: 0; border: 0; background: transparent;
+  color: var(--text-primary); cursor: pointer; font: inherit; font-weight: 600;
+  text-align: left; text-overflow: ellipsis; white-space: nowrap;
 }
-.doc-name-cell .doc-governance > .domain-tag { color: var(--primary); background: var(--primary-light); border-color: rgba(var(--primary-rgb), .2); }
-.doc-name-cell .doc-governance > .effective-tag { color: var(--text-regular); }
-.doc-row > span { color: var(--text-muted); font-variant-numeric: tabular-nums; }
-.doc-type { color: var(--text-regular) !important; font-weight: 600; }
-.doc-status-cell { min-width: 0; align-self: stretch; display: flex; flex-direction: column; justify-content: center; }
-.status-line { display: flex; align-items: center; gap: 6px; }
-.status-line strong { color: var(--text-primary); font-size: 11.5px; }
-.quality-badge {
-  max-width: 92px; overflow: hidden; padding: 1px 5px; border: 1px solid var(--border); border-radius: 999px;
-  color: var(--text-muted); background: var(--bg-main); font-size: 9.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap;
+.doc-name-link:hover { color: var(--primary); text-decoration: underline; }
+.doc-desc-line { overflow: hidden; color: var(--text-faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+/* 状态 pill（24px）：可检索绿 / 处理中蓝 / 需处理黄 / 已停用灰 / 失败红；失败可点 = 重新处理 */
+.status-pill {
+  display: inline-flex; align-items: center; height: 24px; padding: 0 8px; border: 0; border-radius: 6px;
+  font: inherit; font-size: 12px; white-space: nowrap;
 }
-.quality-badge.good { color: var(--success-text); background: var(--success-bg); border-color: var(--success); }
-.quality-badge.warning { color: var(--warning-text); background: var(--warning-bg); border-color: var(--warning-text); }
-.quality-badge.danger { color: var(--error-text); background: var(--error-bg); border-color: var(--error-ring); }
-.quality-badge.processing { color: var(--primary); background: var(--primary-light); border-color: rgba(var(--primary-rgb), .25); }
-.revision-tag { color: var(--primary) !important; border-color: rgba(var(--primary-rgb), .24) !important; background: var(--primary-light) !important; }
-.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
-.doc-row.ready .status-dot { background: var(--success); }
-.doc-row.processing .status-dot { background: var(--primary); box-shadow: 0 0 0 3px var(--primary-light); }
-.doc-row.partial .status-dot { background: var(--warning-text); }
-.doc-row.failed .status-dot { background: var(--error-text); }
-.doc-row.disabled { opacity: .7; background: var(--bg-main); }
-.doc-row.disabled .status-dot { background: var(--text-faint); box-shadow: none; }
-.status-hint { margin-top: 3px; overflow: hidden; color: var(--text-muted); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
-.status-hint.notice { color: var(--warning-text); }
-.doc-row.failed .status-hint { color: var(--error-text); }
-.doc-row.partial .status-hint { color: var(--warning-text); }
-.row-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 5px; }
-.doc-move { min-width: 0; display: inline-flex; align-items: center; gap: 5px; color: var(--text-faint); font-size: 10px; }
-.doc-folder-select { max-width: 150px; height: 26px; padding: 0 24px 0 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg-card); color: var(--text-regular); font: 10.5px var(--font-sans); }
-.doc-folder-select:focus { border-color: var(--primary); outline: 0; box-shadow: var(--ring); }
-.moving-note { color: var(--primary); font-size: 10.5px; white-space: nowrap; }
+.status-pill.ready { color: var(--success-text); background: var(--success-bg); }
+.status-pill.processing { color: var(--primary); background: var(--primary-light); }
+.status-pill.attention { color: var(--warning-text); background: var(--warning-bg); }
+.status-pill.disabled { color: var(--text-muted); background: var(--bg-sunken); }
+.status-pill.failed { color: var(--error-text); background: var(--error-bg); }
+.status-pill.clickable { cursor: pointer; }
+.status-pill.clickable:hover:not(:disabled) { box-shadow: inset 0 0 0 1px var(--error-text); }
+.ops-btn {
+  width: 28px; height: 28px; border: 1px solid transparent; border-radius: 6px; background: transparent;
+  color: var(--text-muted); cursor: pointer; font: inherit; font-size: 15px; line-height: 1;
+}
+.ops-btn:hover { border-color: var(--border); background: var(--bg-main); color: var(--text-primary); }
+.ops-menu {
+  position: absolute; top: 30px; right: 6px; z-index: 6; min-width: 128px; padding: 4px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); box-shadow: var(--shadow-lg);
+}
+.ops-menu button {
+  width: 100%; display: block; padding: 6px 10px; border: 0; border-radius: 5px; background: transparent;
+  color: var(--text-regular); cursor: pointer; font: inherit; font-size: 12px; text-align: left;
+}
+.ops-menu button:hover:not(:disabled) { background: var(--primary-light); color: var(--primary); }
+.ops-menu button.danger { color: var(--error-text); }
+.ops-menu button.danger:hover:not(:disabled) { background: var(--error-bg); }
+.ops-menu button:disabled { cursor: not-allowed; opacity: .5; }
+.doc-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 2px 0; color: var(--text-muted); font-size: 11.5px; }
+.doc-pager-controls { display: flex; align-items: center; gap: 8px; }
+.doc-pager-controls label { display: inline-flex; align-items: center; gap: 5px; }
+.doc-pager-controls select {
+  height: 24px; padding: 0 4px; border: 1px solid var(--border); border-radius: 5px;
+  background: var(--bg-card); color: var(--text-regular); font: inherit; font-size: 11px;
+}
+.doc-pager-controls > button {
+  height: 24px; padding: 0 9px; border: 1px solid var(--border); border-radius: 5px;
+  background: var(--bg-card); color: var(--text-regular); cursor: pointer; font: inherit; font-size: 11px;
+}
+.doc-pager-controls > button:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+.doc-pager-pages { font-variant-numeric: tabular-nums; }
 .text-btn { padding: 0; border: 0; background: transparent; color: var(--primary); cursor: pointer; font-size: 11.5px; }
 .text-btn:hover { text-decoration: underline; }
 .text-btn.danger { color: var(--error-text); }
@@ -2853,18 +3258,6 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .kbp:focus { outline: none; }
-/* 文档表中间档：面板内容宽 < 文档表网格最小宽时操作列被裁 —— 1130px 断点先切卡片堆叠（820 是下一个媒体查询） */
-@media (max-width: 1130px) {
-  .doc-table-head { display: none; }
-  .doc-table { border: 0; overflow: visible; }
-  .doc-row {
-    grid-template-columns: 1fr 1fr; gap: 8px 14px; margin-bottom: 8px; padding: 12px;
-    border: 1px solid var(--border); min-height: 0;
-  }
-  .doc-row:first-of-type { border-top: 1px solid var(--border); }
-  .doc-name-cell, .doc-status-cell { grid-column: 1 / -1; }
-  .doc-row > span::before { content: attr(data-label) ' · '; color: var(--text-faint); }
-}
 @media (max-width: 820px) {
   .kbp-mask { padding: 0; }
   .kbp { width: 100%; height: 100%; border: 0; border-radius: 0; }
@@ -2877,16 +3270,17 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .folder-tree { position: static; max-height: 220px; }
   .folder-breadcrumb { align-items: flex-start; flex-wrap: wrap; }
   .breadcrumb-path { order: 3; width: 100%; }
-  .folder-breadcrumb small { margin-left: auto; }
   .folder-commands { margin-left: 0; }
   .upload-destination { grid-template-columns: auto minmax(0, 1fr); }
   .upload-destination > span { grid-column: 1 / -1; }
   .drop-zone { align-items: flex-start; flex-wrap: wrap; }
   .drop-zone .primary-btn { margin-left: 52px; }
-  .library-head { align-items: stretch; flex-direction: column; gap: 10px; }
-  .library-tools { width: 100%; margin-left: 0; }
-  .search-box { width: 100%; }
-  .filter-bar { overflow-x: auto; }
+  .stat-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .doc-toolbar { align-items: flex-start; flex-wrap: wrap; }
+  .doc-toolbar-tools { width: 100%; }
+  .doc-toolbar .search-box { flex: 1; width: auto; }
+  /* 窄屏弃次要列保文件名与状态（内容量/时间收进 name 的 title 与元数据对话框） */
+  .col-content, .col-time { display: none; }
   .retrieval-input-row { flex-direction: column; }
   .retrieval-input-row .primary-btn { height: 36px; }
   .hit-row { padding-right: 2px; padding-left: 2px; }

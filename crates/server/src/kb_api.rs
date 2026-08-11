@@ -30,11 +30,13 @@ static DOWNLOAD_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new
 
 const IMAGE_OCR_PROMPT: &str = "请逐字识别图片中的全部可见文字，并完整还原表格结构、金额、数字和日期。保持原文顺序和字段，不总结、不改写、不补全、不猜测；无法辨认处标记[无法辨认]。仅输出识别结果。";
 
-struct RuntimeImageOcr<'a> {
-    llm: &'a crate::llm::LlmClient,
+/// 持有 owned `LlmClient`（`Clone` 共享运行时配置）：入库重活在后台任务里执行，
+/// OCR 实现必须能 move 进 `tokio::spawn`，借 `&st.llm` 的引用形态过不去任务边界。
+struct RuntimeImageOcr {
+    llm: crate::llm::LlmClient,
 }
 
-impl<'runtime> ingest::ImageOcr for RuntimeImageOcr<'runtime> {
+impl ingest::ImageOcr for RuntimeImageOcr {
     fn recognize<'a>(
         &'a self,
         file_name: &'a str,
@@ -349,7 +351,9 @@ pub async fn upload(
 ) -> Result<ApiOk, ApiErr> {
     // 先认证再占上传槽：未认证慢请求不能耗尽许可。
     let v = session_viewer(&st, &headers).await?;
-    let _permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
+    // 许可跟着重活走（move 进 spawn 的任务里持有到结束）：字节与解析产物都活在后台任务里，
+    // 许可若随请求返回就释放，「4 并发」闸门形同虚设。
+    let permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
     let form = tokio::time::timeout(UPLOAD_READ_TIMEOUT, read_form(mp))
         .await
         .map_err(|_| err(StatusCode::REQUEST_TIMEOUT, "上传读取超时，请重试"))??;
@@ -364,38 +368,147 @@ pub async fn upload(
         bytes: &bytes,
         preset: form.q.preset.as_deref(),
     };
-    let image_ocr = RuntimeImageOcr { llm: &st.llm };
-    let mut out =
-        ingest::ingest(&st.owned, &st.doc, &st.embed, &v, &st.kb_cfg, req, Some(&image_ocr))
-            .await
-            .map_err(kb_err)?;
-    // 去重命中既有文档时 ingest 会直接复用 doc_id；这里统一再绑定一次目标目录，
+    // 快路径（校验/去重/建行/落盘）在请求内完成；重活（parse→chunk→embed）后台跑——
+    // 大文件解析 50s+，同步 await 会被浏览器/nginx 超时断连把 handler future 直接 drop，
+    // 入库半路取消 → 文档永卡 parsing（生产已复现）。响应立即返回进行态 doc 行，前端轮询。
+    let prepared = ingest::prepare(&st.owned, &v, &st.kb_cfg, req).await.map_err(kb_err)?;
+    if let Some(job) = prepared.job {
+        spawn_ingest_job(st.clone(), v.clone(), prepared.doc_id.clone(), name.clone(), job, permit);
+    }
+    // 去重命中既有文档时 prepare 会直接复用 doc_id；这里统一再绑定一次目标目录，
     // 同时让写权限在返回结果前于同一条写语句中复核，撤权后不返回裸文档元数据。
-    if let Err(e) = store::move_doc(
+    // （绑定失败不再清理数据源：通道②产物在后台任务里才诞生，登记前的失权复核由
+    // `register_source` 自带的 `still_writable` 兜底。）
+    store::move_doc(
         &st.owned,
         &v,
-        &out.doc_id,
+        &prepared.doc_id,
         &space_id,
         form.q.folder_id.as_deref(),
     )
     .await
+    .map_err(kb_err)?;
+    let row = acl::doc_for_viewer(&st.owned, &v, &prepared.doc_id).await.map_err(kb_err)?;
+    Ok(Json(doc_json(&row, chrono::Local::now().date_naive())))
+}
+
+/// 后台跑入库重活：许可 move 进任务、持有到重活结束（闸门防的内存就活在这段期间）。
+fn spawn_ingest_job(
+    st: Arc<AppState>,
+    v: Viewer,
+    doc_id: String,
+    doc_name: String,
+    job: ingest::IngestJob,
+    permit: tokio::sync::SemaphorePermit<'static>,
+) {
+    tokio::spawn(async move {
+        run_ingest_job_logged(&st, &v, &doc_id, &doc_name, job, permit).await;
+    });
+}
+
+/// 重活执行 + 结果收尾：在线上传的后台任务与启动自愈共用这一条。
+/// - 通道②数据源登记依赖重活产物（`source`），只能在这里完成——请求早已返回；
+/// - Fresh 的失败文案 `run_job` 已落库（文档列表可见），Rebuild 失败保留线上版本，
+///   两条链在这里都只欠一条日志。
+async fn run_ingest_job_logged(
+    st: &AppState,
+    v: &Viewer,
+    doc_id: &str,
+    doc_name: &str,
+    job: ingest::IngestJob,
+    _permit: tokio::sync::SemaphorePermit<'_>,
+) {
+    let ocr = RuntimeImageOcr { llm: st.llm.clone() };
+    match ingest::run_job(&st.owned, &st.doc, &st.embed, v, &st.kb_cfg, doc_id, job, Some(&ocr))
+        .await
     {
-        if out.source.is_some() {
-            let _ = cleanup_source(&st, &out.doc_id).await;
+        Ok(source) => {
+            if let Some(src) = source {
+                register_source(st, v, doc_name, doc_id, &src).await;
+            }
         }
-        return Err(kb_err(e));
+        Err(e) => {
+            tracing::warn!(doc_id, error = %e, "入库重活失败（Fresh 已落失败文案；Rebuild 保留线上版本）");
+        }
     }
-    if !register_source(&st, &v, &name, &out).await {
-        out.source = None;
+}
+
+// ════════════════════════ 启动自愈（recover_pending）════════════════════════
+
+/// 卡死判定阈值：进行态文档 10 分钟没动过 ＝ 跑它的那个任务已经随进程死了
+///（正常解析再久，状态推进也会刷 `updated_at`）。
+const RECOVER_STALE_MINUTES: i32 = 10;
+/// 单次启动自愈的份数上限：重启撞上大批量卡死时，恢复本身不该拖垮启动后的第一波请求
+const RECOVER_BATCH_LIMIT: i64 = 50;
+
+/// 【启动自愈】重跑上次进程死亡留下的「进行中」文档（Yuxi recover_pending 同款）。
+/// 同步 ingest 时代浏览器/nginx 超时断连会把 handler future 直接 drop、文档永卡 parsing——
+/// 重活后台化之后这个坑没了，但进程重启（部署/崩溃）仍会留下僵尸，启动时扫一遍补上。
+/// 挂后台不阻塞启动；逐份串行（每份都走上传闸取许可，不与在线上传抢内存）。
+pub fn spawn_recover_pending(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        match recover_pending(&st).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("知识库启动自愈：{n} 份卡死文档已重跑入库"),
+            Err(e) => tracing::warn!("知识库启动自愈失败（剩余文档下次启动再试）: {e}"),
+        }
+    });
+}
+
+async fn recover_pending(st: &AppState) -> Result<usize, KbError> {
+    let stuck = store::stuck_docs(&st.owned, RECOVER_STALE_MINUTES, RECOVER_BATCH_LIMIT).await?;
+    let mut done = 0usize;
+    for d in stuck {
+        if recover_one(st, d).await {
+            done += 1;
+        }
     }
-    // 入库是同步链，回来时状态已终态——顺手带上，省前端一次轮询
-    let row = acl::doc_for_viewer(&st.owned, &v, &out.doc_id).await.map_err(kb_err)?;
-    let mut body = doc_json(&row, chrono::Local::now().date_naive());
-    // 通道②的产物：不带出来，「上传即可问数」对前端就是不可见的
-    if let (Some(src), Some(obj)) = (&out.source, body.as_object_mut()) {
-        obj.insert("datasource".into(), source_json(src));
-    }
-    Ok(Json(body))
+    Ok(done)
+}
+
+/// 单份卡死文档的重跑。分派键是分块存在性：有块走影子重建（首入链的 `insert_chunks`
+/// 全量冲突会报 0 行，那条链不许重入）；无块走首入链（表格通道②才能补上物理表）。
+/// 返回「是否处理到终态」——读文件失败这类可重试错误不算（下次启动再来）。
+async fn recover_one(st: &AppState, d: store::StuckDoc) -> bool {
+    // 系统任务没有会话身份：以空间 owner 执行（owner 恒过写门禁，不是 ACL 旁路）
+    let v = Viewer::new(d.owner.clone(), Vec::new());
+    let Some(path) = stored_file(&st.kb_cfg.root, &d.doc_id).await else {
+        tracing::warn!(doc_id = %d.doc_id, name = %d.name, "知识库启动自愈：原始文件已不存在，标记失败");
+        let _ = store::set_status(&st.owned, &v, &d.doc_id, store::DocStatus::Failed, "原始文件已不存在，请重新上传").await;
+        return true;
+    };
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        tracing::warn!(doc_id = %d.doc_id, name = %d.name, "知识库启动自愈：原始文件读取失败，下次启动重试");
+        return false;
+    };
+    let kind = match ingest::classify(&d.name, bytes.len() as u64, st.kb_cfg.max_bytes) {
+        Ok(kind) => kind,
+        Err(e) => {
+            // 上限收紧后历史大文件不再过校验：标失败让用户看得见，而不是每轮启动空转
+            tracing::warn!(doc_id = %d.doc_id, name = %d.name, err = %e, "知识库启动自愈：文件不再过类型/大小校验，标记失败");
+            let _ = store::set_status(&st.owned, &v, &d.doc_id, store::DocStatus::Failed, &e.to_string()).await;
+            return true;
+        }
+    };
+    // 与在线上传同一条内存闸：恢复同样整文件入内存 + 解析。后台任务等得起，排队取（不 429）。
+    let Ok(permit) = UPLOAD_GATE.acquire().await else { return false };
+    tracing::info!(doc_id = %d.doc_id, name = %d.name, has_chunks = d.has_chunks, "知识库启动自愈：重跑入库重活");
+    let req = ingest::OwnedUploadReq {
+        space_id: d.space_id.clone(),
+        folder_id: d.folder_id.clone(),
+        file_name: d.name.clone(),
+        mime: d.mime.clone(),
+        bytes,
+        // preset 未持久化到 doc 行（与 reprocess 端点同一个有意简化）：自愈按 general 重建
+        preset: None,
+    };
+    let job = if d.has_chunks {
+        ingest::IngestJob::Rebuild { req }
+    } else {
+        ingest::IngestJob::Fresh { req, kind }
+    };
+    run_ingest_job_logged(st, &v, &d.doc_id, &d.name, job, permit).await;
+    true
 }
 
 pub async fn spaces(
@@ -492,39 +605,30 @@ pub async fn reprocess(
         .await
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "原始文件已不存在，请重新上传"))?;
     // 与 upload 同一条内存闸：重处理同样整文件入内存，不占许可就绕过了 20MB × N 的防线；
-    // 429 语义与 upload 一致（拿不到直接拒，不排队）。
-    let _permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
+    // 429 语义与 upload 一致（拿不到直接拒，不排队）。许可随重活 move 进后台任务。
+    let permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
     let bytes = tokio::time::timeout(UPLOAD_READ_TIMEOUT, tokio::fs::read(&path))
         .await
         .map_err(|_| err(StatusCode::REQUEST_TIMEOUT, "文档文件读取超时，请重试"))?
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, MSG_FILE_UNREADABLE))?;
-    let req = ingest::UploadReq {
-        space_id: &row.space_id,
-        folder_id: row.folder_id.as_deref(),
-        file_name: &row.name,
-        mime: &row.mime,
-        bytes: &bytes,
-        // 重处理不保留原分块策略（恒 general）：preset 未持久化到 doc 行，当前是有意的
-        // 简化——按 qa/laws 等策略上传的文档重处理会回到 general 分块，恢复策略需先落库。
-        preset: None,
+    // 同步预检：类型/大小超限当场 400（进了后台就只能留日志）。重建链内部还会再
+    // `classify` 一次——类型白名单只有 knowledge 那一处实现，这里是提前报错，不是第二份判定。
+    ingest::classify(&row.name, bytes.len() as u64, st.kb_cfg.max_bytes).map_err(kb_err)?;
+    // 影子重建是重活（parse→chunk→embed），后台跑——同步 await 会被超时断连取消，
+    // 与 upload 同一个坑。响应立即返回当前行（影子链不完成，线上版本不动），前端轮询。
+    let job = ingest::IngestJob::Rebuild {
+        req: ingest::OwnedUploadReq {
+            space_id: row.space_id.clone(),
+            folder_id: row.folder_id.clone(),
+            file_name: row.name.clone(),
+            mime: row.mime.clone(),
+            bytes,
+            // 重处理不保留原分块策略（恒 general）：preset 未持久化到 doc 行，当前是有意的
+            // 简化——按 qa/laws 等策略上传的文档重处理会回到 general 分块，恢复策略需先落库。
+            preset: None,
+        },
     };
-    let image_ocr = RuntimeImageOcr { llm: &st.llm };
-    let out = ingest::reprocess(
-        &st.owned,
-        &st.doc,
-        &st.embed,
-        &v,
-        &st.kb_cfg,
-        req,
-        &row.doc_id,
-        Some(&image_ocr),
-    )
-    .await
-    .map_err(kb_err)?;
-    // 响应由 doc_json 重建、不带 datasource——register_source 的返回值在这里没有消费者
-    // （upload 侧才据它清 out.source）。
-    let _ = register_source(&st, &v, &row.name, &out).await;
-    let row = acl::doc_for_viewer(&st.owned, &v, &out.doc_id).await.map_err(kb_err)?;
+    spawn_ingest_job(st.clone(), v, row.doc_id.clone(), row.name.clone(), job, permit);
     Ok(Json(doc_json(&row, chrono::Local::now().date_naive())))
 }
 
@@ -648,7 +752,8 @@ mod ops_pack {
         // 再读 body，刻意拒绝 body 身份回退）；本端点是 JSON body 可预读，故用
         // `manager_viewer`（接受 body 的 login_name 回退，同一条 resolve_identity 收口）。
         let v = manager_viewer(&st, &headers, &req.q).await?;
-        let _permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
+        // 许可随重活 move 进后台任务（与 `upload` 同一条闸、同一个理由）
+        let permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
         let page = fetch_url_guarded(req.url.trim()).await?;
         let space_id = space_of(&v, &req.q);
         let up = ingest::UploadReq {
@@ -659,21 +764,23 @@ mod ops_pack {
             bytes: &page.bytes,
             preset: req.q.preset.as_deref(),
         };
-        let image_ocr = RuntimeImageOcr { llm: &st.llm };
-        let out = ingest::ingest(&st.owned, &st.doc, &st.embed, &v, &st.kb_cfg, up, Some(&image_ocr))
-            .await
-            .map_err(kb_err)?;
+        // 快路径在请求内，重活后台跑（与 `upload` 同一条异步化理由：PDF 抓取件解析同样
+        // 可能超过代理超时）。响应立即返回进行态 doc 行，前端轮询。
+        let prepared = ingest::prepare(&st.owned, &v, &st.kb_cfg, up).await.map_err(kb_err)?;
+        if let Some(job) = prepared.job {
+            spawn_ingest_job(st.clone(), v.clone(), prepared.doc_id.clone(), page.file_name.clone(), job, permit);
+        }
         // 与 `upload` 同序：统一再绑定目标目录，写权限在返回结果前于同一条写语句中复核。
-        // html/pdf 不会产表格数据源（通道②只看 sheets 非空），无需 register_source/cleanup。
-        store::move_doc(&st.owned, &v, &out.doc_id, &space_id, req.q.folder_id.as_deref())
+        // html/pdf 不会产表格数据源（通道②只看 sheets 非空），无需登记/清理数据源。
+        store::move_doc(&st.owned, &v, &prepared.doc_id, &space_id, req.q.folder_id.as_deref())
             .await
             .map_err(kb_err)?;
         // source_uri 记**最终落地 URL**（重定向后的真实来源）。回写失败（撤权竞态/DB 抖动）
         // 不抹掉已入库文档：来源地址是治理元数据，不是入库正确性。
-        if let Err(e) = store::set_doc_source_uri(&st.owned, &v, &out.doc_id, &page.final_url).await {
-            tracing::warn!(doc_id = %out.doc_id, err = %e, "URL 已入库，来源地址回写失败");
+        if let Err(e) = store::set_doc_source_uri(&st.owned, &v, &prepared.doc_id, &page.final_url).await {
+            tracing::warn!(doc_id = %prepared.doc_id, err = %e, "URL 已入库，来源地址回写失败");
         }
-        let row = acl::doc_for_viewer(&st.owned, &v, &out.doc_id).await.map_err(kb_err)?;
+        let row = acl::doc_for_viewer(&st.owned, &v, &prepared.doc_id).await.map_err(kb_err)?;
         Ok(Json(doc_json(&row, chrono::Local::now().date_naive())))
     }
 
@@ -1275,11 +1382,17 @@ mod ops_pack {
             }
             // 摘录 SQL 必须内联空间级读谓词（撤权竞态 fail-closed）
             assert!(DESC_EXCERPT_SQL.contains("a.perm IN ('read','write')"));
-            // URL 入库与上传共用同一条 ingest 链（不许有第二份入库实现）
+            // URL 入库与上传共用同一条 ingest 链（不许有第二份入库实现）：
+            // 请求内只做抓取 + 快路径（prepare），重活必须经 spawn_ingest_job 进后台
             let body = src.split("pub async fn ingest_url").nth(1).unwrap();
             let body = body.split("enum FetchedKind").next().unwrap();
-            assert!(body.contains("ingest::ingest(") && body.contains("store::move_doc("));
-            assert!(body.find("fetch_url_guarded").unwrap() < body.find("ingest::ingest(").unwrap());
+            assert!(body.contains("ingest::prepare(") && body.contains("store::move_doc("));
+            assert!(body.contains("spawn_ingest_job("), "重活必须后台化: {body}");
+            assert!(!body.contains("ingest::run_job("), "请求内不许同步跑重活: {body}");
+            let fetch = body.find("fetch_url_guarded").unwrap();
+            let prepare = body.find("ingest::prepare(").unwrap();
+            let spawn = body.find("spawn_ingest_job(").unwrap();
+            assert!(fetch < prepare && prepare < spawn, "必须先抓取、再快路径、最后挂后台: {body}");
         }
     }
 }
@@ -1531,12 +1644,19 @@ async fn still_writable(st: &AppState, v: &Viewer, doc_id: &str) -> bool {
 ///
 /// 文本检索已经可用时，问数源失败不抹掉整份文档；但物理 schema、数据源登记与结构注册
 /// 必须成套成功，否则立即清理半成品并把降级提示写回文档。
-async fn register_source(st: &AppState, v: &Viewer, doc_name: &str, out: &ingest::Ingested) -> bool {
-    let Some(src) = &out.source else { return true };
-    let allowed = still_writable(st, v, &out.doc_id).await;
+/// 入参是通道②的**产物**而不是 `Ingested`：入库异步化后登记只能发生在后台任务里
+/// （`run_job` 返回时才有 `source`），调用方保证 `src` 非 None。
+async fn register_source(
+    st: &AppState,
+    v: &Viewer,
+    doc_name: &str,
+    doc_id: &str,
+    src: &tabular::TabularSource,
+) -> bool {
+    let allowed = still_writable(st, v, doc_id).await;
     if !allowed {
-        let _ = cleanup_source(st, &out.doc_id).await;
-        tracing::warn!(doc_id = %out.doc_id, reason = "upload_permission_revoked", "表格数据源登记前写权限已失效");
+        let _ = cleanup_source(st, doc_id).await;
+        tracing::warn!(doc_id, reason = "upload_permission_revoked", "表格数据源登记前写权限已失效");
         return false;
     }
     let desc = ds_description(doc_name, src);
@@ -1549,32 +1669,32 @@ async fn register_source(st: &AppState, v: &Viewer, doc_name: &str, out: &ingest
     .await
     .is_err()
     {
-        let _ = cleanup_source(st, &out.doc_id).await;
+        let _ = cleanup_source(st, doc_id).await;
         let _ = store::append_notice(
             &st.owned,
             v,
-            &out.doc_id,
+            doc_id,
             "表格已入知识库，问数数据源登记失败，请重新上传",
         )
         .await;
-        tracing::warn!(ds_id = %src.ds_id, doc_id = %out.doc_id, reason = "datasource_register_failed", "上传表格已建表，但登记数据源失败");
+        tracing::warn!(ds_id = %src.ds_id, doc_id, reason = "datasource_register_failed", "上传表格已建表，但登记数据源失败");
         return false;
     }
     if !sync_upload_schema(st, src).await {
-        let _ = cleanup_source(st, &out.doc_id).await;
+        let _ = cleanup_source(st, doc_id).await;
         let _ = store::append_notice(
             &st.owned,
             v,
-            &out.doc_id,
+            doc_id,
             "表格已入知识库，问数结构采集失败，请重新上传",
         )
         .await;
         return false;
     }
-    let still_allowed = still_writable(st, v, &out.doc_id).await;
+    let still_allowed = still_writable(st, v, doc_id).await;
     if !still_allowed {
-        let _ = cleanup_source(st, &out.doc_id).await;
-        tracing::warn!(doc_id = %out.doc_id, reason = "upload_permission_revoked", "表格数据源登记后写权限已失效，已清理");
+        let _ = cleanup_source(st, doc_id).await;
+        tracing::warn!(doc_id, reason = "upload_permission_revoked", "表格数据源登记后写权限已失效，已清理");
         return false;
     }
     true
@@ -1647,17 +1767,6 @@ fn ds_description(doc_name: &str, src: &tabular::TabularSource) -> String {
         d.push_str(&format!("。空表或无表头未建表的 sheet：{}", src.skipped.join("、")));
     }
     d
-}
-
-fn source_json(src: &tabular::TabularSource) -> serde_json::Value {
-    serde_json::json!({
-        "ds_id": src.ds_id,
-        "schema": src.schema,
-        "tables": src.tables.iter().map(|t| serde_json::json!({
-            "sheet": t.sheet, "table": t.table, "rows": t.rows,
-        })).collect::<Vec<_>>(),
-        "skipped": src.skipped,
-    })
 }
 
 pub async fn docs(
@@ -1827,46 +1936,469 @@ pub async fn doc(
     Ok(Json(body))
 }
 
-/// 下载原始文档（预览/下载共用这一个只读端点）。先走与详情/引用相同的 ACL
-/// （`doc_for_viewer`，不存在与不可见统一 403，fail-closed），再从 doc_id 派生的
-/// 服务器文件名取内容；原始文件名只进入 RFC 5987 的展示头，不参与磁盘路径。
+/// 下载/预览原始文档（`/api/kb/doc/{id}/download` 与 `/file` 共用这个只读端点）。
+/// 鉴权双通道：会话（Bearer 优先，`login_name` 回退由 `resolve_identity` 的开关收口）走与
+/// 详情/引用相同的 ACL（`doc_for_viewer`，不存在与不可见统一 403，fail-closed）；
+/// 或 15 分钟预览票据（`preview_ticket` 端点签发）——iframe 放不了 Authorization 头，
+/// 票据是把那次 ACL 授权浓缩成的有时效能力凭证，**只对本端点放行**。
 ///
 /// 🔴 Content-Type 是**扩展名白名单**（`serve_mime`），不信上传时自报的 `row.mime`：
 /// 自报 mime 是攻击面——一个 `text/html`/`image/svg+xml` 就能把脚本写进预览上下文。
 /// svg 刻意不在白名单（可执行脚本），html 按 text/plain 给（安全转文本），
 /// Office 等一律 octet-stream + attachment + nosniff：只许下载，不许内嵌渲染。
+///
+/// 预览增强（全部可选 query 组合）：`inline=1` → `Content-Disposition: inline`；
+/// `Range: bytes=a-b` 单区间 → 206 分段读（上行带宽小，PDF 预览不再等全量下载完）；
+/// `office_pdf=1` 且落盘扩展名属 Office 白名单 → soffice 转 PDF 返回（见 `office_pdf_path`）。
 pub async fn download_doc(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(q): Query<KbQuery>,
-) -> Result<(HeaderMap, Vec<u8>), ApiErr> {
-    let v = viewer(&st, &headers, &q).await?;
-    let row = acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
+    Query(q): Query<FileQuery>,
+) -> Result<axum::response::Response, ApiErr> {
+    let row = if let Some(ticket) = q.ticket.as_deref() {
+        // 票据通道：验签（常量时间比较）+ 时效 + doc_id 绑定三关全过才算数；
+        // 过了也只核对文档还在——授权本身发生在票据签发那一刻。
+        if !verify_preview_ticket(ticket, &id, chrono::Utc::now().timestamp()) {
+            return Err(err(StatusCode::UNAUTHORIZED, "预览票据无效或已过期"));
+        }
+        store::get_doc(&st.owned, &id)
+            .await
+            .map_err(kb_err)?
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "文档已不存在"))?
+    } else {
+        let kq = KbQuery {
+            login_name: q.login_name.clone(),
+            role_code: q.role_code.clone(),
+            ..Default::default()
+        };
+        let v = viewer(&st, &headers, &kq).await?;
+        acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?
+    };
     let path = stored_file(&st.kb_cfg.root, &row.doc_id)
         .await
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "原始文件已不存在"))?;
-    // 整文件入内存 × N 并发与上传闸防的是同一个问题：先过 ACL 再占下载槽，
-    // 无权请求不耗许可；拿不到直接 429（不排队，同 UPLOAD_GATE 的理由）。
+    let inline = flag_on(&q.inline);
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    // Office 原件级预览（Yuxi 同款：soffice headless 转 PDF + 磁盘缓存）。
+    // 非 Office 扩展名带 office_pdf=1 不报错——原样返回原件，前端按实际 Content-Type 降级。
+    if flag_on(&q.office_pdf) && is_office_ext(&path) {
+        let pdf = office_pdf_path(&st.kb_cfg.root, &row.doc_id, &path).await?;
+        return serve_file(&pdf, &pdf_display_name(&row.name), range, inline).await;
+    }
+    serve_file(&path, &row.name, range, inline).await
+}
+
+/// `download_doc` 的 query。**不用 `#[serde(flatten)]`**：`Query` 走 serde_urlencoded，
+/// flatten 在那边直接报 unsupported（与 `ChunkQuery` 同一个坑）。
+#[derive(serde::Deserialize, Default)]
+pub struct FileQuery {
+    /// 预览票据（`POST /api/kb/doc/{id}/preview-ticket` 签发）：Bearer 之外的第二鉴权通道
+    ticket: Option<String>,
+    /// `1`/`true` → `Content-Disposition: inline`（iframe 预览）；缺省 attachment
+    inline: Option<String>,
+    /// `1`/`true` → Office 原件转 PDF 返回（仅 doc/docx/ppt/pptx/xls/xlsx/xlsm 生效）
+    office_pdf: Option<String>,
+    login_name: Option<String>,
+    role_code: Option<String>,
+}
+
+/// 开关型 query 的真值口径：`1`/`true`（大小写不敏感）为真，其余（含空串）为假
+fn flag_on(v: &Option<String>) -> bool {
+    v.as_deref().is_some_and(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
+/// 文件流式返回（原件与 Office 转换产物共用出口）：
+/// - 无 Range：整读（原件 ≤ `kb_max_mb`，内存可控），200；
+/// - 单区间 Range：分段读 → 206 + Content-Range；越界 → 416 + `Content-Range: bytes */size`；
+/// - 永远带 `Accept-Ranges: bytes`（浏览器 PDF 查看器靠它决定发不发分段请求）。
+async fn serve_file(
+    path: &std::path::Path,
+    display_name: &str,
+    range_header: Option<&str>,
+    inline: bool,
+) -> Result<axum::response::Response, ApiErr> {
+    use axum::response::IntoResponse;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let size = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, MSG_FILE_UNREADABLE))?
+        .len();
+    let mut out = HeaderMap::new();
+    out.insert(header::CONTENT_TYPE, HeaderValue::from_static(serve_mime(path)));
+    out.insert(header::HeaderName::from_static("x-content-type-options"), HeaderValue::from_static("nosniff"));
+    out.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    let encoded = percent_encode_filename(display_name);
+    let disposition = format!(
+        "{}; filename=\"knowledge-file\"; filename*=UTF-8''{encoded}",
+        if inline { "inline" } else { "attachment" }
+    );
+    out.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| HeaderValue::from_static(if inline { "inline" } else { "attachment" })),
+    );
+    if let Some(range) = parse_range(range_header, size) {
+        let (start, end) = match range {
+            Ok(r) => r,
+            Err(()) => {
+                let mut h = HeaderMap::new();
+                h.insert(
+                    header::CONTENT_RANGE,
+                    HeaderValue::from_str(&format!("bytes */{size}"))
+                        .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
+                );
+                return Ok((
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    h,
+                    Json(serde_json::json!({ "error": format!("Range 越界（文件共 {size} 字节）") })),
+                )
+                    .into_response());
+            }
+        };
+        // 读入内存 × N 并发与上传闸防的是同一个问题：分段读上限就是文件尺寸，同一道闸。
+        let _permit = DOWNLOAD_GATE.try_acquire().map_err(|_| {
+            err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("下载并发已满（同时最多 {DOWNLOAD_PERMITS} 个），请稍后重试"),
+            )
+        })?;
+        let mut buf = vec![0u8; (end - start + 1) as usize];
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, MSG_FILE_UNREADABLE))?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, MSG_FILE_UNREADABLE))?;
+        file.read_exact(&mut buf)
+            .await
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, MSG_FILE_UNREADABLE))?;
+        out.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{size}"))
+                .unwrap_or_else(|_| HeaderValue::from_static("bytes")),
+        );
+        out.insert(header::CONTENT_LENGTH, HeaderValue::from(buf.len() as u64));
+        return Ok((StatusCode::PARTIAL_CONTENT, out, buf).into_response());
+    }
+    // 先过 ACL 再占下载槽（无权请求不耗许可）；拿不到直接 429（不排队，同 UPLOAD_GATE 的理由）。
     let _permit = DOWNLOAD_GATE.try_acquire().map_err(|_| {
         err(
             StatusCode::TOO_MANY_REQUESTS,
             format!("下载并发已满（同时最多 {DOWNLOAD_PERMITS} 个），请稍后重试"),
         )
     })?;
-    let bytes = tokio::fs::read(&path)
+    let bytes = tokio::fs::read(path)
         .await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, MSG_FILE_UNREADABLE))?;
-    let mut out = HeaderMap::new();
-    out.insert(header::CONTENT_TYPE, HeaderValue::from_static(serve_mime(&path)));
-    out.insert(header::HeaderName::from_static("x-content-type-options"), HeaderValue::from_static("nosniff"));
-    let encoded = percent_encode_filename(&row.name);
-    let disposition = format!("attachment; filename=\"knowledge-file\"; filename*=UTF-8''{encoded}");
-    out.insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&disposition).unwrap_or_else(|_| HeaderValue::from_static("attachment")),
-    );
-    Ok((out, bytes))
+    out.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+    Ok((StatusCode::OK, out, bytes).into_response())
+}
+
+/// 单区间 Range 解析（`bytes=a-b` / `a-` / `-b`，闭区间语义同 RFC 9110；`b` 越过 EOF 收敛到
+/// 最后一字节）。`None` = 语法不认或多区间——按无 Range 全量 200（RFC 允许忽略不支持的形式）；
+/// `Some(Err(()))` = 语法合法但不可满足（起点越过 EOF / 后缀 0 / 空文件）→ 调用方回 416。
+fn parse_range(header: Option<&str>, size: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = header?.trim().strip_prefix("bytes=")?.trim();
+    // 多区间不支持：忽略整头回 200，比回 416 对客户端更可用（PDF 查看器只发单区间）
+    if spec.contains(',') {
+        return None;
+    }
+    if size == 0 {
+        return Some(Err(()));
+    }
+    let (a, b) = spec.split_once('-')?;
+    if a.is_empty() {
+        // 后缀区间：最后 b 字节（b ≥ size 时收敛为全文件）
+        let suffix: u64 = b.parse().ok()?;
+        if suffix == 0 {
+            return Some(Err(()));
+        }
+        return Some(Ok((size.saturating_sub(suffix), size - 1)));
+    }
+    let start: u64 = a.parse().ok()?;
+    if start >= size {
+        return Some(Err(()));
+    }
+    let end = if b.is_empty() { size - 1 } else { b.parse::<u64>().ok()?.min(size - 1) };
+    if end < start {
+        return Some(Err(()));
+    }
+    Some(Ok((start, end)))
+}
+
+// ════════════════════════ 预览票据（15 分钟单文档能力凭证）════════════════════════
+
+/// 票据有效时长（秒）：大 PDF 渐进阅读时浏览器会滚动到哪页才发哪页的 Range 请求，
+/// 120s 太短——用户读到后半票据过期， Range 请求 401 直接掉回降级预览；15 分钟覆盖正常阅读，
+/// 撤权时效仍在可接受窗口（单文档、只读、HMAC 绑定 doc_id，泄露面本就一次预览）
+const PREVIEW_TICKET_TTL_SECS: i64 = 900;
+
+/// `POST /api/kb/doc/{id}/preview-ticket` —— 签 15 分钟单文档预览票据。
+/// 走检索面会话认证 + `doc_for_viewer` 授权（与 download 同一条）：
+/// 票据只是把这次授权浓缩成有时效的能力凭证，本身不放大任何权限。
+pub async fn preview_ticket(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<KbQuery>,
+) -> Result<ApiOk, ApiErr> {
+    let v = viewer(&st, &headers, &q).await?;
+    acl::doc_for_viewer(&st.owned, &v, &id).await.map_err(kb_err)?;
+    Ok(Json(serde_json::json!({
+        "ticket": mint_preview_ticket(&id, chrono::Utc::now().timestamp()),
+        "expires_in": PREVIEW_TICKET_TTL_SECS,
+    })))
+}
+
+/// 票据签名钥匙：与 settings 凭据同一条 `DMS_SECRET_KEY` 派钥路径（`db::crypto::default_key`，
+/// 未配置时机器指纹兜底）——不新发明第二把钥匙。票据只在签发它的部署内有效，
+/// 与 settings 密文的迁移语义天然一致（换机未配 DMS_SECRET_KEY 时两把钥匙一起换）。
+fn preview_ticket_key() -> [u8; 32] {
+    crate::db::crypto::default_key().0
+}
+
+/// payload = `doc_id|exp(Unix秒)|nonce(16字节hex)`；
+/// ticket = `base64url(payload).hex(hmac_sha256(payload))`。
+fn mint_preview_ticket(doc_id: &str, now: i64) -> String {
+    mint_preview_ticket_with(&preview_ticket_key(), doc_id, now)
+}
+
+fn mint_preview_ticket_with(key: &[u8; 32], doc_id: &str, now: i64) -> String {
+    use base64::Engine as _;
+    let payload = format!("{doc_id}|{}|{}", now + PREVIEW_TICKET_TTL_SECS, random_nonce_hex());
+    let sig = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key), payload.as_bytes());
+    format!(
+        "{}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes()),
+        hex_encode(sig.as_ref())
+    )
+}
+
+/// 验票：先验签（`hmac::verify` 常量时间比较）再解析——没过签名的票据连字段都不配被读。
+fn verify_preview_ticket(ticket: &str, doc_id: &str, now: i64) -> bool {
+    verify_preview_ticket_with(&preview_ticket_key(), ticket, doc_id, now)
+}
+
+fn verify_preview_ticket_with(key: &[u8; 32], ticket: &str, doc_id: &str, now: i64) -> bool {
+    use base64::Engine as _;
+    let Some((payload_b64, sig_hex)) = ticket.split_once('.') else { return false };
+    let Ok(payload) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)
+    else { return false };
+    let Ok(sig) = hex_decode(sig_hex) else { return false };
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    if ring::hmac::verify(&k, &payload, &sig).is_err() {
+        return false;
+    }
+    let Ok(payload) = String::from_utf8(payload) else { return false };
+    // 恰好三段：doc_id 是 uuid 不含 '|'，多一段少一段都是构造出来的怪票
+    let mut parts = payload.split('|');
+    let (Some(id), Some(exp), Some(nonce), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else { return false };
+    if id != doc_id || nonce.len() != 32 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    match exp.parse::<i64>() {
+        Ok(exp) => now <= exp,
+        Err(_) => false,
+    }
+}
+
+/// 16 字节随机 nonce 的 hex（32 字符）：票据唯一性的载体（每次签发都是新票），
+/// 随机源与 settings 加密同源；授权本体是签名，nonce 不参与判定。
+fn random_nonce_hex() -> String {
+    use ring::rand::SecureRandom as _;
+    let mut buf = [0u8; 16];
+    if ring::rand::SystemRandom::new().fill(&mut buf).is_err() {
+        // 随机源理论上不该失败；真失败用 uuid 的 CSPRNG 兜底，不静默产出弱 nonce
+        return uuid::Uuid::new_v4().simple().to_string();
+    }
+    hex_encode(&buf)
+}
+
+/// 小写 hex 编解码：为票据这一处编解码不引 hex crate（同 `encode_base64` 的理由）。
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
+    if s.len() % 2 != 0 {
+        return Err(());
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16).ok_or(())?;
+        let lo = (pair[1] as char).to_digit(16).ok_or(())?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Ok(out)
+}
+
+// ════════════════════════ Office 原件 → PDF（Yuxi 同款预览方案）════════════════════════
+
+/// Office 原件级预览的扩展名白名单：只认**落盘扩展名**（与 `serve_mime` 同一信任口径）。
+const OFFICE_PDF_EXTS: [&str; 7] = ["doc", "docx", "ppt", "pptx", "xls", "xlsx", "xlsm"];
+/// soffice 转换超时：大 PPT 实测可达几十秒，90s 与 Yuxi 同口径
+const OFFICE_CONVERT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// 并发转换闸：单个 soffice 进程数百 MB，点击风暴能 OOM 宿主机——排队不拒绝（预览等得起）
+static OFFICE_CONVERT_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+fn is_office_ext(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|ext| OFFICE_PDF_EXTS.contains(&ext.as_str()))
+}
+
+/// 缓存键带源文件指纹（mtime 秒 + size）：重传/重建换了文件自动失效，旧缓存成为惰性孤儿
+///（重启自愈或人工清理回收，不影响正确性）。
+fn office_pdf_cache_path(root: &std::path::Path, doc_id: &str, mtime_secs: u64, size: u64) -> std::path::PathBuf {
+    root.join(".preview_cache").join(format!("{doc_id}-{mtime_secs}-{size}.pdf"))
+}
+
+/// Office 原件 → 缓存 PDF 路径。缓存命中直接返回；未命中做 per-doc 去重的转换
+/// （同一文档的并发请求，第二个在锁上等第一个的产物）。**任何失败统一 404
+/// `office_pdf_unavailable`**——前端据此降级到解析内容预览，绝不许 500。
+async fn office_pdf_path(
+    root: &std::path::Path,
+    doc_id: &str,
+    src: &std::path::Path,
+) -> Result<std::path::PathBuf, ApiErr> {
+    let meta = tokio::fs::metadata(src).await.map_err(|_| office_pdf_unavailable())?;
+    let mtime_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cache = office_pdf_cache_path(root, doc_id, mtime_secs, meta.len());
+    if tokio::fs::metadata(&cache).await.is_ok() {
+        return Ok(cache);
+    }
+    let lock = office_convert_lock(doc_id);
+    let _guard = lock.lock().await;
+    // 拿到锁后再看一次缓存：等锁期间第一个请求可能已经把产物放进来了
+    let result = match tokio::fs::metadata(&cache).await {
+        Ok(_) => Ok(cache.clone()),
+        Err(_) => convert_office_to_pdf(src, &cache)
+            .await
+            .map(|_| cache.clone())
+            .map_err(|_| office_pdf_unavailable()),
+    };
+    release_office_convert_lock(doc_id, &lock);
+    result
+}
+
+/// 转换失败（soffice 缺席/超时/非零退出/IO 失败）的统一出口：404 + 固定错误码 JSON。
+fn office_pdf_unavailable() -> ApiErr {
+    err(StatusCode::NOT_FOUND, "office_pdf_unavailable")
+}
+
+/// per-doc 转换锁表（进程内去重，无跨实例需求：缓存文件本身就是跨实例的去重结果）
+fn office_convert_locks(
+) -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn office_convert_lock(doc_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    office_convert_locks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(doc_id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// 用完即清（锁表不许随文档数无限涨）：只剩「锁表 + 本调用」两个引用时才摘——
+/// 还有等待者就留给等待者清。取与摘都在同一把 map 锁下，不会与并发取用打架。
+fn release_office_convert_lock(doc_id: &str, lock: &Arc<tokio::sync::Mutex<()>>) {
+    let mut map = office_convert_locks().lock().unwrap_or_else(|e| e.into_inner());
+    if Arc::strong_count(lock) == 2 {
+        map.remove(doc_id);
+    }
+}
+
+/// soffice headless 转换（Yuxi 同款命令形态）：唯一 UserInstallation 临时目录防并发 profile 锁；
+/// 工作目录落在缓存目录里的 `tmp-<uuid>/`，产物 rename 进缓存——同文件系统原子换名，
+/// 并发读者不会看到半个 PDF。超时/缺席/非零退出统一 Err（调用方收敛成 404 降级）。
+async fn convert_office_to_pdf(src: &std::path::Path, cache: &std::path::Path) -> Result<(), ()> {
+    let Some(cache_dir) = cache.parent() else { return Err(()) };
+    tokio::fs::create_dir_all(cache_dir).await.map_err(|_| ())?;
+    // canonicalize：kb_root 可能是相对路径，而 soffice 的 -env:UserInstallation 只吃 file:// URL
+    let cache_dir = tokio::fs::canonicalize(cache_dir).await.map_err(|_| ())?;
+    let src_abs = tokio::fs::canonicalize(src).await.map_err(|_| ())?;
+    let work = cache_dir.join(format!("tmp-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&work).await.map_err(|_| ())?;
+    let result = convert_office_in(&src_abs, &work).await;
+    // 临时目录清理 best-effort：失败留下的 tmp-* 只是磁盘垃圾，不影响缓存正确性
+    if let Err(e) = tokio::fs::remove_dir_all(&work).await {
+        tracing::warn!(path = %work.display(), err = %e, "Office 预览临时目录清理失败");
+    }
+    let produced = result?;
+    let cache_abs = cache_dir.join(cache.file_name().ok_or(())?);
+    tokio::fs::rename(&produced, &cache_abs).await.map_err(|e| {
+        tracing::warn!(err = %e, to = %cache_abs.display(), "Office 预览 PDF 落缓存失败");
+    })
+}
+
+/// 返回 soffice 产物路径（`<work>/<源文件stem>.pdf`）。
+async fn convert_office_in(src: &std::path::Path, work: &std::path::Path) -> Result<std::path::PathBuf, ()> {
+    let profile = reqwest::Url::from_file_path(work.join("profile")).map_err(|_| ())?;
+    // kill_on_drop：超时被 timeout 丢掉的 output() future 必须把 soffice 子进程一起带走，
+    // 否则每次超时泄漏一个几百 MB 的僵尸进程
+    let mut cmd = tokio::process::Command::new("soffice");
+    cmd.args(["--headless", "--nologo", "--nodefault"])
+        .arg(format!("-env:UserInstallation={profile}"))
+        .args(["--convert-to", "pdf", "--outdir"])
+        .arg(work)
+        .arg(src)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // 转换闸排队（不拒绝）：并发 soffice 进程数被封顶，超出的请求等同文档锁的等待语义
+    let _permit = OFFICE_CONVERT_GATE.acquire().await.map_err(|_| ())?;
+    match tokio::time::timeout(OFFICE_CONVERT_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => {}
+        Ok(Ok(out)) => {
+            tracing::warn!(status = %out.status, src = %src.display(), "soffice 转 PDF 非零退出");
+            return Err(());
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(err = %e, "soffice 启动失败（容器内未装 LibreOffice？）");
+            return Err(());
+        }
+        Err(_) => {
+            tracing::warn!(src = %src.display(), "soffice 转 PDF 超时（90s）");
+            return Err(());
+        }
+    }
+    let stem = src.file_stem().and_then(|s| s.to_str()).ok_or(())?;
+    let produced = work.join(format!("{stem}.pdf"));
+    match tokio::fs::metadata(&produced).await {
+        Ok(_) => Ok(produced),
+        Err(e) => {
+            tracing::warn!(err = %e, path = %produced.display(), "soffice 零退出但产物不在");
+            Err(())
+        }
+    }
+}
+
+/// 转换产物的展示文件名：原名换 `.pdf` 尾缀（只进 RFC 5987 展示头，不进磁盘路径）
+fn pdf_display_name(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => format!("{stem}.pdf"),
+        _ => format!("{name}.pdf"),
+    }
 }
 
 /// 下载/预览响应的 Content-Type 白名单：只认**落盘扩展名**（ingest 白名单字面量派生，
@@ -2517,7 +3049,7 @@ mod tests {
                 "管理面端点 {name} 没过 kb_manager 闸"
             );
         }
-        for name in ["ask", "search", "chunk", "download_doc"] {
+        for name in ["ask", "search", "chunk", "download_doc", "preview_ticket"] {
             let body = body_of(name);
             assert!(
                 !body.contains("manager_principal") && !body.contains("manager_viewer") && !body.contains("session_viewer"),
@@ -2691,6 +3223,178 @@ mod tests {
         }
     }
 
+    /// 票据往返：签发 → 验真；改 doc_id、换钥匙、过期、篡改签名/载荷、畸形串全部验假
+    #[test]
+    fn preview_ticket_roundtrip_and_tamper_resistance() {
+        const K1: [u8; 32] = [3u8; 32];
+        const K2: [u8; 32] = [4u8; 32];
+        let now = 1_800_000_000i64;
+        let doc = "11111111-2222-3333-4444-555555555555";
+        let ticket = mint_preview_ticket_with(&K1, doc, now);
+        // 形状：base64url(payload).64hex —— payload 恰好 `doc_id|exp|nonce` 三段
+        let (payload_b64, sig) = ticket.split_once('.').unwrap();
+        assert_eq!(sig.len(), 64, "HMAC-SHA256 的 hex 必须 64 字符: {ticket}");
+        use base64::Engine as _;
+        let payload = String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64).unwrap(),
+        )
+        .unwrap();
+        let parts: Vec<&str> = payload.split('|').collect();
+        assert_eq!(parts.len(), 3, "{payload}");
+        assert_eq!(parts[0], doc);
+        assert_eq!(parts[1].parse::<i64>().unwrap(), now + PREVIEW_TICKET_TTL_SECS);
+        assert_eq!(parts[2].len(), 32, "nonce 是 16 字节 hex: {payload}");
+
+        assert!(verify_preview_ticket_with(&K1, &ticket, doc, now));
+        assert!(verify_preview_ticket_with(&K1, &ticket, doc, now + PREVIEW_TICKET_TTL_SECS), "边界时刻仍有效");
+        assert!(!verify_preview_ticket_with(&K1, &ticket, doc, now + PREVIEW_TICKET_TTL_SECS + 1), "过期即废");
+        assert!(!verify_preview_ticket_with(&K1, &ticket, "99999999-2222-3333-4444-555555555555", now), "换文档不许用");
+        assert!(!verify_preview_ticket_with(&K2, &ticket, doc, now), "换钥匙（换部署）不许用");
+        // 篡改签名（末位 hex 翻转）/ 篡改载荷（坏 base64 / 坏 hex / 空串）全部验假
+        let mut bad = ticket.clone();
+        let last = bad.pop().unwrap();
+        bad.push(if last == '0' { '1' } else { '0' });
+        assert!(!verify_preview_ticket_with(&K1, &bad, doc, now), "签名改一个字符也必须响亮失败");
+        assert!(!verify_preview_ticket_with(&K1, "不是base64!!.00", doc, now));
+        assert!(!verify_preview_ticket_with(&K1, &format!("{payload_b64}.zz"), doc, now));
+        assert!(!verify_preview_ticket_with(&K1, "", doc, now));
+    }
+
+    /// Range 单区间全形态：a-b / a- / -b / 收敛 / 越界 416 / 多区间与垃圾语法按无 Range 处理
+    #[test]
+    fn range_parsing_covers_all_forms() {
+        let ok = |h: &str, size: u64| parse_range(Some(h), size).and_then(Result::ok);
+        assert_eq!(ok("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(ok("bytes=500-", 1000), Some((500, 999)));
+        assert_eq!(ok("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(ok("bytes=900-2000", 1000), Some((900, 999)), "尾端越 EOF 收敛到最后一字节");
+        assert_eq!(ok("bytes=-5000", 1000), Some((0, 999)), "后缀长于全文件收敛为全量");
+        assert_eq!(ok(" bytes=0-0 ", 1000), Some((0, 0)), "首尾空白容忍");
+        // 不可满足 → 416
+        assert_eq!(parse_range(Some("bytes=1000-"), 1000), Some(Err(())), "起点越 EOF");
+        assert_eq!(parse_range(Some("bytes=5-2"), 1000), Some(Err(())), "空区间");
+        assert_eq!(parse_range(Some("bytes=-0"), 1000), Some(Err(())), "后缀 0");
+        assert_eq!(parse_range(Some("bytes=0-0"), 0), Some(Err(())), "空文件无可服务区间");
+        // 忽略（None → 全量 200）：无头 / 多区间 / 垃圾语法 / 非 bytes 单位
+        assert_eq!(parse_range(None, 1000), None);
+        assert_eq!(parse_range(Some("bytes=0-1,3-4"), 1000), None, "多区间不支持");
+        assert_eq!(parse_range(Some("bytes=a-b"), 1000), None);
+        assert_eq!(parse_range(Some("items=0-9"), 1000), None);
+        assert_eq!(parse_range(Some("bytes=1-2-3"), 1000), None, "多一个横杠不是合法单区间");
+    }
+
+    /// Office 预览契约：扩展名白名单恰好 7 个；缓存键带 doc_id + mtime + size 指纹；
+    /// 失败出口是 404 + `office_pdf_unavailable`（前端按它降级，绝不许 500）
+    #[test]
+    fn office_pdf_helpers_pin_contract() {
+        for ext in ["doc", "docx", "ppt", "pptx", "xls", "xlsx", "xlsm"] {
+            assert!(is_office_ext(std::path::Path::new(&format!("d/{ext}f.{ext}"))), "{ext}");
+        }
+        for ext in ["pdf", "txt", "png", "csv", "md", "exe", ""] {
+            assert!(!is_office_ext(std::path::Path::new(&format!("d/f.{ext}"))), "{ext}");
+        }
+        // 大小写不敏感（落盘扩展名已是白名单小写，这里钉防御口径）
+        assert!(is_office_ext(std::path::Path::new("d/f.DOCX")));
+
+        let p = office_pdf_cache_path(std::path::Path::new("data/kb"), "doc1", 123, 456);
+        assert_eq!(p, std::path::Path::new("data/kb/.preview_cache/doc1-123-456.pdf"));
+        // 指纹变了键就变（重传/重建自动失效）
+        assert_ne!(p, office_pdf_cache_path(std::path::Path::new("data/kb"), "doc1", 124, 456));
+        assert_ne!(p, office_pdf_cache_path(std::path::Path::new("data/kb"), "doc1", 123, 457));
+
+        let (code, body) = office_pdf_unavailable();
+        assert_eq!(code, StatusCode::NOT_FOUND, "前端靠 404 降级，不许 500");
+        assert_eq!(body.0["error"], "office_pdf_unavailable");
+
+        assert_eq!(pdf_display_name("报销制度.docx"), "报销制度.pdf");
+        assert_eq!(pdf_display_name("noext"), "noext.pdf");
+    }
+
+    /// soffice 缺席/输入非法时转换必须 Err（调用方收敛成 404）——不许 panic、不许 Ok
+    #[tokio::test]
+    async fn convert_office_to_pdf_fails_closed_on_bad_input() {
+        let dir = std::env::temp_dir().join(format!("dms_lo_test_{}", std::process::id()));
+        let cache = dir.join(".preview_cache").join("doc1-1-1.pdf");
+        // 源文件不存在：canonicalize 直接失败，走不到 spawn——与 soffice 装没装无关，处处稳定
+        let r = convert_office_to_pdf(std::path::Path::new("绝不存在的文件.docx"), &cache).await;
+        assert!(r.is_err(), "坏输入必须 Err");
+        assert!(!cache.exists(), "失败不许留下假缓存");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 异步化结构断言（源码钉住）：upload 请求内只跑 prepare，重活连许可一起进 spawn；
+    /// reprocess 同样不许在请求里同步跑重活
+    #[test]
+    fn heavy_ingest_work_is_spawned_with_the_permit() {
+        let src = include_str!("kb_api.rs");
+        let body = src.split("pub async fn upload").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("ingest::prepare("), "upload 请求内只许跑快路径: {body}");
+        assert!(body.contains("spawn_ingest_job("), "upload 重活必须后台化: {body}");
+        assert!(!body.contains("ingest::run_job("), "upload 请求内不许同步跑重活: {body}");
+        // spawn 助手签名必须接收许可（闸门防的内存活在后台任务里）
+        let helper = src.split("fn spawn_ingest_job").nth(1).unwrap();
+        let helper = helper.split("async fn run_ingest_job_logged").next().unwrap();
+        assert!(helper.contains("tokio::spawn"), "重活必须进后台任务: {helper}");
+        assert!(helper.contains("permit: tokio::sync::SemaphorePermit"), "许可必须随任务走: {helper}");
+        // 复跑端点：prepare 没有它的份（文档行早已在），但重活同样后台化
+        let re = src.split("pub async fn reprocess").nth(1).unwrap();
+        let re = re.split("pub async fn set_doc_state").next().unwrap();
+        assert!(re.contains("spawn_ingest_job(") && !re.contains("ingest::run_job("), "reprocess 重活同样后台化: {re}");
+    }
+
+    /// 启动自愈结构断言（源码钉住）：main.rs 挂了自愈 spawn；分派键是分块存在性；
+    /// 恢复执行身份是空间 owner（不开 ACL 旁路）；恢复也走上传内存闸
+    #[test]
+    fn recover_pending_is_wired_and_fail_closed() {
+        let main = include_str!("main.rs");
+        assert!(main.contains("kb_api::spawn_recover_pending(state.clone())"), "main.rs 必须挂启动自愈");
+        for route in [
+            ".route(\"/api/kb/doc/{id}/preview-ticket\", post(kb_api::preview_ticket))",
+            ".route(\"/api/kb/doc/{id}/file\", get(kb_api::download_doc))",
+        ] {
+            assert!(main.contains(route), "main.rs 缺路由: {route}");
+        }
+        let src = include_str!("kb_api.rs");
+        let body = src.split("async fn recover_one").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("Viewer::new(d.owner.clone()"), "自愈必须以空间 owner 身份执行: {body}");
+        assert!(body.contains("UPLOAD_GATE.acquire()"), "自愈必须走上传内存闸: {body}");
+        assert!(body.contains("d.has_chunks"), "自愈必须按分块存在性分派首入/重建: {body}");
+        assert!(body.contains("DocStatus::Failed"), "文件没了必须标失败让用户看见: {body}");
+    }
+
+    /// 预览票据端点必须与 download 同一条认证 + ACL；票据通道只放行 file 端点
+    /// （download_doc 体内必须同时存在票据校验与 doc_for_viewer 两条路）
+    #[test]
+    fn preview_ticket_endpoint_auths_like_download() {
+        let src = include_str!("kb_api.rs");
+        let body = src.split("pub async fn preview_ticket").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("viewer("), "票据签发必须过会话认证: {body}");
+        assert!(body.contains("acl::doc_for_viewer"), "票据签发必须过 ACL: {body}");
+        let dl = src.split("pub async fn download_doc").nth(1).unwrap();
+        let dl = dl.split("\n}\n").next().unwrap();
+        assert!(dl.contains("verify_preview_ticket"), "file 端点必须支持票据通道: {dl}");
+        assert!(dl.contains("acl::doc_for_viewer"), "会话通道的 ACL 不许被票据改造绕掉: {dl}");
+        assert!(dl.contains("store::get_doc"), "票据通道只核对文档存在（授权在签发时）: {dl}");
+    }
+
+    /// 流式端点契约（源码钉住）：Accept-Ranges 常带；206/416 齐备；inline 与 attachment 分叉；
+    /// Office 分支挂在 ACL 之后（`office_pdf_path` 的调用点在 download_doc 体内）
+    #[test]
+    fn serve_file_contract_is_complete() {
+        let src = include_str!("kb_api.rs");
+        let body = src.split("async fn serve_file").nth(1).unwrap();
+        let body = body.split("\n}\n").next().unwrap();
+        assert!(body.contains("ACCEPT_RANGES"), "必须常带 Accept-Ranges: {body}");
+        assert!(body.contains("StatusCode::PARTIAL_CONTENT"), "缺 206: {body}");
+        assert!(body.contains("RANGE_NOT_SATISFIABLE"), "缺 416: {body}");
+        assert!(body.contains("\"inline\""), "缺 inline 分叉: {body}");
+        assert!(body.contains("DOWNLOAD_GATE.try_acquire"), "流式读取不许绕过下载闸: {body}");
+    }
+
+
     #[test]
     fn metadata_validation_normalizes_and_rejects_bad_values() {
         let req = DocMetadataReq {
@@ -2768,8 +3472,12 @@ mod tests {
         assert!(d.contains("销售台账.xlsx") && d.contains("up_d1"), "{d}");
         assert!(d.contains("一月（表 t0___，3 行）"), "{d}");
         assert!(d.contains("空表"), "被跳过的 sheet 不许静默：{d}");
-        // 响应里必须带出 ds_id，否则前端不知道该问哪个源
-        assert_eq!(source_json(&src)["ds_id"], "upload_d1");
+        // 入库异步化后数据源登记在后台任务里完成（`run_ingest_job_logged` → `register_source`），
+        // 不再随上传响应返回——钉住这条链路别被改丢
+        let code = include_str!("kb_api.rs");
+        let spawn_body = code.split("async fn run_ingest_job_logged").nth(1).unwrap();
+        let spawn_body = spawn_body.split("\n}\n").next().unwrap();
+        assert!(spawn_body.contains("register_source("), "后台任务必须登记通道②数据源: {spawn_body}");
     }
 
     /// 上传闸：4 个许可用完即 429（拿不到许可这一支不许悄悄排队）

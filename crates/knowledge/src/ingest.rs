@@ -147,13 +147,6 @@ fn doc_path(cfg: &IngestCfg, doc_id: &str, file_name: &str) -> std::path::PathBu
     cfg.root.join(format!("{doc_id}.{ext}"))
 }
 
-/// 入库结果。`source` 非空＝表格通道②建成了物理表，**调用方必须**拿它去
-/// `meta::register_upload_datasource` 登记 + 授权（knowledge 不碰 `meta.*`，那是纪律）。
-pub struct Ingested {
-    pub doc_id: String,
-    pub source: Option<TabularSource>,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct InferredDocVersion {
     family: String,
@@ -239,16 +232,70 @@ fn is_version_token(token: &str) -> bool {
         && parts.iter().all(|part| part.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// 上传入库。去重命中时返回已有的 `doc_id`（不重复入库，`source` 为空——那次上传已登记过）。
-pub async fn ingest(
+/// `UploadReq` 的 owning 形态：重活进 `tokio::spawn` 要 `'static`，请求作用域的借用过不去。
+/// 字段与 `UploadReq` 一一对应（`as_req` 原位借回，入库链本体不感知所有权差异）。
+#[derive(Debug, Clone)]
+pub struct OwnedUploadReq {
+    pub space_id: String,
+    pub folder_id: Option<String>,
+    pub file_name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+    /// 分块策略（可选）：口径同 `UploadReq.preset`
+    pub preset: Option<String>,
+}
+
+impl OwnedUploadReq {
+    fn from_req(req: &UploadReq<'_>) -> Self {
+        Self {
+            space_id: req.space_id.to_string(),
+            folder_id: req.folder_id.map(str::to_string),
+            file_name: req.file_name.to_string(),
+            mime: req.mime.to_string(),
+            bytes: req.bytes.to_vec(),
+            preset: req.preset.map(str::to_string),
+        }
+    }
+
+    fn as_req(&self) -> UploadReq<'_> {
+        UploadReq {
+            space_id: &self.space_id,
+            folder_id: self.folder_id.as_deref(),
+            file_name: &self.file_name,
+            mime: &self.mime,
+            bytes: &self.bytes,
+            preset: self.preset.as_deref(),
+        }
+    }
+}
+
+/// `prepare` 的产物。`doc_id` 立即可回给前端轮询；`job = None` ＝ 去重秒传复用
+///（那次上传已入库或正在跑，没有重活要跑，物理表数据源也在那次登记过）。
+pub struct Prepared {
+    pub doc_id: String,
+    pub job: Option<IngestJob>,
+}
+
+/// 入库重活（parse → chunk → embed → 状态推进）的全部上下文，owning 形态可直接 move 进
+/// `tokio::spawn`。两个变体对应本文件既有的两条链，语义与各链的同步执行逐字一致。
+pub enum IngestJob {
+    /// 新文档首入：`run` 链（解析 → 分块 → 向量 → 通道②）；失败文案落库。
+    Fresh { req: OwnedUploadReq, kind: FileKind },
+    /// 原地重建（去重命中 failed/chunked、重建端点、启动自愈）：`reprocess` 影子链，
+    /// 失败时线上版本原样保留。kind 不随任务走——`reprocess` 内部会再 `classify` 一次
+    ///（类型白名单只有那一处实现，信任边界上不抄第二份）。
+    Rebuild { req: OwnedUploadReq },
+}
+
+/// 上传入库快路径（请求内同步完成）：校验 → 建目录 → 空间/写权限 → 目录解析 → sha 去重 →
+/// 建行 → 落盘。重活装进 `IngestJob` 交调用方后台执行——大文件解析 50s+，请求里同步 await
+/// 会被浏览器/nginx 超时断连把 handler future 直接 drop，入库半路取消、文档永卡 parsing。
+pub async fn prepare(
     st: &OwnedStore,
-    doc: &DocService,
-    embed: &EmbedClient,
     v: &Viewer,
     cfg: &IngestCfg,
     req: UploadReq<'_>,
-    image_ocr: Option<&dyn ImageOcr>,
-) -> Result<Ingested, KbError> {
+) -> Result<Prepared, KbError> {
     // kind 只用于校验：通道②的分派按**解析结果**（`parsed.sheets` 非空）走，不按扩展名——
     // 文档服务才知道一个 .csv 里到底有没有表格。kind 随调用链下传，parse_input 不再二次查表。
     let kind = classify(req.file_name, req.bytes.len() as u64, cfg.max_bytes)?;
@@ -265,7 +312,7 @@ pub async fn ingest(
     let (folder_id, _) = store::resolve_folder(st, req.space_id, req.folder_id).await?;
     let sha = store::sha256_hex(st, req.bytes).await?;
     if let Some(existing) = store::find_by_sha(st, req.space_id, &sha).await? {
-        return dedup_or_reprocess(st, doc, embed, v, cfg, req, existing, image_ocr).await;
+        return dedup_dispatch(st, &req, existing).await;
     }
     let new = NewDoc {
         space_id: req.space_id,
@@ -281,19 +328,57 @@ pub async fn ingest(
         DocInsert::New(id) => id,
         // find_by_sha 之后被并发上传抢占（同空间同 hash）：走同一套秒传/重建分派，
         // 不重复建行，也不重复消耗解析与向量（B7）。
-        DocInsert::Duplicate(existing) => {
-            return dedup_or_reprocess(st, doc, embed, v, cfg, req, existing, image_ocr).await;
-        }
+        DocInsert::Duplicate(existing) => return dedup_dispatch(st, &req, existing).await,
     };
     try_apply_inferred_version(st, v, &doc_id, req.file_name).await;
-    match run(st, doc, embed, v, cfg, &req, &doc_id, image_ocr, kind).await {
-        Ok(source) => Ok(Ingested { doc_id, source }),
-        Err(e) => {
-            // 不许静默成功：失败文案落库，用户在文档列表里看得见
-            if let Err(se) = store::set_status(st, v, &doc_id, DocStatus::Failed, &e.to_string()).await {
-                tracing::warn!(doc_id, error = %se, "失败文案落库也失败（用户在列表里看不到原因）");
+    // 先推进到 parsing 再交还：响应带回去的 doc 行得是进行态，且启动自愈的扫描
+    //（parsing/chunked）才能覆盖「建行后、重活起跑前」进程死亡的窗口。
+    store::set_status(st, v, &doc_id, DocStatus::Parsing, "").await?;
+    // 落盘也在快路径完成：doc 行一旦可见，文件必定可读（下载/预览/自愈都不用等后台）。
+    // `run` 里的重复写是同字节幂等覆盖，保留它是因为那条链对自己落盘负有完整契约。
+    let path = doc_path(cfg, &doc_id, req.file_name);
+    if let Err(e) = tokio::fs::write(&path, req.bytes).await {
+        // 落盘失败即终态（请求侧也拿到 500）：不留 parsing 僵尸等下次启动自愈收尸
+        let e = io_err(e);
+        let _ = store::set_status(st, v, &doc_id, DocStatus::Failed, &e.to_string()).await;
+        return Err(e);
+    }
+    Ok(Prepared {
+        doc_id,
+        job: Some(IngestJob::Fresh { req: OwnedUploadReq::from_req(&req), kind }),
+    })
+}
+
+/// 入库重活分派（后台任务里跑）。`Fresh` 失败把文案落库（用户在文档列表里看得见）；
+/// `Rebuild` 走影子构建，失败时线上版本原样保留（`reprocess` 语义），错误由调用方记日志。
+/// 返回通道②数据源（仅 Fresh 且真是表格时非空）——登记/授权是 server 侧的事，随任务后台化。
+pub async fn run_job(
+    st: &OwnedStore,
+    doc: &DocService,
+    embed: &EmbedClient,
+    v: &Viewer,
+    cfg: &IngestCfg,
+    doc_id: &str,
+    job: IngestJob,
+    image_ocr: Option<&dyn ImageOcr>,
+) -> Result<Option<TabularSource>, KbError> {
+    match job {
+        IngestJob::Fresh { req, kind } => {
+            match run(st, doc, embed, v, cfg, &req.as_req(), doc_id, image_ocr, kind).await {
+                Ok(source) => Ok(source),
+                Err(e) => {
+                    // 不许静默成功：失败文案落库，用户在文档列表里看得见
+                    if let Err(se) =
+                        store::set_status(st, v, doc_id, DocStatus::Failed, &e.to_string()).await
+                    {
+                        tracing::warn!(doc_id, error = %se, "失败文案落库也失败（用户在列表里看不到原因）");
+                    }
+                    Err(e)
+                }
             }
-            Err(e)
+        }
+        IngestJob::Rebuild { req } => {
+            reprocess(st, doc, embed, v, cfg, req.as_req(), doc_id, image_ocr).await.map(|_| None)
         }
     }
 }
@@ -312,28 +397,27 @@ async fn try_apply_inferred_version(st: &OwnedStore, v: &Viewer, doc_id: &str, f
 
 /// 同内容（hash）命中的统一分派（B7 秒传去重）。
 /// `embedded` 直接复用；`pending/parsing` 说明另一次上传正在跑——复用句柄而不是重复扣解析/向量
-/// （进程崩溃留下的僵尸「处理中」由「重建」端点兜底：`reprocess` 直连、不经过本分派）；
-/// `failed/chunked` 重传真重跑（影子构建，失败时旧块原样保留），重试不重复建行。
-async fn dedup_or_reprocess(
+/// （进程崩溃留下的僵尸「处理中」由启动自愈兜底：自愈直连重建链、不经过本分派，否则
+/// 会被这里的 Reuse 原样弹回）；
+/// `failed/chunked` 重传真重跑（影子构建随 `job` 交后台，失败时旧块原样保留），重试不重复建行。
+async fn dedup_dispatch(
     st: &OwnedStore,
-    doc: &DocService,
-    embed: &EmbedClient,
-    v: &Viewer,
-    cfg: &IngestCfg,
-    req: UploadReq<'_>,
+    req: &UploadReq<'_>,
     existing: String,
-    image_ocr: Option<&dyn ImageOcr>,
-) -> Result<Ingested, KbError> {
+) -> Result<Prepared, KbError> {
     let row = store::get_doc(st, &existing).await?;
-    // 并发删除：find_by_sha 命中后文档没了——直接 NotFound；走 Reprocess 最终会报
+    // 并发删除：find_by_sha 命中后文档没了——直接 NotFound；走 Rebuild 最终会报
     // 「写权限已失效」，语义误导
     let Some(row) = row else {
         return Err(KbError::NotFound(format!("文档 {existing} 已不存在")));
     };
     match dedup_action(Some(row.status.as_str())) {
-        // `source` 为空——那次上传已登记过物理表数据源
-        DedupAction::Reuse => Ok(Ingested { doc_id: existing, source: None }),
-        DedupAction::Reprocess => reprocess(st, doc, embed, v, cfg, req, &existing, image_ocr).await,
+        // 那次上传已登记过物理表数据源，这边没有重活要跑
+        DedupAction::Reuse => Ok(Prepared { doc_id: existing, job: None }),
+        DedupAction::Reprocess => Ok(Prepared {
+            doc_id: existing,
+            job: Some(IngestJob::Rebuild { req: OwnedUploadReq::from_req(req) }),
+        }),
     }
 }
 
@@ -352,6 +436,7 @@ fn dedup_action(status: Option<&str>) -> DedupAction {
 }
 
 /// 对已存在文档原地重建。调用者先做 ACL 与原始文件读取；本函数只负责状态机与入库编排。
+/// 表格物理表属于同一原文件，索引重建不重复灌数（已登记的数据源原样保留），故无返回值。
 pub async fn reprocess(
     st: &OwnedStore,
     doc: &DocService,
@@ -361,7 +446,7 @@ pub async fn reprocess(
     req: UploadReq<'_>,
     doc_id: &str,
     image_ocr: Option<&dyn ImageOcr>,
-) -> Result<Ingested, KbError> {
+) -> Result<(), KbError> {
     let kind = classify(req.file_name, req.bytes.len() as u64, cfg.max_bytes)?;
     // 落盘根目录在入口统一建一次（build_shadow 内不再重建）
     tokio::fs::create_dir_all(&cfg.root).await.map_err(io_err)?;
@@ -398,8 +483,7 @@ pub async fn reprocess(
     )
     .await?;
     try_apply_inferred_version(st, viewer, doc_id, req.file_name).await;
-    // 表格物理表属于同一原文件，不在索引重建时重复灌数；已登记的数据源原样保留。
-    Ok(Ingested { doc_id: doc_id.to_string(), source: None })
+    Ok(())
 }
 
 struct ShadowBuild {
@@ -468,7 +552,7 @@ async fn build_shadow(
     })
 }
 
-/// 落盘 → parse → chunk → 向量 →（表格）通道②。任一步 `Err` 由 `ingest` 统一记 `failed`；
+/// 落盘 → parse → chunk → 向量 →（表格）通道②。任一步 `Err` 由 `run_job` 统一记 `failed`；
 /// 通道② 例外，它失败只记 `kb.doc.error` 不抹掉整次上传（见 `tabular_channel`）。
 async fn run(
     st: &OwnedStore,
@@ -1765,13 +1849,63 @@ mod tests {
     }
 
     /// 并发删除窗口（锚点）：find_by_sha 命中后 get_doc 为 None 时必须直接 NotFound，
-    /// 不许走 Reprocess 落一个「写权限已失效」的误导文案
+    /// 不许走 Rebuild 落一个「写权限已失效」的误导文案
     #[test]
     fn dedup_after_concurrent_delete_is_not_found() {
         let src = include_str!("ingest.rs");
-        let body = src.split("fn dedup_or_reprocess").nth(1).unwrap();
+        let body = src.split("fn dedup_dispatch").nth(1).unwrap();
         let body = body.split("/// dedup 命中文档的处置").next().unwrap();
         assert!(body.contains("KbError::NotFound"), "并发删除必须报不存在而非权限错（若是改名请同步改本锚点）");
+    }
+
+    /// owning ↔ 借用两种形态必须逐字段同值：重活跨 spawn 边界走的就是这条换算
+    #[test]
+    fn owned_upload_req_roundtrips_into_borrowed_form() {
+        let owned = OwnedUploadReq {
+            space_id: "kb-hr".into(),
+            folder_id: Some("f1".into()),
+            file_name: "制度.pdf".into(),
+            mime: "application/pdf".into(),
+            bytes: b"%PDF-1".to_vec(),
+            preset: Some("qa".into()),
+        };
+        let req = owned.as_req();
+        assert_eq!(req.space_id, "kb-hr");
+        assert_eq!(req.folder_id, Some("f1"));
+        assert_eq!(req.file_name, "制度.pdf");
+        assert_eq!(req.mime, "application/pdf");
+        assert_eq!(req.bytes, b"%PDF-1");
+        assert_eq!(req.preset, Some("qa"));
+        // 缺省臂：None 不许变成 Some("")
+        let bare = OwnedUploadReq::from_req(&UploadReq {
+            space_id: "s", folder_id: None, file_name: "a.txt", mime: "text/plain",
+            bytes: b"x", preset: None,
+        });
+        assert!(bare.folder_id.is_none() && bare.preset.is_none());
+    }
+
+    /// 快/慢路径切分契约（源码断言）：
+    /// - `prepare` 只做快路径（不含 parse/chunk/embed 调用），且把状态推进到 parsing、完成落盘——
+    ///   响应的进行态与「doc 行可见即文件可读」都靠这两行；
+    /// - `run_job` 的 Fresh 臂失败必须落 `failed`（不许静默），Rebuild 臂必须走 `reprocess`
+    ///   影子链（失败不动线上版本）。
+    #[test]
+    fn prepare_is_fast_path_and_run_job_owns_heavy_work() {
+        let src = include_str!("ingest.rs");
+        let prep = src.split("pub async fn prepare").nth(1).unwrap();
+        let prep = prep.split("/// 入库重活分派").next().unwrap();
+        for heavy in ["parse_input(", "chunk_with_preset(", "embed_passages(", "insert_chunks("] {
+            assert!(!prep.contains(heavy), "快路径不许碰重活 {heavy}");
+        }
+        assert!(prep.contains("DocStatus::Parsing"), "快路径必须先推进到 parsing 再交还");
+        assert!(prep.contains("tokio::fs::write"), "落盘必须在快路径完成");
+
+        let job = src.split("pub async fn run_job").nth(1).unwrap();
+        let job = job.split("\n}\n").next().unwrap();
+        let fresh = job.split("IngestJob::Fresh").nth(1).unwrap();
+        assert!(fresh.contains("DocStatus::Failed"), "Fresh 失败文案必须落库: {fresh}");
+        let rebuild = job.split("IngestJob::Rebuild").nth(1).unwrap();
+        assert!(rebuild.contains("reprocess("), "Rebuild 必须走影子重建链: {rebuild}");
     }
 
     /// 落库形状契约：Rust preset 的 chunks 与 spans 等长平行，tokens 按统一口径估算

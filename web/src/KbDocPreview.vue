@@ -20,6 +20,8 @@ const emit = defineEmits<{
 const activeTab = ref<PreviewTab>('file')
 const fileLoading = ref(false)
 const fileUrl = ref('')
+const embedLoading = ref(false)
+const officePdfUrl = ref('')
 const fileKind = ref<FileKind>('none')
 const fileText = ref('')
 const csvRows = ref<string[][]>([])
@@ -72,7 +74,7 @@ function extOf(name: string): string {
 // 原件预览分派：扩展名优先（上传白名单保证它存在），mime 兜底（服务端下载已按扩展名白名单改写）。
 // 🔴 svg 刻意不收（可执行脚本的 XSS 面）；tif/tiff 浏览器解不了 → 落 none 走下载提示；
 // html 不按标记渲染，只展示转义后的原文（安全转文本）；
-// Office（Word/Excel/PPT）归 office：不下载原件，「文件」页签直接渲染解析后的内容。
+// Office（Word/Excel/PPT）归 office：优先服务端转换的 PDF 直链，转换不可用才回落到解析内容渲染。
 function kindOf(name: string, mime: string): FileKind {
   const ext = extOf(name)
   if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif'].includes(ext)) return 'image'
@@ -171,9 +173,40 @@ function parseCsv(text: string): { rows: string[][]; truncated: boolean } {
 /** 表体行预计算：模板里 slice(1) 每次渲染都新建数组。 */
 const csvBodyRows = computed(() => csvRows.value.slice(1))
 
-function revokeFileUrl() {
-  if (fileUrl.value) URL.revokeObjectURL(fileUrl.value)
-  fileUrl.value = ''
+/** 预览票据：直链改走 ticket（120s 有效），iframe/img 才能绕开 Authorization 头直挂 URL。 */
+async function previewTicket(): Promise<string> {
+  const response = await fetch(`/api/kb/doc/${encodeURIComponent(props.docId)}/preview-ticket`, {
+    method: 'POST',
+    headers: sessionHeaders(props.token, () => emit('auth-expired')),
+  })
+  if (response.status === 401) emit('auth-expired')
+  if (!response.ok) throw new Error(await errorText(response))
+  const data = await response.json().catch(() => ({})) as Record<string, unknown>
+  const ticket = String(data.ticket ?? '')
+  if (!ticket) throw new Error('预览票据签发失败')
+  return ticket
+}
+
+/** 文件直链（ticket 鉴权、inline 渲染、支持 Range）；office_pdf=1 取服务端转换版 PDF。 */
+function directFileUrl(ticket: string, officePdf = false): string {
+  return `/api/kb/doc/${encodeURIComponent(props.docId)}/file?ticket=${encodeURIComponent(ticket)}&inline=1${officePdf ? '&office_pdf=1' : ''}`
+}
+
+/** 直链由浏览器渐进拉取：load 事件才撤 loading（v-show 常驻 DOM，否则等不到事件）。 */
+function onEmbedLoad() {
+  embedLoading.value = false
+}
+/** 直链失败（票据过期/原件缺失）：回到原有失败态 + Markdown 自动降级。 */
+function onEmbedError() {
+  embedLoading.value = false
+  fileFailed.value = true
+  fileErr.value = '原件直链加载失败'
+  void autoMarkdown()
+}
+/** office 转换版 iframe 加载失败：不亮错误页，静默落回解析内容渲染分支。 */
+function onOfficeEmbedError() {
+  officePdfUrl.value = ''
+  if (!markdownRan.value && !markdownLoading.value) void loadMarkdown()
 }
 
 async function fetchBlob(): Promise<Blob> {
@@ -194,18 +227,14 @@ async function loadFile() {
   fileFailed.value = false
   fileErr.value = ''
   pdfFrag.value = ''
-  revokeFileUrl()
+  embedLoading.value = false
+  officePdfUrl.value = ''
+  fileUrl.value = ''
   fileText.value = ''
   csvRows.value = []
   csvTruncated.value = false
   const kind = kindOf(props.docName, props.mime || '')
   fileKind.value = kind
-  // Office 原件浏览器内嵌不了：不浪费一次下载，「文件」页签直接渲染解析后的内容（与 Markdown 页签同源）
-  if (kind === 'office') {
-    fileLoading.value = false
-    if (!markdownRan.value && !markdownLoading.value) void loadMarkdown()
-    return
-  }
   // 不可内嵌的格式（tif/svg 等）不浪费一次下载：直接落「下载 + Markdown 页签」提示
   if (kind === 'none') {
     fileLoading.value = false
@@ -213,20 +242,45 @@ async function loadFile() {
     return
   }
   try {
+    // pdf/image：票据换直链，浏览器按 Range 渐进渲染，不再整 blob 下载；
+    // loading 由 iframe/img 的 load 事件关闭（embedLoading），onerror 走原有失败态降级
+    if (kind === 'image' || kind === 'pdf') {
+      const ticket = await previewTicket()
+      if (epoch !== previewEpoch) return
+      embedLoading.value = true
+      fileUrl.value = directFileUrl(ticket)
+      // 个别浏览器的内嵌 PDF 查看器不触发 iframe load：兜底撤 loading，不能把人锁在加载页
+      window.setTimeout(() => { if (epoch === previewEpoch) embedLoading.value = false }, 8000)
+      return
+    }
+    // office：先探测转换版 PDF（Range 1 字节，206 才有）；404 office_pdf_unavailable 等
+    // 一律回落到「解析内容渲染」分支（保留的降级路径，与 Markdown 页签同源）
+    if (kind === 'office') {
+      try {
+        const ticket = await previewTicket()
+        if (epoch !== previewEpoch) return
+        const probe = await fetch(directFileUrl(ticket, true), { headers: { Range: 'bytes=0-0' } })
+        if (epoch !== previewEpoch) return
+        if (probe.status === 206) {
+          officePdfUrl.value = directFileUrl(ticket, true)
+          return
+        }
+      } catch { /* 票据/探测失败都按转换不可用处理 */ }
+      if (epoch !== previewEpoch) return
+      if (!markdownRan.value && !markdownLoading.value) void loadMarkdown()
+      return
+    }
+    // text/csv/json/html/md：小文件维持 blob 解析渲染不变
     const blob = await fetchBlob()
     if (epoch !== previewEpoch) return
-    if (kind === 'image' || kind === 'pdf') {
-      fileUrl.value = URL.createObjectURL(blob)
+    const text = await blobText(blob)
+    if (epoch !== previewEpoch) return
+    if (kind === 'csv') {
+      const parsed = parseCsv(text)
+      csvRows.value = parsed.rows
+      csvTruncated.value = parsed.truncated
     } else {
-      const text = await blobText(blob)
-      if (epoch !== previewEpoch) return
-      if (kind === 'csv') {
-        const parsed = parseCsv(text)
-        csvRows.value = parsed.rows
-        csvTruncated.value = parsed.truncated
-      } else {
-        fileText.value = kind === 'json' ? prettyJson(text) : text
-      }
+      fileText.value = kind === 'json' ? prettyJson(text) : text
     }
   } catch (e) {
     if (epoch === previewEpoch) {
@@ -398,7 +452,8 @@ function flipChunkPage(delta: number) {
   chunkPage.value = Math.min(chunkPageCount.value - 1, Math.max(0, chunkPage.value + delta))
 }
 
-// 原文对照（对齐 Yuxi 预览形态）：PDF 原件按页锚点跳（:key 强制 iframe 重挂，查看器才会认新页码）
+// 原文对照（对齐 Yuxi 预览形态）：PDF 原件按页锚点跳（:key 强制 iframe 重挂，查看器才会认新页码）。
+// 直链后 fileUrl 是普通 URL，`直链 + #page=N` 与 blob URL 一样有效。
 function jumpToPdfPage(page?: number | null) {
   if (!page || fileKind.value !== 'pdf' || !fileUrl.value) return
   pdfFrag.value = `#page=${page}`
@@ -478,6 +533,8 @@ watch(() => props.docId, (id, old) => {
   if (id === old) return
   previewEpoch++
   activeTab.value = 'file'
+  embedLoading.value = false
+  officePdfUrl.value = ''
   markdownRan.value = false
   markdownFailed.value = false
   markdownHtml.value = ''
@@ -502,7 +559,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', onKey)
   previewEpoch++
-  revokeFileUrl()
 })
 
 void loadFile()
@@ -536,10 +592,21 @@ void loadFile()
             <strong>原件预览暂不可用</strong>
             <span>{{ fileErr || '服务端暂未提供该文档的原件内容' }}；可切换到 Markdown 或 Chunks 页签查看解析结果。</span>
           </div>
-          <div v-else-if="fileKind === 'image' && fileUrl" class="kdp-image-wrap">
-            <img :src="fileUrl" :alt="docName">
-          </div>
-          <iframe v-else-if="fileKind === 'pdf' && fileUrl" :key="pdfFrag" :src="fileUrl + pdfFrag" title="文档原件预览"></iframe>
+          <!-- pdf/image 直链：iframe/img 用 v-show 常驻 DOM（v-if 会等不到 load 事件），loading 层盖住直到加载完成 -->
+          <template v-else-if="fileKind === 'image' && fileUrl">
+            <div v-if="embedLoading" class="kdp-state" role="status">
+              <strong>正在加载原件</strong><span>图片由浏览器按原始尺寸渐进加载。</span>
+            </div>
+            <div v-show="!embedLoading" class="kdp-image-wrap">
+              <img :src="fileUrl" :alt="docName" @load="onEmbedLoad" @error="onEmbedError">
+            </div>
+          </template>
+          <template v-else-if="fileKind === 'pdf' && fileUrl">
+            <div v-if="embedLoading" class="kdp-state" role="status">
+              <strong>正在加载原件</strong><span>PDF 由浏览器渐进渲染，大文件需要几秒钟。</span>
+            </div>
+            <iframe v-show="!embedLoading" :key="pdfFrag" :src="fileUrl + pdfFrag" title="文档原件预览" @load="onEmbedLoad" @error="onEmbedError"></iframe>
+          </template>
           <div v-else-if="fileKind === 'csv' && csvRows.length" class="kdp-table-wrap">
             <table class="kdp-table">
               <thead><tr><th v-for="(h, i) in csvRows[0]" :key="i">{{ h || '（空表头）' }}</th></tr></thead>
@@ -554,16 +621,23 @@ void loadFile()
           <article v-else-if="fileKind === 'markdown' && fileText" class="kdp-markdown" v-html="fileMarkdownHtml"></article>
           <pre v-else-if="(fileKind === 'text' || fileKind === 'json' || fileKind === 'html') && fileText" class="kdp-text">{{ fileText }}</pre>
           <div v-else-if="fileKind === 'office'" class="kdp-office">
-            <p class="kdp-note kdp-office-note">Office 原件按解析后的内容预览，版式可能与原件有差异；原始排版请下载原件查看。</p>
-            <div v-if="markdownLoading" class="kdp-state" role="status">
-              <strong>正在解析内容</strong><span>Office 文档解析需要几秒钟。</span>
-            </div>
-            <article v-else-if="markdownHtml" class="kdp-markdown" v-html="markdownHtml"></article>
-            <div v-else class="kdp-state">
-              <strong>未能解析出可预览的内容</strong>
-              <span>{{ markdownFailed ? (markdownErr || '解析失败，请稍后重试。') : '该文档没有解析出文本内容。' }}可下载原件后用本地应用打开。</span>
-              <button class="primary-btn" type="button" :disabled="downloading" @click="downloadOriginal">下载原件</button>
-            </div>
+            <!-- 服务端转换版 PDF（探测 206 才进这分支）；转换不可用落解析内容渲染 -->
+            <template v-if="officePdfUrl">
+              <p class="kdp-note kdp-office-note">已转为 PDF 预览，原始文件请下载查看。</p>
+              <iframe class="kdp-office-frame" :src="officePdfUrl" title="Office 文档的 PDF 转换预览" @error="onOfficeEmbedError"></iframe>
+            </template>
+            <template v-else>
+              <p class="kdp-note kdp-office-note">Office 原件按解析后的内容预览，版式可能与原件有差异；原始排版请下载原件查看。</p>
+              <div v-if="markdownLoading" class="kdp-state" role="status">
+                <strong>正在解析内容</strong><span>Office 文档解析需要几秒钟。</span>
+              </div>
+              <article v-else-if="markdownHtml" class="kdp-markdown" v-html="markdownHtml"></article>
+              <div v-else class="kdp-state">
+                <strong>未能解析出可预览的内容</strong>
+                <span>{{ markdownFailed ? (markdownErr || '解析失败，请稍后重试。') : '该文档没有解析出文本内容。' }}可下载原件后用本地应用打开。</span>
+                <button class="primary-btn" type="button" :disabled="downloading" @click="downloadOriginal">下载原件</button>
+              </div>
+            </template>
           </div>
           <div v-else-if="fileKind !== 'none'" class="kdp-state">
             <strong>文件为空</strong>
@@ -706,6 +780,8 @@ void loadFile()
 .kdp-office { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
 .kdp-office-note { flex: none; margin: 10px 18px 0; }
 .kdp-office .kdp-markdown { flex: 1; }
+/* 转换版 PDF 的 iframe 嵌在 .kdp-office 里（不是 .kdp-pane.file 直接子级）， flex 高度要单独给 */
+.kdp-office-frame { flex: 1; min-height: 0; width: 100%; border: 0; background: var(--bg-main); }
 .kdp-text {
   flex: 1; min-height: 0; margin: 0; padding: 16px 20px; overflow: auto;
   background: var(--bg-main); color: var(--text-regular);

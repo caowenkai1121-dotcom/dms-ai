@@ -1741,6 +1741,49 @@ pub async fn promote_doc_if_ready(
     Ok(n > 0)
 }
 
+/// 【启动自愈】卡死文档扫描行：重跑入库重活所需的最小上下文。
+/// `owner` 是恢复动作的执行身份——系统任务没有会话 Viewer，空间 owner 恒过写门禁（不开旁路）。
+#[derive(Debug, Clone)]
+pub struct StuckDoc {
+    pub doc_id: String,
+    pub space_id: String,
+    pub folder_id: Option<String>,
+    pub name: String,
+    pub mime: String,
+    pub owner: String,
+    /// 是否已有分块（`insert_chunks` 单语句落库，块全在或全不在）：决定自愈走首入链
+    /// （无块，零冲突）还是影子重建链（有块，首入链的全量冲突会报 0 行，不许重入）。
+    pub has_chunks: bool,
+}
+
+/// 进程死亡留下的「进行中」文档：status ∈ pending/parsing/chunked 且 `stale_mins` 分钟没动过。
+/// `pending` 也在扫描集里：它只该存在于「建行 → 推进 parsing」的瞬态窗口，超龄即僵尸。
+/// `chunked` 含「向量服务不可用」的刻意降级：重跑幂等（顺带补欠下的向量），与 A9 同向。
+pub async fn stuck_docs(
+    store: &OwnedStore,
+    stale_mins: i32,
+    limit: i64,
+) -> Result<Vec<StuckDoc>, KbError> {
+    Ok(store
+        .fixed(
+            "SELECT d.doc_id,d.space_id,d.folder_id,d.name,d.mime,s.owner,\
+                    EXISTS(SELECT 1 FROM kb.chunk c WHERE c.doc_id=d.doc_id) \
+             FROM kb.doc d JOIN kb.space s ON s.space_id=d.space_id \
+             WHERE d.status IN ('pending','parsing','chunked') \
+               AND d.updated_at < now() - make_interval(mins => $1) \
+             ORDER BY d.updated_at LIMIT $2",
+        )
+        .bind(stale_mins)
+        .bind(limit)
+        .fetch_all::<(String, String, Option<String>, String, String, String, bool)>()
+        .await?
+        .into_iter()
+        .map(|(doc_id, space_id, folder_id, name, mime, owner, has_chunks)| StuckDoc {
+            doc_id, space_id, folder_id, name, mime, owner, has_chunks,
+        })
+        .collect())
+}
+
 pub async fn list_docs(
     store: &OwnedStore,
     viewer: &crate::Viewer,
@@ -2217,6 +2260,19 @@ mod tests {
         assert!(pending.contains("d.enabled=true"));
         let flip = src.split("pub async fn flip_embedded_docs").nth(1).unwrap();
         assert!(flip.contains("AND EXISTS (SELECT 1 FROM kb.chunk"));
+    }
+
+    /// 启动自愈扫描（锚点）：进行态三状态 + 超龄判定 + owner 身份 + 分块存在性一个都不能少——
+    /// 漏掉 owner join 自愈就没有合法执行身份，漏掉 has_chunks 就无法分派首入/重建两条链。
+    #[test]
+    fn stuck_docs_scan_pins_statuses_staleness_and_identity() {
+        let src = include_str!("store.rs");
+        let body = src.split("pub async fn stuck_docs").nth(1).unwrap();
+        let body = body.split("pub async fn ").next().unwrap();
+        assert!(body.contains("'pending','parsing','chunked'"), "扫描集必须是三个进行态: {body}");
+        assert!(body.contains("make_interval(mins => $1)"), "超龄窗口必须参数化: {body}");
+        assert!(body.contains("JOIN kb.space s ON s.space_id=d.space_id"), "必须带出空间 owner: {body}");
+        assert!(body.contains("EXISTS(SELECT 1 FROM kb.chunk c WHERE c.doc_id=d.doc_id)"), "必须带出分块存在性: {body}");
     }
 
     #[test]
