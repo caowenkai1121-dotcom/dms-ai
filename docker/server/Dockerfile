@@ -23,7 +23,10 @@ RUN cargo build --locked && cp /ws/target/debug/dms-ai-server /usr/local/bin/dms
 
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/caowenkai1121-dotcom/dms-ai"
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# 服务器在国内，deb.debian.org 拉源列表常年卡死（2026-08-11 实测 8.8MB Packages 6 分钟拉不动）→
+# 构建时先切阿里云镜像；bookworm-slim 的源在 deb822 格式的 sources.list.d/debian.sources
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 # /app 是 serve.ps1 挂载契约的一部分（why-not-compose 读相对路径 tools/eval_cases.json → /app/tools/...），勿改
 WORKDIR /app
 # 源路径跟着上面 build 的 profile 走：改 profile 两处必须同步
