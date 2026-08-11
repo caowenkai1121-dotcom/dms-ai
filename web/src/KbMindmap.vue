@@ -48,6 +48,8 @@ const exporting = ref(false)
 // 章节缓存只活在本会话：不按空间记忆——章节数据是懒加载的，展开即拉取
 const docSections = ref<Record<string, MNode[]>>({})
 const loadingDoc = ref('')
+/** 章节拉取的中止柄：单飞但可抢占（新点击 abort 旧请求），配 20s 超时防网关挂起死锁 */
+let sectionsAbort: AbortController | null = null
 const activeSection = ref<SectionCard | null>(null)
 const cardCloseBtn = ref<HTMLButtonElement | null>(null)
 const wrapEl = ref<HTMLDivElement>()
@@ -323,17 +325,19 @@ async function toggleDoc(node: LayoutNode) {
     return
   }
   if (!docSections.value[docId]) {
-    if (loadingDoc.value) {
-      note.value = '正在读取另一文档的章节，请稍候。'
-      noteKind.value = 'info'
-      return
-    }
+    // 单飞但**可抢占**：上一个读取还在飞（慢网/网关挂起）时，点新文档 abort 旧的再接新的——
+    // 原来「请稍候」直接 return：fetch 没有超时，一旦挂死，之后所有文档节点都展不开（实测投诉
+    // 「很多节点展不开」的根因）。20s 超时兜底：挂起不许把展开闸锁死。
+    sectionsAbort?.abort()
+    const ctl = new AbortController()
+    sectionsAbort = ctl
     loadingDoc.value = docId
     note.value = ''
     // epoch 守卫：拉取途中换空间/卸载后，旧响应不许写回新状态
     const epoch = mindmapEpoch
+    const timer = setTimeout(() => ctl.abort(), 20000)
     try {
-      const response = await fetch(`/api/kb/doc/${encodeURIComponent(docId)}/sections`, { headers: headers() })
+      const response = await fetch(`/api/kb/doc/${encodeURIComponent(docId)}/sections`, { headers: headers(), signal: ctl.signal })
       if (response.status === 401) emit('auth-expired')
       if (!response.ok) throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status })
       const data = await response.json().catch(() => ({}))
@@ -341,17 +345,23 @@ async function toggleDoc(node: LayoutNode) {
       docSections.value = { ...docSections.value, [docId]: normalizeSections(data) }
     } catch (e) {
       if (epoch !== mindmapEpoch) return
+      if (ctl.signal.aborted && sectionsAbort !== ctl) return // 被更新的点击抢占：静默，状态归新点击管
       // 仅 404 是「接口未上线」；401 已走 auth-expired，其余按普通读取失败
       const status = (e as { status?: number }).status
       const session = e instanceof Error && e.message.includes('登录会话')
       note.value = session ? (e as Error).message
-        : status === 404 ? '章节展开接口尚未上线，当前导图只能展开到文档。'
-          : '章节读取失败，请稍后重试。'
+        : ctl.signal.aborted ? '章节读取超时，请重试。'
+          : status === 404 ? '章节展开接口尚未上线，当前导图只能展开到文档。'
+            : '章节读取失败，请稍后重试。'
       noteKind.value = 'warn'
-      loadingDoc.value = ''
       return
+    } finally {
+      clearTimeout(timer)
+      if (sectionsAbort === ctl) {
+        sectionsAbort = null
+        loadingDoc.value = ''
+      }
     }
-    loadingDoc.value = ''
   }
   if (!docSections.value[docId]?.length) {
     note.value = `《${node.name}》没有可展开的章节结构。`
@@ -520,6 +530,8 @@ async function load() {
   docSections.value = {}
   activeSection.value = null
   loadingDoc.value = ''
+  sectionsAbort?.abort() // 在飞的章节拉取一并中止（epoch 守卫拦写回，这里把传输也断掉）
+  sectionsAbort = null
   if (!props.spaceId) {
     loading.value = false
     unavailable.value = true
