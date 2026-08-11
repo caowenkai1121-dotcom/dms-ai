@@ -36,6 +36,12 @@ pub type ImageOcrFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send
 /// server 注入运行时视觉路由；knowledge 只接收 OCR 正文，不依赖 LLM 实现与凭据。
 pub trait ImageOcr: Send + Sync {
     fn recognize<'a>(&'a self, file_name: &'a str, mime: &'a str, bytes: &'a [u8]) -> ImageOcrFuture<'a>;
+    /// 图片含义（一两句语义描述，不是 OCR 正文）：导图/检索要回答「这张图是什么」。
+    /// 默认恒 None——没有视觉通道的实现（tesseract 降级等）不受影响。
+    fn describe<'a>(&'a self, file_name: &'a str, mime: &'a str, bytes: &'a [u8]) -> ImageOcrFuture<'a> {
+        let _ = (file_name, mime, bytes);
+        Box::pin(async { None })
+    }
 }
 
 pub struct IngestCfg {
@@ -819,7 +825,12 @@ async fn parse_input(
             None => None,
         };
         if let Some(text) = recognized.as_deref().map(str::trim).filter(|text| usable_image_ocr(text)) {
-            return Ok(image_parsed_doc(text));
+            // 图片含义与 OCR 正文并（OCR 成功的同一视觉通道才谈得上描述；describe 失败不挡入库）
+            let caption = match image_ocr {
+                Some(ocr) => ocr.describe(req.file_name, req.mime, req.bytes).await,
+                None => None,
+            };
+            return Ok(image_parsed_doc(text, caption.as_deref()));
         }
     }
 
@@ -864,13 +875,25 @@ fn usable_image_ocr(text: &str) -> bool {
     !normalized.is_empty() && normalized != "无法辨认"
 }
 
-fn image_parsed_doc(text: &str) -> ParsedDoc {
-    ParsedDoc {
-        blocks: vec![Block {
-            text: text.to_string(),
+fn image_parsed_doc(text: &str, caption: Option<&str>) -> ParsedDoc {
+    // 「图片含义」块在最前：导图章节树的第一个节点就是「这张图是什么」（检索同样命中它）
+    let mut blocks: Vec<Block> = caption
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| Block {
+            text: format!("图片含义：{c}"),
             page: Some(1),
-            heading_path: "图片文字识别".to_string(),
-        }],
+            heading_path: "图片含义".to_string(),
+        })
+        .into_iter()
+        .collect();
+    blocks.push(Block {
+        text: text.to_string(),
+        page: Some(1),
+        heading_path: "图片文字识别".to_string(),
+    });
+    ParsedDoc {
+        blocks,
         page_count: 1,
         sheets: Vec::new(),
         notes: Vec::new(),
@@ -1704,12 +1727,26 @@ mod tests {
     #[test]
     fn ai_image_text_becomes_the_parsed_document_without_rewriting_it() {
         let text = "日期：2026-08-06\n金额：￥12,345.67\n| 商品 | 数量 |\n| A | 2 |";
-        let parsed = image_parsed_doc(text);
+        let parsed = image_parsed_doc(text, None);
         assert_eq!(parsed.page_count, 1);
         assert!(parsed.sheets.is_empty());
         assert_eq!(parsed.blocks.len(), 1);
         assert_eq!(parsed.blocks[0].text, text);
         assert_eq!(parsed.blocks[0].page, Some(1));
+    }
+
+    /// 图片含义块：有描述时置首块（导图首节点=「这张图是什么」），无描述/空白描述不产生块
+    #[test]
+    fn image_caption_block_comes_first_when_present() {
+        let parsed = image_parsed_doc("OCR 正文", Some(" 门店陈列照片，烤肠专柜特写 "));
+        assert_eq!(parsed.blocks.len(), 2);
+        assert_eq!(parsed.blocks[0].heading_path, "图片含义");
+        assert_eq!(parsed.blocks[0].text, "图片含义：门店陈列照片，烤肠专柜特写");
+        assert_eq!(parsed.blocks[1].heading_path, "图片文字识别");
+        let bare = image_parsed_doc("OCR 正文", Some("   "));
+        assert_eq!(bare.blocks.len(), 1, "空白描述不许产空块");
+        let none = image_parsed_doc("OCR 正文", None);
+        assert_eq!(none.blocks.len(), 1);
     }
 
     #[test]

@@ -31,10 +31,35 @@ static DOWNLOAD_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new
 
 const IMAGE_OCR_PROMPT: &str = "请逐字识别图片中的全部可见文字，并完整还原表格结构、金额、数字和日期。保持原文顺序和字段，不总结、不改写、不补全、不猜测；无法辨认处标记[无法辨认]。仅输出识别结果。";
 
+/// 图片含义描述（与 OCR 分开问：一个要逐字，一个要语义——一个提示词兼不来两种口径）。
+/// 导图章节树的「图片含义」节点与检索命中都吃这段。
+const IMAGE_DESCRIBE_PROMPT: &str = "用一两句话说明这张图片展示的内容和用途（它是什么图、表达了什么关键信息，如海报主题/表单种类/现场照片的对象）。不要逐字识别文字，不要猜测不可见内容。仅输出描述。";
+
 /// 持有 owned `LlmClient`（`Clone` 共享运行时配置）：入库重活在后台任务里执行，
 /// OCR 实现必须能 move 进 `tokio::spawn`，借 `&st.llm` 的引用形态过不去任务边界。
 struct RuntimeImageOcr {
     llm: crate::llm::LlmClient,
+}
+
+impl RuntimeImageOcr {
+    /// 一次视觉调用的公共段：data URL 装配 + 容量闸 + 调用 + 空串归一 None。
+    async fn vision_once(&self, prompt: &str, file_name: &str, mime: &str, bytes: &[u8]) -> Option<String> {
+        let data_mime = image_data_mime(file_name, mime);
+        if !image_fits_vision_data_url(data_mime, bytes.len()) {
+            return None;
+        }
+        let image_url = format!(
+            "data:{};base64,{}",
+            data_mime,
+            encode_base64(bytes)
+        );
+        self.llm
+            .vision_chat(prompt, &image_url)
+            .await
+            .ok()
+            .map(|(text, _, _)| text)
+            .filter(|text| !text.trim().is_empty())
+    }
 }
 
 impl ingest::ImageOcr for RuntimeImageOcr {
@@ -44,23 +69,16 @@ impl ingest::ImageOcr for RuntimeImageOcr {
         mime: &'a str,
         bytes: &'a [u8],
     ) -> ingest::ImageOcrFuture<'a> {
-        Box::pin(async move {
-            let data_mime = image_data_mime(file_name, mime);
-            if !image_fits_vision_data_url(data_mime, bytes.len()) {
-                return None;
-            }
-            let image_url = format!(
-                "data:{};base64,{}",
-                data_mime,
-                encode_base64(bytes)
-            );
-            self.llm
-                .vision_chat(IMAGE_OCR_PROMPT, &image_url)
-                .await
-                .ok()
-                .map(|(text, _, _)| text)
-                .filter(|text| !text.trim().is_empty())
-        })
+        Box::pin(async move { self.vision_once(IMAGE_OCR_PROMPT, file_name, mime, bytes).await })
+    }
+
+    fn describe<'a>(
+        &'a self,
+        file_name: &'a str,
+        mime: &'a str,
+        bytes: &'a [u8],
+    ) -> ingest::ImageOcrFuture<'a> {
+        Box::pin(async move { self.vision_once(IMAGE_DESCRIBE_PROMPT, file_name, mime, bytes).await })
     }
 }
 
