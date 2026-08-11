@@ -1206,8 +1206,12 @@ async fn describe_columns(
         };
         match conn.describe(sql).await {
             Ok(d) => Ok(d.columns().iter().map(|c| c.name().to_string()).collect()),
-            Err(_) => {
-                tracing::warn!(reason = "describe_columns_failed", ds = at, "DESCRIBE 回填列名失败（空列返回）");
+            Err(e) => {
+                // 错误与 SQL 指纹都得带上：裸「空列返回」告警看不出是哪条查询、什么原因
+                // （实测 Doris 对含子查询/中文别名的语句 describe 不稳），刷屏却无从归因。
+                tracing::warn!(reason = "describe_columns_failed", ds = at, err = %e,
+                    sql = %sql.chars().take(160).collect::<String>(),
+                    "DESCRIBE 回填列名失败（空列返回）");
                 Ok(vec![])
             }
         }

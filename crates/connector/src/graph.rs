@@ -494,19 +494,6 @@ async fn batch_warehouse_catalog(
     batch_named_catalog_nodes(conn, "BusinessDomain", domains).await?;
     // MetricContract 节点不在此预建：下面 USES_AS_DEFAULT 的 MERGE + SET name 一次到位
 
-    for label in ["WarehouseAsset", "DataLayer", "BusinessDomain", "MetricContract"] {
-        if let Err(e) = sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS {}_code_idx ON {GRAPH}.\"{label}\" \
-             USING btree (agtype_access_operator(VARIADIC ARRAY[properties, '\"code\"'::agtype]))",
-            label.to_lowercase()
-        ))
-        .execute(&mut *conn)
-        .await
-        {
-            tracing::warn!(err = %e, label, "图目录索引创建失败，MATCH 将退化为全表扫");
-        }
-    }
-
     let list = assets
         .iter()
         .map(|asset| {
@@ -539,6 +526,22 @@ async fn batch_warehouse_catalog(
          MERGE (c)-[:USES_AS_DEFAULT]->(a) $$) AS (v agtype)"
     );
     sqlx::query(&cy).execute(&mut *conn).await?;
+
+    // 索引必须建在**所有标签都已存在**之后：AGE 里 `CREATE INDEX ON graph."Label"` 对还不存在的
+    // 标签恒报 relation does not exist（实测：MetricContract 的 MERGE 在上面才首次发生，
+    // 索引循环放它前面 = 每轮同步稳定失败一次、告警噪音 + 该标签永远没索引）。
+    for label in ["WarehouseAsset", "DataLayer", "BusinessDomain", "MetricContract"] {
+        if let Err(e) = sqlx::query(&format!(
+            "CREATE INDEX IF NOT EXISTS {}_code_idx ON {GRAPH}.\"{label}\" \
+             USING btree (agtype_access_operator(VARIADIC ARRAY[properties, '\"code\"'::agtype]))",
+            label.to_lowercase()
+        ))
+        .execute(&mut *conn)
+        .await
+        {
+            tracing::warn!(err = %e, label, "图目录索引创建失败，MATCH 将退化为全表扫");
+        }
+    }
 
     // 返回「尝试数」而非实建数（IN_LAYER/IN_DOMAIN/USES_AS_DEFAULT 各一 + 资产数），仅作日志口径
     Ok(assets.len() * 2 + 1)

@@ -96,7 +96,10 @@ fn sqls() -> &'static Sqls {
             "?",
         );
         let keyed = |inner: String, alias: &'static str| {
-            leak(format!("SELECT z.`{alias}` AS k, CAST(z.`销售额` AS DOUBLE) AS v FROM ({inner}) z"))
+            // k 一律 CAST AS CHAR：DATE 类型的键（趋势按日）直接解 String 会被 sqlx 类型检查
+            // 拒掉（MYSQL_TYPE_DATE ⊄ String 的合法来源）——「结果解码失败」的实测根因；
+            // 对 VARCHAR 键（省区/客户）CAST 是恒等，无害。
+            leak(format!("SELECT CAST(z.`{alias}` AS CHAR) AS k, CAST(z.`销售额` AS DOUBLE) AS v FROM ({inner}) z"))
         };
         let ranked = |mut sql: String| {
             sql.push_str(" ORDER BY `销售额` DESC LIMIT 5");
@@ -218,28 +221,31 @@ async fn generate(st: &AppState, today: NaiveDate) -> anyhow::Result<()> {
 
     // 同一时间窗的六个经营指标一次扫描，避免为每个 KPI 重复扫无分区事实表。
     // 12 路互不依赖的查询并发发出：整轮耗时从「总和」降为「最大单路」（每天一轮，值得）。
+    use futures::TryFutureExt as _; // future.map_err（每路挂名字归因，try_join 只抛第一个错）
     let (
         kpis_y, kpis_prev_day, kpis_yoy_day,
         kpis_mtd, kpis_prev_mtd, kpis_yoy_mtd,
         top_region, top_customer, trend,
         orders_y, orders_prev_day, orders_yoy_day,
     ) = tokio::try_join!(
-        one_kpis(st, s.kpis, y, today),
-        one_kpis(st, s.kpis, prev_day, y),
-        one_kpis(st, s.kpis, yoy_day, yoy_day_end),
-        one_kpis(st, s.kpis, month_start, today),
-        one_kpis(st, s.kpis, prev_month_start, prev_mtd_end),
-        one_kpis(st, s.kpis, yoy_month_start, yoy_mtd_end),
-        top(st, s.top_region, y, today),
-        top(st, s.top_customer, y, today),
+        // 每路挂名字：try_join 只抛第一个错，12 路并发下「哪路解码失败」原来无从归因
+        one_kpis(st, s.kpis, y, today).map_err(|e| e.context("kpis-昨日")),
+        one_kpis(st, s.kpis, prev_day, y).map_err(|e| e.context("kpis-前日")),
+        one_kpis(st, s.kpis, yoy_day, yoy_day_end).map_err(|e| e.context("kpis-同比日")),
+        one_kpis(st, s.kpis, month_start, today).map_err(|e| e.context("kpis-MTD")),
+        one_kpis(st, s.kpis, prev_month_start, prev_mtd_end).map_err(|e| e.context("kpis-环比MTD")),
+        one_kpis(st, s.kpis, yoy_month_start, yoy_mtd_end).map_err(|e| e.context("kpis-同比MTD")),
+        top(st, s.top_region, y, today).map_err(|e| e.context("榜-省区")),
+        top(st, s.top_customer, y, today).map_err(|e| e.context("榜-客户")),
         async {
             st.mysql.raw_dates_all::<(String, f64)>(s.trend, &[t30, today])
                 .await
                 .map_err(anyhow::Error::from)
-        },
-        one_orders(st, y, today),
-        one_orders(st, prev_day, y),
-        one_orders(st, yoy_day, yoy_day_end),
+        }
+        .map_err(|e| e.context("趋势-30日")),
+        one_orders(st, y, today).map_err(|e| e.context("订单-昨日")),
+        one_orders(st, prev_day, y).map_err(|e| e.context("订单-前日")),
+        one_orders(st, yoy_day, yoy_day_end).map_err(|e| e.context("订单-同比日")),
     )?;
 
     let digest = Digest {
