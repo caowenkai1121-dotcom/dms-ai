@@ -15,8 +15,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # legacy builder 约束：服务器 Docker 29 没装 buildx 插件，`--mount=type=cache` 直接报
 # "requires BuildKit"（2026-08-11 事故：加 cache mount 后服务器构建即炸）——RUN 保持单行无 mount。
-# 另：服务器 _build.sh 的 sed 靠「RUN cargo build --locked」字面前缀插 rsproxy 镜像配置，
-# 改行首/拆行会让 sed 落空、crates.io 直连卡死。
+# 另：服务器构建脚本用行首锚定的 sed 给下面 RUN 行前插 rsproxy 镜像配置（纯净 Dockerfile 不内嵌
+# 镜像源）——本 RUN 行首保持原样、别拆行，注释里也绝不能再写一遍同款行首字面量（sed 自匹配事故）。
 # debug 是有意取舍：本机/CI 迭代优先构建快；要切 --release 必须同步改下面 COPY 的源路径
 # （target/release/），两处没有对账机制，改一处忘另一处就是构建失败。
 RUN cargo build --locked && cp /ws/target/debug/dms-ai-server /usr/local/bin/dms-ai-server
