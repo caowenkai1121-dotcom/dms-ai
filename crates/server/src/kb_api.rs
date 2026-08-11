@@ -2339,15 +2339,18 @@ async fn convert_office_to_pdf(src: &std::path::Path, cache: &std::path::Path) -
     let work = cache_dir.join(format!("tmp-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&work).await.map_err(|_| ())?;
     let result = convert_office_in(&src_abs, &work).await;
+    // 先取产物再清理：produced 就在 work 里，先 remove_dir_all 会把 PDF 一起删掉
+    //（2026-08-11 生产事故：rename 扑空 ENOENT，全量预览 404）
+    let produced = result?;
+    let cache_abs = cache_dir.join(cache.file_name().ok_or(())?);
+    let renamed = tokio::fs::rename(&produced, &cache_abs).await.map_err(|e| {
+        tracing::warn!(err = %e, to = %cache_abs.display(), "Office 预览 PDF 落缓存失败");
+    });
     // 临时目录清理 best-effort：失败留下的 tmp-* 只是磁盘垃圾，不影响缓存正确性
     if let Err(e) = tokio::fs::remove_dir_all(&work).await {
         tracing::warn!(path = %work.display(), err = %e, "Office 预览临时目录清理失败");
     }
-    let produced = result?;
-    let cache_abs = cache_dir.join(cache.file_name().ok_or(())?);
-    tokio::fs::rename(&produced, &cache_abs).await.map_err(|e| {
-        tracing::warn!(err = %e, to = %cache_abs.display(), "Office 预览 PDF 落缓存失败");
-    })
+    renamed
 }
 
 /// 返回 soffice 产物路径（`<work>/<源文件stem>.pdf`）。

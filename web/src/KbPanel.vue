@@ -372,28 +372,57 @@ function hitLocation(hit: SearchHit): string {
   if (typeof hit.page === 'number') parts.push(`第 ${hit.page} 页`)
   return parts.join(' · ') || '未标注章节或页码'
 }
+/** 「需处理」判定：只有真要用户动手的才算——失败/空内容/待向量/日期失效/带失败语义的提示。
+ *  「第 N 页无文本层已用 OCR 补」这类**系统已自动消化**的提示不算（留痕展示即可，没什么可处理的）。 */
+function attentionInfo(d: Doc): { actionable: boolean; reason: string } | null {
+  if (d.enabled === false) return null
+  const level = d.quality?.level
+  if (!level || level === 'processing' || level === 'good') return null
+  const reason = (d.error || d.notice || d.quality?.label || '').trim()
+  // 已自动消化的纯告知提示（OCR 补页等）：可检索、无动作项，不进「需处理」
+  const digested = level === 'warning' && d.status === OK && (d.chunk_count ?? 0) > 0
+    && !!d.notice && !/失败|请|重试|不可用|缺失/.test(d.notice)
+    && !['待生效', '已失效'].includes(d.quality?.label ?? '')
+  if (digested) return null
+  const actionable = d.status === 'failed' || level === 'danger' || d.status === PARTIAL
+    || /失败|重试|请重新/.test(reason)
+  return { actionable, reason: reason || '状态待确认' }
+}
 function displayState(d: Doc): 'ready' | 'processing' | 'attention' | 'disabled' {
   if (d.enabled === false) return 'disabled'
   if (d.quality?.level === 'processing') return 'processing'
-  if (d.quality?.level === 'good') return 'ready'
-  return 'attention'
+  if (attentionInfo(d)) return 'attention'
+  return 'ready'
 }
 type PillState = 'ready' | 'processing' | 'attention' | 'disabled' | 'failed'
-/** 状态 pill 配色态：失败从「需处理」里单独染红（可点=重新处理），其余沿用 displayState 口径。 */
+/** 状态 pill 配色态：失败从「需处理」里单独染红，其余沿用 displayState 口径。 */
 function pillState(d: Doc): PillState {
   if (d.enabled === false) return 'disabled'
   if (d.status === 'failed') return 'failed'
   return displayState(d)
 }
-/** pill 的悬浮说明：旧版状态行下的 hint 文字收口到这里；处理中明示「点了也没用」。 */
+/** pill 文案：需处理档直接亮服务端质量标签（待向量化/待生效/无可检索内容…），不笼统说「可检索」。 */
+function pillText(d: Doc): string {
+  return pillState(d) === 'attention' ? (d.quality?.label ?? '需处理') : docStatusText(d)
+}
+/** pill 可点 = 主操作（重新处理）：失败/空内容/待向量/采集失败这类「处理动作能解决」的档。 */
+function pillClickable(d: Doc): boolean {
+  return !!currentSpace.value?.writable && !!attentionInfo(d)?.actionable
+}
+/** pill 悬浮说明：原因直接可见；可处理的档给出点击动作，处理中明示「点了也没用」。 */
 function pillTitle(d: Doc): string {
   const state = pillState(d)
   if (state === 'processing') return '正在处理，完成后自动转为可检索'
-  if (state === 'failed') {
-    const why = d.error || '未知错误'
-    return currentSpace.value?.writable ? `处理失败：${why}（点击重新处理）` : `处理失败：${why}`
+  const info = attentionInfo(d)
+  if (info) {
+    const why = info.reason || '未知原因'
+    return info.actionable && currentSpace.value?.writable ? `${why}（点击重新处理）` : why
   }
   return [statusHint(d), d.quality?.label].filter(Boolean).join(' · ')
+}
+/** 文件名下的原因行：需处理文档亮原因（错误>提示>质量标签）；已消化的提示淡色留痕。 */
+function issueText(d: Doc): string {
+  return attentionInfo(d)?.reason ?? (d.notice || d.error || '')
 }
 function dateInputValue(value?: string | null): string {
   return value ? value.slice(0, 10) : ''
@@ -2142,7 +2171,7 @@ void loadSpaces(props.initialSpace)
               <button type="button" class="stat-card" :class="{ active: filter === 'processing' }" @click="filter = 'processing'">
                 <strong>{{ counts.processing }}</strong><span>处理中</span>
               </button>
-              <button type="button" class="stat-card" :class="{ active: filter === 'attention' }" @click="filter = 'attention'">
+              <button type="button" class="stat-card" :class="{ active: filter === 'attention' }" title="需要重新处理或调整的文档（解析失败/待向量化/内容为空/已失效等，原因显示在文档名下方）；OCR 补页这类已自动消化的提示不计入" @click="filter = 'attention'">
                 <strong>{{ counts.attention }}</strong><span>需处理</span>
               </button>
               <button type="button" class="stat-card" :class="{ active: filter === 'all' }" @click="filter = 'all'">
@@ -2327,19 +2356,21 @@ void loadSpaces(props.initialSpace)
                       <span class="file-type" aria-hidden="true">{{ extOf(d.name) }}</span>
                       <div class="doc-name-main">
                         <button type="button" class="doc-name-link" :title="nameTitle(d)" @click.stop="previewDoc = d">{{ d.name }}</button>
-                        <span v-if="d.description" class="doc-desc-line" :title="d.description">{{ d.description }}</span>
+                        <!-- 需处理/有提示的文档把原因亮在名字下（比描述重要），其余才看描述行 -->
+                        <span v-if="issueText(d)" class="doc-issue-line" :class="{ attention: !!attentionInfo(d) }" :title="issueText(d)">{{ issueText(d) }}</span>
+                        <span v-else-if="d.description" class="doc-desc-line" :title="d.description">{{ d.description }}</span>
                       </div>
                     </div>
                   </td>
                   <td class="col-content" :title="contentText(d)">{{ contentText(d) }}</td>
                   <td class="col-status">
-                    <!-- 状态 pill 兼主操作：仅失败态可点（=重新处理），处理中点不动但 title 有说明 -->
+                    <!-- 状态 pill 兼主操作：可处理的档（失败/待向量/采集失败…）可点=重新处理；处理中点不动但 title 有说明 -->
                     <button
-                      v-if="pillState(d) === 'failed' && currentSpace?.writable" type="button"
-                      class="status-pill failed clickable" :title="pillTitle(d)" :disabled="!!reprocessingId"
+                      v-if="pillClickable(d)" type="button"
+                      class="status-pill clickable" :class="pillState(d)" :title="pillTitle(d)" :disabled="!!reprocessingId"
                       @click.stop="reprocess(d)"
-                    >{{ reprocessingId === d.doc_id ? '处理中' : '处理失败' }}</button>
-                    <span v-else class="status-pill" :class="pillState(d)" :title="pillTitle(d)">{{ docStatusText(d) }}</span>
+                    >{{ reprocessingId === d.doc_id ? '处理中' : pillText(d) }}</button>
+                    <span v-else class="status-pill" :class="pillState(d)" :title="pillTitle(d)">{{ pillText(d) }}</span>
                   </td>
                   <td class="col-time">{{ docTimeText(d.updated_at || d.created_at) }}</td>
                   <td class="col-ops" @click.stop>
@@ -3101,6 +3132,9 @@ td.col-ops { position: relative; overflow: visible; }
 }
 .doc-name-link:hover { color: var(--primary); text-decoration: underline; }
 .doc-desc-line { overflow: hidden; color: var(--text-faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+/* 原因行：默认淡色留痕（已消化的提示）；需处理档亮 warning 色直接可见 */
+.doc-issue-line { overflow: hidden; color: var(--text-faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.doc-issue-line.attention { color: var(--warning-text); }
 /* 状态 pill（24px）：可检索绿 / 处理中蓝 / 需处理黄 / 已停用灰 / 失败红；失败可点 = 重新处理 */
 .status-pill {
   display: inline-flex; align-items: center; height: 24px; padding: 0 8px; border: 0; border-radius: 6px;

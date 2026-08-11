@@ -659,11 +659,11 @@ mod tests {
         assert!(!html.contains("⟦CHART:2⟧"), "客户图占位符必须替换：{html}");
     }
 
-    /// 金额：满一万转“万”并固定三位，小金额千分位且最多三位。
+    /// 金额：满一万转“万”并固定两位（2026-08-11 裁决），小金额千分位且最多两位。
     #[test]
     fn money_groups_by_thousands() {
         assert_eq!(money(1234.5), "¥1,234.5");
-        assert_eq!(money(-206084819.194), "¥-20608.482万");
+        assert_eq!(money(-206084819.194), "¥-20608.48万");
         assert_eq!(money(88.0), "¥88");
         assert_eq!(money(1000.0), "¥1,000");
         assert_eq!(money(0.0), "¥0");

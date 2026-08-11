@@ -1980,7 +1980,7 @@ mod tests {
         assert!(html.contains("<strong>&lt;b&gt;x&lt;/b&gt;</strong>"), "{html}");
         // 表格形态
         let t = md_to_html("| 月份 | 销售额 |\n|---|---|\n| 七月 | 206,084,819.19 |");
-        assert!(t.contains("<th>月份</th>") && t.contains("<td>¥20608.482万</td>"), "{t}");
+        assert!(t.contains("<th>月份</th>") && t.contains("<td>¥20608.48万</td>"), "{t}");
         // 围栏代码块整段转义
         let c = md_to_html("```\nSELECT * FROM t WHERE x = '<script>'\n```");
         assert!(c.contains("&lt;script&gt;") && c.contains("<pre><code>"), "{c}");
@@ -2100,12 +2100,12 @@ mod tests {
     #[test]
     fn extract_tables_reads_cells_and_decodes_entities() {
         let html = "<main><p>前文</p><table><tr><th>月份</th><th>销售额</th></tr>\
-            <tr><td>七月 &amp; 八月</td><td><b>¥20608.482万</b></td></tr></table>\
+            <tr><td>七月 &amp; 八月</td><td><b>¥20608.48万</b></td></tr></table>\
             <table><tr><td> lone </td><td>x&lt;y</td></tr></table></main>";
         let tables = extract_tables(html);
         assert_eq!(tables.len(), 2, "{tables:?}");
         assert_eq!(tables[0][0], vec!["月份".to_string(), "销售额".to_string()], "{:?}", tables[0]);
-        assert_eq!(tables[0][1], vec!["七月 & 八月".to_string(), "¥20608.482万".to_string()], "{:?}", tables[0]);
+        assert_eq!(tables[0][1], vec!["七月 & 八月".to_string(), "¥20608.48万".to_string()], "{:?}", tables[0]);
         assert_eq!(tables[1][0], vec!["lone".to_string(), "x<y".to_string()], "{:?}", tables[1]);
         // 无表格 → 空（端点据此 400「该产物不含表格」）
         assert!(extract_tables("<p>纯文本报告</p>").is_empty());

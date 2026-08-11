@@ -826,7 +826,7 @@ fn rounded_equal(left: f64, right: f64) -> bool {
 
 /// 【ANALYSIS_CLAIM_VALUE_MISMATCH 硬规则】分析里的数值主张必须能绑定到证据数值：
 /// ① 字符串相同或 0~2 位小数格式化等价；② 金额/数量允许 ±0.5% 相对误差；
-/// ③ 万/亿 压缩形按展开量级比较（2.06亿 ↔ 20608.482万）；
+/// ③ 万/亿 压缩形按展开量级比较（2.06亿 ↔ 20608.48万）；
 /// ④ 百分数 ×100 形按比例归一后精确等价（25.6% ↔ 0.256），不放相对容差。
 fn parsed_claim_value_binds(claim: (f64, bool), evidence: (f64, bool)) -> bool {
     let (claim, claim_percent) = claim;
@@ -5080,7 +5080,7 @@ mod tests {
             "本月销售额",
             dms_agent::AnalysisPlan { kind: dms_agent::AnalysisKind::Metric, dws_sales_metric: true, allow_model_sections: true }.report_spec(),
             Some("这问的是总量，值得看维度与趋势"),
-            Some(("销售额", "¥20608.482万")),
+            Some(("销售额", "¥20608.48万")),
             &[Comparison {
                 label: "环比".into(),
                 basis: "较上月同期".into(),
@@ -5094,7 +5094,7 @@ mod tests {
             &[Highlight { label: "省份头部".into(), value: "¥100.5".into(), note: "湖南 · 占已展示正向合计 100.0%".into() }],
             &[vec![serde_json::json!("省份拆解"), serde_json::json!(1), serde_json::json!("湖南"), serde_json::json!("销售额"), serde_json::json!(100.5), serde_json::json!(100.0)]],
             &[
-                EvidenceItem { id: "KPI-01".into(), kind: "kpi", label: "销售额".into(), body: "销售额=¥20608.482万".into() },
+                EvidenceItem { id: "KPI-01".into(), kind: "kpi", label: "销售额".into(), body: "销售额=¥20608.48万".into() },
                 EvidenceItem { id: "KPI-02".into(), kind: "kpi", label: "较上月".into(), body: "变化率=12.3%".into() },
                 EvidenceItem { id: "SEC-01".into(), kind: "section", label: "省份拆解".into(), body: "湖南".into() },
                 EvidenceItem { id: "SEC-02".into(), kind: "section", label: "坪效与人效口径".into(), body: "数据状态=<script>缺少归属证据</script>".into() },
@@ -5118,7 +5118,7 @@ mod tests {
         assert!(html.contains("<svg>S1</svg>"), "{html}");
         assert!(!html.contains("⟦CHART"), "{html}");
         // KPI 卡
-        assert!(html.contains("销售额") && html.contains("¥20608.482万"), "{html}");
+        assert!(html.contains("销售额") && html.contains("¥20608.48万"), "{html}");
         assert!(html.contains("环比") && html.contains("+12.3%") && html.contains("较上月同期") && html.contains("变化额"), "{html}");
         for hidden in ["KPI-", "SEC-", "CON-", "证据</th>", "数据边界", "trustx", "trace-1", "0123456789abcdef"] {
             assert!(!html.contains(hidden), "用户页面不应展示 {hidden}：{html}");
@@ -5823,15 +5823,15 @@ mod tests {
         );
 
         let html = table_html(&section.columns, &section.rows, 10);
-        assert!(html.contains("¥12.346万"), "{html}");
-        assert!(html.contains("¥2.346万"), "销售额变化额必须继承指标语义：{html}");
+        assert!(html.contains("¥12.35万"), "{html}");
+        assert!(html.contains("¥2.35万"), "销售额变化额必须继承指标语义：{html}");
         assert!(html.contains("4,321.5"), "{html}");
         assert!(html.contains("19.0%"), "{html}");
         assert!(html.contains("-1.0%"), "毛利率变化值必须按百分点展示：{html}");
         let evidence = evidence_items(None, &[], &[section], &[], false);
         let body = &evidence[0].body;
-        assert!(body.contains("¥12.346万"), "{body}");
-        assert!(body.contains("¥2.346万"), "{body}");
+        assert!(body.contains("¥12.35万"), "{body}");
+        assert!(body.contains("¥2.35万"), "{body}");
         assert!(body.contains("4,321.5"), "{body}");
         assert!(body.contains("19.0%"), "{body}");
     }
@@ -6002,7 +6002,7 @@ mod tests {
     #[test]
     fn compressed_unit_and_percent_scaled_claims_pass_validation() {
         let evidence = vec![
-            EvidenceItem { id: "KPI-01".into(), kind: "kpi", label: "销售额".into(), body: "销售额=20608.482万".into() },
+            EvidenceItem { id: "KPI-01".into(), kind: "kpi", label: "销售额".into(), body: "销售额=20608.48万".into() },
             EvidenceItem { id: "KPI-02".into(), kind: "kpi", label: "毛利率".into(), body: "毛利率=0.256".into() },
         ];
         let text = "## 经营结论\n| 结论 | 业务影响 |\n|---|---|\n| 销售额约2.06亿 [KPI-01] | 规模确认 [KPI-01] |\n| 毛利率25.6% [KPI-02] | 盈利稳定 [KPI-02] |";
@@ -6017,8 +6017,8 @@ mod tests {
         let question = "请生成【单省区周度经营分析报告】。\n周期：2026-08-03 至 2026-08-09";
         assert!(is_weekly_report(question));
         let evidence = vec![
-            EvidenceItem { id: "KPI-01".into(), kind: "kpi", label: "销售额".into(), body: "销售额=12.346万".into() },
-            EvidenceItem { id: "SEC-01".into(), kind: "section", label: "核心经营指标".into(), body: "问题=三周期核心指标；列=指标|本周；总行数=1\n销售额 | ¥12.346万".into() },
+            EvidenceItem { id: "KPI-01".into(), kind: "kpi", label: "销售额".into(), body: "销售额=12.35万".into() },
+            EvidenceItem { id: "SEC-01".into(), kind: "section", label: "核心经营指标".into(), body: "问题=三周期核心指标；列=指标|本周；总行数=1\n销售额 | ¥12.35万".into() },
         ];
         let grounded = StubLlm("## 经营结论\n本周销售额约12.35万。[KPI-01]".into());
         let (passed, _) = evidence_insight(&grounded, question, dms_agent::AnalysisKind::Metric, &evidence, &[]).await;

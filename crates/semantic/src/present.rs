@@ -502,13 +502,14 @@ fn cell_f64(v: &Value) -> Option<f64> {
     }
 }
 
-/// 大数压缩为 万/亿 中文计数（搬运自旧 `server/src/viewspec.rs:404`，逐字保留）。
+/// 大数压缩为 万/亿 中文计数（原搬运自旧 `server/src/viewspec.rs:404`；
+/// 2026-08-11 裁决：万档与亿档统一**恰好两位**小数，与 web 端 format.ts 一致）。
 fn compress(n: f64) -> String {
     let abs = n.abs();
     if abs >= 1e8 {
         format!("{:.2}亿", n / 1e8)
     } else if abs >= 1e4 {
-        format!("{:.1}万", n / 1e4)
+        format!("{:.2}万", n / 1e4)
     } else {
         format!("{:.0}", n)
     }

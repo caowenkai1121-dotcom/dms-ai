@@ -459,8 +459,14 @@ fn label_kind(label: &str) -> &'static str {
 }
 
 fn grouped(v: f64) -> String {
-    let v = if v.abs() < 0.000_5 { 0.0 } else { v };
-    let raw = format!("{v:.3}");
+    grouped_decimals(v, 3)
+}
+
+/// 千分位分组，小数最多 `decimals` 位（尾零剥掉）；|v| 小于半个最小刻度按 0 显示（防「-0」）。
+fn grouped_decimals(v: f64, decimals: usize) -> String {
+    let eps = 0.5 / 10_f64.powi(decimals as i32);
+    let v = if v.abs() < eps { 0.0 } else { v };
+    let raw = format!("{v:.decimals$}");
     let (negative, raw) = raw.strip_prefix('-').map_or((false, raw.as_str()), |value| (true, value));
     let (integer, fraction) = raw.split_once('.').unwrap_or((raw, ""));
     let mut out = String::with_capacity(raw.len() + raw.len() / 3);
@@ -481,19 +487,30 @@ fn grouped(v: f64) -> String {
     out
 }
 
-/// 面向用户的业务数值：满一万固定三位“万”，其余千分位且最多三位小数。
+/// 面向用户的业务数值：满一万固定两位“万”（2026-08-11 裁决，与 web 端 format.ts 对齐），
+/// 其余千分位且最多三位小数。
 pub(crate) fn business_number(v: f64) -> String {
     if v.abs() >= 10_000.0 {
-        format!("{:.3}万", v / 10_000.0)
+        format!("{:.2}万", v / 10_000.0)
     } else {
         grouped(v)
+    }
+}
+
+/// 金额口径（2026-08-11 裁决）：满一万固定两位“万”；不足一万也收紧到最多两位小数
+/// （对齐 web 端 format.ts 的 GROUPING maximumFractionDigits: 2），其余语义仍最多三位。
+fn money_number(v: f64) -> String {
+    if v.abs() >= 10_000.0 {
+        format!("{:.2}万", v / 10_000.0)
+    } else {
+        grouped_decimals(v, 2)
     }
 }
 
 pub(crate) fn display_number(label: &str, v: f64) -> String {
     match label_kind(label) {
         "percent" => format!("{}%", grouped(v)),
-        "money" => format!("¥{}", business_number(v)),
+        "money" => format!("¥{}", money_number(v)),
         "identity" => v.to_string(),
         _ => business_number(v),
     }
@@ -693,13 +710,13 @@ mod tests {
 
     #[test]
     fn user_numbers_keep_metric_and_identity_semantics() {
-        assert_eq!(display_number("销售额", 12_345_678.9), "¥1234.568万");
-        assert_eq!(display_number("客户销售额", 10_000.0), "¥1.000万");
-        assert_eq!(display_number("商品销量", 10_000.0), "1.000万");
-        assert_eq!(display_number("门店数", 10_000.0), "1.000万");
+        assert_eq!(display_number("销售额", 12_345_678.9), "¥1234.57万");
+        assert_eq!(display_number("客户销售额", 10_000.0), "¥1.00万");
+        assert_eq!(display_number("商品销量", 10_000.0), "1.00万");
+        assert_eq!(display_number("门店数", 10_000.0), "1.00万");
         assert_eq!(display_number("状态占比", 10_000.0), "10,000%");
-        assert_eq!(display_number("环比变化额", 10_000.0), "¥1.000万");
-        assert_eq!(display_axis_number("销售额", 10_000.0), "1.000万");
+        assert_eq!(display_number("环比变化额", 10_000.0), "¥1.00万");
+        assert_eq!(display_axis_number("销售额", 10_000.0), "1.00万");
         assert_eq!(display_axis_number("环比", 12.3), "12.3%");
         assert_eq!(display_value("状态码占比", &json!(101)), "101");
         assert_eq!(display_value("商品编码数量", &json!(123456789)), "123456789");
@@ -711,6 +728,9 @@ mod tests {
         assert_eq!(display_value("customer_id", &json!("001234")), "001234");
         assert_eq!(display_value("province", &json!(430000)), "430000");
         assert_eq!(display_value("created_at", &json!(1722859200)), "1722859200");
-        assert_eq!(display_number("qty", 10_000.0), "1.000万");
+        assert_eq!(display_number("qty", 10_000.0), "1.00万");
+        // 2026-08-11 裁决：金额不足一万也收紧到最多两位小数；非金额语义仍最多三位
+        assert_eq!(display_number("销售额", 1_234.567), "¥1,234.57");
+        assert_eq!(display_number("商品销量", 1_234.567), "1,234.567");
     }
 }
