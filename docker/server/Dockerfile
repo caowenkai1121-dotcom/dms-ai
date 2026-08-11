@@ -13,13 +13,13 @@ FROM rust:1-bookworm AS builder
 WORKDIR /ws
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-# BuildKit cache mount：改一行 crates 源码不再 7 crate 全锁树从头重编（registry/target 是缓存卷，
-# 不进镜像层 —— 所以二进制必须同一 RUN 内 cp 出来，否则下一阶 COPY 不到）。
+# legacy builder 约束：服务器 Docker 29 没装 buildx 插件，`--mount=type=cache` 直接报
+# "requires BuildKit"（2026-08-11 事故：加 cache mount 后服务器构建即炸）——RUN 保持单行无 mount。
+# 另：服务器 _build.sh 的 sed 靠「RUN cargo build --locked」字面前缀插 rsproxy 镜像配置，
+# 改行首/拆行会让 sed 落空、crates.io 直连卡死。
 # debug 是有意取舍：本机/CI 迭代优先构建快；要切 --release 必须同步改下面 COPY 的源路径
 # （target/release/），两处没有对账机制，改一处忘另一处就是构建失败。
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/ws/target \
-    cargo build --locked && cp /ws/target/debug/dms-ai-server /usr/local/bin/dms-ai-server
+RUN cargo build --locked && cp /ws/target/debug/dms-ai-server /usr/local/bin/dms-ai-server
 
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/caowenkai1121-dotcom/dms-ai"
