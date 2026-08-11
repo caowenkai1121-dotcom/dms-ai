@@ -361,7 +361,7 @@ CREATE TABLE IF NOT EXISTS meta.scope_binding(
   table_name text PRIMARY KEY,
   mode text NOT NULL DEFAULT 'scoped',
   customer_col text,
-  customer_kind text NOT NULL DEFAULT 'codes', -- codes | manager_codes | shop_codes
+  customer_kind text DEFAULT 'codes', -- codes | manager_codes | shop_codes（Global/Via 臂无客户语义落 NULL）
   owner_col text,
   owner_kind text,          -- ids | codes | login
   via_table text,
@@ -403,6 +403,8 @@ ALTER TABLE meta.join_edge     ADD COLUMN IF NOT EXISTS ds_id text NOT NULL DEFA
 ALTER TABLE meta.table_scope   ADD COLUMN IF NOT EXISTS ds_id text NOT NULL DEFAULT 'dms';
 ALTER TABLE meta.scope_binding ADD COLUMN IF NOT EXISTS ds_id text NOT NULL DEFAULT 'dms';
 ALTER TABLE meta.scope_binding ADD COLUMN IF NOT EXISTS customer_kind text NOT NULL DEFAULT 'codes';
+-- 存量库放宽可空：Global/Via 臂没有客户语义，种子行落 NULL 而非误导性的 'codes'（读侧本就忽略该列）
+ALTER TABLE meta.scope_binding ALTER COLUMN customer_kind DROP NOT NULL;
 ALTER TABLE meta.pitfall       ADD COLUMN IF NOT EXISTS ds_id text NOT NULL DEFAULT 'dms';
 ALTER TABLE meta.sql_exemplar  ADD COLUMN IF NOT EXISTS ds_id text NOT NULL DEFAULT 'dms';
 -- 指标级时间窗上限（'' = 无；'yesterday' = 仅适用于事实合同明确要求的延迟确认指标）。
