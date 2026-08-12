@@ -602,7 +602,7 @@ async fn ask_gate(
 /// 口径）→ payload。观测写入句柄丢弃（fire-and-forget，同 api_ask / mcp_api）。
 async fn ask_data_payload(st: &AppState, gate: &XcxAskGate) -> Result<Value, ApiErr> {
     let conv_id_str = gate.conv_id.to_string();
-    let prev_turn = gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[][..]));
+    let prev_turn = gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
     let (r, _log) = crate::ask(
         &st.llm,
         &st.auth_mysql,
@@ -652,7 +652,7 @@ async fn xcx_hybrid_payload(
     let h = crate::HybridAsk {
         question: &gate.question,
         p: &gate.p,
-        prev: gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[][..])),
+        prev: gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..])),
         ds: None, // 小程序侧不提供选源，后端选源（同 `ask_data_payload`）
         conv_id: Some(conv_id.as_str()),
         space_id: None,

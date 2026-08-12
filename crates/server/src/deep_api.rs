@@ -4045,7 +4045,7 @@ async fn compose_inner(
     let conv_id = req.conv_id.map(|c| c.to_string());
     let primary_future = crate::ask(
         &st.llm, &st.auth_mysql, &st.mysql, &st.sources, st.owned.pool(), &st.embed, &p, &execution_question,
-        prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[] as &[&str])), req.ds.as_deref(),
+        prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[] as &[&str], &[] as &[&str])), req.ds.as_deref(),
         conv_id.as_deref(), sc,
     );
     tokio::pin!(primary_future);

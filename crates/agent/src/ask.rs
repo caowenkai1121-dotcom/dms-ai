@@ -71,7 +71,10 @@ pub type DetectFn = fn(&str) -> Option<Relation>;
 /// 一个字符都不用改 —— 与第二位 SQL 当年进来时同一个「改类型而不加形参」的裁决。
 ///
 /// 用元组别名而不是 struct：三个字段、只在一条链上传递，struct 除了多一处 import 什么都不多给。
-pub type PrevTurn<'a> = (&'a str, Option<&'a str>, &'a [&'a str]);
+/// 上一轮：(问句, 那一轮执行的 SQL, 证据引用片段, 更早的生效问句序列（新→旧）)。
+/// 第四位是追问改写的对话上下文——链式追问（「上月呢」→「那今年呢」）的语义锚点
+/// 可能在倒数第二、三轮，只看最近一轮拿不回它（2026-08-12 实测）。
+pub type PrevTurn<'a> = (&'a str, Option<&'a str>, &'a [&'a str], &'a [&'a str]);
 
 /// 一次问答的全部外部依赖（**与问句无关**的那些；随问句变的四个是 `ask` 的形参）。
 /// 收成一个 struct 是 D4 的做法：拆分前 `ask_traced` 是 9 个形参 + 一个 `#[allow(too_many_arguments)]`。
@@ -130,7 +133,7 @@ pub async fn ask(
     // 别退回全历史（那看着就像「数据不对」）。纯词法：`time_phrase_of` 只认表面词，
     // 不猜语义；改写自带时间词（「那上个月呢」）或本来就是首问时一步不动。
     let rewritten = match prev {
-        Some((prev_q, _, _))
+        Some((prev_q, ..))
             if dms_kernel::nl::time::time_predicate(&rewritten).is_none()
                 && dms_kernel::nl::time::time_predicate(prev_q).is_some() =>
         {
@@ -1660,7 +1663,7 @@ async fn rewrite_followup(
     question: &str,
     prev: Option<PrevTurn<'_>>,
 ) -> String {
-    let Some((prev_q, prev_sql, refs)) = prev else {
+    let Some((prev_q, prev_sql, refs, history)) = prev else {
         return question.to_string();
     };
     if !is_followup(question) {
@@ -1691,8 +1694,30 @@ async fn rewrite_followup(
         Some(s) => format!("#上一轮SQL：{s}"),
         None => String::new(),
     };
+    // 更早几轮的生效问句（新→旧）：链式追问的实体/口径锚点常在倒数第二三轮。
+    // 空 = 一字不多（单轮提示词与引入前逐字相同）。用户问句是不可信文本，换行剥掉
+    // 防段头搅乱（与 refs 段①同一纪律）。
+    let history_section = if history.is_empty() {
+        String::new()
+    } else {
+        let items = history
+            .iter()
+            .map(|q| q.chars().filter(|c| !c.is_control()).collect::<String>())
+            .map(|q| q.trim().chars().take(80).collect::<String>())
+            .filter(|q| !q.is_empty())
+            .take(3)
+            .enumerate()
+            .map(|(i, q)| format!("{}. {}", i + 1, q))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if items.is_empty() {
+            String::new()
+        } else {
+            format!("\n#对话上下文（更早几轮的生效问句，由近及远）：\n{items}")
+        }
+    };
     let user = format!(
-        "#上一轮问题：{prev_q}\n{sql_section}{refs_section}\n#本轮追问：{question}\n#改写后的问题："
+        "#上一轮问题：{prev_q}\n{sql_section}{refs_section}{history_section}\n#本轮追问：{question}\n#改写后的问题："
     );
     // 温度 0.1 = 搬运前 `LlmClient::chat` 写死的那个值（`server/src/llm.rs:53`）
     let req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
@@ -2433,31 +2458,31 @@ mod tests {
         let boom = Fake::new(None); // 一调就挂
         assert_eq!(rewrite_followup(&boom, &|_| {}, "那上月呢", None).await, "那上月呢");
         assert_eq!(
-            rewrite_followup(&boom, &|_| {}, "本月各省份销售额是多少", Some(("上月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&boom, &|_| {}, "本月各省份销售额是多少", Some(("上月销售额", Some(PREV_SQL), &[], &[]))).await,
             "本月各省份销售额是多少"
         );
         assert_eq!(boom.calls(), 0, "「没有上一轮」与「不是追问」两档都不许调模型");
         // 追问 + 有上一轮 + 上一轮真有 SQL → 调模型；挂了照样原样返回
         assert_eq!(
-            rewrite_followup(&boom, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&boom, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await,
             "那上月呢"
         );
         assert_eq!(boom.calls(), 1, "这一档必须真的调了一次，否则上面那两条恒绿");
         let ok = Fake::new(Some("  \"上月销售额是多少。\"  "));
         assert_eq!(
-            rewrite_followup(&ok, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&ok, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await,
             "上月销售额是多少"
         );
         // 弯引号/书名号同样剥（与 `parse_gate_verdict` 同一剥法）
         let curly = Fake::new(Some("「上月按区域的销售额」"));
         assert_eq!(
-            rewrite_followup(&curly, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&curly, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await,
             "上月按区域的销售额"
         );
         // 模型回空串 → 不许把问句变成空的
         let blank = Fake::new(Some("  "));
         assert_eq!(
-            rewrite_followup(&blank, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&blank, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await,
             "那上月呢"
         );
     }
@@ -2473,7 +2498,7 @@ mod tests {
         for prev_sql in [None, Some("[复合问题拆解]"), Some("   "), Some("上月销售额是多少")] {
             let f = Fake::new(Some("上月销售额是多少"));
             assert_eq!(
-                rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", prev_sql, &[]))).await,
+                rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", prev_sql, &[], &[]))).await,
                 "那上月呢"
             );
             assert_eq!(f.calls(), 0, "上一轮 SQL = {prev_sql:?} 时仍然调了模型");
@@ -2481,7 +2506,7 @@ mod tests {
         // 反面：上一轮真有一条查询 → 必须改写
         let f = Fake::new(Some("上月销售额是多少"));
         assert_eq!(
-            rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await,
             "上月销售额是多少"
         );
         assert_eq!(f.calls(), 1);
@@ -2496,14 +2521,14 @@ mod tests {
             &f,
             &|_| {},
             "上月呢？",
-            Some(("线下-潍坊程祥商贸有限公司，本月的数据", None, &[])),
+            Some(("线下-潍坊程祥商贸有限公司，本月的数据", None, &[], &[])),
         )
         .await;
         assert_eq!(out, "线下-潍坊程祥商贸有限公司上月的数据");
         assert_eq!(f.calls(), 1, "带实体锚点的反问轮必须真的调一次改写");
         // 无锚点的（政策/制度轮）维持跳过：没有口径可继承时改写纯属自由发挥
         let f2 = Fake::new(Some("随便"));
-        let out2 = rewrite_followup(&f2, &|_| {}, "上月呢？", Some(("报销政策是什么", None, &[]))).await;
+        let out2 = rewrite_followup(&f2, &|_| {}, "上月呢？", Some(("报销政策是什么", None, &[], &[]))).await;
         assert_eq!(out2, "上月呢？");
         assert_eq!(f2.calls(), 0);
     }
@@ -2515,7 +2540,7 @@ mod tests {
     #[tokio::test]
     async fn rewrite_prompt_carries_the_previous_sql() {
         let f = Fake::new(Some("上月销售额是多少"));
-        rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await;
+        rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await;
         let p = f.prompt();
         assert_eq!(f.calls(), 1, "提示词判据的输入必须真的产生过一次调用（否则 p 为空串、恒绿）");
         assert!(p.contains(PREV_SQL), "提示词里没有上一轮 SQL：{p}");
@@ -2534,12 +2559,12 @@ mod tests {
             usages.fetch_add(1, Ordering::SeqCst);
         };
         let f = Fake::new(Some("上月销售额是多少"));
-        let out = rewrite_followup(&f, &count, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await;
+        let out = rewrite_followup(&f, &count, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await;
         assert_eq!(out, "上月销售额是多少");
         assert_eq!(usages.load(Ordering::SeqCst), 1, "改写成功必须报一次用量");
         // 调用失败没有 usage 可报（回调数不涨）
         let boom = Fake::new(None);
-        rewrite_followup(&boom, &count, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await;
+        rewrite_followup(&boom, &count, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await;
         assert_eq!(usages.load(Ordering::SeqCst), 1, "失败没有 usage，不该回调");
     }
 
@@ -2558,7 +2583,7 @@ mod tests {
         for r in leaked {
             let f = Fake::new(Some(r));
             assert_eq!(
-                rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+                rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await,
                 "那上月呢",
                 "泄了 SQL 还被当问句用：{r}"
             );
@@ -2567,7 +2592,7 @@ mod tests {
         // 反面①：正常改写结果照用（否则把守卫写成恒丢也全绿）
         let ok = Fake::new(Some("上月销售额是多少"));
         assert_eq!(
-            rewrite_followup(&ok, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[]))).await,
+            rewrite_followup(&ok, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[], &[]))).await,
             "上月销售额是多少"
         );
         // 反面②：判据是同一个函数的两个极性 —— 它对真 SQL 必须为真、对真问句必须为假
@@ -2589,7 +2614,7 @@ mod tests {
         );
         for refs in [&[][..], &["", "   ", "\x07"][..]] {
             let f = Fake::new(Some("上月销售额是多少"));
-            let out = rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), refs))).await;
+            let out = rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), refs, &[]))).await;
             assert_eq!(out, "上月销售额是多少");
             assert_eq!(f.calls(), 1, "输入必须真的产生过一次调用，否则提示词断言恒绿");
             assert!(f.prompt().ends_with(&expected_user), "空 refs 改了提示词：{}", f.prompt());
@@ -2603,7 +2628,7 @@ mod tests {
     async fn refs_reach_the_prompt_capped_at_three() {
         let refs = ["华东区上月销售额 12 万", "片段乙", "片段丙", "片段丁（第四段，不许出现）"];
         let f = Fake::new(Some("上月按区域的销售额"));
-        let out = rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &refs))).await;
+        let out = rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &refs, &[]))).await;
         assert_eq!(out, "上月按区域的销售额", "引用不许改变改写结果的消费方式");
         assert_eq!(f.calls(), 1);
         let p = f.prompt();
@@ -2625,7 +2650,7 @@ mod tests {
     async fn a_ref_fragment_is_truncated_at_500_chars() {
         let long: String = "长".repeat(600);
         let f = Fake::new(Some("上月销售额是多少"));
-        rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[long.as_str()]))).await;
+        rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &[long.as_str()], &[]))).await;
         assert_eq!(f.calls(), 1);
         let p = f.prompt();
         assert!(p.contains(&"长".repeat(500)), "500 字以内必须保留");
@@ -2637,7 +2662,7 @@ mod tests {
     #[tokio::test]
     async fn refs_are_stripped_of_control_characters() {
         let f = Fake::new(Some("上月销售额是多少"));
-        rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &["甲\x00\x07\x1b乙\n丙\t丁"]))).await;
+        rewrite_followup(&f, &|_| {}, "那上月呢", Some(("本月销售额", Some(PREV_SQL), &["甲\x00\x07\x1b乙\n丙\t丁"], &[]))).await;
         assert_eq!(f.calls(), 1);
         let p = f.prompt();
         assert!(p.contains("甲乙丙丁"), "剥完控制字符的片段必须进提示词：{p}");

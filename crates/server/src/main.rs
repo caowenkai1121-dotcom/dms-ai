@@ -1175,7 +1175,7 @@ async fn main() -> anyhow::Result<()> {
         // 只给 prev 问句、不给 prev SQL 也是**有意义的一档**（= 上一轮失败/走了知识库）：
         // 那一档 `rewrite_followup` 必须一次 LLM 都不调，两轮题正好用它当反面用例。
         // 第三位【证据引用】恒空：CLI 没有「圈选上轮结果」的输入面（与 conv_id=None 同一个约定）。
-        let prev = slot(5).map(|q| (q, slot(6), &[] as &[&str]));
+        let prev = slot(5).map(|q| (q, slot(6), &[] as &[&str], &[] as &[&str]));
         let (r, log) =
             ask(&client, &auth_mysql, &mysql, &sources, pg, &embed, &p, &args[3], prev, None, None, cfg.sc_samples)
                 .await;
@@ -2001,6 +2001,8 @@ struct AskGate {
     prev: Option<(String, Option<String>)>,
     /// 【证据引用】追问携带的上轮结果片段（截断/剥控制字符/段数上限在 agent 侧收口）。
     refs: Vec<String>,
+    /// 更早几轮的生效问句（新→旧，**不含** prev 那一轮）：追问改写的对话上下文。
+    history: Vec<String>,
 }
 
 async fn ask_gate(
@@ -2029,11 +2031,21 @@ async fn ask_gate(
             .flatten(),
         None => None,
     };
+    // 更早几轮的生效问句（追问改写的对话上下文）：取 4 跳 1 = 紧挨着的 prev 不重复进。
+    // 读失败/无会话 = 空（追问降级为首问，语义不变）。
+    let history = match req.conv_id {
+        Some(cid) => chat::recent_questions(st.owned.pool(), cid, 4)
+            .await
+            .into_iter()
+            .skip(1)
+            .collect(),
+        None => vec![],
+    };
     // 【证据引用】追问携带的上轮结果片段，打包进 `PrevTurn` 第三位随改写透传。
     // 没有上一轮（首问/新会话）时引用无处附着，随 `prev = None` 一起不落 ——
     // 「上轮结果引用」本就以上轮为前提，这是刻意而不是丢数据。
     let refs: Vec<String> = req.refs.clone().unwrap_or_default();
-    Ok(AskGate { p, prev, refs })
+    Ok(AskGate { p, prev, refs, history })
 }
 
 /// `/api/ask` 与 `/api/ask/stream` 共用的问数分支：`crate::ask` → 错误映射 → payload。
@@ -2044,10 +2056,13 @@ async fn ask_data_payload(
     gate: &AskGate,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
+    let history: Vec<&str> = gate.history.iter().map(String::as_str).collect();
     let r = ask_data_run(
         st,
         &gate.p,
-        gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice())),
+        gate.prev
+            .as_ref()
+            .map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice(), history.as_slice())),
         req.ds.as_deref(),
         req.conv_id.map(|c| c.to_string()).as_deref(),
         // 【深度模式】SC 抬到 ≥3：多数派投票是现成的「AI 深度参与生成」件
@@ -2181,11 +2196,14 @@ async fn hybrid_branch(
     }
     let (kb_q, data_q) = hybrid_split(&req.question)?;
     let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
+    let history: Vec<&str> = gate.history.iter().map(String::as_str).collect();
     let conv_id = req.conv_id.map(|c| c.to_string());
     let h = HybridAsk {
         question: &req.question,
         p: &gate.p,
-        prev: gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice())),
+        prev: gate.prev
+            .as_ref()
+            .map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice(), history.as_slice())),
         ds: req.ds.as_deref(),
         conv_id: conv_id.as_deref(),
         space_id: req.space_id.as_deref(),

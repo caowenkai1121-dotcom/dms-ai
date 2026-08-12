@@ -206,6 +206,8 @@ pub async fn last_turn(
 ) -> anyhow::Result<Option<(String, Option<String>)>> {
     // 上一轮问句优先取 AI 产物里的「生效问句」（resolved_question：追问改写/归一后的完整形态）——
     // 用户上一句可能是碎片（「上月呢？」），链式追问拿碎片当上下文会丢实体（2026-08-12 实测）。
+    // 深度轮的产物包一层 `{"result": …}`（deep_api 的落账形状）——sql/resolved_question 都在里层，
+    // 两档都要看（2026-08-12 实测深度轮后追问断链）。
     let row = sqlx::query(
         "SELECT u.question AS raw_q,
                 (SELECT a.payload FROM chat.msg a
@@ -221,18 +223,56 @@ pub async fn last_turn(
     Ok(row.map(|r| {
         let raw: String = r.get("raw_q");
         let payload: Option<serde_json::Value> = r.get("payload");
-        let resolved = payload
-            .as_ref()
-            .and_then(|p| p.get("resolved_question"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let sql = payload
-            .as_ref()
-            .and_then(|p| p.get("sql"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        (resolved.unwrap_or(raw), sql)
+        let pick = |key: &str| {
+            payload.as_ref().and_then(|p| {
+                p.get(key)
+                    .or_else(|| p.get("result").and_then(|inner| inner.get(key)))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+        };
+        (pick("resolved_question").unwrap_or(raw), pick("sql"))
     }))
+}
+
+/// 最近 N 轮的**生效问句**（新→旧，resolved_question 优先）：追问改写的对话上下文。
+/// 读失败 = 空 Vec（追问降级为首问语义不变，与 `last_turn` 的失败口径一致）。
+pub async fn recent_questions(pg: &PgPool, conv_id: i64, limit: i64) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT u.question AS raw_q,
+                (SELECT a.payload FROM chat.msg a
+                  WHERE a.conv_id = u.conv_id AND a.role = 'ai' AND a.id > u.id
+                  ORDER BY a.id LIMIT 1) AS payload
+           FROM chat.msg u
+          WHERE u.conv_id = $1 AND u.role = 'user'
+          ORDER BY u.id DESC LIMIT $2",
+    )
+    .bind(conv_id)
+    .bind(limit)
+    .fetch_all(pg)
+    .await;
+    match rows {
+        Ok(rows) => rows
+            .iter()
+            .map(|r| {
+                let raw: String = r.get("raw_q");
+                let payload: Option<serde_json::Value> = r.get("payload");
+                payload
+                    .as_ref()
+                    .and_then(|p| {
+                        p.get("resolved_question")
+                            .or_else(|| p.get("result").and_then(|inner| inner.get("resolved_question")))
+                            .and_then(|v| v.as_str())
+                    })
+                    .map(str::to_string)
+                    .unwrap_or(raw)
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(conv_id, error = %e, "取会话上下文失败，本轮按无历史处理");
+            vec![]
+        }
+    }
 }
 
 /// 删除会话。**`Ok` ≠ 删了行**：非属主/不存在时 WHERE 命中 0 行也是 Ok ——
