@@ -1649,6 +1649,13 @@ fn warehouse_sales_fact_predicated(question: &str, customer: Option<&str>) -> Op
     // 「同比/环比多少」类尾词因此只在标量下才允许剥（见 `answerable_tail_words` 的纪律）。
     // 消化词与「解析失败」卡共用同一份构造（`sales_fact_consumed`，含「最低」补丁与客户名）。
     let (consumed, scalar) = sales_fact_consumed(question, &metric_hits, &dimension_hits, customer);
+    // 已探明客户的名字自带渠道前缀（线下-/线上-）：问句里的渠道词由实体解释，不算残留——
+    // 「潍坊程祥商贸有限公司本月线下销售额」的「线下」不许把整条拦回落（2026-08-12 生产实测）。
+    // 只在有实体时消化渠道词：无实体的「本月线上销售额」族不受本路径影响。
+    let mut consumed = consumed;
+    if customer.is_some() {
+        consumed.extend(["线下".to_string(), "线上".to_string()]);
+    }
     let predicates = customer
         .map(|name| vec![dms_semantic::sales_fact::Predicate::contains(Dimension::Customer, name)])
         .unwrap_or_default();
@@ -3476,6 +3483,37 @@ fn customer_name_fragment(question: &str) -> Option<String> {
             if let Some(rest) = name.strip_suffix(w) {
                 name = rest.trim_end().to_string();
                 break;
+            }
+        }
+        // 渠道词（线下/线上）黏在实体名头尾时是**限定**不是名字，与虚词同轮边剥
+        // （「…有限公司本月线下销售额」剥掉「线下」后「本月」才到边，必须同轮续剥——
+        // 2026-08-12 生产实测归一重试两连不中）。护栏：剥完只剩渠道词本身时保留
+        // （「本月线下销售额」的「线下」是渠道过滤本体）；带连字符的前缀（「线下-潍坊…」）
+        // 是库内名称的一部分，不剥。
+        for w in ["线下", "线上"] {
+            // 剥后残余不许能被虚词表整个消化（「线下是多少」剥出「是多少」= 把渠道词本体剥没了）
+            let junk_free_len = |s: &str| -> usize {
+                let mut t = s.to_string();
+                for ew in &edge_words {
+                    t = t.replace(*ew, "");
+                }
+                t.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count()
+            };
+            if let Some(rest) = name.strip_suffix(w) {
+                let rest = rest.trim_matches(|c: char| c.is_whitespace() || RESIDUAL_PUNCT.contains(c));
+                if junk_free_len(rest) >= 2 {
+                    name = rest.to_string();
+                    break;
+                }
+            }
+            if let Some(rest) = name.strip_prefix(w) {
+                if !rest.starts_with('-') && !rest.starts_with('_') {
+                    let rest = rest.trim_matches(|c: char| c.is_whitespace() || RESIDUAL_PUNCT.contains(c));
+                    if junk_free_len(rest) >= 2 {
+                        name = rest.to_string();
+                        break;
+                    }
+                }
             }
         }
         if name == before {
@@ -6297,6 +6335,22 @@ mod tests {
         );
         // 剥完是类别词的照旧拒（分类问句不许错配成名称探库）
         assert_eq!(customer_name_fragment("线下客户本月销售额"), None);
+        // 渠道词黏在实体名头尾是限定不是名字（2026-08-12 生产实测归一重试两连不中）
+        assert_eq!(
+            customer_name_fragment("潍坊程祥商贸有限公司本月线下销售额是多少？"),
+            Some("潍坊程祥商贸有限公司".to_string())
+        );
+        // 剥完只剩渠道词本身时保留：「本月线下销售额」的「线下」是渠道过滤本体
+        assert_eq!(customer_name_fragment("本月线下销售额是多少"), Some("线下".to_string()));
+        // 带渠道词的客户题整条能装配：残留守卫不许把渠道词拦下
+        let frag = customer_name_fragment("潍坊程祥商贸有限公司本月线下销售额是多少？");
+        let h = warehouse_sales_fact_predicated(
+            "潍坊程祥商贸有限公司本月线下销售额是多少？",
+            frag.as_deref(),
+        )
+        .expect("客户+渠道词+销售额必须能落到共享 DWS 合同");
+        assert!(h.sql.contains("dws_off_offline_sale_dfn"), "{}", h.sql);
+        assert!(h.sql.contains("潍坊程祥商贸有限公司"), "{}", h.sql);
         // 探明片段交给共享事实合同：DWS 事实表 + storename 过滤
         let frag = customer_name_fragment("线下-潍坊程祥商贸有限公司本月销售额和销量是多少？");
         let h = warehouse_sales_fact_predicated(
