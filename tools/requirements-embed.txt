@@ -1,0 +1,10 @@
+# embed_service.py（解析/向量服务）依赖 —— 与生产 venv 对齐（2026-08-12）
+fastembed==0.8.0
+numpy==2.5.2
+openpyxl==3.1.5
+pillow==12.3.0
+pymupdf==1.28.2
+pymupdf4llm==0.0.17
+pypdf==6.14.2
+python-docx==1.2.0
+python-pptx==1.0.2
