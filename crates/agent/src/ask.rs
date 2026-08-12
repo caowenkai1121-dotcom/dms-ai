@@ -223,8 +223,12 @@ pub async fn ask(
                 r = nt;
             }
             crate::localize::localize_result(&cx, &mut r).await;
-            // ── 【AI 重新理解层】只有「不可计算」卡触发；合同能答的问句一行行为不变 ──
-            if !is_unavailable_card_result(&r) {
+            // ── 【AI 重新理解层】「不可计算」卡与「反问」卡触发；合同能答的问句一行行为不变 ──
+            // 反问卡纳入触发（2026-08-12 业主裁决：意图不明先归一再重试，不许上来就反问）——
+            // 破坏性问句（红线）除外：它的反问是刻意拦截，放行改写等于帮它换皮。
+            let retryable =
+                is_unavailable_card_result(&r) || (r.route == NEED_INTENT && !destructive_hit(&current));
+            if !retryable {
                 // 重试命中（任何非卡结果都算）：透出「已按理解为你想问：X」
                 if let Some(rewritten) = &retry_of {
                     r.reinterpret_note = Some(format!(
@@ -234,8 +238,9 @@ pub async fn ask(
                 return Ok(r);
             }
             match retry_of.take() {
-                // 首轮出卡 → fast 归一问法后**重试一次**；改不出/校验不过/模型失败 = 原卡照出
-                None => match reinterpret_question(&**d.llm, d.on_usage, &current).await {
+                // 首轮出卡 → fast 归一问法后**重试一次**；改不出/校验不过/模型失败 = 原卡照出。
+                // 实体族（⑤）只对反问卡开放：不可计算卡的收窄纪律（开票/对账族不进重试）一字不动。
+                None => match reinterpret_question(&**d.llm, d.on_usage, &current, r.route == NEED_INTENT).await {
                     Some(rewritten) => {
                         tracing::info!(original = %current, rewritten = %rewritten,
                             "不可计算卡 → AI 归一问法，重试一次");
@@ -272,14 +277,16 @@ pub async fn ask(
 // 用户问题的拆解让 AI 参与一次：fast 把问句**归一成标准问法**（不是生成 SQL！）→ 安全校验 →
 // 用归一后的问句重跑一次主链 → 命中即答（透出 `reinterpret_note`）；仍出卡 → 澄清型回答
 // （route = need-intent，候选进 `clarify_options` 与 `view.interact.drill`）。
+// 2026-08-12 起**反问卡同样进本层**（业主裁决：意图不明先归一重试，不许上来就反问；
+// 校验⑤实体族放行「X客户本月的数据」这类）；破坏性红线问句的反问是刻意拦截，不进本层。
 //
 // 纪律（与任务裁决逐条对应）：
-// - 只有 `is_unavailable_card_result` 认出的卡触发本层，合同能答的问句一行行为不变；
+// - 只有「不可计算」卡与非破坏性的反问卡触发本层，合同能答的问句一行行为不变；
 // - 改写/校验/模型任何一步失败都静默回落原卡（记 warn）——本层是补救路径，它自己挂了
 //   不许把问答拖死（与 `need_intent_reply` ③ 的降级同一纪律）；
 // - 重试走的就是 `ask_single`，fail-closed 闸门/口径复核在重试抡照常全跑，改写句没有任何特权；
-// - 开票/对账卡今天进不了重试：校验④要求命中销售合同指标，而「本月开票金额」族不命中 ——
-//   那是刻意的收窄：它们不是口语残留族，放行改写等于给 LLM 自由发挥面。
+// - 校验④（指标族）/⑤（实体族）之外的主题进不了重试：那是刻意的收窄，
+//   放行改写等于给 LLM 自由发挥面。
 
 /// 「不可计算」卡的唯一识别口径：**镜像** `server/src/direct.rs` 的 `is_unavailable_card`
 /// （那是 crate 私有 fn，agent 不许反向引 server —— 同一识别串在此守一份镜像）。
@@ -307,14 +314,18 @@ const REINTERPRET_SYSTEM: &str = "你是 DMS 数据问答的问句归一助手�
 示例：\n原句：销售额度按照省份按照商品\n改写：销售额按省份按商品\n\
 原句：董会琴这个月卖了多少\n改写：客户董会琴本月的销售额\n\
 原句：上个月各个省区卖的怎么样\n改写：上月销售额按省区\n\
+原句：线下-某某商贸有限公司，本月的数据\n改写：线下-某某商贸有限公司本月的经营情况\n\
 只输出改写后的问句一行，不要解释、不要引号、不要 SQL。";
 
 /// fast 把出卡问句归一成标准问法。**任何失败 = `None`**（调用方回落原卡）：
 /// 模型失败/超时、答非所问、空串、校验不过，全部记 warn 后返回 None。
+/// `entity_ok`：实体族（校验⑤）是否开放——只对反问卡开；不可计算卡不开
+/// （开票/对账族「不进重试」的收窄纪律不变）。
 async fn reinterpret_question(
     llm: &dyn ChatModel,
     on_usage: &(dyn Fn(&Usage) + Send + Sync),
     question: &str,
+    entity_ok: bool,
 ) -> Option<String> {
     let user = format!("原句：{question}\n改写：");
     // 温度 0：归一是确定性任务，温度抖动是纯噪音（与三词意图门同一本账）
@@ -333,7 +344,7 @@ async fn reinterpret_question(
     };
     on_usage(&reply.usage);
     let rewritten = parse_reinterpret(reply.content.as_deref()?)?;
-    if validate_reinterpret(question, &rewritten) {
+    if validate_reinterpret(question, &rewritten, entity_ok) {
         Some(rewritten)
     } else {
         // 校验不过 = 没改（严禁 LLM 改写引入新语义；判据全在纯函数里，分支有单测）
@@ -364,9 +375,11 @@ fn parse_reinterpret(reply: &str) -> Option<String> {
 /// ① 非空且与原句不同（原样输出是提示词给的 fail-closed 出口，重试它等于原地踏步）；
 /// ② 长度护栏：≤100 字且 ≤ 原句 2 倍（标准问法不可能比原句长太多）；
 /// ③ 不是 SQL（模型把提示词里的「SQL」字样当任务抄出来时，`looks_like_sql` 接住）；
-/// ④ 仍命中销售合同指标、且至少一个与原句命中的**相同**（`run::sales_contract_metrics`）——
-///    「销售额…」被改成纯毛利问句就是引入新语义，本条把它拦下。
-fn validate_reinterpret(original: &str, rewritten: &str) -> bool {
+/// ④ 指标族：仍命中销售合同指标、且至少一个与原句命中的**相同**（`run::sales_contract_metrics`）——
+///    「销售额…」被改成纯毛利问句就是引入新语义，本条把它拦下；
+/// ⑤ 实体族（**仅 `entity_ok`（反问卡）时开放**）：公司名原样保留，或裸名句 ≥4 连续共享
+///    汉字锚点；不可计算卡不开——开票/对账族「不进重试」的收窄纪律不变。
+fn validate_reinterpret(original: &str, rewritten: &str, entity_ok: bool) -> bool {
     if rewritten.is_empty() || rewritten == original {
         return false;
     }
@@ -381,7 +394,45 @@ fn validate_reinterpret(original: &str, rewritten: &str) -> bool {
         crate::run::sales_contract_metrics(original).into_iter().map(|(m, _)| m).collect();
     let after: Vec<dms_semantic::sales_fact::Metric> =
         crate::run::sales_contract_metrics(rewritten).into_iter().map(|(m, _)| m).collect();
-    !after.is_empty() && after.iter().any(|m| before.contains(m))
+    // ④ 销售指标族：仍命中销售合同指标、且至少一个与原句相同
+    if !after.is_empty() && after.iter().any(|m| before.contains(m)) {
+        return true;
+    }
+    if !entity_ok {
+        return false; // 不可计算卡只走④：开票/对账族「不进重试」的收窄一字不动
+    }
+    // ⑤ 实体族 A（公司形实体）：改写必须**原样保留**公司名（防 LLM 偷换对象），
+    //    且不许引入原句没有的指标新语义
+    if let Some(entity) = crate::answerers::entity::company_span(original) {
+        return rewritten.contains(&entity) && after.iter().all(|m| before.contains(m));
+    }
+    // ⑤ 实体族 B（裸名/口语，如「潍坊程祥本月情况咋样」）：改写与原句要有 ≥4 个连续
+    //    相同汉字作锚点，且两侧都无指标（指标语义变动走④，不进本族）
+    if before.is_empty() && after.is_empty() {
+        return longest_shared_hanzi_run(original, rewritten) >= 4;
+    }
+    false
+}
+
+/// 两串间最长公共连续汉字段的长度（**纯函数**）。只数 CJK 表意字——
+/// 数字/字母/标点不参与锚点判定（「2026」「-」这类shared nothing 不算证据）。
+fn longest_shared_hanzi_run(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let hanzi = |c: char| ('\u{4e00}'..='\u{9fff}').contains(&c);
+    let mut best = 0;
+    // 经典 DP：dp[j] = 以 a[i-1]/b[j-1] 结尾的公共长度（字符串都 <200 字，O(n·m) 足够）
+    let mut dp = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        let mut prev = 0;
+        for j in 1..=b.len() {
+            let cur = dp[j];
+            dp[j] = if hanzi(a[i - 1]) && a[i - 1] == b[j - 1] { prev + 1 } else { 0 };
+            best = best.max(dp[j]);
+            prev = cur;
+        }
+    }
+    best
 }
 
 /// 重试仍失败时的**合同模板候选**（纯函数）：只用问句自己命中的合同指标/维度拼标准问法 ——
@@ -2778,25 +2829,60 @@ mod tests {
     #[test]
     fn reinterpret_validation_rejects_drift_and_keeps_normalized_forms() {
         // 判官原案：口语残留「度」归一 → 过
-        assert!(validate_reinterpret("销售额度按照省份按照商品", "销售额按省份按商品"));
+        assert!(validate_reinterpret("销售额度按照省份按照商品", "销售额按省份按商品", false));
         // 客户名问法补全 → 过
-        assert!(validate_reinterpret("董会琴这个月卖了多少", "客户董会琴本月的销售额"));
+        assert!(validate_reinterpret("董会琴这个月卖了多少", "客户董会琴本月的销售额", false));
         // 原样输出 = 没改（提示词的 fail-closed 出口，重试它等于原地踏步）
-        assert!(!validate_reinterpret("销售额度按照省份按照商品", "销售额度按照省份按照商品"));
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", "销售额度按照省份按照商品", false));
         // 空串
-        assert!(!validate_reinterpret("销售额度按照省份按照商品", ""));
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", "", false));
         // SQL 泄漏
-        assert!(!validate_reinterpret("销售额度按照省份按照商品", "SELECT SUM(amount) FROM sales_dw.dws"));
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", "SELECT SUM(amount) FROM sales_dw.dws", false));
         // 长度 2 倍规则（4 字原句 → 9 字改写，唯一触发的是 2 倍护栏）
-        assert!(!validate_reinterpret("销售额度", "销售额按省份按商品"), "超过原句 2 倍");
+        assert!(!validate_reinterpret("销售额度", "销售额按省份按商品", false), "超过原句 2 倍");
         // 长度 100 字规则（101 字 ≤ 原句 2 倍、仍命中指标 —— 唯一触发的是 100 字护栏）
         let long = format!("销售额按省份按商品{}", "析".repeat(92));
         assert_eq!(long.chars().count(), 101);
-        assert!(!validate_reinterpret("销售额度按照省份按照商品", &long), "超 100 字");
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", &long, false), "超 100 字");
         // 指标漂移：销售额 → 纯毛利（引入新语义）
-        assert!(!validate_reinterpret("销售额度按照省份按照商品", "本月毛利按省份"));
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", "本月毛利按省份", false));
         // 指标丢失：改写成没有合同指标的话
-        assert!(!validate_reinterpret("销售额度按照省份按照商品", "今天天气怎么样"));
+        assert!(!validate_reinterpret("销售额度按照省份按照商品", "今天天气怎么样", false));
+    }
+
+    /// 校验⑤实体族（2026-08-12「X客户本月的数据」跌反问实测）：公司名必须原样保留；
+    /// 裸名/口语句靠 ≥4 连续共享汉字锚点；换对象/加指标/无锚点随口话 全拦。
+    #[test]
+    fn reinterpret_validation_entity_family() {
+        // A 族：保留公司名、不加指标 → 放行
+        assert!(validate_reinterpret(
+            "线下-潍坊程祥商贸有限公司，本月的数据",
+            "线下-潍坊程祥商贸有限公司本月的经营情况",
+            true
+        ));
+        // A 族：公司名被换掉 → 拦（LLM 幻觉不许改实体）
+        assert!(!validate_reinterpret(
+            "线下-潍坊程祥商贸有限公司，本月的数据",
+            "线下-某某其他商贸有限公司本月的经营情况",
+            true
+        ));
+        // A 族：保留实体但引入原句没有的指标 → 拦（那是加新语义，不是归一）
+        assert!(!validate_reinterpret(
+            "线下-潍坊程祥商贸有限公司，本月的数据",
+            "线下-潍坊程祥商贸有限公司本月的毛利率",
+            true
+        ));
+        // A 族关门验证：不可计算卡（entity_ok=false）实体句也不许进⑤——收窄纪律
+        assert!(!validate_reinterpret(
+            "线下-潍坊程祥商贸有限公司，本月的数据",
+            "线下-潍坊程祥商贸有限公司本月的经营情况",
+            false
+        ));
+        // B 族（裸名口语）：共享「潍坊程祥」锚点、两侧无指标 → 放行
+        assert!(validate_reinterpret("潍坊程祥本月情况咋样", "潍坊程祥本月的经营情况", true));
+        // B 族：无锚点（<4 连续共享汉字）→ 拦（维持原反问行为）
+        assert!(!validate_reinterpret("嗨肉", "你好", true));
+        assert!(!validate_reinterpret("本月的数据", "本月的经营情况", true), "「本月的」只有 3 字锚点");
     }
 
     /// 合同模板候选（纯函数）：只用问句自己命中的合同维度 + 恒在的标量总览；
@@ -2828,21 +2914,21 @@ mod tests {
     async fn reinterpret_question_rewrites_validates_and_fails_closed() {
         let ok = Fake::new(Some("销售额按省份按商品"));
         assert_eq!(
-            reinterpret_question(&ok, &|_| {}, "销售额度按照省份按照商品").await.as_deref(),
+            reinterpret_question(&ok, &|_| {}, "销售额度按照省份按照商品", true).await.as_deref(),
             Some("销售额按省份按商品")
         );
         // 模型拿不准原样返回 → None（= 没改，调用方回落原卡）
         let same = Fake::new(Some("销售额度按照省份按照商品"));
-        assert_eq!(reinterpret_question(&same, &|_| {}, "销售额度按照省份按照商品").await, None);
+        assert_eq!(reinterpret_question(&same, &|_| {}, "销售额度按照省份按照商品", true).await, None);
         // 模型挂了 → None
         let boom = Fake::new(None);
-        assert_eq!(reinterpret_question(&boom, &|_| {}, "销售额度按照省份按照商品").await, None);
+        assert_eq!(reinterpret_question(&boom, &|_| {}, "销售额度按照省份按照商品", true).await, None);
         // 模型吐了 SQL → None
         let sql = Fake::new(Some("SELECT SUM(amount) FROM sales_dw.dws_off_offline_sale_dfn"));
-        assert_eq!(reinterpret_question(&sql, &|_| {}, "销售额度按照省份按照商品").await, None);
+        assert_eq!(reinterpret_question(&sql, &|_| {}, "销售额度按照省份按照商品", true).await, None);
         // 指标漂移 → None（销售额被改成纯毛利）
         let drift = Fake::new(Some("本月毛利按省份"));
-        assert_eq!(reinterpret_question(&drift, &|_| {}, "销售额度按照省份按照商品").await, None);
+        assert_eq!(reinterpret_question(&drift, &|_| {}, "销售额度按照省份按照商品", true).await, None);
     }
 
     /// 归一的用量必须进 `on_usage`（K6-B 同一本账：查询日志 token 列不能少算这一次）；
@@ -2854,10 +2940,10 @@ mod tests {
             usages.fetch_add(1, Ordering::SeqCst);
         };
         let ok = Fake::new(Some("销售额按省份按商品"));
-        reinterpret_question(&ok, &count, "销售额度按照省份按照商品").await;
+        reinterpret_question(&ok, &count, "销售额度按照省份按照商品", true).await;
         assert_eq!(usages.load(Ordering::SeqCst), 1, "归一成功必须报一次用量");
         let boom = Fake::new(None);
-        reinterpret_question(&boom, &count, "销售额度按照省份按照商品").await;
+        reinterpret_question(&boom, &count, "销售额度按照省份按照商品", true).await;
         assert_eq!(usages.load(Ordering::SeqCst), 1, "失败没有 usage，不该回调");
     }
 

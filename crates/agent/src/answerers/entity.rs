@@ -64,6 +64,9 @@ const ANALYSIS_TAILS: &[&str] = &[
 const ENTITY_VIEW_TAILS: &[&str] = &[
     "的订单明细", "的下单信息", "的订单信息", "的销售明细", "的销售表现",
     "的下单情况", "的订单情况", "的销售情况",
+    // 「经营情况/经营数据/经营状况」= 要经营总览卡（归一提示词的实体样例输出「本月的经营情况」，
+    // 剥不掉它实体名就带着尾巴去探库，必空 —— 2026-08-12 实测归一重试句被实体卡 miss）
+    "的经营情况", "的经营数据", "的经营状况",
 ];
 
 const QUESTION_MARKERS: &[&str] = &[
@@ -296,6 +299,12 @@ fn parse_entity(question: &str) -> Option<ParsedEntity> {
         (kind, field)
     };
     Some(ParsedEntity { kind, field, value: value.to_string() })
+}
+
+/// 问句里的公司形实体名（归一改写的安全校验用它防 LLM 换掉实体）：形态证据见 `looks_like_company`。
+pub(crate) fn company_span(question: &str) -> Option<String> {
+    let parsed = parse_entity(question)?;
+    looks_like_company(&parsed.value).then_some(parsed.value)
 }
 
 /// 组织/公司形态证据：DMS 客户名带渠道前缀（customer_class 04=线下客户 的「线下-」命名约定），
@@ -1734,6 +1743,14 @@ mod tests {
         assert_eq!(
             bare_name("长才保温柜裸机（鸣忙专用）DHT150-6，昨天").as_deref(),
             Some("长才保温柜裸机（鸣忙专用）DHT150-6")
+        );
+        // 归一层的实体样例输出形态（「本月的经营情况/经营数据」）必须能剥回裸名——
+        // 剥不掉 = 带着尾巴探库必空（2026-08-12 实测归一重试句被实体卡 miss）
+        assert_eq!(bare_name("潍坊程祥本月的经营情况").as_deref(), Some("潍坊程祥"));
+        assert_eq!(bare_name("潍坊程祥本月的经营数据").as_deref(), Some("潍坊程祥"));
+        assert_eq!(
+            bare_name("线下-潍坊程祥商贸有限公司本月的经营情况").as_deref(),
+            Some("线下-潍坊程祥商贸有限公司")
         );
         let max = "甲".repeat(80);
         assert_eq!(bare_name(&max).as_deref(), Some(max.as_str()));

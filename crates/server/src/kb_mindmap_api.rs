@@ -594,13 +594,29 @@ mod content_pack {
     /// 递归序列化：每节带 `children`（叶子为空数组），前端按同形递归嫁接进导图
     fn section_json(node: &SectionNode) -> serde_json::Value {
         serde_json::json!({
-            "section": node.section,
+            "section": display_section_name(&node.section, &node.excerpt),
             "chunk_count": node.chunk_count,
             "first_ord": node.first_ord,
             "page": node.page,
             "excerpt": node.excerpt,
             "children": node.children.iter().map(section_json).collect::<Vec<_>>(),
         })
+    }
+
+    /// OCR 页桶的展示名：「第 N 页（OCR）」对用户零信息（2026-08-12 用户：不能显示为 OCR）。
+    /// 用首块摘录的开头当内容标签，页码收进后缀（「市场费用申请-费用项目明细…（第 11 页）」）。
+    /// 摘录空时保留原名（总比空标签强）。
+    fn display_section_name(section: &str, excerpt: &str) -> String {
+        if !(section.starts_with("第 ") && section.contains("页（OCR")) {
+            return section.to_string();
+        }
+        let hint: String = excerpt.chars().take(16).collect();
+        let hint = hint.trim();
+        if hint.is_empty() {
+            return section.to_string();
+        }
+        let page = section.replace("（OCR）", "");
+        format!("{hint}…（{page}）")
     }
 
     /// 章节 SQL。调用方已过 `doc_for_viewer`，这里仍内联一次空间级读谓词——撤权若发生在
@@ -738,6 +754,17 @@ mod content_pack {
             assert!(secs[0].children.is_empty());
             assert_eq!(secs[0].excerpt.chars().count(), SECTION_EXCERPT_CHARS);
             assert!(!secs[0].excerpt.contains(char::is_whitespace), "摘录不许带空白: {}", secs[0].excerpt);
+        }
+
+        /// OCR 页桶在导图上显示内容含义（摘录开头），页码收后缀；普通章节名一字不动
+        #[test]
+        fn ocr_page_nodes_display_content_hint_not_the_ocr_label() {
+            assert_eq!(
+                display_section_name("第 11 页（OCR）", "市场费用申请-费用项目明细表单 报销需…"),
+                "市场费用申请-费用项目明细表单…（第 11 页）"
+            );
+            assert_eq!(display_section_name("第 11 页（OCR）", ""), "第 11 页（OCR）", "空摘录保留原名");
+            assert_eq!(display_section_name("04 市场费用申请-合计费用", "随便"), "04 市场费用申请-合计费用");
         }
 
         /// 有界闸：总节点数封顶 `MAX_SECTIONS`（截断不报错；满闸后已有路径仍累计块数）
