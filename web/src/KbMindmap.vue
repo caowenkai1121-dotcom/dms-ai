@@ -486,6 +486,11 @@ const viewTransform = computed(() => `translate(${view.ox} ${view.oy}) scale(${v
 
 function onPointerDown(event: PointerEvent) {
   if (event.button !== 0) return
+  // 节点/展收钮上的按压是**点选**，不是平移起点：它们冒泡到根 svg 的 pointerdown 会把
+  // 点击时的手滑（>3px）误判成拖拽并把这次 click 吞掉（生产实测「节点展不开」——
+  // 点击全被拖拽判定吃掉）。平移只从空白处发起。
+  const target = event.target as Element | null
+  if (target?.closest?.('.mm-node, .mm-toggle')) return
   drag.active = true
   drag.moved = false
   drag.sx = drag.ix = event.clientX
