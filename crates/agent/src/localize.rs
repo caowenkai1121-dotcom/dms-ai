@@ -79,6 +79,7 @@ mod tests {
             subs: vec![],
             caliber_note: None,
             reinterpret_note: None,
+        resolved_question: None,
             truncation_note: None,
             redacted: vec![],
             scope_note: None,

@@ -204,11 +204,13 @@ pub async fn last_turn(
     pg: &PgPool,
     conv_id: i64,
 ) -> anyhow::Result<Option<(String, Option<String>)>> {
+    // 上一轮问句优先取 AI 产物里的「生效问句」（resolved_question：追问改写/归一后的完整形态）——
+    // 用户上一句可能是碎片（「上月呢？」），链式追问拿碎片当上下文会丢实体（2026-08-12 实测）。
     let row = sqlx::query(
-        "SELECT u.question,
-                (SELECT a.payload->>'sql' FROM chat.msg a
+        "SELECT u.question AS raw_q,
+                (SELECT a.payload FROM chat.msg a
                   WHERE a.conv_id = u.conv_id AND a.role = 'ai' AND a.id > u.id
-                  ORDER BY a.id LIMIT 1) AS sql
+                  ORDER BY a.id LIMIT 1) AS payload
            FROM chat.msg u
           WHERE u.conv_id = $1 AND u.role = 'user'
           ORDER BY u.id DESC LIMIT 1",
@@ -216,7 +218,21 @@ pub async fn last_turn(
     .bind(conv_id)
     .fetch_optional(pg)
     .await?;
-    Ok(row.map(|r| (r.get("question"), r.get("sql"))))
+    Ok(row.map(|r| {
+        let raw: String = r.get("raw_q");
+        let payload: Option<serde_json::Value> = r.get("payload");
+        let resolved = payload
+            .as_ref()
+            .and_then(|p| p.get("resolved_question"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let sql = payload
+            .as_ref()
+            .and_then(|p| p.get("sql"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        (resolved.unwrap_or(raw), sql)
+    }))
 }
 
 /// 删除会话。**`Ok` ≠ 删了行**：非属主/不存在时 WHERE 命中 0 行也是 Ok ——

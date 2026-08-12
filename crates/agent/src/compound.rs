@@ -279,6 +279,7 @@ mod tests {
             comparisons: vec![],
             subs: vec![],
             reinterpret_note: None,
+        resolved_question: None,
             caliber_note: None,
             truncation_note: None,
             redacted: vec![],

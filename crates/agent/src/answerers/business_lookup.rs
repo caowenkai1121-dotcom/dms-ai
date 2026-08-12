@@ -745,6 +745,7 @@ fn result(
         subs: vec![],
         caliber_note: None,
         reinterpret_note: None,
+        resolved_question: None,
         truncation_note: None,
         redacted,
         scope_note: (!cx.scope.unrestricted_by_role())

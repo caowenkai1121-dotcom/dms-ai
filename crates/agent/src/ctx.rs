@@ -129,6 +129,11 @@ pub struct AskResult {
     /// 同样 `skip_serializing_if`：不重理解整键不上线，前端与两个判官脚本的形状不变。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reinterpret_note: Option<String>,
+    /// 本轮实际生效的问句（追问改写/日期继承/归一重试之后的形态，与用户原句不同才填）：
+    /// 会话持久化靠它让下一轮追问继承到**完整问句**而不是用户上一句碎片（「上月呢？」
+    /// 本身是碎片，链式追问会因此丢实体——2026-08-12 实测）。None = 整键不上线，wire 不变。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_question: Option<String>,
     /// 本次结果的可核查可信凭证。等级只依据路由、口径判据、截断与权限事实计算，
     /// 不接受 LLM 自评概率。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,6 +257,7 @@ impl AskResult {
             supplemental: None,
             comparisons: vec![],
             reinterpret_note: None,
+        resolved_question: None,
             subs,
             // 容器本身没有 SQL 可判；每个子结果各自带着自己的标注
             caliber_note: None,
@@ -300,6 +306,7 @@ pub fn table_answer(
         supplemental: None,
         comparisons: vec![],
         reinterpret_note: None,
+        resolved_question: None,
         subs: vec![],
         caliber_note: None,
         truncation_note: truncation_note(wire, row_count),
@@ -860,6 +867,7 @@ mod tests {
             route: "llm".into(),
             view: dms_semantic::present::build(&[], &[]),
             reinterpret_note: None,
+        resolved_question: None,
             supplemental: None,
             comparisons: vec![],
             subs: vec![],
@@ -951,6 +959,7 @@ mod tests {
             route: "need-intent".into(),
             view: dms_semantic::present::build(&[], &[]),
             reinterpret_note: None,
+        resolved_question: None,
             supplemental: None,
             comparisons: vec![],
             subs: vec![],

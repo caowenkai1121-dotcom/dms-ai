@@ -235,6 +235,12 @@ pub async fn ask(
                         "原问句未能直接解析，已按理解为你想问：「{rewritten}」，以上是该问法的结果。"
                     ));
                 }
+                // 落账生效问句（追问改写/归一后的形态）：下一轮追问靠它继承完整上下文，
+                // 而不是用户上一句碎片（「上月呢？」链式追问会丢实体，2026-08-12 实测）。
+                let resolved = if current != original { &current } else { &original };
+                if resolved != question {
+                    r.resolved_question = Some(resolved.clone());
+                }
                 return Ok(r);
             }
             match retry_of.take() {
@@ -870,6 +876,7 @@ fn empty_reply(route: &str, elapsed_ms: u128, note: String) -> AskResult {
         subs: vec![],
         caliber_note: Some(note),
         reinterpret_note: None,
+        resolved_question: None,
         truncation_note: None,
         redacted: vec![],
         scope_note: None,
@@ -1663,17 +1670,29 @@ async fn rewrite_followup(
     // 判「是不是一条查询」而不只判非空：`AskResult::compound` 的 `sql` 字段是字面量
     // `[复合问题拆解]`（那是容器不是 SQL），知识库轮的 payload 连 `sql` 键都没有。
     // 拿这两种当上下文＝把用户往同一个坑里带，还白烧一次 fast 调用。
-    let Some(hist_sql) = prev_sql.map(str::trim).filter(|s| looks_like_sql(s)) else {
+    //
+    // 例外（2026-08-12 实测追问死循环）：上一轮是**反问卡**（没 SQL 但问句带着公司形实体
+    // 锚点）时，追问「上月呢？」的语义锚点全在上一轮问句里——允许无 SQL 改写（提示词
+    // 缺 SQL 段），否则用户一路被反问死。无锚点的（政策/制度轮）维持跳过：没有口径可
+    // 继承时改写纯属自由发挥。
+    let hist_sql = prev_sql.map(str::trim).filter(|s| looks_like_sql(s));
+    if hist_sql.is_none() && crate::answerers::entity::company_span(prev_q).is_none() {
         return question.to_string();
-    };
+    }
     let system = "#角色：你是数据分析产品经理，负责把口语化的追问补全成可独立理解的取数问题。\n\
                   #任务：结合上一轮的问题与上一轮**实际执行的 SQL**，把本轮追问改写成一个完整、独立、可单独理解的问题。\n\
                   #规则：1. 只输出改写后的问题本身，不要解释、不要引号、不要输出 SQL；\
                   2. 上一轮 SQL 里的表、时间列与过滤条件就是上一轮的口径，追问没有另行指定时一律沿用；\
-                  3. 追问本身已经完整则原样输出。";
+                  3. 追问本身已经完整则原样输出；\
+                  4. 时间词一律沿用自然说法（本月/上月/今年/全年），绝不展开成具体日期——展开错了就是错口径。";
     let refs_section = refs_section_of(refs);
+    // SQL 段缺席时一字不多（与 refs 段同一纪律）；在场时与既有文案逐字一致（多轮题集钉着）
+    let sql_section = match hist_sql {
+        Some(s) => format!("#上一轮SQL：{s}"),
+        None => String::new(),
+    };
     let user = format!(
-        "#上一轮问题：{prev_q}\n#上一轮SQL：{hist_sql}{refs_section}\n#本轮追问：{question}\n#改写后的问题："
+        "#上一轮问题：{prev_q}\n{sql_section}{refs_section}\n#本轮追问：{question}\n#改写后的问题："
     );
     // 温度 0.1 = 搬运前 `LlmClient::chat` 写死的那个值（`server/src/llm.rs:53`）
     let req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
@@ -2466,6 +2485,27 @@ mod tests {
             "上月销售额是多少"
         );
         assert_eq!(f.calls(), 1);
+    }
+
+    /// 反问轮例外（2026-08-12 追问死循环实测）：上一轮无 SQL 但问句带公司形实体锚点 →
+    /// 允许无 SQL 改写（「X客户本月的数据」→「上月呢」= X客户上月…）；无锚点维持跳过。
+    #[tokio::test]
+    async fn clarify_turn_with_an_entity_anchor_still_rewrites() {
+        let f = Fake::new(Some("线下-潍坊程祥商贸有限公司上月的数据"));
+        let out = rewrite_followup(
+            &f,
+            &|_| {},
+            "上月呢？",
+            Some(("线下-潍坊程祥商贸有限公司，本月的数据", None, &[])),
+        )
+        .await;
+        assert_eq!(out, "线下-潍坊程祥商贸有限公司上月的数据");
+        assert_eq!(f.calls(), 1, "带实体锚点的反问轮必须真的调一次改写");
+        // 无锚点的（政策/制度轮）维持跳过：没有口径可继承时改写纯属自由发挥
+        let f2 = Fake::new(Some("随便"));
+        let out2 = rewrite_followup(&f2, &|_| {}, "上月呢？", Some(("报销政策是什么", None, &[]))).await;
+        assert_eq!(out2, "上月呢？");
+        assert_eq!(f2.calls(), 0);
     }
 
     /// 🔴 改写提示词必须**带上一轮那条 SQL**，且六段槽位齐全。
