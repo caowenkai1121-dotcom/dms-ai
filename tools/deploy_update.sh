@@ -31,10 +31,10 @@ echo "== 3/5 服务器解包 + Docker 构建（数分钟，耐心）"
 python tools/_deploy.py run "mkdir -p $APP && tar -xzf $REMOTE/src.tar.gz -C $APP && echo extracted" 120
 # 若服务器拉 crates.io 慢：先在服务器放 /root/.cargo/config.toml（rsproxy 镜像）再构建，
 # 纯净 Dockerfile 不内嵌镜像源（纪律见 docker/server/Dockerfile 头注）。
-python tools/_deploy.py run "cd $APP && docker build -f docker/server/Dockerfile -t dms-ai-server . 2>&1 | tail -3" 3600
+python tools/_deploy.py run "cd $APP && bash scripts/server-build.sh 2>&1 | tail -3" 3600
 
 echo "== 4/5 重启 dms-ai-server（健康探针内置）+ 更新 web 产物"
-python tools/_deploy.py run "bash $APP/tools/_restart_server.sh" 300
+python tools/_deploy.py run "bash $APP/scripts/server-restart.sh" 300
 # web 容器形态以现网为准：若 dms-ai-web 存在且挂了 html 卷，直接刷进卷目录
 python tools/_deploy.py run "set -e; docker cp $REMOTE/web-dist.tar.gz dms-ai-web:/tmp/wd.tgz 2>/dev/null && \
   docker exec dms-ai-web sh -c 'tar -xzf /tmp/wd.tgz -C /usr/share/nginx/html && rm /tmp/wd.tgz' && \
