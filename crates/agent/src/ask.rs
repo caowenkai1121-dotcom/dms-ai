@@ -1697,17 +1697,19 @@ async fn rewrite_followup(
     // 更早几轮的生效问句（新→旧）：链式追问的实体/口径锚点常在倒数第二三轮。
     // 空 = 一字不多（单轮提示词与引入前逐字相同）。用户问句是不可信文本，换行剥掉
     // 防段头搅乱（与 refs 段①同一纪律）。
+    // 长会话**压缩但不丢**（业主裁决）：最多 6 轮全保留，近的留 80 字、远的压到 40 字。
     let history_section = if history.is_empty() {
         String::new()
     } else {
         let items = history
             .iter()
             .map(|q| q.chars().filter(|c| !c.is_control()).collect::<String>())
-            .map(|q| q.trim().chars().take(80).collect::<String>())
+            .map(|q| q.trim().to_string())
             .filter(|q| !q.is_empty())
-            .take(3)
+            .take(6)
             .enumerate()
-            .map(|(i, q)| format!("{}. {}", i + 1, q))
+            // 近两轮留 80 字，更早的压到 40 字：压缩长度但不丢轮次
+            .map(|(i, q)| format!("{}. {}", i + 1, q.chars().take(if i < 2 { 80 } else { 40 }).collect::<String>()))
             .collect::<Vec<_>>()
             .join("\n");
         if items.is_empty() {

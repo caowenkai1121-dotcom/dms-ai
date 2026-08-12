@@ -129,6 +129,13 @@ pub async fn gather(
     let value_hints = value_hints
         .map_err(|e| tracing::warn!(err = %e, "码值提示召回失败 → 码值提示缺席"))
         .unwrap_or_default();
+    // 实体锚定并进码值段（同一段进 prompt、同一份「绝不丢」预算纪律）：
+    // 问句里的名字探得主档唯一命中 → LLM 必须带实体谓词（实测漏写客户过滤出全量错数）。
+    let value_hints = {
+        let mut v = value_hints;
+        v.extend(crate::answerers::entity::entity_anchor_hints(cx).await);
+        v
+    };
     // 值域命中（精确词典层）：问句里的专名是某**实体名**列的取值（「手抓饼这个分类」实测虚高 36%）。
     let domain_hits = domain_hits
         .map_err(|e| tracing::warn!(err = %e, "值域命中召回失败 → 值域卡缺席"))

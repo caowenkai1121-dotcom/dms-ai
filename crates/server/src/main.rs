@@ -1417,6 +1417,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/convs", get(api_convs))
         .route("/api/conv/new", post(api_conv_new))
         .route("/api/conv/{id}", get(api_conv_msgs).delete(api_conv_delete))
+        .route("/api/conv/{id}/clear", post(api_conv_clear))
         // 【K1】知识库。上传单挂 body limit：axum 默认 2MB 会先于配置触发
         //（症状是「配置写着 50MB 却报 413」）。并发闸在 `kb_api::UPLOAD_GATE`（4 许可 → 429）。
         .route(
@@ -2034,7 +2035,7 @@ async fn ask_gate(
     // 更早几轮的生效问句（追问改写的对话上下文）：取 4 跳 1 = 紧挨着的 prev 不重复进。
     // 读失败/无会话 = 空（追问降级为首问，语义不变）。
     let history = match req.conv_id {
-        Some(cid) => chat::recent_questions(st.owned.pool(), cid, 4)
+        Some(cid) => chat::recent_questions(st.owned.pool(), cid, 7)
             .await
             .into_iter()
             .skip(1)
@@ -2528,6 +2529,29 @@ async fn api_conv_delete(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// 清空会话全部消息（保留会话）：用户「清空当前会话历史记录」入口。
+/// 属主闸 `ensure_owner`（非属主/不存在统一 403，与删会话同一条不泄存在性纪律）。
+async fn api_conv_clear(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    axum::extract::Query(q): axum::extract::Query<ConvQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (login, _) = resolve_identity(&st, &headers, &q.login_name, &None)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "未认证" }))))?;
+    chat::ensure_owner(st.owned.pool(), id, &login)
+        .await
+        .map_err(|_| (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "无权操作该会话" }))))?;
+    let removed = chat::clear_msgs(st.owned.pool(), id)
+        .await
+        .inspect_err(|e| tracing::warn!(conv_id = id, "会话清空失败: {e}"))
+        .map_err(|_| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "清空会话失败，请稍后重试" })),
+        ))?;
+    Ok(Json(serde_json::json!({ "ok": true, "cleared": removed })))
+}
+
 /// 分支会话：从 `from_seq`（1 基消息序号，缺省=整条）处 fork 出新会话并复制前缀消息。
 /// 属主校验与复制在同一事务里（chat::branch_conv），非属主/不存在统一 403 不泄存在性。
 async fn api_conv_branch(
@@ -2941,15 +2965,15 @@ mod tests {
         assert!(src.contains(concat!("with_graceful", "_shutdown")), "axum::serve 没有接优雅停机");
     }
 
-    /// 会话属主闸唯一事实源：api_ask 与 api_conv_msgs 都走 `chat::ensure_owner`
-    ///（判据/文案一字不动；第三处调用点在 chat.rs 的 steer）
+    /// 会话属主闸唯一事实源：api_ask / api_conv_msgs / api_conv_clear 都走 `chat::ensure_owner`
+    ///（判据/文案一字不动；另一处调用点在 chat.rs 的 steer）
     #[test]
     fn conv_owner_gate_is_shared() {
         let src = include_str!("main.rs");
         assert_eq!(
             src.matches(concat!("chat::ensure", "_owner(")).count(),
-            2,
-            "api_ask/api_conv_msgs 必须共用 ensure_owner（各写一份判据必漂）"
+            3,
+            "api_ask/api_conv_msgs/api_conv_clear 必须共用 ensure_owner（各写一份判据必漂）"
         );
     }
 

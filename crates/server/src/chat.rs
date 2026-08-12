@@ -286,6 +286,16 @@ pub async fn delete_conv(pg: &PgPool, conv_id: i64, login: &str) -> anyhow::Resu
     Ok(())
 }
 
+/// 清空会话**消息**（保留会话本身与标题）：「清空上下文」功能——追问改写只看 chat.msg，
+/// 清完下一轮就是干净的全新首问。属主闸在调用方（与 delete_conv 同入口）。
+pub async fn clear_msgs(pg: &PgPool, conv_id: i64) -> anyhow::Result<u64> {
+    let r = sqlx::query("DELETE FROM chat.msg WHERE conv_id = $1")
+        .bind(conv_id)
+        .execute(pg)
+        .await?;
+    Ok(r.rows_affected())
+}
+
 /// 校验会话归属（防越权访问他人会话）
 pub async fn conv_owner(pg: &PgPool, conv_id: i64) -> anyhow::Result<Option<String>> {
     Ok(sqlx::query_scalar("SELECT login_name FROM chat.conv WHERE id = $1")

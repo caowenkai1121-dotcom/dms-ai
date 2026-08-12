@@ -1629,6 +1629,20 @@ async function delConv(id: number, ev: Event) {
   } catch { showToast('删除会话失败（网络）') }
 }
 
+/** 清空会话全部问答记录（保留会话本体）：追问上下文随之重置，下一问就是干净首问。 */
+async function clearConv(id: number, ev: Event) {
+  ev.stopPropagation()
+  if (!window.confirm('清空该会话的全部问答记录？会话本身保留，追问上下文将重置。')) return
+  try {
+    if (!await okJson(await fetch(`/api/conv/${id}/clear${loginQuery()}`,
+      { method: 'POST', headers: authHeaders(false) }), '清空会话失败', () => true, showToast)) return
+    // 消息缓存作废：当前打开的立即清屏，其它会话下次打开重新拉（空）
+    turnsByConv.delete(id)
+    if (id === curConvId.value) draftTurns.value = []
+    showToast('已清空该会话记录')
+  } catch { showToast('清空会话失败（网络）') }
+}
+
 function applyTheme() {
   document.documentElement.setAttribute('data-theme', theme.value)
 }
@@ -2501,6 +2515,7 @@ function exportSupplementalCsv(t: Turn) {
           <span class="hi-title">{{ c.title }}</span>
           <span class="hi-time">{{ c.time }}</span>
           <button class="hi-trace" title="Trace 时间线：回放该会话的问答过程" aria-label="Trace 时间线" @click="openTrace(c.id, $event)">🕓</button>
+          <button class="hi-clear" title="清空会话记录（保留会话，追问上下文将重置）" aria-label="清空会话记录" @click="clearConv(c.id, $event)">🧹</button>
           <button class="hi-del" title="删除会话" aria-label="删除会话" @click="delConv(c.id, $event)">×</button>
         </div>
       </div>
@@ -3398,7 +3413,9 @@ function exportSupplementalCsv(t: Turn) {
 .hist-item .hi-time { font-size: 11px; color: var(--text-faint); flex-shrink: 0; }
 .hist-item .hi-del { opacity: 0; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 15px; line-height: 1; flex-shrink: 0; }
 .hist-item .hi-trace { opacity: 0; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 12px; line-height: 1; flex-shrink: 0; }
+.hist-item .hi-clear { opacity: 0; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 12px; line-height: 1; flex-shrink: 0; }
 .hist-item:hover .hi-trace, .hist-item:focus-within .hi-trace { opacity: 1; }
+.hist-item:hover .hi-clear, .hist-item:focus-within .hi-clear { opacity: 1; }
 .hist-item .hi-trace:hover { color: var(--primary); }
 .hist-item:hover .hi-del, .hist-item:focus-within .hi-del { opacity: 1; }
 .hist-item .hi-del:hover { color: var(--error-text); }

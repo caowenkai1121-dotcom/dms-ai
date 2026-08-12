@@ -919,6 +919,91 @@ fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''").replace('_', "\\_")
 }
 
+// ─────────── LLM 路径实体锚定 ───────────
+// 2026-08-12 实测：「红欢喜上月的退货数据」走 LLM 路径时模型漏写客户谓词，出了全公司的
+// 售后数。LLM 不该靠列名猜实体——名字探到主档唯一命中就注入绑定提示（进 gather 的
+// value_hints 段：预算纪律里「绝不丢」的那一段）。
+
+/// 探库用的名字候选：指标/主题/时间/虚词**只从两头剥**（全局剥会吃公司名肚子里的「有」等字，
+/// 与 server 侧 `customer_name_fragment` 同一条纪律——两份实现是刻意的（agent↔server 不许互引），
+/// 词表有交集，改一边时另一边对一遍）。
+fn entity_anchor(question: &str) -> Option<String> {
+    let mut edge: Vec<&str> = dms_kernel::nl::lexicon::STRIP_WORDS.to_vec();
+    edge.extend([
+        "怎么样", "如何", "的", "退货", "售后", "退款", "开票", "对账", "订单", "库存", "费用",
+        "数据", "情况", "明细", "表现", "经营", "销售额", "销量", "销售", "毛利", "成本", "收入",
+        "金额", "数量", "是多少", "多少",
+    ]);
+    edge.sort_by_key(|w| std::cmp::Reverse(w.chars().count()));
+    let mut name = question.trim().to_string();
+    loop {
+        let before = name.clone();
+        name = name
+            .trim_matches(|c: char| c.is_whitespace() || "，。？?、,.~～!！:：;；".contains(c))
+            .to_string();
+        for w in &edge {
+            if let Some(rest) = name.strip_prefix(w) {
+                name = rest.trim_start().to_string();
+                break;
+            }
+            if let Some(rest) = name.strip_suffix(w) {
+                name = rest.trim_end().to_string();
+                break;
+            }
+        }
+        if name == before {
+            break;
+        }
+    }
+    let hanzi = name.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+    (hanzi >= 2).then_some(name)
+}
+
+/// 实体锚定提示（追问/裸名问句的取数锚点）。**唯一命中才绑定**：多命中=歧义，绑错了
+/// 比不绑更坏（交回模型自己判）。两次探库走 `fetch_rows`（闸门+行级权限一个不少），
+/// 失败/超时 = 空（提示缺席不挡主链）。
+pub(crate) async fn entity_anchor_hints(cx: &AskCtx<'_>) -> Vec<String> {
+    let Some(frag) = entity_anchor(cx.question) else {
+        return vec![];
+    };
+    let safe = esc(&frag);
+    let cust_sql = format!(
+        "SELECT customer_code, customer_name FROM t_customer \
+         WHERE deleted_flag = 0 AND customer_name LIKE '%{safe}%' LIMIT 4"
+    );
+    let goods_sql = format!(
+        "SELECT goods_code, goods_name FROM t_goods \
+         WHERE deleted_flag = 0 AND goods_name LIKE '%{safe}%' LIMIT 4"
+    );
+    let (cust, goods) = tokio::join!(fetch_rows(cx, &cust_sql), fetch_rows(cx, &goods_sql));
+    let mut out = Vec::new();
+    if let Ok(Some(rs)) = cust {
+        if rs.rows.len() == 1 {
+            let code = rs.rows[0].first().and_then(value_text).unwrap_or_default();
+            let name = rs.rows[0].get(1).and_then(value_text).unwrap_or_default();
+            if !name.is_empty() {
+                out.push(format!(
+                    "实体锚定：问句涉及客户「{name}」（customer_code={code}）。凡涉该客户的取数，SQL 必须带过滤 \
+                     customer_name LIKE '%{frag}%' 或 customer_code = '{code}'；禁止出全量。"
+                ));
+            }
+        }
+    }
+    if let Ok(Some(rs)) = goods {
+        if rs.rows.len() == 1 {
+            let code = rs.rows[0].first().and_then(value_text).unwrap_or_default();
+            let name = rs.rows[0].get(1).and_then(value_text).unwrap_or_default();
+            if !name.is_empty() {
+                out.push(format!(
+                    "实体锚定：问句涉及商品「{name}」（goods_code={code}）。凡涉该商品的取数，SQL 必须带过滤 \
+                     goods_name LIKE '%{frag}%' 或 goods_code = '{code}'；禁止出全量。"
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// 品牌不伪造 DWS 品牌维度，只展示已唯一确认品牌的主档商品集合。
 async fn brand_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Option<AskResult>> {
     let brand = candidate.name.clone();
