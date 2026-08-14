@@ -2389,7 +2389,13 @@ mod tests {
             "两臂合成必须走 fuse（主体保留 + kb 挂附加字段）：{dual}"
         );
         let outcome = src.split("pub async fn dual_outcome(").nth(1).expect("dual_outcome 改名了");
-        assert!(outcome.contains("tokio::join!(data_fut, kb_fut)"), "两臂必须并行：{outcome}");
+        assert!(outcome.contains("race_arms(data_fut, kb_fut)"), "两臂必须并行：{outcome}");
+        // 资料臂是加分项：问数臂已经答出实质内容时不许让它继续干等
+        let race = src.split("async fn race_arms<K>(").nth(1).expect("race_arms 改名了");
+        assert!(
+            race.contains("KB_BONUS_BUDGET") && race.contains("KB_PRIMARY_BUDGET"),
+            "资料臂的预算没了 —— 实体卡会从 1 秒变成 39 秒：{race}"
+        );
         // 主体不许被 compound 壳吃掉：那会让 row_count 归零、导出/解读按钮消失、收据变空
         let fuse = src
             .split("fn fuse(outcome: HybridOutcome")

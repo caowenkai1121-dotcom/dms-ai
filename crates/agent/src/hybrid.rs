@@ -239,6 +239,54 @@ fn fuse(outcome: HybridOutcome, prepared: &PreparedQuestion) -> AskResult {
     r
 }
 
+/// 资料臂在问数臂**已经答出实质内容**之后还能再等多久。
+/// 它只是给答案加一段资料佐证，超时就不要了 —— 用户不该为一个加分项多等半分钟。
+const KB_BONUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+/// 问数臂没有实质内容时资料臂的预算：这时它就是**答案本身**，得给足
+/// （检索 + 一次生成，30 秒级是常态）。
+const KB_PRIMARY_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// 两臂并发跑，但**先等问数臂**：它有实质内容时资料臂只再给 [`KB_BONUS_BUDGET`]，
+/// 没有实质内容时给 [`KB_PRIMARY_BUDGET`]（那一档资料臂就是答案本身）。
+///
+/// 不是 `tokio::join!`：那会让总耗时恒等于**较慢**的一路，而两臂的快慢差一个数量级
+/// （实体卡 1 秒 vs 知识库 30 秒）。
+async fn race_arms<K>(
+    data: impl std::future::Future<Output = anyhow::Result<AskResult>>,
+    kb: K,
+) -> (anyhow::Result<AskResult>, Option<Answer>)
+where
+    K: std::future::Future<Output = Option<Answer>>,
+{
+    let mut kb = std::pin::pin!(kb);
+    let mut kb_done: Option<Option<Answer>> = None;
+    // 等问数臂的同时资料臂照跑（`select!` 两条腿都在被 poll）
+    let data_out = {
+        let mut data = std::pin::pin!(data);
+        loop {
+            tokio::select! {
+                out = &mut data => break out,
+                answer = &mut kb, if kb_done.is_none() => kb_done = Some(answer),
+            }
+        }
+    };
+    if let Some(answer) = kb_done {
+        return (data_out, answer);
+    }
+    let budget = match &data_out {
+        Ok(r) if data_has_substance(r) => KB_BONUS_BUDGET,
+        _ => KB_PRIMARY_BUDGET,
+    };
+    let answer = match tokio::time::timeout(budget, kb).await {
+        Ok(answer) => answer,
+        Err(_) => {
+            tracing::warn!(?budget, "资料臂超出预算 → 只用问数半（加分项不拖主答案）");
+            None
+        }
+    };
+    (data_out, answer)
+}
+
 /// [`dual`] 的**类型化**中间产物：两臂各自答了什么，还没塑成任何 wire 形状。
 ///
 /// 拆出来是为了让「执行」与「塑形」分开 —— 但当前**只有 [`dual`] 一个调用者**：
@@ -269,8 +317,10 @@ pub async fn dual_outcome(
         .map_err(|e| tracing::warn!(err = %e, "两臂并行：知识库路失败 → 只用问数半"))
         .ok()
     };
-    // 两路**并行**：总耗时 = 较大者，不是相加
-    let (data_r, knowledge) = tokio::join!(data_fut, kb_fut);
+    // 两路**并行**，但资料臂**带预算**：它是加分项，不该让一个已经答完的问数结果干等。
+    // 生产实测（2026-08-14）：裸客户名的实体卡本身 1 秒出，改造后整轮 39 秒 ——
+    // 全花在等知识库那一路上（检索 + 一次生成，30 秒级很正常）。
+    let (data_r, knowledge) = race_arms(data_fut, kb_fut).await;
     let knowledge = knowledge.filter(kb_has_substance);
 
     let only_kb = |a| HybridOutcome {
