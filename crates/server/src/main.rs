@@ -3040,7 +3040,7 @@ pub(crate) async fn unknown_route_kb_fallback(
         // 有引用 = 真的在库里找到了依据。没有引用的那两种（NO_HIT / 模型没给带角标的结论）
         // 都不顶替澄清卡：那时卡片至少还给了下一步怎么问。
         Ok(a) => match &a.body {
-            dms_kernel::AnswerBody::Text { citations, markdown }
+            dms_kernel::AnswerBody::Text { citations, markdown, .. }
                 if !citations.is_empty() && !reads_as_not_found(markdown) =>
             {
                 Some(a)

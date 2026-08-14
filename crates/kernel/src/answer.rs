@@ -52,7 +52,15 @@ pub enum AnswerBody {
     },
     /// 引用式回答：markdown + 角标来源（角标 = `citations` 下标 + 1，不存字段；
     /// web 渲染侧按同一句契约实现，改动两处同步）
-    Text { markdown: String, citations: Vec<Citation> },
+    ///
+    /// `sections` 是同一份 markdown 的**分节视图**（`split_sections` 从 markdown 切出来，
+    /// 唯一生产者是 `Answer::text`，不可能与 markdown 漂）。空数组不上线，老前端一字不改。
+    Text {
+        markdown: String,
+        citations: Vec<Citation>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        sections: Vec<Section>,
+    },
     /// 复合容器：主体空但**继续输出 `sql`/`row_count`/`truncated` 占位键**（前端老字段兼容）
     Composite {
         sql: String,
@@ -129,7 +137,11 @@ impl Answer {
     pub fn text(markdown: String, citations: Vec<Citation>, elapsed_ms: u128) -> Self {
         Answer {
             route: crate::qalog::ROUTE_KNOWLEDGE.into(),
-            body: AnswerBody::Text { markdown, citations },
+            body: AnswerBody::Text {
+                sections: split_sections(&markdown),
+                markdown,
+                citations,
+            },
             view: None,
             subs: vec![],
             elapsed_ms,
@@ -282,5 +294,189 @@ mod tests {
         keys.sort_unstable();
         // page 无 skip 属性（null 也上线，老前端契约）；其余 Option/空集合一律不上线
         assert_eq!(keys, ["chunk_id", "doc_id", "doc_name", "heading_path", "page", "score"]);
+    }
+}
+
+/// 一节的**形态**。由这一节的正文实际是什么判定 —— 不看标题的中文措辞。
+///
+/// 🔴 由来（业主 2026-08-15：「以后你给出的答案类型不是固定的，要结合数据让大模型
+/// 动态调整，来优化显示」）：此前「知识库答案长什么样」被钉死在两处 ——
+/// 后端提示词点名四个模块名（直接结论/关键要点/操作步骤/版本与差异），
+/// 前端再用一串中文正则（`headingClass`）按标题措辞上色。模型换个说法叫「费用标准」，
+/// 前端就只剩默认样式。两处白名单，一个固定模板。
+///
+/// 现在：标题由模型自己写（写什么就是什么），**渲染看形态**——
+/// 这一节是表就当表渲染，是步骤就编号，是要点就列点。内容决定显示。
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionShape {
+    /// 有 Markdown 表格（表头 + `---` 分隔行）
+    Table,
+    /// 有序列表：有先后的流程
+    Steps,
+    /// 无序列表：并列要点
+    Bullets,
+    /// 其余散文段落
+    Prose,
+}
+
+/// 引用式回答的一节：模型自己写的标题 + 内容判出的形态 + 该节原文。
+#[derive(Debug, Serialize, Clone)]
+pub struct Section {
+    /// 模型写的标题原文（首节可能没有标题，此时为空串）
+    pub title: String,
+    pub shape: SectionShape,
+    /// 该节正文（**不含**标题行）。角标 `[^n]` 原样保留 —— 分节不碰引用。
+    pub markdown: String,
+}
+
+/// Markdown → 分节。纯函数：同一份 markdown 恒得同一组节。
+///
+/// 切分点是 `#` 标题行（1–4 级）。首个标题之前的正文自成一节（标题空串）。
+/// 围栏代码块内的 `#` 与 `|` 一律不算 —— 那是代码不是结构。
+pub fn split_sections(markdown: &str) -> Vec<Section> {
+    let mut sections: Vec<Section> = vec![];
+    let mut title = String::new();
+    let mut body: Vec<&str> = vec![];
+    let mut in_code = false;
+    let mut push = |title: &mut String, body: &mut Vec<&str>| {
+        let text = body.join("\n");
+        // 标题与正文都空的节不产出（文首空行、连续标题之间）
+        if !title.is_empty() || !text.trim().is_empty() {
+            sections.push(Section {
+                shape: shape_of(&text),
+                title: std::mem::take(title),
+                markdown: text.trim_matches('\n').to_string(),
+            });
+        }
+        body.clear();
+    };
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            body.push(line);
+            continue;
+        }
+        match heading_text(line).filter(|_| !in_code) {
+            Some(text) => {
+                push(&mut title, &mut body);
+                title = text.to_string();
+            }
+            None => body.push(line),
+        }
+    }
+    push(&mut title, &mut body);
+    sections
+}
+
+/// `## 标题` → `Some("标题")`。`#` 后必须有空白且标题非空，否则不是标题行
+/// （`#tag`、`####` 不是）。
+fn heading_text(line: &str) -> Option<&str> {
+    let rest = line.trim_start();
+    let hashes = rest.chars().take_while(|c| *c == '#').count();
+    if !(1..=4).contains(&hashes) {
+        return None;
+    }
+    let text = rest[hashes..].trim();
+    (rest[hashes..].starts_with(char::is_whitespace) && !text.is_empty()).then_some(text)
+}
+
+/// 形态判定：表 > 步骤 > 要点 > 散文。围栏内的行不参与。
+fn shape_of(body: &str) -> SectionShape {
+    let mut in_code = false;
+    let mut pipes = 0usize;
+    let mut delimiter = false;
+    let mut steps = false;
+    let mut bullets = false;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        if t.starts_with('|') && t.ends_with('|') && t.len() > 2 {
+            pipes += 1;
+            // 分隔行：`| --- | :--: |` —— 只由 `|`/`-`/`:`/空白组成
+            if t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) && t.contains('-') {
+                delimiter = true;
+            }
+        }
+        let after_marker = t.trim_start_matches(|c: char| c.is_ascii_digit());
+        if after_marker.len() < t.len()
+            && (after_marker.starts_with(". ") || after_marker.starts_with(") "))
+        {
+            steps = true;
+        }
+        if (t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ")) && t.len() > 2 {
+            bullets = true;
+        }
+    }
+    // 表要求「表头 + 分隔行 + 至少一行数据」——只有一根竖线的散文行不算表
+    if delimiter && pipes >= 3 {
+        SectionShape::Table
+    } else if steps {
+        SectionShape::Steps
+    } else if bullets {
+        SectionShape::Bullets
+    } else {
+        SectionShape::Prose
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+
+    #[test]
+    fn sections_split_on_headings_and_keep_the_models_own_titles() {
+        let md = "## 直接结论\n\n上限每晚八百元[^1]。\n\n## 费用标准\n\n| 项目 | 上限 |\n| --- | --- |\n| 住宿 | 800[^1] |\n\n## 报销步骤\n\n1. 上传发票[^2]\n2. 关联单号[^2]\n";
+        let s = split_sections(md);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0].title, "直接结论");
+        assert_eq!(s[0].shape, SectionShape::Prose);
+        // 标题不在白名单里也照样成节 —— 这正是要治的那件事
+        assert_eq!(s[1].title, "费用标准");
+        assert_eq!(s[1].shape, SectionShape::Table);
+        assert_eq!(s[2].shape, SectionShape::Steps);
+        // 角标不许在分节时丢
+        assert!(s[1].markdown.contains("[^1]") && s[2].markdown.contains("[^2]"));
+        // 正文不含标题行
+        assert!(!s[0].markdown.contains('#'));
+    }
+
+    #[test]
+    fn prose_before_the_first_heading_is_its_own_untitled_section() {
+        let s = split_sections("先说一句[^1]。\n\n## 要点\n\n- 甲[^1]\n- 乙[^2]\n");
+        assert_eq!(s.len(), 2);
+        assert!(s[0].title.is_empty());
+        assert_eq!(s[0].shape, SectionShape::Prose);
+        assert_eq!(s[1].shape, SectionShape::Bullets);
+    }
+
+    /// 围栏里的 `#` 是注释、`|` 是表格字符画，都不是结构
+    #[test]
+    fn fenced_code_never_creates_structure() {
+        let md = "## 示例\n\n```sql\n# 这不是标题\n| a | b |\n| --- | --- |\n```\n\n正文一句[^1]。\n";
+        let s = split_sections(md);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(s[0].title, "示例");
+        assert_eq!(s[0].shape, SectionShape::Prose, "围栏里的表不算表");
+    }
+
+    /// 一根竖线的散文不是表（「A|B 两种口径」）
+    #[test]
+    fn a_stray_pipe_is_not_a_table() {
+        let s = split_sections("## 说明\n\n甲|乙 两种口径都可以[^1]。\n");
+        assert_eq!(s[0].shape, SectionShape::Prose);
+    }
+
+    /// 空 markdown 不产出空节
+    #[test]
+    fn empty_markdown_yields_no_sections() {
+        assert!(split_sections("").is_empty());
+        assert!(split_sections("\n\n  \n").is_empty());
     }
 }

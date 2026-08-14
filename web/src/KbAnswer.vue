@@ -16,8 +16,11 @@ interface Citation {
   document_family?: string | null; document_revision?: string | null
   source_hash?: string; doc_updated_at?: string
 }
+interface KbSection { title: string; shape: 'prose' | 'bullets' | 'steps' | 'table'; markdown: string }
 interface TextResult {
   markdown?: string; citations?: Citation[]
+  /// 后端按**内容**切出的分节（`kernel::answer::split_sections`）。生成中不到，收尾才有。
+  sections?: KbSection[]
   intent_summary?: IntentSummary
   resolved_question?: string
 }
@@ -213,13 +216,21 @@ function cleanMarkdown(md: string): string {
   }
   return output.join('\n').trim()
 }
-function headingClass(title: string): string {
-  if (/(结论|摘要|核心答案|直接回答)/.test(title)) return 'conclusion'
-  if (/(关键要点|核心要点|重点|关键信息|主要内容)/.test(title)) return 'points'
-  if (/(建议|步骤|操作|行动|怎么做|处理方式)/.test(title)) return 'action'
-  if (/(对比|比较|区别|差别|变化)/.test(title)) return 'compare'
-  if (/(注意|风险|限制|边界|异常|差异)/.test(title)) return 'caution'
-  return 'default'
+// 章节样式由**这一节实际是什么**决定（后端 `split_sections` 按内容判形），
+// 不再由标题的中文措辞猜。原先是五条中文正则：模型把一节叫「费用标准」就掉回默认样式，
+// 而「答案长什么样」正是本轮业主要求不再固定的东西（2026-08-15）。
+// 生成中后端还没给分节，回默认样式 —— 收尾一次到位，比逐 token 变色好。
+const SHAPE_CLASS: Record<string, string> = {
+  prose: 'shape-prose', bullets: 'shape-bullets', steps: 'shape-steps', table: 'shape-table',
+}
+function shapeIndex(sections: KbSection[] | undefined): Map<string, string> {
+  const index = new Map<string, string>()
+  for (const s of sections ?? []) {
+    const title = (s.title ?? '').trim()
+    // 同名节取第一个：一份回答里标题重名极少，重名时前一节的形态更接近读者正在看的那节
+    if (title && !index.has(title)) index.set(title, SHAPE_CLASS[s.shape] ?? 'shape-prose')
+  }
+  return index
 }
 function cellClass(value: string): string {
   const plain = value.replace(/\[\^\d+\]/g, '').replace(/[*`]/g, '').replace(/<[^>]+>/g, '').trim()
@@ -227,7 +238,7 @@ function cellClass(value: string): string {
   if (/(异常|风险|逾期|禁止|不允许|失败|冲突|废止|需人工确认)/.test(plain)) return ' class="risk"'
   return ''
 }
-function render(md: string): string {
+function render(md: string, shapes: Map<string, string>): string {
   const out: string[] = []
   let listTag: 'ul' | 'ol' | null = null
   let inCode = false, inTable = false, code: string[] = []
@@ -269,7 +280,7 @@ function render(md: string): string {
       closeList()
       // 标题降两级（+2）：回答卡片在页面大纲里层级较深；KbDocPreview 预览场景只降一级（+1），差异有意
       const level = Math.min(6, heading[1].length + 2)
-      section = headingClass(heading[2])
+      section = shapes.get(heading[2].trim()) ?? 'default'
       out.push(`<h${level} class="kb-section-title ${section}">${inline(heading[2])}</h${level}>`)
       continue
     }
@@ -355,7 +366,7 @@ const presented = computed(() =>
     : presentation(displayMarkdown.value),
 )
 const summaryHtml = computed(() => inline(escHtml(presented.value.summary)))
-const html = computed(() => render(presented.value.body))
+const html = computed(() => render(presented.value.body, shapeIndex(props.result.sections)))
 
 function spanOf(c: Citation): number {
   return c.span && c.span > 1 ? c.span : 1
@@ -609,11 +620,11 @@ function onSourcesToggle(e: Event) {
 .answer-body :deep(h3), .answer-body :deep(h4), .answer-body :deep(h5), .answer-body :deep(h6) {
   margin: 18px 0 9px; padding: 0 0 7px 10px; border-bottom: 1px solid var(--divider); border-left: 3px solid var(--border); color: var(--text-primary); font-size: 14px; font-weight: 750; line-height: 1.45;
 }
-.answer-body :deep(.kb-section-title.conclusion) { border-left-color: var(--primary); }
-.answer-body :deep(.kb-section-title.points) { border-left-color: #5174c8; }
-.answer-body :deep(.kb-section-title.action) { border-left-color: #3c9460; }
-.answer-body :deep(.kb-section-title.compare) { border-left-color: #7b67b8; }
-.answer-body :deep(.kb-section-title.caution) { border-left-color: #d38b19; }
+/* 章节色带按**形态**分（散文/要点/步骤/表），不按标题措辞 —— 见 SHAPE_CLASS 那段 */
+.answer-body :deep(.kb-section-title.shape-prose) { border-left-color: var(--primary); }
+.answer-body :deep(.kb-section-title.shape-bullets) { border-left-color: #5174c8; }
+.answer-body :deep(.kb-section-title.shape-steps) { border-left-color: #3c9460; }
+.answer-body :deep(.kb-section-title.shape-table) { border-left-color: #7b67b8; }
 .answer-body :deep(ul), .answer-body :deep(ol) { margin: 0 0 12px; padding: 0; list-style: none; counter-reset: kb-step; }
 .answer-body :deep(li) { position: relative; min-width: 0; margin: 7px 0; padding: 8px 10px 8px 25px; overflow-wrap: anywhere; border: 1px solid var(--divider); background: var(--bg-card); }
 .answer-body :deep(li)::before { content: ''; position: absolute; left: 11px; top: 1.25em; width: 5px; height: 5px; border-radius: 50%; background: var(--primary); }
@@ -623,10 +634,10 @@ function onSourcesToggle(e: Event) {
   border: 1px solid rgba(var(--primary-rgb), .25); border-radius: 50%; background: var(--primary-bg);
   color: var(--primary); font-size: 10px; font-weight: 750;
 }
-.answer-body :deep(.kb-list.points) { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.answer-body :deep(.kb-list.points li) { margin: 0; border-left: 3px solid #5174c8; }
-.answer-body :deep(.kb-list.action li) { border-left: 3px solid #3c9460; }
-.answer-body :deep(.kb-list.caution li) { border-left: 3px solid #d38b19; }
+/* 要点节的列表两栏排（并列信息横着看更快）；步骤节保持单栏纵向（有先后） */
+.answer-body :deep(.kb-list.shape-bullets) { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.answer-body :deep(.kb-list.shape-bullets li) { margin: 0; border-left: 3px solid #5174c8; }
+.answer-body :deep(.kb-list.shape-steps li) { border-left: 3px solid #3c9460; }
 .answer-body :deep(b) { color: var(--text-primary); }
 .answer-body :deep(blockquote) {
   margin: 10px 0 14px; padding: 10px 12px; border-left: 3px solid var(--primary);
@@ -645,7 +656,7 @@ function onSourcesToggle(e: Event) {
   color: var(--text-regular); font-family: var(--font-mono); font-size: 12px; line-height: 1.65;
 }
 .answer-body :deep(.kb-table-wrap) { max-width: 100%; margin: 8px 0 14px; overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; -webkit-overflow-scrolling: touch; }
-.answer-body :deep(.kb-table-wrap.compare) { border-top: 3px solid #7b67b8; }
+.answer-body :deep(.kb-table-wrap.shape-table) { border-top: 3px solid #7b67b8; }
 .answer-body :deep(table) { width: 100%; min-width: 480px; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .answer-body :deep(th), .answer-body :deep(td) { padding: 8px 10px; border-bottom: 1px solid var(--divider); text-align: left; vertical-align: top; }
 .answer-body :deep(th) { background: var(--bg-main); color: var(--text-primary); font-weight: 650; }

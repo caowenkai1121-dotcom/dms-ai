@@ -452,7 +452,7 @@ pub fn data_has_substance(r: &AskResult) -> bool {
 /// 拿它当界比任何相关度阈值都可靠 —— RRF 融合分不是标定过的相关度，阈值切不准。
 pub fn kb_has_substance(a: &Answer) -> bool {
     match &a.body {
-        dms_kernel::AnswerBody::Text { markdown, citations } => {
+        dms_kernel::AnswerBody::Text { markdown, citations, .. } => {
             !citations.is_empty() && !markdown.trim().starts_with(dms_knowledge::answer::NO_HIT)
         }
         _ => true,
@@ -492,7 +492,7 @@ pub fn into_ask_result(outcome: HybridOutcome, prepared: &PreparedQuestion) -> A
     // CLI/判官这条路只需要「知识库半答了什么」，故落 `caliber_note`；
     // HTTP 侧仍由 server 把整份 `Answer` 塞进 `v["kb"]`（协议归 server）。
     if let Some(a) = knowledge {
-        if let dms_kernel::AnswerBody::Text { markdown, citations } = &a.body {
+        if let dms_kernel::AnswerBody::Text { markdown, citations, .. } = &a.body {
             out.caliber_note = Some(format!(
                 "知识库：{}（引用 {} 条）",
                 markdown.chars().take(400).collect::<String>(),
