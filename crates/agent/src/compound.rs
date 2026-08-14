@@ -221,26 +221,34 @@ async fn summarize(
 /// 列名与 `insight::Reading::answer_contract` 的 COMPARE 域同一套中文（本期/基期/变化额/增幅）：
 /// 两处用同一批词，模型才不会因为换了说法而重新学一遍。
 fn delta_facts(data: &AskResult) -> Vec<Vec<serde_json::Value>> {
+    // 读 `comparisons` 而不是 `view.blocks[..].delta`：两者由同一个 `apply_prev` 同时落，
+    // 但前者带**完整原值**（`view` 里的 delta 只保留第一项，是给老前端的兼容位）。
+    data.comparisons
+        .iter()
+        .map(|c| {
+            vec![
+                serde_json::Value::from(main_metric_label(data)),
+                serde_json::Value::from(c.label.clone()),
+                serde_json::Value::from(c.current),
+                serde_json::Value::from(c.baseline),
+                serde_json::Value::from(c.change),
+                serde_json::Value::from(c.pct),
+            ]
+        })
+        .collect()
+}
+
+/// 主指标名：环比比的就是它。取 KPI 卡第一项的标签，没有卡时退回第一列列名。
+fn main_metric_label(data: &AskResult) -> String {
     data.view
         .blocks
         .iter()
-        .filter_map(|block| match block {
-            dms_kernel::present::Block::Kpis { items } => Some(items),
+        .find_map(|block| match block {
+            dms_kernel::present::Block::Kpis { items } => items.first().map(|k| k.label.clone()),
             _ => None,
         })
-        .flatten()
-        .filter_map(|kpi| {
-            let d = kpi.delta.as_ref()?;
-            Some(vec![
-                serde_json::Value::from(kpi.label.clone()),
-                serde_json::Value::from(d.label.clone()),
-                kpi.value.clone(),
-                serde_json::Value::from(d.baseline),
-                serde_json::Value::from(d.change),
-                serde_json::Value::from(d.pct),
-            ])
-        })
-        .collect()
+        .or_else(|| data.columns.first().cloned())
+        .unwrap_or_else(|| "主指标".to_string())
 }
 
 /// 【混合查询】「问数 + 知识库」两路结果的 AI 综合（fast LLM）。与 `summarize` 同一份纪律：
@@ -309,16 +317,20 @@ mod tests {
         use dms_kernel::present::{Block, Delta, Kpi, Semantic};
         let mut r = crate::ask::prepared_for_test_result();
         r.view.blocks = vec![Block::Kpis {
-            items: vec![
-                Kpi {
-                    label: "销售额".into(),
-                    value: serde_json::Value::from(120.0),
-                    semantic: Semantic::Money,
-                    delta: Some(Delta { pct: 13.4, dir: "up", label: "较上月".into(), baseline: 100.0, change: 20.0 }),
-                },
-                // 没有 delta 的 KPI 不产事实（不许凭空造一个基期）
-                Kpi { label: "订单数".into(), value: serde_json::Value::from(7.0), semantic: Semantic::Count, delta: None },
-            ],
+            items: vec![Kpi {
+                label: "销售额".into(),
+                value: serde_json::Value::from(120.0),
+                semantic: Semantic::Money,
+                delta: Some(Delta { pct: 13.4, dir: "up", label: "较上月".into(), baseline: 100.0, change: 20.0 }),
+            }],
+        }];
+        r.comparisons = vec![crate::ctx::KpiComparison {
+            label: "较上月".into(),
+            current: 120.0,
+            baseline: 100.0,
+            change: 20.0,
+            pct: 13.4,
+            dir: "up",
         }];
         let facts = delta_facts(&r);
         assert_eq!(facts.len(), 1, "{facts:?}");
