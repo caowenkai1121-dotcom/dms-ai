@@ -430,6 +430,7 @@ async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, 
                 ds.as_deref(),
                 None, // conv_id：MCP 无会话概念（`chat.msg.conv_id` 只存在于 HTTP 聊天）
                 st.sc_samples,
+                None, // space_id：MCP 无空间选择面
                 true,
             )
             .await;

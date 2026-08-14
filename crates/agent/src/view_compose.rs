@@ -84,6 +84,11 @@ fn worth_composing(r: &AskResult) -> bool {
     if r.rows.len() < MIN_ROWS || r.columns.len() < 2 || !r.subs.is_empty() {
         return false;
     }
+    // 🔴 结果被截断时不编排：`aggregate` 只看回传的这几行，算出来的「合计」是**小计**，
+    // 而卡上写着「合计」。宁可少一张 KPI 卡，不给一个悄悄少算的数（2026-08-14 自审）。
+    if r.truncated {
+        return false;
+    }
     // 反问卡/出界卡没有数据可编排（它们的 blocks 是文案载体）
     if r.sql.trim().is_empty() {
         return false;
@@ -163,10 +168,14 @@ fn build_blocks(plan: &Plan, view: &ViewSpec, rows: &[Vec<Value>]) -> Vec<Block>
                 let Some((value, semantic)) = aggregate(rows, *col, agg, spec.semantic) else {
                     continue;
                 };
-                let Some(label) = safe_title(label).or_else(|| default_stat_label(agg, &spec.name))
-                else {
-                    continue;
+                // 🔴 计数类的标题**只由代码拼**：`count` 数的是**行数**，而模型常写成
+                // 「客户数」——一行一个客户时它对，一个客户多行时它就是个错数，
+                // 且错在标题上（数字本身没错），比错数更难发现。
+                let label = match agg.as_str() {
+                    "count" | "distinct" => default_stat_label(agg, &spec.name),
+                    _ => safe_title(label).or_else(|| default_stat_label(agg, &spec.name)),
                 };
+                let Some(label) = label else { continue };
                 if stats.iter().any(|k| k.label == label) {
                     continue;
                 }
@@ -301,7 +310,9 @@ fn default_stat_label(agg: &str, column: &str) -> Option<String> {
 /// 标题清洗：**含数字即拒**（一个带数字的标题就是一句未经核验的断言），去围栏字符，限长。
 fn safe_title(raw: &str) -> Option<String> {
     let t = raw.trim().replace(['`', '|', '\n'], "");
-    if t.is_empty() || t.chars().any(|c| c.is_ascii_digit()) {
+    // 中文数字与全角数字同样是数字：只拒 ASCII 的话，模型写「合计一万二千元」照样进标题
+    const CN_DIGITS: &str = "零〇一二两三四五六七八九十百千万亿０１２３４５６７８９";
+    if t.is_empty() || t.chars().any(|c| c.is_ascii_digit() || CN_DIGITS.contains(c)) {
         return None;
     }
     let t: String = t.chars().take(TITLE_MAX_CHARS).collect();

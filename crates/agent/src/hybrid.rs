@@ -267,8 +267,15 @@ pub async fn dual_outcome(
     let data = match data_r {
         Ok(r) => r,
         Err(e) => {
-            // 两路皆挂才上抛（fail-closed，不伪造半个答案）
-            let Some(a) = knowledge else { return Err(e) };
+            // 🔴 权限类失败**一律上抛**，资料半有没有答出来都不算数（2026-08-14 自审）：
+            // 「无权访问数据源」「权限注入失败」是本仓的 fail-closed 信号，降级成一句 warn
+            // 就变成「用户拿到 200 + 一份资料答案」，而他其实**没有权限**看这份数据。
+            // 其余失败（取数超时、SQL 执行错）才允许退化成单臂。
+            let msg = e.to_string();
+            let permission_failure = ["无权", "权限", "scope", "Scope", "principal", "Principal"]
+                .iter()
+                .any(|word| msg.contains(word));
+            let Some(a) = knowledge.filter(|_| !permission_failure) else { return Err(e) };
             tracing::warn!(err = %e, "两臂并行：问数路失败 → 只用资料半");
             return Ok(only_kb(a));
         }
@@ -313,41 +320,13 @@ pub fn data_has_substance(r: &AskResult) -> bool {
 /// 资料臂**答出东西了**吗。判据只有一条：模型给不出任何带角标的结论时，
 /// `finalize_markdown` 会把整份答案换成 [`dms_knowledge::answer::NO_HIT`]。
 /// 拿它当界比任何相关度阈值都可靠 —— RRF 融合分不是标定过的相关度，阈值切不准。
-fn kb_has_substance(a: &Answer) -> bool {
+pub fn kb_has_substance(a: &Answer) -> bool {
     match &a.body {
         dms_kernel::AnswerBody::Text { markdown, citations } => {
             !citations.is_empty() && !markdown.trim().starts_with(dms_knowledge::answer::NO_HIT)
         }
         _ => true,
     }
-}
-
-/// 纯资料问句（`IntentRoute::Knowledge`）：直接走知识库半。
-///
-/// `None` = 本次调用没有 KB 臂或知识库这一路失败 → 由调用方出澄清卡。
-/// 失败也返 `None` 而不是伪造空答案：知识库答不出来时编一段话，比说不知道糟得多。
-pub async fn knowledge_only(
-    d: &AskDeps<'_>,
-    p: &Principal,
-    prepared: &PreparedQuestion,
-) -> Option<AskResult> {
-    let kb = d.kb.as_ref()?;
-    let answer = crate::answerers::knowledge::answer(
-        kb.owned,
-        d.embed,
-        &**d.llm,
-        p,
-        kb.space,
-        &prepared.effective_question,
-        kb.weights,
-    )
-    .await
-    .map_err(|e| tracing::warn!(err = %e, "纯资料问句的知识库路失败 → 退回澄清卡"))
-    .ok()?;
-    Some(into_ask_result(
-        HybridOutcome { data: None, knowledge: Some(answer), summary: None, clarification: None },
-        prepared,
-    ))
 }
 
 /// 类型化产物 → `AskResult`。**CLI/判官那条路的出口**：HTTP 侧另有自己的 wire 形状
@@ -435,6 +414,94 @@ fn data_ms(subs: &[crate::ctx::SubResult]) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn card(route: &str, sql: &str, blocks: Vec<dms_kernel::present::Block>, rows: usize) -> AskResult {
+        let mut r = crate::ctx::AskResult::compound(vec![], 0);
+        r.route = route.into();
+        r.sql = sql.into();
+        r.row_count = rows;
+        r.view.blocks = blocks;
+        r.subs = vec![];
+        r
+    }
+
+    /// 🔴「有块」不等于「有内容」：确定性视图对空结果同样兜底成 `[Table]`，
+    /// 于是 0 行的失败查询曾被判成「有实质」，把真正答出东西的资料半挤成侧栏
+    /// （生产实测 `route=llm+repair, rows=0` 却当了主答案）。
+    #[test]
+    fn empty_table_is_not_substance_but_cards_are() {
+        use dms_kernel::present::Block;
+        assert!(!data_has_substance(&card("llm+repair", "SELECT 1", vec![Block::Table], 0)));
+        assert!(data_has_substance(&card("llm", "SELECT 1", vec![Block::Table], 3)));
+        // 卡片自带内容，0 行也算
+        let entity = Block::Entity { pairs: vec![("单号".into(), serde_json::Value::from("X"))] };
+        assert!(data_has_substance(&card("direct-doc", "SELECT 1", vec![entity], 0)));
+        // 「我答不了」的四种说法一个都不算
+        for route in [crate::ask::NEED_INTENT, crate::ask::NO_TOPIC] {
+            assert!(!data_has_substance(&card(route, "", vec![Block::Table], 0)), "{route}");
+        }
+        let unavailable = card("direct-agg", "SELECT '不可计算' AS `数据状态`", vec![Block::Table], 1);
+        assert!(!data_has_substance(&unavailable), "不可计算卡不算答出东西");
+    }
+
+    /// 资料臂的实质判据：模型给不出带角标的结论时 `finalize_markdown` 会整份换成 `NO_HIT`。
+    #[test]
+    fn kb_substance_needs_citations_and_not_no_hit() {
+        use dms_kernel::{Answer, Citation};
+        // 只需要「有没有引用」，字段值不重要
+        let cite = || Citation { doc_id: "d".into(), doc_name: "n".into(), chunk_id: 1, ..Citation::default() };
+        assert!(kb_has_substance(&Answer::text("有结论[^1]".into(), vec![cite()], 1)));
+        assert!(!kb_has_substance(&Answer::text("有结论[^1]".into(), vec![], 1)), "没引用不算");
+        assert!(
+            !kb_has_substance(&Answer::text(dms_knowledge::answer::NO_HIT.into(), vec![cite()], 1)),
+            "NO_HIT 不算"
+        );
+    }
+
+    /// 四档合成：问数为主 + 资料挂 `kb`；只有一边时不套壳、不丢内容。
+    #[test]
+    fn fuse_covers_all_four_branches() {
+        use dms_kernel::present::Block;
+        let prepared = crate::ask::prepared_for_test("本月销售额");
+        let data = || card("direct-agg", "SELECT 1", vec![Block::Table], 2);
+        let answer = || dms_kernel::Answer::text("资料结论[^1]".into(), vec![], 1);
+
+        // ① 两边都有 → 问数主体 + kb 挂件 + 综合落 insight
+        let both = fuse(
+            HybridOutcome { data: Some(data()), knowledge: Some(answer()), summary: Some("综合".into()), clarification: None },
+            &prepared,
+        );
+        assert_eq!(both.route, "direct-agg", "主体必须还是问数结果");
+        assert_eq!(both.row_count, 2, "行数不许被容器清零");
+        assert!(both.kb.is_some(), "资料半必须挂在 kb 上");
+        assert_eq!(both.view.insight.as_deref(), Some("综合"));
+
+        // ② 只有问数 → 逐字原样（wire 与改造前一致）
+        let only_data = fuse(
+            HybridOutcome { data: Some(data()), knowledge: None, summary: None, clarification: None },
+            &prepared,
+        );
+        assert_eq!(only_data.route, "direct-agg");
+        assert!(only_data.kb.is_none());
+
+        // ③ 只有资料 → route=knowledge，且**整份 Answer 带出去**（HTTP 要靠它重塑形状）
+        let only_kb = fuse(
+            HybridOutcome { data: None, knowledge: Some(answer()), summary: None, clarification: None },
+            &prepared,
+        );
+        assert_eq!(only_kb.route, "knowledge");
+        assert!(only_kb.kb.is_some(), "纯资料答案必须把原件带出去，否则角标点不开");
+
+        // ④ 澄清卡原样返回
+        let mut clar = card(crate::ask::NEED_INTENT, "", vec![], 0);
+        clar.caliber_note = Some("请补充".into());
+        let out = fuse(
+            HybridOutcome { data: None, knowledge: None, summary: None, clarification: Some(clar) },
+            &prepared,
+        );
+        assert_eq!(out.route, crate::ask::NEED_INTENT);
+        assert_eq!(out.caliber_note.as_deref(), Some("请补充"));
+    }
 
     fn rq(route: IntentRoute, q: &str) -> RoutedQuestion {
         RoutedQuestion { route, question: q.to_string() }

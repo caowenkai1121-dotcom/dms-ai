@@ -316,6 +316,20 @@ fn has_measurable_slots(attempt: &crate::intent::IntentAttempt) -> bool {
     })
 }
 
+/// 测试用的最小 `PreparedQuestion`（不调模型、合同为空）。
+///
+/// 放在生产代码里而不是测试段：测试段里的项只对本模块的测试可见，
+/// 而 `hybrid` 的行为测试在另一个模块，引不到。
+#[doc(hidden)]
+pub fn prepared_for_test(question: &str) -> PreparedQuestion {
+    PreparedQuestion {
+        original_question: question.to_string(),
+        effective_question: question.to_string(),
+        intent_attempt: crate::intent::IntentAttempt::Unavailable,
+        started_at: Instant::now(),
+    }
+}
+
 /// 统一入口准备：多轮改写 → 日期继承 → 错字归一 → 一次结构化意图解析。
 pub async fn prepare_question(
     llm: &dyn ChatModel,
@@ -358,6 +372,20 @@ pub async fn ask(
 ) -> anyhow::Result<AskResult> {
     let prepared = prepare_question(&**d.llm, d.on_usage, question, prev).await;
     ask_prepared(d, p, &prepared, explicit_ds).await
+}
+
+/// [`ask`] 的**只跑问数臂**变体。给「产物形状必须是一份取数结果」的调用方用
+/// （深度报告的板块子问：它只取 `columns/rows/sql`，资料半整份会被丢掉 ——
+/// 那就是白打一次检索加一次生成，每个板块一次）。
+pub async fn ask_data_only(
+    d: &AskDeps<'_>,
+    p: &Principal,
+    question: &str,
+    prev: Option<PrevTurn<'_>>,
+    explicit_ds: Option<&str>,
+) -> anyhow::Result<AskResult> {
+    let prepared = prepare_question(&**d.llm, d.on_usage, question, prev).await;
+    ask_prepared_data_only(d, p, &prepared, explicit_ds).await
 }
 
 /// 执行一份已经准备好的问句。调用方不得重新抽取意图；选源、compound 与所有
@@ -444,7 +472,23 @@ pub(crate) async fn ask_data_arm(
     let scope = compute_scope_cached(d.auth, p).await?;
     let rewritten = prepared.effective_question.clone();
     // 【K3-B ③】选源。判据顺序在 `source::select_source`（显式 > 单源直通 > 向量最近邻）
-    let picked = source::select_source(&**d.llm, d.pg, d.embed, p, &rewritten, explicit_ds).await?;
+    //
+    // 🔴 **单号锁主源**（2026-08-14 生产实测）：问句里有已登记的单据号时，源是由
+    // `DocumentFamily` 注册表**证明**的（那张表在哪个库是登记好的事实），不该再交给
+    // 向量最近邻猜。实测「订单 HJXH-DXO2026081300138」里的「订单」二字把选源推到了
+    // 某个用户**上传的数据源**上，于是单据 SQL 打进别人的上传 schema：
+    //   `查询失败 [upload_390f2419-…] 上传数据源只允许访问 schema up_390f2419_… 里已登记的表`
+    // 结果 direct-doc 整条路失败、回落自由 SQL 返 0 行。而裸单号（没有「订单」二字）
+    // 向量选到主源，同一张单就查得出来 —— 同一个单号，多两个字就查不到。
+    //
+    // 用户显式选了源（`explicit_ds`）时不夺权：那是他自己的选择。
+    let has_document_code = explicit_ds.is_none()
+        && dms_semantic::document::resolve_document(&rewritten, d.dms.is_warehouse()).is_some();
+    let picked = if has_document_code {
+        ds_reg::DMS_DS_ID.to_string()
+    } else {
+        source::select_source(&**d.llm, d.pg, d.embed, p, &rewritten, explicit_ds).await?
+    };
     (d.on_ds)(&picked);
     let (extra, ds_global) = open_source(d.registry, d.pg, &picked).await?;
     let source: &dyn SqlSource = match &extra {
@@ -512,6 +556,8 @@ pub(crate) async fn ask_data_arm(
                 llm: d.llm,
                 ds_global,
                 t0,
+                // 资料问句/无合同的问数臂：连成员内部的 ODS 推导也不许写新 SQL
+                deterministic_only: deterministic_fallback,
                 trace_id: trace_id.clone(),
                 conv_id: conv_id.clone(),
                 on_usage: d.on_usage,
@@ -2230,6 +2276,31 @@ mod tests {
     ///    确定性成员照跑，自由 SQL 仍然关死。
     /// ③ Hybrid 合同只能由 `hybrid::run` 出手，不许落进两臂档。
     /// ④ 兜底档摘掉 `llm` 成员。
+    /// 🔴 单号锁主源：源由单据族注册表**证明**，不交给向量最近邻猜。
+    ///
+    /// 生产实测（2026-08-14）：「订单 HJXH-DXO2026081300138」里的「订单」二字把选源
+    /// 推到某个用户上传的数据源，单据 SQL 打进别人的上传 schema 当场失败、回落自由 SQL
+    /// 返 0 行；而**裸单号**同一张单查得出来 —— 同一个单号，多两个字就查不到。
+    #[test]
+    fn a_document_code_pins_the_main_source() {
+        let src = include_str!("ask.rs");
+        let arm = src.split("pub(crate) async fn ask_data_arm(").nth(1).expect("ask_data_arm 改名了");
+        assert!(
+            arm.contains("let has_document_code = explicit_ds.is_none()")
+                && arm.contains("dms_semantic::document::resolve_document(&rewritten"),
+            "单号又回去参与向量选源了：{arm}"
+        );
+        // 用户显式选了源就不夺权
+        assert!(arm.contains("explicit_ds.is_none()"), "显式选源必须优先：{arm}");
+        // 判据本体：带不带类别词都认同一个单号
+        for q in ["HJXH-DXO2026081300138", "订单 HJXH-DXO2026081300138", "查 HJXH-DXO2026081300138"] {
+            assert!(
+                dms_semantic::document::resolve_document(q, true).is_some(),
+                "{q} 应当被识别成单据号"
+            );
+        }
+    }
+
     /// 🔴 单号在追问改写前后必须**逐字**活下来。
     ///
     /// 生产实测（2026-08-14）：「订单 HJXH-DXO2026081300138」两次得到两个不同结果

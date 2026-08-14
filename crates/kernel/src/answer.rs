@@ -73,7 +73,10 @@ pub struct SubAnswer {
 
 /// 引用来源。字段集是裁决过的（`docs/superpowers/plans/_DECISIONS.md` 二·C）：
 /// 前端点开原文要 `chunk_id` + `page`，塞进一个字符串 locator 等于让前端解字符串。
-#[derive(Debug, Serialize)]
+///
+/// `Default` 只为测试构造用（字段多、且都是「有就填」的可选治理信息）；
+/// 生产侧一律由 `knowledge::answer::citations` 从 `Hit` 填满。
+#[derive(Debug, Serialize, Default)]
 pub struct Citation {
     pub doc_id: String,
     pub doc_name: String,

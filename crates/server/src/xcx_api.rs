@@ -677,6 +677,7 @@ async fn ask_data_payload(
         None, // ds：小程序侧不提供选源，后端选源（可见源只有一个时直通主源）
         Some(&conv_id_str),
         st.sc_samples,
+        None, // space_id：小程序无空间选择面（恒不限空间）
         true,
     )
     .await;

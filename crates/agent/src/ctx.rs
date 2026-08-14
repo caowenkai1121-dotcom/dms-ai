@@ -53,6 +53,13 @@ pub struct AskCtx<'a> {
     /// 成员各自 `Instant::now()` 会让排在后面的成员把自己之前的耗时全丢掉，
     /// 快路径与缓存那两处实测差十几毫秒：读日志的人会以为缓存比实际更快。
     pub t0: Instant,
+    /// 🔴 本轮**不许生成新 SQL 形态**（合同没就绪 / 资料问句的问数臂）。
+    ///
+    /// `ask_data_arm` 的 `members.retain(|m| m.route() != "llm")` 只摘掉 Router 末位的
+    /// `LlmAnswerer` —— 而 `direct-doc` 成员内部的 ODS 推导（`fastpath_intent::ods_derive`）
+    /// 本身就是一次 Precise 模型自由写 SQL 并执行。两臂并行让资料问句的问数臂也跑起来之后，
+    /// 只摘 Router 末位就关不住这条路了（2026-08-14 自审发现）。
+    pub deterministic_only: bool,
     /// 一次问答的关联键（子问题共用父的）。透传到 `correction_log` / `failure_log` / `query_log` ——
     /// 三张表各记一段，没有这个键就拼不回同一次问答（`chat.rs:117` 已吃过一次这个亏）。
     /// **写入侧失败不许让问答失败**：观测掉了不算故障（`query_log.rs` 的纪律 1）。

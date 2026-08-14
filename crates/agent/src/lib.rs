@@ -46,8 +46,8 @@ pub use analysis::{AnalysisKind, AnalysisPlan, AnalysisShape, ReportSpec};
 // HTTP / CLI / 定时任务三入口共用的唯一入口。`AskDeps` 里的三个 `fn` 指针与 `correctors`
 // 是 T8/T10 的临时入参（实现仍在 `server/src/{direct,corrector}.rs`），那两处各有一行 ponytail 记账。
 pub use ask::{
-    ask, ask_prepared, ask_prepared_data_only, is_followup, prepare_question, AskDeps, DetectFn,
-    HitFn, PreparedQuestion,
+    ask, ask_data_only, ask_prepared, ask_prepared_data_only, is_followup, prepare_question,
+    AskDeps, DetectFn, HitFn, PreparedQuestion,
 };
 pub use ctx::{
     table_answer, truncation_note, AskCtx, AskResult, ClarifyOption, Step, SubResult, SupplementalResult,

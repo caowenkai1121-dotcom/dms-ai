@@ -2242,8 +2242,11 @@ async fn sub_ask(
     ds: Option<&str>,
 ) -> Option<(Vec<String>, Vec<Vec<serde_json::Value>>, String)> {
     // 子问 SC=1：它们命中确定性模板（ship 系），投票只烧 LLM 不提质
+    // 板块子问只取 columns/rows/sql —— 资料半整份会被丢掉，跑它就是每个板块白打一次
+    // 检索加一次生成（自审发现的净增成本）。空间同理传 None：这条路不出资料答案。
     let (r, _log) = crate::ask(
         &st.llm, &st.auth_mysql, &st.mysql, &st.sources, st.owned.pool(), &st.embed, p, q, None, ds, None, 1,
+        None, false,
     )
     .await;
     match r {
@@ -4731,6 +4734,7 @@ async fn compose_inner(
         req.ds.as_deref(),
         conv_id.as_deref(),
         sc,
+        None,
         // 深度报告只要问数臂：主结果要拿去拼板块，compound 壳会让整份报告散架
         false,
     );

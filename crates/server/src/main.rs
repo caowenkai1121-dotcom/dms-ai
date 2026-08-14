@@ -544,6 +544,8 @@ async fn eval_batch_one(
             eval_ds,
             None,
             sc_samples,
+            None,  // space_id：评测不选空间
+            false, // 评测只对问数结果打分，资料臂跑了也没人看
         )
         .await;
         // 与一次性 ask CLI 一样，在输出前等观测写入完成；写日志失败不改变业务结果。
@@ -1184,8 +1186,11 @@ async fn main() -> anyhow::Result<()> {
         // 第三位【证据引用】恒空：CLI 没有「圈选上轮结果」的输入面（与 conv_id=None 同一个约定）。
         let prev = slot(5).map(|q| (q, slot(6), &[] as &[&str], &[] as &[&str]));
         let (r, log) =
-            ask(&client, &auth_mysql, &mysql, &sources, pg, &embed, &p, &args[3], prev, None, None, cfg.sc_samples)
-                .await;
+            ask(
+                &client, &auth_mysql, &mysql, &sources, pg, &embed, &p, &args[3], prev, None, None,
+                cfg.sc_samples, None, true,
+            )
+            .await;
         // CLI 是一次性进程：不 await 写入句柄，`main` 返回时 spawn 出的 INSERT 还没跑，
         // 进程退出连任务一起带走 —— `query_log` 整行丢失（实测）。服务侧则直接丢弃句柄。
         let _ = log.await;
@@ -2084,6 +2089,7 @@ async fn ask_arms_payload(
         req.conv_id.map(|c| c.to_string()).as_deref(),
         if req.mode.as_deref() == Some("deep") { st.sc_samples.max(3) } else { st.sc_samples },
         prepared,
+        req.space_id.as_deref(),
         true,
     )
     .await?;
@@ -2110,35 +2116,6 @@ async fn ask_arms_payload(
 }
 
 
-/// `/api/ask` 与 `/api/ask/stream` 共用的问数分支：`crate::ask` → 错误映射 → payload。
-/// 「无权访问数据源」是权限拒绝 → 403，其余 422（与迁移前逐字一致）。
-async fn ask_data_payload(
-    st: &AppState,
-    req: &AskReq,
-    gate: &AskGate,
-    prepared: &PreparedAsk,
-) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let r = ask_data_run(
-        st,
-        &gate.p,
-        req.ds.as_deref(),
-        req.conv_id.map(|c| c.to_string()).as_deref(),
-        // 【深度模式】SC 抬到 ≥3：多数派投票是现成的「AI 深度参与生成」件
-        //（配置 sc_samples 已 ≥3 时不降 —— max 不是 overwrite）
-        if req.mode.as_deref() == Some("deep") {
-            st.sc_samples.max(3)
-        } else {
-            st.sc_samples
-        },
-        prepared,
-        true,
-    )
-    .await?;
-    let mut payload =
-        serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
-    insight_api::attach_analysis_receipt(&mut payload, &req.question, &gate.p);
-    Ok(payload)
-}
 
 /// 问数半的执行体（`AskResult` 本体，未序列化）：`ask_data_payload` 与混合查询编排共用，
 /// 错误映射（403 无权 / 422 问数失败）只有这一份。入参是拆开的字段而不是 `AskReq`/`AskGate`
@@ -2151,6 +2128,8 @@ async fn ask_data_run(
     conv_id: Option<&str>,
     sc_samples: usize,
     prepared: &PreparedAsk,
+    // 页面上选定的知识空间（此前被写死成 None，用户选的空间被静默忽略）
+    space_id: Option<&str>,
     // `false` = 只跑问数臂。流式 Knowledge 分支拿它**先探一次数据**：探到实质就整轮走
     // 同步双臂答案，探不到才把知识库流式推给前端（见 `api_ask_stream` 的 Knowledge 臂）。
     dual_arms: bool,
@@ -2170,6 +2149,7 @@ async fn ask_data_run(
         // 「query_log 当年没有 conv_id，从它拿不回本会话上一轮」
         conv_id,
         sc_samples,
+        space_id,
         dual_arms,
     )
     .await;
@@ -2735,7 +2715,7 @@ async fn api_ask_stream(
     }
     match route {
         IntentRoute::Data => {
-            let payload = ask_data_payload(&st, &req, &gate, &prepared).await?;
+            let payload = ask_arms_payload(&st, &req, &gate, &prepared).await?;
             ask_persist(&st, req.conv_id, &req.question, &payload).await;
             Ok(Json(payload).into_response())
         }
@@ -2754,6 +2734,7 @@ async fn api_ask_stream(
                 req.conv_id.map(|c| c.to_string()).as_deref(),
                 st.sc_samples,
                 &prepared,
+                req.space_id.as_deref(),
                 false,
             )
             .await
@@ -2852,6 +2833,11 @@ async fn ask(
     // CLI / `mcp_api::tool_ask` 无会话概念恒传 `None`（与 `explicit_ds` 同一个约定）。
     conv_id: Option<&str>,
     sc_samples: usize,
+    // 页面上选定的知识空间（`None` = 不限空间，ACL 仍由 retrieve 在 SQL 内把关）
+    space_id: Option<&str>,
+    // `false` = 只跑问数臂，且**不给 KbArm**。深度报告的板块子问只取 columns/rows/sql，
+    // 资料半整份会被丢掉 —— 那就是每个板块白打一次检索加一次生成。
+    dual_arms: bool,
     // 返回值带观测写入句柄：服务侧调用方丢弃它（fire-and-forget，主链路不多一次往返），
     // CLI 一次性进程必须 await —— 否则进程退出时 spawn 出的 INSERT 还没跑（实测整行丢失）。
 ) -> (anyhow::Result<dms_agent::AskResult>, tokio::task::JoinHandle<()>) {
@@ -2897,11 +2883,12 @@ async fn ask(
         // 🔴 这里此前是 `None` —— 于是 CLI / MCP / 深度子问这条链**答不了任何文档问题**：
         // 混合问句的知识半被静默丢掉（实测 `route=compound, subs=1`），纯资料问句退澄清卡。
         // 从已有池借一个 store（`from_pool` 不新建池），不为它给十个调用点各加一个形参。
-        kb: Some(dms_agent::hybrid::KbArm {
+        // `None` = 本次不跑资料臂（深度板块子问）。空间由调用方给：页面上选定的知识空间
+        // 此前被这里写死的 `None` 静默忽略，检索范围扩大到该 viewer 可见的全部空间。
+        kb: dual_arms.then(|| dms_agent::hybrid::KbArm {
             owned: &kb_store,
             weights: &kb_weights,
-            // 不限空间：被授权看别人空间的人也得检索得到，ACL 由 retrieve 在 SQL 内把关
-            space: None,
+            space: space_id,
         }),
         main_source_name: &main_source_name,
         on_usage: &on_usage,
@@ -2910,7 +2897,11 @@ async fn ask(
         conv_id,
         sc_samples,
     };
-    let out = dms_agent::ask(&deps, p, question, prev, explicit_ds).await;
+    let out = if dual_arms {
+        dms_agent::ask(&deps, p, question, prev, explicit_ds).await
+    } else {
+        dms_agent::ask_data_only(&deps, p, question, prev, explicit_ds).await
+    };
     let log = query_log::finish(pg, &trace, &p.login_name, question, &out, t0.elapsed().as_millis());
     (out, log)
 }
@@ -2929,6 +2920,8 @@ async fn ask_prepared(
     explicit_ds: Option<&str>,
     conv_id: Option<&str>,
     sc_samples: usize,
+    // 页面上选定的知识空间（`None` = 不限空间，ACL 仍由 retrieve 在 SQL 内把关）
+    space_id: Option<&str>,
     // `dual_arms=false` = **只跑问数臂**。深度 BI 报告拿主结果去拼板块
     // （`primary.columns` / `primary.rows` / `document_evidence`），
     // 两臂合成出来的 compound 壳会让整份报告散架。
@@ -2970,11 +2963,12 @@ async fn ask_prepared(
         // 🔴 这里此前是 `None` —— 于是 CLI / MCP / 深度子问这条链**答不了任何文档问题**：
         // 混合问句的知识半被静默丢掉（实测 `route=compound, subs=1`），纯资料问句退澄清卡。
         // 从已有池借一个 store（`from_pool` 不新建池），不为它给十个调用点各加一个形参。
-        kb: Some(dms_agent::hybrid::KbArm {
+        // `None` = 本次不跑资料臂（深度板块子问）。空间由调用方给：页面上选定的知识空间
+        // 此前被这里写死的 `None` 静默忽略，检索范围扩大到该 viewer 可见的全部空间。
+        kb: dual_arms.then(|| dms_agent::hybrid::KbArm {
             owned: &kb_store,
             weights: &kb_weights,
-            // 不限空间：被授权看别人空间的人也得检索得到，ACL 由 retrieve 在 SQL 内把关
-            space: None,
+            space: space_id,
         }),
         main_source_name: &main_source_name,
         on_usage: &on_usage,
@@ -3838,7 +3832,7 @@ mod tests {
         assert!(cli.contains("let auth_mysql = auth_source(&cfg).await?"), "CLI 没建立固定 DMS 认证源");
         assert!(
             cli.contains("principal::load_principal(&auth_mysql")
-                && cli.contains("ask(&client, &auth_mysql, &mysql"),
+                && cli.contains("&client, &auth_mysql, &mysql"),
             "CLI 又把热切换后的分析库当成身份/权限库了"
         );
     }

@@ -1021,7 +1021,12 @@ pub fn direct_hit<'a>(cx: &'a crate::ctx::AskCtx<'a>) -> dms_kernel::BoxFut<'a, 
 /// 推导资格：只有「DMS 主库 + 数仓源」才有 ODS 层可推。生产 MySQL 在进 Router 前已被
 /// business-lookup 硬切；其他数据源没有这份静态目录（召回与卡渲染都按 dms 目录来）。
 fn derive_eligible(cx: &crate::ctx::AskCtx<'_>) -> bool {
-    cx.source.is_warehouse() && cx.ds == dms_semantic::registry::datasource::DMS_DS_ID
+    // 🔴 推导 = 一次 Precise 模型自由写 SQL。合同没就绪、或这是资料问句的问数臂时
+    // （`AskCtx::deterministic_only`），这条路必须关死 —— Router 末位摘掉 `LlmAnswerer`
+    // 拦不住它，因为它长在 `direct-doc` 成员**内部**。
+    !cx.deterministic_only
+        && cx.source.is_warehouse()
+        && cx.ds == dms_semantic::registry::datasource::DMS_DS_ID
 }
 
 /// LLM 组推导 SQL：仅候选 ODS 表的 schema 卡 + 规则时间窗，一次 precise 调用。

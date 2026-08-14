@@ -767,7 +767,11 @@ fn source_numbers_of(hit: &Hit) -> Vec<String> {
 fn is_presentation_structure(lines: &[&str], index: usize) -> bool {
     let line = lines[index].trim();
     if is_heading_line(line) {
-        return numbers(line).is_empty();
+        // 🔴 中文数字也算数字（2026-08-14 自审）：`numbers()` 只认 ASCII，于是
+        // `## 报销上限为八百元` 走标题豁免 —— 既不要角标也不过数值核验，
+        // 编造的金额直接上线。标题豁免的前提是「标题不承载业务事实」，带数字就不是标题了。
+        const CN_DIGITS: &str = "零〇一二两三四五六七八九十百千万亿０１２３４５６７８９";
+        return numbers(line).is_empty() && !line.chars().any(|c| CN_DIGITS.contains(c));
     }
     if line.len() < 3 || !(line.starts_with('|') && line.ends_with('|')) {
         return false;
@@ -790,7 +794,14 @@ fn is_heading_line(line: &str) -> bool {
     if (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
         return true;
     }
-    line.len() > 4 && line.starts_with("**") && line.ends_with("**")
+    // 🔴 整行加粗**限长**（2026-08-14 自审）：LLM 很常把一整句结论写成 `**……**`，
+    // 不限长就等于「任何不含数字的编造结论都能当标题偷渡」——标题豁免连角标闸一起跳过。
+    // 真标题都很短；20 字以上的加粗行按正文走，该要角标就要角标。
+    const HEADING_MAX_CHARS: usize = 20;
+    line.len() > 4
+        && line.starts_with("**")
+        && line.ends_with("**")
+        && line.chars().count() <= HEADING_MAX_CHARS + 4
 }
 
 fn is_table_separator(line: &str) -> bool {
@@ -822,16 +833,37 @@ fn has_supported_content(md: &str) -> bool {
 /// 这两类恰恰是 [`business_values`] 刻意排除在「数值」之外的，所以要有自己的判据 ——
 /// 否则模型可以凭空写一个银行账号而无人核对。
 fn identifier_tokens(text: &str) -> Vec<String> {
-    text.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| {
-            let long_number = token.len() >= 12 && token.bytes().all(|b| b.is_ascii_digit());
-            let mixed = token.len() >= 4
-                && token.bytes().any(|b| b.is_ascii_alphabetic())
-                && token.bytes().any(|b| b.is_ascii_digit());
-            long_number || mixed
-        })
+    let mut out: Vec<String> = text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| is_identifier_token(token))
         .map(|token| token.to_ascii_uppercase())
-        .collect()
+        .collect();
+    // 🔴 长数字**另走 `numbers`**（2026-08-14 自审）：`810,000,297,001,000,001` 按
+    // 非字母数字切开后每段只有 3 位，两道闸都放行 —— 一个逗号就绕开了整道闸。
+    // 不在上面那次 split 里保留逗号：那样 `123456789012,987654321098` 会被粘成一个
+    // 24 位 token，源侧分两处写就比对不上，**真句子被整句删掉**（本文件红字警告过的翻车形态）。
+    // `numbers` 逐段扫描、自带千分位归一，天然不跨分隔符粘连。
+    out.extend(
+        numbers(text)
+            .into_iter()
+            .filter(|n| is_identifier_token(n))
+            .map(|n| n.to_ascii_uppercase()),
+    );
+    out
+}
+
+/// 「这个 token 是标识符还是数值」——与 [`business_values`] 的屏蔽判据**同一条**。
+///
+/// 🔴 两处曾各写一份且不一致：`business_values` 屏蔽**任意长度**的字母数字混排块，
+/// 而这里要求 `len >= 4`。于是原文写「适用机型 B7」、模型写「适用机型 A1」时，
+/// 数值闸把 `A1` 整块屏蔽（无数字可比），标识符闸又因为太短而不收 —— 两道闸都放行，
+/// 编造的机型号原样留在答案里。
+fn is_identifier_token(token: &str) -> bool {
+    let digits = token.trim_start_matches('-');
+    let long_number = digits.len() >= 12 && digits.bytes().all(|b| b.is_ascii_digit());
+    let mixed = token.bytes().any(|b| b.is_ascii_alphabetic())
+        && token.bytes().any(|b| b.is_ascii_digit());
+    long_number || mixed
 }
 
 /// 句子里出现的标识符必须**整串**出现在它引用的原文里。大小写不敏感 ——
@@ -1195,10 +1227,9 @@ fn business_values(text: &str) -> Vec<String> {
     flush(&mut token, &mut masked);
     numbers(&masked)
         .into_iter()
-        .filter(|n| {
-            let digits = n.trim_start_matches('-');
-            !(digits.len() >= 12 && digits.bytes().all(|b| b.is_ascii_digit()))
-        })
+        // 与 `is_identifier_token` 同一条：≥12 位纯整数是标识符不是金额/数量。
+        // `numbers()` 已经把千分位剥掉了，所以这里直接看长度。
+        .filter(|n| !is_identifier_token(n))
         .collect()
 }
 
