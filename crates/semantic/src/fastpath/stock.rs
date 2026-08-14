@@ -215,7 +215,20 @@ pub fn stock_product_unavailable(fragment: &str, reason: &str) -> DirectHit {
 
 
 
+/// 模板兑现了哪个指标，模板自己说 —— `compose::hit` 造出来的 `intent_evidence` 是空的，
+/// 于是收据里每个槽位都只敢标「grounded（抽到了但没证明落进 SQL）」，
+/// 而这些 SQL 是代码写死的、指标名就是它自己写的列别名（生产回归 E10 的最后一格）。
+///
+/// 六个 return 各写一遍必漂：证据取自**产出的 SQL 别名本身**，一处收口。
 pub fn stock_snapshot(question: &str) -> Option<DirectHit> {
+    let mut hit = stock_snapshot_sql(question)?;
+    let metric = if hit.sql.contains("`库存金额`") { "库存金额" } else { "库存量" };
+    hit.intent_evidence = std::mem::take(&mut hit.intent_evidence)
+        .resolve(IntentSlotKind::Metric, metric);
+    Some(hit)
+}
+
+fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
     if !["库存", "存货"].iter().any(|w| question.contains(w)) {
         return None;
     }
