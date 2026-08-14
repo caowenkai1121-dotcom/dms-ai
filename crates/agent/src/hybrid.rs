@@ -239,11 +239,12 @@ fn fuse(outcome: HybridOutcome, prepared: &PreparedQuestion) -> AskResult {
     r
 }
 
-/// [`dual`] 的**类型化**出口：wire 形状归协议层。
+/// [`dual`] 的**类型化**中间产物：两臂各自答了什么，还没塑成任何 wire 形状。
 ///
-/// HTTP 面把资料半塞进 `v["kb"]`（引用角标要能点开，`Answer` 必须整份过去），
-/// CLI/判官那条路只需要「资料半答了什么」。两条路必须来自**同一次执行** ——
-/// 这正是 `hybrid::run` 当初收口的理由，`dual` 不许再破一次。
+/// 拆出来是为了让「执行」与「塑形」分开 —— 但当前**只有 [`dual`] 一个调用者**：
+/// HTTP 侧最终走的是 `AskResult.kb` 附加字段（server 的 `ask_arms_payload` 按
+/// `route == "knowledge"` 分档重塑），不再自己拿 outcome 拼。
+/// 保留 `pub` 是给协议层将来要自己塑形时留的口子；哪天确认不需要，连同这层一起收掉。
 pub async fn dual_outcome(
     d: &AskDeps<'_>,
     p: &Principal,
