@@ -380,6 +380,10 @@ pub(crate) async fn seed_dimensions(pg: &PgPool) -> anyhow::Result<()> {
          "t_sales_order o",
          "COALESCE(o.shop_name,'未知')",
          "ODS 订单口径门店取订单头 shop_name；不是默认销售事实的客户 storename"),
+        ("shop_business_region", "门店业务省区", &["门店省区", "门店所属省区"],
+         "t_master_shop s",
+         "COALESCE(NULLIF(s.province_department_name,''),'未归属')",
+         "门店业务省区直接读取 t_master_shop.province_department_name（DMS 生产落库字段）；province 是行政省份，禁止从 t_customer.department_id 或省份字面拼接推断。权威映射含上海→浙江省区、海南→广东省区"),
         ("goods_category", "订单商品分类", &["下单商品分类"],
          "t_sales_order_detail d JOIN t_goods g ON g.goods_code = d.sku_code AND g.deleted_flag = 0",
          "COALESCE(NULLIF(g.goods_category_name,''),'未分类')",
@@ -801,6 +805,32 @@ mod tests {
             "码值过滤写了中文名 ⇒ 必然返 0 行（码字段永不等于中文名）：{bad:?}。\
              正确写法：写码，并在同一句里注明码的含义（照「活动费用」那条的形态）"
         );
+    }
+
+    #[test]
+    fn shop_business_region_dimension_uses_the_persisted_shop_field() {
+        let src = include_str!("seed_defs.rs");
+        let dimensions = src
+            .split("const DIMENSIONS: &[(&str, &str, &[&str], &str, &str, &str)] = &[")
+            .nth(1)
+            .expect("DIMENSIONS 不见了")
+            .split("];")
+            .next()
+            .unwrap();
+        let compact = dimensions.split_whitespace().collect::<String>();
+
+        assert!(compact.contains("(\"shop_business_region\",\"门店业务省区\",&[\"门店省区\",\"门店所属省区\"],\"t_master_shops\",\"COALESCE(NULLIF(s.province_department_name,''),'未归属')\""));
+        assert!(dimensions.contains("上海→浙江省区") && dimensions.contains("海南→广东省区"));
+        assert!(dimensions.contains("禁止从 t_customer.department_id"));
+        let tuple = dimensions
+            .split("(\"shop_business_region\"")
+            .nth(1)
+            .expect("门店业务省区维度不见了")
+            .split("),")
+            .next()
+            .unwrap();
+        assert!(!tuple.contains("t_customer cus"), "门店业务省区不能经客户表取部门：{tuple}");
+        assert!(!tuple.contains("cus.department_id"), "门店业务省区不能读取 customer.department_id：{tuple}");
     }
 
     /// 🔴 本文件里不许出现裸「余额」这个名字/别名（种子是 const、在函数体内，测试够不到，

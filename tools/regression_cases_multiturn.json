@@ -32,20 +32,18 @@
     },
     {
       "name": "M02-两轮-追问加一个维度",
-      "note": "首轮成功 → 追问换维度。改写后虽能恢复为「本月销售额按省份」，但默认销售事实只确认省区 region；省份未接独立资产时必须明确 fail-closed，禁止回接客户表或偷换成省区。（2026-08-08 首次连库实跑：钉的列名按真实诚实卡形状订正——原钉（维度/无法安全计算）从未实跑验证过，语义不变：识别省份为未确认范围、禁止回接与偷换。）",
+      "note": "首轮成功 → 追问加维度。改写恢复为「本月销售额按省份」。2026-08-11 业务裁决：省份=省区（region 字段），进 Region 别名，必须直接回答——本断言从「fail-closed 不可计算卡」按新裁决订正为「direct-agg 走 DWS region 分组」。",
       "login": "admin",
       "prev": "本月销售额是多少",
       "prev_sql": "SELECT COALESCE(SUM(sf.amount), 0) AS `销售额` FROM sales_dw.dws_off_offline_sale_dfn sf WHERE sf.order_date >= DATE_FORMAT(CURDATE(),'%Y-%m-01') AND sf.order_date < DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'), INTERVAL 1 MONTH)",
       "q": "那按省份拆呢",
       "llm": true,
-      "route": "direct-doc",
+      "route": "direct-agg",
       "sql_contains": [
-        "'不可计算' AS `数据状态`",
-        "'省份' AS `未确认范围`",
-        "sales_fact 合同没有该维度或语义"
+        "sales_dw.dws_off_offline_sale_dfn",
+        "region"
       ],
       "sql_not_contains": [
-        "sales_dw.dws_off_offline_sale_dfn",
         "t_sales_order",
         "t_customer",
         "total_amount",

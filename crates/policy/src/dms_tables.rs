@@ -293,48 +293,67 @@ pub async fn manager_customer_codes(
 
 /// 单列字符串取数的公用体：`sql` 必是 `&'static str` 模板（含 `{in}`），值全走 bind。
 /// 空白串结果直接丢弃（与 `fetch_str_by_str_in` 同口径）：空串 login_name/actual_name/
+/// IN 列表的**单批上限**。与 DMS Java 同一手法（`DefaultEmployee.getEmployeeCodesByIds`
+/// 的 `batchSize = 800`），取 800 是为了对齐、不是拍的。
+///
+/// 🔴 由来（2026-08-14 回归实测 F04）：`city_manager` 的客户集合上千条，
+/// `SELECT DISTINCT shop_code FROM t_master_shop WHERE customer_code IN (…1000+…)`
+/// 在生产 MySQL 上撞 `max_statement_time` → **3024**，整轮问答直接非 0 退出。
+/// 分批之后每批都是小 IN，总量不变 —— **不许改成 LIMIT**：截断权限集合是 fail-open。
+const IN_BATCH: usize = 800;
+
 /// customer_code 原样进 `IN ('')` 是垃圾条件。
 async fn fetch_str_in(
     mysql: &ReadOnlyMySql,
     sql: &'static str,
     ids: &[i64],
 ) -> anyhow::Result<Vec<String>> {
-    if ids.is_empty() {
-        return Ok(vec![]);
+    // 同 `fetch_str_by_str_in`：分批走，见 `IN_BATCH` 的红字（部门树展开后的员工 id
+    // 同样能上千 —— 那是 `login_name`/`actual_name` 两条查询的入参）
+    let mut out: Vec<String> = vec![];
+    for chunk in ids.chunks(IN_BATCH) {
+        let mut q = mysql.fixed(sql).expand(chunk.len());
+        for id in chunk {
+            q = q.bind(id);
+        }
+        out.extend(
+            q.fetch_all::<(String,)>()
+                .await?
+                .into_iter()
+                .map(|(s,)| s)
+                .filter(|s| !s.trim().is_empty()),
+        );
     }
-    let mut q = mysql.fixed(sql).expand(ids.len());
-    for id in ids {
-        q = q.bind(id);
-    }
-    Ok(q
-        .fetch_all::<(String,)>()
-        .await?
-        .into_iter()
-        .map(|(s,)| s)
-        .filter(|s| !s.trim().is_empty())
-        .collect())
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|s| seen.insert(s.clone()));
+    Ok(out)
 }
 
 /// 字符串 `IN` 的固定模板版本；空白结果不能形成可用权限标识，直接丢弃。
+
 async fn fetch_str_by_str_in(
     mysql: &ReadOnlyMySql,
     sql: &'static str,
     values: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    if values.is_empty() {
-        return Ok(vec![]);
+    let mut out: Vec<String> = vec![];
+    for chunk in values.chunks(IN_BATCH) {
+        let mut q = mysql.fixed(sql).expand(chunk.len());
+        for value in chunk {
+            q = q.bind(value.as_str());
+        }
+        out.extend(
+            q.fetch_all::<(Option<String>,)>()
+                .await?
+                .into_iter()
+                .filter_map(|(s,)| s)
+                .filter(|s| !s.trim().is_empty()),
+        );
     }
-    let mut q = mysql.fixed(sql).expand(values.len());
-    for value in values {
-        q = q.bind(value.as_str());
-    }
-    Ok(q
-        .fetch_all::<(Option<String>,)>()
-        .await?
-        .into_iter()
-        .filter_map(|(s,)| s)
-        .filter(|s| !s.trim().is_empty())
-        .collect())
+    // 分批之后 `DISTINCT` 只在批内成立，跨批要再去一次重（顺序保持先见先出：D9）
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|s| seen.insert(s.clone()));
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -352,4 +371,24 @@ mod tests {
         }
         assert!(GUEST_DISTRIBUTOR.contains("config_key = 'guest_distributor'"));
     }
+    /// 🔴 分批不许变成截断：`IN_BATCH` 只是把一条大 IN 拆成几条小 IN，**总量必须不变**。
+    ///
+    /// 由来（2026-08-14 回归 F04）：`city_manager` 上千客户编码一次性 IN 进
+    /// `t_master_shop`，生产 MySQL 撞 `max_statement_time` 报 3024，整轮问答非 0 退出。
+    /// 分批是 DMS Java 的同一手法（`getEmployeeCodesByIds` 的 `batchSize = 800`）。
+    #[test]
+    fn in_batching_splits_but_never_truncates() {
+        assert_eq!(IN_BATCH, 800, "改批量要同步复核：它对齐的是 Java 的 batchSize");
+        let src = include_str!("dms_tables.rs");
+        let prod = src.split("
+#[cfg(test)]").next().unwrap();
+        for f in ["async fn fetch_str_in(", "async fn fetch_str_by_str_in("] {
+            let body = prod.split(f).nth(1).expect("辅助函数改名了").split("
+}").next().unwrap();
+            assert!(body.contains("chunks(IN_BATCH)"), "{f} 没分批：大 IN 会撞语句超时");
+            assert!(!body.contains("LIMIT"), "{f} 出现 LIMIT —— 截断权限集合是 fail-open");
+            assert!(body.contains("seen.insert"), "{f} 分批后没跨批去重（DISTINCT 只在批内成立）");
+        }
+    }
+
 }

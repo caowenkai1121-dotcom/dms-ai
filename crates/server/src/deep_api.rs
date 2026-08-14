@@ -370,6 +370,21 @@ struct EvidenceItem {
     body: String,
 }
 
+#[derive(Clone, Debug)]
+struct EvidenceFact {
+    id: String,
+    source: String,
+    subjects: Vec<String>,
+    metric: String,
+    value: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EvidenceIntentScope {
+    subjects: Vec<String>,
+    qualifiers: Vec<String>,
+}
+
 impl EvidenceItem {
     fn is_gap(&self) -> bool {
         self.body.contains("数据状态=")
@@ -383,6 +398,7 @@ const EVIDENCE_SYSTEM: &str = "你是严谨的经营分析师，只能根据<unt
     每条结论、发现和建议都必须在句末引用一个或多个现有证据编号，例如[KPI-01]、[SEC-01]、[CON-01]。\
     只能引用目录中存在的编号，不得伪造编号。\
     可以复述证据正文中已经给出的精确数值，但禁止编造、外推或自行计算新数值。优先给出2至3条量化结论，覆盖规模、同比环比、结构贡献、趋势异常和行动，不重复堆砌卡片。\
+    证据含“主体范围”或“指标范围”时，结论必须完整复述对应主体和指标，不得省略、替换或新增限定。\
     只有数据直接支持时才能写确定原因；仅有相关迹象时必须写成“可能原因（待核实）”，并给出核实动作。\
     只输出最终分析，禁止展示思考过程、推理步骤、内部草稿或chain-of-thought。\
     用中文markdown，结构固定为：## 经营结论（表格：结论|业务影响，最多3行）、## 关键变化（表格：变化|判断|建议，最多3行）、\
@@ -705,6 +721,314 @@ fn evidence_items(
     out
 }
 
+fn intent_evidence_scope(summary: &dms_agent::intent::IntentSummary) -> EvidenceIntentScope {
+    use dms_agent::intent::IntentSlotKind;
+
+    let mut subjects = Vec::new();
+    let mut qualifiers = Vec::new();
+    for slot in &summary.slots {
+        let surface = slot.surface.trim();
+        if surface.is_empty() {
+            continue;
+        }
+        match slot.kind {
+            IntentSlotKind::Entity | IntentSlotKind::Region => subjects.push(surface.to_string()),
+            IntentSlotKind::Time | IntentSlotKind::Filter => qualifiers.push(surface.to_string()),
+            _ => {}
+        }
+    }
+    subjects.sort();
+    subjects.dedup();
+    qualifiers.sort();
+    qualifiers.dedup();
+    EvidenceIntentScope { subjects, qualifiers }
+}
+
+fn evidence_facts(
+    kpi: Option<(&str, &str)>,
+    comparisons: &[Comparison],
+    sections: &[Section],
+    contributions: &[Vec<serde_json::Value>],
+    include_contributions: bool,
+    scope: &EvidenceIntentScope,
+) -> Vec<EvidenceFact> {
+    let mut out = Vec::new();
+    let metric = kpi.map(|(label, _)| label).unwrap_or("指标");
+    let scoped_subjects = || {
+        scope
+            .subjects
+            .iter()
+            .chain(scope.qualifiers.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if let Some((label, value)) = kpi {
+        out.push(EvidenceFact {
+            id: "KPI-01".into(),
+            source: label.into(),
+            subjects: scoped_subjects(),
+            metric: label.into(),
+            value: serde_json::Value::String(value.into()),
+        });
+    }
+    for (index, cmp) in comparisons.iter().enumerate() {
+        let id = format!("KPI-{:02}", index + 2);
+        let common = scope
+            .subjects
+            .iter()
+            .chain(scope.qualifiers.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        for (field, value, raw) in [
+            ("本期值", fmt_metric_number(metric, cmp.current), serde_json::json!(cmp.current)),
+            ("基期值", fmt_metric_number(metric, cmp.baseline), serde_json::json!(cmp.baseline)),
+            ("变化额", fmt_signed_change(metric, cmp.change), serde_json::json!(cmp.change)),
+            ("变化率", comparison_rate_text(cmp), serde_json::json!(cmp.pct)),
+        ] {
+            out.push(EvidenceFact {
+                id: id.clone(),
+                source: format!("{} {}", cmp.label, cmp.basis),
+                subjects: common.clone(),
+                metric: format!("{metric}{}{}", cmp.label, field),
+                value: if field == "变化率" {
+                    serde_json::Value::String(value.clone())
+                } else {
+                    raw
+                },
+            });
+            if field == "变化率" {
+                let direction = if cmp.pct.unwrap_or(0.0) > 0.0 {
+                    "增长"
+                } else if cmp.pct.unwrap_or(0.0) < 0.0 {
+                    "下降"
+                } else {
+                    "持平"
+                };
+                out.push(EvidenceFact {
+                    id: id.clone(),
+                    source: format!("{} {}", cmp.label, cmp.basis),
+                    subjects: common.clone(),
+                    metric: format!("{metric}{}{direction}", cmp.label),
+                    value: serde_json::Value::String(value),
+                });
+            }
+        }
+    }
+    for (index, section) in sections.iter().enumerate() {
+        let id = format!("SEC-{:02}", index + 1);
+        for row in section.rows.iter().take(8) {
+            let numeric = row.iter().map(number).collect::<Vec<_>>();
+            let row_subjects = row
+                .iter()
+                .zip(&numeric)
+                .filter(|(value, number)| number.is_none() && !value.is_null())
+                .map(|(value, _)| fmt_value(value))
+                .filter(|value| !value.trim().is_empty())
+                .chain(scope.subjects.iter().cloned())
+                .chain(scope.qualifiers.iter().cloned())
+                .collect::<Vec<_>>();
+            for (cell, value) in row.iter().enumerate().filter(|(cell, _)| numeric[*cell].is_some()) {
+                out.push(EvidenceFact {
+                    id: id.clone(),
+                    source: section.title.clone(),
+                    subjects: row_subjects.clone(),
+                    metric: section_cell_label(&section.columns, row, cell).to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+    }
+    if include_contributions {
+        for (index, row) in contributions.iter().enumerate() {
+            let id = format!("CON-{:02}", index + 1);
+            let board = row.first().map(fmt_value).unwrap_or_else(|| "贡献结构".into());
+            let object = row.get(2).map(fmt_value).unwrap_or_default();
+            let metric = row.get(3).map(fmt_value).unwrap_or_else(|| "指标".into());
+            let subjects = [board.clone(), object]
+                .into_iter()
+                .chain(scope.subjects.iter().cloned())
+                .chain(scope.qualifiers.iter().cloned())
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>();
+            if let Some(value) = row.get(4) {
+                out.push(EvidenceFact {
+                    id: id.clone(),
+                    source: board.clone(),
+                    subjects: subjects.clone(),
+                    metric: metric.clone(),
+                    value: value.clone(),
+                });
+            }
+            if let Some(value) = row.get(5) {
+                out.push(EvidenceFact {
+                    id,
+                    source: board,
+                    subjects,
+                    metric: "板块内占比".into(),
+                    value: value.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn validate_evidence_facts(raw: &str, facts: &[EvidenceFact]) -> Option<String> {
+    if atomic_fact_scope_conflict(raw, facts) {
+        return None;
+    }
+    let contract = dms_agent::answer_contract::AnswerContract::from_facts(facts.iter().map(|fact| {
+        dms_agent::answer_contract::ContractFactInput {
+            namespace: fact.id.clone(),
+            source: fact.source.clone(),
+            subjects: fact.subjects.clone(),
+            metric: fact.metric.clone(),
+            value: fact.value.clone(),
+        }
+    }));
+    let fact_ids = contract.fact_ids();
+    let mut by_evidence = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for id in fact_ids {
+        if let Some((evidence_id, _)) = id.split_once(":F") {
+            by_evidence.entry(evidence_id.to_string()).or_default().push(id);
+        }
+    }
+    let rewritten = by_evidence.into_iter().fold(raw.to_string(), |text, (evidence_id, ids)| {
+        let refs = ids
+            .into_iter()
+            .map(|id| format!("[{id}]"))
+            .collect::<Vec<_>>()
+            .join("");
+        text.replace(&format!("[{evidence_id}]"), &refs)
+    });
+    contract.validate(&rewritten).ok().map(|validated| {
+        facts.iter().fold(validated, |text, fact| {
+            text.replace(&format!("[{}]", fact.id), "")
+        })
+    })
+}
+
+/// `AnswerContract` 能阻止已知主体之间借值；这里再拦模型在正确主体后追加的合同外省份、
+/// 否定限定和比较方向反转。只用于服务端已原子化的 deep facts，避免扩大通用回答闸的误伤面。
+fn atomic_fact_scope_conflict(raw: &str, facts: &[EvidenceFact]) -> bool {
+    for line in raw.lines() {
+        let cited = facts
+            .iter()
+            .filter(|fact| line.contains(&format!("[{}]", fact.id)))
+            .collect::<Vec<_>>();
+        if cited.is_empty() {
+            continue;
+        }
+
+        for (_, province) in dms_semantic::present::PROVINCE_LABELS {
+            if province_mentioned(line, province)
+                && !cited.iter().any(|fact| {
+                    fact.subjects.iter().any(|subject| subject.contains(province))
+                        || fact.source.contains(province)
+                })
+            {
+                return true;
+            }
+        }
+
+        if cited.iter().flat_map(|fact| &fact.subjects).any(|subject| {
+            ["非", "不含", "不包括", "排除", "剔除"]
+                .iter()
+                .any(|prefix| line.contains(&format!("{prefix}{subject}")))
+                || line.contains(&format!("{subject}外"))
+        }) {
+            return true;
+        }
+
+        let directions = cited
+            .iter()
+            .filter(|fact| fact.metric.contains("变化额") || fact.metric.contains("变化率"))
+            .filter_map(|fact| signed_fact_value(&fact.value))
+            .map(|value| value.total_cmp(&0.0))
+            .collect::<Vec<_>>();
+        let says_negative = ["方向为负", "负向", "负增长", "下降", "下滑", "减少", "降低"]
+            .iter()
+            .any(|cue| line.contains(cue));
+        let says_positive = ["方向为正", "正向", "正增长", "增长", "上升", "增加", "提升"]
+            .iter()
+            .any(|cue| line.contains(cue));
+        if (says_negative
+            && directions.contains(&std::cmp::Ordering::Greater)
+            && !directions.contains(&std::cmp::Ordering::Less))
+            || (says_positive
+                && directions.contains(&std::cmp::Ordering::Less)
+                && !directions.contains(&std::cmp::Ordering::Greater))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn province_mentioned(text: &str, province: &str) -> bool {
+    text.contains(province)
+}
+
+fn signed_fact_value(value: &serde_json::Value) -> Option<f64> {
+    value.as_f64().or_else(|| {
+        value
+            .as_str()?
+            .trim()
+            .trim_end_matches(['%', '％', '元', '件', '个'])
+            .replace(',', "")
+            .parse()
+            .ok()
+    })
+}
+
+/// 把已经统一意图闸和查询覆盖闸确认的主体/指标写回 KPI 证据。
+/// 这些是服务端执行合同，不是让模型再猜一次；深度文案必须同时命中
+/// 主体、完整指标和数值，才能引用该 KPI。
+fn bind_intent_scope_to_kpis(
+    evidence: &mut [EvidenceItem],
+    summary: &dms_agent::intent::IntentSummary,
+) {
+    use dms_agent::intent::IntentSlotKind;
+
+    let mut subjects = summary
+        .slots
+        .iter()
+        .filter(|slot| matches!(slot.kind, IntentSlotKind::Entity | IntentSlotKind::Region))
+        .map(|slot| slot.surface.trim())
+        .filter(|surface| !surface.is_empty())
+        .collect::<Vec<_>>();
+    subjects.sort_unstable();
+    subjects.dedup();
+    let mut intent_metrics = summary
+        .slots
+        .iter()
+        .filter(|slot| slot.kind == IntentSlotKind::Metric)
+        .map(|slot| slot.surface.trim())
+        .filter(|surface| !surface.is_empty())
+        .collect::<Vec<_>>();
+    intent_metrics.sort_unstable();
+    intent_metrics.dedup();
+    let primary_label = evidence
+        .iter()
+        .find(|item| item.id == "KPI-01")
+        .map(|item| item.label.trim().to_string())
+        .filter(|label| !matches!(label.as_str(), "指标" | "指标值" | "数值" | "金额"));
+    let primary_metric = primary_label.or_else(|| {
+        (intent_metrics.len() == 1).then(|| intent_metrics[0].to_string())
+    });
+
+    for item in evidence.iter_mut().filter(|item| item.kind == "kpi") {
+        if !subjects.is_empty() {
+            item.body.push_str("；主体范围=");
+            item.body.push_str(&subjects.join("/"));
+        }
+        if let Some(metric) = primary_metric.as_deref() {
+            item.body.push_str("；指标范围=");
+            item.body.push_str(metric);
+        }
+    }
+}
+
 fn insight_line_needs_ref(line: &str) -> bool {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -728,9 +1052,19 @@ fn insight_line_needs_ref(line: &str) -> bool {
 }
 
 /// 模型输出闸门：内部必须引用现有编号；每个数值主张必须能绑定到已执行证据中的数值
-/// （金额/数量 ±0.5% 相对容差、万/亿压缩形、百分数 ×100 形），绑不上 → 整段分析判失败，
+/// （只允许精确复述、单位换算及由主张显示精度造成的舍入；不按数值规模放百分比容差），
+/// 绑不上 → 整段分析判失败，
 /// 由调用方回落 factual_insight/weekly_factual_insight 确定性摘要。通过后页面再隐藏编号。
+#[cfg(test)]
 fn validate_evidence_insight(raw: &str, evidence: &[EvidenceItem]) -> Option<String> {
+    validate_evidence_insight_with_facts(raw, evidence, &[])
+}
+
+fn validate_evidence_insight_with_facts(
+    raw: &str,
+    evidence: &[EvidenceItem],
+    facts: &[EvidenceFact],
+) -> Option<String> {
     let normalized = if raw.matches("\\n").count() >= 2 {
         raw.replace("\\n", "\n")
     } else {
@@ -772,12 +1106,204 @@ fn validate_evidence_insight(raw: &str, evidence: &[EvidenceItem]) -> Option<Str
     {
         return None;
     }
-    let without_refs = tokens.iter().fold(text.to_string(), |s, token| s.replace(token, ""));
-    if let Some(claim) = first_unbound_claim_value(&without_refs, evidence) {
-        tracing::warn!(claim = %claim, "ANALYSIS_CLAIM_VALUE_MISMATCH：分析数值绑不上任何证据 → 整段分析判失败");
+    if facts.is_empty() {
+        if let Some(claim) = first_scoped_unbound_claim_value(text, evidence) {
+            tracing::warn!(claim = %claim, "ANALYSIS_CLAIM_VALUE_MISMATCH：分析数值绑不上任何证据 → 整段分析判失败");
+            return None;
+        }
+    }
+    if contains_chinese_numeric_claim(text) {
+        tracing::warn!("ANALYSIS_CHINESE_NUMBER_UNVERIFIED：中文数字当前不能可靠归一 → 整段分析判失败");
         return None;
     }
+    if !facts.is_empty() {
+        let Some(validated) = validate_evidence_facts(text, facts) else {
+            tracing::warn!("ANALYSIS_FACT_SCOPE_MISMATCH：分析事实未按主体/指标/比较字段/单元格原子绑定");
+            return None;
+        };
+        return Some(sanitize_insight_for_display(&validated, &tokens));
+    }
     Some(sanitize_insight_for_display(text, &tokens))
+}
+
+/// 每条事实句只能使用**该句实际引用**的证据值。旧实现把全部 evidence 的数字装进一个
+/// 全局候选池，导致 `SEC-01=120、SEC-02=900` 时，“销售额 900 [SEC-01]”也能通过。
+/// 标题/表头不承载事实，不参与数值绑定；事实行缺引用已由上游引用闸拦截。
+fn first_scoped_unbound_claim_value(
+    text: &str,
+    evidence: &[EvidenceItem],
+) -> Option<String> {
+    for line in text.lines().filter(|line| insight_line_needs_ref(line)) {
+        let cited = evidence
+            .iter()
+            .filter(|item| line.contains(&format!("[{}]", item.id)))
+            .collect::<Vec<_>>();
+        if cited.is_empty() {
+            continue;
+        }
+        let without_refs = cited.iter().fold(line.to_string(), |body, item| {
+            body.replace(&format!("[{}]", item.id), "")
+        });
+        for fragment in without_refs.split(['|', '，', ',', '、', '；', ';']) {
+            for claim in number_tokens(fragment) {
+                let matched = cited.iter().any(|item| {
+                    let number_matches = number_tokens(&item.body)
+                        .iter()
+                        .any(|candidate| claim_value_binds(&claim, candidate));
+                    if !number_matches {
+                        return false;
+                    }
+                    let subjects = evidence_subject_terms(item);
+                    if !subjects.iter().all(|subject| fragment.contains(subject)) {
+                        return false;
+                    }
+                    let phrase = claim_metric_phrase(fragment, &claim, &subjects);
+                    metric_phrase_matches(&phrase, &evidence_metric_terms(item))
+                });
+                if !matched {
+                    return Some(claim);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn claim_metric_phrase(fragment: &str, claim: &str, subjects: &[String]) -> String {
+    let Some(index) = fragment.find(claim) else { return String::new() };
+    let prefix = fragment[..index]
+        .trim_end_matches(|c: char| c.is_whitespace() || "+-≈~：:=".contains(c))
+        .trim_end_matches(['约', '为', '达', '至', '到', '有', '是', '占', '较']);
+    let mut run = prefix
+        .rsplit(|c: char| !(c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&c)))
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let mut ordered_subjects = subjects.iter().collect::<Vec<_>>();
+    ordered_subjects.sort_by_key(|subject| std::cmp::Reverse(subject.chars().count()));
+    for subject in ordered_subjects {
+        run = run.replace(subject, "");
+    }
+    for prefix in ["本周", "本月", "本年", "当周", "当月", "当前", "本期", "同期", "今日", "今天"] {
+        if let Some(rest) = run.strip_prefix(prefix) {
+            run = rest.to_string();
+        }
+    }
+    for suffix in ["同比增长", "环比增长", "同比下降", "环比下降", "增长", "下降", "上升", "减少", "提升", "回落"] {
+        if let Some(rest) = run.strip_suffix(suffix) {
+            run = rest.to_string();
+        }
+    }
+    run
+}
+
+fn evidence_subject_terms(item: &EvidenceItem) -> Vec<String> {
+    const SUBJECT_KEYS: [&str; 14] = [
+        "主体范围", "地区", "省区", "省份", "对象", "客户", "商品", "产品", "门店", "仓库", "渠道", "品牌", "品类", "城市",
+    ];
+    let mut out = Vec::new();
+    for part in item.body.split(['；', '\n', '|']) {
+        if let Some((key, value)) = part.split_once('=') {
+            if SUBJECT_KEYS.iter().any(|candidate| key.trim().contains(candidate)) {
+                for value in value.split(['/', '、']) {
+                    let value = value.trim();
+                    if value.chars().count() >= 2 && number_tokens(value).is_empty() {
+                        out.push(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn evidence_metric_terms(item: &EvidenceItem) -> Vec<String> {
+    let mut out = Vec::new();
+    if item.kind == "kpi" {
+        out.push(item.label.trim().to_string());
+    }
+    for part in item.body.split(['；', '\n']) {
+        let Some((key, value)) = part.split_once('=') else { continue };
+        let key = key.trim();
+        if key == "指标范围" || key == "指标" {
+            out.extend(
+                value
+                    .split(['/', '、', '|'])
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+            );
+        } else if key == "列" {
+            out.extend(
+                value
+                    .split('|')
+                    .map(str::trim)
+                    .filter(|column| metric_key(column))
+                    .map(ToString::to_string),
+            );
+        } else if metric_key(key) {
+            out.push(key.to_string());
+        }
+    }
+    out.retain(|term| !term.is_empty());
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn metric_key(key: &str) -> bool {
+    sales_measure_from_text(key).is_some()
+        || [
+            "库存", "库存量", "库存金额", "订单数", "客户数", "门店数", "商品数", "数量", "金额",
+            "占比", "变化率", "变化额", "本期值", "基期值", "指标值", "日期", "时间", "周期",
+        ]
+        .contains(&key)
+}
+
+fn metric_phrase_matches(phrase: &str, terms: &[String]) -> bool {
+    if phrase.is_empty() || terms.is_empty() {
+        return false;
+    }
+    let mut aliases = Vec::new();
+    for term in terms {
+        aliases.push(term.as_str());
+        if let Some(metric) = sales_measure_from_text(term) {
+            aliases.push(metric.name());
+            aliases.extend(metric.aliases().iter().copied());
+        }
+        match term.as_str() {
+            "库存量" => aliases.extend(["库存", "库存数量"]),
+            "订单数" => aliases.extend(["订单量"]),
+            "客户数" => aliases.extend(["客户量"]),
+            _ => {}
+        }
+    }
+    aliases.sort_unstable();
+    aliases.dedup();
+    aliases.iter().any(|alias| phrase == *alias)
+        || aliases.iter().any(|left| {
+            aliases.iter().any(|right| {
+                left != right
+                    && (phrase == format!("{left}{right}") || phrase == format!("{right}{left}"))
+            })
+        })
+}
+
+/// 可靠中文数值换算尚未进入权威合同前，宁可回退确定性摘要，也不让“一百万元/三个月”
+/// 绕过只识别 ASCII 数字的数值闸。普通“第一/二级”等非量化序号不在这条最小判据内。
+fn contains_chinese_numeric_claim(text: &str) -> bool {
+    const DIGITS: &str = "零〇一二两三四五六七八九十百千万亿点半";
+    const UNITS: [&str; 19] = [
+        "元", "万元", "亿元", "个", "件", "家", "单", "笔", "次", "台", "箱", "天", "日", "周", "月", "年", "倍", "成", "百分之",
+    ];
+    text.split(|c: char| c.is_whitespace() || "，。；：、|()（）[]【】".contains(c))
+        .any(|part| {
+            part.chars().any(|c| DIGITS.contains(c))
+                && UNITS.iter().any(|unit| part.contains(unit))
+                && !part.chars().any(|c| c.is_ascii_digit())
+        })
 }
 
 /// 提取数值 token：连续数字（含千分位/小数/百分号），尾部 万/亿 压缩单位一并保留，
@@ -811,13 +1337,17 @@ fn number_tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// 数值主张的相对容差：仅金额/数量享有 ±0.5%；百分数对百分数只认精确复述，
-/// 否则 99.9% 会蒙混成证据里的 100%。
-const CLAIM_VALUE_REL_TOLERANCE: f64 = 0.005;
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClaimValue {
+    value: f64,
+    percent: bool,
+    /// 原文本最后一位代表的绝对精度。它只允许模型把证据写得更粗，不能凭空增加精度。
+    resolution: f64,
+}
 
-/// 把数值 token 归一化为（展开 万/亿 量级后的值，是否百分数）：
-/// "2.06亿" → (206000000.0, false)，"25.6%" → (25.6, true)；单位可组合："1.2万亿" → 1.2e12。
-fn claim_value(raw: &str) -> Option<(f64, bool)> {
+/// 把数值 token 归一化为展开量级后的值，并保留原文本显示精度：
+/// "2.06亿" → value=206000000、resolution=1000000；"25.6%" → value=25.6、resolution=0.1。
+fn claim_value(raw: &str) -> Option<ClaimValue> {
     let percent = raw.ends_with('%') || raw.ends_with('％');
     let body = raw.trim_end_matches(|c| c == '%' || c == '％');
     // 从尾部逐个吃掉 万/亿 并累乘量级（"万亿" = 1e4 × 1e8）
@@ -832,35 +1362,49 @@ fn claim_value(raw: &str) -> Option<(f64, bool)> {
         digits = &digits[..digits.len() - last.len_utf8()];
         scale *= factor;
     }
-    let value = digits.replace(',', "").parse::<f64>().ok()?;
-    Some((value * scale, percent))
-}
-
-/// 去尾零与 0~2 位小数四舍五入后相等（沿用原 equivalent_number 的格式化容差）。
-fn rounded_equal(left: f64, right: f64) -> bool {
-    (0..=2).any(|digits| {
-        let factor = 10_f64.powi(digits);
-        (left - (right * factor).round() / factor).abs() < 1e-9
+    let normalized = digits.replace(',', "");
+    let value = normalized.parse::<f64>().ok()? * scale;
+    if !value.is_finite() {
+        return None;
+    }
+    let decimals = normalized
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len() as i32)
+        .unwrap_or(0);
+    Some(ClaimValue {
+        value,
+        percent,
+        resolution: scale * 10_f64.powi(-decimals),
     })
 }
 
+fn exact_float(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 1e-9_f64.max(1e-12 * right.abs())
+}
+
 /// 【ANALYSIS_CLAIM_VALUE_MISMATCH 硬规则】分析里的数值主张必须能绑定到证据数值：
-/// ① 字符串相同或 0~2 位小数格式化等价；② 金额/数量允许 ±0.5% 相对误差；
-/// ③ 万/亿 压缩形按展开量级比较（2.06亿 ↔ 20608.48万）；
-/// ④ 百分数 ×100 形按比例归一后精确等价（25.6% ↔ 0.256），不放相对容差。
-fn parsed_claim_value_binds(claim: (f64, bool), evidence: (f64, bool)) -> bool {
-    let (claim, claim_percent) = claim;
-    let (evidence, evidence_percent) = evidence;
-    if claim_percent == evidence_percent {
-        if rounded_equal(claim, evidence) {
-            return true;
+/// ① 单位归一后数值精确相等；② 模型可按更粗显示精度四舍五入证据；
+/// ③ 模型不得写出比证据更细但不相等的数；④ 百分数 ×100 形只认精确等价。
+fn parsed_claim_value_binds(claim: ClaimValue, evidence: ClaimValue) -> bool {
+    let (mut claim_value, mut claim_resolution) = (claim.value, claim.resolution);
+    let (mut evidence_value, mut evidence_resolution) = (evidence.value, evidence.resolution);
+    if claim.percent != evidence.percent {
+        if claim.percent {
+            claim_value /= 100.0;
+            claim_resolution /= 100.0;
         }
-        return !claim_percent
-            && (claim - evidence).abs() <= CLAIM_VALUE_REL_TOLERANCE * evidence.abs();
+        if evidence.percent {
+            evidence_value /= 100.0;
+            evidence_resolution /= 100.0;
+        }
     }
-    let claim_ratio = if claim_percent { claim / 100.0 } else { claim };
-    let evidence_ratio = if evidence_percent { evidence / 100.0 } else { evidence };
-    (claim_ratio - evidence_ratio).abs() < 1e-9 || rounded_equal(claim_ratio, evidence_ratio)
+    if exact_float(claim_value, evidence_value) {
+        return true;
+    }
+    if claim.percent || evidence.percent || claim_resolution < evidence_resolution {
+        return false;
+    }
+    (claim_value - evidence_value).abs() <= claim_resolution / 2.0 + 1e-9
 }
 
 fn claim_value_binds(claim: &str, evidence: &str) -> bool {
@@ -873,28 +1417,15 @@ fn claim_value_binds(claim: &str, evidence: &str) -> bool {
 
 /// 返回分析文本里第一个绑不上任何证据的数值主张；None = 全部绑定成功。
 /// 纯函数拆分：容差判定集中在 claim_value_binds，单测无需构造 validate 全文。
+#[allow(dead_code)] // 诊断纯函数同时供对抗单测；生产主闸使用更严格的 scoped 版本。
 fn first_unbound_claim_value(text: &str, evidence: &[EvidenceItem]) -> Option<String> {
-    // 证据 token 预解析一次、主张 token 各解析一次，比较走数值而非反复字符串解析
     let allowed = evidence
         .iter()
         .flat_map(|item| number_tokens(&item.body))
-        .map(|token| {
-            let parsed = claim_value(&token);
-            (token, parsed)
-        })
         .collect::<Vec<_>>();
     number_tokens(text)
         .into_iter()
-        .find(|token| {
-            let parsed = claim_value(token);
-            !allowed.iter().any(|(candidate, candidate_parsed)| {
-                match (parsed, candidate_parsed) {
-                    (Some(claim), Some(evidence)) => parsed_claim_value_binds(claim, *evidence),
-                    // 任一侧解析不了（罕见畸形 token）退回字符串级判据（同串即绑）
-                    _ => claim_value_binds(token, candidate),
-                }
-            })
-        })
+        .find(|token| !allowed.iter().any(|candidate| claim_value_binds(token, candidate)))
 }
 
 fn internal_reference_len(text: &str) -> Option<usize> {
@@ -955,6 +1486,7 @@ async fn evidence_insight(
     question: &str,
     kind: dms_agent::AnalysisKind,
     evidence: &[EvidenceItem],
+    facts: &[EvidenceFact],
     assertions: &[dms_agent::analysis::Assertion],
 ) -> (Option<String>, Vec<Option<dms_agent::analysis::Acceptance>>) {
     if evidence.is_empty() {
@@ -1018,10 +1550,7 @@ async fn evidence_insight(
     } else {
         EVIDENCE_SYSTEM
     };
-    let mut req = ChatRequest::text(ModelTier::Precise, system, &user, Some(0.0));
-    // 断言版要多容纳 JSON 壳与判词数组：+220 tokens 余量
-    req.max_tokens = Some(if weekly { 560 } else { 420 }
-        + if assertions.is_empty() { 0 } else { 220 });
+    let req = ChatRequest::text(ModelTier::Precise, system, &user, Some(0.0));
     let reply = match llm.chat(req).await {
         Ok(reply) => reply.content,
         Err(e) => {
@@ -1038,7 +1567,7 @@ async fn evidence_insight(
     if !assertions.is_empty() {
         if let Some(js) = extract_json(&raw) {
             if let Ok(parsed) = serde_json::from_str::<EvidenceVerdicts>(js) {
-                let checked = validate_evidence_insight(&parsed.insight, evidence);
+                let checked = validate_evidence_insight_with_facts(&parsed.insight, evidence, facts);
                 if checked.is_none() {
                     tracing::warn!("深度解读未通过证据引用/数字/思维链闸门 → 使用确定性摘要");
                 }
@@ -1046,11 +1575,11 @@ async fn evidence_insight(
             }
         }
         return (
-            validate_evidence_insight(&raw, evidence),
+            validate_evidence_insight_with_facts(&raw, evidence, facts),
             vec![None; assertions.len()],
         );
     }
-    let checked = validate_evidence_insight(&raw, evidence);
+    let checked = validate_evidence_insight_with_facts(&raw, evidence, facts);
     if checked.is_none() {
         tracing::warn!("深度解读未通过证据引用/数字/思维链闸门 → 使用确定性摘要");
     }
@@ -3935,9 +4464,16 @@ async fn compose_inner(
         .map(str::trim)
         .filter(|question| !question.is_empty())
         .unwrap_or(req.question.trim());
-    let execution_question = execution_question_of(&req.question);
-    let (login_name, role_code) = crate::resolve_identity(&st, &headers, &req.login_name, &req.role_code)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未认证：缺会话 token 或 login_name"))?;
+    let requested_execution_question = execution_question_of(&req.question);
+    let (login_name, role_code) =
+        crate::resolve_identity(&st, &headers, &req.login_name, &req.role_code).ok_or_else(
+            || {
+                err(
+                    StatusCode::UNAUTHORIZED,
+                    "未认证：缺会话 token 或 login_name",
+                )
+            },
+        )?;
     // 身份权限来自 DMS，聊天归属来自自有 PG；两项互不依赖，先并行完成再统一放行。
     let (principal, conv_access) = tokio::join!(
         crate::auth::load_principal(&st.auth_mysql, &login_name, role_code.as_deref()),
@@ -3952,38 +4488,86 @@ async fn compose_inner(
     );
     let p = principal.map_err(|e| identity_err(&login_name, e))?;
     conv_access?;
-    // 会话追问上下文与意图分诊互不依赖；两条 PG/LLM 路径并发，避免固定串行税。
-    let triage_ds = req
-        .ds
-        .as_deref()
-        .unwrap_or(dms_semantic::registry::datasource::DMS_DS_ID);
-    let (prev, intent) = tokio::join!(
-        async {
-            match req.conv_id {
-                Some(cid) => match crate::chat::last_turn(st.owned.pool(), cid).await {
-                    Ok(turn) => turn,
-                    Err(e) => {
-                        // 上一轮上下文悄悄丢失会拉低追问分诊质量：按 None 降级但要留痕
-                        tracing::warn!(error = %e, "深度模式上一轮上下文读取失败 → 按无上下文继续");
-                        None
-                    }
-                },
-                None => None,
+    // 上一轮必须先加载，再由统一准备层完成追问改写 + 一次结构化意图解析。
+    // 旧实现把 raw question 的 triage 与上一轮并行，随后 `crate::ask` 又改写和解析一次，
+    // 路由与实际执行可能理解成两件事。
+    let prev = match req.conv_id {
+        Some(cid) => match crate::chat::last_turn(st.owned.pool(), cid).await {
+            Ok(turn) => turn,
+            Err(e) => {
+                tracing::warn!(error = %e, "深度模式上一轮上下文读取失败 → 按无上下文继续");
+                None
             }
         },
-        crate::triage::triage(
-            &st.llm,
-            st.owned.pool(),
-            triage_ds,
-            &execution_question,
-            req.intent.as_deref(),
-        ),
-    );
+        None => None,
+    };
+    let prev_turn = prev
+        .as_ref()
+        .map(|(q, s)| (q.as_str(), s.as_deref(), &[] as &[&str], &[] as &[&str]));
+    let prepared = crate::prepare_ask(&st, &requested_execution_question, prev_turn).await;
+    let forced = crate::forced_route(req.intent.as_deref());
     // `rid` 只登记属主与固定脱敏阶段；进度端点不得承载问题、实体、数据或模型文本。
     // 属主登记抢在第一个 note 前：前端发起 POST 即开始轮询，早一拍是一拍。
     let rid = req.rid.clone().unwrap_or_default();
     note_owner(&rid, &login_name);
-    if matches!(intent, crate::triage::Intent::Knowledge) {
+    // 🔴 合同不可用 ≠ 知识库不能答（与 `main.rs` 两个端点同一个函数，不写第二份）。
+    // 深度模式此前是唯一没接兜底的入口 —— 业主从这里进来，同一句「下载 押金转货款申请书」
+    // 拿到的是 38 行账余表，而 CLI 拿到的是知识库回答。同题不同答的成因就在这里。
+    if !crate::prepared_contract_ready(&prepared) {
+        let result = match crate::unknown_route_kb_fallback(
+            &st,
+            &p,
+            None,
+            &prepared.question.effective_question,
+        )
+        .await
+        {
+            Some(a) => serde_json::to_value(&a)
+                .expect("Answer 是纯数据 struct，派生 Serialize 不会失败"),
+            None => serde_json::to_value(prepared.question.clarification_result())
+                .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+        };
+        if let Some(cid) = req.conv_id {
+            save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
+            let payload = serde_json::json!({ "result": result });
+            save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+        }
+        note(&rid, ProgressStage::Done);
+        return Ok(Json(serde_json::json!({ "result": result })));
+    }
+    let prepared = match forced {
+        Some(route) => match crate::projected_forced(&prepared, route) {
+            Some(projected) => projected,
+            None => {
+                let result = serde_json::to_value(prepared.question.clarification_result())
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+                if let Some(cid) = req.conv_id {
+                    save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
+                    let payload = serde_json::json!({ "result": result });
+                    save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+                }
+                note(&rid, ProgressStage::Done);
+                return Ok(Json(serde_json::json!({ "result": result })));
+            }
+        },
+        None => prepared,
+    };
+    let route = prepared.question.route();
+    if route == dms_agent::intent::IntentRoute::Data
+        && !prepared.question.intent_attempt.is_data_executable()
+    {
+        let result = serde_json::to_value(prepared.question.clarification_result())
+            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+        if let Some(cid) = req.conv_id {
+            save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
+            let payload = serde_json::json!({ "result": result });
+            save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+        }
+        note(&rid, ProgressStage::Done);
+        return Ok(Json(serde_json::json!({ "result": result })));
+    }
+    let execution_question = prepared.question.effective_question.clone();
+    if route == dms_agent::intent::IntentRoute::Knowledge {
         note(&rid, ProgressStage::Knowledge);
         let answer = dms_agent::answerers::knowledge::answer(
             &st.owned,
@@ -3991,7 +4575,7 @@ async fn compose_inner(
             &st.llm,
             &p,
             req.space_id.as_deref(),
-            &req.question,
+            &execution_question,
             &st.cfg().kb_rrf_weights,
         )
         .await
@@ -4001,7 +4585,31 @@ async fn compose_inner(
             tracing::warn!(error = %e, "深度模式知识检索失败");
             err(StatusCode::UNPROCESSABLE_ENTITY, "暂时无法完成知识检索，请稍后重试")
         })?;
-        let result = serde_json::to_value(&answer).unwrap_or_else(|_| serde_json::json!({}));
+        let mut result = serde_json::to_value(&answer).unwrap_or_else(|_| serde_json::json!({}));
+        result["intent_summary"] = crate::knowledge_summary_value(&prepared, &answer);
+        if execution_question != requested_execution_question {
+            result["resolved_question"] = serde_json::json!(execution_question);
+        }
+        if let Some(cid) = req.conv_id {
+            save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
+            let payload = serde_json::json!({ "result": result });
+            save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+        }
+        note(&rid, ProgressStage::Done);
+        return Ok(Json(serde_json::json!({ "result": result })));
+    }
+    if route == dms_agent::intent::IntentRoute::Hybrid {
+        note(&rid, ProgressStage::Knowledge);
+        let conv_id = req.conv_id.map(|id| id.to_string());
+        let h = crate::HybridAsk {
+            question: &requested_execution_question,
+            p: &p,
+            ds: req.ds.as_deref(),
+            conv_id: conv_id.as_deref(),
+            space_id: req.space_id.as_deref(),
+            sc_samples: st.sc_samples.max(3),
+        };
+        let result = crate::hybrid_payload(&st, &h, &prepared).await?;
         if let Some(cid) = req.conv_id {
             save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
             let payload = serde_json::json!({ "result": result });
@@ -4043,10 +4651,18 @@ async fn compose_inner(
     });
     let sc = st.sc_samples.max(3); // 深度模式：SC ≥3（与 /api/ask 的 deep 分支同一条）
     let conv_id = req.conv_id.map(|c| c.to_string());
-    let primary_future = crate::ask(
-        &st.llm, &st.auth_mysql, &st.mysql, &st.sources, st.owned.pool(), &st.embed, &p, &execution_question,
-        prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[] as &[&str], &[] as &[&str])), req.ds.as_deref(),
-        conv_id.as_deref(), sc,
+    let primary_future = crate::ask_prepared(
+        &st.llm,
+        &st.auth_mysql,
+        &st.mysql,
+        &st.sources,
+        st.owned.pool(),
+        &st.embed,
+        &p,
+        &prepared,
+        req.ds.as_deref(),
+        conv_id.as_deref(),
+        sc,
     );
     tokio::pin!(primary_future);
     let mut prefetched_plan = None;
@@ -4489,11 +5105,16 @@ async fn compose_inner(
         &contributions,
         report_spec.show_contribution,
     );
-    let evidence = if is_weekly_report(&req.question) {
+    let mut evidence = if is_weekly_report(&req.question) {
         weekly_evidence_items(evidence, &requested_sections, &sections)
     } else {
         evidence
     };
+    if let Some(summary) = primary.intent_summary.as_ref() {
+        bind_intent_scope_to_kpis(&mut evidence, summary);
+    } else {
+        bind_intent_scope_to_kpis(&mut evidence, &prepared.question.intent_summary());
+    }
     // 【D8】验收断言透出清单（计划定稿即固定；无断言 = 空清单，不阻塞报告）。
     // 与进度事件里的板块断言同源（requested_sections = 最终计划），最终自评按下标对齐。
     let report_assertions = dms_agent::analysis::collect_assertions(
@@ -4502,8 +5123,21 @@ async fn compose_inner(
     note(&rid, ProgressStage::Analyze);
     // 【D8】有断言时证据解读**同一发** LLM 顺带输出逐条自评（不新增串行调用）；
     // 模型失败/判词不合法 = 全 None（断言仍透出，只是没有判词）。
+    let evidence_scope = primary
+        .intent_summary
+        .as_ref()
+        .map(intent_evidence_scope)
+        .unwrap_or_else(|| intent_evidence_scope(&prepared.question.intent_summary()));
+    let contract_facts = evidence_facts(
+        kpi,
+        &comparisons,
+        &sections,
+        &contributions,
+        report_spec.show_contribution,
+        &evidence_scope,
+    );
     let (insight_text, verdicts) = if st.insight_enabled {
-        evidence_insight(&st.llm, &req.question, analysis_plan.kind, &evidence, &report_assertions)
+        evidence_insight(&st.llm, &req.question, analysis_plan.kind, &evidence, &contract_facts, &report_assertions)
             .await
     } else {
         (None, Vec::new())
@@ -4763,7 +5397,7 @@ mod tests {
             subs: vec![],
             caliber_note: None,
             reinterpret_note: None,
-        resolved_question: None,
+            resolved_question: None,
             truncation_note: None,
             redacted: vec![],
             scope_note: None,
@@ -4772,6 +5406,7 @@ mod tests {
             clarify_options: vec![],
             value_labels: vec![],
             sales_context: None,
+            intent_summary: None,
         }
     }
 
@@ -4975,10 +5610,20 @@ mod tests {
     #[test]
     fn artifact_save_follows_conversation_ownership_and_progress_is_static() {
         let src = include_str!("deep_api.rs");
-        let owner = src.find("crate::chat::conv_owner").expect("深度请求必须校验会话归属");
-        let query = src[owner..].find("crate::ask(").map(|index| owner + index).expect("应执行主查询");
-        let save = src.find("crate::artifact_api::save_artifact").expect("应保存产物");
-        assert!(owner < query && query < save, "会话归属必须在查询和产物保存之前校验");
+        let owner = src
+            .find("crate::chat::conv_owner")
+            .expect("深度请求必须校验会话归属");
+        let query = src[owner..]
+            .find("crate::ask_prepared(")
+            .map(|index| owner + index)
+            .expect("主查询应复用入口已解析的 PreparedQuestion");
+        let save = src
+            .find("crate::artifact_api::save_artifact")
+            .expect("应保存产物");
+        assert!(
+            owner < query && query < save,
+            "会话归属必须在查询和产物保存之前校验"
+        );
 
         let allowed = [
             ProgressStage::Knowledge,
@@ -5182,6 +5827,7 @@ mod tests {
             "本月销售额",
             dms_agent::AnalysisKind::Metric,
             &evidence,
+            &[],
             &[],
         )
         .await;
@@ -6080,19 +6726,19 @@ mod tests {
         }
     }
 
-    /// claim 容差纯函数：±0.5% 边界、万/亿压缩形互认、百分数 ×100 形、百分数不放相对容差。
+    /// claim 精度纯函数：只认精确值、单位换算与显示精度舍入，不按数值规模放相对容差。
     #[test]
-    fn claim_value_binds_tolerance_and_format_equivalents() {
-        assert_eq!(claim_value("2.06亿"), Some((206_000_000.0, false)));
-        assert_eq!(claim_value("12.346万"), Some((123_460.0, false)));
-        assert_eq!(claim_value("25.6%"), Some((25.6, true)));
+    fn claim_value_binds_display_precision_and_format_equivalents() {
+        assert_eq!(claim_value("2.06亿").map(|v| (v.value, v.percent, v.resolution)), Some((206_000_000.0, false, 1_000_000.0)));
+        assert_eq!(claim_value("12.346万").map(|v| (v.value, v.percent, v.resolution)), Some((123_460.0, false, 10.0)));
+        assert_eq!(claim_value("25.6%").map(|v| (v.value, v.percent, v.resolution)), Some((25.6, true, 0.1)));
 
-        assert!(claim_value_binds("120.5", "120.00"), "+0.42% 在容差内");
-        assert!(!claim_value_binds("121.0", "120.00"), "+0.83% 超出容差");
-        assert!(!claim_value_binds("119.3", "120.00"), "-0.58% 超出容差");
+        assert!(claim_value_binds("120", "120.00"));
+        assert!(!claim_value_binds("120.5", "120.00"), "事实没有 0.5 的显示舍入空间");
+        assert!(!claim_value_binds("99万", "100万"), "大额数也不得按比例放宽");
 
-        assert!(claim_value_binds("2.06亿", "20608.482万"), "压缩形互认（0.04% 误差）");
-        assert!(claim_value_binds("206084819.19", "20608.482万"), "原始值绑定压缩证据");
+        assert!(claim_value_binds("2.06亿", "20608.482万"), "证据按主张的 0.01 亿显示精度舍入");
+        assert!(!claim_value_binds("206084819.19", "20608.482万"), "不能从较粗证据虚构更细小数");
         assert!(!claim_value_binds("2.06", "20608.482万"), "丢掉单位的数不能蒙混");
 
         assert!(claim_value_binds("25.6%", "0.256"), "百分数 ×100 形");
@@ -6111,26 +6757,260 @@ mod tests {
         assert!(claim_value_binds("-20.0%", "-20%"));
         assert!(!claim_value_binds("-20.0%", "20.0%"), "符号翻转不得绑定");
         assert!(!claim_value_binds("20.0%", "-20.0%"));
-        let (value, percent) = claim_value("1.2万亿").expect("组合单位可解析");
-        assert!((value - 1.2e12).abs() < 1.0 && !percent, "万亿 = 1e4 × 1e8");
+        let parsed = claim_value("1.2万亿").expect("组合单位可解析");
+        assert!((parsed.value - 1.2e12).abs() < 1.0 && !parsed.percent, "万亿 = 1e4 × 1e8");
         assert!(claim_value_binds("1.2万亿", "12000亿"), "组合单位与展开量级互认");
     }
 
-    /// 容差内通过 / 超出容差整段判失败（validate 全文级）。
+    /// 精确复述通过 / 近似编造整段判失败（validate 全文级）。
     #[test]
-    fn insight_claim_values_must_bind_within_tolerance() {
+    fn insight_claim_values_must_bind_to_exact_evidence() {
         let evidence = vec![EvidenceItem {
             id: "KPI-01".into(), kind: "kpi", label: "销售额".into(), body: "销售额=120.00".into(),
         }];
-        let within = "## 经营结论\n销售额为120.5，基本持平。[KPI-01]";
-        assert!(validate_evidence_insight(within, &evidence).is_some(), "±0.5% 容差内应通过");
-        let beyond = "## 经营结论\n销售额为121.0，明显增长。[KPI-01]";
-        assert!(validate_evidence_insight(beyond, &evidence).is_none(), "超出容差应整段判失败");
+        let exact = "## 经营结论\n销售额为120.00。[KPI-01]";
+        assert!(validate_evidence_insight(exact, &evidence).is_some());
+        let beyond = "## 经营结论\n销售额为120.5。[KPI-01]";
+        assert!(validate_evidence_insight(beyond, &evidence).is_none(), "接近但非证据值也必须失败");
         assert_eq!(
-            first_unbound_claim_value("销售额为121.0。", &evidence).as_deref(),
-            Some("121.0"),
+            first_unbound_claim_value("销售额为120.5。", &evidence).as_deref(),
+            Some("120.5"),
             "应诊断出第一个绑不上的主张值"
         );
+    }
+
+    /// 引用不是装饰：一句话只能借用它实际引用的板块。旧全局数字池会让 SEC-02 的 900
+    /// 替 SEC-01 背书，跨板块错配仍被当成“有证据”。
+    #[test]
+    fn insight_claim_values_are_scoped_to_the_cited_evidence() {
+        let evidence = vec![
+            EvidenceItem {
+                id: "SEC-01".into(),
+                kind: "section",
+                label: "山东销售".into(),
+                body: "地区=山东；销售额=120".into(),
+            },
+            EvidenceItem {
+                id: "SEC-02".into(),
+                kind: "section",
+                label: "江苏销售".into(),
+                body: "地区=江苏；销售额=900".into(),
+            },
+        ];
+        assert!(
+            validate_evidence_insight("## 核心结论\n山东销售额120。[SEC-01]", &evidence)
+                .is_some()
+        );
+        assert!(
+            validate_evidence_insight("## 核心结论\n山东销售额900。[SEC-01]", &evidence)
+                .is_none(),
+            "900 只存在于 SEC-02，引用 SEC-01 时不得跨板块借数"
+        );
+        assert!(
+            validate_evidence_insight(
+                "## 核心结论\n山东销售额120、江苏销售额900。[SEC-01][SEC-02]",
+                &evidence,
+            )
+            .is_some(),
+            "一句显式引用两个板块时可使用两边证据"
+        );
+        assert!(
+            validate_evidence_insight("## 核心结论\n江苏毛利额120。[SEC-01]", &evidence)
+                .is_none(),
+            "同一证据里的数值也不能给错误主体/指标背书"
+        );
+    }
+
+    /// KPI 不能只凭“数值相同 + 指标后三字相同”背书。主体和完整指标
+    /// 都必须与服务端已验证的意图作用域一致。
+    #[test]
+    fn kpi_claims_bind_verified_subject_and_full_metric() {
+        let scoped = vec![EvidenceItem {
+            id: "KPI-01".into(),
+            kind: "kpi",
+            label: "销售额".into(),
+            body: "销售额=120；主体范围=山东省；指标范围=销售额".into(),
+        }];
+        assert!(
+            validate_evidence_insight("## 核心结论\n山东省销售额120。[KPI-01]", &scoped).is_some()
+        );
+        assert!(
+            validate_evidence_insight("## 核心结论\n江苏省销售额120。[KPI-01]", &scoped).is_none(),
+            "相同数值不能把山东 KPI 偷换成江苏"
+        );
+        assert!(
+            validate_evidence_insight("## 核心结论\n山东省净销售额120。[KPI-01]", &scoped).is_none(),
+            "指标必须完整匹配，不能靠尾词‘销售额’蒙混"
+        );
+
+        let unscoped = vec![EvidenceItem {
+            id: "KPI-01".into(),
+            kind: "kpi",
+            label: "销售额".into(),
+            body: "销售额=120".into(),
+        }];
+        assert!(
+            validate_evidence_insight("## 核心结论\n江苏省销售额120。[KPI-01]", &unscoped).is_none(),
+            "即使旧证据没有主体字段，也不得凭空新增主体"
+        );
+    }
+
+    #[test]
+    fn intent_scope_is_written_into_kpi_evidence() {
+        use dms_agent::intent::{
+            IntentCoverageSummary, IntentRoute, IntentSlotKind, IntentSlotState,
+            IntentSlotSummary, IntentSummary,
+        };
+
+        let mut evidence = evidence_items(Some(("销售额", "120")), &[], &[], &[], false);
+        bind_intent_scope_to_kpis(
+            &mut evidence,
+            &IntentSummary {
+                mode: IntentRoute::Data,
+                status: "grounded",
+                slots: vec![
+                    IntentSlotSummary {
+                        kind: IntentSlotKind::Region,
+                        surface: "山东省".into(),
+                        state: IntentSlotState::Resolved,
+                    },
+                    IntentSlotSummary {
+                        kind: IntentSlotKind::Metric,
+                        surface: "销售额".into(),
+                        state: IntentSlotState::Resolved,
+                    },
+                ],
+                coverage: IntentCoverageSummary {
+                    status: "complete",
+                    issues: vec![],
+                },
+            },
+        );
+        assert_eq!(
+            evidence[0].body,
+            "销售额=120；主体范围=山东省；指标范围=销售额"
+        );
+        assert!(
+            validate_evidence_insight("## 核心结论\n山东省销售额120。[KPI-01]", &evidence).is_some()
+        );
+        assert!(
+            validate_evidence_insight("## 核心结论\n江苏省销售额120。[KPI-01]", &evidence).is_none()
+        );
+    }
+
+    #[test]
+    fn atomic_deep_facts_do_not_mix_comparison_fields_or_numeric_sku_subjects() {
+        let scope = EvidenceIntentScope {
+            subjects: vec!["山东省".into()],
+            qualifiers: vec!["本月".into()],
+        };
+        let comparisons = vec![Comparison {
+            label: "环比".into(),
+            basis: "较上月同期".into(),
+            current: 120.0,
+            baseline: 100.0,
+            change: 20.0,
+            pct: Some(20.0),
+            dir: "up",
+        }];
+        let evidence = evidence_items(Some(("销售额", "120")), &comparisons, &[], &[], false);
+        let facts = evidence_facts(
+            Some(("销售额", "120")),
+            &comparisons,
+            &[],
+            &[],
+            false,
+            &scope,
+        );
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n山东省本月销售额环比本期值120。[KPI-02]",
+            &evidence,
+            &facts,
+        )
+        .is_some());
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n山东省本月销售额环比增长20%。[KPI-02]",
+            &evidence,
+            &facts,
+        )
+        .is_some(), "自然中文比较表达应通过");
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n山东省本月销售额为100。[KPI-02]",
+            &evidence,
+            &facts,
+        )
+        .is_none(), "基期 100 不能冒充本期销售额");
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n山东省本月销售额同比下降20%。[KPI-02]",
+            &evidence,
+            &facts,
+        )
+        .is_none(), "环比增长 20% 不能改成同比下降");
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n山东省本月销售额环比变化率为+20.0%。[KPI-02]",
+            &evidence,
+            &facts,
+        )
+        .is_some(), "与证据一致的正向比较不能误杀");
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n山东省本月销售额环比变化率为20%，方向为负。[KPI-02]",
+            &evidence,
+            &facts,
+        )
+        .is_none(), "正变化率不能被模型改写成负向");
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n山东省本月口径同时适用于江苏省：销售额120。[KPI-01]",
+            &evidence,
+            &facts,
+        )
+        .is_none(), "完整正确作用域后也不能追加合同外省份");
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n山东省本月口径同时适用于江苏：销售额120。[KPI-01]",
+            &evidence,
+            &facts,
+        )
+        .is_none(), "裸省名同样不得绕过作用域合同");
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n山东省外口径：本月销售额120。[KPI-01]",
+            &evidence,
+            &facts,
+        )
+        .is_none(), "不能把正向主体改写成排除主体");
+
+        let sku_scope = EvidenceIntentScope {
+            subjects: vec!["小虎黑椒味烤肠500G".into()],
+            qualifiers: vec![],
+        };
+        let sku_evidence = evidence_items(Some(("库存量", "20件")), &[], &[], &[], false);
+        let sku_facts = evidence_facts(
+            Some(("库存量", "20件")),
+            &[],
+            &[],
+            &[],
+            false,
+            &sku_scope,
+        );
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n小虎黑椒味烤肠500G库存量为20件。[KPI-01]",
+            &sku_evidence,
+            &sku_facts,
+        )
+        .is_some(), "型号中的 500G 是主体，不是库存数值");
+        assert!(validate_evidence_insight_with_facts(
+            "## 核心结论\n小虎黑椒味烤肠500G库存量为500件。[KPI-01]",
+            &sku_evidence,
+            &sku_facts,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn chinese_numeric_claims_fail_closed_until_typed_parsing_exists() {
+        let evidence = vec![EvidenceItem {
+            id: "KPI-01".into(), kind: "kpi", label: "销售额".into(), body: "销售额=100万".into(),
+        }];
+        assert!(contains_chinese_numeric_claim("销售额为一百万元"));
+        assert!(validate_evidence_insight("## 经营结论\n销售额为一百万元。[KPI-01]", &evidence).is_none());
     }
 
     /// 编造数字被拦 → 生产链路（or_else）回落 factual_insight 确定性摘要。
@@ -6141,7 +7021,7 @@ mod tests {
             EvidenceItem { id: "KPI-02".into(), kind: "kpi", label: "环比".into(), body: "比较口径=较上月同期；本期值=120；基期值=100；变化额=+20；变化率=+20.0%；方向=up".into() },
         ];
         let llm = StubLlm("## 经营结论\n| 结论 | 业务影响 |\n|---|---|\n| 销售额突破500万 [KPI-01] | 规模翻倍 [KPI-02] |".into());
-        let (insight, _) = evidence_insight(&llm, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &[]).await;
+        let (insight, _) = evidence_insight(&llm, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &[], &[]).await;
         assert!(insight.is_none(), "编造数字必须被 ANALYSIS_CLAIM_VALUE_MISMATCH 拦下");
         let fallback = insight.or_else(|| factual_insight(&evidence)).expect("应回落确定性摘要");
         assert!(fallback.contains("120.00"), "回落摘要只复述证据数值");
@@ -6171,10 +7051,10 @@ mod tests {
             EvidenceItem { id: "SEC-01".into(), kind: "section", label: "核心经营指标".into(), body: "问题=三周期核心指标；列=指标|本周；总行数=1\n销售额 | ¥12.35万".into() },
         ];
         let grounded = StubLlm("## 经营结论\n本周销售额约12.35万。[KPI-01]".into());
-        let (passed, _) = evidence_insight(&grounded, question, dms_agent::AnalysisKind::Metric, &evidence, &[]).await;
+        let (passed, _) = evidence_insight(&grounded, question, dms_agent::AnalysisKind::Metric, &evidence, &[], &[]).await;
         assert!(passed.is_some(), "周报容差内压缩形应通过：{passed:?}");
         let fabricated = StubLlm("## 经营结论\n本周销售额达到99万。[KPI-01]".into());
-        let (blocked, _) = evidence_insight(&fabricated, question, dms_agent::AnalysisKind::Metric, &evidence, &[]).await;
+        let (blocked, _) = evidence_insight(&fabricated, question, dms_agent::AnalysisKind::Metric, &evidence, &[], &[]).await;
         assert!(blocked.is_none(), "周报编造数字同样被拦");
         let fallback = weekly_factual_insight(&evidence).expect("周报应回落确定性摘要");
         assert!(fallback.contains("经营结论"));
@@ -6467,7 +7347,7 @@ mod tests {
         // JSON 契约：insight 过闸 + 两档判词对齐
         let json_reply = StubLlm(r###"{"insight":"## 经营结论\n销售额120.00。[KPI-01]","verdicts":["met","unmet"]}"###.into());
         let (insight, verdicts) =
-            evidence_insight(&json_reply, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &assertions).await;
+            evidence_insight(&json_reply, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &[], &assertions).await;
         assert!(insight.is_some(), "JSON 内的 insight 仍过同一道证据闸门：{insight:?}");
         assert_eq!(
             verdicts,
@@ -6476,7 +7356,7 @@ mod tests {
         // 模型直接给纯 markdown（不理会 JSON 指令）→ 退回老校验，判词全缺但不废解读
         let plain_reply = StubLlm("## 经营结论\n销售额120.00。[KPI-01]".into());
         let (insight, verdicts) =
-            evidence_insight(&plain_reply, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &assertions).await;
+            evidence_insight(&plain_reply, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &[], &assertions).await;
         assert!(insight.is_some(), "纯文本回退路径保住解读");
         assert_eq!(verdicts, vec![None, None], "判词缺席 = 待评，不猜档");
     }
@@ -6507,14 +7387,14 @@ mod tests {
         let assertions = vec![
             dms_agent::analysis::Assertion { section: "主指标".into(), text: "证明销售规模可核".into() },
         ];
-        let _ = evidence_insight(&spy, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &assertions).await;
+        let _ = evidence_insight(&spy, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &[], &assertions).await;
         let user = spy.0.lock().unwrap()[1].clone();
         assert!(user.contains("验收断言清单"), "{user}");
         assert!(user.contains("A1（板块「主指标」）：证明销售规模可核"), "{user}");
         assert!(user.contains("verdicts"), "应要求按序回判词：{user}");
 
         let spy2 = Spy(Default::default());
-        let _ = evidence_insight(&spy2, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &[]).await;
+        let _ = evidence_insight(&spy2, "本月销售额", dms_agent::AnalysisKind::Metric, &evidence, &[], &[]).await;
         let user2 = spy2.0.lock().unwrap()[1].clone();
         assert!(user2.contains("只输出最终分析："), "{user2}");
         assert!(!user2.contains("验收断言") && !user2.contains("verdicts"), "无断言不许出现断言指令：{user2}");

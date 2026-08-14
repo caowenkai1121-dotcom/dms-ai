@@ -71,6 +71,9 @@ ALTER TABLE meta.query_log ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT
 -- 不进 INSERT_SQL：那条是 KB 落账共用的 15 列契约（kernel qalog 的测试钉着 $15/!$16），
 -- 本列只属本写口，INSERT 后按 trace_id UPDATE 贴回（见 `insert`）。老行留默认空串不回填。
 ALTER TABLE meta.query_log ADD COLUMN IF NOT EXISTS context_summary text NOT NULL DEFAULT '';
+-- 已返回但需要复核的结果收据（trust/coverage/复合子问状态）；不混进 error，避免把软降级
+-- 伪装成执行异常。老行留空，写入方式与 context_summary 相同。
+ALTER TABLE meta.query_log ADD COLUMN IF NOT EXISTS result_receipt text NOT NULL DEFAULT '';
 "#;
 
 /// 建表。走 `crate::run_ddl`（按分号逐句切 + 单事务；split 纪律见该函数文档）。
@@ -148,6 +151,8 @@ pub struct Entry {
     pub llm_calls: i32,
     /// 结局分类（A2）：取值仅 `STATUS_*` 四个常量
     pub status: &'static str,
+    /// Ok 结果的可信终闸快照；只含 level、覆盖问题码与复合子问状态，不含数据值。
+    pub result_receipt: Option<String>,
     /// 【D7】本轮实际进 prompt 的上下文摘要（JSON 文本：结构/尺寸/表名，无用户数据值）。
     /// **不是 `INSERT_SQL` 的列**（那条是 KB 落账共用的 15 列契约，kernel qalog 的测试钉着
     /// `$15`/`!$16`）：`finish` 从 agent 的进程内暂存取来，`insert` 里按 `trace_id` UPDATE 贴回。
@@ -210,6 +215,7 @@ fn entry(
         // 几发 precise」。采样提前收工的效果（1 发而非 `sc_samples` 发）直接读得出来。
         llm_calls: clamp_u32_i32(trace.calls.load(Ordering::Relaxed)),
         status: status_of(out),
+        result_receipt: result_receipt(out),
         // D7：纯函数不碰进程内暂存 —— 摘要由 `finish` 补（这样 `entry` 的既有判据一条不动）
         context_summary: None,
     }
@@ -218,7 +224,16 @@ fn entry(
 /// 结局分类（纯函数）。typed 判据优先：错误在 agent 侧多数是 `anyhow::Error::from`
 /// 原样上抛（fail-closed 纪律要求 PolicyError 绝不包装降级），downcast 拿得到原类型。
 fn status_of(out: &anyhow::Result<AskResult>) -> &'static str {
-    let Err(e) = out else { return STATUS_SUCCEEDED };
+    let Err(e) = out else {
+        return if out
+            .as_ref()
+            .is_ok_and(result_requires_review)
+        {
+            STATUS_BLOCKED
+        } else {
+            STATUS_SUCCEEDED
+        };
+    };
     // 权限注入失败 / 只读红线：闸门原样上抛时类型还在（agent `gate_on` → `?`）。
     if e.downcast_ref::<dms_kernel::PolicyError>().is_some()
         || e.downcast_ref::<dms_kernel::GuardError>().is_some()
@@ -247,6 +262,41 @@ fn status_of(out: &anyhow::Result<AskResult>) -> &'static str {
         return STATUS_TIMEOUT;
     }
     STATUS_FAILED
+}
+
+fn result_requires_review(result: &AskResult) -> bool {
+    result
+        .trust
+        .as_ref()
+        .is_some_and(|trust| trust.level == "review")
+        || result
+            .intent_summary
+            .as_ref()
+            .is_some_and(|summary| summary.coverage.status != "complete")
+        || result.subs.iter().any(|sub| result_requires_review(&sub.result))
+}
+
+/// 非敏感的执行收据：trace 诊断只需要知道哪一层被降级，不需要把结果行再存一份。
+fn result_receipt(out: &anyhow::Result<AskResult>) -> Option<String> {
+    let result = out.as_ref().ok()?;
+    serde_json::to_string(&serde_json::json!({
+        "trust_level": result.trust.as_ref().map(|trust| trust.level),
+        "issues": result
+            .intent_summary
+            .as_ref()
+            .map(|summary| summary.coverage.issues.as_slice())
+            .unwrap_or_default(),
+        "subs": result.subs.iter().map(|sub| serde_json::json!({
+            "route": sub.result.route,
+            "trust_level": sub.result.trust.as_ref().map(|trust| trust.level),
+            "issues": sub.result
+                .intent_summary
+                .as_ref()
+                .map(|summary| summary.coverage.issues.as_slice())
+                .unwrap_or_default(),
+        })).collect::<Vec<_>>(),
+    }))
+    .ok()
 }
 
 /// cache_hit 判定：只有语义缓存复用了别人的 SQL 才算命中。
@@ -322,6 +372,28 @@ async fn insert(pg: &PgPool, e: &Entry) -> anyhow::Result<()> {
                 }
                 _ => {}
             }
+        }
+    }
+    if let (Some(receipt), false) = (&e.result_receipt, e.trace_id.is_empty()) {
+        match sqlx::query(
+            "UPDATE meta.query_log SET result_receipt = $1 WHERE trace_id = $2 AND result_receipt = ''",
+        )
+        .bind(receipt)
+        .bind(&e.trace_id)
+        .execute(pg)
+        .await
+        {
+            Ok(done) if done.rows_affected() != 1 => {
+                tracing::warn!(
+                    trace_id = %e.trace_id,
+                    rows = done.rows_affected(),
+                    "结果收据贴回行数异常（主行已落库）"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(trace_id = %e.trace_id, "结果收据贴回失败（主行已落库）: {err:#}");
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -401,7 +473,7 @@ mod tests {
             subs: vec![],
             caliber_note: None,
             reinterpret_note: None,
-        resolved_question: None,
+            resolved_question: None,
             truncation_note: None,
             redacted: vec![],
             scope_note: None,
@@ -410,6 +482,7 @@ mod tests {
             clarify_options: vec![],
             value_labels: vec![],
             sales_context: None,
+            intent_summary: None,
         }
     }
 
@@ -424,37 +497,125 @@ mod tests {
         let out: anyhow::Result<AskResult> = Ok(ok_result());
         let e = entry(&Trace::default(), "zhangsan", "本月销售额", &out, 42);
         assert_eq!(e.status, STATUS_SUCCEEDED);
-        assert_eq!((e.error.as_str(), e.route.as_str(), e.sql.as_str()), ("", "llm", "SELECT 1"));
+        assert_eq!(
+            (e.error.as_str(), e.route.as_str(), e.sql.as_str()),
+            ("", "llm", "SELECT 1")
+        );
         assert_eq!(e.row_count, 1);
+    }
+
+    #[test]
+    fn review_or_incomplete_ok_result_is_blocked_with_receipt() {
+        let mut result = ok_result();
+        result.trust = Some(dms_agent::TrustEnvelope {
+            level: "review",
+            trace_id: "trace-1".into(),
+            source: "dms".into(),
+            route: "llm".into(),
+            access: "当前角色全量权限".into(),
+            execution: "实时执行",
+            fingerprint: "f".into(),
+            checks: vec![],
+        });
+        let out = Ok(result);
+        let logged = entry(&Trace::default(), "u", "q", &out, 1);
+        assert_eq!(logged.status, STATUS_BLOCKED);
+        let receipt: serde_json::Value = serde_json::from_str(
+            logged.result_receipt.as_deref().expect("review 结果必须留收据"),
+        )
+        .unwrap();
+        assert_eq!(receipt["trust_level"], "review");
+        assert_eq!(logged.error, "", "软降级不是执行异常");
+
+        let mut result = ok_result();
+        result.intent_summary = Some(dms_agent::IntentSummary {
+            mode: dms_agent::IntentRoute::Data,
+            status: "grounded",
+            slots: vec![],
+            coverage: dms_agent::IntentCoverageSummary {
+                status: "blocked",
+                issues: vec!["result:detail-empty".into()],
+            },
+        });
+        let out = Ok(result);
+        let logged_entry = entry(&Trace::default(), "u", "q", &out, 1);
+        assert_eq!(logged_entry.status, STATUS_BLOCKED);
+        let receipt: serde_json::Value =
+            serde_json::from_str(logged_entry.result_receipt.as_deref().unwrap()).unwrap();
+        assert_eq!(receipt["issues"], serde_json::json!(["result:detail-empty"]));
+        assert!(
+            receipt["subs"]
+                .as_array()
+                .is_some_and(|subs| subs.iter().all(|sub| sub.get("question").is_none())),
+            "执行收据不应重复保存用户子问"
+        );
+
+        let mut result = ok_result();
+        let mut sub_result = ok_result();
+        sub_result.trust = Some(dms_agent::TrustEnvelope {
+            level: "review",
+            trace_id: "trace-sub".into(),
+            source: "dms".into(),
+            route: "llm".into(),
+            access: "当前角色全量权限".into(),
+            execution: "实时执行",
+            fingerprint: "sub-f".into(),
+            checks: vec![],
+        });
+        result.subs.push(dms_agent::SubResult {
+            question: "敏感的复合子问题原文".into(),
+            result: sub_result,
+        });
+        let out = Ok(result);
+        let entry = entry(&Trace::default(), "u", "q", &out, 1);
+        let receipt: serde_json::Value =
+            serde_json::from_str(entry.result_receipt.as_deref().unwrap()).unwrap();
+        assert!(receipt["subs"][0].get("question").is_none());
+        assert_eq!(receipt["subs"][0]["route"], "llm");
+        assert_eq!(receipt["subs"][0]["trust_level"], "review");
     }
 
     /// 权限注入失败（PolicyError）→ blocked：typed 原样上抛，downcast 必须认得出
     #[test]
     fn policy_error_status_is_blocked() {
-        let s = status(anyhow::Error::new(dms_kernel::PolicyError::UnregisteredTable("t_x".into())));
+        let s = status(anyhow::Error::new(
+            dms_kernel::PolicyError::UnregisteredTable("t_x".into()),
+        ));
         assert_eq!(s, STATUS_BLOCKED);
     }
 
     /// 红线拒绝（GuardError）→ blocked：typed 与折成文案的两种形态都认
     #[test]
     fn guard_error_status_is_blocked() {
-        let s = status(anyhow::Error::new(dms_kernel::GuardError::WriteToken("delete".into())));
+        let s = status(anyhow::Error::new(dms_kernel::GuardError::WriteToken(
+            "delete".into(),
+        )));
         assert_eq!(s, STATUS_BLOCKED, "闸门原样上抛时类型还在");
-        let s = status(anyhow::anyhow!("SQL 安全校验未通过: 只读红线：禁止写操作 [delete]"));
-        assert_eq!(s, STATUS_BLOCKED, "llm 路径自修后仍是红线不过（run 折成文案）");
+        let s = status(anyhow::anyhow!(
+            "SQL 安全校验未通过: 只读红线：禁止写操作 [delete]"
+        ));
+        assert_eq!(
+            s, STATUS_BLOCKED,
+            "llm 路径自修后仍是红线不过（run 折成文案）"
+        );
     }
 
     /// ds 级 ACL 拒绝 → blocked（HTTP 侧同文案映 403，审计口径必须一致）
     #[test]
     fn ds_acl_denial_status_is_blocked() {
-        assert_eq!(status(anyhow::anyhow!("无权访问数据源 ds-9")), STATUS_BLOCKED);
+        assert_eq!(
+            status(anyhow::anyhow!("无权访问数据源 ds-9")),
+            STATUS_BLOCKED
+        );
     }
 
     /// 🔴 「无权访问数据源」是 starts_with 锚定（该句由 source.rs 原样上抛无包装）：
     /// 短语混在报错**中段**（如问句原文被回显进 connector 报错）不得误判 blocked。
     #[test]
     fn ds_acl_phrase_mid_text_is_not_blocked() {
-        let s = status(anyhow::anyhow!("查询失败 [dms] 语法错误 near '无权访问数据源 ds-9'"));
+        let s = status(anyhow::anyhow!(
+            "查询失败 [dms] 语法错误 near '无权访问数据源 ds-9'"
+        ));
         assert_eq!(s, STATUS_FAILED, "短语出现在句中是报错回显，不是 ACL 拒绝");
     }
 
@@ -462,7 +623,8 @@ mod tests {
     #[test]
     fn error_reason_keeps_context_chain() {
         // `anyhow::Error::context` 是 inherent 方法，不需要 trait 导入
-        let out: anyhow::Result<AskResult> = Err(anyhow::anyhow!("底层连接被拒").context("取数失败"));
+        let out: anyhow::Result<AskResult> =
+            Err(anyhow::anyhow!("底层连接被拒").context("取数失败"));
         let e = entry(&Trace::default(), "u", "q", &out, 1);
         assert!(
             e.error.contains("取数失败") && e.error.contains("底层连接被拒"),
@@ -479,7 +641,9 @@ mod tests {
             std::time::Duration::from_secs(30),
         )));
         assert_eq!(s, STATUS_TIMEOUT, "取数超时是 typed 上抛");
-        let s = status(anyhow::anyhow!("LLM 请求失败: error sending request: operation timed out"));
+        let s = status(anyhow::anyhow!(
+            "LLM 请求失败: error sending request: operation timed out"
+        ));
         assert_eq!(s, STATUS_TIMEOUT, "上游超时的丢类型文案");
         let s = status(anyhow::anyhow!("超时 [dms] 等待 30.0s 未返回"));
         assert_eq!(s, STATUS_TIMEOUT, "丢了类型的中文超时文案");
@@ -488,8 +652,16 @@ mod tests {
     /// 其余执行错误 → failed；且 blocked/timeout 的判据不许误伤普通 SQL 报错
     #[test]
     fn generic_error_status_is_failed() {
-        assert_eq!(status(anyhow::anyhow!("查询失败 [dms] Unknown column 'x' in 'field list'")), STATUS_FAILED);
-        assert_eq!(status(anyhow::anyhow!("生成失败（自修后仍不可用）")), STATUS_FAILED);
+        assert_eq!(
+            status(anyhow::anyhow!(
+                "查询失败 [dms] Unknown column 'x' in 'field list'"
+            )),
+            STATUS_FAILED
+        );
+        assert_eq!(
+            status(anyhow::anyhow!("生成失败（自修后仍不可用）")),
+            STATUS_FAILED
+        );
     }
 
     /// 脱敏：URL userinfo 与凭据键值对不许落库；正常错误文案剥完逐字不变
@@ -499,11 +671,28 @@ mod tests {
             "连接失败: dsn=postgres://svc:TopSecret@db.internal/mds password=hunter2 API_KEY=sk-123"
         ));
         let e = entry(&Trace::default(), "u", "q", &out, 1);
-        assert!(!e.error.contains("TopSecret") && !e.error.contains("hunter2") && !e.error.contains("sk-123"), "凭据落库: {}", e.error);
-        assert!(e.error.contains("postgres://***@db.internal"), "{}", e.error);
-        assert!(e.error.contains("password=***") && e.error.contains("API_KEY=***"), "{}", e.error);
+        assert!(
+            !e.error.contains("TopSecret")
+                && !e.error.contains("hunter2")
+                && !e.error.contains("sk-123"),
+            "凭据落库: {}",
+            e.error
+        );
+        assert!(
+            e.error.contains("postgres://***@db.internal"),
+            "{}",
+            e.error
+        );
+        assert!(
+            e.error.contains("password=***") && e.error.contains("API_KEY=***"),
+            "{}",
+            e.error
+        );
         // 无凭据形态时逐字不变（剥过头会把 LLM 自修要看的报错改坏）
-        assert_eq!(sanitize("查询失败 [dms] Unknown column 'x'"), "查询失败 [dms] Unknown column 'x'");
+        assert_eq!(
+            sanitize("查询失败 [dms] Unknown column 'x'"),
+            "查询失败 [dms] Unknown column 'x'"
+        );
     }
 
     /// migrate 幂等纪律：DDL 每句都必须可重复执行（启动路径每次全跑）；
@@ -522,10 +711,25 @@ mod tests {
                 "split 切出的碎句（注释内 ASCII 分号？）: {stmt}"
             );
         }
-        assert!(DDL.contains("ADD COLUMN IF NOT EXISTS status"), "status 列的迁移丢了");
-        assert!(DDL.contains("ADD COLUMN IF NOT EXISTS context_summary"), "context_summary 列的迁移丢了");
+        assert!(
+            DDL.contains("ADD COLUMN IF NOT EXISTS status"),
+            "status 列的迁移丢了"
+        );
+        assert!(
+            DDL.contains("ADD COLUMN IF NOT EXISTS context_summary"),
+            "context_summary 列的迁移丢了"
+        );
+        assert!(
+            DDL.contains("ADD COLUMN IF NOT EXISTS result_receipt"),
+            "result_receipt 列的迁移丢了"
+        );
         // 索引被误删会静默退成全表扫，名字钉在这里
-        for idx in ["idx_query_log_at", "idx_query_log_route_at", "idx_query_trace", "idx_query_log_conv"] {
+        for idx in [
+            "idx_query_log_at",
+            "idx_query_log_route_at",
+            "idx_query_trace",
+            "idx_query_log_conv",
+        ] {
             assert!(DDL.contains(idx), "索引 {idx} 的建句丢了");
         }
     }
@@ -558,13 +762,22 @@ mod tests {
             finish_body.contains("take_context_summary"),
             "finish 没从暂存取摘要 —— context_summary 列会永远空着"
         );
-        assert!(finish_body.contains("trace_id"), "必须按 trace_id 取（暂存键就是 trace_id）");
+        assert!(
+            finish_body.contains("trace_id"),
+            "必须按 trace_id 取（暂存键就是 trace_id）"
+        );
         let insert_body = src.split("async fn insert(").nth(1).expect("insert 没了");
         assert!(
             insert_body.contains("UPDATE meta.query_log SET context_summary"),
             "贴回 UPDATE 没了"
         );
-        assert!(insert_body.contains("WHERE trace_id = $2"), "必须按 trace_id 贴回本行");
-        assert!(src.contains("sqlx::query(INSERT_SQL)"), "INSERT 主语句必须吃共享常量（一字未动）");
+        assert!(
+            insert_body.contains("WHERE trace_id = $2"),
+            "必须按 trace_id 贴回本行"
+        );
+        assert!(
+            src.contains("sqlx::query(INSERT_SQL)"),
+            "INSERT 主语句必须吃共享常量（一字未动）"
+        );
     }
 }

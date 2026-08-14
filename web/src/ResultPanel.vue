@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, ref } from 'vue'
-import { fmt, semanticForLabel, toNum, type Semantic } from './format'
+import { fmt, isGrossMarginLabel, semanticForLabel, toNum, type Semantic } from './format'
+import { intentIssueText, type IntentSlot, type IntentSummary } from './result-receipt'
 
 // 弱网 / chunk 加载失败时图表区不能长期空白无反馈：loading 占位 + error 兜底
 const BiChart = defineAsyncComponent({
@@ -55,6 +56,11 @@ interface Result {
    *  那件事不报错、也没有任何判据抓得到，属正确性而非产品面。
    *  【结果卡降噪】它是「判断/校验类信息」：渲染在底部「核查详情」折叠条里（默认收起），不占首屏。 */
   scope_note?: string
+  /** 用户原问被补全/归一后，本轮实际采用的理解。只展示后端事实，不在前端猜口径。 */
+  reinterpret_note?: string
+  resolved_question?: string
+  /** 同一份结构化意图合同的安全摘要；不含 SQL、prompt、内部实体 ID。 */
+  intent_summary?: IntentSummary
   /** 可信核查凭证（`agent::ctx::attach_trust`）：级别/来源/权限边界/执行方式/指纹/checks 清单。
    *  全是判断/校验类信息 —— 裁决（2026-08-10 结果卡降噪）：收进「核查详情」折叠条，
    *  数据一项不丢，只是默认收起。后端 `skip_serializing_if`，老服务端不带这个键也不崩。 */
@@ -177,11 +183,38 @@ const isAskRoute = computed(() => props.result.route === 'need-intent' || props.
  *  caliber-warn 那句一句话警告仍留首屏 —— 「数字不可信」这件事本身不能折叠。 */
 const auditTrust = computed(() => props.result.trust)
 const auditCaliberNote = computed(() => (isAskRoute.value ? '' : (props.result.caliber_note ?? '')))
-const hasAudit = computed(() => !!(auditCaliberNote.value || props.result.scope_note || auditTrust.value))
+const resolvedQuestion = computed(() => (props.result.resolved_question ?? '').trim())
+const reinterpretNote = computed(() => (props.result.reinterpret_note ?? '').trim())
+const intentSummary = computed(() => props.result.intent_summary)
+const understandingText = computed(() => reinterpretNote.value || (resolvedQuestion.value
+  ? `本轮实际按「${resolvedQuestion.value}」执行。`
+  : ''))
+const hasFoundation = computed(() => !!(
+  auditCaliberNote.value || props.result.scope_note || auditTrust.value
+  || reinterpretNote.value || resolvedQuestion.value || intentSummary.value
+))
+const INTENT_MODE_LABEL: Record<IntentSummary['mode'], string> = {
+  data: '问数', knowledge: '知识检索', hybrid: '数据 + 知识', unknown: '待确认',
+}
+const INTENT_SLOT_LABEL: Record<IntentSlot['kind'], string> = {
+  metric: '指标', entity: '对象', region: '地区', time: '时间', filter: '筛选',
+  breakdown: '拆分', comparison: '比较', detail: '明细',
+}
+const intentStatusText = computed(() => {
+  const summary = intentSummary.value
+  if (!summary) return ''
+  if (summary.coverage.status === 'complete') return `${INTENT_MODE_LABEL[summary.mode]}意图已完整覆盖`
+  return summary.status === 'clarification' ? '需要补充问题限定' : '意图覆盖未通过'
+})
 const TRUST_LEVEL_LABEL: Record<string, string> = {
-  verified: '已验证（确定性路径）',
-  high: '较高（模型 SQL 已过全闸门）',
-  review: '需复核（有明确风险标注）',
+  verified: '已验证',
+  high: '已校验',
+  review: '需复核',
+}
+const TRUST_LEVEL_NOTE: Record<string, string> = {
+  verified: '确定性业务路径',
+  high: '模型查询已通过安全、权限与执行校验',
+  review: '存在明确风险，使用前请核对',
 }
 const insightCards = computed<InsightCard[]>(() => {
   if (isEntityCandidate.value) return []
@@ -290,11 +323,6 @@ function entityValue(pair: [string, unknown]): string {
   return displayValue(pair[0], pair[1]) || '—'
 }
 
-function isGrossMarginLabel(label: string): boolean {
-  const normalized = label.replace(/\s+/g, '')
-  return normalized === '毛利率' || normalized === '销售毛利率'
-}
-
 function displayValue(label: string, value: unknown, semantic?: Semantic, metric = false): string {
   const number = toNum(value)
   if (isGrossMarginLabel(label) && number !== null) return fmt(number * 100, 'percent')
@@ -338,11 +366,21 @@ function chartTitle(block: Block, view = props.result.view): string {
   return `${metrics}按${x}对比`
 }
 
-function chartCaption(block: Block, view = props.result.view): string {
+function chartCaption(
+  block: Block,
+  view = props.result.view,
+  rows: unknown[] = props.result.rows,
+): string {
   const x = (block.x === undefined ? undefined : view?.columns[block.x]?.name) ?? '维度'
-  if (block.kind === 'line') return `按${x}观察变化与拐点`
-  if (block.kind === 'pie') return `各${x}占比与集中度`
-  return `各${x}贡献与排名`
+  const base =
+    block.kind === 'line' ? `按${x}观察变化与拐点`
+    : block.kind === 'pie' ? `各${x}占比与集中度`
+    : `各${x}贡献与排名`
+  // 🔴 TOP 收纳必须告知：200 个客户只画 10 根柱，而标题写「各客户贡献与排名」——
+  // 用户会把这 10 个当成全部。把「图只画了一部分」这件事赌在用户自己去数表格行数上，
+  // 是把正确性外包给用户（2026-08-13 视觉审计）。
+  const top = block.top
+  return top && rows.length > top ? `${base}（前 ${top} 项，共 ${rows.length} 项）` : base
 }
 
 function entityTitle(block: Block): string {
@@ -552,6 +590,84 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
       未找到数据。可能：① 该口径本期无记录；② 数据权限范围内无此数据；③ 换个说法试试
     </div>
 
+    <!-- 在 AI 结论和业务数字之前给出依据：等级只来自后端 trust，不在 UI 伪造置信度。 -->
+    <details
+      v-if="hasFoundation && !isEntityCandidate"
+      class="foundation"
+      :open="auditTrust?.level === 'review' || intentSummary?.coverage.status === 'blocked'"
+    >
+      <summary>
+        <span v-if="auditTrust" class="trust-badge" :class="auditTrust.level">
+          <i aria-hidden="true"></i>{{ TRUST_LEVEL_LABEL[auditTrust.level] ?? auditTrust.level }}
+        </span>
+        <span v-else-if="intentSummary" class="trust-badge" :class="intentSummary.coverage.status === 'complete' ? 'verified' : 'review'">
+          <i aria-hidden="true"></i>{{ intentSummary.coverage.status === 'complete' ? '已理解' : '待确认' }}
+        </span>
+        <span class="foundation-title">{{ intentSummary ? '问题理解与结果依据' : '结果依据' }}</span>
+        <small v-if="auditTrust">{{ TRUST_LEVEL_NOTE[auditTrust.level] }}</small>
+        <small v-else-if="intentStatusText">{{ intentStatusText }}</small>
+        <b>查看理解与证据</b>
+      </summary>
+      <div class="foundation-body">
+        <div v-if="understandingText" class="foundation-row">
+          <span>本轮理解</span>
+          <p>{{ understandingText }}</p>
+        </div>
+        <div v-if="intentSummary" class="foundation-row intent-row">
+          <span>识别条件</span>
+          <div class="intent-slots">
+            <span class="intent-mode">{{ INTENT_MODE_LABEL[intentSummary.mode] }}</span>
+            <span v-for="(slot, si) in intentSummary.slots" :key="`${slot.kind}-${slot.surface}-${si}`" class="intent-slot">
+              <i>{{ INTENT_SLOT_LABEL[slot.kind] }}</i>{{ slot.surface }}
+            </span>
+            <span v-if="!intentSummary.slots.length" class="intent-empty">尚未识别到可执行限定</span>
+          </div>
+        </div>
+        <div v-if="intentSummary?.coverage.issues.length" class="foundation-row risk">
+          <span>理解缺口</span>
+          <ul class="foundation-checks"><li v-for="(issue, ii) in intentSummary.coverage.issues" :key="ii">{{ intentIssueText(issue) }}</li></ul>
+        </div>
+        <div v-if="auditTrust" class="foundation-facts" aria-label="结果来源与边界">
+          <div><span>数据来源</span><b>{{ auditTrust.source }}</b></div>
+          <div><span>执行方式</span><b>{{ auditTrust.execution }}</b></div>
+          <div><span>权限范围</span><b>{{ auditTrust.access }}</b></div>
+        </div>
+        <div v-else-if="result.scope_note" class="foundation-row">
+          <span>权限范围</span>
+          <p>{{ result.scope_note }}</p>
+        </div>
+        <div v-if="auditCaliberNote" class="foundation-row risk">
+          <span>口径风险</span>
+          <p>{{ auditCaliberNote }}</p>
+        </div>
+        <div v-if="auditTrust?.checks.length" class="foundation-row">
+          <span>已完成校验</span>
+          <ul class="foundation-checks"><li v-for="(c, ci) in auditTrust.checks" :key="ci">{{ c }}</li></ul>
+        </div>
+        <div v-if="auditTrust" class="foundation-trace">
+          <span>Trace {{ auditTrust.trace_id }}</span><span>计算指纹 {{ auditTrust.fingerprint }}</span>
+        </div>
+      </div>
+    </details>
+
+    <section v-if="insightCards.length" class="result-section insight-section">
+      <div class="section-head">
+        <div>
+          <span class="section-kicker">AI</span>
+          <h3>结论与建议</h3>
+        </div>
+        <span class="analysis-basis">基于本次查询结果</span>
+      </div>
+      <div class="insight-grid">
+        <article v-for="card in insightCards" :key="card.kind" class="insight-card" :class="card.kind">
+          <div class="insight-card-head"><span class="insight-dot"></span>{{ card.title }}</div>
+          <ul>
+            <li v-for="(item, ii) in card.items" :key="ii">{{ item }}</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
     <section v-if="kpis.length" class="result-section kpi-section">
       <div class="section-head">
         <div>
@@ -702,7 +818,7 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
         <div class="chart-grid">
           <article v-for="(b, bi) in supplementalTrendCharts" :key="`supplemental-trend-${bi}`" class="chart-card">
             <header class="chart-head">
-              <div><h4>{{ chartTitle(b, supplemental.view) }}</h4><p>{{ chartCaption(b, supplemental.view) }}</p></div>
+              <div><h4>{{ chartTitle(b, supplemental.view) }}</h4><p>{{ chartCaption(b, supplemental.view, supplemental.rows) }}</p></div>
               <span class="chart-type">趋势</span>
             </header>
             <BiChart :kind="b.kind!" :columns="supplemental.view.columns" :rows="supplemental.rows" :x="b.x!" :y="b.y!" :top="b.top" :series="b.series" />
@@ -715,7 +831,7 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
         <div class="chart-grid" :class="{ paired: supplementalCompositionCharts.length > 1 }">
           <article v-for="(b, bi) in supplementalCompositionCharts" :key="`supplemental-composition-${bi}`" class="chart-card">
             <header class="chart-head">
-              <div><h4>{{ chartTitle(b, supplemental.view) }}</h4><p>{{ chartCaption(b, supplemental.view) }}</p></div>
+              <div><h4>{{ chartTitle(b, supplemental.view) }}</h4><p>{{ chartCaption(b, supplemental.view, supplemental.rows) }}</p></div>
               <span class="chart-type">{{ b.kind === 'pie' ? '占比' : b.top != null ? '排名' : '对比' }}</span>
             </header>
             <BiChart :kind="b.kind!" :columns="supplemental.view.columns" :rows="supplemental.rows" :x="b.x!" :y="b.y!" :top="b.top" :series="b.series" />
@@ -765,49 +881,6 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
       <pre>{{ displaySql }}</pre>
     </details>
 
-    <!-- 【结果卡降噪】判断/校验类信息的默认收起位：口径复核明细、权限注入回显、
-         可信凭证（级别/Trace/来源/权限边界/执行方式/指纹/checks 清单）。数据全在，只是默认折叠。 -->
-    <details v-if="hasAudit" class="audit-details">
-      <summary>核查详情</summary>
-      <div class="audit-body">
-        <div v-if="auditCaliberNote" class="audit-item">
-          <span class="audit-k">口径复核</span>
-          <p>{{ auditCaliberNote }}</p>
-        </div>
-        <div v-if="result.scope_note" class="audit-item">
-          <span class="audit-k">数据权限</span>
-          <p>{{ result.scope_note }}</p>
-        </div>
-        <div v-if="auditTrust" class="audit-item">
-          <span class="audit-k">可信凭证</span>
-          <p>
-            级别 {{ TRUST_LEVEL_LABEL[auditTrust.level] ?? auditTrust.level }} · Trace {{ auditTrust.trace_id }}
-            · 来源 {{ auditTrust.source }} · {{ auditTrust.access }} · {{ auditTrust.execution }} · 指纹 {{ auditTrust.fingerprint }}
-          </p>
-          <ul class="audit-checks">
-            <li v-for="(c, ci) in auditTrust.checks" :key="ci">{{ c }}</li>
-          </ul>
-        </div>
-      </div>
-    </details>
-
-    <section v-if="insightCards.length" class="result-section insight-section">
-      <div class="section-head">
-        <div>
-          <span class="section-kicker">AI</span>
-          <h3>分析结论</h3>
-        </div>
-        <span class="analysis-basis">基于本次查询结果</span>
-      </div>
-      <div class="insight-grid">
-        <article v-for="card in insightCards" :key="card.kind" class="insight-card" :class="card.kind">
-          <div class="insight-card-head"><span class="insight-dot"></span>{{ card.title }}</div>
-          <ul>
-            <li v-for="(item, ii) in card.items" :key="ii">{{ item }}</li>
-          </ul>
-        </article>
-      </div>
-    </section>
   </div>
 </template>
 
@@ -827,6 +900,50 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
 }
 .derive-note b { color: var(--warning-text); }
 
+.foundation {
+  margin: 0 0 14px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-card); box-shadow: var(--shadow-sm); overflow: hidden;
+}
+.foundation summary {
+  min-height: 42px; display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+  color: var(--text-regular); cursor: pointer; list-style: none; user-select: none;
+}
+.foundation summary::-webkit-details-marker { display: none; }
+.foundation-title { color: var(--text-primary); font-size: 12.5px; font-weight: 700; }
+.foundation summary small { min-width: 0; color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
+.foundation summary > b { margin-left: auto; color: var(--primary); font-size: 10.5px; font-weight: 600; white-space: nowrap; }
+.trust-badge {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px;
+  border: 1px solid var(--border); border-radius: 999px; font-size: 10.5px; font-weight: 700;
+}
+.trust-badge i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.trust-badge.verified { border-color: rgba(60, 148, 96, .28); background: rgba(60, 148, 96, .07); color: var(--success-text); }
+.trust-badge.high { border-color: rgba(var(--primary-rgb), .25); background: var(--primary-light); color: var(--primary); }
+.trust-badge.review { border-color: rgba(211, 139, 25, .3); background: rgba(211, 139, 25, .07); color: var(--warning-text); }
+.foundation[open] summary { border-bottom: 1px solid var(--divider); }
+.foundation-body { display: grid; gap: 11px; padding: 12px; color: var(--text-regular); font-size: 11.5px; line-height: 1.65; }
+.foundation-row { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 10px; }
+.foundation-row > span, .foundation-facts span { color: var(--text-muted); font-size: 10.5px; }
+.foundation-row p { margin: 0; overflow-wrap: anywhere; }
+.foundation-row.risk { padding: 8px 9px; border-left: 3px solid var(--warning-text); background: var(--warning-bg); }
+.intent-row { align-items: start; }
+.intent-slots { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.intent-mode, .intent-slot, .intent-empty {
+  display: inline-flex; align-items: center; gap: 4px; min-width: 0; padding: 3px 7px;
+  border: 1px solid var(--divider); border-radius: 999px; background: var(--bg-main);
+  color: var(--text-regular); font-size: 10.5px; line-height: 1.4; overflow-wrap: anywhere;
+}
+.intent-mode { border-color: rgba(var(--primary-rgb), .22); background: var(--primary-light); color: var(--primary); font-weight: 700; }
+.intent-slot i { color: var(--text-muted); font-style: normal; }
+.intent-empty { color: var(--text-muted); }
+.foundation-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.foundation-facts div { min-width: 0; padding: 8px 9px; border: 1px solid var(--divider); border-radius: 6px; background: var(--bg-main); }
+.foundation-facts span, .foundation-facts b { display: block; }
+.foundation-facts b { margin-top: 2px; color: var(--text-primary); font-size: 11.5px; font-weight: 650; overflow-wrap: anywhere; }
+.foundation-checks { margin: 0; padding-left: 17px; }
+.foundation-checks li { margin: 1px 0; }
+.foundation-trace { display: flex; flex-wrap: wrap; gap: 5px 12px; color: var(--text-faint); font: 10px/1.5 var(--font-mono); overflow-wrap: anywhere; }
+
 .result-section { min-width: 0; margin: 22px 0 0; }
 .result-section:first-of-type { margin-top: 14px; }
 .section-head {
@@ -836,6 +953,10 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
 .section-head h3 { display: flex; align-items: center; gap: 7px; margin: 2px 0 0; color: var(--text-primary); font-size: 15px; line-height: 1.35; font-weight: 700; }
 .section-kicker { display: block; color: var(--primary); font-size: 10px; line-height: 1.2; font-weight: 750; }
 .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: 0; }
+/* auto-fit 会把空轨道塌掉，于是**一张卡吃满整行**：28px 的数字左挂在 800px 空白里。
+   `.solo` 那条大卡规则在后面，仍然胜出；窄屏的两处覆写（容器查询 / @media）也在后面，
+   仍然 1fr 铺满 —— 这条只管「有图有表时的单卡」这一档。 */
+.kpi-row:not(.solo) { grid-template-columns: repeat(auto-fit, minmax(180px, 300px)); justify-content: start; }
 .metric-card {
   position: relative; min-width: 0; min-height: 116px; padding: 15px 16px; border: 1px solid var(--border);
   border-radius: 8px; background: var(--bg-card); box-shadow: var(--shadow-sm); overflow: hidden;
@@ -923,7 +1044,8 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
 .tbl-wrap thead .row-index { z-index: 3; background: var(--bg-main); }
 /* 斑马行的 sticky 行号格与同行数据格同一底色（color-mix），不能一行两种底 */
 .tbl-wrap tbody tr:nth-child(even) .row-index { background: color-mix(in srgb, var(--bg-main) 56%, var(--bg-card)); }
-.tbl-wrap tbody tr:hover .row-index { background: var(--primary-light); }
+  /* sticky 首列不能用半透明底：横滚时被压在下面的单元格文字会直接透出来 */
+.tbl-wrap tbody tr:hover .row-index { background: color-mix(in srgb, var(--primary) 8%, var(--bg-card)); }
 .redact-lock { margin-left: 4px; font-size: 10px; }
 .table-scroll-hint { display: none; margin-top: 6px; color: var(--text-muted); font-size: 10.5px; text-align: right; }
 
@@ -982,25 +1104,7 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
   white-space: pre; tab-size: 2;
 }
 
-/* 「核查详情」折叠条（结果卡降噪）：小字弱化，判断/校验类信息的默认收起位 */
-.audit-details {
-  margin-top: 12px; border: 1px dashed var(--border); border-radius: 7px;
-  background: transparent; overflow: hidden;
-}
-.audit-details summary {
-  padding: 7px 12px; color: var(--text-faint); font-size: 11px; font-weight: 600;
-  cursor: pointer; user-select: none;
-}
-.audit-details[open] summary { border-bottom: 1px dashed var(--border); color: var(--text-muted); }
-.audit-body { padding: 10px 13px; color: var(--text-muted); font-size: 11.5px; line-height: 1.7; }
-.audit-item { margin-bottom: 8px; }
-.audit-item:last-child { margin-bottom: 0; }
-.audit-item p { margin: 2px 0 0; overflow-wrap: anywhere; }
-.audit-k { color: var(--text-faint); font-size: 10.5px; font-weight: 700; }
-.audit-checks { margin: 4px 0 0; padding-left: 16px; }
-.audit-checks li { margin: 1px 0; }
-
-.insight-section { margin-top: 24px; padding-top: 2px; }
+.insight-section { margin-top: 18px; padding-top: 2px; }
 .analysis-basis { color: var(--text-muted); font-size: 11px; }
 /* auto-fit：1-2 张卡时不压成 1/3 宽留白 */
 .insight-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
@@ -1023,7 +1127,7 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
 .ask-custom { display: flex; gap: 8px; margin-top: 10px; }
 .ask-input { min-width: 0; flex: 1; height: 36px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); outline: none; background: var(--bg-card); color: var(--text-regular); font: inherit; }
 .ask-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-bg); }
-.ask-submit { height: 36px; padding: 0 16px; border: 1px solid var(--primary); border-radius: var(--radius); background: var(--primary); color: #fff; font: inherit; cursor: pointer; }
+.ask-submit { height: 36px; padding: 0 16px; border: 1px solid var(--primary); border-radius: var(--radius); background: var(--primary); color: var(--on-primary); font: inherit; cursor: pointer; }
 .ask-submit:disabled { opacity: .45; cursor: not-allowed; }
 
 @container (max-width: 720px) {
@@ -1034,6 +1138,7 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
   .kpi-row { grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); }
   .table-scroll-hint { display: block; }
   .supplemental-head { align-items: flex-start; }
+  .foundation-facts { grid-template-columns: 1fr; }
 }
 
 /* 与上方 @container(720px) 同形规则是**双断点刻意并存**，不是重复：
@@ -1059,6 +1164,9 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
   .tbl-wrap th, .tbl-wrap td { max-width: 210px; padding: 8px 9px; font-size: 11.5px; }
   .insight-grid { grid-template-columns: 1fr; gap: 8px; }
   .analysis-basis { display: none; }
+  .foundation summary { align-items: flex-start; flex-wrap: wrap; }
+  .foundation summary > b { margin-left: 0; }
+  .foundation-row { grid-template-columns: 1fr; gap: 3px; }
   .ask-custom { flex-direction: column; }
   .ask-submit { width: 100%; }
 }

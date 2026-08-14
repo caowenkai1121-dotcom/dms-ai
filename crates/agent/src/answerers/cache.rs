@@ -46,6 +46,14 @@ impl CacheAnswerer {
         if !passes_guards(cx.question, &hit_q, dist) {
             return Ok(None);
         }
+        let intent_coverage = crate::intent::sql_coverage(cx.intent, &hit_sql, cx.source.dialect());
+        if !intent_coverage.complete() {
+            tracing::warn!(
+                ?intent_coverage,
+                "语义缓存 SQL 未覆盖本轮结构化意图 → 回落 LLM"
+            );
+            return Ok(None);
+        }
         // 命中：复用 SQL（数据实时查、权限按**当轮**用户重新注入，I4）。
         let scoped = match gate_on(cx.p, &hit_sql, cx.scope, cx.ds_global, cx.source.dialect()) {
             Ok(s) => s,
@@ -75,7 +83,7 @@ impl Answerer for CacheAnswerer {
     /// 追问不许命中缓存（`pipeline.rs:707`）：追问的字面很短、语义靠上一轮撑着，
     /// 向量近邻会稳定地把它认成别的问题。
     fn accept(&self, cx: &AskCtx<'_>) -> bool {
-        !(self.is_followup)(cx.question)
+        cx.intent_attempt.is_data_executable() && !(self.is_followup)(cx.question)
     }
 
     fn answer<'a>(&'a self, cx: &'a AskCtx<'a>) -> BoxFut<'a, anyhow::Result<Option<AskResult>>> {

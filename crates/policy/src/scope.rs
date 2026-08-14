@@ -260,6 +260,15 @@ async fn shop_contact_scope(
 
 /// 普通角色/客户联系人按客户取有效门店。真空客户集合对普通 DMS 策略表示不限制；
 /// 哨兵或有客户却查不到门店则必须保留拒绝哨兵，不能让空集合反向变成全量。
+///
+/// 🔴 **读失败退化成拒绝哨兵，而不是整轮失败**（2026-08-14 回归 F04）：
+/// `SELECT DISTINCT shop_code FROM t_master_shop WHERE customer_code IN (27 个) …`
+/// 在生产 MySQL 上要 4s，撞 `max_statement_time` 返 3024 —— 于是 `city_manager`
+/// **一句话都问不了**（算权限就挂了），而门店只是他众多可查对象里的一个维度。
+///
+/// 退化方向是 fail-closed 的：哨兵 = 该用户看不到任何门店行（`t_master_shop` 那一族查询返空），
+/// 其余表照常按客户/员工集合注入。**不许**改成空集合 —— `ShopCodes` 臂空集不注入 ＝ 整表可见。
+/// 这条退化是给「库慢/抖」兜底，不是给「查出来就是空」用：后者本来就走 `deny_empty_strings`。
 async fn shops_for_customer_scope(
     mysql: &ReadOnlyMySql,
     customer_codes: &[String],
@@ -270,9 +279,13 @@ async fn shops_for_customer_scope(
     if !has_real_codes(customer_codes) {
         return Ok(vec![SENTINEL_STR.into()]);
     }
-    Ok(deny_empty_strings(
-        t::active_shop_codes_by_customers(mysql, customer_codes).await?,
-    ))
+    match t::active_shop_codes_by_customers(mysql, customer_codes).await {
+        Ok(codes) => Ok(deny_empty_strings(codes)),
+        Err(e) => {
+            tracing::warn!(err = %e, "门店集合读取失败 → 该维度按拒绝哨兵处理（其余维度照常）");
+            Ok(vec![SENTINEL_STR.into()])
+        }
+    }
 }
 
 fn has_real_codes(codes: &[String]) -> bool {
@@ -450,6 +463,27 @@ mod tests {
         assert_eq!(special_role("customer_contact"), Some(SpecialRole::CustomerContact));
         assert_eq!(special_role("shop_contact"), Some(SpecialRole::ShopContact));
         assert_eq!(special_role("city_manager"), None);
+    }
+
+    /// 🔴 门店读失败必须退化成**拒绝哨兵**，不能整轮失败、更不能退成空集合。
+    ///
+    /// 空集合会让 `ShopCodes` 臂一个段都不 push ＝ `t_master_shop` 整表可见（fail-open）；
+    /// 整轮失败则是 2026-08-14 回归 F04 的现象：生产库 3024 一次，`city_manager` 一句话都问不了。
+    #[test]
+    fn shop_read_failure_degrades_to_deny_not_to_full_access() {
+        let src = include_str!("scope.rs");
+        let body = src
+            .split("async fn shops_for_customer_scope(")
+            .nth(1)
+            .expect("函数改名了")
+            .split("
+}")
+            .next()
+            .unwrap();
+        assert!(body.contains("Err(e) =>"), "读失败仍在上抛：算权限挂了就等于一句话都问不了");
+        let arm = body.split("Err(e) =>").nth(1).unwrap();
+        assert!(arm.contains("SENTINEL_STR"), "退化必须是拒绝哨兵：{arm}");
+        assert!(!arm.contains("vec![]"), "退成空集合 = ShopCodes 不注入 = 整表可见：{arm}");
     }
 
     #[test]

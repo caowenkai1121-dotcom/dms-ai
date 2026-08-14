@@ -205,7 +205,11 @@ mod tests {
         // 篡改密文体（base64 尾部一个字符）
         let mut bad = c.clone();
         let n = bad.len();
-        bad.replace_range(n - 2..n - 1, if bad.ends_with('A') { "B" } else { "A" });
+        // 🔴 按**被替换的那一位**选替换值，不是按末位：原写法判 `ends_with('A')` 却改
+        // 倒数第二位，当那一位本来就是 'A' 而末位不是时，这次「篡改」是空操作 →
+        // 密文没变 → 解密成功 → 断言随机红（随机 nonce 下约 1/64 一次，2026-08-13 实测撞到）。
+        let target = bad.as_bytes()[n - 2] as char;
+        bad.replace_range(n - 2..n - 1, if target == 'A' { "B" } else { "A" });
         assert!(decrypt_with(&K1, &bad).is_err(), "改过的密文必须响亮失败");
         // 截断（连 tag 都不剩）
         let short = format!("{ENC_PREFIX}{}", base64::engine::general_purpose::STANDARD.encode([1u8; 8]));

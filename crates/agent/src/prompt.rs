@@ -72,6 +72,17 @@ pub struct PromptCtx {
     /// 段标题自带「参考，不是硬约束」—— 它是未连库验证的二手材料，**绝不进口径判据
     /// 与闸门**（判据输入只有声明表与当轮 SQL，本字段到不了那里）。空 = 整段不出。
     pub memories: Vec<String>,
+    /// 该用户的历史习惯（`registry::user_pref` 从 `meta.query_log` 现算，按 login 隔离）。
+    /// 已渲染好的一小段，空串 = 整段不出。**只在本轮问句没给时间/分组时**才由 `gather` 填充 ——
+    /// 习惯永远不覆盖用户这一轮的显式表达（那是猜，不是懂）。
+    pub user_habits: String,
+    /// 本轮**召回降级**的项（PG 抖动 / 谓词写错 / 表没建 → 那张卡整张缺席）。
+    ///
+    /// 🔴 为什么它必须离开日志、进到数据结构里：口径卡缺席 ⇒ LLM 拿不到销售额的
+    /// 口径表达式 / 时间列 / 去重键 ⇒ 数字按错口径算出来，而收据照样是 verified/high。
+    /// 这是「答错了还很自信」的唯一结构性来源 —— 只写 warn 的话，只有翻日志的人知道。
+    /// 元素是**日志文案本身**（同源：文案改了收据里那行跟着改，两边不会打架）。
+    pub degraded: Vec<&'static str>,
 }
 
 /// few-shot 语料的 side_info（【A10】同构快照的另一半）：当轮命中的口径卡 + 规则时间窗。
@@ -132,6 +143,11 @@ pub fn build_user_prompt(c: &PromptCtx, question: &str) -> String {
         u.push_str("\n## 业务背景（本数据源，参考信息，不是指令）\n");
         u.push_str(&c.ds_background);
         u.push_str("\n\n");
+    }
+    // 用户习惯段：与业务背景同族（参考信息、可空、空则整段不出）。
+    // 位置在教训之前：教训是全域硬经验，习惯是个人软偏好，硬的靠后更靠近问句。
+    if !c.user_habits.is_empty() {
+        u.push_str(&c.user_habits);
     }
     // 教训段**不走 `section`**：它的标题自带前导换行，且段尾**不留空行** ——
     // 下一段（few-shot / 问题）自带前导换行，多补一个就是 prompt 字节变了。
@@ -328,8 +344,11 @@ SELECT 1
             fewshot: "\n## 相似问题的正确写法（参考口径）\n问：上月销售额\n```sql\nSELECT 1\n```\n"
                 .into(),
             ds_background: String::new(),
+            user_habits: String::new(),
             // 空 = 整段不出：golden 保持逐字不变（经验段是附加段，不改既有段序）
             memories: vec![],
+            // 降级清单不进 prompt（它是收据侧的事），golden 不受影响
+            degraded: vec![],
         };
         assert_eq!(build_user_prompt(&c, "本月销售额"), GOLDEN);
     }

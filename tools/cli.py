@@ -181,6 +181,22 @@ def stale_exe(exe=None, crates=None):
     return result
 
 
+# 🔴 判官/评测进程一律带上判官模式：服务端据此关掉全部学习写口
+# （`registry::judge_mode`）。不带这一条，跑一趟全量题集就把评测问句连同那一刻的 SQL
+# 灌进 few-shot 与经验池，再喂回真实用户 —— 判官必须能观察系统而不改变系统。
+# 本机 exe 那条路靠继承的环境变量；docker exec 那条路要显式 `-e` 注入（见 _base_argv）。
+JUDGE_ENV = ("DMSAI_JUDGE", "1")
+os.environ.setdefault(*JUDGE_ENV)
+
+
+def _with_judge_env(base):
+    """docker exec 形态：在 exec 子命令后插 `-e DMSAI_JUDGE=1`（已带则不重复）。"""
+    at = _docker_exec_at(base)
+    if at is None or any(t == f"{JUDGE_ENV[0]}={JUDGE_ENV[1]}" for t in base):
+        return base
+    return base[: at + 1] + ["-e", f"{JUDGE_ENV[0]}={JUDGE_ENV[1]}"] + base[at + 1 :]
+
+
 def _base_argv():
     """读 `DMSAI_CLI` 前缀（未设时先验本机 exe 不过期），返回 shlex 切好的 base。"""
     pre = os.environ.get("DMSAI_CLI", "").strip()
@@ -188,7 +204,7 @@ def _base_argv():
         why = stale_exe()
         if why:
             raise SystemExit("❌ " + why)
-    return shlex.split(pre) if pre else [str(EXE)]
+    return _with_judge_env(shlex.split(pre) if pre else [str(EXE)])
 
 
 def cli(*args):
@@ -276,15 +292,20 @@ if __name__ == "__main__":  # python tools/cli.py —— 自检
     if EXE.exists() and not stale_exe():
         print("⚠️ 本机 exe 存在且不过期：SAC 可能松了，确认一下这条水位计是否还有效")
     os.environ["DMSAI_CLI"] = "docker exec dms-ai-server /app/dms-ai-server"
+    # 判官模式随 argv 走：docker exec 形态必须显式 -e，否则容器里读不到本进程的环境变量
     assert cli_stdin("eval-batch") == [
-        "docker", "exec", "-i", "dms-ai-server", "/app/dms-ai-server", "eval-batch",
+        "docker", "exec", "-i", "-e", "DMSAI_JUDGE=1",
+        "dms-ai-server", "/app/dms-ai-server", "eval-batch",
     ]
     os.environ["DMSAI_CLI"] = "docker exec -i dms-ai-server /app/dms-ai-server"
+    # 已带 -i 时 -e 插在 exec 之后、-i 之前：两种排列 docker 都认，钉住实际产出即可
     assert cli_stdin("eval-batch") == [
-        "docker", "exec", "-i", "dms-ai-server", "/app/dms-ai-server", "eval-batch",
+        "docker", "exec", "-e", "DMSAI_JUDGE=1", "-i",
+        "dms-ai-server", "/app/dms-ai-server", "eval-batch",
     ]
     assert cli("ask", "admin", "问句") == [
-        "docker", "exec", "dms-ai-server", "/app/dms-ai-server", "ask", "admin", "问句",
+        "docker", "exec", "-e", "DMSAI_JUDGE=1",
+        "dms-ai-server", "/app/dms-ai-server", "ask", "admin", "问句",
     ]
     # DMSAI_CLI 已设时 available() 不看本机 exe
     assert available() is True

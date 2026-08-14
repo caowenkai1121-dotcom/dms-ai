@@ -357,12 +357,21 @@ pub(crate) fn table_hit(q: &str) -> bool {
 /// 那是日期，由 `time_hit` 管 —— 否则含日期的制度类问句会被抢成 Data。
 /// `pub(crate)` 的第二个消费者：`ask::hold_back_uncovered`（同上）。
 pub(crate) fn doc_code_hit(q: &str) -> bool {
-    q.contains("单号")
-        || q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).any(|t| {
-            t.len() >= 6
-                && t.chars().any(|c| c.is_ascii_digit())
-                && t.chars().any(|c| c.is_ascii_alphabetic())
-        })
+    q.contains("单号") || code_token_hit(q)
+}
+
+/// 问句里有没有**真正的单据号 token**（字母数字混排、≥6 位）。
+///
+/// 与 `doc_code_hit` 拆开的理由（2026-08-14）：`ask::decide` 的确定性问数规则只能认
+/// 「真的有个号」，不能认「单号」这个**词** —— 「账余记录单号是什么意思」是口径问句，
+/// 把它判成点查就是又一次误路由。`doc_code_hit` 那侧维持原判据一字不变（它只用于
+/// 「要不要多走一次问数」，判宽的代价是快路径不命中后回落，不对称地便宜）。
+pub(crate) fn code_token_hit(q: &str) -> bool {
+    q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).any(|t| {
+        t.len() >= 6
+            && t.chars().any(|c| c.is_ascii_digit())
+            && t.chars().any(|c| c.is_ascii_alphabetic())
+    })
 }
 
 /// fast LLM 二分类。答非所问/超时/挂掉 → `None`，调用方兜底 Data。

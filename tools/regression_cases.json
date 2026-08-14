@@ -229,6 +229,54 @@
       "note": "省份=省区（region，业务确认字段）：2026-08-11 前「省份」被判未支持语义 → ODS 推导被营销通 t_winc_sale_report（sale_amount/province 列名太像）截胡答错口径。"
     },
     {
+      "name": "B01W-周报主查询单省显式周窗",
+      "login": "admin",
+      "q": "山东省 2026-08-10 至 2026-08-11 销售额",
+      "route": "direct-agg",
+      "sql_contains": [
+        "sales_dw.dws_off_offline_sale_dfn",
+        "SUM(sf.amount)",
+        "sf.order_date >= '2026-08-10'",
+        "sf.order_date < DATE_ADD('2026-08-11', INTERVAL 1 DAY)",
+        "sf.region",
+        "'山东省区'",
+        "'山东战区'",
+        "'山东大区'",
+        "'山东'"
+      ],
+      "sql_not_contains": [
+        "GROUP BY",
+        " JOIN ",
+        "UNION ALL",
+        "t_sales_order",
+        "不可计算",
+        "未确认限定"
+      ],
+      "view0": "kpis",
+      "min_rows": 1,
+      "intent_mode": "data",
+      "intent_status": "grounded",
+      "intent_slots": [
+        {
+          "kind": "metric",
+          "surface": "销售额",
+          "state": "resolved"
+        },
+        {
+          "kind": "region",
+          "surface": "山东省",
+          "state": "resolved"
+        },
+        {
+          "kind": "time",
+          "surface": "2026-08-10",
+          "state": "resolved"
+        }
+      ],
+      "coverage_status": "complete",
+      "note": "周报 compose 会把单省主指标改写成该形态；省名必须兑现为 DWS region 谓词，不能被当作未确认残留，也不能误变成全国按省分组。"
+    },
+    {
       "name": "B01T-客户名带类别前缀",
       "login": "admin",
       "q": "客户董会琴本月的销售额",
@@ -905,6 +953,16 @@
       "sql_not_contains": [
         "t_winc_stock_report"
       ],
+      "intent_mode": "data",
+      "intent_status": "grounded",
+      "intent_slots": [
+        {
+          "kind": "metric",
+          "surface": "库存量",
+          "state": "resolved"
+        }
+      ],
+      "coverage_status": "complete",
       "note": "默认库存源=业务中台 WMS 现行库存（2026-08-11 用户指定「库存表用中台的」）；营销通快照是门店/经销商进销存口径，仅金额/省份问法保留。"
     },
     {

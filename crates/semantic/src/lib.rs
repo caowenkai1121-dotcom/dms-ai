@@ -13,6 +13,10 @@
 //!
 //! 预算：≤38 个 `.rs`、单文件 ≤450 行。落点清单见 `docs/ARCHITECTURE.md` §4.4。
 
+pub mod compose;
+pub mod correct;
+pub mod direct_types;
+pub mod fastpath;
 pub mod datamap_usage;
 pub mod datamap;
 pub mod lineage;
@@ -28,3 +32,8 @@ pub mod sales_fact;
 pub mod seed;
 pub mod seed_defs;
 pub mod warehouse_catalog;
+
+// T8-B5：确定性路径与 agent 的共享类型（ARCHITECTURE §4.4 的 lib.rs 行）
+pub use direct_types::{
+    DirectHit, DirectOutcome, ExecutionEvidence, IntentSlotKind, Relation, ResolvedSlot,
+};

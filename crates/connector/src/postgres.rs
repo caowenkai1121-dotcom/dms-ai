@@ -279,9 +279,9 @@ impl SqlSource for PostgresSource {
                 .await
                 .map_err(|_| ConnectorError::timeout(at, t))?
                 .map_err(|e| sqlx_err(at, e))?;
-            let (columns, mut data) = to_table(&rows, max);
+            let (columns, mut data, truncated) = to_table(&rows, max);
             let redacted = redact(self.sensitive, &columns, &mut data);
-            Ok(RowSet { columns, rows: data, redacted })
+            Ok(RowSet { columns, rows: data, redacted, truncated })
         })
     }
 
@@ -345,8 +345,9 @@ impl SqlSource for PostgresSource {
     }
 }
 
-fn to_table(rows: &[sqlx::postgres::PgRow], max: usize) -> (Vec<String>, Vec<Vec<Value>>) {
-    let Some(first) = rows.first() else { return (vec![], vec![]) };
+/// 第三位 = 是否在上限处截断（与 mysql.rs 同一条：截断此前没有出口）。
+fn to_table(rows: &[sqlx::postgres::PgRow], max: usize) -> (Vec<String>, Vec<Vec<Value>>, bool) {
+    let Some(first) = rows.first() else { return (vec![], vec![], false) };
     let columns: Vec<String> = first.columns().iter().map(|c| c.name().to_string()).collect();
     // 类型名 → 取值路径只算一次（逐行逐 cell 重算 type_info().name() 是纯浪费）
     let kinds: Vec<Cell> =
@@ -356,7 +357,8 @@ fn to_table(rows: &[sqlx::postgres::PgRow], max: usize) -> (Vec<String>, Vec<Vec
     for row in rows.iter().take(max) {
         data.push(row.columns().iter().enumerate().map(|(ci, _)| cell_to_json(row, ci, &kinds[ci])).collect());
     }
-    (columns, data)
+    let truncated = rows.len() > data.len();
+    (columns, data, truncated)
 }
 
 /// PG 类型名 → 取值路径（`Cell` 与 MySQL 版共用一个枚举：下游 JSON 形态必须一致）。

@@ -23,12 +23,11 @@ pub struct Message {
     pub content: String,
 }
 
-/// 一次对话请求。`temperature`/`max_tokens` 是**请求级**的（升温重试不许写回共享配置）。
+/// 一次对话请求。应用层不设置模型输出 token/费用上限；供应商按模型自身上下文能力完成输出。
 pub struct ChatRequest {
     pub tier: ModelTier,
     pub messages: Vec<Message>,
     pub temperature: Option<f32>,
-    pub max_tokens: Option<u32>,
 }
 
 impl ChatRequest {
@@ -41,7 +40,6 @@ impl ChatRequest {
                 Message { role: "user".into(), content: user.into() },
             ],
             temperature,
-            max_tokens: None,
         }
     }
 }
@@ -116,7 +114,6 @@ mod tests {
         assert_eq!(r.messages[1].role, "user");
         assert_eq!(r.messages[1].content, "问句");
         assert_eq!(r.temperature, Some(0.1));
-        assert!(r.max_tokens.is_none());
         assert_eq!(r.tier, ModelTier::Fast);
     }
 

@@ -44,7 +44,69 @@ pub async fn answer(
     weights: &dms_knowledge::retrieve::RrfWeights,
 ) -> Result<Answer, KbError> {
     let v = viewer(p);
+    // 🔴 **要文件的问句不生成回答**（2026-08-14 架构级体检 R1）。
+    //
+    // 业主实测「下载 押金转货款申请书」返回 38 行账余充值明细 —— 合同没有「动作」维，
+    // 「下载」无处安放，被塞进 `data` 后由 `kw_force` 的「押金 → 账余表」种子钉成数据卡。
+    // 判据在 `dms_kernel::nl::doc`（确定性、零 IO），分流放在**这一个函数**里而不是各入口：
+    // 五套入口都经过这里，改一处五处同时生效。
+    if dms_kernel::nl::doc::is_document_request(question) {
+        if let Some(list) = documents(store, embed, &v, space, question, weights).await? {
+            return Ok(list);
+        }
+        // 一份都没检索到就回落 —— 由 `dms_knowledge::answer` 去说「知识库里没有相关内容」，
+        // 空清单卡比一句人话更难堪。
+    }
     dms_knowledge::answer::answer(store, embed, llm, &v, space, question, weights).await
+}
+
+/// 文件清单卡：检索一次，按文件去重，直接把**可下载的文件**列给用户。
+///
+/// **零 LLM 调用** —— 用户要的是文件本身，不是一段关于文件的话。前端
+/// `KbAnswer.vue` 已为每条 `citation` 渲染「下载原件」按钮（走
+/// `/api/kb/doc/{doc_id}/download`），所以这里一个字节的前端改动都不需要。
+///
+/// 返回 `None` = 一条都没检索到，交调用方回落到常规问答。
+pub async fn documents(
+    store: &OwnedStore,
+    embed: &EmbedClient,
+    v: &Viewer,
+    space: Option<&str>,
+    question: &str,
+    weights: &dms_knowledge::retrieve::RrfWeights,
+) -> Result<Option<Answer>, KbError> {
+    let t0 = std::time::Instant::now();
+    let hits = dms_knowledge::retrieve::search(store, embed, v, space, question, weights).await?;
+    // 检索返回的是**片段**，用户要的是**文件**：一份文件只留命中最好的那一块（`search`
+    // 已按相关度排序，`insert` 首次为真即最好那条）。8 条封顶 —— 再多就不是「给你文件」
+    // 而是「你自己找」了。
+    let mut seen = std::collections::HashSet::new();
+    let picked: Vec<&dms_knowledge::retrieve::Hit> =
+        hits.iter().filter(|h| seen.insert(h.doc_id.clone())).take(8).collect();
+    let picked = rank_by_name(question, picked);
+    if picked.is_empty() {
+        return Ok(None);
+    }
+    let mut md = format!("为你找到 {} 份相关文件，点条目下方的「下载原件」即可取用：\n\n", picked.len());
+    for (i, h) in picked.iter().enumerate() {
+        // 角标 = citations 下标 + 1（`AnswerBody::Text` 的契约），前端靠它把条目连到下载按钮
+        md.push_str(&format!("{}. **{}**[^{}]\n", i + 1, h.doc_name, i + 1));
+        let mut meta = Vec::new();
+        if !h.folder_path.is_empty() {
+            meta.push(format!("目录：{}", h.folder_path));
+        }
+        if let Some(from) = &h.effective_from {
+            meta.push(format!("生效：{from}"));
+        }
+        if !h.doc_updated_at.is_empty() {
+            meta.push(format!("更新于 {}", h.doc_updated_at));
+        }
+        if !meta.is_empty() {
+            md.push_str(&format!("   {}\n", meta.join(" · ")));
+        }
+    }
+    let cites = dms_knowledge::answer::citations(picked.into_iter());
+    Ok(Some(Answer::text(md, cites, t0.elapsed().as_millis())))
 }
 
 /// `Principal` → `Viewer`（knowledge 刻意不依赖 policy，两者唯一交集就是这两个字符串）。
@@ -55,6 +117,31 @@ pub async fn answer(
 /// 两处口径必须一致，且应向**解出来的**那侧统一：它就是该账号真实的激活角色，从不超过其真实权限。
 pub fn viewer(p: &Principal) -> Viewer {
     Viewer::new(&p.login_name, vec![p.role_code.clone()])
+}
+
+/// 按**文件名与问句的最长公共子串**重排并剪枝。
+///
+/// 🔴 业主 2026-08-14 实测：「下载 押金转货款申请书」返回 5 份文件，只有第 1 份对得上，
+/// 其余是《线下设备物资处置申请单流程指引》《客户退出申请流程填写详细指引》——
+/// 它们靠正文里的「申请」两个字挤进了向量召回。**要文件的人是在念文件名**，
+/// 名字对不上就不是他要的那份。
+///
+/// 剪枝只在「真有人对上了」时发生（最佳 ≥3 字），且保留最佳的一半以上；
+/// 一个字都对不上就**全留**，交给检索原序 —— 宁可多给，不可给空。
+/// `sort_by_key` 是稳定排序，同分者维持检索相关度顺序。
+fn rank_by_name<'a>(
+    question: &str,
+    mut hits: Vec<&'a dms_knowledge::retrieve::Hit>,
+) -> Vec<&'a dms_knowledge::retrieve::Hit> {
+    let score = |h: &dms_knowledge::retrieve::Hit| {
+        dms_kernel::nl::text::longest_common_run(question, &h.doc_name)
+    };
+    let best = hits.iter().map(|h| score(h)).max().unwrap_or(0);
+    if best >= 3 {
+        hits.retain(|h| score(h) * 2 >= best);
+    }
+    hits.sort_by_key(|h| std::cmp::Reverse(score(h)));
+    hits
 }
 
 #[cfg(test)]

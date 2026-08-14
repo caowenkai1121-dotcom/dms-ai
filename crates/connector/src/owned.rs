@@ -3,18 +3,19 @@
 //! ## 红线的形状：这里刻意缺席的东西比存在的东西重要
 //! - **不实现 `SqlSource`**：`fetch(&ScopedSql)` 是「LLM 产物过闸门后可执行」的通道，
 //!   自有库不该有这条路。类型上 `OwnedStore` 就不是一个 `dyn SqlSource`，塞不进 `AskCtx`。
-//! - **没有 `execute(&str)`**：写只有两条路 —— `fixed(&'static str) + bind`（值全走占位符）
-//!   与 `create_upload_table(&UploadTableSpec)`（标识符经 `SafeIdent` 白名单，DDL 由代码渲染）。
+//! - **没有 `execute(&str)`**：写只走 `fixed(&'static str) + bind`（含同约束的事务版）
+//!   或 `create_upload_table(&UploadTableSpec)`（标识符经 `SafeIdent` 白名单，DDL 由代码渲染）。
 //! - **没有 `From<ScopedSql>` / `From<RawSql>` / 任何吃 `String` 的语句入口**：
 //!   LLM 产物在**类型上**到不了这里，不依赖任何人记得「别把生成的 SQL 往自有库送」。
 //!
-//! 唯二的例外是 `pool()` 与 `dead_pg_pool_for_tests()`：前者是迁移期过渡口，后者对外交出
+//! 裸池的两个例外是 `pool()` 与 `dead_pg_pool_for_tests()`：前者是迁移期过渡口，后者对外交出
 //! 裸 `PgPool` 但只给单测用（见其文档注释与 `#[doc(hidden)]`）。
 
 use crate::ddl::{SafeIdent, UploadTableSpec};
 use crate::error::ConnectorError;
 use crate::fixed::PgStmt;
 use crate::mysql::sqlx_err;
+use sqlx::Arguments;
 
 /// 自有库的错误标识：只有一个自有库，故是字面量而非 `DsId`（`DsId` 是**只读源**的身份）。
 const AT: &str = "owned-pg";
@@ -57,6 +58,26 @@ pub struct OwnedStore {
     pool: sqlx::PgPool,
 }
 
+/// 自有库字面量事务。事务内仍只接受 `&'static str`，不会因为需要原子性而重新暴露裸连接。
+pub struct OwnedTx {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+/// 固定 SQL 在一条已占用连接上的语句。只由 [`OwnedTx`] 与 advisory-lock 会话构造。
+pub struct OwnedConnStmt<'a> {
+    conn: &'a mut sqlx::PgConnection,
+    sql: &'static str,
+    args: sqlx::postgres::PgArguments,
+    err: Option<ConnectorError>,
+}
+
+/// 会话级 advisory lock 的所有权凭证。连接不会回池：正常 release、错误、取消与 panic
+/// 最终都会关闭这条专用连接，让 PostgreSQL 释放该会话持有的锁。
+pub struct OwnedAdvisoryLock {
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    key: i64,
+}
+
 impl OwnedStore {
     pub async fn connect(url: &str, max_conn: u32) -> Result<Self, ConnectorError> {
         // max_conn=0 与 MySQL 侧（effective_max_connections）对齐钳到 ≥1；
@@ -71,9 +92,41 @@ impl OwnedStore {
         Ok(Self { pool })
     }
 
+    /// 从**已有连接池**借一个 store —— 不新建池（`PgPool` 内部是 `Arc`，clone 只加引用计数）。
+    ///
+    /// 🔴 存在的理由（2026-08-14）：`server::ask` 这条链（CLI / MCP / 深度报告子问）
+    /// 只拿得到 `&PgPool`，于是知识库臂长期传 `None` —— 混合问句的知识半被**静默丢掉**
+    /// （实测 `route=compound, subs=1`：用户问了两件事只拿回一件），纯资料问句直接退澄清卡。
+    /// 为它给十个调用点各加一个形参不值得；从池借一个 store 是等价且零扩散的做法。
+    pub fn from_pool(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+
     /// 字面量语句通道：SQL 只能是 `&'static str`，值全走 `bind`，动态 `IN` 只能 `expand(n)`。
     pub fn fixed(&self, sql: &'static str) -> PgStmt<'_> {
         PgStmt::new(&self.pool, AT, sql)
+    }
+
+    /// 开一个固定 SQL 事务。上层拿不到 `Transaction`/`PgConnection`，只能逐条执行字面量语句。
+    pub async fn begin_fixed(&self) -> Result<OwnedTx, ConnectorError> {
+        let tx = self.pool.begin().await.map_err(|e| sqlx_err(AT, e))?;
+        Ok(OwnedTx { tx })
+    }
+
+    /// 尝试获取会话级 advisory lock。锁与 release 被类型绑定在同一条专用连接上。
+    pub async fn try_advisory_lock(
+        &self,
+        key: i64,
+    ) -> Result<Option<OwnedAdvisoryLock>, ConnectorError> {
+        let mut conn = self.pool.acquire().await.map_err(|e| sqlx_err(AT, e))?;
+        // try-lock 的响应若在网络中途丢失，客户端无法知道服务端是否已经持锁。
+        // 这条连接因此从一开始就不再回池；关闭会话是唯一 fail-safe 的释放方式。
+        conn.close_on_drop();
+        let locked: (bool,) = OwnedConnStmt::new(&mut conn, "SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one()
+            .await?;
+        Ok(locked.0.then_some(OwnedAdvisoryLock { conn, key }))
     }
 
     /// 迁移期过渡口：semantic 的 30+ 个 `&PgPool` 签名与 server 的既有查询暂时还需要它。
@@ -191,6 +244,104 @@ impl OwnedStore {
     }
 }
 
+impl OwnedTx {
+    pub fn fixed(&mut self, sql: &'static str) -> OwnedConnStmt<'_> {
+        OwnedConnStmt::new(&mut self.tx, sql)
+    }
+
+    pub async fn commit(self) -> Result<(), ConnectorError> {
+        self.tx.commit().await.map_err(|e| sqlx_err(AT, e))
+    }
+
+    pub async fn rollback(self) -> Result<(), ConnectorError> {
+        self.tx.rollback().await.map_err(|e| sqlx_err(AT, e))
+    }
+}
+
+impl OwnedAdvisoryLock {
+    /// 在获取锁的同一条物理连接上释放。无论成功失败，专用连接随后关闭而不回池。
+    pub async fn release(mut self) -> Result<(), ConnectorError> {
+        let released: (bool,) = OwnedConnStmt::new(&mut self.conn, "SELECT pg_advisory_unlock($1)")
+            .bind(self.key)
+            .fetch_one()
+            .await?;
+        if !released.0 {
+            return Err(ConnectorError::query(AT, "advisory lock 不属于当前会话"));
+        }
+        Ok(())
+    }
+}
+
+impl<'a> OwnedConnStmt<'a> {
+    fn new(conn: &'a mut sqlx::PgConnection, sql: &'static str) -> Self {
+        Self { conn, sql, args: Default::default(), err: None }
+    }
+
+    pub fn bind<'v, T>(mut self, value: T) -> Self
+    where
+        T: 'v + sqlx::Encode<'v, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+    {
+        if self.err.is_none() {
+            if let Err(e) = self.args.add(value) {
+                self.err = Some(ConnectorError::decode(AT, e));
+            }
+        }
+        self
+    }
+
+    fn into_parts(
+        self,
+    ) -> Result<(&'a mut sqlx::PgConnection, &'static str, sqlx::postgres::PgArguments), ConnectorError>
+    {
+        match self.err {
+            Some(e) => Err(e),
+            None => Ok((self.conn, self.sql, self.args)),
+        }
+    }
+
+    pub async fn fetch_one<T>(self) -> Result<T, ConnectorError>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    {
+        let (conn, sql, args) = self.into_parts()?;
+        sqlx::query_as_with::<sqlx::Postgres, T, _>(sql, args)
+            .fetch_one(conn)
+            .await
+            .map_err(|e| sqlx_err(AT, e))
+    }
+
+    pub async fn fetch_optional<T>(self) -> Result<Option<T>, ConnectorError>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    {
+        let (conn, sql, args) = self.into_parts()?;
+        sqlx::query_as_with::<sqlx::Postgres, T, _>(sql, args)
+            .fetch_optional(conn)
+            .await
+            .map_err(|e| sqlx_err(AT, e))
+    }
+
+    pub async fn fetch_all<T>(self) -> Result<Vec<T>, ConnectorError>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    {
+        let (conn, sql, args) = self.into_parts()?;
+        sqlx::query_as_with::<sqlx::Postgres, T, _>(sql, args)
+            .fetch_all(conn)
+            .await
+            .map_err(|e| sqlx_err(AT, e))
+    }
+
+    pub async fn execute(self) -> Result<u64, ConnectorError> {
+        let (conn, sql, args) = self.into_parts()?;
+        sqlx::query_with::<sqlx::Postgres, _>(sql, args)
+            .execute(conn)
+            .await
+            .map(|done| done.rows_affected())
+            .map_err(|e| sqlx_err(AT, e))
+    }
+}
+
 /// 第 `i` 格的值：行比表头短时 `get` 返 `None`；空串与全空白串都当 `NULL`
 /// （见 `insert_upload_rows`；与 ddl.rs `infer_col_type` 先 trim 再判空的口径一致）。
 /// 行比表头长时多出来的格直接丢 —— 表头是列数的唯一真相源。
@@ -303,5 +454,22 @@ mod tests {
         let rows = vec![vec!["1".to_string()]];
         let err = store.insert_upload_rows(&spec, &rows).await.unwrap_err();
         assert!(matches!(err, ConnectorError::Config(_)), "{err}");
+    }
+
+    /// 上层只能传编译期字面量；事务/会话锁能力都不公开裸 pool、connection 或 sql 字符串入口。
+    #[test]
+    fn owned_transaction_and_lock_keep_the_fixed_sql_boundary() {
+        let src = include_str!("owned.rs");
+        let tx = src.split("impl OwnedTx").nth(1).unwrap();
+        let tx = tx.split("impl OwnedAdvisoryLock").next().unwrap();
+        assert!(tx.contains("sql: &'static str"));
+        assert!(!tx.contains("pub fn pool"));
+        let lock = src.split("pub async fn try_advisory_lock").nth(1).unwrap();
+        let lock = lock.split("/// 迁移期过渡口").next().unwrap();
+        assert!(lock.contains("close_on_drop()"), "锁连接不得带锁回池");
+        assert!(lock.contains("pg_try_advisory_lock"), "必须是非阻塞 try-lock");
+        let release = src.split("impl OwnedAdvisoryLock").nth(1).unwrap();
+        let release = release.split("impl<'a> OwnedConnStmt").next().unwrap();
+        assert!(release.contains("pg_advisory_unlock"));
     }
 }

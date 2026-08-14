@@ -85,9 +85,16 @@ META_KEYS = {"name", "login", "q", "role", "llm", "note", "type", "requires_embe
 ASSERT_KEYS = {"route", "route_not", "sql_contains", "sql_contains_any", "sql_not_contains",
                "min_rows", "min_cols", "view0", "chart_kind", "chart_series",
                "json_contains", "sql_golden", "entity_fields", "kpi_labels",
-               "columns_contains", "drill_contains"}
+               "columns_contains", "drill_contains", "intent_mode", "intent_status",
+               "intent_slots", "coverage_status", "coverage_issues_contains"}
 KNOWN = META_KEYS | ASSERT_KEYS
 RULE_KEYS = {"lt", "note"}          # rules 同样是白名单消费（只认 lt），同样会静默忽略
+INTENT_SLOT_KEYS = {"kind", "surface", "state"}
+INTENT_MODES = {"data", "knowledge", "hybrid", "unknown"}
+INTENT_STATUSES = {"grounded", "clarification", "blocked"}
+INTENT_SLOT_KINDS = {"metric", "entity", "region", "time", "filter", "breakdown", "comparison", "detail"}
+INTENT_SLOT_STATES = {"grounded", "resolved"}
+COVERAGE_STATUSES = {"complete", "blocked"}
 
 # 与 Rust `dms_agent::is_followup` 的长度门同值：超过它一律不算追问 → 改写整段跳过。
 # **刻意只复刻长度这一半**，那 22 个标记词不抄第二份（抄了就是一处会漂的判据，
@@ -133,6 +140,37 @@ def key_errors(cases, rules):
             ig = sorted(set(c) & ASSERT_KEYS)
             if ig:
                 errs.append((name, f"redline 题带断言键 {ig}，redline 分支不消费它们"))
+        for key, allowed in [
+            ("intent_mode", INTENT_MODES),
+            ("intent_status", INTENT_STATUSES),
+            ("coverage_status", COVERAGE_STATUSES),
+        ]:
+            if key in c and (not isinstance(c[key], str) or c[key] not in allowed):
+                errs.append((name, f"{key}={c[key]!r} 不在允许值 {sorted(allowed)} 中"))
+        if "intent_slots" in c:
+            slots = c["intent_slots"]
+            if not isinstance(slots, list) or not slots:
+                errs.append((name, "intent_slots 必须是非空列表（空断言会恒过）"))
+            else:
+                for at, slot in enumerate(slots):
+                    if not isinstance(slot, dict):
+                        errs.append((name, f"intent_slots[{at}] 必须是对象")); continue
+                    bad_slot = sorted(set(slot) - INTENT_SLOT_KEYS)
+                    if bad_slot:
+                        errs.append((name, f"intent_slots[{at}] 未知键 {bad_slot}（拼错会恒不命中）"))
+                    missing = sorted(INTENT_SLOT_KEYS - set(slot))
+                    if missing:
+                        errs.append((name, f"intent_slots[{at}] 缺键 {missing}"))
+                    if not isinstance(slot.get("kind"), str) or slot.get("kind") not in INTENT_SLOT_KINDS:
+                        errs.append((name, f"intent_slots[{at}].kind={slot.get('kind')!r} 非法"))
+                    if not isinstance(slot.get("surface"), str) or not slot.get("surface"):
+                        errs.append((name, f"intent_slots[{at}].surface 必须是非空字符串"))
+                    if not isinstance(slot.get("state"), str) or slot.get("state") not in INTENT_SLOT_STATES:
+                        errs.append((name, f"intent_slots[{at}].state={slot.get('state')!r} 非法"))
+        if "coverage_issues_contains" in c:
+            issues = c["coverage_issues_contains"]
+            if not isinstance(issues, list) or not issues or not all(isinstance(x, str) and x for x in issues):
+                errs.append((name, "coverage_issues_contains 必须是非空字符串列表（空串会恒过）"))
     for i, r in enumerate(rules):
         bad = sorted(set(r) - RULE_KEYS)
         if bad:
@@ -226,14 +264,42 @@ def ask_argv(c):
     return cli("ask", c["login"], c["q"], *tail)
 
 
+# 一次 CLI 调用里**回答之外**的固定开销（进程启动 + DDL 迁移 + 语义种子 + 目录校验 +
+# 权限库首连）。开机自测一次，之后每题的门槛都是「这份开销 + 真正留给回答的秒数」。
+#
+# 🔴 为什么必须自测而不是写死：2026-08-14 实测，开发机连公网生产库时这份开销 **30s**
+# （`ask 本月销售额` wall=30.0s 而 `elapsed_ms=34`），于是五道题被 60s 门禁判成「超时失败」——
+# 它们并不慢，是启动费把它们推过了线。写死一个大数又会让内网跑失去速度门禁的意义。
+_BOOT_COST = None
+
+
+def _boot_cost():
+    """量一次 CLI 固定开销（秒）。量不出来按 0 计 —— 门禁只会更严，不会更松。"""
+    global _BOOT_COST
+    if _BOOT_COST is None:
+        t0 = time.time()
+        try:
+            subprocess.run(cli("scope", "admin"), capture_output=True, text=True,
+                           cwd=str(ROOT), timeout=180)
+            _BOOT_COST = time.time() - t0
+        except (OSError, subprocess.TimeoutExpired):
+            _BOOT_COST = 0.0
+        print(f"· CLI 固定开销实测 {_BOOT_COST:.1f}s（每题门槛 = 它 + 回答预算）", flush=True)
+    return _BOOT_COST
+
+
 def _ask_timeout():
-    """DMS_REGRESSION_TIMEOUT 解析：非数字的环境变量回落 60 并提示，不许 ValueError 崩。"""
+    """留给**回答**的秒数（DMS_REGRESSION_TIMEOUT），再加上实测的固定开销。
+
+    非数字的环境变量回落 60 并提示，不许 ValueError 崩。
+    """
     raw = os.environ.get("DMS_REGRESSION_TIMEOUT", "60")
     try:
-        return int(raw)
+        budget = int(raw)
     except ValueError:
         print(f"⚠️ DMS_REGRESSION_TIMEOUT={raw!r} 不是数字，按 60s 计", flush=True)
-        return 60
+        budget = 60
+    return budget + int(_boot_cost())
 
 
 def ask(c, retries=1):
@@ -390,6 +456,31 @@ def check(c, j):
         for drill in c["drill_contains"]:
             if not any(drill in actual for actual in drills):
                 fails.append(f"下钻缺[{drill}]")
+    summary = j.get("intent_summary") if isinstance(j.get("intent_summary"), dict) else {}
+    if "intent_mode" in c and summary.get("mode") != c["intent_mode"]:
+        fails.append(f"intent.mode={summary.get('mode')}≠{c['intent_mode']}")
+    if "intent_status" in c and summary.get("status") != c["intent_status"]:
+        fails.append(f"intent.status={summary.get('status')}≠{c['intent_status']}")
+    if "intent_slots" in c:
+        actual_slots = summary.get("slots") if isinstance(summary.get("slots"), list) else []
+        for expected in c["intent_slots"]:
+            if not any(
+                isinstance(actual, dict)
+                and actual.get("kind") == expected["kind"]
+                and actual.get("state") == expected["state"]
+                and norm(expected["surface"]) in norm(actual.get("surface", ""))
+                for actual in actual_slots
+            ):
+                fails.append(f"intent槽缺[{expected['kind']}:{expected['surface']}:{expected['state']}]")
+    coverage = summary.get("coverage") if isinstance(summary.get("coverage"), dict) else {}
+    if "coverage_status" in c and coverage.get("status") != c["coverage_status"]:
+        fails.append(f"coverage.status={coverage.get('status')}≠{c['coverage_status']}")
+    if "coverage_issues_contains" in c:
+        actual_issues = coverage.get("issues") if isinstance(coverage.get("issues"), list) else []
+        actual_issues = [issue for issue in actual_issues if isinstance(issue, str)]
+        for fragment in c["coverage_issues_contains"]:
+            if not any(norm(fragment) in norm(issue) for issue in actual_issues):
+                fails.append(f"coverage.issues缺[{fragment}]")
     return fails
 
 
@@ -562,11 +653,19 @@ def selfcheck():
     # ⑥ 两轮题：`prev`/`prev_sql` 必须**真的进 argv**。只把键登记进白名单而没人消费，
     #    就是这道 preflight 自己要堵的那个洞（登记而不消费 = 假绿）。
     two = {**base, "q": "那上月呢", "prev": "本月销售额", "prev_sql": "SELECT 1 FROM t"}
-    a = ask_argv(two)
-    assert a[-3:] == ["", "本月销售额", "SELECT 1 FROM t"], a   # role 那一位必须占住
-    assert a[-4] == "那上月呢", a
-    assert ask_argv({**base, "role": "r"})[-1] == "r"          # 只有 role：尾部不多不少
-    assert ask_argv(base)[-1] == base["q"]                     # 都没有：一位都不多加
+    old_cli = os.environ.get("DMSAI_CLI")
+    os.environ["DMSAI_CLI"] = "dms-ai-server"  # selfcheck 只验 argv，不能被本机旧 exe 水位计挡住
+    try:
+        a = ask_argv(two)
+        assert a[-3:] == ["", "本月销售额", "SELECT 1 FROM t"], a   # role 那一位必须占住
+        assert a[-4] == "那上月呢", a
+        assert ask_argv({**base, "role": "r"})[-1] == "r"          # 只有 role：尾部不多不少
+        assert ask_argv(base)[-1] == base["q"]                     # 都没有：一位都不多加
+    finally:
+        if old_cli is None:
+            os.environ.pop("DMSAI_CLI", None)
+        else:
+            os.environ["DMSAI_CLI"] = old_cli
     #    prev_sql 少了 prev / 问句长到 is_followup 判否 → 门禁红（两轮题静默退化成单轮题）
     e = key_errors([{**base, "prev_sql": "SELECT 1"}], [])
     assert e and "prev_sql" in e[0][1], e
@@ -613,30 +712,75 @@ def selfcheck():
     ]:
         f = check({**base, key: value}, rich)
         assert len(f) == 1 and marker in f[0], (key, f)
-    # ⑨ 必需 meta 键：缺 name/login/q 从前是 run_case 里 KeyError traceback，现在门禁先说清楚
+    # ⑨ typed intent/coverage 金标：五个键都必须由 check() 真消费；正例绿、逐项反例红。
+    # slots 是子集合同（系统新增合法槽不应打红）；kind/state 精确，surface 归一后包含匹配。
+    intent_response = {
+        "intent_summary": {
+            "mode": "data",
+            "status": "grounded",
+            "slots": [
+                {"kind": "metric", "surface": "销售额", "state": "resolved"},
+                {"kind": "region", "surface": "山东省", "state": "resolved"},
+            ],
+            "coverage": {"status": "blocked", "issues": ["unresolved:entity:小虎烤肠"]},
+        },
+    }
+    intent_contract = {
+        **base,
+        "intent_mode": "data",
+        "intent_status": "grounded",
+        "intent_slots": [{"kind": "region", "surface": "山东省", "state": "resolved"}],
+        "coverage_status": "blocked",
+        "coverage_issues_contains": ["entity:小虎烤肠"],
+    }
+    assert check(intent_contract, intent_response) == []
+    for key, value, marker in [
+        ("intent_mode", "knowledge", "intent.mode"),
+        ("intent_status", "clarification", "intent.status"),
+        ("intent_slots", [{"kind": "region", "surface": "山东省", "state": "grounded"}], "intent槽缺"),
+        ("coverage_status", "complete", "coverage.status"),
+        ("coverage_issues_contains", ["ambiguity:entity"], "coverage.issues缺"),
+    ]:
+        f = check({**base, key: value}, intent_response)
+        assert len(f) == 1 and marker in f[0], (key, f)
+    for bad, marker in [
+        ({**base, "intent_mode": "datas"}, "intent_mode"),
+        ({**base, "intent_slots": []}, "非空列表"),
+        ({**base, "intent_slots": [{"kind": "region", "surface": "山东省", "states": "resolved"}]}, "未知键"),
+        ({**base, "coverage_issues_contains": []}, "非空字符串列表"),
+    ]:
+        e = key_errors([bad], [])
+        assert e and any(marker in msg for _, msg in e), (bad, e)
+    # ⑩ 必需 meta 键：缺 name/login/q 从前是 run_case 里 KeyError traceback，现在门禁先说清楚
     e = key_errors([{"login": "a", "q": "b"}], [])
     assert e and "缺必需键 name" in e[0][1], e
     e = key_errors([{"name": "X"}], [])
     assert e and "缺必需键 login" in e[0][1] and any("缺必需键 q" in m for _, m in e), e
     assert not key_errors([{"name": "X", "type": "gate", "gate_sql": "DELETE FROM t"}], [])  # gate 题用不到 login/q
-    # ⑩ 未知旗标必须当场报错（`--fliter` 打错 = 不过滤跑全量，静默不得）
+    # ⑪ 未知旗标必须当场报错（`--fliter` 打错 = 不过滤跑全量，静默不得）
     try:
         _check_argv(["--fliter", "A01"])
         raise AssertionError("未知旗标没被拦")
     except SystemExit:
         pass
     _check_argv(["--filter", "A01", "--selfcheck"])              # 已知旗标不许误拦
-    # ⑪ gate 超时 → (False, 超时)，不许挂住整轮（mock 掉 subprocess.run 自证）
+    # ⑫ gate 超时 → (False, 超时)，不许挂住整轮（mock 掉 subprocess.run 自证）
     orig_run = subprocess.run
     def _boom(*a, **k):
         raise subprocess.TimeoutExpired(cmd="x", timeout=60)
     subprocess.run = _boom
+    old_cli = os.environ.get("DMSAI_CLI")
+    os.environ["DMSAI_CLI"] = "dms-ai-server"
     try:
         ok, msg = gate_verdict("SELECT 1")
     finally:
         subprocess.run = orig_run
+        if old_cli is None:
+            os.environ.pop("DMSAI_CLI", None)
+        else:
+            os.environ["DMSAI_CLI"] = old_cli
     assert ok is False and "超时" in msg, (ok, msg)
-    # ⑫ rule 的 note 必须真的进 detail（登记而不消费 = 假绿），且只在判红/判过时拼
+    # ⑬ rule 的 note 必须真的进 detail（登记而不消费 = 假绿），且只在判红/判过时拼
     n, ok, d = rule_verdict({"lt": ["A", "B"], "note": "为什么"}, {"A": 5.0, "B": 3.0})
     assert ok is False and "为什么" in d, (n, ok, d)
     n, ok, d = rule_verdict({"lt": ["A", "B"], "note": "为什么"}, {"A": 1.0, "B": 3.0})
@@ -647,7 +791,8 @@ def selfcheck():
           "DML 探测器正反对照 / 无 SQL 第三态 / 金文件缺失 / 金文件不一致 / "
           "两轮题 prev 进 argv + 两个静默退化陷阱 / "
           "chart_series 的 0 与 None 两档 / 实体详情四层合同 / "
-          "缺必需 meta 键 / 未知旗标拦截 / gate 超时判红 / rule note 进 detail 全部会红")
+          "typed intent/coverage 五键正反对照 / 缺必需 meta 键 / 未知旗标拦截 / "
+          "gate 超时判红 / rule note 进 detail 全部会红")
 
 
 if "--selfcheck" in argv:

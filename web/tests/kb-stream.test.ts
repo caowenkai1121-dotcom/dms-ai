@@ -2,6 +2,7 @@
 // 跑法：cd web && node --test tests/kb-stream.test.ts
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { SseParser, parseEventData } from '../src/kb-stream.ts'
 
 test('SseParser：一帧一字节块的基本形态', () => {
@@ -50,4 +51,17 @@ test('parseEventData：坏 JSON / 非对象返回 null（跳过该帧，不炸�
   assert.equal(parseEventData({ event: 'meta', data: '{oops' }), null)
   assert.equal(parseEventData({ event: 'meta', data: '[1,2]' }), null)
   assert.equal(parseEventData({ event: 'meta', data: '"str"' }), null)
+})
+
+test('生成中冻结标题与摘要拆分（半截 markdown 会让标题逐字跳变）', () => {
+  const kb = readFileSync(new URL('../src/KbAnswer.vue', import.meta.url), 'utf8')
+  assert.match(kb, /props\.streaming\s*\?\s*\{ title: '知识库回答', summary: '', body: displayMarkdown\.value \}/)
+})
+
+test('流式跟随滚动：有阈值、不复用 smooth 动画', () => {
+  const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
+  assert.match(app, /function followStream\(\)/)
+  assert.match(app, /el\.scrollHeight - el\.scrollTop - el\.clientHeight > 120/)
+  // scrollDown 的 behavior:'smooth' 会和每帧新内容打架，跟随必须直接赋 scrollTop
+  assert.match(app, /el\.scrollTop = el\.scrollHeight/)
 })

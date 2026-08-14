@@ -10,6 +10,7 @@ use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::Json;
+use dms_connector::url_fetch;
 use dms_kernel::{ChatModel, ChatRequest, ModelTier};
 use dms_knowledge::store::DocRow;
 use dms_knowledge::{acl, ingest, store, tabular, KbError, Viewer};
@@ -777,13 +778,6 @@ mod ops_pack {
 
     // ───────────────────── 【Y12】URL 抓取入库 ─────────────────────
 
-    /// 抓取护栏常量：总超时 15s（reqwest 的 timeout 覆盖到响应体读完）、大小帽 5MB、
-    /// 手动跟随重定向 ≤3 跳、URL 长度封顶 2048。
-    const URL_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-    const URL_FETCH_MAX_BYTES: usize = 5 * 1_048_576;
-    const URL_FETCH_MAX_REDIRECTS: usize = 3;
-    const URL_MAX_LEN: usize = 2048;
-
     #[derive(serde::Deserialize, Default)]
     pub struct IngestUrlReq {
         url: String,
@@ -791,44 +785,32 @@ mod ops_pack {
         q: KbQuery,
     }
 
-    /// body `{"url","space_id"?,"folder_id"?,"preset"?,...身份}`：服务端抓取网页（HTML）或
-    /// PDF，存成 `<slug>.html`/`.pdf` 后**复用既有 ingest 全流程**（白名单校验/落盘/解析/
-    /// 分块/向量/权限），`source_uri` 列记最终落地 URL。响应与 `/api/kb/upload` 同形。
+    /// body `{"url","space_id"?,"folder_id"?,"preset"?,...身份}`：connector 安全抓取
+    /// HTML/PDF 后复用既有 ingest 全流程，`source_uri` 记录重定向后的最终 URL。
     pub async fn ingest_url(
         State(st): State<Arc<AppState>>,
         headers: HeaderMap,
         Json(req): Json<IngestUrlReq>,
     ) -> Result<ApiOk, ApiErr> {
-        // 先认证再占上传槽（与 `upload` 同序）：未认证请求不能耗尽许可。
-        // 认证口径与 upload 有刻意差异：upload 走 `session_viewer`（multipart 必须先认证
-        // 再读 body，刻意拒绝 body 身份回退）；本端点是 JSON body 可预读，故用
-        // `manager_viewer`（接受 body 的 login_name 回退，同一条 resolve_identity 收口）。
         let v = manager_viewer(&st, &headers, &req.q).await?;
-        // 许可随重活 move 进后台任务（与 `upload` 同一条闸、同一个理由）
         let permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
-        let page = fetch_url_guarded(req.url.trim()).await?;
+        let page = url_fetch::fetch_guarded(req.url.trim()).await.map_err(url_fetch_err)?;
         let space_id = space_of(&v, &req.q);
         let up = ingest::UploadReq {
             space_id: &space_id,
             folder_id: req.q.folder_id.as_deref(),
             file_name: &page.file_name,
-            mime: page.kind.mime(),
+            mime: page.mime(),
             bytes: &page.bytes,
             preset: req.q.preset.as_deref(),
         };
-        // 快路径在请求内，重活后台跑（与 `upload` 同一条异步化理由：PDF 抓取件解析同样
-        // 可能超过代理超时）。响应立即返回进行态 doc 行，前端轮询。
         let prepared = ingest::prepare(&st.owned, &v, &st.kb_cfg, up).await.map_err(kb_err)?;
         if let Some(job) = prepared.job {
             spawn_ingest_job(st.clone(), v.clone(), prepared.doc_id.clone(), page.file_name.clone(), job, permit);
         }
-        // 与 `upload` 同序：统一再绑定目标目录，写权限在返回结果前于同一条写语句中复核。
-        // html/pdf 不会产表格数据源（通道②只看 sheets 非空），无需登记/清理数据源。
         store::move_doc(&st.owned, &v, &prepared.doc_id, &space_id, req.q.folder_id.as_deref())
             .await
             .map_err(kb_err)?;
-        // source_uri 记**最终落地 URL**（重定向后的真实来源）。回写失败（撤权竞态/DB 抖动）
-        // 不抹掉已入库文档：来源地址是治理元数据，不是入库正确性。
         if let Err(e) = store::set_doc_source_uri(&st.owned, &v, &prepared.doc_id, &page.final_url).await {
             tracing::warn!(doc_id = %prepared.doc_id, err = %e, "URL 已入库，来源地址回写失败");
         }
@@ -836,282 +818,13 @@ mod ops_pack {
         Ok(Json(upload_doc_json(&row, prepared.replaced.as_deref())))
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum FetchedKind {
-        Html,
-        Pdf,
-    }
-
-    impl FetchedKind {
-        /// 落盘扩展名是白名单字面量（与 `ingest::EXTS` 同集），用户输入一个字都进不了路径
-        fn ext(self) -> &'static str {
-            match self {
-                FetchedKind::Html => "html",
-                FetchedKind::Pdf => "pdf",
-            }
-        }
-        fn mime(self) -> &'static str {
-            match self {
-                FetchedKind::Html => "text/html",
-                FetchedKind::Pdf => "application/pdf",
-            }
-        }
-    }
-
-    struct FetchedPage {
-        bytes: Vec<u8>,
-        kind: FetchedKind,
-        /// 重定向后的最终 URL（`source_uri` 写它）
-        final_url: String,
-        /// 由 URL 派生的展示文件名（`<slug>.<白名单扩展名>`）
-        file_name: String,
-    }
-
-    /// URL 形状闸（纯函数，单测钉住）：仅 http/https、必须有 host、禁 userinfo、
-    /// 端口只放 80/443、长度封顶。IP 段判定不在这里——必须等 DNS 解析后做（见 `resolve_checked`）。
-    fn checked_url_shape(raw: &str) -> Result<reqwest::Url, ApiErr> {
-        if raw.is_empty() || raw.len() > URL_MAX_LEN {
-            return Err(err(StatusCode::BAD_REQUEST, format!("URL 不能为空且不超过 {URL_MAX_LEN} 字符")));
-        }
-        let url = reqwest::Url::parse(raw).map_err(|_| err(StatusCode::BAD_REQUEST, "URL 格式无效"))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(err(StatusCode::BAD_REQUEST, "只支持 http:// 或 https:// 地址"));
-        }
-        if url.host_str().is_none() {
-            return Err(err(StatusCode::BAD_REQUEST, "URL 缺少主机名"));
-        }
-        // userinfo（user:pass@host）的唯一用途是混淆真实目标，一律拒
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(err(StatusCode::BAD_REQUEST, "URL 不允许携带账号信息"));
-        }
-        // 只放标准 Web 端口：非常用端口是打内网服务（redis/管理面/元数据 API）的经典 SSRF 通道
-        if !matches!(url.port_or_known_default(), Some(80 | 443)) {
-            return Err(err(StatusCode::BAD_REQUEST, "只支持 80/443 端口的地址"));
-        }
-        Ok(url)
-    }
-
-    /// SSRF 核心护栏：本机/私网/链路本地/保留段一律拒。std 稳定判断（`is_private` 等）只覆盖
-    /// 一部分段；CGNAT（100.64/10）与 v6 的 ULA/链路本地没有稳定 API，按段字面量补全。
-    /// v4 映射的 v6 地址（::ffff:127.0.0.1）解包后按 v4 判，不允许借壳绕过。
-    fn is_forbidden_ip(ip: std::net::IpAddr) -> bool {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                let o = v4.octets();
-                v4.is_private()            // 10/8、172.16/12、192.168/16
-                    || v4.is_loopback()    // 127/8
-                    || v4.is_link_local()  // 169.254/16
-                    || v4.is_unspecified() // 0.0.0.0
-                    || v4.is_multicast()   // 224/4
-                    || v4.is_broadcast()   // 255.255.255.255
-                    || o[0] == 0           // 0/8「本网络」
-                    || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64/10 CGNAT 共享段
-                    || o[0] >= 240 // 240/4 保留段
-            }
-            std::net::IpAddr::V6(v6) => {
-                if let Some(mapped) = v6.to_ipv4_mapped() {
-                    return is_forbidden_ip(std::net::IpAddr::V4(mapped));
-                }
-                let seg = v6.segments();
-                v6.is_loopback()           // ::1
-                    || v6.is_unspecified() // ::
-                    || v6.is_multicast()   // ff00::/8
-                    || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA 私网段
-                    || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 链路本地
-            }
-        }
-    }
-
-    /// DNS 解析 + **全量** IP 校验：任一解析结果落在禁止段即整域拒绝（客户端可能挑任一地址
-    /// 连接，放过一个就是放过全部）。返回的地址随后钉进 reqwest 的 DNS 覆盖
-    /// （`resolve_to_addrs`）——连接时不再二次解析，这是防 DNS rebinding
-    /// （校验时返公网 IP、连接时换成 127.0.0.1）的那道闸。
-    async fn resolve_checked(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, ApiErr> {
-        let host = url.host_str().unwrap_or_default();
-        let port = url.port_or_known_default().unwrap_or(443);
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|_| err(StatusCode::BAD_GATEWAY, "目标地址无法解析"))?
-            .collect();
-        if addrs.is_empty() {
-            return Err(err(StatusCode::BAD_GATEWAY, "目标地址无法解析"));
-        }
-        if addrs.iter().any(|a| is_forbidden_ip(a.ip())) {
-            return Err(err(StatusCode::BAD_REQUEST, "目标地址指向内网或本机，不允许抓取"));
-        }
-        Ok(addrs)
-    }
-
-    /// 服务端抓取（SSRF 护栏全链）：
-    /// 1. 每跳都过 `checked_url_shape`——重定向目标同样受限，跳转不是绕护栏的后门；
-    /// 2. 每跳 DNS 解析后全量校验 IP，并把校验过的地址钉进该跳专用 client（防 rebinding）；
-    /// 3. 重定向手动跟随 ≤3 跳（reqwest 自动跟随无法在跳转间重验目标，故 `Policy::none()`）；
-    /// 4. 15s 总超时、5MB 大小帽（Content-Length 预检只是早退，真正的帽是分块流式累计）。
-    ///
-    /// 每跳重建 reqwest Client 是**刻意的安全换性能**：resolve 钉定（`resolve_to_addrs`）
-    /// 绑在 client 上，共享 client 会让被钉地址串到别的 host。要优化可按 `(host, addrs)`
-    /// 做小型缓存，但现状（≤4 跳、低频管理面操作）是有意权衡，先别动。
-    async fn fetch_url_guarded(raw: &str) -> Result<FetchedPage, ApiErr> {
-        let mut current = checked_url_shape(raw)?;
-        for hop in 0..=URL_FETCH_MAX_REDIRECTS {
-            let addrs = resolve_checked(&current).await?;
-            let client = reqwest::Client::builder()
-                .timeout(URL_FETCH_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .resolve_to_addrs(current.host_str().unwrap_or_default(), &addrs)
-                .user_agent(concat!("dms-kb-url-ingest/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "抓取客户端初始化失败"))?;
-            let mut resp = client
-                .get(current.clone())
-                .send()
-                .await
-                .map_err(|_| err(StatusCode::BAD_GATEWAY, "目标地址抓取失败或超时（15s）"))?;
-            let status = resp.status();
-            if status.is_redirection() {
-                if hop == URL_FETCH_MAX_REDIRECTS {
-                    return Err(err(StatusCode::BAD_REQUEST, "重定向次数过多（最多 3 次）"));
-                }
-                let location = resp
-                    .headers()
-                    .get(header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "上游返回了无效的重定向"))?;
-                // join 兼容相对跳转；形状闸与 IP 闸在下一跳开头重验
-                current = current
-                    .join(location)
-                    .map_err(|_| err(StatusCode::BAD_GATEWAY, "上游返回了无效的重定向"))?;
-                continue;
-            }
-            if !status.is_success() {
-                return Err(err(StatusCode::BAD_GATEWAY, format!("目标地址返回 HTTP {status}")));
-            }
-            if resp.content_length().is_some_and(|n| n as usize > URL_FETCH_MAX_BYTES) {
-                return Err(err(StatusCode::BAD_REQUEST, "页面超过 5MB 上限，未入库"));
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = resp
-                .chunk()
-                .await
-                .map_err(|_| err(StatusCode::BAD_GATEWAY, "读取目标内容失败或超时"))?
-            {
-                if !capped_append(&mut bytes, &chunk) {
-                    return Err(err(StatusCode::BAD_REQUEST, "页面超过 5MB 上限，未入库"));
-                }
-            }
-            if bytes.is_empty() {
-                return Err(err(StatusCode::BAD_REQUEST, "目标页面为空"));
-            }
-            let content_type = resp
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok());
-            let kind = classify_content(content_type, &bytes).ok_or_else(|| {
-                err(StatusCode::BAD_REQUEST, "只支持 HTML 页面或 PDF 文档（按 Content-Type 与内容判定）")
-            })?;
-            let file_name = url_file_name(&current, kind);
-            return Ok(FetchedPage { bytes, kind, final_url: current.to_string(), file_name });
-        }
-        unreachable!("重定向跳数闸在循环内已返回")
-    }
-
-    /// 流式大小帽：追加后超 5MB 返回 false（调用方中断并 400）。抽成纯函数是为了单测钉住。
-    fn capped_append(buf: &mut Vec<u8>, chunk: &[u8]) -> bool {
-        if buf.len() + chunk.len() > URL_FETCH_MAX_BYTES {
-            return false;
-        }
-        buf.extend_from_slice(chunk);
-        true
-    }
-
-    /// 内容分派：Content-Type 优先；`application/pdf` 头与 `%PDF-` 魔数双通道认 PDF；
-    /// `text/plain`/缺报的服务器若正文明显是 HTML 也按 HTML 收。其余一律拒——入库链的
-    /// 类型白名单只有 html/pdf 两个出口，这里不许放宽。
-    fn classify_content(content_type: Option<&str>, bytes: &[u8]) -> Option<FetchedKind> {
-        let ct = content_type.unwrap_or_default().to_ascii_lowercase();
-        let ct = ct.split(';').next().unwrap_or_default().trim();
-        if ct.contains("text/html") || ct.contains("application/xhtml") {
-            return Some(FetchedKind::Html);
-        }
-        if ct.contains("application/pdf") || bytes.starts_with(b"%PDF-") {
-            return Some(FetchedKind::Pdf);
-        }
-        if (ct.is_empty() || ct.contains("text/plain")) && looks_like_html(bytes) {
-            return Some(FetchedKind::Html);
-        }
-        None
-    }
-
-    /// 首 512 字节转小写、去 BOM 与空白后，以 `<!doctype html` / `<html` 开头
-    fn looks_like_html(bytes: &[u8]) -> bool {
-        // 先截取再一次性小写化（原形态 collect Vec 再 lossy 转换，两次分配）
-        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]).to_ascii_lowercase();
-        let text = head.trim_start_matches('\u{feff}').trim_start();
-        text.starts_with("<!doctype html") || text.starts_with("<html")
-    }
-
-    /// URL → 展示文件名。slug 取路径末段（空则主机名），只留字母/数字/`-`/`_`/CJK，
-    /// 其余折叠成单个 `_`，封顶 60 字符；扩展名由内容判定给（白名单字面量，路径穿越面
-    /// 为零——与 `ingest::doc_path` 同一理由：原始名字从不进磁盘路径）。
-    /// 仅当末段尾缀本就是 html/htm/pdf 时才剥掉重补（避免 `a.html.html`，也避免把
-    /// 主机名 `example.com` 的 `.com` 误当文档扩展名剥掉）。
-    fn url_file_name(url: &reqwest::Url, kind: FetchedKind) -> String {
-        let raw = url
-            .path_segments()
-            .and_then(|segs| segs.filter(|s| !s.is_empty()).next_back())
-            .map(percent_decode)
-            .unwrap_or_else(|| url.host_str().unwrap_or("page").to_string());
-        let stem = match raw.rsplit_once('.') {
-            Some((s, ext)) if matches!(ext.to_ascii_lowercase().as_str(), "html" | "htm" | "pdf") => s,
-            _ => raw.as_str(),
+    fn url_fetch_err(e: url_fetch::UrlFetchError) -> ApiErr {
+        let code = match &e {
+            url_fetch::UrlFetchError::BadInput(_) => StatusCode::BAD_REQUEST,
+            url_fetch::UrlFetchError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            url_fetch::UrlFetchError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let mut slug = String::new();
-        let mut len = 0usize; // 字符计数器：chars().count() 每字符重扫全串是 O(n²)
-        for c in stem.chars() {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') || ('\u{4e00}'..='\u{9fff}').contains(&c) {
-                slug.push(c);
-                len += 1;
-            } else if !slug.ends_with('_') {
-                slug.push('_');
-                len += 1;
-            }
-            if len >= 60 {
-                break;
-            }
-        }
-        let slug = slug.trim_matches('_');
-        let slug = if slug.is_empty() { "page" } else { slug };
-        format!("{slug}.{}", kind.ext())
-    }
-
-    /// 路径段的 percent-decode（`path_segments()` 返回的是编码形态，CJK 文件名不先解就是
-    /// 一串 `E6_8A`）。非法 `%` 序列按原样保留——只服务展示名，解码失败不产生安全后果。
-    /// 手写 20 行避免为一个解码点扩大依赖面（同 `encode_base64` 的理由）。
-    fn percent_decode(seg: &str) -> String {
-        let bytes = seg.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                    out.push(h * 16 + l);
-                    i += 3;
-                    continue;
-                }
-            }
-            out.push(bytes[i]);
-            i += 1;
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    fn hex_val(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
+        err(code, e)
     }
 
     // ───────────────────── 【Y7】空间导出 ─────────────────────
@@ -1255,8 +968,7 @@ mod ops_pack {
             供知识库检索与列表展示使用。只输出描述本身：一两句话、不超过 120 字、客观陈述文档的\
             主题与用途；不编号、不加引号、不复述文件名、不评价。";
         let user = format!("文档《{}》摘录：\n{excerpt}", row.name);
-        let mut chat = ChatRequest::text(ModelTier::Fast, SYSTEM, &user, Some(0.1));
-        chat.max_tokens = Some(300);
+        let chat = ChatRequest::text(ModelTier::Fast, SYSTEM, &user, Some(0.1));
         let reply = tokio::time::timeout(DESC_LLM_TIMEOUT, st.llm.chat(chat))
             .await
             .map_err(|_| err(StatusCode::BAD_GATEWAY, "AI 描述生成超时，请稍后重试"))?
@@ -1300,108 +1012,17 @@ mod ops_pack {
     mod ops_tests {
         use super::*;
 
-        /// URL 形状闸：非法 scheme / 缺 host / userinfo / 非常用端口 / 超长一律 400
         #[test]
-        fn url_shape_gate_rejects_non_web_and_confusing_targets() {
-            for bad in [
-                "file:///etc/passwd",
-                "ftp://example.com/a.pdf",
-                "javascript:alert(1)",
-                "http://",
-                "http://user:pass@example.com/",
-                "http://user@example.com/",
-                "http://example.com:8080/",
-                "https://example.com:6379/",
-                "gopher://example.com/",
+        fn url_fetch_errors_keep_the_http_contract() {
+            for (error, expected) in [
+                (url_fetch::UrlFetchError::BadInput("bad".into()), StatusCode::BAD_REQUEST),
+                (url_fetch::UrlFetchError::Upstream("upstream".into()), StatusCode::BAD_GATEWAY),
+                (url_fetch::UrlFetchError::Internal("internal".into()), StatusCode::INTERNAL_SERVER_ERROR),
             ] {
-                assert!(checked_url_shape(bad).is_err(), "{bad}");
+                let (status, body) = url_fetch_err(error);
+                assert_eq!(status, expected);
+                assert!(body.0["error"].is_string());
             }
-            let too_long = format!("https://example.com/{}", "a".repeat(URL_MAX_LEN));
-            assert!(checked_url_shape(&too_long).is_err());
-            assert!(checked_url_shape("").is_err());
-            for ok in [
-                "http://example.com/a/b.html",
-                "https://example.com:443/x.pdf",
-                "http://example.com:80/",
-                "https://example.com",
-                "https://example.com/path?q=1#frag",
-            ] {
-                assert!(checked_url_shape(ok).is_ok(), "{ok}");
-            }
-        }
-
-        /// SSRF IP 护栏：私网/环回/链路本地/CGNAT/保留段/v6 ULA/v4 映射 v6 全拒；公网放行
-        #[test]
-        fn ssrf_ip_blocklist_covers_private_loopback_and_reserved() {
-            use std::net::IpAddr;
-            let blocked = [
-                "127.0.0.1", "127.0.1.1", "10.0.0.1", "10.255.255.255", "172.16.0.1",
-                "172.31.255.255", "192.168.1.1", "169.254.1.1", "0.0.0.0", "0.1.2.3",
-                "100.64.0.1", "100.127.255.254", "224.0.0.1", "240.0.0.1",
-                "255.255.255.255", "::1", "::", "fe80::1", "fc00::1", "fd00::1",
-                "ff02::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:192.168.0.1",
-            ];
-            for ip in blocked {
-                assert!(is_forbidden_ip(ip.parse::<IpAddr>().unwrap()), "{ip} 应被拒");
-            }
-            let allowed = ["8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.1", "172.15.0.1", "172.32.0.1", "2606:4700:4700::1111"];
-            for ip in allowed {
-                assert!(!is_forbidden_ip(ip.parse::<IpAddr>().unwrap()), "{ip} 应放行");
-            }
-        }
-
-        /// 大小帽：累计超 5MB 即拒（Content-Length 缺报/谎报时的真正护栏）
-        #[test]
-        fn fetch_cap_aborts_over_5mb_stream() {
-            let mut buf = Vec::new();
-            assert!(capped_append(&mut buf, &vec![0u8; URL_FETCH_MAX_BYTES]));
-            assert_eq!(buf.len(), URL_FETCH_MAX_BYTES);
-            assert!(!capped_append(&mut buf, &[1u8; 1]), "超帽必须拒");
-            let mut small = Vec::new();
-            assert!(capped_append(&mut small, &[0u8; 1024]));
-            assert!(!capped_append(&mut small, &vec![0u8; URL_FETCH_MAX_BYTES]));
-            assert_eq!(small.len(), 1024, "拒绝时不得污染已读内容");
-        }
-
-        /// 内容分派：Content-Type 优先，PDF 魔数兜底，text/plain 误配的 HTML 也收，其余一律拒
-        #[test]
-        fn fetched_content_classification_is_html_or_pdf_only() {
-            assert_eq!(classify_content(Some("text/html; charset=utf-8"), b"x"), Some(FetchedKind::Html));
-            assert_eq!(classify_content(Some("application/xhtml+xml"), b"x"), Some(FetchedKind::Html));
-            assert_eq!(classify_content(Some("application/pdf"), b"x"), Some(FetchedKind::Pdf));
-            assert_eq!(classify_content(None, b"%PDF-1.7 rest"), Some(FetchedKind::Pdf));
-            assert_eq!(classify_content(Some("application/octet-stream"), b"%PDF-1.4"), Some(FetchedKind::Pdf));
-            assert_eq!(classify_content(Some("text/plain"), b"  <!DOCTYPE html><html>"), Some(FetchedKind::Html));
-            assert_eq!(classify_content(None, b"<html lang=\"zh\">"), Some(FetchedKind::Html));
-            assert_eq!(classify_content(Some("text/plain"), b"\xef\xbb\xbf<html>"), Some(FetchedKind::Html));
-            for (ct, body) in [
-                (Some("image/png"), &b"\x89PNG"[..]),
-                (Some("application/zip"), &b"PK\x03\x04"[..]),
-                (Some("text/plain"), &b"just some text"[..]),
-                (None, &b"{}"[..]),
-            ] {
-                assert_eq!(classify_content(ct, body), None, "{ct:?}");
-            }
-        }
-
-        /// 文件名派生：slug 清洗、尾缀剥除、CJK 保留、长度封顶、空名回退
-        #[test]
-        fn url_file_name_sanitizes_and_caps() {
-            let u = |s: &str| reqwest::Url::parse(s).unwrap();
-            assert_eq!(url_file_name(&u("https://example.com/a/b.html"), FetchedKind::Html), "b.html");
-            assert_eq!(url_file_name(&u("https://example.com/report.pdf"), FetchedKind::Pdf), "report.pdf");
-            assert_eq!(url_file_name(&u("https://example.com/report.pdf?v=2"), FetchedKind::Pdf), "report.pdf");
-            assert_eq!(url_file_name(&u("https://example.com/"), FetchedKind::Html), "example_com.html");
-            assert_eq!(url_file_name(&u("https://example.com/.../!!!/"), FetchedKind::Html), "page.html");
-            assert_eq!(url_file_name(&u("https://example.com/报销制度-2026"), FetchedKind::Html), "报销制度-2026.html");
-            // percent 编码段先解码再清洗；非法 % 序列原样折叠，不炸
-            assert_eq!(url_file_name(&u("https://example.com/%E6%8A%A5%E9%94%80"), FetchedKind::Html), "报销.html");
-            assert_eq!(url_file_name(&u("https://example.com/%zz%2"), FetchedKind::Html), "zz_2.html");
-            // 末段带点号也只吃主体，清洗后不残留路径分隔符
-            let name = url_file_name(&u("https://example.com/dir/../../etc/passwd"), FetchedKind::Html);
-            assert!(!name.contains('/') && !name.contains('\\'), "{name}");
-            let long = url_file_name(&u(&format!("https://example.com/{}", "长".repeat(200))), FetchedKind::Html);
-            assert!(long.trim_end_matches(".html").chars().count() <= 60, "{long}");
         }
 
         /// 导出分页收口：limit clamp 到 [1, 500]，offset 负值归零
@@ -1440,11 +1061,11 @@ mod ops_pack {
             // URL 入库与上传共用同一条 ingest 链（不许有第二份入库实现）：
             // 请求内只做抓取 + 快路径（prepare），重活必须经 spawn_ingest_job 进后台
             let body = src.split("pub async fn ingest_url").nth(1).unwrap();
-            let body = body.split("enum FetchedKind").next().unwrap();
+            let body = body.split("fn url_fetch_err").next().unwrap();
             assert!(body.contains("ingest::prepare(") && body.contains("store::move_doc("));
             assert!(body.contains("spawn_ingest_job("), "重活必须后台化: {body}");
             assert!(!body.contains("ingest::run_job("), "请求内不许同步跑重活: {body}");
-            let fetch = body.find("fetch_url_guarded").unwrap();
+            let fetch = body.find("url_fetch::fetch_guarded").unwrap();
             let prepare = body.find("ingest::prepare(").unwrap();
             let spawn = body.find("spawn_ingest_job(").unwrap();
             assert!(fetch < prepare && prepare < spawn, "必须先抓取、再快路径、最后挂后台: {body}");
@@ -2528,7 +2149,7 @@ async fn convert_office_to_pdf(src: &std::path::Path, cache: &std::path::Path) -
 
 /// 返回 soffice 产物路径（`<work>/<源文件stem>.pdf`）。
 async fn convert_office_in(src: &std::path::Path, work: &std::path::Path) -> Result<std::path::PathBuf, ()> {
-    let profile = reqwest::Url::from_file_path(work.join("profile")).map_err(|_| ())?;
+    let profile = url_fetch::local_file_url(&work.join("profile")).ok_or(())?;
     // 电子表格启用 SinglePageSheets（每 sheet 一整页）：默认分页会把宽表从列中间切成好几页
     //（2026-08-11 实测 4 页断列），用户要求与源文件一致。LO ≥7.4 支持该 filter option。
     let ext = src
@@ -2910,12 +2531,64 @@ pub(crate) enum SseItem {
     Fail(String),
 }
 
+/// SSE 响应拥有问答任务：响应流丢弃时由事件泵中止任务，避免客户端已经离开后仍继续
+/// 调模型、写会话。只有终止帧成功交给响应流后才解除这个 drop 保护。
+struct WorkerAbort(Option<tokio::task::AbortHandle>);
+
+impl WorkerAbort {
+    fn cancel(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for WorkerAbort {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+pub(crate) struct KbWorker {
+    rx: Option<tokio::sync::mpsc::UnboundedReceiver<SseItem>>,
+    abort: Option<WorkerAbort>,
+}
+
+impl KbWorker {
+    fn new(
+        rx: tokio::sync::mpsc::UnboundedReceiver<SseItem>,
+        abort: tokio::task::AbortHandle,
+    ) -> Self {
+        Self {
+            rx: Some(rx),
+            abort: Some(WorkerAbort(Some(abort))),
+        }
+    }
+
+    fn into_parts(mut self) -> (tokio::sync::mpsc::UnboundedReceiver<SseItem>, WorkerAbort) {
+        (
+            self.rx.take().expect("KB worker receiver 只取一次"),
+            self.abort.take().expect("KB worker abort handle 只取一次"),
+        )
+    }
+}
+
 /// meta 帧载荷。extra 先插、基础键后插：端点附加键（conv_id 等）撞名也盖不掉协议键。
 fn meta_payload(
     m: &dms_knowledge::answer::AnswerMeta,
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
     let mut o = extra.clone();
+    if let Some(summary) = o.get("intent_summary").cloned() {
+        o.insert(
+            "intent_summary".into(),
+            crate::knowledge_receipt_value(summary, !m.citations.is_empty()),
+        );
+    }
     o.insert("trace_id".into(), serde_json::json!(m.trace_id));
     o.insert(
         "citations".into(),
@@ -2932,8 +2605,26 @@ fn delta_payload(text: &str) -> String {
     serde_json::to_string(&serde_json::json!({ "text": text })).expect("JSON map 序列化不失败")
 }
 
-fn done_payload(a: &dms_kernel::Answer) -> String {
-    serde_json::to_string(&serde_json::json!({ "answer": a })).expect("Answer 是纯数据 struct，序列化不失败")
+fn done_payload(
+    a: &dms_kernel::Answer,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut answer = serde_json::to_value(a).expect("Answer 是纯数据 struct，序列化不失败");
+    if let Some(object) = answer.as_object_mut() {
+        // 前端以 done.answer 作为终态覆盖流式 meta，因此执行意图也必须随终态返回。
+        // conv_id/space_id 仍只属于 meta；这里只合并会影响答案解释的两个字段。
+        if let Some(summary) = extra.get("intent_summary") {
+            object.insert(
+                "intent_summary".into(),
+                crate::knowledge_receipt_value(summary.clone(), crate::knowledge_has_citation(a)),
+            );
+        }
+        if let Some(value) = extra.get("resolved_question") {
+            object.insert("resolved_question".into(), value.clone());
+        }
+    }
+    serde_json::to_string(&serde_json::json!({ "answer": answer }))
+        .expect("Answer 是纯数据 struct，序列化不失败")
 }
 
 fn error_payload(msg: &str) -> String {
@@ -2962,40 +2653,59 @@ impl DeltaBatcher {
 }
 
 /// 事件泵：工人通道 → SSE 帧。meta/done/error 到达前先冲掉未发 delta（事件序 = 产生序）；
-/// `tx` 是有界 mpsc，客户端消费慢时背压自然传到攒批器。send 失败 = 客户端断流，泵即收工
-/// （工人在生成侧继续跑完 —— 与同步路径一样，断流不撤销已发起的生成，落账照常）。
+/// `tx` 是有界 mpsc，客户端消费慢时背压自然传到攒批器。响应流关闭或 send 失败 =
+/// 客户端断流，立即中止工人，避免无接收方时继续生成并落账。
 async fn pump_sse(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<SseItem>,
+    worker: KbWorker,
     extra: serde_json::Map<String, serde_json::Value>,
     tx: tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>,
 ) {
+    let (mut rx, mut worker_abort) = worker.into_parts();
     let mut batcher = DeltaBatcher::default();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(DELTA_FLUSH_MS));
     // 攒批期间工人狂推时跳拍（Skip）：连发几拍补帧只会把同一缓冲切成两半，没有意义
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = tx.closed() => {
+                worker_abort.cancel();
+                return;
+            }
             item = rx.recv() => match item {
                 Some(SseItem::Delta(t)) => {
                     if let Some(chunk) = batcher.push(&t) {
-                        if tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await.is_err() { return; }
+                        if tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await.is_err() {
+                            worker_abort.cancel();
+                            return;
+                        }
                     }
                 }
                 Some(other) => {
                     if let Some(chunk) = batcher.flush() {
-                        if tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await.is_err() { return; }
+                        if tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await.is_err() {
+                            worker_abort.cancel();
+                            return;
+                        }
                     }
                     let (name, payload, terminal) = match other {
                         SseItem::Meta(m) => ("meta", meta_payload(&m, &extra), false),
-                        SseItem::Done(a) => ("done", done_payload(&a), true),
+                        SseItem::Done(a) => ("done", done_payload(&a, &extra), true),
                         SseItem::Fail(msg) => ("error", error_payload(&msg), true),
                         SseItem::Delta(_) => unreachable!("delta 已在上个分支收走"),
                     };
-                    if tx.send(Ok(sse_event(name, payload))).await.is_err() { return; }
-                    if terminal { return; }
+                    if tx.send(Ok(sse_event(name, payload))).await.is_err() {
+                        worker_abort.cancel();
+                        return;
+                    }
+                    if terminal {
+                        worker_abort.disarm();
+                        return;
+                    }
                 }
                 // 工人异常消失（通道无终止帧就关了）：冲掉残余后补 error 帧，客户端不傻等
                 None => {
+                    // 通道关闭说明任务已退出（正常返回或 panic），无需再中止。
+                    worker_abort.disarm();
                     if let Some(chunk) = batcher.flush() {
                         let _ = tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await;
                     }
@@ -3005,7 +2715,10 @@ async fn pump_sse(
             },
             _ = tick.tick() => {
                 if let Some(chunk) = batcher.flush() {
-                    if tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await.is_err() { return; }
+                    if tx.send(Ok(sse_event("delta", delta_payload(&chunk)))).await.is_err() {
+                        worker_abort.cancel();
+                        return;
+                    }
                 }
             }
         }
@@ -3014,11 +2727,11 @@ async fn pump_sse(
 
 /// 三条流式端点共用的 SSE 装配：事件泵 spawn + 15s keep-alive 注释帧（防反代掐空闲连接）。
 pub(crate) fn sse_response(
-    rx: tokio::sync::mpsc::UnboundedReceiver<SseItem>,
+    worker: KbWorker,
     extra: serde_json::Map<String, serde_json::Value>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let (tx, out) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(pump_sse(rx, extra, tx));
+    tokio::spawn(pump_sse(worker, extra, tx));
     let stream = futures::stream::unfold(out, |mut out| async move {
         out.recv().await.map(|item| (item, out))
     });
@@ -3036,20 +2749,25 @@ pub(crate) fn spawn_kb_worker(
     st: &Arc<AppState>,
     v: Viewer,
     space: Option<String>,
-    question: &str,
+    query_question: &str,
+    persisted_question: Option<&str>,
+    persisted_extra: Option<serde_json::Map<String, serde_json::Value>>,
     conv_id: Option<i64>,
     fail_msg: fn(&KbError) -> String,
-) -> tokio::sync::mpsc::UnboundedReceiver<SseItem> {
+) -> KbWorker {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
     let st = st.clone();
-    let question = question.to_string();
-    tokio::spawn(async move {
+    let query_question = query_question.to_string();
+    let persisted_question = persisted_question
+        .unwrap_or(query_question.as_str())
+        .to_string();
+    let task = tokio::spawn(async move {
         let on_event = |ev: dms_knowledge::answer::AnswerEvent| {
             let item = match ev {
                 dms_knowledge::answer::AnswerEvent::Meta(m) => SseItem::Meta(m),
                 dms_knowledge::answer::AnswerEvent::Delta(t) => SseItem::Delta(t),
             };
-            // 客户端断流后 send 失败：丢弃预览增量，答案仍生成完并落账（与同步路径一致）
+            // 事件泵检测到客户端断流会 abort 当前任务；这里仅负责把模型事件转入内部通道。
             let _ = tx.send(item);
         };
         let cfg = st.cfg();
@@ -3059,21 +2777,56 @@ pub(crate) fn spawn_kb_worker(
             &st.llm,
             &v,
             space.as_deref(),
-            &question,
+            &query_question,
             &cfg.kb_rrf_weights,
             &on_event,
         )
         .await;
         match out {
             Ok(a) => {
+                // 事件泵已经观察到断流时不再开始落账。若断流恰好发生在下方数据库 await
+                // 已提交之后，abort 只能阻止后续步骤，无法回滚已完成的外部副作用。
+                if tx.is_closed() {
+                    return;
+                }
                 // 会话型端点：与 /api/ask 同口径存 user/ai 两条（写库失败只丢历史，不拦响应）
                 if let Some(cid) = conv_id {
-                    let payload = serde_json::to_value(&a).unwrap_or_else(|e| {
+                    let mut payload = serde_json::to_value(&a).unwrap_or_else(|e| {
                         tracing::warn!(conv_id = cid, reason = %e, "流式问答结果序列化失败，会话内落空对象");
                         serde_json::json!({})
                     });
-                    crate::chat::save_msg_logged(st.owned.pool(), cid, crate::chat::ROLE_USER, &question, None).await;
-                    crate::chat::save_msg_logged(st.owned.pool(), cid, crate::chat::ROLE_AI, "", Some(&payload)).await;
+                    if let (Some(object), Some(extra)) =
+                        (payload.as_object_mut(), persisted_extra.as_ref())
+                    {
+                        if let Some(summary) = extra.get("intent_summary") {
+                            object.insert(
+                                "intent_summary".into(),
+                                crate::knowledge_receipt_value(
+                                    summary.clone(),
+                                    crate::knowledge_has_citation(&a),
+                                ),
+                            );
+                        }
+                        if let Some(value) = extra.get("resolved_question") {
+                            object.insert("resolved_question".into(), value.clone());
+                        }
+                    }
+                    crate::chat::save_msg_logged(
+                        st.owned.pool(),
+                        cid,
+                        crate::chat::ROLE_USER,
+                        &persisted_question,
+                        None,
+                    )
+                    .await;
+                    crate::chat::save_msg_logged(
+                        st.owned.pool(),
+                        cid,
+                        crate::chat::ROLE_AI,
+                        "",
+                        Some(&payload),
+                    )
+                    .await;
                 }
                 let _ = tx.send(SseItem::Done(Box::new(a)));
             }
@@ -3084,7 +2837,7 @@ pub(crate) fn spawn_kb_worker(
             }
         }
     });
-    rx
+    KbWorker::new(rx, task.abort_handle())
 }
 
 /// `POST /api/kb/ask/stream` —— `ask` 的 SSE 流式变体（协议见本文件「SSE 流式问答」段头注）。
@@ -3104,7 +2857,16 @@ pub async fn ask_stream(
         req.q.space_id.clone().map_or(serde_json::Value::Null, serde_json::Value::String),
     );
     // 无会话概念（与 `ask` 一致）：conv_id = None 不做持久化
-    let rx = spawn_kb_worker(&st, v, req.q.space_id.clone(), question, None, kb_err_msg);
+    let rx = spawn_kb_worker(
+        &st,
+        v,
+        req.q.space_id.clone(),
+        question,
+        None,
+        None,
+        None,
+        kb_err_msg,
+    );
     Ok(sse_response(rx, extra))
 }
 
@@ -3240,6 +3002,7 @@ fn doc_json(d: &DocRow, today: chrono::NaiveDate) -> serde_json::Value {
         "quality": { "level": quality_level, "label": quality_label },
         "error": d.error,
         "notice": d.notice,
+        "last_ingest_error": d.last_ingest_error,
         "description": d.description,
         "page_count": d.page_count,
         "chunk_count": d.chunk_count,
@@ -3880,6 +3643,7 @@ mod tests {
             error: String::new(),
             notice: String::new(),
             description: String::new(),
+            last_ingest_error: String::new(),
             page_count: 1,
             chunk_count: 3,
             uploaded_by: "zhangsan".into(),
@@ -3902,6 +3666,15 @@ mod tests {
         assert_eq!(fresh["replaced_doc_name"], serde_json::Value::Null);
     }
 
+    #[test]
+    fn doc_json_exposes_shadow_ingest_failure_without_hiding_live_status() {
+        let mut row = doc_row_fixture();
+        row.last_ingest_error = "向量服务不可用，保留原版本未切换".into();
+        let body = doc_json(&row, chrono::NaiveDate::from_ymd_opt(2026, 8, 12).unwrap());
+        assert_eq!(body["status"], "embedded", "线上旧版本状态不能降成 failed");
+        assert_eq!(body["last_ingest_error"], row.last_ingest_error);
+    }
+
     /// 同名覆盖的接线合同（源码钉住）：两个入库入口的响应都经 `upload_doc_json` 透出
     /// replaced 标记；覆盖任务的通道②收尾（有表重新登记 / 无表退役清理）在后台任务里
     /// 分派——`cleanup_source` 必须挂在 Overwrite 臂上，Rebuild（自愈会重建表格文档，
@@ -3913,7 +3686,7 @@ mod tests {
         let up = up.split("\n}\n").next().unwrap();
         assert!(up.contains("upload_doc_json(&row, prepared.replaced.as_deref())"), "upload 响应必须透出 replaced: {up}");
         let url = src.split("pub async fn ingest_url").nth(1).unwrap();
-        let url = url.split("enum FetchedKind").next().unwrap();
+        let url = url.split("fn url_fetch_err").next().unwrap();
         assert!(url.contains("upload_doc_json(&row, prepared.replaced.as_deref())"), "ingest_url 响应必须透出 replaced: {url}");
         let job = src.split("async fn run_ingest_job_logged").nth(1).unwrap();
         let job = job.split("\n}\n").next().unwrap();
@@ -4309,10 +4082,24 @@ mod tests {
         assert!(!error_payload("x").contains('\n'));
 
         let a = dms_kernel::Answer::text("正文[^1]".into(), vec![], 12);
-        let done: serde_json::Value = serde_json::from_str(&done_payload(&a)).unwrap();
-        assert_eq!(done["answer"]["kind"], "text", "done 的 Answer 与同步端点同 wire");
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "resolved_question".into(),
+            serde_json::json!("解析后的问题"),
+        );
+        extra.insert(
+            "intent_summary".into(),
+            serde_json::json!({ "mode": "knowledge" }),
+        );
+        let done: serde_json::Value = serde_json::from_str(&done_payload(&a, &extra)).unwrap();
+        assert_eq!(
+            done["answer"]["kind"], "text",
+            "done 的 Answer 与同步端点同 wire"
+        );
         assert_eq!(done["answer"]["route"], "knowledge");
         assert_eq!(done["answer"]["markdown"], "正文[^1]");
+        assert_eq!(done["answer"]["resolved_question"], "解析后的问题");
+        assert_eq!(done["answer"]["intent_summary"]["mode"], "knowledge");
     }
 
     /// 事件帧组装：event 名与单行 data。axum `Event` 不带公开读取口，走 Debug 形态钉 —
@@ -4322,7 +4109,13 @@ mod tests {
         for (name, payload) in [
             ("meta", meta_payload(&dms_knowledge::answer::AnswerMeta { trace_id: "t".into(), citations: vec![], searched_docs: None }, &serde_json::Map::new())),
             ("delta", delta_payload("x")),
-            ("done", done_payload(&dms_kernel::Answer::text("m".into(), vec![], 1))),
+            (
+                "done",
+                done_payload(
+                    &dms_kernel::Answer::text("m".into(), vec![], 1),
+                    &serde_json::Map::new(),
+                ),
+            ),
             ("error", error_payload("固定文案")),
         ] {
             assert!(!payload.contains('\n'), "{name} 载荷多行会拆帧: {payload}");
@@ -4337,8 +4130,10 @@ mod tests {
     #[tokio::test]
     async fn pump_flushes_pending_delta_before_meta_and_done() {
         let (wtx, wrx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
+        let worker_task = tokio::spawn(async {});
+        let worker = KbWorker::new(wrx, worker_task.abort_handle());
         let (otx, mut orx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(pump_sse(wrx, serde_json::Map::new(), otx));
+        tokio::spawn(pump_sse(worker, serde_json::Map::new(), otx));
         wtx.send(SseItem::Delta("part-1".into())).unwrap();
         wtx.send(SseItem::Meta(dms_knowledge::answer::AnswerMeta {
             trace_id: "t-1".into(),
@@ -4365,8 +4160,10 @@ mod tests {
     #[tokio::test]
     async fn pump_emits_error_when_worker_vanishes() {
         let (wtx, wrx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
+        let worker_task = tokio::spawn(async {});
+        let worker = KbWorker::new(wrx, worker_task.abort_handle());
         let (otx, mut orx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(pump_sse(wrx, serde_json::Map::new(), otx));
+        tokio::spawn(pump_sse(worker, serde_json::Map::new(), otx));
         wtx.send(SseItem::Delta("partial".into())).unwrap();
         drop(wtx); // 工人没了
         let mut frames = Vec::new();
@@ -4377,5 +4174,101 @@ mod tests {
         assert!(frames[0].contains("partial"), "{}", frames[0]);
         // error 帧必到（文案本身由 sse_payload_shapes 钉；Event Debug 对中文转义，这里只认事件名）
         assert!(frames[1].contains("error"), "{}", frames[1]);
+    }
+
+    /// 输出接收端即 SSE 响应体；客户端断开会 drop 它。事件泵必须随即 abort 工人，
+    /// 让工人 await 后的持久化/Done 路径没有机会执行。
+    #[tokio::test]
+    async fn pump_cancels_worker_when_client_disconnects() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_in_worker = completed.clone();
+        let (wtx, wrx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
+        let worker_task = tokio::spawn(async move {
+            wtx.send(SseItem::Delta("preview".into())).unwrap();
+            futures::future::pending::<()>().await;
+            completed_in_worker.store(true, Ordering::SeqCst);
+        });
+        let worker = KbWorker::new(wrx, worker_task.abort_handle());
+        let (otx, orx) = tokio::sync::mpsc::channel(8);
+        let pump = tokio::spawn(pump_sse(worker, serde_json::Map::new(), otx));
+
+        drop(orx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), pump)
+            .await
+            .expect("客户端断开后事件泵应立即退出")
+            .unwrap();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(1), worker_task)
+            .await
+            .expect("后台工人应被 abort")
+            .expect_err("后台工人不应正常完成");
+        assert!(joined.is_cancelled(), "工人应因客户端断流被取消: {joined}");
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "取消后不应进入持久化/Done 路径"
+        );
+    }
+
+    /// 取消不能回滚已经完成的数据库提交：这里人工停在“持久化完成、Done 尚未发送”的
+    /// 极窄窗口，断流仍会取消后续工作，但已完成标记必须保持。这是外部副作用的边界，
+    /// 不是继续生成或继续落账。
+    #[tokio::test]
+    async fn disconnect_does_not_pretend_to_rollback_completed_side_effect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let persisted = Arc::new(AtomicBool::new(false));
+        let persisted_in_worker = persisted.clone();
+        let (at_boundary_tx, at_boundary_rx) = tokio::sync::oneshot::channel();
+        let (wtx, wrx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
+        let worker_task = tokio::spawn(async move {
+            persisted_in_worker.store(true, Ordering::SeqCst);
+            let _ = at_boundary_tx.send(());
+            futures::future::pending::<()>().await;
+            let _ = wtx.send(SseItem::Done(Box::new(dms_kernel::Answer::text(
+                "must-not-send".into(),
+                vec![],
+                1,
+            ))));
+        });
+        let worker = KbWorker::new(wrx, worker_task.abort_handle());
+        let (otx, orx) = tokio::sync::mpsc::channel(8);
+        let pump = tokio::spawn(pump_sse(worker, serde_json::Map::new(), otx));
+
+        at_boundary_rx.await.unwrap();
+        drop(orx);
+        pump.await.unwrap();
+        let joined = worker_task.await.expect_err("Done 前断流应取消剩余工作");
+        assert!(joined.is_cancelled());
+        assert!(persisted.load(Ordering::SeqCst), "取消不能回滚已完成副作用");
+    }
+
+    /// Done 成功交给响应流后，取消保护必须解除：工人正常收尾不能被误 abort。
+    #[tokio::test]
+    async fn pump_disarms_cancellation_after_terminal_frame() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_in_worker = completed.clone();
+        let (wtx, wrx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
+        let worker_task = tokio::spawn(async move {
+            wtx.send(SseItem::Done(Box::new(dms_kernel::Answer::text(
+                "final".into(),
+                vec![],
+                1,
+            ))))
+            .unwrap();
+            tokio::task::yield_now().await;
+            completed_in_worker.store(true, Ordering::SeqCst);
+        });
+        let worker = KbWorker::new(wrx, worker_task.abort_handle());
+        let (otx, mut orx) = tokio::sync::mpsc::channel(8);
+        let pump = tokio::spawn(pump_sse(worker, serde_json::Map::new(), otx));
+
+        let frame = orx.recv().await.expect("应收到 Done").unwrap();
+        assert!(format!("{frame:?}").contains("done"));
+        pump.await.unwrap();
+        worker_task.await.expect("正常终态不应误取消工人");
+        assert!(completed.load(Ordering::SeqCst), "工人应完成正常收尾");
     }
 }

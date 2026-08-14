@@ -10,12 +10,17 @@ use dms_semantic::registry::{ds_pred, ds_pred_at, DS_PRED};
 /// 仍在别的 crate 里读 `meta.*` 的文件（相对 `crates/semantic/`）。
 /// 随 T8/T9 把它们的 SQL 收进 `registry::*` 而逐条删除 —— 删空那天这个常量也就没了。
 const EXTERNAL: &[&str] = &[
-    "../server/src/direct.rs",
+    // `server/src/direct.rs` 已随 T8-B9 整文件删除：装配器与模板迁入本 crate 的
+    // `src/{compose,fastpath}/*`（被上面的 src/** 全树扫描覆盖），吃 `AskCtx`/intent 合同的
+    // 那批迁 agent —— 后者是这条清单的**继任者**，仍要跨 crate 扫（它有 meta.* 查询与 SQL 拼接）。
+    "../agent/src/answerers/fastpath_intent.rs",
     // `server/src/pipeline.rs` 整块迁 `dms-agent`（T9）后**没有继任条目**，刻意的：
     // 它自己从不写 `meta.*` 的 SQL（一律经 `registry::exemplar`），而 agent 侧连写都写不出来 ——
     // `scripts/check-arch.ps1` 对整个 `crates/agent/src` 守着 `sqlx::query`（FAIL 级），
     // 所以 agent 的每一条 meta 查询都必须落在本 crate 的 `src/**` 里，而那已经全被扫了。
-    "../server/src/corrector.rs",
+    // `server/src/corrector.rs` 已随 T8-B3 整文件删除（六族全部迁入本 crate 的
+    // `src/correct/*`，已被上面的 src/** 全树扫描覆盖），故**没有继任条目** ——
+    // 与 pipeline.rs 那条同一个理由。
     // 权限档案的两条 SQL 随 inject.rs 迁 dms-policy（`scope_binding` 的 ds 谓词现在在那里）
     "../policy/src/rules.rs",
 ];
@@ -58,7 +63,10 @@ fn every_meta_recall_is_ds_scoped() {
     // 加 `ds_id IN (ds,'*')` 谓词反而会让运营视图只看得见一个源。
     // `query_log` 预先入列：它的 `ds:any` 标记离 SQL 有 11 行，谁把 query_log.rs 加进下面的
     // 文件清单都会当场假红——先在这里断掉那个陷阱。
-    const EXEMPT: &[&str] = &["datasource", "correction_log", "failure_log", "query_log"];
+    // `learn_event` 同族：**全局审计表**，无 ds 列 —— 一次学习可能同时动多个源的语料，
+    // 按源切账本反而拼不回一次完整的学习行为（回滚要的正是「这一批全部」）。
+    const EXEMPT: &[&str] =
+        &["datasource", "correction_log", "failure_log", "query_log", "learn_event"];
     let mut checked = 0usize;
     for (name, src) in &sources() {
         let lines: Vec<&str> = src.lines().collect();
@@ -167,6 +175,95 @@ const ALLOW: &[(&str, &str)] = &[
     // recall/pitfall.rs 的 {kinds} 由本文件 RECALLED_KINDS 常量数组现场拼成（固定字面量清单），
     // 无外部输入入口。
     ("pitfall.rs", "kinds"),
+    // exemplar.rs 的 {FEWSHOT_MIN_SIMILARITY} 是本文件的 f32 编译期常量（few-shot 相似度下限），
+    // 无外部输入入口；与 ods.rs 的 JOIN_MIN_CONFIDENCE 同理。
+    ("exemplar.rs", "FEWSHOT_MIN_SIMILARITY"),
+    // correct/agg.rs 的 {agg_expr} 来自 meta.metric 注册表的 agg_expr 列（种子与人工登记，
+    // 非用户输入），且只被 `Parser::parse_sql` 解析成 AST、不发往任何数据库。
+    ("agg.rs", "agg_expr"),
+    // registry/failure.rs 的 {ERR_CLASS_CHARS} 是本文件的 usize 编译期常量（错误分类前缀长度），
+    // 无外部输入入口；与 ods.rs 的 JOIN_MIN_CONFIDENCE 同理。
+    ("failure.rs", "ERR_CLASS_CHARS"),
+    // correct/agg_rewrite.rs 的 {f} 是**该文件测试里**的字面量数组元素（"max"/"min" 等函数名）。
+    // 本门禁刻意不切 #[cfg(test)]（测试里的拼接同样是判据面），故测试的插值也要报备。
+    ("agg_rewrite.rs", "f"),
+    // fastpath/finance.rs 的 {name} 是本文件 `MARKET_COST_GROUPS` 常量数组的第一元素
+    // （六个费用分类的固定中文字面量），无外部输入入口。
+    ("finance.rs", "name"),
+    // ── T8 搬运批：`server/src/direct.rs` 的装配器与模板迁入本 crate 后纳入本门禁 ──
+    // （旧址在 server，门禁对 server 是 WarnOnly，这些插值此前从未被这道判据看过）
+    // 装配器自生成的表别名（`b{i}` 或维度别名，均由代码构造）
+    ("assemble.rs", "alias"),
+    // `from_table_aliases` 从已装配 SQL 解析出的别名，非外部输入
+    ("assemble.rs", "base_alias"),
+    // 由本函数的 scope/time/value 三段现拼，各段来源见同批条目
+    ("assemble.rs", "inner_where"),
+    // 注册表 `dedup_keys` 声明的列名清单（种子与人工登记）
+    ("assemble.rs", "keys"),
+    // 注册表 `metric.source_table` 剥注解后的物理表名
+    ("assemble.rs", "m_src"),
+    // 由 `join_edge` 声明的列对现拼（注册表数据）
+    ("assemble.rs", "on_cond"),
+    // 代码按维度是否为时间表达式二选一的固定字面量
+    ("assemble.rs", "order"),
+    // 注册表 `table_scope`/`metric.scope_filter` 声明拼成
+    ("assemble.rs", "scope"),
+    // 注册表 `dimension.source_table` / `metric.source_table`
+    ("assemble.rs", "table"),
+    // `kernel::nl::time` 的模板填列名而来，模板是编译期字面量
+    ("assemble.rs", "time_and"),
+    // `join_edge` 声明的对端表名（注册表数据）
+    ("assemble.rs", "to"),
+    // 本文件 `MARKET_COST_GROUPS` 常量数组现拼的 UNION 片段
+    ("finance.rs", "detail"),
+    // `kernel::nl::time` 模板填死列名 `f.data_month` 的产物
+    ("finance.rs", "p"),
+    // `market_cost_where` 由问句**匹配**出的固定字面量分支（不回填问句文本）
+    ("finance.rs", "pred"),
+    // `detect_top_n` 的 usize（1..=200 闭区间，越界取默认）
+    ("finance.rs", "top_n"),
+    // 给人看的中文说明串，不参与 SQL 执行（拼在注释位）
+    ("ops.rs", "note"),
+    // 按省区枚举匹配出的固定字面量分支
+    ("ops.rs", "region_sql"),
+    // 代码按维度组合选定的固定列清单
+    ("ops.rs", "select_cols"),
+    // 本文件编译期字面量（最新快照日子查询）
+    ("ops.rs", "snapshot"),
+    // `sales_status_sql` 由注册表有效订单状态码拼成
+    ("ops.rs", "status_sql"),
+    // `kernel::nl::time` 模板填死列名的产物
+    ("ops.rs", "time"),
+    // 由上面几项现拼，各段来源见同批条目
+    ("ops.rs", "where_sql"),
+    // 不可计算卡的中文文案（编译期字面量），进的是常量投影不是谓词
+    ("sales.rs", "advice"),
+    // 注册表命中的指标名清单（`sales_fact::Metric` 枚举名）
+    ("sales.rs", "names"),
+    // 同 advice：不可计算卡文案
+    ("sales.rs", "reason"),
+    // 同 advice：不可计算卡文案（缺省为固定字面量）
+    ("sales.rs", "requested"),
+    // 本文件编译期常量（中台库表名）
+    ("stock.rs", "ZT_FROM"),
+    // 本文件编译期常量（库存状态固定过滤）
+    ("stock.rs", "ZT_WHERE"),
+    // 调用方传入的**列名字面量**（本文件内部调用，无外部入口）
+    ("stock.rs", "column"),
+    // 中文列别名字面量（展示用）
+    ("stock.rs", "label"),
+    // 按省份枚举匹配出的固定字面量分支
+    ("stock.rs", "where_sql"),
+    // 单号直查的编号——已过 `sniff_doc_code` 的字符集白名单（只留字母数字与连字符）
+    ("template.rs", "code"),
+    // 代码二选一的固定 GROUP BY 片段
+    ("template.rs", "group"),
+    // 按单据族选定的固定 JOIN 片段
+    ("template.rs", "joins"),
+    // `sales_status_sql` 由注册表有效订单状态码拼成
+    ("template.rs", "status"),
+    // 由上面几项现拼，各段来源见同批条目
+    ("template.rs", "where_sql"),
 ];
 
 /// 🔴 SQL 拼接守卫：semantic 是 `meta.*` 的唯一读写口，门禁不再对它守 `sqlx::query`

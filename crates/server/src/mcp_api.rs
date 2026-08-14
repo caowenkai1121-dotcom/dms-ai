@@ -2,7 +2,7 @@
 //! 变更原因＝对外集成协议（n8n / Dify / DataEase 调我们的问数、知识库与数据地图）。
 //!
 //! 三条纪律：
-//! 1. **零旁路**：`ask` 走的就是 `/api/ask` 那条链（`triage` → `crate::ask` / `knowledge::answer`），
+//! 1. **零旁路**：`ask` 走的就是 `/api/ask` 那条链（一次 PreparedQuestion → typed route → 对应执行器），
 //!    `kb_search` 走的就是 `retrieve::search`；三个 `datamap_*` 走 `datamap_api` 抽出的共用取数层
 //!    （与 REST 同一函数，不另抄 SQL）。本文件不含任何判据、不拼一行 SQL。
 //! 2. **权限等同该员工登录**：key 只映射到 login_name，随后**必须**过
@@ -28,9 +28,9 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use crate::AppState;
-use dms_agent::triage;
-use dms_semantic::registry::datasource as ds_reg;
+use dms_agent::intent::IntentRoute;
 use dms_policy::{principal, Principal};
+use dms_semantic::registry::datasource as ds_reg;
 
 type ApiErr = (StatusCode, Json<Value>);
 /// JSON-RPC 失败：(code, message)。**不是 HTTP 错误**——它进 200 响应的 `error` 字段。
@@ -68,11 +68,30 @@ fn fail_code(msg: &str) -> i64 {
     // 连接类只收瞬时形态：「连接失败」对应 connector::Connect（建池/握手/被拒，瞬时倾向），
     // 裸「连接」/「connect」会误吞「连接配置缺失」「connection string invalid」这类永久错误
     //（与上方「宁少不多」的偏向一致）。
-    const RETRYABLE_CN: &[&str] = &["超时", "连接失败", "连接重置", "连接中断", "熔断", "限流", "请稍后", "暂时不可用"];
+    const RETRYABLE_CN: &[&str] = &[
+        "超时",
+        "连接失败",
+        "连接重置",
+        "连接中断",
+        "熔断",
+        "限流",
+        "请稍后",
+        "暂时不可用",
+    ];
     const RETRYABLE_EN: &[&str] = &[
-        "timeout", "timed out", "connection refused", "connection reset", "connection closed",
-        "connection terminated", "broken pipe", "429", "502", "503", "504",
-        "too many requests", "temporarily",
+        "timeout",
+        "timed out",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "connection terminated",
+        "broken pipe",
+        "429",
+        "502",
+        "503",
+        "504",
+        "too many requests",
+        "temporarily",
     ];
     // 先判 CN：中文文案命中时，全文小写化那次分配是白付
     if RETRYABLE_CN.iter().any(|w| msg.contains(w)) {
@@ -114,7 +133,10 @@ fn req_id(v: &Value) -> Value {
 fn parse_req(v: &Value) -> Result<RpcReq, RpcFail> {
     let id = req_id(v);
     if id.is_null() {
-        return Err((INVALID_REQUEST, "缺 id 或 id 类型非法（仅收字符串/整数；本端点不受理通知式请求）".into()));
+        return Err((
+            INVALID_REQUEST,
+            "缺 id 或 id 类型非法（仅收字符串/整数；本端点不受理通知式请求）".into(),
+        ));
     }
     let method = v
         .get("method")
@@ -235,7 +257,13 @@ fn tools() -> Value {
 /// `tools/call` 的 `{name, arguments}`。`arguments` 缺省按空对象（无参工具的合法形态）。
 fn call_args(params: &Value) -> Result<(String, Value), RpcFail> {
     let name = req_str(params, "name")?;
-    Ok((name, params.get("arguments").cloned().unwrap_or_else(|| json!({}))))
+    Ok((
+        name,
+        params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    ))
 }
 
 /// 必填字符串参数：缺失 / 非字符串 / 空白串一律 -32602。
@@ -274,7 +302,10 @@ fn authorize(keys: &HashMap<String, String>, headers: &HeaderMap) -> Result<Stri
         // 默认关：没配 key 时连「端点存在」都不该暴露
         return Err(deny(StatusCode::NOT_FOUND, "未找到"));
     }
-    let raw = headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let raw = headers
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
     // 常量时间比较（复用 `auth::api_key_login`）：`HashMap::get` 的哈希早退会泄露时序，
     // 攻击者可逐位探测 key 前缀 —— 与 REST 双通道同一条比较链，不各抄一份。
     match crate::auth::api_key_login(keys, raw) {
@@ -300,7 +331,10 @@ pub async fn mcp(
     let v: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(Json(err_resp(&Value::Null, (PARSE_ERROR, format!("JSON 解析失败：{e}")))))
+            return Ok(Json(err_resp(
+                &Value::Null,
+                (PARSE_ERROR, format!("JSON 解析失败：{e}")),
+            )))
         }
     };
     let id = req_id(&v);
@@ -324,7 +358,11 @@ pub async fn mcp(
 /// 工具闭集（与 tools() 清单同源 —— dispatch_covers_every_listed_tool 钉着一致性）。
 /// 先验名再加载身份：乱填工具名的请求不许白打一次身份库。
 const TOOL_NAMES: &[&str] = &[
-    "ask", "kb_search", "datamap_search_nodes", "datamap_find_paths", "datamap_list_pending_edges",
+    "ask",
+    "kb_search",
+    "datamap_search_nodes",
+    "datamap_find_paths",
+    "datamap_list_pending_edges",
 ];
 
 /// 工具分派。**身份换算在这里发生且只发生一次**：login_name → `Principal`
@@ -355,17 +393,32 @@ async fn call(st: &AppState, login: &str, params: &Value) -> Result<Value, RpcFa
     Ok(text_content(text))
 }
 
-/// 与 `/api/ask` 完全同一条链路：分诊 → `crate::ask` 或 `knowledge::answer`。
-/// 无会话状态，故 `prev_question=None`、`forced intent=None`（MCP 侧不给 chip）。
+/// 与 `/api/ask` 完全同一条链路：统一准备一次 → typed route → 对应执行器。
+/// 无会话状态，故 `prev_question=None`、forced intent=None（MCP 侧不给 chip）。
 async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, RpcFail> {
     let question = req_str(args, "question")?;
     let ds = opt_str(args, "ds");
-    // 分诊 ds 恒 DMS_DS_ID，即便调用方显式传 ds —— 与主通路 `api_ask`（main.rs）逐字对齐：
-    // 分诊判据是判官金标钉着的红线，MCP 不另搞一套（显式选源只进下方 crate::ask）
-    let out = match triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &question, None).await
-    {
-        triage::Intent::Data => {
-            let (r, _log) = crate::ask(
+    let prepared = crate::prepare_ask(st, &question, None).await;
+    let out: Value = match prepared.question.route() {
+        // 合同不可用 ≠ 知识库不能答（同 `/api/ask`，见 `unknown_route_kb_fallback` 的红字）。
+        // 只做检索、不生成任何 SQL；查到带引用的内容才顶替卡片。
+        IntentRoute::Unknown => {
+            match crate::unknown_route_kb_fallback(
+                st,
+                p,
+                None,
+                &prepared.question.effective_question,
+            )
+            .await
+            {
+                Some(a) => serde_json::to_value(&a)
+                    .map_err(|e| internal_fail("知识库结果序列化", &e))?,
+                None => serde_json::to_value(prepared.question.clarification_result())
+                    .map_err(|e| internal_fail("澄清结果序列化", &e))?,
+            }
+        }
+        IntentRoute::Data => {
+            let (r, _log) = crate::ask_prepared(
                 &st.llm,
                 &st.auth_mysql,
                 &st.mysql,
@@ -373,8 +426,7 @@ async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, 
                 st.owned.pool(),
                 &st.embed,
                 p,
-                &question,
-                None,
+                &prepared,
                 ds.as_deref(),
                 None, // conv_id：MCP 无会话概念（`chat.msg.conv_id` 只存在于 HTTP 聊天）
                 st.sc_samples,
@@ -382,21 +434,42 @@ async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, 
             .await;
             // 长驻进程，写入句柄直接丢弃（fire-and-forget，同 `/api/ask`）
             let r = r.map_err(|e| internal_fail("问数执行", &e))?;
-            serde_json::to_value(&r)
+            serde_json::to_value(&r).map_err(|e| internal_fail("问数结果序列化", &e))?
         }
-        triage::Intent::Knowledge => {
-            let a =
-                dms_knowledge::answer::answer(&st.owned, &st.embed, &st.llm, &viewer(p), None, &question, &st.cfg().kb_rrf_weights)
-                    .await
-                    .map_err(|e| internal_fail("知识问答", &e))?;
-            serde_json::to_value(&a)
+        IntentRoute::Knowledge => {
+            let a = crate::kb_answer(st, p, None, &prepared.question.effective_question)
+                .await
+                .map_err(|e| internal_fail("知识问答", &e))?;
+            let mut payload =
+                serde_json::to_value(&a).map_err(|e| internal_fail("知识结果序列化", &e))?;
+            payload["intent_summary"] = crate::knowledge_summary_value(&prepared, &a);
+            if prepared.question.effective_question != question {
+                payload["resolved_question"] = json!(prepared.question.effective_question);
+            }
+            payload
+        }
+        IntentRoute::Hybrid => {
+            let h = crate::HybridAsk {
+                question: &question,
+                p,
+                ds: ds.as_deref(),
+                conv_id: None,
+                space_id: None,
+                sc_samples: st.sc_samples,
+            };
+            crate::hybrid_payload(st, &h, &prepared)
+                .await
+                .map_err(|(_, body)| {
+                    let msg = body
+                        .0
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("混合问答执行失败")
+                        .to_string();
+                    (EXEC_FAILED, msg)
+                })?
         }
     };
-    // 序列化失败不能吞：吞了客户端会收到「成功」响应体却是 "null"
-    let out = out.map_err(|e| {
-        tracing::warn!(err = %e, "MCP ask 结果序列化失败");
-        (EXEC_FAILED, "结果序列化失败".to_string())
-    })?;
     Ok(json_text(&out))
 }
 
@@ -404,10 +477,16 @@ async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, 
 async fn tool_kb_search(st: &AppState, p: &Principal, args: &Value) -> Result<String, RpcFail> {
     let query = req_str(args, "query")?;
     let space = opt_str(args, "space_id");
-    let hits =
-        dms_knowledge::retrieve::search(&st.owned, &st.embed, &viewer(p), space.as_deref(), &query, &st.cfg().kb_rrf_weights)
-            .await
-            .map_err(|e| internal_fail("知识库检索", &e))?;
+    let hits = dms_knowledge::retrieve::search(
+        &st.owned,
+        &st.embed,
+        &viewer(p),
+        space.as_deref(),
+        &query,
+        &st.cfg().kb_rrf_weights,
+    )
+    .await
+    .map_err(|e| internal_fail("知识库检索", &e))?;
     let hits: Vec<Value> = hits
         .into_iter()
         .map(|h| {
@@ -428,12 +507,17 @@ async fn tool_kb_search(st: &AppState, p: &Principal, args: &Value) -> Result<St
 async fn require_ds(st: &AppState, p: &Principal, args: &Value) -> Result<String, RpcFail> {
     let ds = opt_str(args, "ds").unwrap_or_else(|| ds_reg::DMS_DS_ID.to_string());
     if !crate::datamap_api::valid_ds(&ds) {
-        return Err((INVALID_PARAMS, format!("ds 非法：{ds}（字母数字与 _-，≤64 字符）")));
+        return Err((
+            INVALID_PARAMS,
+            format!("ds 非法：{ds}（字母数字与 _-，≤64 字符）"),
+        ));
     }
-    let visible = crate::datamap_api::ds_visible(st, p, &ds).await.map_err(|e| {
-        let m = format!("ds 可见性判定失败：{e}");
-        (fail_code(&m), m)
-    })?;
+    let visible = crate::datamap_api::ds_visible(st, p, &ds)
+        .await
+        .map_err(|e| {
+            let m = format!("ds 可见性判定失败：{e}");
+            (fail_code(&m), m)
+        })?;
     if !visible {
         // 与 REST 侧同一文案口径：「不存在」与「无权」不分写（分开 = 证实存在性，枚举 oracle）
         return Err((EXEC_FAILED, format!("数据源不存在或无权访问：{ds}")));
@@ -443,7 +527,10 @@ async fn require_ds(st: &AppState, p: &Principal, args: &Value) -> Result<String
 
 /// 可选整数限量参数（纯函数）：缺失/非数字 → default，再 clamp 进 [lo, hi]。
 fn opt_limit(args: &Value, key: &str, default: i64, lo: i64, hi: i64) -> i64 {
-    args.get(key).and_then(Value::as_i64).unwrap_or(default).clamp(lo, hi)
+    args.get(key)
+        .and_then(Value::as_i64)
+        .unwrap_or(default)
+        .clamp(lo, hi)
 }
 
 /// 节点关键字匹配（纯函数）：表名/列名/注释/域任一包含即命中（大小写不敏感）。
@@ -460,7 +547,11 @@ fn node_matches(node: &Value, kw: &str) -> bool {
 
 /// ① 节点检索：共用层取全量节点，关键字过滤 + 限量在 Rust 侧（目录体量小，
 /// 比多养一份 LIKE SQL 值得 —— 纪律 1「不拼一行 SQL」）。
-async fn tool_datamap_search_nodes(st: &AppState, p: &Principal, args: &Value) -> Result<String, RpcFail> {
+async fn tool_datamap_search_nodes(
+    st: &AppState,
+    p: &Principal,
+    args: &Value,
+) -> Result<String, RpcFail> {
     let keyword = req_str(args, "keyword")?;
     let limit = opt_limit(args, "limit", 50, 1, 200) as usize;
     let ds = require_ds(st, p, args).await?;
@@ -469,14 +560,22 @@ async fn tool_datamap_search_nodes(st: &AppState, p: &Principal, args: &Value) -
         (fail_code(&m), m)
     })?;
     // 大小写归一化收在 node_matches 内部，调用方不再先 lower 一遍
-    let hits: Vec<&Value> = nodes.iter().filter(|n| node_matches(n, &keyword)).take(limit).collect();
+    let hits: Vec<&Value> = nodes
+        .iter()
+        .filter(|n| node_matches(n, &keyword))
+        .take(limit)
+        .collect();
     Ok(json_text(&json!({
         "ds": ds, "keyword": keyword, "count": hits.len(), "nodes": hits,
     })))
 }
 
 /// ② 两级路径：合同边加载口、边数护栏、BFS 与组装全部与 REST `/api/datamap/paths` 同款。
-async fn tool_datamap_find_paths(st: &AppState, p: &Principal, args: &Value) -> Result<String, RpcFail> {
+async fn tool_datamap_find_paths(
+    st: &AppState,
+    p: &Principal,
+    args: &Value,
+) -> Result<String, RpcFail> {
     let from = req_str(args, "from")?;
     let to = req_str(args, "to")?;
     let ds = require_ds(st, p, args).await?;
@@ -498,12 +597,18 @@ async fn tool_datamap_find_paths(st: &AppState, p: &Principal, args: &Value) -> 
             ),
         ));
     }
-    Ok(json_text(&crate::datamap_api::paths_result_json(&ds, &from, &to, &edges)))
+    Ok(json_text(&crate::datamap_api::paths_result_json(
+        &ds, &from, &to, &edges,
+    )))
 }
 
 /// ③ 待审推断边：status 恒 pending、confidence 降序（SQL 内 ORDER BY + LIMIT 500），
 /// 调用侧限量是「从最强候选里再截一段」，语义与 REST 复核队列一致。
-async fn tool_datamap_list_pending_edges(st: &AppState, p: &Principal, args: &Value) -> Result<String, RpcFail> {
+async fn tool_datamap_list_pending_edges(
+    st: &AppState,
+    p: &Principal,
+    args: &Value,
+) -> Result<String, RpcFail> {
     let limit = opt_limit(args, "limit", 50, 1, 500) as usize;
     let ds = require_ds(st, p, args).await?;
     // kind 过滤与 REST ② 同一个闭集函数：非法取值 REST 映 400，这里映 -32602
@@ -527,12 +632,18 @@ async fn tool_datamap_list_pending_edges(st: &AppState, p: &Principal, args: &Va
             (fail_code(&m), m)
         })?;
     edges.truncate(limit);
-    Ok(json_text(&json!({ "ds": ds, "count": edges.len(), "edges": edges })))
+    Ok(json_text(
+        &json!({ "ds": ds, "count": edges.len(), "edges": edges }),
+    ))
 }
 
 /// 知识库身份：映射到的 login + 该 `Principal` 的**角色码**。多一个字都不许放宽。
 fn viewer(p: &Principal) -> dms_knowledge::Viewer {
-    let roles = if p.role_code.is_empty() { vec![] } else { vec![p.role_code.clone()] };
+    let roles = if p.role_code.is_empty() {
+        vec![]
+    } else {
+        vec![p.role_code.clone()]
+    };
     dms_knowledge::Viewer::new(&p.login_name, roles)
 }
 
@@ -597,18 +708,33 @@ mod tests {
         assert_eq!(req_id(&json!({"id": "abc"})), json!("abc"));
         assert_eq!(req_id(&json!({"id": 7})), json!(7));
         assert_eq!(req_id(&json!({"id": -3})), json!(-3), "负整数是合法 id");
-        for bad in [json!({"id": 1.5}), json!({"id": true}), json!({"id": null}), json!({})] {
+        for bad in [
+            json!({"id": 1.5}),
+            json!({"id": true}),
+            json!({"id": null}),
+            json!({}),
+        ] {
             assert_eq!(req_id(&bad), Value::Null, "{bad}");
-            let e = parse_req(&json!({"id": bad.get("id").cloned().unwrap_or(Value::Null), "method": "m"})).unwrap_err();
+            let e = parse_req(
+                &json!({"id": bad.get("id").cloned().unwrap_or(Value::Null), "method": "m"}),
+            )
+            .unwrap_err();
             assert_eq!(e.0, INVALID_REQUEST, "{bad}");
-            assert!(e.1.contains("id 类型非法"), "文案要分清缺失与类型非法：{}", e.1);
+            assert!(
+                e.1.contains("id 类型非法"),
+                "文案要分清缺失与类型非法：{}",
+                e.1
+            );
         }
     }
 
     /// 缺 id / id=null 都不受理（通知式请求）；且此时错误响应必须带 `id: null`
     #[test]
     fn parse_missing_id_is_invalid_request() {
-        for v in [json!({ "method": "tools/list" }), json!({ "id": null, "method": "tools/list" })] {
+        for v in [
+            json!({ "method": "tools/list" }),
+            json!({ "id": null, "method": "tools/list" }),
+        ] {
             let e = parse_req(&v).unwrap_err();
             assert_eq!(e.0, INVALID_REQUEST);
             assert_eq!(req_id(&v), Value::Null);
@@ -656,7 +782,10 @@ mod tests {
             assert_eq!(fail_code(m), EXEC_RETRYABLE, "该判可重试：{m}");
         }
         // 瞬时（连接类收窄后的瞬时形态仍要认）
-        assert_eq!(fail_code("连接失败 [owned-pg] connection refused"), EXEC_RETRYABLE);
+        assert_eq!(
+            fail_code("连接失败 [owned-pg] connection refused"),
+            EXEC_RETRYABLE
+        );
         assert_eq!(fail_code("连接重置，请重试"), EXEC_RETRYABLE);
         // 永久：重试一万次也还是这个结果，重试就是纯浪费
         for m in [
@@ -682,7 +811,13 @@ mod tests {
         let names: Vec<&str> = arr.iter().map(|x| x["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            vec!["ask", "kb_search", "datamap_search_nodes", "datamap_find_paths", "datamap_list_pending_edges"]
+            vec![
+                "ask",
+                "kb_search",
+                "datamap_search_nodes",
+                "datamap_find_paths",
+                "datamap_list_pending_edges"
+            ]
         );
         assert_eq!(arr[0]["inputSchema"]["required"], json!(["question"]));
         assert_eq!(arr[1]["inputSchema"]["required"], json!(["query"]));
@@ -691,9 +826,16 @@ mod tests {
         // 数据地图三工具的契约钉点
         assert_eq!(arr[2]["inputSchema"]["required"], json!(["keyword"]));
         assert_eq!(arr[3]["inputSchema"]["required"], json!(["from", "to"]));
-        assert_eq!(arr[4]["inputSchema"]["required"], json!([]), "待审边全参数可选");
+        assert_eq!(
+            arr[4]["inputSchema"]["required"],
+            json!([]),
+            "待审边全参数可选"
+        );
         for i in 2..=4 {
-            assert!(arr[i]["inputSchema"]["properties"]["ds"].is_object(), "工具 {i} 缺 ds 参数");
+            assert!(
+                arr[i]["inputSchema"]["properties"]["ds"].is_object(),
+                "工具 {i} 缺 ds 参数"
+            );
         }
         assert!(arr[2]["inputSchema"]["properties"]["limit"].is_object());
         assert!(arr[4]["inputSchema"]["properties"]["kind"].is_object());
@@ -711,7 +853,10 @@ mod tests {
         let src = include_str!("mcp_api.rs");
         for tool in tools()["tools"].as_array().unwrap() {
             let name = tool["name"].as_str().unwrap();
-            assert!(src.contains(&format!("\"{name}\" =>")), "call() 缺 {name} 的派发臂");
+            assert!(
+                src.contains(&format!("\"{name}\" =>")),
+                "call() 缺 {name} 的派发臂"
+            );
         }
         assert!(src.contains("\"ping\" =>"), "MCP 规范的 ping 保活臂不许丢");
     }
@@ -724,9 +869,17 @@ mod tests {
         let (_, args) = call_args(&json!({ "name": "ask" })).unwrap();
         assert_eq!(req_str(&args, "question").unwrap_err().0, INVALID_PARAMS);
         // 空白串不算填了
-        assert_eq!(req_str(&json!({ "question": "  " }), "question").unwrap_err().0, INVALID_PARAMS);
+        assert_eq!(
+            req_str(&json!({ "question": "  " }), "question")
+                .unwrap_err()
+                .0,
+            INVALID_PARAMS
+        );
         assert_eq!(opt_str(&json!({ "ds": "" }), "ds"), None);
-        assert_eq!(opt_str(&json!({ "ds": " up_d1 " }), "ds").as_deref(), Some("up_d1"));
+        assert_eq!(
+            opt_str(&json!({ "ds": " up_d1 " }), "ds").as_deref(),
+            Some("up_d1")
+        );
     }
 
     /// 脱敏已收敛为「日志只记 key_len」：`mask_key` 已删（前 4 位也是 key 的一部分）。
@@ -736,7 +889,10 @@ mod tests {
     fn key_masking_helper_is_gone() {
         let src = include_str!("mcp_api.rs");
         let code = src.split("#[cfg(test)]").next().unwrap_or("");
-        assert!(!code.contains("fn mask_key"), "脱敏函数加回来 = 前缀泄露面加回来");
+        assert!(
+            !code.contains("fn mask_key"),
+            "脱敏函数加回来 = 前缀泄露面加回来"
+        );
     }
 
     /// 鉴权的三条分支（本文件唯一的 HTTP 状态码来源）
@@ -749,17 +905,29 @@ mod tests {
         let (code, Json(body)) = authorize(&keys(), &hdr("k-wrongwrongwrong")).unwrap_err();
         assert_eq!(code, StatusCode::UNAUTHORIZED);
         let body = body.to_string();
-        assert!(!body.contains("k-wrongwrongwrong") && !body.contains("k-abcdef123456"), "{body}");
+        assert!(
+            !body.contains("k-wrongwrongwrong") && !body.contains("k-abcdef123456"),
+            "{body}"
+        );
         // 缺头 → 401（不是 500）
         assert_eq!(
             authorize(&keys(), &HeaderMap::new()).unwrap_err().0,
             StatusCode::UNAUTHORIZED
         );
         // 匹配 → login_name
-        assert_eq!(authorize(&keys(), &hdr("k-abcdef123456")).unwrap(), "zhangsan");
+        assert_eq!(
+            authorize(&keys(), &hdr("k-abcdef123456")).unwrap(),
+            "zhangsan"
+        );
         // 差一位 / 前缀相同都不许命中（常量时间比较的行为由 auth 侧单测钉，这里钉接线没丢）
-        assert_eq!(authorize(&keys(), &hdr("k-abcdef123457")).unwrap_err().0, StatusCode::UNAUTHORIZED);
-        assert_eq!(authorize(&keys(), &hdr("k-abcdef12345")).unwrap_err().0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            authorize(&keys(), &hdr("k-abcdef123457")).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            authorize(&keys(), &hdr("k-abcdef12345")).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     /// 🔴 比较链必须复用 `auth::api_key_login`（常量时间）：`HashMap::get` 的哈希早退
@@ -775,9 +943,18 @@ mod tests {
             .split("\n}\n")
             .next()
             .unwrap();
-        assert!(body.contains("crate::auth::api_key_login"), "key 比较必须走常量时间版：{body}");
-        assert!(!body.contains("keys.get("), "API key 查找不许用 HashMap::get（哈希早退泄露时序）：{body}");
-        assert!(!body.contains("mask_key"), "失败日志不回显 key 前缀：{body}");
+        assert!(
+            body.contains("crate::auth::api_key_login"),
+            "key 比较必须走常量时间版：{body}"
+        );
+        assert!(
+            !body.contains("keys.get("),
+            "API key 查找不许用 HashMap::get（哈希早退泄露时序）：{body}"
+        );
+        assert!(
+            !body.contains("mask_key"),
+            "失败日志不回显 key 前缀：{body}"
+        );
         assert!(body.contains("key_len"), "失败日志只记长度：{body}");
     }
 
@@ -804,14 +981,21 @@ mod tests {
     ///（关键字与字段值两侧都不敏感，调用方不必记得先 lower —— 契约钉在这里）
     #[test]
     fn node_matches_any_metadata_field_case_insensitively() {
-        let table = json!({"kind": "table", "table": "DWS_Sale", "comment": "销售汇总", "domain": "销售"});
-        assert!(node_matches(&table, "dws_"), "表名命中（字段值大小写不敏感）");
+        let table =
+            json!({"kind": "table", "table": "DWS_Sale", "comment": "销售汇总", "domain": "销售"});
+        assert!(
+            node_matches(&table, "dws_"),
+            "表名命中（字段值大小写不敏感）"
+        );
         assert!(node_matches(&table, "dws_sale"), "完整表名");
         assert!(node_matches(&table, "销售汇总"), "注释命中");
         assert!(node_matches(&table, "销售"), "域命中");
         assert!(!node_matches(&table, "门店"), "全不中");
         let column = json!({"kind": "column", "table": "dws_sale", "column": "StoreCode", "comment": "客户编码"});
-        assert!(node_matches(&column, "storecode"), "列名命中（字段值大小写不敏感）");
+        assert!(
+            node_matches(&column, "storecode"),
+            "列名命中（字段值大小写不敏感）"
+        );
         assert!(node_matches(&column, "客户"), "列注释命中");
         // 缺字段不 panic（节点 JSON 形状由 load_nodes 保证，这里钉容错）
         assert!(!node_matches(&json!({"kind": "table"}), "x"));
@@ -821,10 +1005,17 @@ mod tests {
     #[test]
     fn opt_limit_defaults_and_clamps() {
         assert_eq!(opt_limit(&json!({}), "limit", 50, 1, 200), 50);
-        assert_eq!(opt_limit(&json!({"limit": "abc"}), "limit", 50, 1, 200), 50, "非数字按缺省");
+        assert_eq!(
+            opt_limit(&json!({"limit": "abc"}), "limit", 50, 1, 200),
+            50,
+            "非数字按缺省"
+        );
         assert_eq!(opt_limit(&json!({"limit": 5}), "limit", 50, 1, 200), 5);
         assert_eq!(opt_limit(&json!({"limit": 0}), "limit", 50, 1, 200), 1);
         assert_eq!(opt_limit(&json!({"limit": -9}), "limit", 50, 1, 200), 1);
-        assert_eq!(opt_limit(&json!({"limit": 99999}), "limit", 50, 1, 500), 500);
+        assert_eq!(
+            opt_limit(&json!({"limit": 99999}), "limit", 50, 1, 500),
+            500
+        );
     }
 }

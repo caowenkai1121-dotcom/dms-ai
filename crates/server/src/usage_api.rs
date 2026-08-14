@@ -484,8 +484,7 @@ async fn llm_samples(st: &AppState, excerpts: &[(&str, Vec<String>)]) -> Option<
         }
         user.push('\n');
     }
-    let mut req = ChatRequest::text(ModelTier::Fast, SYSTEM, &user, Some(0.1));
-    req.max_tokens = Some(400);
+    let req = ChatRequest::text(ModelTier::Fast, SYSTEM, &user, Some(0.1));
     let reply = match tokio::time::timeout(LLM_TIMEOUT, st.llm.chat(req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {

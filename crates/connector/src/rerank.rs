@@ -277,3 +277,11 @@ mod tests {
         assert!(dbg.contains("***"), "{dbg}");
     }
 }
+
+/// 熔断是否**正在**生效。与 `EmbedClient::cooling` 同一条纪律：
+/// `/api/health` 要能回答「这一路服务通不通」，而不是只回答「库里有没有向量列」。
+impl RerankClient {
+    pub fn cooling(&self) -> bool {
+        now() < self.cooldown_until.load(Ordering::Relaxed)
+    }
+}

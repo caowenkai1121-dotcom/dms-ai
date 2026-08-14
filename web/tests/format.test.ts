@@ -3,7 +3,7 @@
 // 放在 tests/ 而非 src/：tsconfig 只 include src/**，别让应用侧 vue-tsc 去收 node:test 的类型。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { compress, fmt, semanticForLabel, toNum } from '../src/format.ts'
+import { compress, fmt, isGrossMarginLabel, semanticForLabel, toNum } from '../src/format.ts'
 
 test('toNum 千分位只认合法分组，畸形串判非数值（不静默洗白）', () => {
   assert.equal(toNum('1,234.5'), 1234.5)
@@ -74,4 +74,16 @@ test('fmt：纯空白串归空', () => {
   assert.equal(fmt('   ', 'none'), '')
   assert.equal(fmt('', 'money'), '')
   assert.equal(fmt(null, 'count'), '')
+})
+
+test('毛利率判定：全仓一份，宽判据覆盖变体', () => {
+  // 变体必须全命中：三处各写一份时，窄判据让图表 ×100、表格不 ×100，
+  // 同一屏 19.6% vs 0.2%，而 SQL/行数/口径全对，没有判据会红
+  for (const label of ['毛利率', '销售毛利率', '平均毛利率', '毛利率（%）', '品类毛利率', ' 毛利率 ']) {
+    assert.equal(isGrossMarginLabel(label), true, label)
+  }
+  // 其它「率」不是 0~1 ratio 合同，×100 就是错数
+  for (const label of ['汇率', '增长率', '毛利额', '销售额']) {
+    assert.equal(isGrossMarginLabel(label), false, label)
+  }
 })

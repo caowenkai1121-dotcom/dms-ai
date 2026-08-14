@@ -59,28 +59,8 @@ pub const CALIBER_ROUNDS: usize = 2;
 /// 在 1.97 上不是 dyn 兼容的。
 pub type Fix<'a> = BoxFut<'a, anyhow::Result<Option<String>>>;
 
-/// schema 校正 + 七件确定性校正的**形状**。实现仍在 `server/src/corrector.rs`（`schema_check(pg,ds,sql)` /
-/// `fix_group_by(sql)` / `correct_agg(pg,ds,question,sql)` / `correct_caliber(..)` /
-/// `correct_value(pg,ds,sql)`，`pg`/`ds`/`question` 三个都在 `cx` 里），wire 那步在 server 侧写 `impl`。
-/// 顺序即行为，见 `correct_chain`；`fix_group_by` 同步是因为它本来就纯 AST、零 IO。
-pub trait Correctors: Send + Sync {
-    /// 字段白名单校验 → `Some(hint)` = 有幻觉列，携真实列清单去自修（**不占 repair 预算**）
-    fn schema_check<'a>(&'a self, cx: &'a AskCtx<'a>, sql: &'a str) -> Fix<'a>;
-    /// 【A12】GROUP BY 有、SELECT 没有 ⇒ 补分类轴列（先于 `fix_group_by`：投影是它的输入）
-    fn fix_select_fields(&self, sql: &str) -> Option<String>;
-    /// 【A12】投影逐字重复项只留第一份（不同别名的不碰 —— ORDER BY 可能指着它）
-    fn dedup_select_fields(&self, sql: &str) -> Option<String>;
-    fn fix_group_by(&self, sql: &str) -> Option<String>;
-    fn correct_agg<'a>(&'a self, cx: &'a AskCtx<'a>, sql: &'a str) -> Fix<'a>;
-    fn correct_caliber<'a>(&'a self, cx: &'a AskCtx<'a>, sql: &'a str) -> Fix<'a>;
-    fn correct_value<'a>(&'a self, cx: &'a AskCtx<'a>, sql: &'a str) -> Fix<'a>;
-    /// 【A12】只有上界补下界（防全表扫；**缺时间补默认窗**是 X3 裁决禁止的，不是这条）
-    fn fix_time_lower_bound(&self, sql: &str) -> Option<String>;
-}
-
 /// LLM 路径的外部依赖（见文件头「两个入参化的依赖」）。
 pub struct LlmDeps<'a> {
-    pub correctors: &'a dyn Correctors,
     pub embed: &'a EmbedClient,
     /// 自一致采样数（SuperSonic SC）。**默认 1＝与本字段引入前逐字等价**：
     /// 1 时不多一次 LLM 调用、不多一次取数、不多一个分支（`run_llm` 直接返回第一次的结果）。
@@ -305,20 +285,28 @@ pub async fn run_llm(cx: &AskCtx<'_>, d: &LlmDeps<'_>) -> anyhow::Result<AskResu
     // （含经验命中计数 +1 这类遥测副作用）——只多日志与读，不改任何答案语义。
     // SC 的多次采样共享这**一次**召回：采样间的差异只该来自温度，不来自材料抖动，
     // 原来每次采样重召回一遍是把同样的十几条 IO 重复付 N 次。
-    let gate = crate::ask::need_intent_reply(&**cx.llm, cx.on_usage, cx.pg, cx.ds, cx.question, cx.t0);
     let gathered = gather::gather(cx, d.embed);
-    let (gate, gathered) = tokio::join!(gate, gathered);
+    let gate = crate::ask::prepared_data_safety_reply(cx.question, cx.t0);
     if let Some(r) = gate {
         // 反问成立时召回材料整份丢弃 —— 但 gather 若是 Err，那是真实故障（embed/PG 挂了），
         // 不能随材料一起静默蒸发（反问答案不读材料，这次回答不受影响）
-        if let Err(e) = &gathered {
+        if let Err(e) = &gathered.await {
             tracing::warn!(err = %e, "意图反问成立，召回材料的错误随材料一并丢弃");
         }
         return Ok(r);
     }
-    let gathered = gathered?;
+    let gathered = gathered.await?;
+    // 本轮召回降级 → 口径卡缺席时给结果挂标注（trust 随之降 review）。
+    // 用闭包而不是在每个 return 处手抄：三条返回路径少接一条，就是一次「自信的错答」。
+    let gap_note = |r: &mut AskResult| {
+        if let Some(note) = caliber_gap_note(&gathered.0.degraded) {
+            note_onto(r, note);
+        }
+    };
     if d.sc_samples <= 1 {
-        return run_once(cx, d, TEMP_FIRST, &gathered).await;
+        let mut r = run_once(cx, d, TEMP_FIRST, &gathered).await?;
+        gap_note(&mut r);
+        return Ok(r);
     }
     let need = majority_need(d.sc_samples);
     let mut got: Vec<AskResult> = vec![];
@@ -350,17 +338,45 @@ pub async fn run_llm(cx: &AskCtx<'_>, d: &LlmDeps<'_>) -> anyhow::Result<AskResu
             let noted: Vec<bool> = got.iter().map(|r| r.caliber_note.is_some()).collect();
             let w = clean_pick(&prints, &noted, w);
             tracing::info!(samples = i + 1, winner = w, "SC 提前收工（已达多数派）");
-            return Ok(got.swap_remove(w));
+            let mut r = got.swap_remove(w);
+            gap_note(&mut r);
+            return Ok(r);
         }
     }
     let mut first = got.swap_remove(0);
     tracing::warn!(samples = prints.len(), "SC 无多数派，返回首次结果并标注不可信");
-    let note = no_majority_note(d.sc_samples, &prints);
-    first.caliber_note = Some(match first.caliber_note.take() {
+    note_onto(&mut first, no_majority_note(d.sc_samples, &prints));
+    gap_note(&mut first);
+    Ok(first)
+}
+
+/// 口径卡缺席的用户可见标注（纯函数，故单测可钉文案）。
+///
+/// 🔴 这是「答错了还很自信」的唯一结构性来源：PG 抖一下 → 指标卡缺席 → LLM 拿不到
+/// 销售额的口径表达式 / 时间列 / 去重键 → 数字按错口径算出来，而收据照样 verified/high。
+/// 走既有的 `caliber_note` 通道（`attach_trust` 的 risk 判据读它，trust 自动降 review、
+/// checks 多一行）——**不新造字段、不新造状态**。
+fn caliber_gap_note(degraded: &[&'static str]) -> Option<String> {
+    let gaps: Vec<&str> = degraded
+        .iter()
+        .copied()
+        .filter(|item| crate::gather::CALIBER_CARDS.contains(item))
+        .collect();
+    if gaps.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "本轮业务口径卡缺席（{}），数字未经口径素材约束 —— 请先核对口径再用。",
+        gaps.join("；")
+    ))
+}
+
+/// 把一条标注并进结果（既有标注保留，换行相接）。两处调用共用，措辞不分叉。
+fn note_onto(r: &mut AskResult, note: String) {
+    r.caliber_note = Some(match r.caliber_note.take() {
         Some(old) => format!("{old}\n{note}"),
         None => note,
     });
-    Ok(first)
 }
 
 /// 多数派门槛（**严格过半**：3→2，5→3；偶数也必须过半，不许 2/4 就算多数派）。
@@ -681,6 +697,52 @@ impl Round<'_> {
         if self.caliber_round(st, n).await? {
             return Ok(None);
         }
+        // 结构化意图执行闸：提示词只是请求，真正防静默缩窄必须在 SQL 入闸前检查。
+        // 首轮缺槽走既有 repair；第二轮仍缺则 fail-closed，绝不执行一个范围更宽的查询。
+        let coverage =
+            crate::intent::sql_coverage(self.cx.intent, &st.candidate, self.cx.source.dialect());
+        // 两级：硬阻断（用户槽位被删/歧义/结构上证不了）走 repair→fail-closed；
+        // 软降级（证不出来但没有删槽证据）照常执行，收据由 `attach_intent_summary`
+        // 重算同一份 coverage 后降到 review —— 结果给用户，可信边界说清楚。
+        if coverage.blocking() {
+            let err = format!("SQL 未覆盖结构化意图槽位：{}", coverage.issue_text());
+            log(self.cx, "intent-coverage", &err).await;
+            if n == 0 {
+                self.repair_round(st, &err)
+                    .await
+                    .map_err(|re| repair_fail(&err, re))?;
+                return Ok(None);
+            }
+            // 🔴 回炉之后仍然覆盖不了 → **出卡，不是抛错**（2026-08-14 回归实测）。
+            //
+            // fail-closed 的语义一个字不改：这条 SQL **不执行**。变的只是用户看到什么 ——
+            // 「本月各品牌销售额」（品牌不在默认销售事实里）原来给的是
+            // `Error: SQL 未覆盖结构化意图槽位：缺失:breakdown:品牌`：CLI 非 0 退出、HTTP 422、
+            // 前端一个红条。而这本来是**系统最该说清楚的一类回答**：这个维度我没有可信来源，
+            // 不是出故障了。
+            //
+            // 用与「意图不明」同一张卡（`intent_reply`）：它的文案纪律就是「不出现内部措辞」，
+            // 而 `caliber_note` 那一格正是用来说明「这个答案有缺陷/为什么给不了」的。
+            let mut card = crate::ask::intent_reply(self.cx.question, self.cx.t0, vec![]);
+            card.caliber_note = Some(format!(
+                "这个问题里有我无法用可信数据源证明的部分（{}）—— 与其给一个看起来对的数字，                 不如说清楚：换个已接入的口径或维度再问一次。",
+                coverage.issue_text()
+            ));
+            return Ok(Some(card));
+        }
+        if coverage.needs_review() {
+            // 首轮先给 repair 一次机会把证据补进 SQL（不占 fail-closed 语义）；
+            // 二轮仍证不出就带着 review 收据放行。
+            let note = format!("SQL 未能证明部分槽位：{}", coverage.issue_text());
+            log(self.cx, "intent-coverage", &note).await;
+            if n == 0 {
+                self.repair_round(st, &note)
+                    .await
+                    .map_err(|re| repair_fail(&note, re))?;
+                return Ok(None);
+            }
+            tracing::warn!(%note, "覆盖闸降级放行：结果照常返回，收据标 review");
+        }
         // 先落地成局部再 match：`st` 后面要按可变借用改（`repair_round`），闸门的入参借的是它的字段。
         let gated = gate_on(
             self.cx.p,
@@ -711,7 +773,10 @@ impl Round<'_> {
         };
         // 预翻译验证（SuperSonic 解析期 dry-run）：EXPLAIN 毫秒级验证列名/语法/类型，比等真执行
         // 报错更早（大表可能扫十几秒才失败，白占生产库）。**只对首轮做**（次轮已是 repair 结果）。
-        // `Ok(Some(_))` 才是「数据库明确判定 SQL 有问题」；`Ok(None)`=抖动/超时、`Err`=连不上池
+        // `Ok(Some(_))` = 数据库明确判定 SQL 有问题**或**计划显示全分区扫描
+        //（`source::scan_verdict`：语法合法但要扫全表的查询，此前一路跑到 EXEC_TIMEOUT
+        // 才失败 —— 用户等满半分钟拿到一句「超时」，而计划文本这一次往返已经付过了）；
+        // `Ok(None)`=抖动/超时、`Err`=连不上池
         // 一律不改写（抖动触发的改写可能把对的 SQL 改坏）。
         // 两种「没判成」都留 debug（不升级 warn 免噪音）：「预检层今天到底跑没跑」必须可证伪。
         if n == 0 {
@@ -818,7 +883,9 @@ impl Round<'_> {
                 );
                 if rs.rows.is_empty() {
                     // 0 行也记录（攒数据找「中文名直写/口径过严」模式，不触发复盘——0 行常常是正确答案）
-                    exemplar::log_failure_traced(cx.pg, "zero-rows", cx.question, scoped.wire(), "", &cx.trace_id).await;
+                    // 同 exec-error 那条：素材用闸门前候选，不带行级权限条件
+                    // （`meta.failure_log` 会被复盘读走，教训是 ds 级共享的）
+                    exemplar::log_failure_traced(cx.pg, "zero-rows", cx.question, &st.candidate, "", &cx.trace_id).await;
                 } else {
                     // 【判官实测·问题 1②】合同绕开降级（LLM 路径出口）：问句点的是已验证合同的
                     // 指标，最终 SQL 却引了同主题的 ODS 原始表、没引合同表 → 附口径说明。
@@ -840,12 +907,22 @@ impl Round<'_> {
                 // 改写它只会引入新错。素材用 `candidate`（闸门前原文）—— wire() 会把行级权限
                 // 条件写进经验，而经验是 ds 级共享的（跨用户泄漏面，与语料同一条防线）。
                 // embedding 留 NULL 由 A9 自愈补；同问句去重在 save_memory 里。
-                if st.route == "llm+repair" && !rs.rows.is_empty() {
-                    let (pg, ds, q, fixed) = (
+                // 🔴 与十行上的语料沉淀**共用同一个判据**：`worth_learning` 里 `st.note.is_some()`
+                // 即否决（口径复核未过 / 绕开合同的 SQL 不许进 few-shot）。此前这里只看
+                // 「route 对 + 有行」，于是一条挂着 caliber_note（数字明示不可信）的修正版 SQL
+                // 照样落 meta.memory，再由 gather 的向量召回进**每一个用户**的 prompt。
+                // 同一个文件里两条学习路径两种诚实度（2026-08-13 审计）。
+                if st.route == "llm+repair" && !rs.rows.is_empty() && worth_learning(st, &rs) {
+                    // 归属人：自动蒸馏只进**个人**经验层（升格公有走人工复核）
+                    // 批次号 = 本轮 `trace_id`：粒度就是「一轮问答」，管理员据此撤回这一轮学到的东西
+                    let (pg, ds, login, q, fixed, batch, conv) = (
                         cx.pg.clone(),
                         cx.ds.to_string(),
+                        cx.p.login_name.clone(),
                         cx.question.to_string(),
                         st.candidate.clone(),
+                        cx.trace_id.clone(),
+                        cx.conv_id.clone(),
                     );
                     tokio::spawn(async move {
                         let content =
@@ -853,7 +930,7 @@ impl Round<'_> {
                         // 蒸馏失败零痕迹是排障盲区（写 PG 挂了与「没东西可学」同形）；
                         // warn 不传播 —— 蒸馏是附加动作，不许拖死主路
                         if let Err(e) = dms_semantic::registry::memory::save_memory(
-                            &pg, &ds, "", "review", &q, &content,
+                            &pg, (&batch, &login), &ds, &login, &conv, "review", &q, &content,
                         )
                         .await
                         {
@@ -882,13 +959,35 @@ impl Round<'_> {
             Err(e) => {
                 // 引擎 C 失败复盘：记录 + 异步 LLM 复盘产出候选教训（候选态不召回，复核启用才生效）
                 let err = e.to_string();
-                exemplar::log_failure_traced(cx.pg, "exec-error", cx.question, scoped.wire(), &err, &cx.trace_id).await;
-                let llm = Arc::clone(cx.llm);
-                let (pg, ds, q) = (cx.pg.clone(), cx.ds.to_string(), cx.question.to_string());
-                let sql = scoped.wire().to_string();
-                tokio::spawn(async move {
-                    crate::review::review_failure(llm.as_ref(), &pg, &ds, &q, &sql, &err).await;
-                });
+                // 🔴 失败素材用**闸门前**的候选 SQL，不是 `scoped.wire()`。
+                // `wire()` 带着本轮注入的行级权限条件（这个用户的客户编码/员工 ID 集合），
+                // 而 `meta.pitfall` 的教训是 **ds 级共享**的、还要进别人的 prompt ——
+                // 存注入后 SQL ＝ 把一个人的权限集合泄漏给全员，并教会模型把权限条件写进 SQL。
+                // 与 AX118 修的 HITL sql-edit 同一条防线（F6 那族）。
+                exemplar::log_failure_traced(cx.pg, "exec-error", cx.question, &st.candidate, &err, &cx.trace_id).await;
+                // 【失败经验读回】同一类错第 1 次只落日志，第 2 次起才惊动模型复盘 ——
+                // 一次偶发（超时/抖动）本来就不该沉淀成教训，而自动日报那种一天 7 次的重复
+                // 失败此前会起 7 次全量 fast 复盘，产出的还是同一条候选教训（去重在落库那步，
+                // 白烧的是模型调用）。取不到次数按 0 处理 = 退回照旧复盘的老行为。
+                let streak = dms_semantic::registry::failure::failure_streak(
+                    cx.pg, cx.ds, "exec-error", &err, 7,
+                )
+                .await;
+                if streak < dms_semantic::registry::failure::REVIEW_STREAK {
+                    tracing::info!(streak, "首次遇到这类执行错误 → 只记日志，不起复盘");
+                } else {
+                    let llm = Arc::clone(cx.llm);
+                    let (pg, ds, q) = (cx.pg.clone(), cx.ds.to_string(), cx.question.to_string());
+                    let sql = st.candidate.clone();
+                    // 批次号 = 本轮 trace_id（同经验蒸馏那条）：复盘产出的教训属于这一轮
+                    let (batch, actor) = (cx.trace_id.clone(), cx.p.login_name.clone());
+                    tokio::spawn(async move {
+                        crate::review::review_failure(
+                            llm.as_ref(), (&batch, &actor), &pg, &ds, &q, &sql, &err,
+                        )
+                        .await;
+                    });
+                }
                 Err(e.into())
             }
         }
@@ -908,7 +1007,8 @@ impl Round<'_> {
     /// 【A10】沉淀连当轮快照（schema 段 + 口径卡）一起存 —— 历史样例带得回当时的上下文。
     async fn save_exemplar(&self, candidate: &str, snapshot: &(String, String)) {
         let (cx, d) = (self.cx, self.d);
-        if !exemplar::save_with_context(cx.pg, cx.ds, cx.question, candidate, &snapshot.0, &snapshot.1).await {
+        let who = (cx.trace_id.as_str(), cx.p.login_name.as_str());
+        if !exemplar::save_with_context(cx.pg, who, cx.ds, cx.question, candidate, &snapshot.0, &snapshot.1).await {
             // false 有两种含义：已有同问句语料（`save` 靠 NOT EXISTS 去重 → 不重复复核、
             // 不重算向量，是刻意）**或 PG 写失败**（`save_with_context` 对错误 `unwrap_or(false)`）——
             // 后者只是本轮少一次复核/向量回写，留 debug 可证伪，不升级 warn
@@ -918,8 +1018,10 @@ impl Round<'_> {
         let llm = Arc::clone(cx.llm);
         let (pg, ds, q) = (cx.pg.clone(), cx.ds.to_string(), cx.question.to_string());
         let (sql, embed) = (candidate.to_string(), d.embed.clone());
+        // 与本轮沉淀同一个批次号（trace_id）：一次问答学到的东西整批可撤
+        let (batch, actor) = (cx.trace_id.clone(), cx.p.login_name.clone());
         tokio::spawn(async move {
-            crate::review::review_exemplar(llm.as_ref(), &pg, &ds, &q, &sql).await;
+            crate::review::review_exemplar(llm.as_ref(), (&batch, &actor), &pg, &ds, &q, &sql).await;
             if let Some(v) = embed.embed_query(&q).await {
                 exemplar::set_embedding(&pg, &ds, &q, &to_pgvector(&v)).await;
             }
@@ -1114,7 +1216,7 @@ fn contract_overlap_note(cx: &AskCtx<'_>, sql: &str) -> Option<String> {
 /// **在循环外、不占 repair 预算**：它判的是「这个列名根本不存在」，与执行失败不是同一类问题。
 async fn schema_fix(cx: &AskCtx<'_>, d: &LlmDeps<'_>, st: &mut State) {
     // 【A13】Err 分支同样不许静默（与 `correct_chain` 的三处同一条纪律）
-    let hint = match d.correctors.schema_check(cx, &ensure_limit(&st.sql, cx.source.dialect())).await {
+    let hint = match dms_semantic::correct::schema::schema_check(cx.pg, cx.ds, &ensure_limit(&st.sql, cx.source.dialect())).await {
         Ok(Some(hint)) => hint,
         Ok(None) => return,
         Err(e) => {
@@ -1138,26 +1240,25 @@ async fn schema_fix(cx: &AskCtx<'_>, d: &LlmDeps<'_>, st: &mut State) {
 /// 两个投影级的在最前（`fix_group_by` 读投影）；时间下界在最后（WHERE 级，
 /// 让 caliber/value 先补完口径条件再统一补下界）。每件命中都落 `correction_log`。
 async fn correct_chain(cx: &AskCtx<'_>, d: &LlmDeps<'_>, mut sql: String) -> String {
-    let c = d.correctors;
-    // 【A12】SelectCorrector：GROUP BY 有、SELECT 没有 ⇒ 补分类轴列
-    if let Some(fixed) = c.fix_select_fields(&sql) {
+        // 【A12】SelectCorrector：GROUP BY 有、SELECT 没有 ⇒ 补分类轴列
+    if let Some(fixed) = dms_semantic::correct::groupby::fix_select_fields(&sql) {
         log(cx, "select-fields-fix", &format!("补分组列进投影：{} → {}", clip(&sql, 120), clip(&fixed, 120))).await;
         sql = fixed;
     }
     // 【A12】removeSameFieldFromSelect：投影逐字重复项只留第一份
-    if let Some(fixed) = c.dedup_select_fields(&sql) {
+    if let Some(fixed) = dms_semantic::correct::groupby::dedup_select_fields(&sql) {
         log(cx, "dedup-select-fix", &format!("去投影重复列：{} → {}", clip(&sql, 120), clip(&fixed, 120))).await;
         sql = fixed;
     }
     // GroupByCorrector：漏 GROUP BY 确定性补全
-    if let Some(fixed) = c.fix_group_by(&sql) {
+    if let Some(fixed) = dms_semantic::correct::groupby::fix_group_by(&sql) {
         log(cx, "groupby-fix", &format!("补 GROUP BY：{} → {}", clip(&sql, 120), clip(&fixed, 120))).await;
         sql = fixed;
     }
     // AggCorrector（correctAggFunction）：命中指标的聚合列归一到注册表默认聚合
     // 【A13】Err 分支必须留痕：校正器炸了 SQL 保持上一版继续走 —— 静默就是
     // 「校正器集体失灵」与「无事发生」在日志里同形（与 gather 六路同一条纪律）。
-    match c.correct_agg(cx, &sql).await {
+    match dms_semantic::correct::agg::correct_agg(cx.pg, cx.ds, cx.question, &sql).await {
         Ok(Some(fixed)) => {
             log(cx, "agg-fix", &format!("聚合归一：{} → {}", clip(&sql, 120), clip(&fixed, 120))).await;
             sql = fixed;
@@ -1167,7 +1268,7 @@ async fn correct_chain(cx: &AskCtx<'_>, d: &LlmDeps<'_>, mut sql: String) -> Str
     }
     // 口径过滤补全（指标 filter 恒生效）：漏注册表 scope_filter 则补
     // （评测抓获：问「本月有多少个订单」LLM 漏有效订单过滤，数字虚高 17%）
-    match c.correct_caliber(cx, &sql).await {
+    match dms_semantic::correct::caliber::correct_caliber(cx.pg, cx.ds, cx.question, &sql).await {
         Ok(Some(fixed)) => {
             log(cx, "caliber-fix", &format!("口径补全：{} → {}", clip(&sql, 120), clip(&fixed, 120)))
                 .await;
@@ -1177,7 +1278,7 @@ async fn correct_chain(cx: &AskCtx<'_>, d: &LlmDeps<'_>, mut sql: String) -> Str
         Err(e) => tracing::warn!("caliber-fix 校正器失败（保持上一版 SQL 继续）: {e}"),
     }
     // ValueLinker（值链接）：编码列中文名直写确定性换码（写中文名必返 0 行的真坑）
-    match c.correct_value(cx, &sql).await {
+    match dms_semantic::correct::value::correct_value(cx.pg, cx.ds, &sql).await {
         Ok(Some(fixed)) => {
             log(cx, "value-fix", &format!("码值换写：{} → {}", clip(&sql, 120), clip(&fixed, 120)))
                 .await;
@@ -1187,7 +1288,7 @@ async fn correct_chain(cx: &AskCtx<'_>, d: &LlmDeps<'_>, mut sql: String) -> Str
         Err(e) => tracing::warn!("value-fix 校正器失败（保持上一版 SQL 继续）: {e}"),
     }
     // 【A12】TimeCorrector 半边：只有上界补下界（防全表扫；**缺时间补默认窗**是 X3 禁止的）
-    if let Some(fixed) = c.fix_time_lower_bound(&sql) {
+    if let Some(fixed) = dms_semantic::correct::groupby::fix_time_lower_bound(&sql) {
         log(cx, "time-lower-bound-fix", &format!("补时间下界：{} → {}", clip(&sql, 120), clip(&fixed, 120))).await;
         sql = fixed;
     }
@@ -1237,7 +1338,7 @@ async fn generate_sql_for(
     // 【A10】同构快照（schema 段 + side_info 口径卡）：语料沉淀时一起进 `meta.sql_exemplar`
     let snapshot = (pc.schema.clone(), prompt::side_info_of(pc));
     let system = prompt::build_system_prompt(cx.p, &prompt::today_cn(), cx.source.dialect());
-    let user = prompt::build_user_prompt(pc, question);
+    let user = crate::intent::inject_contract(prompt::build_user_prompt(pc, question), cx.intent);
     // 计时：公网 LLM 往返是这条链上最大的一段，逐次留痕（`ms` 含连接与生成全程）
     let t_llm = Instant::now();
     let resp = chat_precise_at(cx, &system, &user, temperature).await?;
@@ -1258,7 +1359,10 @@ pub async fn repair(
 ) -> anyhow::Result<String> {
     let schema = gather::gather_all_cards(cx, d.embed).await?;
     let dialect = cx.source.dialect();
-    let user = prompt::build_repair_prompt(&schema, cx.question, bad_sql, error, dialect);
+    let user = crate::intent::inject_contract(
+        prompt::build_repair_prompt(&schema, cx.question, bad_sql, error, dialect),
+        cx.intent,
+    );
     let system = prompt::build_system_prompt(cx.p, &prompt::today_cn(), dialect);
     // 🔴 自修用**更高的温度**：0.1 的重试就是同一个错误再来一遍（见 `TEMP_RETRY`）
     let resp = chat_precise_at(cx, &system, &user, TEMP_RETRY).await?;
@@ -1304,9 +1408,10 @@ async fn chat_precise_at(
     reply.content.ok_or_else(|| LlmError::MissingContent.into())
 }
 
-/// `correction_log` 的唯一落点。kind 全清单（16 个）：本文件 13 个字面量
+/// `correction_log` 的唯一落点。kind 全清单（17 个）：本文件 14 个字面量
 /// （`schema-fix`/`select-fields-fix`/`dedup-select-fix`/`groupby-fix`/`agg-fix`/`caliber-fix`/
-/// `value-fix`/`time-lower-bound-fix`/`explain-fail`/`gate-blocked`/`exec-error`/`steer-applied`/`steer-failed`），
+/// `value-fix`/`time-lower-bound-fix`/`intent-coverage`/`explain-fail`/`gate-blocked`/`exec-error`/
+/// `steer-applied`/`steer-failed`），
 /// 加 `guard::Verdict::log_kind()` 给的三个（`caliber-retry`/`caliber-unresolved`/`caliber-grader-error`）。
 /// 少一个＝一类自进化数据静默断供（`correction_kinds_all_present` 守着）。
 async fn log(cx: &AskCtx<'_>, kind: &str, detail: &str) {
@@ -1322,39 +1427,37 @@ fn clip(sql: &str, n: usize) -> String {
 
 /// Router 末位的 `llm` 成员（`ROUTER_ORDER` 的第 5 位）。`accept` 恒真 —— 它是**兜底**：
 /// 前四位都没接住时必须有人出手，返回 `Ok(None)` 会让整轮问答无声无息地没有答案。
-pub struct LlmAnswerer<'a> {
+pub struct LlmAnswerer {
     /// 实例式（connector 侧禁全局单例）；`Clone` 共享熔断状态，wire 侧传 `AppState` 那一份的克隆。
     embed: EmbedClient,
-    /// 借用而非 `Box`：Router 是每次问答现组的，五个成员都活在这一轮里，
-    /// 为兜底成员单独要一份 owned 校正器只会逼调用方多做一次装箱。
-    correctors: &'a dyn Correctors,
     /// 自一致采样数（配置项 `sc_samples`，默认 1）
     sc_samples: usize,
 }
 
-impl<'a> LlmAnswerer<'a> {
+impl LlmAnswerer {
     /// `sc_samples` 默认 1（与本参数引入前逐字等价）。构造口只留带参这一个：
     /// 留一个「不带参」的重载就等于留一处会悄悄用默认值的调用点，而这个默认值
     /// 决定要不要多花两次 precise LLM 调用 —— 那种事不该由缺省决定。
-    pub fn borrowed(embed: EmbedClient, correctors: &'a dyn Correctors, sc_samples: usize) -> Self {
-        Self { embed, correctors, sc_samples }
+    /// T8-B3：`Correctors` trait 删除后不再借用任何东西，生命周期参数随之消失
+    /// （D7：唯一实现的 trait 不该存在；校正链现在直调 `dms_semantic::correct::*`）。
+    pub fn borrowed(embed: EmbedClient, sc_samples: usize) -> Self {
+        Self { embed, sc_samples }
     }
 }
 
-impl crate::answerers::Answerer for LlmAnswerer<'_> {
+impl crate::answerers::Answerer for LlmAnswerer {
     fn route(&self) -> &'static str {
         "llm"
     }
 
-    /// 恒真：兜底成员。`accept` 里做门禁的只有 `graph`（unrestricted）与 `cache`（非追问）。
-    fn accept(&self, _cx: &AskCtx<'_>) -> bool {
-        true
+    /// 只有结构化意图合同有效才允许自由生成 SQL；否则由 Router 末端返回用户可理解的澄清卡。
+    fn accept(&self, cx: &AskCtx<'_>) -> bool {
+        cx.intent_attempt.is_data_executable()
     }
 
     fn answer<'a>(&'a self, cx: &'a AskCtx<'a>) -> BoxFut<'a, anyhow::Result<Option<AskResult>>> {
         Box::pin(async move {
             let d = LlmDeps {
-                correctors: self.correctors,
                 embed: &self.embed,
                 sc_samples: self.sc_samples,
             };
@@ -1450,7 +1553,7 @@ mod sc_tests {
             alt_questions: vec![],
         };
         let rows =
-            |r: Vec<Vec<Value>>| RowSet { columns: vec!["x".into()], rows: r, redacted: vec![] };
+            |r: Vec<Vec<Value>>| RowSet { columns: vec!["x".into()], rows: r, redacted: vec![], truncated: false };
         // 正常：有值 + 无口径标注 → 沉淀
         assert!(worth_learning(&st(None), &rows(vec![vec![json!(12)]])));
         // ① 口径复核未通过（答案已挂「不可信」）→ 不沉淀
@@ -1519,6 +1622,35 @@ mod sc_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 失败复盘的两条纪律（2026-08-14）：
+    /// ① 素材必须是**闸门前**候选 SQL —— `scoped.wire()` 带着本轮注入的行级权限条件，
+    ///    而教训是 ds 级共享、还要进别人的 prompt（与 HITL sql-edit 同一条防线）；
+    /// ② 同一类错第 1 次不起复盘 —— 一次偶发不该沉淀成教训，也不该白烧一次 fast 调用。
+    #[test]
+    fn failure_review_uses_pre_gate_sql_and_needs_a_streak() {
+        let src = include_str!("run.rs");
+        // 🔴 扫**全部**落账点：只切一段会漏掉另一处（zero-rows 那条就是这么被漏掉的，
+        // 2026-08-14 这条判据加上的当天就把它抓了出来）。
+        // 只扫生产段：`include_str!` 读的是整份文件，把本判据自己的源码也扫进去会自伤
+        // （断言文案里就写着 `scoped.wire()` 这几个字）。
+        let prod = src.split("
+#[cfg(test)]").next().unwrap();
+        for (i, seg) in prod.split("exemplar::log_failure_traced").enumerate().skip(1) {
+            let call = seg.split(").await").next().unwrap();
+            assert!(!call.contains("scoped.wire()"), "第 {i} 处落账带了注入后 SQL：{call}");
+        }
+        let body = src
+            .split(r#"exemplar::log_failure_traced(cx.pg, "exec-error""#)
+            .nth(1)
+            .expect("exec-error 落账调用没了")
+            .split("Err(e.into())")
+            .next()
+            .unwrap();
+        assert!(body.contains("st.candidate.clone()"), "素材不是闸门前候选：{body}");
+        assert!(body.contains("failure_streak"), "没读失败连续次数：{body}");
+        assert!(body.contains("REVIEW_STREAK"), "连续次数阈值不是共享常量：{body}");
+    }
     use super::*;
 
     /// 【S4】经验蒸馏的接线判据（源码扫描 —— 蒸馏块在 execute 深处，无库测不了）：
@@ -1535,10 +1667,18 @@ mod tests {
         let dpos = body
             .find(concat!("save_", "memory("))
             .expect("execute 里找不到经验蒸馏 —— S4 的写入半掉线了");
-        let block = &body[dpos.saturating_sub(900)..dpos + 200];
+        // 区间从**门本身**锚到写入调用，不用固定窗口：定长窗口每加一行注释就假红一次，
+        // 而且中文注释让 `dpos - N` 的字节减法会切在字符中间直接 panic（长得像判据坏了）。
+        let gpos = body
+            .find(concat!("st.route == \"llm+", "repair\""))
+            .expect("蒸馏门（只在回炉成功时）不见了");
+        assert!(gpos < dpos, "蒸馏门跑到写入之后了：门形同虚设");
+        let block = &body[gpos..dpos];
+        // 🔴 与语料沉淀共用同一个诚实度判据：`st.note.is_some()`（口径复核未过）即否决。
+        // 少了它，一条数字明示不可信的 SQL 会被蒸馏成经验，再喂给每一个用户（2026-08-13 审计）。
         assert!(
-            block.contains(concat!("st.route == \"llm+", "repair\"")),
-            "蒸馏门（只在回炉成功时）被改了：{block}"
+            block.contains("worth_learning(st, &rs)"),
+            "蒸馏没过 worth_learning 闸：不可信的 SQL 会变成全员经验：{block}"
         );
         assert!(
             block.contains("st.candidate.clone()"),
@@ -1612,8 +1752,8 @@ mod tests {
         assert_eq!(outcome(&guard::judge(Ok(&v), 0, CALIBER_ROUNDS)), (None, true));
     }
 
-    /// 🔴 `correction_log` 十六个 kind 一个不少（铁律 1）。少一个＝一类自进化数据静默断供，
-    /// 而那件事没有任何运行时报错 —— 所以用源码守：十三个字面量必须各自出现在本文件的
+    /// 🔴 `correction_log` 十七个 kind 一个不少（铁律 1）。少一个＝一类自进化数据静默断供，
+    /// 而那件事没有任何运行时报错 —— 所以用源码守：十四个字面量必须各自出现在本文件的
     /// `log(...)` 调用里（常量表里那一次之外还得有一次），另三个必须走 `log_kind()` 通道。
     #[test]
     fn correction_kinds_all_present() {
@@ -1626,6 +1766,7 @@ mod tests {
             "caliber-fix",
             "value-fix",
             "time-lower-bound-fix",
+            "intent-coverage",
             "explain-fail",
             "gate-blocked",
             "exec-error",
@@ -1654,7 +1795,11 @@ mod tests {
         assert!(src.contains(exec_call), "首轮执行错误的 exec-error 留痕没了");
         // `LITERALS.len() + 3 == 16` 写成断言是**常量表达式**，永远不可能红（交叉审抓的）。
         // 真正要守的是「清单没被人删条目」，所以断言的是清单长度本身。
-        assert_eq!(LITERALS.len(), 13, "十六个 kind = 这十三个字面量 + guard 的三个");
+        assert_eq!(
+            LITERALS.len(),
+            14,
+            "十七个 kind = 这十四个字面量 + guard 的三个"
+        );
         assert_eq!(guard::KIND_RETRY, "caliber-retry");
         assert_eq!(guard::KIND_UNRESOLVED, "caliber-unresolved");
         assert_eq!(guard::KIND_GRADER_ERROR, "caliber-grader-error");
@@ -1951,4 +2096,51 @@ mod contract_bypass_tests {
         let zero = body.find("zero-rows").expect("零行留痕没了");
         assert!(zero < note, "零行分支必须先于标注分支（空结果不打绕开标注）：{body}");
     }
+    /// 🔴 口径卡缺席必须变成用户看得见的一行 —— 它决定 trust 降不降 review。
+    ///
+    /// 只有**口径类**降级算数：术语/关联图/经验缺席只是素材少，不改口径，
+    /// 拿它们去降 trust 会让「结果不可信」这条警告贬值（用久了就没人看了）。
+    #[test]
+    fn only_caliber_card_gaps_downgrade_the_answer() {
+        assert_eq!(caliber_gap_note(&[]), None);
+        assert_eq!(caliber_gap_note(&["术语召回失败 → 术语卡缺席"]), None, "非口径类不该降级");
+        let note = caliber_gap_note(&["指标召回失败 → 指标卡缺席"]).expect("口径卡缺席必须出标注");
+        assert!(note.contains("口径卡缺席") && note.contains("核对口径"), "{note}");
+        // 两张都缺 → 一条标注里点全，不是两条
+        let both = caliber_gap_note(crate::gather::CALIBER_CARDS).expect("两张都缺也要出");
+        assert!(both.contains("指标卡缺席") && both.contains("维度卡缺席"), "{both}");
+        // 合并不覆盖既有标注
+        let mut r = AskResult::compound(vec![], 0);
+        r.caliber_note = Some("旧标注".into());
+        note_onto(&mut r, "新标注".into());
+        let merged = r.caliber_note.unwrap();
+        assert!(merged.contains("旧标注") && merged.contains("新标注"), "{merged}");
+    }
+
+    /// 🔴 覆盖闸硬阻断 → **出卡，不是抛错**（fail-closed 语义不变：SQL 照样不执行）。
+    ///
+    /// 由来（2026-08-14 回归 E09/B04）：「本月各品牌销售额」——品牌不在默认销售事实里，
+    /// 系统正确地拒绝了，可用户拿到的是 `Error: SQL 未覆盖结构化意图槽位：缺失:breakdown:品牌`：
+    /// CLI 非 0 退出、HTTP 422、前端一条红杠。而这本该是系统**最该说清楚**的一类回答。
+    #[test]
+    fn blocked_coverage_answers_with_a_card_not_an_error() {
+        // 锚点用**生产段独有的那行 format!**：本文件有 8 个 `#[cfg(test)]`，
+        // 按它切只会切到第一个测试模块之前（覆盖闸在更后面），第一版当场红。
+        let src = include_str!("run.rs");
+        let body = src
+            .split(r#"let err = format!("SQL 未覆盖结构化意图槽位"#)
+            .nth(1)
+            .expect("覆盖闸没了")
+            .split("if coverage.needs_review()")
+            .next()
+            .unwrap();
+        assert!(!body.contains("anyhow::bail!"), "又变回抛错了：用户拿到的是一条技术错误串");
+        assert!(body.contains("intent_reply"), "必须复用既有的反问卡（文案纪律在它那里）");
+        assert!(body.contains("caliber_note"), "得说清为什么给不了：{body}");
+        // 首轮仍必须先回炉一次（不许直接出卡，那会少给模型一次改对的机会）
+        assert!(body.contains("self.repair_round(st, &err)"), "首轮回炉不许省");
+        // 绝不能顺手把 SQL 执行掉
+        assert!(!body.contains("self.execute("), "fail-closed 破了：这条 SQL 不许执行");
+    }
+
 }

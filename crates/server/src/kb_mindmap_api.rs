@@ -14,16 +14,20 @@
 //! ## ① 知识导图
 //! - `GET /api/kb/mindmap?space_id=`（`space_id` 缺省＝登录名＝个人空间，同 `/api/kb/docs`）
 //!   → `{ "space_id": "...", "root": { "label": "...", "children": [
-//!       { "label": "...", "children": [ { "label": "...", "doc_id": "..." } ] } ] } }`
-//!   三级定深：根＝空间，一级分支＝目录首段（根目录文档归「未分类」），叶子＝文档。
-//!   骨架按 `folder_path`/文档名**确定性**聚合（排序只依赖数据，不依赖 LLM），
+//!       { "label": "...", "children": [ { "label": "...", "children": [
+//!         { "label": "...", "doc_id": "..." } ] } ] } ] } }`
+//!   不限层级：根＝空间，中间节点＝`folder_path` 的每一段，根目录文档归「未分类」，
+//!   叶子＝文档。骨架按 `folder_path`/文档名**确定性**聚合（排序只依赖数据，不依赖 LLM），
 //!   再让 fast 模型给一级分支改写主题标签；**LLM 失败/超时/答非所问一律回退纯结构骨架，
 //!   不报错**——导图是导航面，目录名本身就是够用的标签。
-//!   结果缓存 `meta.kv['kb_mindmap:{space_id}']`（读写在 server 侧：knowledge 的纪律是不碰
-//!   `meta.*`，SQL 复用 `admin_api::KV_GET_SQL/KV_SET_SQL` 那对口，不复述第三份）。
+//!   同一目录直接文档超过 12 篇时增加“目录→主题→文档”层；主题优先由 fast 模型严格分类，
+//!   模型输出若有漏项、重复或越界则整目录回退到确定性的标题族分组。
+//!   结果缓存 `meta.kv['kb_mindmap:v3:{space_id}']`（读写在 server 侧：knowledge 的纪律是不碰
+//!   `meta.*`，SQL 复用 `admin_api::KV_GET_SQL/KV_SET_SQL` 那对口，不复述第三份）。缓存值内带
+//!   当前空间名 + 文档 id/名称/目录路径的稳定指纹；GET 比较当前指纹后才命中，
+//!   因此上传/删除/移动/改名无需在每条 mutation 路径手工删缓存。
 //!   缓存是**空间级**的：`list_docs` 的可见性过滤内联在 SQL 里，任何通过 `space_readable`
-//!   的 viewer 看到的文档集相同，故缓存对不同读者不泄露差异；文档增删后的新鲜度由
-//!   regenerate 收口（见「遗留风险」）。
+//!   的 viewer 看到的文档集相同，故缓存对不同读者不泄露差异。
 //! - `POST /api/kb/mindmap/regenerate` `{ "space_id": "...", "login_name"?, "role_code"? }`
 //!   → 同上形状。强制重生成并覆盖缓存。**要 `space_writable`**：它改写共享缓存且每次
 //!   都烧 fast LLM 额度，只读授权者不许反复触发（`insight_api` 那条「别让烧 LLM 额度
@@ -74,10 +78,27 @@ const MAX_NAMES_PER_BRANCH: usize = 12;
 const MAX_LABEL_CHARS: usize = 24;
 /// 喂给模型的文档名截断长度（提示词体量闸，与 MAX_NAMES_PER_BRANCH 一族）。
 const MAX_PROMPT_NAME_CHARS: usize = 40;
+/// 单目录超过该值才增加主题层；小目录直接展开更省一次点击。
+const DENSE_DOC_THRESHOLD: usize = 12;
+/// 每个主题的目标体量与硬上限：119 篇会收敛为约 10 个主题，不再形成一条超长文档瀑布。
+const DENSE_GROUP_TARGET: usize = 12;
+const MAX_DENSE_GROUP_DOCS: usize = 16;
+const MAX_DENSE_GROUPS: usize = 12;
+/// 一次分类调用的输入闸；超出预算的目录直接走确定性标题族回退，不拖慢导图。
+const MAX_DENSE_LLM_FOLDERS: usize = 4;
+const MAX_DENSE_LLM_DOCS: usize = 160;
+const MAX_DENSE_PROMPT_NAME_CHARS: usize = 64;
 
 const LABEL_SYSTEM: &str = "你是企业知识库的主题归纳助手。给定若干分组（组名＝目录名，附组内文档名），\
 为每个分组写一个不超过 12 字的主题标签。只输出 JSON 字符串数组，长度与分组数一致、顺序一致，\
 不输出任何其他内容。";
+
+const DENSE_GROUP_SYSTEM: &str =
+    "你是企业知识库的文档分类器。输入包含若干目录及目录内带编号的文档。\
+请按业务主题或文档族分类。只输出 JSON 数组，元素形如\
+{\"folder\":1,\"groups\":[{\"label\":\"主题名\",\"docs\":[1,2]}]}。\
+每个目录输出 2 到 12 组；每个文档编号必须且只能出现一次；不得创造、遗漏或重复编号；\
+每组最多 16 篇，主题名不超过 12 字且同目录内不得重名；不要输出解释、Markdown 或其他字段。";
 
 /// 响应体沿用 `{"error": msg}` 形状（前端只认这一种，同 kb_api）
 fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiErr {
@@ -159,46 +180,364 @@ struct SkelDoc {
     folder_path: String,
 }
 
-/// `meta.kv` 的缓存键：空间级，键形是契约的一部分（单测钉住）。
+/// `meta.kv` 的缓存键：v3 引入密集目录主题层，隔离旧的 v2 平铺缓存。
 fn cache_key(space_id: &str) -> String {
-    format!("kb_mindmap:{space_id}")
+    format!("kb_mindmap:v3:{space_id}")
 }
 
-/// `folder_path` 的首段：`'/'` 或 `'//'` 归根目录（空串），`'/财务/报销'` → `'财务'`。
-fn first_segment(folder_path: &str) -> &str {
-    folder_path.trim_start_matches('/').split('/').next().unwrap_or("")
+/// 导图只依赖空间显示名和文档的这三个结构字段；状态/分块数的后台推进不应让
+/// 导图重烧 LLM。先按内容排序再摘要，使 `list_docs` 返回顺序变化不会伪造失效。
+fn source_fingerprint(space_label: &str, docs: &[SkelDoc]) -> String {
+    fn field(ctx: &mut ring::digest::Context, value: &str) {
+        ctx.update(&(value.len() as u64).to_be_bytes());
+        ctx.update(value.as_bytes());
+    }
+
+    let mut ordered = docs.iter().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| {
+        (&a.doc_id, &a.name, &a.folder_path).cmp(&(&b.doc_id, &b.name, &b.folder_path))
+    });
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    field(&mut ctx, "kb-mindmap-source-v1");
+    field(&mut ctx, space_label);
+    for doc in ordered {
+        field(&mut ctx, &doc.doc_id);
+        field(&mut ctx, &doc.name);
+        field(&mut ctx, &doc.folder_path);
+    }
+    let digest = ctx.finish();
+    let mut out = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
-/// 确定性骨架：分支＝目录首段（根目录文档归「未分类」），分支按段名排序，
-/// 叶子按 `(folder_path, name, doc_id)` 排序。LLM 之后只许改写分支 `label`，
+fn cache_envelope(fingerprint: &str, body: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "fingerprint": fingerprint, "body": body })
+}
+
+fn cached_body(text: &str, fingerprint: &str) -> Option<serde_json::Value> {
+    let cached: serde_json::Value = serde_json::from_str(text).ok()?;
+    if cached.get("fingerprint")?.as_str()? != fingerprint {
+        return None;
+    }
+    let body = cached.get("body")?.clone();
+    body.get("root").is_some().then_some(body)
+}
+
+#[derive(Default)]
+struct FolderBucket<'a> {
+    docs: Vec<&'a SkelDoc>,
+    children: std::collections::BTreeMap<&'a str, FolderBucket<'a>>,
+}
+
+fn folder_node(label: &str, mut bucket: FolderBucket<'_>) -> MindNode {
+    let mut children = bucket
+        .children
+        .into_iter()
+        .map(|(name, child)| folder_node(name, child))
+        .collect::<Vec<_>>();
+    bucket
+        .docs
+        .sort_by(|a, b| (&a.name, &a.doc_id).cmp(&(&b.name, &b.doc_id)));
+    children.extend(bucket.docs.into_iter().map(|d| MindNode {
+        label: d.name.clone(),
+        doc_id: Some(d.doc_id.clone()),
+        children: Vec::new(),
+    }));
+    MindNode {
+        label: label.to_string(),
+        doc_id: None,
+        children,
+    }
+}
+
+/// 标题族键：去扩展名、版本/日期/编号/括号尾巴后取稳定前缀；无可用前缀时退化为首字符。
+/// 它只负责模型失败时的安全分桶，不假装理解具体业务词汇。
+fn title_family(name: &str) -> String {
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem).trim();
+    let mut out = String::new();
+    for ch in stem.chars() {
+        if ch.is_ascii_digit()
+            || matches!(ch, '(' | '（' | '[' | '【' | '-' | '_' | ' ' | '·' | '—')
+        {
+            break;
+        }
+        if !ch.is_ascii_punctuation() {
+            out.push(ch);
+        }
+        if out.chars().count() >= 8 {
+            break;
+        }
+    }
+    if out.chars().count() < 2 {
+        out = stem
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(2)
+            .collect();
+    }
+    if out.is_empty() {
+        "其他".to_string()
+    } else {
+        out
+    }
+}
+
+fn fallback_dense_groups(docs: Vec<MindNode>) -> Vec<MindNode> {
+    let mut families: std::collections::BTreeMap<String, Vec<MindNode>> =
+        std::collections::BTreeMap::new();
+    for doc in docs {
+        families
+            .entry(title_family(&doc.label))
+            .or_default()
+            .push(doc);
+    }
+    // 标题族按稳定顺序装箱；一个族过大就切片，小族尽量相邻合并，每组硬封顶 16 篇。
+    let mut groups: Vec<(Vec<String>, Vec<MindNode>)> = Vec::new();
+    for (family, members) in families {
+        for chunk in members.chunks(DENSE_GROUP_TARGET) {
+            if let Some((labels, docs)) = groups.last_mut() {
+                if docs.len() + chunk.len() <= MAX_DENSE_GROUP_DOCS {
+                    if labels.last() != Some(&family) {
+                        labels.push(family.clone());
+                    }
+                    docs.extend_from_slice(chunk);
+                    continue;
+                }
+            }
+            groups.push((vec![family.clone()], chunk.to_vec()));
+        }
+    }
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, (labels, children))| MindNode {
+            label: match labels.as_slice() {
+                [only] if only == "其他" => format!("其他资料 {}", i + 1),
+                [only] => only.clone(),
+                [first, ..] => format!("{}等", first),
+                [] => format!("资料组 {}", i + 1),
+            },
+            doc_id: None,
+            children,
+        })
+        .collect()
+}
+
+fn dense_fallback(root: &mut MindNode) {
+    fn visit(node: &mut MindNode) {
+        for child in &mut node.children {
+            visit(child);
+        }
+        let direct_docs = node
+            .children
+            .iter()
+            .filter(|child| child.doc_id.is_some())
+            .count();
+        if direct_docs <= DENSE_DOC_THRESHOLD {
+            return;
+        }
+        let mut docs = Vec::with_capacity(direct_docs);
+        let mut branches = Vec::new();
+        for child in std::mem::take(&mut node.children) {
+            if child.doc_id.is_some() {
+                docs.push(child);
+            } else {
+                branches.push(child);
+            }
+        }
+        branches.extend(fallback_dense_groups(docs));
+        node.children = branches;
+    }
+    visit(root);
+}
+
+#[derive(serde::Deserialize)]
+struct DenseReplyFolder {
+    folder: usize,
+    groups: Vec<DenseReplyGroup>,
+}
+#[derive(serde::Deserialize)]
+struct DenseReplyGroup {
+    label: String,
+    docs: Vec<usize>,
+}
+
+fn dense_prompt(root: &MindNode) -> Option<(String, Vec<Vec<MindNode>>)> {
+    fn collect(node: &MindNode, path: &str, out: &mut Vec<(String, Vec<MindNode>)>) {
+        let next = if path.is_empty() {
+            node.label.clone()
+        } else {
+            format!("{path}/{}", node.label)
+        };
+        let docs: Vec<MindNode> = node
+            .children
+            .iter()
+            .filter(|c| c.doc_id.is_some())
+            .cloned()
+            .collect();
+        if docs.len() > DENSE_DOC_THRESHOLD {
+            out.push((next.clone(), docs));
+        }
+        for child in node.children.iter().filter(|c| c.doc_id.is_none()) {
+            collect(child, &next, out);
+        }
+    }
+    let mut folders = Vec::new();
+    collect(root, "", &mut folders);
+    if folders.is_empty()
+        || folders.len() > MAX_DENSE_LLM_FOLDERS
+        || folders
+            .iter()
+            .any(|(_, docs)| docs.len() > MAX_DENSE_LLM_DOCS)
+    {
+        return None;
+    }
+    let mut prompt = String::from("目录清单：\n");
+    let mut docs_by_folder = Vec::new();
+    for (fi, (path, docs)) in folders.into_iter().enumerate() {
+        use std::fmt::Write as _;
+        let _ = writeln!(prompt, "目录 {}「{}」：", fi + 1, path);
+        for (di, doc) in docs.iter().enumerate() {
+            let name: String = doc
+                .label
+                .chars()
+                .take(MAX_DENSE_PROMPT_NAME_CHARS)
+                .collect();
+            let _ = writeln!(prompt, "{}. {}", di + 1, name);
+        }
+        docs_by_folder.push(docs);
+    }
+    Some((prompt, docs_by_folder))
+}
+
+fn parse_dense_groups(reply: &str, docs_by_folder: &[Vec<MindNode>]) -> Option<Vec<Vec<MindNode>>> {
+    let start = reply.find('[')?;
+    let end = reply.rfind(']')?;
+    let raw: Vec<DenseReplyFolder> = serde_json::from_str(&reply[start..=end]).ok()?;
+    if raw.len() != docs_by_folder.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for (expected, folder) in raw.into_iter().enumerate() {
+        let docs = &docs_by_folder[expected];
+        if folder.folder != expected + 1 || !(2..=MAX_DENSE_GROUPS).contains(&folder.groups.len()) {
+            return None;
+        }
+        let mut seen = vec![false; docs.len()];
+        let mut labels = std::collections::HashSet::new();
+        let mut groups = Vec::with_capacity(folder.groups.len());
+        for group in folder.groups {
+            let label = group.label.trim();
+            if label.is_empty()
+                || label.chars().count() > 12
+                || group.docs.is_empty()
+                || group.docs.len() > MAX_DENSE_GROUP_DOCS
+                || !labels.insert(label.to_string())
+            {
+                return None;
+            }
+            let mut children = Vec::with_capacity(group.docs.len());
+            for index in group.docs {
+                let slot = index.checked_sub(1)?;
+                if slot >= docs.len() || std::mem::replace(&mut seen[slot], true) {
+                    return None;
+                }
+                children.push(docs[slot].clone());
+            }
+            groups.push(MindNode {
+                label: label.to_string(),
+                doc_id: None,
+                children,
+            });
+        }
+        if seen.iter().any(|covered| !covered) {
+            return None;
+        }
+        out.push(groups);
+    }
+    Some(out)
+}
+
+fn apply_dense_groups(root: &mut MindNode, grouped: Vec<Vec<MindNode>>) {
+    fn visit(node: &mut MindNode, grouped: &mut std::vec::IntoIter<Vec<MindNode>>) {
+        let dense =
+            node.children.iter().filter(|c| c.doc_id.is_some()).count() > DENSE_DOC_THRESHOLD;
+        // prompt/解析是前序遍历：先取本目录结果，再递归原有子目录；主题节点在递归后才嫁接，
+        // 否则一个主题自己含 13 篇文档时会被误当成“待二次分层目录”。
+        let current = dense.then(|| grouped.next().expect("已按同一棵树校验目录数量"));
+        for child in node.children.iter_mut().filter(|c| c.doc_id.is_none()) {
+            visit(child, grouped);
+        }
+        if dense {
+            let mut branches: Vec<MindNode> = std::mem::take(&mut node.children)
+                .into_iter()
+                .filter(|child| child.doc_id.is_none())
+                .collect();
+            branches.extend(current.expect("dense 时已有本目录分组"));
+            node.children = branches;
+        }
+    }
+    let mut grouped = grouped.into_iter();
+    visit(root, &mut grouped);
+    debug_assert!(grouped.next().is_none(), "分类结果目录数应已完全消费");
+}
+
+/// 确定性骨架：完整保留目录树（根目录文档归「未分类」），同层目录按名称排序，
+/// 目录内文档按 `(name, doc_id)` 排序。LLM 之后只许改写根下分支 `label`，
 /// 结构与顺序与模型输出无关——模型挂了，导图只是标签朴素一点，形状不变。
 fn build_skeleton(space_label: &str, docs: &[SkelDoc]) -> MindNode {
-    let mut by_segment: std::collections::BTreeMap<&str, Vec<&SkelDoc>> =
-        std::collections::BTreeMap::new();
+    let mut root = FolderBucket::default();
     for d in docs {
-        by_segment.entry(first_segment(&d.folder_path)).or_default().push(d);
+        let mut cursor = &mut root;
+        for segment in d
+            .folder_path
+            .split('/')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            cursor = cursor.children.entry(segment).or_default();
+        }
+        cursor.docs.push(d);
     }
-    let children = by_segment
+    let mut children = root
+        .children
         .into_iter()
-        .map(|(segment, mut ds)| {
-            ds.sort_by(|a, b| {
-                (&a.folder_path, &a.name, &a.doc_id).cmp(&(&b.folder_path, &b.name, &b.doc_id))
-            });
-            MindNode {
-                label: if segment.is_empty() { "未分类".to_string() } else { segment.to_string() },
-                doc_id: None,
-                children: ds
-                    .into_iter()
-                    .map(|d| MindNode {
-                        label: d.name.clone(),
-                        doc_id: Some(d.doc_id.clone()),
-                        children: Vec::new(),
-                    })
-                    .collect(),
+        .map(|(name, bucket)| folder_node(name, bucket))
+        .collect::<Vec<_>>();
+    if !root.docs.is_empty() {
+        children.insert(
+            0,
+            folder_node(
+                "未分类",
+                FolderBucket {
+                    docs: root.docs,
+                    ..Default::default()
+                },
+            ),
+        );
+    }
+    MindNode {
+        label: space_label.to_string(),
+        doc_id: None,
+        children,
+    }
+}
+
+fn collect_doc_names(node: &MindNode, names: &mut Vec<String>) {
+    if node.doc_id.is_some() {
+        names.push(node.label.chars().take(MAX_PROMPT_NAME_CHARS).collect());
+    } else {
+        for child in &node.children {
+            if names.len() >= MAX_NAMES_PER_BRANCH {
+                break;
             }
-        })
-        .collect();
-    MindNode { label: space_label.to_string(), doc_id: None, children }
+            collect_doc_names(child, names);
+        }
+    }
 }
 
 /// 给模型的素材：分支序号 + 目录名（即骨架标签）+ 前几条文档名。只取材于标签所需的最小集。
@@ -206,13 +545,9 @@ fn label_prompt(branches: &[MindNode]) -> String {
     use std::fmt::Write as _;
     let mut out = String::from("分组清单：\n");
     for (i, b) in branches.iter().enumerate() {
-        let names = b
-            .children
-            .iter()
-            .take(MAX_NAMES_PER_BRANCH)
-            .map(|d| d.label.chars().take(MAX_PROMPT_NAME_CHARS).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("、");
+        let mut names = Vec::new();
+        collect_doc_names(b, &mut names);
+        let names = names.join("、");
         let _ = writeln!(out, "{}. 目录「{}」：{}", i + 1, b.label, names);
     }
     let _ = write!(out, "共 {} 个分组，请输出 {} 个主题标签的 JSON 数组。", branches.len(), branches.len());
@@ -260,8 +595,7 @@ async fn llm_labels(st: &AppState, root: &MindNode) -> Option<Vec<String>> {
     }
     let sent = &branches[..branches.len().min(MAX_LLM_BRANCHES)];
     let user = label_prompt(sent);
-    let mut req = ChatRequest::text(ModelTier::Fast, LABEL_SYSTEM, &user, Some(0.1));
-    req.max_tokens = Some(800);
+    let req = ChatRequest::text(ModelTier::Fast, LABEL_SYSTEM, &user, Some(0.1));
     let reply = match tokio::time::timeout(LLM_LABEL_TIMEOUT, st.llm.chat(req)).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(e)) => {
@@ -281,6 +615,26 @@ async fn llm_labels(st: &AppState, root: &MindNode) -> Option<Vec<String>> {
     parse_labels(content, sent.len())
 }
 
+/// 密集目录主题分类：严格 JSON 全量校验，任一目录漏项/重复/越界都整体返回 None。
+/// 调用方随后走 `dense_fallback`，所以模型故障永远不会丢文档或打坏导图。
+async fn llm_dense_groups(st: &AppState, root: &MindNode) -> Option<Vec<Vec<MindNode>>> {
+    let (user, docs_by_folder) = dense_prompt(root)?;
+    let req = ChatRequest::text(ModelTier::Fast, DENSE_GROUP_SYSTEM, &user, Some(0.0));
+    let reply = match tokio::time::timeout(LLM_LABEL_TIMEOUT, st.llm.chat(req)).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => {
+            tracing::warn!(err = %e, "导图密集目录分类失败 → 回退确定性标题族");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("导图密集目录分类超时 → 回退确定性标题族");
+            return None;
+        }
+    };
+    let content = reply.content.as_deref()?;
+    parse_dense_groups(content, &docs_by_folder)
+}
+
 /// 空间显示名（根节点标签）；空名回退 `space_id` 本身。
 async fn space_label(st: &AppState, space_id: &str) -> Result<String, ApiErr> {
     let row: Option<(String,)> = st
@@ -296,29 +650,49 @@ async fn space_label(st: &AppState, space_id: &str) -> Result<String, ApiErr> {
         .unwrap_or_else(|| space_id.to_string()))
 }
 
-/// 生成一棵新导图（不含缓存读写）。`list_docs` 的 viewer 可见性过滤内联在它自己的 SQL 里，
-/// 本函数不拼第二份 ACL。
-async fn generate_mindmap(
+/// 一次取出导图的完整结构输入；缓存比对与未命中后生成共用同一份快照。
+/// `list_docs` 的 viewer 可见性过滤内联在它自己的 SQL 里，本函数不拼第二份 ACL。
+async fn load_mindmap_source(
     st: &AppState,
     v: &Viewer,
     space_id: &str,
-) -> Result<serde_json::Value, ApiErr> {
-    let rows = store::list_docs(&st.owned, v, space_id).await.map_err(kb_err)?;
+) -> Result<(String, Vec<SkelDoc>, String), ApiErr> {
+    let rows = store::list_docs(&st.owned, v, space_id)
+        .await
+        .map_err(kb_err)?;
     let docs: Vec<SkelDoc> = rows
         .into_iter()
         .map(|r| SkelDoc { doc_id: r.doc_id, name: r.name, folder_path: r.folder_path })
         .collect();
-    let mut root = build_skeleton(&space_label(st, space_id).await?, &docs);
-    let labels = llm_labels(st, &root).await;
+    let label = space_label(st, space_id).await?;
+    let fingerprint = source_fingerprint(&label, &docs);
+    Ok((label, docs, fingerprint))
+}
+
+/// 从已取快照生成一棵新导图（不含缓存读写）。
+async fn generate_mindmap(
+    st: &AppState,
+    space_id: &str,
+    label: &str,
+    docs: &[SkelDoc],
+) -> serde_json::Value {
+    let mut root = build_skeleton(label, docs);
+    // 两个 fast 增强互不依赖，并行后仍由纯函数依序落树；最坏等待保持单个 20s 闸而非叠成 40s。
+    let (groups, labels) = tokio::join!(llm_dense_groups(st, &root), llm_labels(st, &root));
+    if let Some(groups) = groups {
+        apply_dense_groups(&mut root, groups);
+    } else {
+        dense_fallback(&mut root);
+    }
     apply_labels(&mut root, labels.as_deref());
-    Ok(serde_json::json!({ "space_id": space_id, "root": root }))
+    serde_json::json!({ "space_id": space_id, "root": root })
 }
 
 /// 写缓存失败只记 warn 不报错：导图已经生成出来，没有理由因为缓存写不进让用户看见 500
 /// （代价只是下次 GET 重新生成一次）。
-async fn write_cache(st: &AppState, space_id: &str, body: &serde_json::Value) {
+async fn write_cache(st: &AppState, space_id: &str, fingerprint: &str, body: &serde_json::Value) {
     // Value 的 Display 即紧凑 JSON（序列化不可失败，unwrap_or_else 的 fallback 是死代码）
-    let text = body.to_string();
+    let text = cache_envelope(fingerprint, body).to_string();
     if let Err(e) = st
         .owned
         .fixed(crate::admin_api::KV_SET_SQL)
@@ -332,11 +706,17 @@ async fn write_cache(st: &AppState, space_id: &str, body: &serde_json::Value) {
 }
 
 /// 缓存写放后台：响应路径不白等一个 RTT（写失败本来就只 warn）。
-fn spawn_write_cache(st: &Arc<AppState>, space_id: &str, body: &serde_json::Value) {
+fn spawn_write_cache(
+    st: &Arc<AppState>,
+    space_id: &str,
+    fingerprint: &str,
+    body: &serde_json::Value,
+) {
     let st = st.clone();
     let space_id = space_id.to_string();
+    let fingerprint = fingerprint.to_string();
     let body = body.clone();
-    tokio::spawn(async move { write_cache(&st, &space_id, &body).await });
+    tokio::spawn(async move { write_cache(&st, &space_id, &fingerprint, &body).await });
 }
 
 /// `space_id` 缺省＝个人空间；trim 后空串按缺省、超长拒——与 `kb_eval_api::normalize_space`
@@ -349,7 +729,8 @@ fn normalize_space(v: &Viewer, space_id: Option<&str>) -> Result<String, ApiErr>
     Ok(s.to_string())
 }
 
-/// `GET /api/kb/mindmap?space_id=`：缓存命中直接返回；未命中/缓存损坏则生成后落缓存。
+/// `GET /api/kb/mindmap?space_id=`：当前结构指纹与缓存一致才命中；
+/// 未命中/过期/缓存损坏则生成后落缓存。
 pub async fn mindmap(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -360,6 +741,7 @@ pub async fn mindmap(
     if !acl::space_readable(&st.owned, &v, &space_id).await.map_err(kb_err)? {
         return Err(err(StatusCode::FORBIDDEN, format!("无权访问知识空间 {space_id}")));
     }
+    let (label, docs, fingerprint) = load_mindmap_source(&st, &v, &space_id).await?;
     // 缓存只是加速器：读失败不该 500，按未命中重新生成（与缓存损坏同口径）
     let cached: Option<(String,)> = match st
         .owned
@@ -375,15 +757,13 @@ pub async fn mindmap(
         }
     };
     if let Some((text,)) = cached {
-        // 缓存损坏（手改/旧版形状）按未命中处理：覆盖写回，不报错。
-        if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
-            if body.get("root").is_some() {
-                return Ok(Json(body));
-            }
+        // 缓存过期/损坏（手改/旧版形状）按未命中处理：覆盖写回，不报错。
+        if let Some(body) = cached_body(&text, &fingerprint) {
+            return Ok(Json(body));
         }
     }
-    let body = generate_mindmap(&st, &v, &space_id).await?;
-    spawn_write_cache(&st, &space_id, &body);
+    let body = generate_mindmap(&st, &space_id, &label, &docs).await;
+    spawn_write_cache(&st, &space_id, &fingerprint, &body);
     Ok(Json(body))
 }
 
@@ -399,8 +779,9 @@ pub async fn regenerate_mindmap(
     if !acl::space_writable(&st.owned, &v, &space_id).await.map_err(kb_err)? {
         return Err(err(StatusCode::FORBIDDEN, format!("无权修改知识空间 {space_id} 的导图")));
     }
-    let body = generate_mindmap(&st, &v, &space_id).await?;
-    spawn_write_cache(&st, &space_id, &body);
+    let (label, docs, fingerprint) = load_mindmap_source(&st, &v, &space_id).await?;
+    let body = generate_mindmap(&st, &space_id, &label, &docs).await;
+    spawn_write_cache(&st, &space_id, &fingerprint, &body);
     Ok(Json(body))
 }
 
@@ -828,9 +1209,9 @@ mod tests {
         }
     }
 
-    /// 骨架聚合：首段分组、根目录归「未分类」、排序确定（同样的输入乱序给同一棵树）
+    /// 骨架聚合：完整目录分层、根目录归「未分类」、排序确定（同样的输入乱序给同一棵树）
     #[test]
-    fn skeleton_groups_by_first_segment_deterministically() {
+    fn skeleton_preserves_full_folder_hierarchy_deterministically() {
         let docs = vec![
             skel("d4", "补贴办法.pdf", "/财务/报销"),
             skel("d2", "报销制度 v2.pdf", "/财务"),
@@ -849,8 +1230,15 @@ mod tests {
             .iter()
             .map(|l| (l.label.as_str(), l.doc_id.as_deref()))
             .collect();
-        // 叶子按 (folder_path, name, doc_id) 排：/财务 先于 /财务/报销
-        assert_eq!(leaves, vec![("报销制度 v2.pdf", Some("d2")), ("补贴办法.pdf", Some("d4"))]);
+        assert_eq!(
+            leaves,
+            vec![("报销", None), ("报销制度 v2.pdf", Some("d2"))]
+        );
+        assert_eq!(finance.children[0].children[0].label, "补贴办法.pdf");
+        assert_eq!(
+            finance.children[0].children[0].doc_id.as_deref(),
+            Some("d4")
+        );
         // 乱序输入同一棵树
         let shuffled: Vec<SkelDoc> = docs
             .iter()
@@ -868,6 +1256,92 @@ mod tests {
         assert_eq!(tree.children.len(), 1);
         assert_eq!(tree.children[0].label, "未分类");
         assert!(build_skeleton("s", &[]).children.is_empty());
+    }
+
+    fn doc_ids(node: &MindNode, out: &mut Vec<String>) {
+        if let Some(id) = &node.doc_id {
+            out.push(id.clone());
+        }
+        for child in &node.children {
+            doc_ids(child, out);
+        }
+    }
+
+    #[test]
+    fn dense_folder_fallback_adds_topic_layer_without_losing_docs() {
+        let docs: Vec<SkelDoc> = (0..24)
+            .map(|i| skel(&format!("d{i}"), &format!("业务资料{i:02}.pdf"), "/运营"))
+            .collect();
+        let mut tree = build_skeleton("s", &docs);
+        dense_fallback(&mut tree);
+        let folder = &tree.children[0];
+        assert!(folder.children.len() >= 2 && folder.children.len() <= MAX_DENSE_GROUPS);
+        assert!(
+            folder.children.iter().all(|node| node.doc_id.is_none()),
+            "密集目录下必须先到主题节点"
+        );
+        let mut ids = Vec::new();
+        doc_ids(folder, &mut ids);
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), docs.len(), "每篇文档必须且只能出现一次");
+    }
+
+    #[test]
+    fn small_folder_does_not_gain_an_extra_topic_layer() {
+        let docs: Vec<SkelDoc> = (0..DENSE_DOC_THRESHOLD)
+            .map(|i| skel(&format!("d{i}"), &format!("资料{i}.pdf"), "/运营"))
+            .collect();
+        let mut tree = build_skeleton("s", &docs);
+        dense_fallback(&mut tree);
+        assert!(tree.children[0]
+            .children
+            .iter()
+            .all(|node| node.doc_id.is_some()));
+    }
+
+    #[test]
+    fn dense_model_output_must_cover_each_doc_exactly_once_or_fall_back() {
+        let docs: Vec<SkelDoc> = (0..20)
+            .map(|i| skel(&format!("d{i}"), &format!("资料{i}.pdf"), "/运营"))
+            .collect();
+        let tree = build_skeleton("s", &docs);
+        let (_, folders) = dense_prompt(&tree).expect("20 篇应进入模型分类预算");
+        let good = r#"[{"folder":1,"groups":[{"label":"制度","docs":[1,2,3,4,5,6,7,8,9,10]},{"label":"流程","docs":[11,12,13,14,15,16,17,18,19,20]}]}]"#;
+        let groups = parse_dense_groups(good, &folders).expect("合法全覆盖输出");
+        let mut grouped = tree.clone();
+        apply_dense_groups(&mut grouped, groups);
+        assert!(grouped.children[0]
+            .children
+            .iter()
+            .all(|node| node.doc_id.is_none()));
+        let mut ids = Vec::new();
+        doc_ids(&grouped, &mut ids);
+        ids.sort();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!((before, ids.len()), (20, 20));
+
+        let duplicate = r#"[{"folder":1,"groups":[{"label":"甲","docs":[1,2,3,4,5,6,7,8,9,10]},{"label":"乙","docs":[10,11,12,13,14,15,16,17,18,19,20]}]}]"#;
+        assert!(
+            parse_dense_groups(duplicate, &folders).is_none(),
+            "重复编号必须整份拒绝"
+        );
+        let missing = r#"[{"folder":1,"groups":[{"label":"甲","docs":[1,2,3]},{"label":"乙","docs":[4,5]}]}]"#;
+        assert!(
+            parse_dense_groups(missing, &folders).is_none(),
+            "漏文档必须整份拒绝"
+        );
+
+        let mut fallback = tree;
+        dense_fallback(&mut fallback);
+        let mut fallback_ids = Vec::new();
+        doc_ids(&fallback, &mut fallback_ids);
+        assert_eq!(
+            fallback_ids.len(),
+            20,
+            "坏模型输出的安全回退仍须保留全部文档"
+        );
     }
 
     /// 节点序列化形状即契约：叶子只有 label+doc_id，分支只有 label+children
@@ -934,14 +1408,62 @@ mod tests {
         assert!(prompt.contains("共 1 个分组"));
     }
 
-    /// 缓存键形状是契约：`kb_mindmap:{space_id}`，与 `admin_api` 的 kv 口配套
+    /// 缓存键形状是契约：版本前缀隔离旧扁平树，与 `admin_api` 的 kv 口配套
     #[test]
     fn cache_key_is_namespaced_by_space() {
-        assert_eq!(cache_key("zhangsan"), "kb_mindmap:zhangsan");
-        assert_eq!(cache_key("enterprise-hr"), "kb_mindmap:enterprise-hr");
+        assert_eq!(cache_key("zhangsan"), "kb_mindmap:v3:zhangsan");
+        assert_eq!(cache_key("enterprise-hr"), "kb_mindmap:v3:enterprise-hr");
         // 键带前缀：kv 表是全 runtime 开关共用的（llm_provider/mysql_target/digest_date），
         // 裸 space_id 会撞上同名登录名以外的键族。
         assert!(cache_key("llm_provider").ends_with(":llm_provider"));
+    }
+
+    #[test]
+    fn source_fingerprint_tracks_only_mindmap_structure() {
+        let docs = vec![
+            skel("d2", "招聘.pdf", "/人事"),
+            skel("d1", "报销.pdf", "/财务"),
+        ];
+        let same_reordered = vec![
+            skel("d1", "报销.pdf", "/财务"),
+            skel("d2", "招聘.pdf", "/人事"),
+        ];
+        let base = source_fingerprint("企业知识库", &docs);
+        assert_eq!(base, source_fingerprint("企业知识库", &same_reordered));
+        assert_ne!(
+            base,
+            source_fingerprint("新空间名", &docs),
+            "空间改名必须失效"
+        );
+        assert_ne!(
+            base,
+            source_fingerprint("企业知识库", &[skel("d1", "报销.pdf", "/财务")]),
+            "文档删除必须失效"
+        );
+        assert_ne!(
+            base,
+            source_fingerprint(
+                "企业知识库",
+                &[
+                    skel("d2", "招聘.pdf", "/人事"),
+                    skel("d1", "报销.pdf", "/财务/制度")
+                ],
+            ),
+            "文档移动/目录改名必须失效"
+        );
+    }
+
+    #[test]
+    fn cache_envelope_requires_matching_current_fingerprint() {
+        let body = serde_json::json!({ "space_id": "s", "root": { "label": "s" } });
+        let text = cache_envelope("rev-1", &body).to_string();
+        assert_eq!(cached_body(&text, "rev-1"), Some(body.clone()));
+        assert!(cached_body(&text, "rev-2").is_none(), "旧指纹缓存必须失效");
+        assert!(
+            cached_body(&body.to_string(), "rev-1").is_none(),
+            "v3 旧裸 body 要自动重建"
+        );
+        assert!(cached_body(r#"{"fingerprint":"rev-1","body":{}}"#, "rev-1").is_none());
     }
 
     /// markdown 重建：重叠尾巴按偏移去重；缺偏移的块全文保留；空块跳过

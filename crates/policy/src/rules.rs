@@ -62,7 +62,9 @@ const RETIRED: &[&str] = &[
     "t_account_bill_header",
     "t_account_bill_detail",
     "t_winc_purchase_transfer",
-    "t_device_requisition",
+    // t_device_requisition 2026-08-14 **解除退役**：Java 的条件挂在 JOIN 进来的 t_customer 上
+    // （DeviceRequisitionMapper.xml:201），via 能逐字表达。退役期间它是 `UnregisteredTable`
+    // ——**所有**受限角色问设备申请单都被整句拒，包括那两个本该看全量的设备专职角色。
     "t_device_receive_item",
     "t_device_delivery_item",
 ];
@@ -382,7 +384,6 @@ mod tests {
             "t_account_bill_header",
             "t_account_bill_detail",
             "t_winc_purchase_transfer",
-            "t_device_requisition",
             "t_device_receive_item",
             "t_device_delivery_item",
         ] {

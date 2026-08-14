@@ -53,7 +53,25 @@ $env:MSYS_NO_PATHCONV = '1'
 # Windows 上 Python 把 `/kbdata/x` 解析到**当前驱动器**（embed 服务的 CWD 在 D:）→ `D:\kbdata\x`，
 # 两侧于是指向同一个文件。**必须是 D 盘**：换成别的盘符或从别的盘启动 embed 服务，这个巧合就断。
 if (-not (Test-Path 'D:\kbdata')) { New-Item -ItemType Directory -Force 'D:\kbdata' | Out-Null }
+# 🔴 容器里必须显式给 `DMS_SECRET_KEY`，否则 settings 的凭据**每次容器重建就永久解不开**：
+# 无显式钥匙时钥匙由机器指纹派生（`db/crypto.rs:157` 的 host+user），而 Docker 注入的
+# `HOSTNAME` 就是**容器短 id** —— 启动路径又会拿当前钥匙把明文凭据加密写回挂载的
+# settings 文件（`db.rs:487-511` 的幂等迁移）。于是「重建一次容器」＝「凭据被上一个
+# 容器 id 锁死」，实测撞过一次（只能翻旧日志找回那个 id 才解得开）。
+# 钥匙落 `secrets/`（.gitignore 第 46 行整目录忽略），与 DEPLOY.md 的
+# `$DMS_RUNTIME_ROOT/.secret_key` 同一条纪律。丢了它同样解不开 —— 别删 secrets/。
+$keyFile = "$repo\secrets\dms-secret.key"
+if (-not (Test-Path $keyFile)) {
+    New-Item -ItemType Directory -Force "$repo\secrets" | Out-Null
+    $bytes = [byte[]]::new(48)
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    [System.IO.File]::WriteAllText($keyFile, [Convert]::ToBase64String($bytes))
+    Write-Host "已生成 $keyFile（settings 凭据密钥；备份它，丢了要重填凭据）"
+}
+$secretKey = (Get-Content $keyFile -Raw).Trim()
+
 $mounts = @(
+    '-e', "DMS_SECRET_KEY=$secretKey",
     # settings 运行时挂载不进镜像层（F8）。**可写**：`settings_api`（页面编辑配置）
     # 原地写它 —— 单文件挂载点 inode 固定，原地写宿主机立即可见；改回 :ro 那天
     # 页面保存会变成 500「写 settings.json 失败」。

@@ -2,20 +2,18 @@
 //!
 //! 逐行搬 `server/src/pipeline.rs:372-401`（`is_followup` / `rewrite_followup`）、
 //! `534-603`（`ask` / `ask_traced`）、`608-627`（`open_source`）与 `629-711`（`ask_single` 的分派骨架）。
-//! **顺序即行为**：权限集合 → 多轮改写 → 选源 → 开源 → 复合拆解 → 单问 Router 遍历 → LLM 兜底。
+//! **顺序即行为**：权限集合 → 多轮改写 → 结构化意图 → 选源 → typed 子问 → Router → LLM 兜底。
 //! 单问出口另挂一层「不可计算卡 → AI 归一问法 → 重试一次 → 仍出卡则澄清」（`reinterpret_question` 一节）。
 //!
 //! HTTP / CLI / 定时任务三入口共用这一个 `ask()`（server 侧那层薄包装只负责 `Trace` 与查询日志）。
 //!
-//! ## 三处刻意不做（交接单上各有一条）
-//! - **分诊（`triage`）不搬进来**：它今天在 server 的 handler 里、且在本函数**之前**
-//!   （`main.rs:516` / `mcp_api.rs:250`），两条分支返回**两个不同类型**（`AskResult` vs
-//!   `dms_kernel::Answer`）。挪进来要么改 `ask` 的返回形状（前端与两个判官脚本都在解析它），
-//!   要么把「改写在分诊之前」变成「之后」—— 两条都是行为变化。
+//! ## 两处刻意不做（交接单上各有一条）
+//! - **不保留旧字符串分诊旁路**：所有 HTTP/CLI/MCP 入口都先构造 `PreparedQuestion`，
+//!   Data/Knowledge/Hybrid 只消费同一份已 grounding 合同。
 //! - **`llm` 是 Router 的末位成员**，不是表外的直调。它一度在表外：`LlmAnswerer` 拿不到
 //!   token 用量回调（走它等于让查询日志的 token 列静默变空，K6-B）也拿不到单问起点 `t0`。
 //!   两样都收进 `AskCtx` 之后它就是个普通成员 ——「加一种能力＝加一个 Answerer」才 5/5 成立。
-//! - **hybrid（两路都答）不做**：`triage::Intent` 只有两个变体，见那边的文件头。
+//! - **Hybrid 不自由拆字符串**：只执行 typed subgoal；归属不唯一直接澄清。
 
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
@@ -34,11 +32,11 @@ use dms_semantic::registry::datasource as ds_reg;
 
 use crate::answerers::cache::CacheAnswerer;
 use crate::answerers::graph::{GraphAnswerer, Relation};
-use crate::answerers::hits::{land, DirectHit, HitAnswerer};
+use crate::answerers::hits::{land, DirectHit, DirectOutcome, HitAnswerer};
 use crate::answerers::Answerer;
 use crate::ctx::{attach_trust, AskCtx, AskResult, ClarifyOption, Step};
-use crate::run::{Correctors, LlmAnswerer};
-use crate::{compound, source};
+use crate::run::LlmAnswerer;
+use crate::source;
 
 /// 非主源（上传表格源/第二方库）的连接池上限。比主源（10）小：这类源多而每个都轻，
 /// 且它们与 DMS 主源共享同一份数据库连接预算。
@@ -91,13 +89,14 @@ pub struct AskDeps<'a> {
     pub pg: &'a PgPool,
     /// **实例式**（connector 侧禁全局单例）：`Clone` 共享熔断状态，wire 侧传 `AppState` 那一份。
     pub embed: &'a EmbedClient,
-    /// schema 校正 + 七件确定性校正（实现在 `server/src/corrector.rs`，同一笔 T8/T10 的债）
-    pub correctors: &'a dyn Correctors,
     pub detect: DetectFn,
     pub compose_hit: HitFn,
     pub direct_hit: HitFn,
     /// 主逻辑源 `dms` 当前热切到的物理目标名；其他显式数据源仍显示自己的 ds_id。
     pub main_source_name: &'a str,
+    /// 知识库那一路的依赖（混合问句用）。`None` = 该调用方不提供 KB —— 见
+    /// `hybrid::KbArm` 的文档：那是调用方的能力边界，不是用户问错了。
+    pub kb: Option<crate::hybrid::KbArm<'a>>,
     /// 每次 precise 调用后的用量回调（server 传 `&|u| trace.add(u)`）。`Trace` 住
     /// `server/src/query_log.rs` 且带 axum，落不进 agent —— 故用量与 ds 两个观测出口都是回调。
     pub on_usage: &'a (dyn Fn(&Usage) + Send + Sync),
@@ -114,24 +113,218 @@ pub struct AskDeps<'a> {
     pub sc_samples: usize,
 }
 
-/// 完整问答链。搬运源 `pipeline.rs:555-603`（`ask_traced`）—— `ask` 那一层的 `Trace` 与
-/// `query_log::finish` 留在 server 的薄包装里（那两个都带 axum）。
-pub async fn ask(
-    d: &AskDeps<'_>,
-    p: &Principal,
+/// 入口只解析一次的生效问句与结构化意图。HTTP/小程序/MCP 可先用 `route()` 分诊，
+/// Data 执行再把同一个值交给 `ask_prepared`，不会发生第二次 `understand`。
+#[derive(Debug, Clone)]
+pub struct PreparedQuestion {
+    pub original_question: String,
+    pub effective_question: String,
+    pub intent_attempt: crate::intent::IntentAttempt,
+    started_at: Instant,
+}
+
+impl PreparedQuestion {
+    /// 本轮起点（`ask_prepared` 用它算耗时）。`hybrid` 的纯资料半也要它 ——
+    /// 没有问数子结果时耗时只能从这里算，写 0 就是收据上一条假数。
+    pub fn started_at(&self) -> std::time::Instant {
+        self.started_at
+    }
+
+    /// 本轮的**唯一裁决**。纯函数、零 IO —— 每次调用即时重算而不缓存：
+    /// 不存字段就没有陈旧状态，`project()` 与 server 侧 `recover_sales_intent` 覆写
+    /// `intent_attempt` 之后全部自动一致。
+    ///
+    /// `// ponytail: 一次 contains 扫 ~35 个词 vs 一次 DB 往返，不值得为它引入可变状态；`
+    /// `// 真成热点再加 OnceCell。`
+    pub fn plan(&self) -> AskPlan {
+        decide(&self.effective_question, &self.intent_attempt, None)
+    }
+
+    /// 🔴 路由从此**不再**直接读合同（`intent_attempt.route()`）。
+    ///
+    /// 那一版的唯一输入是一次 fast LLM 采样的 `mode` 字段，于是同一句
+    /// 「下载 押金转货款申请书」在 CLI 返 `knowledge`、在 HTTP 深度模式返 38 行账余表 ——
+    /// 两次采样，两条路。改动之后确定性信号先说话，模型只在它没意见时裁决。
+    pub fn route(&self) -> crate::intent::IntentRoute {
+        self.plan().route
+    }
+
+    pub fn routed_questions(&self) -> Vec<crate::intent::RoutedQuestion> {
+        self.intent_attempt
+            .routed_questions(&self.effective_question)
+    }
+
+    /// 将 hybrid 的一个 typed subgoal 投影成可独立消费的准备结果；父级实体/地区/时间
+    /// 已由 `routed_questions` 补到 `question` 中，合同同时收窄到该 route。
+    pub fn project(&self, routed: &crate::intent::RoutedQuestion) -> Self {
+        Self {
+            original_question: self.original_question.clone(),
+            effective_question: routed.question.clone(),
+            intent_attempt: self.intent_attempt.project(&routed.question, routed.route),
+            started_at: self.started_at,
+        }
+    }
+
+    /// Unknown/Invalid/Unavailable 的统一 fail-closed 卡。服务端可在选源前直接返回，
+    /// 避免未知意图继续进入知识库或数据执行。
+    pub fn clarification_result(&self) -> AskResult {
+        let mut result = intent_reply(&self.effective_question, self.started_at, vec![]);
+        if let Some(note) = self.intent_attempt.user_note() {
+            result.caliber_note = Some(note.to_string());
+        }
+        result.intent_summary = Some(self.intent_summary());
+        result
+    }
+
+    pub fn intent_summary(&self) -> crate::intent::IntentSummary {
+        self.intent_attempt
+            .summary(None, &crate::intent::ExecutionEvidence::default())
+    }
+}
+
+/// 交付面：用户要的**产物**是什么。与 `IntentRoute`（去哪条链路取）**正交** ——
+/// 「下载合同模板」和「合同模板里付款条款怎么写」都走知识库，但一个要文件、一个要答案。
+///
+/// 取值域刻意只有两个：今天只有这两种执行体。`Table`/`Chart`/`Export` 加进来就是第二个
+/// `EntityKind::Document` —— 定义处一条、消费者零个。有执行体那天再加一个变体，一行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deliverable {
+    Answer,
+    Document,
+}
+
+/// 一次问答的裁决结果。
+///
+/// `route` 与 wire 完全不变（仍是四档），新增的是「要什么产物」与「这条路是谁定的」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AskPlan {
+    pub route: crate::intent::IntentRoute,
+    pub deliverable: Deliverable,
+    /// `true` = 由问句词法信号定的路，**与本次 LLM 采样无关**（同一句永远同一条路）。
+    ///
+    /// 🔴 fail-closed 的真正护栏**不在这里**：它是 `run.rs:1455` 的
+    /// `LlmAnswerer::accept == is_data_executable()` —— 合同没 Ready 时自由 SQL 那一路
+    /// 结构上不接单，**与 route 判成什么无关**。所以确定性规则判 `Data` 是安全的
+    /// （单号点查必须判 Data，否则裸单号会掉进知识库兜底被一份文档「答」掉）。
+    /// `deterministic_rules_never_open_free_sql` 同时钉住这两件事。
+    pub deterministic: bool,
+    /// 这条路是按什么定的，上收据（`intent_summary.plan_reason`）。误路由从此可自证。
+    pub reason: &'static str,
+}
+
+/// ★ **全系统唯一的路由裁决点**。纯函数、零 IO、可单测。
+///
+/// ## 它替换了什么
+///
+/// 此前路由 = `IntentV1::route()`，唯一输入是 `understand()` 一次 fast 采样的 `mode` 字段。
+/// 后果有二：① 同一句话两次采样两条路（业主实测「下载 押金转货款申请书」CLI 返
+/// `knowledge`、HTTP 深度返 38 行账余表）；② 合同没有「动作」维，要文件的诉求只能被塞进
+/// `data`，再被 `kw_force` 的「押金 → 账余表」种子钉成一张数据卡。
+///
+/// ## 规则表（首条命中即止，确定性在前）
+///
+/// | # | 条件 | 结果 | deterministic |
+/// |---|---|---|---|
+/// | R0 | `forced` 非空（前端 chip 显式钉死） | `{forced, Answer}` | false |
+/// | R1 | 动词 × (文档名词 \| 扩展名) | `{Knowledge, Document}` | **true** |
+/// | R1.5 | 有单据号 token（字母数字混排 ≥6 位） | `{Data, Answer}` | **true** |
+/// | R2 | 有文档名词、合同无可度量槽位、且合同没说这是 Hybrid | `{Knowledge, Answer}` | **true** |
+/// | R3 | 合同有意见 | `{合同的路, Answer}` | false |
+/// | R4 | 其余 | `{Unknown, Answer}` | false |
+pub fn decide(
+    question: &str,
+    attempt: &crate::intent::IntentAttempt,
+    forced: Option<crate::intent::IntentRoute>,
+) -> AskPlan {
+    use crate::intent::IntentRoute as R;
+    // R0：用户自己点的 chip 最大。投影是否成立由 server 侧 `projected_forced` 判，这里只认路。
+    if let Some(route) = forced {
+        return plan(route, Deliverable::Answer, false, "forced");
+    }
+    let sig = dms_kernel::nl::doc::signals(question);
+    // R1：要文件。**共现**才算，判据与纪律都在 `dms_kernel::nl::doc`。
+    // 刻意不看合同 —— 这条规则存在的全部意义就是「模型这次说什么都不影响它」。
+    if sig.verb && (sig.noun || sig.ext) {
+        return plan(R::Knowledge, Deliverable::Document, true, "doc-request");
+    }
+    // R1.5：单据号点查。**单号是全系统最不含糊的问数信号**，不许掉进知识库。
+    //
+    // 🔴 业主 2026-08-14 实测：发一个 `CZ202608131914` 过去，合同判 Unknown（一个裸号
+    // 抽不出任何槽位），于是走 `unknown_route_kb_fallback` 问知识库；知识库拿一份讲
+    // 「账余记录」的文档**答了出来**、还带引用，于是顶替卡片上线 ——
+    // 用户要查一张单，拿到的是一段「账余记录页面位于财务 > 客户账余记录」的说明。
+    //
+    // 这条规则判 `Data`，但**不开自由 SQL**：合同没 Ready 时 `LlmAnswerer::accept`
+    // （`run.rs:1455` 恒等于 `is_data_executable()`）结构上不接单，只有 business-lookup /
+    // 实体卡这些代码写死的确定性成员会接。判据由
+    // `deterministic_rules_never_open_free_sql` 钉住。
+    if crate::triage::code_token_hit(question) {
+        return plan(R::Data, Deliverable::Answer, true, "code-lookup");
+    }
+    // R2：纯资料/政策问句。有文档名词，且合同一个**可度量**槽位都没抽到。
+    //
+    // 🔴 **Hybrid 不再豁免**（2026-08-14 业主实测「客户打款 退款政策」）。
+    //
+    // 上一版怕压掉真混合问句，给 `Hybrid` 开了后门。结果同一句话：合同判 knowledge 就答得
+    // 很好（引用 6 条，正是《客户打款退款指引》），判 hybrid 就把「客户打款」当数据半执行，
+    // 在 `t_customer_balance` 上拉回 **200 行账余充值明细**、口径复核还不通过。
+    // 非确定性从这个后门原样回来了。
+    //
+    // 现在的判据一句话：**数据半必须自带可度量槽位**（指标/时间/分组/对比）。
+    // `has_measurable_slots` 本来就同时看根与 subgoals —— 所以删掉这条豁免就等于
+    // 「没有任何一个子任务能算 → 它不是混合问句，是一句被劈成两半的政策问题」。
+    // 真混合问句不受影响：「查最近的设备订单，并且最近的线下设备政策」的数据半带时间槽位。
+    if sig.noun && !has_measurable_slots(attempt) {
+        return plan(R::Knowledge, Deliverable::Answer, true, "doc-topic");
+    }
+    // R3：确定性信号没意见时，听合同的。
+    let route = attempt.route();
+    if route != R::Unknown {
+        return plan(route, Deliverable::Answer, false, "contract");
+    }
+    plan(R::Unknown, Deliverable::Answer, false, "no-signal")
+}
+
+/// 五处 `AskPlan { .. }` 字面量收成一行（D1：`decide` 不为构造语法超 40 行）。
+fn plan(
+    route: crate::intent::IntentRoute,
+    deliverable: Deliverable,
+    deterministic: bool,
+    reason: &'static str,
+) -> AskPlan {
+    AskPlan { route, deliverable, deterministic, reason }
+}
+
+/// 合同里有没有**可度量**的槽位：指标 / 时间 / 分组 / 对比。V2 合同把槽位下推到
+/// subgoals，所以根与子任务都要看。
+///
+/// 🔴 实体（`entity_mentions`）与地区（`regions`）**刻意不算**：政策类问句天生带它们
+/// （「线下设备申请政策」「湖南的报销制度」），拿它们判 Data 就是把资料问句误伤成问数 ——
+/// 这正是「线下设备申请政策」被要求「补充明确的对象、指标和时间」的成因之一。
+fn has_measurable_slots(attempt: &crate::intent::IntentAttempt) -> bool {
+    attempt.ready().is_some_and(|i| {
+        let root = !i.metrics.is_empty()
+            || i.time.is_some()
+            || !i.breakdowns.is_empty()
+            || !i.comparisons.is_empty();
+        root || i.subgoals.iter().any(|g| {
+            !g.metrics.is_empty()
+                || g.time.is_some()
+                || !g.breakdowns.is_empty()
+                || !g.comparisons.is_empty()
+        })
+    })
+}
+
+/// 统一入口准备：多轮改写 → 日期继承 → 错字归一 → 一次结构化意图解析。
+pub async fn prepare_question(
+    llm: &dyn ChatModel,
+    on_usage: &(dyn Fn(&Usage) + Send + Sync),
     question: &str,
     prev: Option<PrevTurn<'_>>,
-    explicit_ds: Option<&str>,
-) -> anyhow::Result<AskResult> {
-    let t0 = Instant::now();
-    // 权限集合按当轮用户算一次（`compute_scope_cached` 本来就带缓存，子问题共用同一份，I4 不变）
-    let scope = compute_scope_cached(d.auth, p).await?;
-    // 多轮追问改写：把"那上个月呢"结合上一轮改写成"上月销售额"再走管线
-    let rewritten = rewrite_followup(&**d.llm, d.on_usage, question, prev).await;
-    // 【A17 ①】日期继承：改写后的问题**没有时间词**、而上一轮问句有 ——
-    // 把上一轮的时间表面词接到尾巴（「那品类第二的呢」→「那品类第二的呢，上月」），
-    // 别退回全历史（那看着就像「数据不对」）。纯词法：`time_phrase_of` 只认表面词，
-    // 不猜语义；改写自带时间词（「那上个月呢」）或本来就是首问时一步不动。
+) -> PreparedQuestion {
+    let started_at = Instant::now();
+    let rewritten = rewrite_followup(llm, on_usage, question, prev).await;
     let rewritten = match prev {
         Some((prev_q, ..))
             if dms_kernel::nl::time::time_predicate(&rewritten).is_none()
@@ -144,11 +337,87 @@ pub async fn ask(
         }
         _ => rewritten,
     };
-    // 【判官实测·问题 1①】错别字归一：在改写与日期继承之后、选源/复合拆解/路由之前 ——
-    // 下游（注册表召回、语义缓存键、LLM prompt）全见到归一后的问句，错别字问法与正确问法
-    // 走同一条路。用户原文仍在 server 侧的聊天记录里，这里改的是送去分析的那份；
-    // 多轮改写若把上一轮的错字带下来，也在这一并被归一。
-    let rewritten = crate::triage::normalize_typos(&rewritten).into_owned();
+    let effective_question = crate::triage::normalize_typos(&rewritten).into_owned();
+    let intent_attempt = crate::intent::understand(llm, on_usage, &effective_question).await;
+    PreparedQuestion {
+        original_question: question.to_string(),
+        effective_question,
+        intent_attempt,
+        started_at,
+    }
+}
+
+/// 完整问答链。搬运源 `pipeline.rs:555-603`（`ask_traced`）—— `ask` 那一层的 `Trace` 与
+/// `query_log::finish` 留在 server 的薄包装里（那两个都带 axum）。
+pub async fn ask(
+    d: &AskDeps<'_>,
+    p: &Principal,
+    question: &str,
+    prev: Option<PrevTurn<'_>>,
+    explicit_ds: Option<&str>,
+) -> anyhow::Result<AskResult> {
+    let prepared = prepare_question(&**d.llm, d.on_usage, question, prev).await;
+    ask_prepared(d, p, &prepared, explicit_ds).await
+}
+
+/// 执行一份已经准备好的问句。调用方不得重新抽取意图；选源、compound 与所有
+/// Answerer 都复用 `prepared.intent_attempt`。
+pub async fn ask_prepared(
+    d: &AskDeps<'_>,
+    p: &Principal,
+    prepared: &PreparedQuestion,
+    explicit_ds: Option<&str>,
+) -> anyhow::Result<AskResult> {
+    let t0 = prepared.started_at;
+    // 🔴 意图不可用 ≠ 不能回答。`AGENT-ARCHITECTURE §3.1` 的原话是「已有确定性路径仍可尝试，
+    // 但只能标记为 review」—— 此前这里直接出反问卡，于是 fast 模型一次抖动（偶发
+    // `mode=unknown`）就把一道确定性模板答得出的题变成反问：**同一句问三次，一次反问两次出卡**
+    // （2026-08-13 实测）。同题不同答比答错更伤信任。
+    //
+    // 分档：Knowledge/Hybrid 仍然直接澄清（数据成员回答不了文档问题，硬答就是编）；
+    // 只有 `Unknown`（＝合同没拿到，不是用户真的问了别的）才走确定性兜底 ——
+    // 自由 SQL 那一路仍由 `cx.intent == None` 时的既有闸门挡着，兜底只可能命中
+    // graph/装配器/模板/实体卡这些**代码写死**的路径，收据照常按 review 出。
+    let deterministic_fallback = match prepared.route() {
+        crate::intent::IntentRoute::Data => false,
+        crate::intent::IntentRoute::Unknown => true,
+        // Hybrid 收进 agent（T8 之后的第二套编排器清理）：两路并行 + 一次合成，
+        // CLI/判官与 HTTP 从此走同一条 —— 此前判官问混合问句永远得到澄清卡。
+        crate::intent::IntentRoute::Hybrid => {
+            let outcome = crate::hybrid::run(d, p, prepared, explicit_ds).await?;
+            return Ok(crate::hybrid::into_ask_result(outcome, prepared));
+        }
+        // 与 Hybrid 同一条收口：**能答就答，不能答才澄清**。此前这里无条件出澄清卡，
+        // 于是纯资料问句在 CLI/判官链路永远得不到答案 —— 而 HTTP 侧早就把它接到知识库了，
+        // 又是一处「两条链路对同一问句行为相反」（Hybrid 那次收口只修了一半）。
+        // `d.kb` 缺席（深度报告子问、定时任务）才澄清：那是调用方的能力边界，不是用户问错了。
+        crate::intent::IntentRoute::Knowledge => {
+            return match crate::hybrid::knowledge_only(d, p, prepared).await {
+                Some(r) => Ok(r),
+                None => Ok(prepared.clarification_result()),
+            };
+        }
+    };
+    // 兜底档没有合同，自然也没有 typed 子问；这条只管有合同那一档。
+    //
+    // 🔴 **确定性车道也没有 typed 子问**（2026-08-14 业主实测裸单号）。
+    // `routed_questions()` 读的是**合同**，`route()` 读的是**裁决** —— 我把决策从合同搬到
+    // `decide()` 的那一刻，这两者就分叉了：合同 `Invalid` 时 `routed_questions` 恒返回
+    // 一条 `route=Unknown` 的子问，于是 R1.5 明明把 `HJXH-DXO2026081300138` 判成了
+    // 问数点查，这道闸又把它退成澄清卡（业主看到「意图解析结果未通过一致性校验」）。
+    let plan = prepared.plan();
+    let routed = prepared.routed_questions();
+    if !deterministic_fallback
+        && !plan.deterministic
+        && routed
+            .iter()
+            .any(|child| child.route != crate::intent::IntentRoute::Data)
+    {
+        return Ok(prepared.clarification_result());
+    }
+    // 权限集合按当轮用户算一次（`compute_scope_cached` 本来就带缓存，子问题共用同一份，I4 不变）
+    let scope = compute_scope_cached(d.auth, p).await?;
+    let rewritten = prepared.effective_question.clone();
     // 【K3-B ③】选源。判据顺序在 `source::select_source`（显式 > 单源直通 > 向量最近邻）
     let picked = source::select_source(&**d.llm, d.pg, d.embed, p, &rewritten, explicit_ds).await?;
     (d.on_ds)(&picked);
@@ -166,14 +435,27 @@ pub async fn ask(
     // 还是某个校正器改坏」这个问题查不出来 —— 三张表各记一段、拼不回同一次问答。
     // `conv_id`（一次会话一个）由调用方给：CLI 没有会话概念时与 `trace_id` 相同。
     // 引用绑定：`async move` 把 `trace_id`/`conv_id` 按值捕获会让闭包退化成 `FnOnce`，
-    // 而 `try_compound` 要反复调它（`Fn`）—— 与 `scope` 同一个理由。
+    // 而 typed Data 子任务要反复调它（`Fn`）—— 与 `scope` 同一个理由。
     let (trace_id, conv_id) = (d.trace_id.clone(), d.conv_id.clone());
     let (trace_id, conv_id) = (&trace_id, &conv_id);
     // Router 一次问答只组一次：成员只持依赖引用、无 per-call 状态，复合拆解的每个子问
     // 共用同一表（原来每个子问都重建 7 个 Box）。
-    let members = router(d.embed, d.detect, d.compose_hit, d.direct_hit, d.correctors, d.sc_samples);
+    let mut members =
+        router(d.embed, d.detect, d.compose_hit, d.direct_hit, d.sc_samples);
+    if deterministic_fallback {
+        // 没有合同就不许自由生成 SQL：兜底档只留代码写死的确定性成员
+        // （graph / 装配器 / 模板 / 实体卡 / 语义缓存都不产新 SQL 形态）。
+        members.retain(|m| m.route() != "llm");
+    }
     let members = &members;
     let one = |q: String| async move {
+        let child_route = prepared
+            .intent_attempt
+            .routed_questions(&prepared.effective_question)
+            .into_iter()
+            .find(|child| child.question == q)
+            .map_or(prepared.route(), |child| child.route);
+        let intent_attempt = prepared.intent_attempt.project(&q, child_route);
         // 单问的 `t0` 是**单问入口**（拆分前 `pipeline.rs:641`），不是整轮入口。
         // 放进 `AskCtx` 之后，成员再也不用各自 `Instant::now()`——那会让排在后面的成员
         // 把自己之前的耗时丢掉（缓存那处实测偏小十几毫秒）。
@@ -193,6 +475,10 @@ pub async fn ask(
                 p,
                 scope,
                 question: &current,
+                // 归一重试必须继承首轮合同：覆盖闸门已证明改写没有丢槽，再调一次模型只会
+                // 增加抖动与延迟。复合问题在进入本闭包前已拆开，因此不会误带父问题槽位。
+                intent_attempt: &intent_attempt,
+                intent: intent_attempt.ready().map(|intent| intent.as_ref()),
                 ds,
                 source_name,
                 source,
@@ -220,6 +506,13 @@ pub async fn ask(
                     return Err(e);
                 }
             };
+            tracing::info!(
+                question = %current,
+                route = %r.route,
+                intent = ?intent_attempt,
+                trace_id = %d.trace_id,
+                "结构化意图影子记录"
+            );
             // 【判官实测·问题 3】空结果 + 出界主题无注册表覆盖 → 换 no-topic 文案
             // （「请确认筛选条件」对「主题根本不存在」不对症）。在 localize 之前整份换掉。
             if let Some(nt) = out_of_scope_empty_reply(&cx, &mut r).await {
@@ -229,8 +522,17 @@ pub async fn ask(
             // ── 【AI 重新理解层】「不可计算」卡与「反问」卡触发；合同能答的问句一行行为不变 ──
             // 反问卡纳入触发（2026-08-12 业主裁决：意图不明先归一再重试，不许上来就反问）——
             // 破坏性问句（红线）除外：它的反问是刻意拦截，放行改写等于帮它换皮。
-            let retryable =
-                is_unavailable_card_result(&r) || (r.route == NEED_INTENT && !destructive_hit(&current));
+            // 确定性解析器已经明确要求用户补充信息时，这张卡就是终态；再次交给模型改写
+            // 会把“多 SKU/无法唯一解析”偷偷改成另一个可执行问题。意图合同本身未就绪时
+            // 也不开放第二次自由模型调用，只把可理解的反问卡返回给用户。
+            let direct_clarification = r.route == NEED_INTENT
+                && r.steps.iter().any(|step| {
+                    step.kind == "hit" && matches!(step.stage, "direct-agg" | "direct-doc")
+                });
+            let retryable = intent_attempt.is_ready()
+                && !direct_clarification
+                && (is_unavailable_card_result(&r)
+                    || (r.route == NEED_INTENT && !destructive_hit(&current)));
             if !retryable {
                 // 重试命中（任何非卡结果都算）：透出「已按理解为你想问：X」
                 if let Some(rewritten) = &retry_of {
@@ -240,8 +542,12 @@ pub async fn ask(
                 }
                 // 落账生效问句（追问改写/归一后的形态）：下一轮追问靠它继承完整上下文，
                 // 而不是用户上一句碎片（「上月呢？」链式追问会丢实体，2026-08-12 实测）。
-                let resolved = if current != original { &current } else { &original };
-                if resolved != question {
+                let resolved = if current != original {
+                    &current
+                } else {
+                    &original
+                };
+                if resolved.as_str() != prepared.original_question {
                     r.resolved_question = Some(resolved.clone());
                 }
                 return Ok(r);
@@ -249,7 +555,15 @@ pub async fn ask(
             match retry_of.take() {
                 // 首轮出卡 → fast 归一问法后**重试一次**；改不出/校验不过/模型失败 = 原卡照出。
                 // 实体族（⑤）只对反问卡开放：不可计算卡的收窄纪律（开票/对账族不进重试）一字不动。
-                None => match reinterpret_question(&**d.llm, d.on_usage, &current, r.route == NEED_INTENT).await {
+                None => match reinterpret_question(
+                    &**d.llm,
+                    d.on_usage,
+                    &current,
+                    r.route == NEED_INTENT,
+                    cx.intent,
+                )
+                .await
+                {
                     Some(rewritten) => {
                         tracing::info!(original = %current, rewritten = %rewritten,
                             "不可计算卡 → AI 归一问法，重试一次");
@@ -274,8 +588,42 @@ pub async fn ask(
             }
         }
     };
-    if let Some(r) = compound::try_compound(&**d.llm, &rewritten, t0, &one).await {
-        return Ok(r);
+    // 结构化意图是唯一拆分合同：Ready Data 不再调另一个 LLM 重猜子问。
+    // 多个 typed Data subgoal 逐个走同一 Router，并以复合容器保留每份终态收据。
+    if routed.len() > 1 {
+        // 🔴 两处与此前不同，都是从 `compound::try_compound` 抄来的既有做法（那条路早就这么做了，
+        // typed 这条是唯一的例外）：
+        // ① **并行**。每个子问各打一次库，串行等于白等（同一份 `scope` 只算一次，I4 不变）。
+        // ② **一条失败不再整轮 422**。此前 `one(..).await?` 让用户连另一条已经查出来的
+        //    子结果都看不到；现在失败的那条由 `missing_note` 点名 —— 措辞里写死了
+        //    「不是 0、也不是没有数据」，缺席的面板最容易被读成「那一项是零」。
+        //    全部失败才上抛（`?` 的语义留给「一条都没成」）。
+        let questions: Vec<String> = routed.iter().map(|child| child.question.clone()).collect();
+        let results = futures::future::join_all(questions.iter().cloned().map(&one)).await;
+        let (mut subs, mut failed) = (Vec::with_capacity(questions.len()), Vec::new());
+        let mut first_err = None;
+        for (question, r) in questions.into_iter().zip(results) {
+            match r {
+                Ok(result) => subs.push(crate::ctx::SubResult { question, result }),
+                Err(e) => {
+                    tracing::warn!(sub = %question, err = %e, "typed 子问失败 → 结果里点名，不静默丢");
+                    failed.push(question);
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        if subs.is_empty() {
+            return Err(first_err.expect("subs 空必然至少一条失败"));
+        }
+        let ok = subs.len();
+        let mut out = AskResult::compound(subs, t0.elapsed().as_millis());
+        out.caliber_note = crate::compound::missing_note(&failed, ok);
+        // 「问题理解与结果依据」此前对复合答案**整块空白**：容器的 intent_summary 恒 None，
+        // 而合同本来就在手上。填它是如实呈现，不是补数。
+        // 🔴 `trust` 仍留 None 且**不许**在这里造一个：凭证要有 SQL 指纹、来源、执行方式，
+        // 而容器一句 SQL 都没跑 —— 每个子结果各自带着自己的凭证，容器编一份就是假收据。
+        out.intent_summary = Some(prepared.intent_summary());
+        return Ok(out);
     }
     one(rewritten).await
 }
@@ -335,11 +683,11 @@ async fn reinterpret_question(
     on_usage: &(dyn Fn(&Usage) + Send + Sync),
     question: &str,
     entity_ok: bool,
+    intent: Option<&crate::intent::IntentV1>,
 ) -> Option<String> {
     let user = format!("原句：{question}\n改写：");
     // 温度 0：归一是确定性任务，温度抖动是纯噪音（与三词意图门同一本账）
-    let mut req = ChatRequest::text(ModelTier::Fast, REINTERPRET_SYSTEM, &user, Some(0.0));
-    req.max_tokens = Some(48);
+    let req = ChatRequest::text(ModelTier::Fast, REINTERPRET_SYSTEM, &user, Some(0.0));
     let reply = match tokio::time::timeout(REINTERPRET_TIMEOUT, llm.chat(req)).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(e)) => {
@@ -353,7 +701,7 @@ async fn reinterpret_question(
     };
     on_usage(&reply.usage);
     let rewritten = parse_reinterpret(reply.content.as_deref()?)?;
-    if validate_reinterpret(question, &rewritten, entity_ok) {
+    if validate_reinterpret_with_intent(question, &rewritten, entity_ok, intent) {
         Some(rewritten)
     } else {
         // 校验不过 = 没改（严禁 LLM 改写引入新语义；判据全在纯函数里，分支有单测）
@@ -388,7 +736,17 @@ fn parse_reinterpret(reply: &str) -> Option<String> {
 ///    「销售额…」被改成纯毛利问句就是引入新语义，本条把它拦下；
 /// ⑤ 实体族（**仅 `entity_ok`（反问卡）时开放**）：公司名原样保留，或裸名句 ≥4 连续共享
 ///    汉字锚点；不可计算卡不开——开票/对账族「不进重试」的收窄纪律不变。
+#[cfg(test)]
 fn validate_reinterpret(original: &str, rewritten: &str, entity_ok: bool) -> bool {
+    validate_reinterpret_with_intent(original, rewritten, entity_ok, None)
+}
+
+fn validate_reinterpret_with_intent(
+    original: &str,
+    rewritten: &str,
+    entity_ok: bool,
+    intent: Option<&crate::intent::IntentV1>,
+) -> bool {
     if rewritten.is_empty() || rewritten == original {
         return false;
     }
@@ -397,6 +755,11 @@ fn validate_reinterpret(original: &str, rewritten: &str, entity_ok: bool) -> boo
         return false;
     }
     if looks_like_sql(rewritten) {
+        return false;
+    }
+    let coverage = crate::intent::reinterpret_coverage(original, rewritten, intent);
+    if !coverage.complete() {
+        tracing::warn!(?coverage, "归一结果丢失用户显式槽位");
         return false;
     }
     let before: Vec<dms_semantic::sales_fact::Metric> =
@@ -568,138 +931,11 @@ fn destructive_hit(question: &str) -> bool {
     })
 }
 
-/// 意图不足时的反问（`None` = 有意图，照常走管线）。
-///
-/// 🔴 **调用点必须在 LLM 兜底的入口**（`run::run_llm` 开头），**不是** `ask()` 的开头。
-/// 第一版放在 `ask()` 里、Router 之前 —— 当场造成 5 个回归（回归题实测）：
-///   `C01-单号直查`「帮我查下 HJXH-DXO…」→ need-intent（该走 `direct-doc` 的 `sniff_doc_code`）
-///   `F01-图-买过烤肠的客户`            → need-intent（该走 `graph`）
-///   `H01/H02/H03` 红线题                → need-intent ⇒ 红线闸门失去输入
-/// 那三类问句都不含疑问词，所以第三条门放不过它们；而它们**本来有确定性路径接**。
-/// 正确语义是「**所有确定性路径都不接、LLM 只能猜**时才反问」——
-/// 那个位置就是 LLM 路的入口，一个字都不用多判。
-///
-/// **零 serde 形状变更**：`rows`/`columns` 空、话说在 `caliber_note` 里（前端已渲染它），
-/// 建议的问法放 `view.interact.drill`（前端已把它渲染成可点的按钮）。
-/// `route` 用新标签 `need-intent` —— 那样判官脚本的 route 断言有东西可钉，
-/// 而不是只能断言「返 0 行」（返 0 行与「真的没数据」分不开，正是这个 bug 最坏的一层）。
-///
-/// 【意图先分析后规划（业主裁决 2026-08-10）】fast 判定从两词扩成**三词**：
-/// `answer`（够格进 SQL 生成链）/ `clarify`（意图不明 → 意图分析 + 候选问法）/
-/// `unsupported|主题`（主题根本没接入，如「积分」→ 直接明说能问什么，**不走 SQL 试探**）。
-/// 由来是实测：「本月的积分情况」被 fast 判 answer 放行后，LLM 拿一张无关表编出
-/// 「积分兑换金额 958 客户」（比报错更坏），或产全常量试探 SQL 被闸门拒、
-/// 用户看到「SQL 安全校验未通过」的内部措辞。两个出口都是**回答**，不是报错。
-pub(crate) async fn need_intent_reply(
-    llm: &dyn ChatModel,
-    on_usage: &(dyn Fn(&Usage) + Send + Sync),
-    pg: &PgPool,
-    ds: &str,
-    question: &str,
-    t0: Instant,
-) -> Option<AskResult> {
-    // 🔴 ① 破坏性词先于一切模型判定（词表与命中判据收口在 `destructive_hit`，纯函数可单测）
-    if destructive_hit(question) {
-        // 破坏性请求不给候选问法（不引导、也不为它多烧一次 fast 调用）
-        return Some(intent_reply(question, t0, vec![]));
-    }
-
-    // ② 精简模式统一入口：**所有**确定性路由未命中、走到 LLM 兜底的问句，先过一次
-    // Fast 极短判定（answer/clarify/unsupported 三词协议）。`answer` 只表示“问题已足够进入
-    // 既有 SQL 生成链”，模型在这里不生成 SQL、不碰权限；后续仍由 precise 生成并经过口径、
-    // 权限和只读执行闸门。`clarify` 反问（意图分析 + 候选问法）；`unsupported` 是
-    // 「主题根本没接入」—— 直接明说能问什么。两者都不产 SQL。
-    // 模型失败（None）不直接反问 —— 降级到 ③ 的本地规则，模型抖动不能把清楚的问句误判成澄清。
-    match ai_query_is_actionable(llm, on_usage, question).await {
-        Some(GateVerdict::Answer) => {
-            // ②b 覆盖兜底：fast 说「能答」，但注册表三路（指标/维度/术语）一个都不认识、
-            // 问句剥掉虚词后又有实义残留、且无疑问词/关系词/单据形 —— 那它大概率在猜
-            // （「本月的积分情况」族：fast 对「情况」类问句很容易判 answer）。
-            // 不产 SQL，按意图不明反问。判据与分诊共用 `triage::registry_hit` ——
-            // 「注册表认不认识这句问句」两份实现必漂。读失败放行：反问是补救路径，
-            // 它自己挂了不该把问答一起拖死（与 ③ 的指标召回失败同一纪律）。
-            match crate::triage::registry_hit(pg, ds, question).await {
-                Ok(covered) if hold_back_uncovered(question, covered) => {
-                    tracing::info!(question, "Fast 判可执行但注册表零覆盖且无查询目标 → 意图反问（不产 SQL）");
-                    let options = clarify_options_for(llm, on_usage, question).await;
-                    return Some(intent_reply(question, t0, options));
-                }
-                Ok(_) => {
-                    tracing::info!(question, "精简模式 Fast 理解判为可执行 → 继续 SQL 生成链");
-                }
-                Err(e) => {
-                    tracing::warn!(err = %e, "覆盖兜底读注册表失败 → 本轮不拦截，照常走管线");
-                }
-            }
-            return None;
-        }
-        Some(GateVerdict::Clarify) => {
-            tracing::info!(question, "精简模式 Fast 理解判为含糊 → 反问（不产 SQL）");
-            // need-intent 增强：fast 在线才生成结构化候选；任何失败都降级为空数组
-            // （= 纯文本反问，wire 上 `clarify_options` 整键不上线，老客户端零影响）。
-            let options = clarify_options_for(llm, on_usage, question).await;
-            return Some(intent_reply(question, t0, options));
-        }
-        Some(GateVerdict::Unsupported(topic)) => {
-            tracing::info!(question, topic, "精简模式 Fast 判主题未接入 → 直接告知能问什么（不产 SQL）");
-            let options = topic_options_for(llm, on_usage, question).await;
-            return Some(no_topic_reply(question, &topic, t0, options));
-        }
-        None => {}
-    }
-
-    // ③ 本地明确性降级（仅 Fast 失败/超时/答非所问时到达）。
-    // 指标命中：走 semantic 的召回（agent 不许自己写 `meta.*` 的 SQL —— 架构门禁）
-    let rc = dms_semantic::recall::RecallCtx {
-        question,
-        tables: &[],
-        limit: 0,
-        ds,
-        embed: None,
-        embed_slices: &[],
-    };
-    // 读失败 → 当成「有意图」照常走：反问是补救路径，它自己挂了不该把问答一起拖死
-    let hits = match dms_semantic::recall::recall_metric_hits(pg, &rc).await {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(err = %e, "意图判据读指标失败 → 本轮不反问，照常走管线");
-            return None;
-        }
-    };
-    if !hits.is_empty() {
-        return None;
-    }
-    // 剥掉通用虚词后还剩实义字 = 那点内容是个名字/未知词。`consumed` 传空：
-    // 一个指标都没命中，所以没有任何业务词该被消化。
-    if !dms_kernel::nl::text::has_residue_with(question, &[], dms_kernel::nl::lexicon::STRIP_WORDS) {
-        return None;
-    }
-    // 🔴 **③ 问句里有疑问/度量词就不反问** —— 那说明用户问得很清楚，
-    // 只是我们**没声明那个指标**，该照常走 LLM 去查。
-    //
-    // 这一条是实测补的：只有「零指标命中 + 有残留」时「今年审核通过的对账单有多少笔」
-    // 被判成缺意图并反问，而它意图明确（「有多少笔」＝计数），只是「对账单数」不在
-    // 已声明指标里。也就是说没有疑问词放行会把**一整族「问了未声明指标」的问句**误伤成
-    // 反问 —— 比 LLM 猜更坏（用户问得清清楚楚却被要求「说清你要问什么」）。
-    //
-    // 判据在**剥词之前**看：`STRIP_WORDS` 里本来就有「是多少/多少/查/统计/排行/对比」这些，
-    // 剥完残留里就没有它们了，所以不能等剥完再判。
-    if ASKING.iter().any(|w| question.contains(w))
-        || crate::triage::analytical_question_hit(question)
-    {
-        return None;
-    }
-    tracing::info!(question, "意图不足 → 反问（不产 SQL）");
-    // ③ 到达这里说明 fast 已经失败过一次 —— 不为候选问法再付一次超时，直接纯文本反问
-    Some(intent_reply(question, t0, vec![]))
+/// Prepared Ready(Data) 已完成唯一一次大模型意图抽取；LLM SQL 入口只保留破坏性红线，
+/// 不再调用第二套 answer/clarify/unsupported Fast 二分类。
+pub(crate) fn prepared_data_safety_reply(question: &str, t0: Instant) -> Option<AskResult> {
+    destructive_hit(question).then(|| intent_reply(question, t0, vec![]))
 }
-
-/// 疑问/度量词表（模块级：③ 的本地降级与 ②b 的覆盖兜底 `hold_back_uncovered` 共用 ——
-/// 「有疑问词 = 用户问得很清楚」这条判据两处必须同一份，抄第二份必漂）。
-const ASKING: &[&str] = &[
-    "多少", "几", "哪些", "那些", "哪几", "哪家", "谁", "哪个", "什么", "怎么", "统计", "列出", "排行", "排名",
-    "最高", "最低", "最多", "最少", "趋势", "占比", "比例", "对比", "明细", "清单", "分布", "top", "TOP", "前",
-];
 
 /// 已接入数据主题的**对用户口径**清单（主题粒度，不是指标粒度）。
 /// 两个消费者：fast 意图门的判据参照（`ai_query_is_actionable` 的 prompt）与
@@ -720,74 +956,6 @@ fn known_topics_joined() -> &'static str {
 /// 超时，这些辅助判定等不起 —— 卡 90s 整条问答都废了（与 triage.rs 的 `LLM_TIMEOUT` 同一本账）。
 const FAST_CALL_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// fast 判 answer 后的覆盖兜底判据（**纯函数**，IO 那半是 `triage::registry_hit`）：
-/// 注册表零覆盖 + 剥掉虚词有实义残留 + 无疑问词 + 无关系词 + 无单据/表名形 → 扣住反问。
-///
-/// 每一条逃逸都有它护着的一族（删一条就有一族被误拦成反问）：
-/// - **疑问词**（`ASKING`）：「今年审核通过的对账单有多少笔」—— 意图明确，只是指标没声明；
-/// - **关系词**（`triage::RELATION_WORDS`）：「本月的退货情况」—— 注册表别名是「退货数」，
-///   词面搭不上，但「退货」是数仓里有的事件；
-/// - **单据/表名形**：「帮我查下 HJXH-…」直查族 —— 快路径万一流单到这里，意图也是明确的。
-fn hold_back_uncovered(question: &str, covered: bool) -> bool {
-    if covered {
-        return false;
-    }
-    // `consumed` 传空：一个资产都没命中，没有任何业务词该被消化（与 ③ 同一约定）
-    if !dms_kernel::nl::text::has_residue_with(question, &[], dms_kernel::nl::lexicon::STRIP_WORDS) {
-        return false;
-    }
-    if ASKING.iter().any(|w| question.contains(w))
-        || crate::triage::analytical_question_hit(question)
-        || crate::triage::RELATION_WORDS.iter().any(|w| question.contains(w))
-        || crate::triage::doc_code_hit(question)
-        || crate::triage::table_hit(question)
-    {
-        return false;
-    }
-    true
-}
-
-/// 反问的结构化候选：fast 生成 2~4 个最可能的意图问法，失败一律空数组（纯文本反问兜底）。
-///
-/// 输出协议是「每行 `标签|问句`」—— 比 JSON 数组耐截断（max_tokens 砍半也不会整份解析失败），
-/// 解析器 [`parse_clarify_options`] 对序号/全角竖线/垃圾行全容忍：凑不齐 2 条就当没生成。
-async fn clarify_options_for(
-    llm: &dyn ChatModel,
-    on_usage: &(dyn Fn(&Usage) + Send + Sync),
-    question: &str,
-) -> Vec<ClarifyOption> {
-    clarify_options_with(llm, on_usage, question, CLARIFY_SYSTEM).await
-}
-
-/// 「主题未接入」的候选：围绕**已接入**主题给问法 —— 与 clarify 候选共用解析与降级，
-/// 只换 system（候选必须落在能答的主题里，再围着没接入的主题生成就是二次误导）。
-async fn topic_options_for(
-    llm: &dyn ChatModel,
-    on_usage: &(dyn Fn(&Usage) + Send + Sync),
-    question: &str,
-) -> Vec<ClarifyOption> {
-    clarify_options_with(llm, on_usage, question, &topic_system()).await
-}
-
-const CLARIFY_SYSTEM: &str = "你是 DMS 数据问答的意图澄清助手。用户的问题缺少明确查询目标。\
-              给出 2 到 4 个用户最可能想问的完整问句，每行一个，格式：短标签|完整问句。\
-              短标签不超过 6 个汉字（如：销售表现、订单明细、基础资料）。\
-              问句必须具体、可直接执行（带指标或明细目标），不许复述原问题，不要解释、不要编号外的文字。";
-
-/// 「主题未接入」候选的 system。主题清单 `format!` 注入 `KNOWN_TOPICS`（与 ③ 意图门同法）——
-/// 硬编码第二份清单已经漂过一次（缺 开票/对账/业务员/仓库），两处必须同源。
-fn topic_system() -> String {
-    format!(
-        "你是 DMS 数据问答的引导助手。用户问的主题还没有接入数据。\
-         从已接入的主题（{}）里，\
-         给出 2 到 4 个用户最可能想改问的完整问句，每行一个，格式：短标签|完整问句。\
-         短标签不超过 6 个汉字（如：销售表现、订单明细、库存现状）。\
-         问句必须具体、可直接执行（带指标或明细目标），不许再围绕用户原来那个未接入的主题，\
-         不要解释、不要编号外的文字。",
-        known_topics_joined()
-    )
-}
-
 async fn clarify_options_with(
     llm: &dyn ChatModel,
     on_usage: &(dyn Fn(&Usage) + Send + Sync),
@@ -795,8 +963,7 @@ async fn clarify_options_with(
     system: &str,
 ) -> Vec<ClarifyOption> {
     let user = format!("用户问题：{question}\n候选问法：");
-    let mut req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
-    req.max_tokens = Some(200);
+    let req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
     let reply = match tokio::time::timeout(FAST_CALL_TIMEOUT, llm.chat(req)).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(e)) => {
@@ -888,6 +1055,7 @@ fn empty_reply(route: &str, elapsed_ms: u128, note: String) -> AskResult {
         clarify_options: vec![],
         value_labels: vec![],
         sales_context: None,
+        intent_summary: None,
     }
 }
 
@@ -897,9 +1065,25 @@ fn clip_user_text(s: &str) -> String {
     s.chars().take(REFS_FRAG_MAX_CHARS).collect()
 }
 
+/// 实体卡三问的尾词。与 `answerers::entity::ENTITY_VIEW_TAILS` 同族（那边负责**剥**，
+/// 这边负责**拼**）—— 拼出来的问句必须能被那边剥回裸实体名，否则点了照样落反问。
+const ENTITY_CARD_TAILS: &[&str] = &["的销售表现", "的订单明细", "的基础资料"];
+
+/// 拼模板三问的前提：剥完之后剩下的确实是一个**名字**，而不是半句话。
+/// 尾词表剥不掉的成分（「…420g 的信息 和 拆单标准」里的「拆单标准」）会整段留在里面，
+/// 照拼就是「越点越长」。判据只看空白：公司名/商品名不含空格，而多子句问句必然含空格
+/// （「和利食品有限公司」这类名字里的「和」不能当连接词判，会误杀真实客户名）。
+fn chip_safe_entity(name: &str) -> bool {
+    !name.contains(char::is_whitespace)
+}
+
 /// 意图不明时的反问（route = `need-intent`）：**意图分析是回答主体，不是报错** ——
 /// 文案只说「我不确定你要查什么 + 可以怎么问」，不出现任何内部措辞（闸门/校验/生成失败）。
-fn intent_reply(question: &str, t0: Instant, clarify_options: Vec<ClarifyOption>) -> AskResult {
+pub(crate) fn intent_reply(
+    question: &str,
+    t0: Instant,
+    clarify_options: Vec<ClarifyOption>,
+) -> AskResult {
     let mut r = empty_reply(
         NEED_INTENT,
         t0.elapsed().as_millis(),
@@ -911,12 +1095,17 @@ fn intent_reply(question: &str, t0: Instant, clarify_options: Vec<ClarifyOption>
     // 模板三问只给「裸实体名」族（嗨肉/某客户有限公司）：那是它实测有效的场景
     // （`need_intent_has_its_own_route_label` 钉着）。非实体问句套「X 的销售表现」是噪音，
     // 候选由 clarify_options（fast 生成）承担；两者都空时前端还剩自填框（ask-card 的输入行恒在）。
-    if crate::answerers::entity::entity_form_hit(question) {
-        r.view.interact.drill = vec![
-            format!("{question} 的销售表现"),
-            format!("{question} 的订单明细"),
-            format!("{question} 的基础资料"),
-        ];
+    //
+    // 🔴 拼的是**实体名本体**（`entity_form_surface` 已剥前缀/时间词/尾部语义），不是整句：
+    // 整句拼出来的是「小虎青菜香菇薄皮包子420g 的信息 和 拆单标准 的订单明细」，用户点一次
+    // 长一截，再点变成「… 的订单明细 的订单明细」（2026-08-13 生产截图）。
+    if let Some(name) =
+        crate::answerers::entity::entity_form_surface(question).filter(|n| chip_safe_entity(n))
+    {
+        r.view.interact.drill = ENTITY_CARD_TAILS
+            .iter()
+            .map(|tail| format!("{name} {tail}"))
+            .collect();
     }
     // 反问没走 Router，steps 恒空（不出现在 JSON 里）
     r.clarify_options = clarify_options;
@@ -1119,83 +1308,6 @@ pub const NEED_INTENT: &str = "need-intent";
 /// 是两种回答（后者永不试探 SQL），判官脚本与前端卡标题都要分开钉。
 pub const NO_TOPIC: &str = "no-topic";
 
-/// 意图门三态判定。`Unsupported` 带主题词（fast 从问句里摘的，如「积分」），
-/// 只用于回答文案 —— 它是模型产出，进 JSON 前剥控制字符、截 12 字（同 refs 纪律）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GateVerdict {
-    /// 问题已足够进入既有 SQL 生成链（模型不在这里生成 SQL）
-    Answer,
-    /// 意图不明 → 反问（意图分析 + 候选问法）
-    Clarify,
-    /// 主题没接入 → 直接告知能问什么，不走 SQL 试探
-    Unsupported(String),
-}
-
-/// 精简模式的统一意图门：所有确定性路由未命中、走到 LLM 兜底的问句都过一次。
-/// `Some(_)` = 三态判定成立；`None` = 模型失败/答非所问（降级到本地规则）。
-async fn ai_query_is_actionable(
-    llm: &dyn ChatModel,
-    on_usage: &(dyn Fn(&Usage) + Send + Sync),
-    question: &str,
-) -> Option<GateVerdict> {
-    let system = format!(
-        "你只判断一个 DMS 业务数据问题该如何处理。本系统已接入的数据主题只有：{}。\
-         若问题的主题明显不在上述范围内（如积分、会员等级、考勤、工资、人事），输出 unsupported|主题词。\
-         若问题包含明确指标、明细/关系目标，或给出客户、商品、型号、单据、人员等具体实体并要求资料、订单或销售上下文，输出 answer。\
-         具体实体名称本身也代表查看该实体总览，输出 answer。\
-         只有缺少具体对象和查询目标、仅有代词/寒暄、或对象无法辨认时输出 clarify。\
-         拿不准主题是否已接入时输出 answer，不许猜 unsupported（后面还有一道注册表覆盖检查接住它）。\
-         不识别表，不生成 SQL，不回答数据，不补写用户问题；只输出 answer、clarify 或 unsupported|主题词。",
-        known_topics_joined()
-    );
-    let user = format!("问题：{question}\n判定：");
-    // 温度 0.0：三词协议的输出就一个词，温度抖动是纯噪音；与 triage 二分类的 0.1 不同档，
-    // 那边的答错代价只是路由差一点（兜底恒 Data），两边各自的理由都写在各自注释里
-    let mut req = ChatRequest::text(ModelTier::Fast, &system, &user, Some(0.0));
-    // 「unsupported|主题词」比单词回复长，预算给到 24（answer/clarify 时代是 8）
-    req.max_tokens = Some(24);
-    let reply = match tokio::time::timeout(FAST_CALL_TIMEOUT, llm.chat(req)).await {
-        Ok(Ok(reply)) => reply,
-        Ok(Err(e)) => {
-            tracing::warn!(err = %e, "精简模式 Fast 理解失败 → 保持澄清");
-            return None;
-        }
-        Err(_) => {
-            tracing::warn!("精简模式 Fast 理解超时 → 保持澄清");
-            return None;
-        }
-    };
-    on_usage(&reply.usage);
-    parse_gate_verdict(reply.content.as_deref()?)
-}
-
-/// 三词协议解析（**纯函数**）：只认首行、只认 `answer` / `clarify` / `unsupported[|主题]`。
-/// 答非所问（解释/多词/别的词）一律 `None` → 降级到本地规则，模型抖动不能误判清楚的问句。
-fn parse_gate_verdict(reply: &str) -> Option<GateVerdict> {
-    let line = reply
-        .trim()
-        .trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c.is_whitespace());
-    // 只取首行：协议是单词回复，多行输出说明模型开始解释 —— 解释不是协议
-    let line = line.lines().next().unwrap_or("").trim();
-    let (head, topic) = match line.split_once('|').or_else(|| line.split_once('｜')) {
-        Some((h, t)) => (h.trim(), t.trim()),
-        None => (line, ""),
-    };
-    match head.to_ascii_lowercase().as_str() {
-        "answer" if topic.is_empty() => Some(GateVerdict::Answer),
-        "clarify" if topic.is_empty() => Some(GateVerdict::Clarify),
-        "unsupported" => {
-            let topic: String = topic.chars().filter(|c| !c.is_control()).take(12).collect();
-            // 直/弯引号、书名号、句号一把剥（原来同字符 `trim_matches('"')` 写两遍，弯引号没剥到）
-            let topic = topic
-                .trim_matches(|c: char| matches!(c, '"' | '“' | '”' | '「' | '」' | '。'))
-                .to_string();
-            Some(GateVerdict::Unsupported(topic))
-        }
-        _ => None,
-    }
-}
-
 /// 单问：Router 有序表遍历 → LLM 兜底。逐条转写 `pipeline.rs:643-713` 的五支内联 if。
 /// `members` 由 `ask()` 组一次传入（复合拆解的子问共用同一表，成员无 per-call 状态）。
 async fn ask_single(
@@ -1225,6 +1337,15 @@ async fn ask_single(
             steps.push(Step { stage: a.route(), kind: "skip", ms: t.elapsed().as_millis() });
             continue;
         }
+        // 🔴 这里**曾经**有一道「进 LLM 前的主题门」（2026-08-14 第 13 轮加、第 20 轮撤）。
+        //
+        // 它省下的是真的：一道该拒答的题从 44.4s 降到 8.5s，答案一个字没变。
+        // 但 80 题回归当场打出四条反例 —— 拒答不是只有「主题未接入」一种：
+        //   H01/H02「删除订单」「清空订单表」→ 应出**红线拦截**卡（need-intent），被换成了主题未接入；
+        //   E05/E08 数仓缺开票事实 → 应出「不可计算」降级卡（direct-doc），同样被抢答。
+        // 「这个主题没接入」与「这个问题我拒绝执行」是两件事，而进 LLM 之前分不清它们：
+        // 分得清的那个判据（`row_count == 0` + 路由白名单）**只有执行完才成立**。
+        // 想再省这 30 秒，得先有一条能在执行前区分四类拒答的证据，不是把其中一类提前。
         // `Ok(None)` = 没接住，交下一个；`Err` **原样上抛** ——
         // 权限注入失败是 fail-closed 信号，绝不降级成「换下一路重试」
         if let Some(mut r) = a.answer(cx).await? {
@@ -1266,8 +1387,21 @@ async fn ask_single(
         }
         steps.push(Step { stage: a.route(), kind: "miss", ms: t.elapsed().as_millis() });
     }
-    // Router 的末位就是 llm 兜底，遍历到它必然产出或报错 —— 走不到这里。
-    // 这条 bail 不是「没答案」的兜底，而是「有人从表里删了 llm」的当场暴露。
+    if let Some(note) = cx.intent_attempt.user_note() {
+        let mut r = intent_reply(cx.question, cx.t0, vec![]);
+        r.caliber_note = Some(note.to_string());
+        r.steps = steps;
+        return Ok(r);
+    }
+    // 确定性兜底档（合同没拿到 → `ask_prepared` 摘掉了末位 llm）：一个成员都没接住时
+    // 回澄清卡，而不是 bail 成 500。`user_note()` 只覆盖 Unavailable/Invalid 两态，
+    // 「解析成功但 mode=unknown/自报歧义」那一档它是 None（2026-08-13 实测同题不同答）。
+    if !members.iter().any(|m| m.route() == "llm") {
+        let mut r = intent_reply(cx.question, cx.t0, vec![]);
+        r.steps = steps;
+        return Ok(r);
+    }
+    // Ready 状态下 Router 的末位 llm 必然产出或报错；走到这里说明表被改坏。
     anyhow::bail!("Router 未产出答案：`llm` 兜底成员不在表里（ROUTER_ORDER 被改坏）")
 }
 
@@ -1565,7 +1699,16 @@ fn build_dimension_value_hit(
     let detail = scalar.then(|| sales_fact::detail_sql(&begin, &end, &predicates, DETAIL_ROWS));
     let sales_context = scalar.then(|| with(&begin, &end, sales_fact::CONTEXT_METRICS));
     // route 与合同装配器同款：direct-agg（`land` 按它走 verified 信任级）
-    Some(DirectHit { sql, route: "direct-agg".into(), prev, comparisons, detail, sales_context })
+    Some(DirectHit {
+        outcome: DirectOutcome::Data,
+        sql,
+        route: "direct-agg".into(),
+        prev,
+        comparisons,
+        detail,
+        sales_context,
+        intent_evidence: Default::default(),
+    })
 }
 
 /// Router 有序表 = `ROUTER_ORDER` **七位齐全**，一位都不许换：
@@ -1581,7 +1724,6 @@ fn router<'a>(
     detect: DetectFn,
     compose_hit: HitFn,
     direct_hit: HitFn,
-    correctors: &'a dyn Correctors,
     sc_samples: usize,
 ) -> Vec<Box<dyn Answerer + 'a>> {
     vec![
@@ -1596,7 +1738,7 @@ fn router<'a>(
         // 生产 DMS 只做兜底点查：单表、索引条件、小 LIMIT、2 秒超时；分析查询不走此路。
         Box::new(crate::answerers::business_lookup::BusinessLookupAnswerer::new()),
         Box::new(CacheAnswerer::new(embed.clone(), is_followup)),
-        Box::new(LlmAnswerer::borrowed(embed.clone(), correctors, sc_samples)),
+        Box::new(LlmAnswerer::borrowed(embed.clone(), sc_samples)),
     ]
 }
 
@@ -1679,7 +1821,21 @@ async fn rewrite_followup(
     // 缺 SQL 段），否则用户一路被反问死。无锚点的（政策/制度轮）维持跳过：没有口径可
     // 继承时改写纯属自由发挥。
     let hist_sql = prev_sql.map(str::trim).filter(|s| looks_like_sql(s));
-    if hist_sql.is_none() && crate::answerers::entity::company_span(prev_q).is_none() {
+    // 上一轮没有 SQL 时能不能改写，看的是**这一轮追问要什么**，不是上一轮长什么样：
+    // - 追问自带时间窗或指标（「上月呢」「销量呢」）→ 它要的是数据口径，而上一轮
+    //   （知识库/政策轮）根本没有口径可继承，改写就是自由发挥 → 维持跳过；
+    // - 追问只是换话题/指代（「那出差呢」「怎么申请」「它多久」）→ 要继承的只是**主题**，
+    //   提示词第 5 条已经把它钉死（只继承上一问明确出现的实体或主题，不得补造指标/时间/筛选）。
+    //
+    // 此前这里是一张「它/这个/那个/该/此」5 词表 —— 用户不说指代词就整轮跳过，
+    // 于是**知识库的追问必然丢上下文**（「报销标准是什么」→「那出差呢」拿碎片去检索）。
+    // 词表补丁换成判据本身：换个说法就失效的规则不是规则（2026-08-13 审计）。
+    let wants_data_caliber = dms_kernel::nl::time::time_predicate(question).is_some()
+        || !crate::run::sales_contract_metrics(question).is_empty();
+    if hist_sql.is_none()
+        && crate::answerers::entity::company_span(prev_q).is_none()
+        && (wants_data_caliber || prev_q.trim().is_empty())
+    {
         return question.to_string();
     }
     let system = "#角色：你是数据分析产品经理，负责把口语化的追问补全成可独立理解的取数问题。\n\
@@ -1687,7 +1843,8 @@ async fn rewrite_followup(
                   #规则：1. 只输出改写后的问题本身，不要解释、不要引号、不要输出 SQL；\
                   2. 上一轮 SQL 里的表、时间列与过滤条件就是上一轮的口径，追问没有另行指定时一律沿用；\
                   3. 追问本身已经完整则原样输出；\
-                  4. 时间词一律沿用自然说法（本月/上月/今年/全年），绝不展开成具体日期——展开错了就是错口径。";
+                   4. 时间词一律沿用自然说法（本月/上月/今年/全年），绝不展开成具体日期——展开错了就是错口径；\
+                   5. 上一轮没有 SQL 时，只继承上一问明确出现的实体或主题，不得补造数据指标、时间或筛选口径。";
     let refs_section = refs_section_of(refs);
     // SQL 段缺席时一字不多（与 refs 段同一纪律）；在场时与既有文案逐字一致（多轮题集钉着）
     let sql_section = match hist_sql {
@@ -1754,7 +1911,12 @@ async fn rewrite_followup(
             // 症状是选源打偏、召回打偏、问句里多几百字噪音，全程零报错零告警。
             // 判据与上面「上一轮素材是不是一条 SQL」**共用 `looks_like_sql`**，
             // 两处各写一份的话改一处忘另一处不会红。
-            if rewritten.is_empty() || looks_like_sql(&rewritten) {
+            let explicit_slots = crate::intent::reinterpret_coverage(question, &rewritten, None);
+            if rewritten.is_empty() || looks_like_sql(&rewritten) || !explicit_slots.complete() {
+                if !explicit_slots.complete() {
+                    tracing::warn!(original = question, candidate = rewritten, coverage = ?explicit_slots,
+                        "追问改写丢失本轮显式槽位 → 原样放行");
+                }
                 question.to_string()
             } else {
                 rewritten
@@ -1837,35 +1999,8 @@ mod tests {
         fn no_rel(_q: &str) -> Option<Relation> {
             None
         }
-        struct NoFix;
-        impl Correctors for NoFix {
-            fn schema_check<'a>(&'a self, _c: &'a AskCtx<'a>, _s: &'a str) -> crate::run::Fix<'a> {
-                Box::pin(async { Ok(None) })
-            }
-            fn fix_select_fields(&self, _s: &str) -> Option<String> {
-                None
-            }
-            fn dedup_select_fields(&self, _s: &str) -> Option<String> {
-                None
-            }
-            fn fix_group_by(&self, _s: &str) -> Option<String> {
-                None
-            }
-            fn correct_agg<'a>(&'a self, _c: &'a AskCtx<'a>, _s: &'a str) -> crate::run::Fix<'a> {
-                Box::pin(async { Ok(None) })
-            }
-            fn correct_caliber<'a>(&'a self, _c: &'a AskCtx<'a>, _s: &'a str) -> crate::run::Fix<'a> {
-                Box::pin(async { Ok(None) })
-            }
-            fn correct_value<'a>(&'a self, _c: &'a AskCtx<'a>, _s: &'a str) -> crate::run::Fix<'a> {
-                Box::pin(async { Ok(None) })
-            }
-            fn fix_time_lower_bound(&self, _s: &str) -> Option<String> {
-                None
-            }
-        }
-        let (embed, fix) = (EmbedClient::new("http://127.0.0.1:8077"), NoFix);
-        let r = router(&embed, no_rel, no_hit, no_hit, &fix, 1);
+        let embed = EmbedClient::new("http://127.0.0.1:8077");
+        let r = router(&embed, no_rel, no_hit, no_hit, 1);
         let labels: Vec<&str> = r.iter().map(|a| a.route()).collect();
         assert_eq!(
             labels,
@@ -1936,47 +2071,16 @@ mod tests {
     const PREV_SQL: &str = "SELECT SUM(o.total_amount) FROM t_sales_order o \
                             WHERE o.order_time >= '2026-07-01' AND o.deleted_flag = 0";
 
-    /// 🔴 **意图判据的两侧**（业主报的准确度问题）。
-    ///
-    /// 🔴 反问的**调用点**必须在 LLM 入口，不许回到 `ask()` 开头。
-    ///
-    /// 这条判据的由来是实测回归：第一版放在 `ask()` 里、Router 之前，
-    /// 一次回归跑出 `C01-单号直查`/`F01-图` 两红 + `H01/H02/H03` 三个红线题失去输入。
-    /// 那类错误单元测试抓不到（`need_intent_reply` 自己的逻辑是对的，**位置**错了），
-    /// 所以只能扫源码钉位置。
+    /// Ready Data 在 `prepare_question` 已经完成一次结构化意图判定；
+    /// LLM 执行入口只保留破坏性安全门，不再调第二套三词分类器。
     #[test]
-    fn ask_back_is_wired_at_the_llm_entry_not_before_the_router() {
-        // ① `ask()`（Router 遍历那一层）里不许有调用
-        let ask_src = include_str!("ask.rs");
-        let calls: Vec<&str> = ask_src
-            .lines()
-            .filter(|l| l.contains("need_intent_reply("))
-            .filter(|l| {
-                let t = l.trim();
-                // 排除注释、定义行，以及**本判据自己**（它引用这个名字时一定带引号：
-                // 既在 `.contains("…")` 里，也在 panic 文案里）。带引号的真实调用会被漏掉，
-                // 但 Rust 里调用点行上出现字符串字面量的写法这里不存在。
-                !t.starts_with("//") && !t.contains("async fn ") && !t.contains('"')
-            })
-            .collect();
-        assert!(
-            calls.is_empty(),
-            "ask.rs 里出现了 need_intent_reply 的调用：{calls:?}
-             它必须只在 run::run_llm 里被调用 —— 放在 Router 之前会拦掉单号直查/图/红线题"
-        );
-
-        // ② `run.rs` 里必须有，且在**任何一次 run_once 之前**（= LLM 干活之前）
+    fn ready_data_has_no_second_intent_classifier() {
+        let ask_prod = include_str!("ask.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!ask_prod.contains(concat!("need_intent_", "reply(")));
+        assert!(!ask_prod.contains(concat!("ai_query_is_", "actionable(")));
         let run_src = include_str!("run.rs");
-        let call = run_src
-            .find(concat!("crate::ask::need_intent_", "reply("))
-            .expect("run.rs 里没有 need_intent_reply 的调用 —— 反问功能整条掉线了");
-        let first_work = run_src
-            .find("run_once(cx, d,")
-            .expect("run.rs 变形了：找不到 run_once 调用，本判据的锚点失效（签名带温度后是 `run_once(cx, d,`）");
-        assert!(
-            call < first_work,
-            "need_intent_reply 在 run.rs 里的位置晚于第一次 run_once —— 那样已经付了一次 LLM 调用才反问"
-        );
+        assert!(run_src.contains("prepared_data_safety_reply"));
+        assert!(!run_src.contains(concat!("ai_query_is_", "actionable(")));
     }
 
     /// 【A17 ①】日期继承的接线判据：改写后无时间词 + 上一轮有 ⇒ 必须调
@@ -1986,10 +2090,10 @@ mod tests {
     fn date_inheritance_is_wired_after_rewrite() {
         let src = include_str!("ask.rs");
         let body = src
-            .split(concat!("pub async fn ask", "("))
+            .split(concat!("pub async fn prepare_", "question("))
             .nth(1)
-            .expect("ask 没了")
-            .split(concat!("let one = |q: String|"))
+            .expect("prepare_question 没了")
+            .split(concat!("/// 完整问答链"))
             .next()
             .unwrap();
         assert!(body.contains("rewrite_followup"), "改写没了");
@@ -1998,60 +2102,6 @@ mod tests {
         let rw = body.find("rewrite_followup").unwrap();
         let ih = body.find("time_phrase_of").unwrap();
         assert!(rw < ih, "继承必须在改写之后（先改写丢词、再继承补回）");
-    }
-
-    /// `need_intent_reply` 的 IO 那半（查 `meta.metric`）无库测不了，所以把**判据本身**
-    /// 拆成纯逻辑在这里判：`hits.is_empty() && has_residue(...)`。
-    /// 这两个条件缺任一个都会出事：
-    /// - 少了 `hits.is_empty()` → 「嗨肉今年销售额」也被反问（那句今天是**对的**，1446315.81）
-    /// - 少了 `has_residue` → 「本月」「昨天」这类纯时间词问句被反问，
-    ///   而那一族本来由 `agg_template` 接得住
-    #[test]
-    fn intent_check_needs_both_conditions() {
-        use dms_kernel::nl::lexicon::STRIP_WORDS;
-        let residue = |q: &str| dms_kernel::nl::text::has_residue_with(q, &[], STRIP_WORDS);
-        // ① 裸实体名：剥完仍有实义残留 ⇒ 配上「零指标命中」就该反问
-        for q in ["嗨肉", "线下-嗨肉(上海)食品有限公司", "南京苏宇食品有限公司"] {
-            assert!(residue(q), "裸实体名该判成有残留：{q}");
-        }
-        // ② 纯时间词：剥完为空 ⇒ **不许**反问（`agg_template` 那一族靠它）
-        for q in ["本月", "今天", "上个月", "今年", "本月的"] {
-            assert!(!residue(q), "纯时间词不许被判成缺意图：{q}");
-        }
-        // ⚠️ 「上个月**呢**」剥完剩一个「呢」⇒ 会被判成缺意图。**那是对的**：
-        // 首问只说「上个月呢」本来就没有意图（有上一轮时 `rewrite_followup` 已经把它
-        // 补成完整问句，到这里已经带指标了）。我第一版把它列进 ② 当场红 ——
-        // 断言写错了，不是代码错。
-        //
-        // 顺带记一笔真事实：`STRIP_WORDS` 里**没有语气词**（呢/吗/了/总共/一共），
-        // 那 5 个只在 `direct.rs::agg_strip_words()` 里 —— 统一词表那一轮特意保留的差异。
-        // 补进 kernel 是安全的（纯语气词不可能是实体名的一部分），但会动
-        // `word_lists_are_stable` 的长度锁与全仓残留守卫，属独立一笔。
-        assert!(residue("上个月呢"), "「呢」不在 STRIP_WORDS 里 —— 这条钉住那个现状");
-        // ③ 带指标的问句：`residue` 仍为真（「嗨肉」是残留），
-        //    所以**只能**靠「指标命中非空」那一半救它 —— 这一条就是在钉住
-        //    「两个条件必须 AND」这件事，删掉任一个都会让这族问句被误拦。
-        assert!(
-            residue("嗨肉今年销售额是多少"),
-            "带指标的问句剥完也有残留 —— 所以判据必须同时看指标命中，不能只看残留"
-        );
-        // ④ 🔴 第三个条件（疑问词）的两侧。实测补的：只有 ①② 时
-        //    「今年审核通过的对账单有多少笔」被误判成缺意图 —— 它意图明确，
-        //    只是「对账单数」不在声明指标里。那一族被反问比让 LLM 去查更坏。
-        //    词表直接引 `ASKING` 本体（抄第二份必漂 —— 本文件 337-338 行注释自己写明过）
-        let asking = |q: &str| ASKING.iter().any(|w| q.contains(w));
-        for q in [
-            "今年审核通过的对账单有多少笔",
-            "被驳回的开票申请有哪些",
-            "昨天下单的有那些客户",
-            "各省份的设备台数分布",
-            "本月销量最高的商品",
-        ] {
-            assert!(asking(q), "有疑问词的问句不许被反问（用户问得很清楚）：{q}");
-        }
-        for q in ["嗨肉", "线下-嗨肉(上海)食品有限公司", "南京苏宇食品有限公司"] {
-            assert!(!asking(q), "裸实体名不该含疑问词：{q}");
-        }
     }
 
     #[test]
@@ -2090,6 +2140,28 @@ mod tests {
 
     /// 反问的 route 标签必须**独立于 `llm`**：判官脚本要能把「缺意图」与「LLM 答错」分开钉。
     /// 而返 0 行两者都会 —— 那正是这个 bug 最坏的一层（分不开）。
+    /// 🔴 一条子问失败不许整轮 422：用户连另一条已经查出来的结果都看不到，是最伤的降级。
+    /// 判据打源码：这条路径要跑起来得整套 deps（LLM/PG/MySQL），而它的形态本身是可判的。
+    #[test]
+    fn typed_compound_degrades_instead_of_failing_the_round() {
+        let src = include_str!("ask.rs");
+        let prod = src.split("
+#[cfg(test)]").next().unwrap();
+        let body = prod
+            .split("if routed.len() > 1 {")
+            .nth(1)
+            .expect("typed 复合分支没了")
+            .split("
+    }")
+            .next()
+            .unwrap();
+        assert!(!body.contains("one(question.clone()).await?"), "一条失败就整轮上抛：{body}");
+        assert!(body.contains("join_all"), "子问必须并行（串行等于白等）：{body}");
+        assert!(body.contains("missing_note"), "失败的子问必须点名，不许静默丢：{body}");
+        assert!(body.contains("intent_summary = Some"), "容器要填合同，否则前端整块空白");
+        assert!(!body.contains("trust = Some"), "容器没跑 SQL，编凭证就是假收据");
+    }
+
     #[test]
     fn need_intent_has_its_own_route_label() {
         assert_eq!(NEED_INTENT, "need-intent");
@@ -2114,6 +2186,81 @@ mod tests {
         assert!(vague.view.interact.drill.is_empty(), "{:?}", vague.view.interact.drill);
     }
 
+    /// 🔴 意图合同拿不到时走**确定性兜底**，不是直接反问（`AGENT-ARCHITECTURE §3.1` 原话：
+    /// 「已有确定性路径仍可尝试，但只能标记为 review」）。
+    ///
+    /// 由来：fast 模型偶发吐 `mode=unknown`，同一句「潍坊程祥商贸有限公司，本月的数据」
+    /// 问三次得到 反问 / 实体卡 / 实体卡（2026-08-13 实测）。同题不同答比答错更伤信任。
+    /// 分档必须保住：Knowledge/Hybrid 仍直接澄清（数据成员回答不了文档问题，硬答就是编）。
+    #[test]
+    fn unknown_intent_falls_back_to_deterministic_members_not_a_question_card() {
+        let src = include_str!("ask.rs");
+        let body = src
+            .split("pub async fn ask_prepared(")
+            .nth(1)
+            .expect("ask_prepared 改名了")
+            .split("
+async fn ")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("IntentRoute::Unknown => true"),
+            "Unknown 不再走确定性兜底 —— 模型一次抖动就把答得出的题变反问：{body}"
+        );
+        assert!(
+            body.contains("IntentRoute::Knowledge => {"),
+            "Knowledge 必须仍走澄清，不许被数据成员硬答：{body}"
+        );
+        // Hybrid 已收进 agent 执行（`hybrid::run` 两路并行），不再与 Knowledge 同走澄清 ——
+        // 但它**只能**由 hybrid 编排出手，不许落进下面的确定性兜底档。
+        assert!(
+            body.contains("crate::hybrid::run(d, p, prepared, explicit_ds)"),
+            "Hybrid 没有走 agent 的编排：CLI/判官与 HTTP 又会行为相反：{body}"
+        );
+        assert!(
+            body.contains(r#"m.route() != "llm""#),
+            "兜底档必须摘掉自由 SQL 成员（没有合同不许生成新 SQL 形态）：{body}"
+        );
+        // 一个成员都没接住时回澄清卡而不是 bail 成 500
+        let single = src.split("async fn ask_single(").nth(1).expect("ask_single 改名了");
+        assert!(
+            single.contains(r#"!members.iter().any(|m| m.route() == "llm")"#),
+            "兜底档全 miss 时会 bail 成 500：{single}"
+        );
+    }
+
+
+    /// 🔴 候选问法拿**实体名本体**拼，不拿整句拼 —— 否则点一次长一截。
+    ///
+    /// 生产截图（2026-08-13）：「小虎青菜香菇薄皮包子420g 的信息 和 拆单标准」出反问卡，
+    /// 三个候选是整句 + 尾巴；点「…的订单明细」后新一轮的候选变成
+    /// 「… 的订单明细 的订单明细」，越点越离谱。
+    #[test]
+    fn entity_chips_are_built_from_the_entity_name_not_the_whole_question() {
+        // 多子句问句：剥不成裸名字 → 一个模板候选都不给（候选交给 clarify_options 与自填框）
+        let r = intent_reply("小虎青菜香菇薄皮包子420g 的信息 和 拆单标准", Instant::now(), vec![]);
+        assert!(
+            r.view.interact.drill.is_empty(),
+            "半句话不许当实体名拼模板：{:?}",
+            r.view.interact.drill
+        );
+        // 裸商品名：模板三问照给，且拼的是名字本体
+        let bare = intent_reply("小虎青菜香菇薄皮包子420g", Instant::now(), vec![]);
+        assert_eq!(bare.view.interact.drill.len(), 3);
+        for chip in &bare.view.interact.drill {
+            assert!(chip.starts_with("小虎青菜香菇薄皮包子420g "), "{chip}");
+            assert_eq!(chip.matches("的订单明细").count() <= 1, true, "尾词重复：{chip}");
+        }
+        // 已经是模板问法时再出卡，不能在它后面再叠一层同族尾词
+        for chip in &intent_reply("小虎青菜香菇薄皮包子420g的订单明细", Instant::now(), vec![])
+            .view
+            .interact
+            .drill
+        {
+            assert!(!chip.contains("的订单明细 的"), "尾词叠加：{chip}");
+        }
+    }
+
     /// 「主题未接入」的回答：route 独立、文案明说「还没有接入数据」+ 列能问的主题、
     /// drill 给确定能答的入口题；sql 恒空（**不走 SQL 试探**是这条 route 的存在理由）。
     #[test]
@@ -2133,60 +2280,6 @@ mod tests {
         // 主题词缺席时就着原问句说，不编造
         let r2 = no_topic_reply("本月的积分情况", "", Instant::now(), vec![]);
         assert!(r2.caliber_note.unwrap().contains("本月的积分情况"));
-    }
-
-    /// 三词协议解析：answer / clarify / unsupported[|主题]，其余一律 None（降级本地规则）。
-    #[test]
-    fn gate_verdict_parser_only_accepts_the_protocol_words() {
-        assert_eq!(parse_gate_verdict("answer"), Some(GateVerdict::Answer));
-        assert_eq!(parse_gate_verdict("`ANSWER`"), Some(GateVerdict::Answer));
-        assert_eq!(parse_gate_verdict("clarify"), Some(GateVerdict::Clarify));
-        assert_eq!(
-            parse_gate_verdict("unsupported|积分"),
-            Some(GateVerdict::Unsupported("积分".into()))
-        );
-        // 全角竖线、主题带引号、只回单词（主题缺席 = 空串，不编造）
-        assert_eq!(
-            parse_gate_verdict("unsupported｜「会员等级」"),
-            Some(GateVerdict::Unsupported("会员等级".into()))
-        );
-        assert_eq!(parse_gate_verdict("unsupported"), Some(GateVerdict::Unsupported(String::new())));
-        // 弯引号/书名号同样剥（与改写结果的剥法对齐）
-        assert_eq!(
-            parse_gate_verdict("unsupported|“会员等级”。"),
-            Some(GateVerdict::Unsupported("会员等级".into()))
-        );
-        // 答非所问一律 None
-        assert_eq!(parse_gate_verdict("answer because"), None);
-        assert_eq!(parse_gate_verdict("可以查询"), None);
-        // 多行输出只取首行（解释不是协议，但首行的判定词仍然有效 —— 与「只输出一个词」的协议对齐）
-        assert_eq!(
-            parse_gate_verdict("unsupported|积分\n因为积分是会员体系"),
-            Some(GateVerdict::Unsupported("积分".into()))
-        );
-        assert_eq!(parse_gate_verdict("answer\n因为问题已经足够明确"), Some(GateVerdict::Answer));
-    }
-
-    /// 覆盖兜底判据的两侧（纯函数）：每条逃逸护一族真实问句，删一条就有一族被误拦。
-    #[test]
-    fn hold_back_only_uncovered_targetless_questions() {
-        // 拦截：注册表零覆盖 + 有残留 + 无疑问词/关系词/单据形（「积分」族）
-        assert!(hold_back_uncovered("本月的积分情况", false));
-        assert!(hold_back_uncovered("积分", false));
-        // 逃逸①：注册表有覆盖（指标/维度/术语命中）→ 放行
-        assert!(!hold_back_uncovered("本月的积分情况", true));
-        assert!(!hold_back_uncovered("本月活动费用", true), "指标名逐字命中 → covered=true 放行");
-        // 反向（防恒真）：同一问句零覆盖时确实会被扣住 —— 这就是「积分」族的拦截形态
-        assert!(hold_back_uncovered("本月活动费用", false), "零覆盖 + 无疑问词 → 扣住（保守侧）");
-        // 逃逸②：无疑义残留（纯时间词）→ 放行
-        assert!(!hold_back_uncovered("本月", false));
-        // 逃逸③：疑问词（意图明确，只是指标没声明）→ 放行
-        assert!(!hold_back_uncovered("今年审核通过的对账单有多少笔", false));
-        // 逃逸④：关系词（「退货」是数仓里有的事件，词表别名搭不上字面条）→ 放行
-        assert!(!hold_back_uncovered("本月的退货情况", false));
-        // 逃逸⑤：单据/表名形 → 放行
-        assert!(!hold_back_uncovered("帮我查下 HJXH-DXO2026072300384", false));
-        assert!(!hold_back_uncovered("t_sales_order 现在是什么结构", false));
     }
 
     /// 反问候选的解析判据：剥序号、认全/半角竖线、滤垃圾行、去重、去掉与原问句相同的项；
@@ -2217,7 +2310,7 @@ mod tests {
         assert_eq!(got[0].question, "嗨肉本月销售额", "{got:?}");
     }
 
-    /// 顺序假模型：按队列逐次出回复（第一次 = 意图判定，第二次 = 候选生成），`None` = 该次调用失败。
+    /// 顺序假模型：按队列逐次出回复，`None` = 该次调用失败。
     struct Seq {
         replies: std::sync::Mutex<std::collections::VecDeque<Option<&'static str>>>,
     }
@@ -2240,49 +2333,13 @@ mod tests {
         }
     }
 
-    fn lazy_pg() -> PgPool {
-        // lazy 池不发连接：Some(false) 这条路不碰 DB（PG 挂了也不许影响反问）
-        PgPool::connect_lazy("postgres://127.0.0.1:1/dms").unwrap()
-    }
-
-    /// 🔴 fast 判含糊 → 反问带结构化候选；候选生成挂了/回垃圾 → 空数组（= 纯文本反问，行为兼容）。
-    #[tokio::test]
-    async fn clarify_options_attach_when_fast_judges_clarify_and_degrade_on_failure() {
-        let pg = lazy_pg();
-        // ① 判含糊 + 候选正常 → clarify_options 上线
-        let ok = Seq::of(&[Some("clarify"), Some("销售表现|嗨肉本月销售额\n订单明细|嗨肉本月的订单明细")]);
-        let r = need_intent_reply(&ok, &|_| {}, &pg, "dms", "嗨肉", Instant::now())
-            .await
-            .expect("判含糊必须反问");
+    #[test]
+    fn prepared_data_safety_stops_destructive_requests_without_a_model() {
+        let r = prepared_data_safety_reply("删除所有订单", Instant::now())
+            .expect("破坏性词必须终止执行");
         assert_eq!(r.route, NEED_INTENT);
-        assert_eq!(r.clarify_options.len(), 2, "{:?}", r.clarify_options);
-        let j = serde_json::to_value(&r).unwrap();
-        assert_eq!(j["clarify_options"][0]["label"], "销售表现");
-        // ② 判含糊 + 候选生成失败 → 空数组降级，整键不上线（与引入前逐字等价）
-        let down = Seq::of(&[Some("clarify"), None]);
-        let r = need_intent_reply(&down, &|_| {}, &pg, "dms", "嗨肉", Instant::now())
-            .await
-            .expect("判含糊必须反问");
-        assert!(r.clarify_options.is_empty());
-        assert!(serde_json::to_value(&r).unwrap().get("clarify_options").is_none());
-        // ③ 判含糊 + 候选回垃圾 → 同样空数组
-        let garbage = Seq::of(&[Some("clarify"), Some("我无法理解这个问题")]);
-        let r = need_intent_reply(&garbage, &|_| {}, &pg, "dms", "嗨肉", Instant::now())
-            .await
-            .unwrap();
-        assert!(r.clarify_options.is_empty(), "{:?}", r.clarify_options);
-    }
-
-    /// 🔴 破坏性词的反问**一次 LLM 都不许调**（不为红线问句生成候选问法）。
-    #[tokio::test]
-    async fn destructive_intent_reply_never_calls_the_model() {
-        let pg = lazy_pg();
-        let m = Seq::of(&[]);
-        let r = need_intent_reply(&m, &|_| {}, &pg, "dms", "删除所有订单", Instant::now())
-            .await
-            .expect("破坏性词必须反问");
-        assert!(r.clarify_options.is_empty());
-        assert!(m.replies.lock().unwrap().is_empty(), "红线问句不该消费任何回复");
+        assert!(r.sql.is_empty() && r.rows.is_empty());
+        assert!(prepared_data_safety_reply("本月销售额是多少", Instant::now()).is_none());
     }
 
     /// 🔴 破坏性词的**词边界**（纯函数）：英文词内的子串（"dropdown"/"waterdrop"）不得误判红线，
@@ -2310,56 +2367,6 @@ mod tests {
         assert!(!note.contains(&"长".repeat(REFS_FRAG_MAX_CHARS + 1)), "{note}");
     }
 
-    /// topic system 的主题清单必须与 `KNOWN_TOPICS` 同源 —— 硬编码第二份清单已经漂过一次。
-    #[test]
-    fn topic_system_lists_every_known_topic() {
-        let s = topic_system();
-        for t in KNOWN_TOPICS {
-            assert!(s.contains(t), "topic system 漏了主题 {t}：{s}");
-        }
-    }
-
-    /// 🔴 Fast 判定是精简模式的**统一入口**：所有确定性路由未命中、走到 LLM 兜底的
-    /// 问句都先过它；本地明确性规则（指标召回/残留/疑问词）只在 Fast 失败时降级兜底。
-    /// 顺序错了就是「模型抖动把清楚问句误成澄清」或「快路径烧两次模型」。
-    #[test]
-    fn fast_gate_precedes_local_fallback_rules() {
-        let src = include_str!("ask.rs");
-        let body = src
-            .split("pub(crate) async fn need_intent_reply(")
-            .nth(1)
-            .expect("need_intent_reply 没了")
-            .split("fn intent_reply(")
-            .next()
-            .unwrap();
-        let destructive = body.find("destructive_hit(question)").expect("缺红线词门");
-        let fast = body
-            .find("ai_query_is_actionable(llm, on_usage, question)")
-            .expect("缺 Fast 判定调用");
-        let recall = body.find("recall_metric_hits").expect("缺指标召回降级");
-        let asking = body.find("if ASKING.iter().any").expect("缺疑问词降级");
-        assert!(
-            destructive < fast && fast < recall && recall < asking,
-            "顺序必须是 红线词 → Fast 判定 → 指标召回 → 疑问词降级：{body}"
-        );
-        // Fast 三态分支齐全：answer 放行 / clarify 反问 / unsupported 主题未接入 / None 才走本地降级
-        assert!(
-            body.contains("Some(GateVerdict::Answer)")
-                && body.contains("Some(GateVerdict::Clarify)")
-                && body.contains("Some(GateVerdict::Unsupported")
-                && body.contains("None => {}"),
-            "Fast 四态分支不完整：{body}"
-        );
-        // 🔴 ②b 覆盖兜底的接线：answer 分支里必须先过 `registry_hit` + `hold_back_uncovered`
-        // 才放行（`return None`）—— 删掉这道，「积分」族又回到「fast 说能答就去猜 SQL」。
-        let answer_arm = body.find("Some(GateVerdict::Answer)").unwrap();
-        let answer_body = &body[answer_arm..];
-        let pass_through = answer_body.find("return None;").expect("answer 分支缺放行");
-        let cover = answer_body.find("crate::triage::registry_hit(pg, ds, question)").expect("缺覆盖兜底调用");
-        let hold = answer_body.find("hold_back_uncovered(question, covered)").expect("缺覆盖兜底判据");
-        assert!(cover < hold && hold < pass_through, "覆盖兜底必须在放行之前：{answer_body}");
-    }
-
     /// 🔴 呈现中文化的**接线**判据：`ask()` 的 `one` 闭包必须在 `ask_single` 之后过
     /// `localize_result` —— 那是七条路由（含复合子问、生产点查）共用的唯一出口。
     /// 改名/翻译的逻辑判据全在纯函数侧（`localize.rs` / `present_cn.rs` 的单测），
@@ -2371,7 +2378,7 @@ mod tests {
             .split("let one = |q: String|")
             .nth(1)
             .expect("one 闭包没了")
-            .split("if let Some(r) = compound::try_compound")
+            .split("结构化意图是唯一拆分合同")
             .next()
             .expect("one 闭包边界没了");
         let single = body.find("ask_single(&cx, members)").expect("缺 ask_single 调用");
@@ -2379,75 +2386,6 @@ mod tests {
             .find("localize_result(&cx")
             .expect("缺呈现中文化收口 —— 英文列名/状态码会原样透出到前端");
         assert!(single < loc, "localize 必须在 ask_single 之后（译的是它产出的结果）");
-    }
-
-    #[test]
-    fn destructive_words_are_kept_out_of_ai_rescue() {
-        let src = include_str!("ask.rs");
-        let guard = src.find(concat!("const DESTR", "UCTIVE")).expect("缺破坏性词门");
-        let ai = src.find("ai_query_is_actionable(llm, on_usage, question)").expect("缺 AI 理解调用");
-        assert!(guard < ai, "破坏性词必须在 AI 理解放行之前拦住");
-        for word in ["删除", "清空", "drop", "truncate", "update "] {
-            assert!(src[guard..ai].contains(word), "红线词未纳入前置门：{word}");
-        }
-        assert!(!src[guard..ai].contains("\"新增\""), "新增客户数是分析语义，不能按写操作拦截");
-        let asking = src.find("if ASKING.iter().any").expect("缺明确问句门");
-        assert!(guard < asking, "红线门必须早于疑问词放行，否则“删除哪些”会绕过");
-    }
-
-    #[tokio::test]
-    async fn lite_ai_understanding_is_bounded_and_fail_closed() {
-        let answer = Fake::new(Some("answer"));
-        assert_eq!(
-            ai_query_is_actionable(&answer, &|_| {}, "长才保温柜裸机 DHT150-6").await,
-            Some(GateVerdict::Answer)
-        );
-        assert_eq!(answer.calls(), 1);
-        let prompt = answer.prompt();
-        assert!(prompt.contains("客户、商品、型号、单据、人员"), "提示词必须覆盖业务实体：{prompt}");
-        assert!(prompt.contains("具体实体名称本身也代表查看该实体总览"), "裸实体必须由 Fast 模型判为可查询：{prompt}");
-        assert!(!prompt.to_ascii_lowercase().contains("select "), "理解层不许诱导生成 SQL：{prompt}");
-        // 三词协议：主题清单进 prompt（判据参照）+ unsupported 的用法与「拿不准答 answer」的方向约束
-        assert!(prompt.contains("已接入的数据主题只有"), "主题清单必须进 prompt：{prompt}");
-        assert!(prompt.contains("unsupported|主题词"), "{prompt}");
-        assert!(prompt.contains("拿不准主题是否已接入时输出 answer"), "unsupported 误判方向必须写死：{prompt}");
-
-        let clarify = Fake::new(Some("clarify"));
-        assert_eq!(ai_query_is_actionable(&clarify, &|_| {}, "这个呢").await, Some(GateVerdict::Clarify));
-
-        let unsupported = Fake::new(Some("unsupported|积分"));
-        assert_eq!(
-            ai_query_is_actionable(&unsupported, &|_| {}, "本月的积分情况").await,
-            Some(GateVerdict::Unsupported("积分".into()))
-        );
-
-        let down = Fake::new(None);
-        assert_eq!(ai_query_is_actionable(&down, &|_| {}, "某个陌生词").await, None);
-    }
-
-    /// 🔴 fast 判 unsupported → 「主题未接入」回答：route = no-topic、文案点名主题、
-    /// 候选围绕**已接入**主题生成（用第二包 system）；候选生成失败 → drill 兜底入口题仍在。
-    #[tokio::test]
-    async fn unsupported_topic_reply_never_probes_sql() {
-        let pg = lazy_pg();
-        // ① 判 unsupported + 候选正常 → no-topic + 结构化候选
-        let ok = Seq::of(&[Some("unsupported|积分"), Some("销售表现|本月销售额是多少\n库存现状|现在总库存量是多少")]);
-        let r = need_intent_reply(&ok, &|_| {}, &pg, "dms", "本月的积分情况", Instant::now())
-            .await
-            .expect("判 unsupported 必须直接回答");
-        assert_eq!(r.route, NO_TOPIC);
-        assert!(r.sql.is_empty(), "no-topic 不许带 SQL（不走试探）");
-        assert_eq!(r.clarify_options.len(), 2, "{:?}", r.clarify_options);
-        let note = r.caliber_note.unwrap();
-        assert!(note.contains("积分") && note.contains("还没有接入数据"), "{note}");
-        // ② 判 unsupported + 候选生成失败 → drill 兜底入口题仍在，回答照常成立
-        let down = Seq::of(&[Some("unsupported|积分"), None]);
-        let r = need_intent_reply(&down, &|_| {}, &pg, "dms", "本月的积分情况", Instant::now())
-            .await
-            .unwrap();
-        assert_eq!(r.route, NO_TOPIC);
-        assert!(r.clarify_options.is_empty());
-        assert_eq!(r.view.interact.drill.len(), 4, "兜底入口题不许丢");
     }
 
     /// 🔴 改写的四条降级路：没有上一轮 / 不是追问 → **一次 LLM 都不调**；
@@ -2533,6 +2471,74 @@ mod tests {
         let out2 = rewrite_followup(&f2, &|_| {}, "上月呢？", Some(("报销政策是什么", None, &[], &[]))).await;
         assert_eq!(out2, "上月呢？");
         assert_eq!(f2.calls(), 0);
+    }
+
+    /// 🔴 知识库追问必须继承主题：判据看「这一轮要什么」，不看用户有没有说指代词。
+    ///
+    /// 此前是「它/这个/那个/该/此」5 词表 —— 用户说「那出差呢」（不含表内任何词）就整轮
+    /// 跳过改写，拿碎片去检索 ⇒ **知识库的追问结构上必然丢上下文**（2026-08-13 审计）。
+    #[tokio::test]
+    async fn knowledge_topic_followup_inherits_the_previous_topic() {
+        let f = Fake::new(Some("出差费用的报销标准是什么"));
+        let out = rewrite_followup(
+            &f,
+            &|_| {},
+            "那出差呢？",
+            Some(("报销标准是什么", None, &[], &[])),
+        )
+        .await;
+        assert_eq!(out, "出差费用的报销标准是什么");
+        assert_eq!(f.calls(), 1, "换话题式追问必须真的调一次改写");
+
+        // 反向：追问自带时间窗 → 上一轮没有口径可继承，维持跳过（与政策轮那条同一判据）
+        let f2 = Fake::new(Some("随便"));
+        let out2 = rewrite_followup(&f2, &|_| {}, "上月呢？", Some(("报销标准是什么", None, &[], &[]))).await;
+        assert_eq!(out2, "上月呢？");
+        assert_eq!(f2.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_kb_reference_rewrites_without_previous_sql() {
+        let f = Fake::new(Some("美的烤箱保修期多久"));
+        let out = rewrite_followup(
+            &f,
+            &|_| {},
+            "它多久",
+            Some(("美的烤箱保修期", None, &[], &[])),
+        )
+        .await;
+        assert_eq!(out, "美的烤箱保修期多久");
+        assert_eq!(f.calls(), 1, "明确指代词应允许从知识问答轮继承主题");
+    }
+
+    #[tokio::test]
+    async fn followup_rewrite_preserves_the_current_explicit_region() {
+        let wrong = Fake::new(Some("山东省本月销售额"));
+        let rejected = rewrite_followup(
+            &wrong,
+            &|_| {},
+            "那江苏呢",
+            Some(("山东省本月销售额", Some(PREV_SQL), &[], &[])),
+        )
+        .await;
+        assert_eq!(rejected, "那江苏呢", "候选丢失本轮江苏必须 fail closed");
+
+        let right = Fake::new(Some("江苏省本月销售额"));
+        let accepted = rewrite_followup(
+            &right,
+            &|_| {},
+            "那江苏呢",
+            Some(("山东省本月销售额", Some(PREV_SQL), &[], &[])),
+        )
+        .await;
+        assert_eq!(accepted, "江苏省本月销售额");
+    }
+
+    #[test]
+    fn ready_execution_never_calls_the_legacy_compound_splitter() {
+        let production = include_str!("ask.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains(concat!("compound::try_", "compound(")));
+        assert!(production.contains("if routed.len() > 1"));
     }
 
     /// 🔴 改写提示词必须**带上一轮那条 SQL**，且六段槽位齐全。
@@ -2688,19 +2694,27 @@ mod tests {
     #[test]
     fn typo_normalization_is_wired_after_rewrite_before_source_pick() {
         let src = include_str!("ask.rs");
-        let body = src
-            .split(concat!("pub async fn ask", "("))
+        let prepare = src
+            .split(concat!("pub async fn prepare_", "question("))
             .nth(1)
-            .expect("ask 没了")
-            .split("let one = |q: String|")
+            .expect("prepare_question 没了")
+            .split(concat!("/// 完整问答链"))
             .next()
             .unwrap();
-        let rw = body.find("rewrite_followup").expect("改写没了");
-        let inherit = body.find("time_phrase_of").expect("日期继承没了");
-        let norm =
-            body.find(concat!("normalize_", "typos(&rewritten)")).expect("ask 入口没接错别字归一");
-        let pick = body.find("select_source").expect("选源没了");
-        assert!(rw < norm && inherit < norm && norm < pick, "归一必须在改写/继承之后、选源之前：{body}");
+        let rw = prepare.find("rewrite_followup").expect("改写没了");
+        let inherit = prepare.find("time_phrase_of").expect("日期继承没了");
+        let norm = prepare
+            .find(concat!("normalize_", "typos(&rewritten)"))
+            .expect("prepare_question 没接错别字归一");
+        let execute = src
+            .split(concat!("pub async fn ask_", "prepared("))
+            .nth(1)
+            .expect("ask_prepared 没了");
+        assert!(execute.contains("select_source"), "选源没了");
+        assert!(
+            rw < norm && inherit < norm,
+            "归一必须在改写/继承之后：{prepare}"
+        );
     }
 
     /// 【问题 2】值词残留提取：剥指标词/虚词后剩下的整串才是候选过滤值。
@@ -2836,7 +2850,7 @@ mod tests {
             .split("let one = |q: String|")
             .nth(1)
             .expect("one 闭包没了")
-            .split("if let Some(r) = compound::try_compound")
+            .split("结构化意图是唯一拆分合同")
             .next()
             .expect("one 闭包边界没了");
         let single = one.find("ask_single(&cx, members)").expect("ask_single 调用没了");
@@ -2864,7 +2878,7 @@ mod tests {
     #[test]
     fn unavailable_card_mark_mirrors_direct_rs() {
         const MARK: &str = "'不可计算' AS `数据状态`";
-        let direct = include_str!("../../server/src/direct.rs");
+        let direct = include_str!("answerers/fastpath_tests.rs");
         assert!(
             direct.contains(MARK),
             "direct.rs 的卡投影头变了 —— 本镜像识别串同步失效，重理解层会静默不触发"
@@ -2952,6 +2966,30 @@ mod tests {
         assert!(!validate_reinterpret("本月的数据", "本月的经营情况", true), "「本月的」只有 3 字锚点");
     }
 
+    #[test]
+    fn reinterpret_validation_protects_region_time_product_and_breakdown_slots() {
+        let intent = crate::intent::parse_intent(
+            r#"{"mode":"data","goals":["查库存"],"metrics":["库存量"],"entity_mentions":[{"surface":"小虎黑椒味烤肠500G","kind":"product"}],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":true,"ambiguities":[]}"#,
+        )
+        .unwrap();
+        assert!(!validate_reinterpret_with_intent(
+            "小虎黑椒味烤肠500G的库存信息",
+            "库存信息",
+            true,
+            Some(&intent),
+        ));
+        assert!(!validate_reinterpret(
+            "山东省 2026-08-10 至 2026-08-11 销售额按照商品统计",
+            "销售额",
+            false,
+        ));
+        assert!(validate_reinterpret(
+            "山东省 2026-08-10 至 2026-08-11 销售额度按照商品统计",
+            "山东 2026-08-10 到 2026-08-11 销售额按商品",
+            false,
+        ));
+    }
+
     /// 合同模板候选（纯函数）：只用问句自己命中的合同维度 + 恒在的标量总览；
     /// 失败句与原句不许再推荐；时间词继承问句表面词。
     #[test]
@@ -2981,21 +3019,37 @@ mod tests {
     async fn reinterpret_question_rewrites_validates_and_fails_closed() {
         let ok = Fake::new(Some("销售额按省份按商品"));
         assert_eq!(
-            reinterpret_question(&ok, &|_| {}, "销售额度按照省份按照商品", true).await.as_deref(),
+            reinterpret_question(&ok, &|_| {}, "销售额度按照省份按照商品", true, None)
+                .await
+                .as_deref(),
             Some("销售额按省份按商品")
         );
         // 模型拿不准原样返回 → None（= 没改，调用方回落原卡）
         let same = Fake::new(Some("销售额度按照省份按照商品"));
-        assert_eq!(reinterpret_question(&same, &|_| {}, "销售额度按照省份按照商品", true).await, None);
+        assert_eq!(
+            reinterpret_question(&same, &|_| {}, "销售额度按照省份按照商品", true, None).await,
+            None
+        );
         // 模型挂了 → None
         let boom = Fake::new(None);
-        assert_eq!(reinterpret_question(&boom, &|_| {}, "销售额度按照省份按照商品", true).await, None);
+        assert_eq!(
+            reinterpret_question(&boom, &|_| {}, "销售额度按照省份按照商品", true, None).await,
+            None
+        );
         // 模型吐了 SQL → None
-        let sql = Fake::new(Some("SELECT SUM(amount) FROM sales_dw.dws_off_offline_sale_dfn"));
-        assert_eq!(reinterpret_question(&sql, &|_| {}, "销售额度按照省份按照商品", true).await, None);
+        let sql = Fake::new(Some(
+            "SELECT SUM(amount) FROM sales_dw.dws_off_offline_sale_dfn",
+        ));
+        assert_eq!(
+            reinterpret_question(&sql, &|_| {}, "销售额度按照省份按照商品", true, None).await,
+            None
+        );
         // 指标漂移 → None（销售额被改成纯毛利）
         let drift = Fake::new(Some("本月毛利按省份"));
-        assert_eq!(reinterpret_question(&drift, &|_| {}, "销售额度按照省份按照商品", true).await, None);
+        assert_eq!(
+            reinterpret_question(&drift, &|_| {}, "销售额度按照省份按照商品", true, None).await,
+            None
+        );
     }
 
     /// 归一的用量必须进 `on_usage`（K6-B 同一本账：查询日志 token 列不能少算这一次）；
@@ -3007,10 +3061,10 @@ mod tests {
             usages.fetch_add(1, Ordering::SeqCst);
         };
         let ok = Fake::new(Some("销售额按省份按商品"));
-        reinterpret_question(&ok, &count, "销售额度按照省份按照商品", true).await;
+        reinterpret_question(&ok, &count, "销售额度按照省份按照商品", true, None).await;
         assert_eq!(usages.load(Ordering::SeqCst), 1, "归一成功必须报一次用量");
         let boom = Fake::new(None);
-        reinterpret_question(&boom, &count, "销售额度按照省份按照商品", true).await;
+        reinterpret_question(&boom, &count, "销售额度按照省份按照商品", true, None).await;
         assert_eq!(usages.load(Ordering::SeqCst), 1, "失败没有 usage，不该回调");
     }
 
@@ -3053,7 +3107,7 @@ mod tests {
             .split("let one = |q: String|")
             .nth(1)
             .expect("one 闭包没了")
-            .split("if let Some(r) = compound::try_compound")
+            .split("结构化意图是唯一拆分合同")
             .next()
             .expect("one 闭包边界没了");
         let single = one.find("ask_single(&cx, members)").expect("ask_single 调用没了");
@@ -3072,5 +3126,213 @@ mod tests {
         assert!(one.contains("reinterpret_note"), "命中透出没了");
         // 重试抡硬失败的回落：首轮的 Err 原样上抛、重试抡的 Err 回落首张卡
         assert!(one.contains(concat!("first_", "card")), "重试抡失败回落没了 —— 重试 Err 会把原卡顶成 500");
+    }
+
+    // ── 路由裁决（`decide`）─────────────────────────────────────────────────────
+    //
+    // 这一组测试守的是本仓最贵的一类事故：**同一句话在不同入口/不同采样得到不同答案**。
+
+    /// 造一份 Ready 合同。`mode` 之外的槽位按需给，其余空。
+    fn contract(question: &str, mode: crate::intent::IntentMode, metrics: &[&str]) -> crate::intent::IntentAttempt {
+        let intent = crate::intent::IntentV1 {
+            version: 2,
+            mode,
+            metrics: metrics.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        crate::intent::IntentAttempt::validated(intent, question)
+    }
+
+    /// 🔴 R1：要文件的问句，**合同说什么都不影响裁决**。
+    ///
+    /// 业主实测：同一句「下载 押金转货款申请书」，容器 CLI 返 `route=knowledge`，
+    /// HTTP 深度模式返 38 行账余充值明细 + 一整页深度 BI —— 因为路由此前的唯一输入
+    /// 是一次 fast 采样的 `mode` 字段，两次采样两条路。这条测试把「两次采样同一条路」
+    /// 钉成会红的断言。
+    #[test]
+    fn a_document_request_routes_the_same_whatever_the_contract_says() {
+        let q = "下载 押金转货款申请书";
+        let attempts = [
+            contract(q, crate::intent::IntentMode::Data, &[]),
+            contract(q, crate::intent::IntentMode::Knowledge, &[]),
+            crate::intent::IntentAttempt::Unavailable,
+            crate::intent::IntentAttempt::Invalid,
+        ];
+        for a in attempts {
+            let plan = decide(q, &a, None);
+            assert_eq!(plan.route, crate::intent::IntentRoute::Knowledge, "{a:?} 把要文件的问句判去了别处");
+            assert_eq!(plan.deliverable, Deliverable::Document);
+            assert!(plan.deterministic);
+            assert_eq!(plan.reason, "doc-request");
+        }
+    }
+
+    /// 🔴 fail-closed：确定性规则**不得让没有合同的问句进入自由 SQL 生成**。
+    ///
+    /// 注意这**不是**「确定性规则不许判 Data」—— 单号点查就是一条确定性 Data 规则，
+    /// 而且必须有：业主实测发一个裸 `CZ202608131914` 过去，合同判 Unknown，
+    /// 于是走知识库兜底，被一份讲「账余记录」的文档答掉了。
+    ///
+    /// 真正的护栏与 route 无关：`LlmAnswerer::accept` 恒等于 `is_data_executable()`，
+    /// 合同没 Ready 时自由 SQL 那一路结构上不接单。两件事一起钉。
+    #[test]
+    fn deterministic_rules_never_open_free_sql() {
+        // ① 确定性 Data 只许有一个理由：单号点查。多出任何一条都要在这里显形。
+        for q in [
+            "下载 押金转货款申请书",
+            "把设备管理办法.pdf发我",
+            "线下设备申请政策",
+            "本月报销制度",
+            "客户合同模板发我一份",
+            "CZ202608131914",
+            "HJXH-DXO2026081300138 这单什么状态",
+        ] {
+            for a in [
+                contract(q, crate::intent::IntentMode::Data, &[]),
+                crate::intent::IntentAttempt::Unavailable,
+            ] {
+                let plan = decide(q, &a, None);
+                if plan.deterministic && plan.route == crate::intent::IntentRoute::Data {
+                    assert_eq!(
+                        plan.reason, "code-lookup",
+                        "「{q}」多了一条确定性问数规则：确认它不会绕过合同闸再放行"
+                    );
+                }
+            }
+        }
+        // ② 自由 SQL 的闸门还在原处
+        assert!(
+            include_str!("run.rs").contains("cx.intent_attempt.is_data_executable()"),
+            "LlmAnswerer 的合同闸没了 —— 确定性 Data 车道会开出自由 SQL"
+        );
+    }
+
+    /// 🔴 裸单号必须走问数，且**不许**先去问知识库。
+    ///
+    /// 业主实测 `CZ202608131914` / `HJXH-DXO2026081300138` 都被知识库接走，
+    /// 返回「该订单号未出现在任何资料中」——用户要查单，系统在翻制度文档。
+    #[test]
+    fn a_bare_document_code_is_always_a_data_lookup() {
+        for q in [
+            "CZ202608131914",
+            "HJXH-DXO2026081300138",
+            "HJXH-DXO2026081300138 这单什么状态",
+        ] {
+            let plan = decide(q, &crate::intent::IntentAttempt::Unavailable, None);
+            assert_eq!(plan.route, crate::intent::IntentRoute::Data, "「{q}」没走问数");
+            assert!(plan.deterministic);
+            assert_eq!(plan.reason, "code-lookup");
+        }
+        // 「单号」这个**词**不算：口径问句不许被判成点查
+        let q = "账余记录单号是什么意思";
+        assert_ne!(decide(q, &crate::intent::IntentAttempt::Unavailable, None).reason, "code-lookup");
+    }
+
+    /// R2：资料/政策问句不再吃澄清卡；带指标的问句一条都不许被抢走。
+    #[test]
+    fn topic_questions_go_to_the_kb_but_metrics_still_win() {
+        // 有文档名词、无可度量槽位 → 知识库（合同哪怕说 data 也救回来）
+        let q = "线下设备申请政策";
+        let plan = decide(q, &contract(q, crate::intent::IntentMode::Data, &[]), None);
+        assert_eq!(plan.route, crate::intent::IntentRoute::Knowledge);
+        assert_eq!(plan.deliverable, Deliverable::Answer);
+        assert_eq!(plan.reason, "doc-topic");
+
+        // 合同抽到了指标 → 归问数，一个字都不许改
+        let q = "本月合同金额多少";
+        let plan = decide(q, &contract(q, crate::intent::IntentMode::Data, &["合同金额"]), None);
+        assert_eq!(plan.route, crate::intent::IntentRoute::Data);
+        assert!(!plan.deterministic);
+        assert_eq!(plan.reason, "contract");
+    }
+
+    /// R2 不许压掉 Hybrid：模型明确说「这句里有两件事」时，把它压成单路就是丢掉数据半。
+    #[test]
+    fn a_hybrid_contract_survives_the_document_noun() {
+        // Hybrid 必须由 **subgoals** 承载：只把顶层 `mode` 写成 hybrid、不给子任务，
+        // `route()` 落的是 `Unknown`（`route_from_subgoals` 拿不到两侧就往下走）。
+        let q = "查一下最近的设备订单，并且最近的线下设备政策";
+        let plan = decide(q, &hybrid(q, Some("最近"), "最近的设备订单", "最近的线下设备政策"), None);
+        assert_eq!(plan.route, crate::intent::IntentRoute::Hybrid, "R2 把真混合问句压成了单路：数据半会被丢掉");
+        assert_eq!(plan.reason, "contract");
+    }
+
+    /// 🔴 数据半**空槽**的 Hybrid 要降级 —— 业主 2026-08-14 实测的那 200 行垃圾。
+    ///
+    /// 「客户打款 退款政策」：合同劈成 data=「客户打款」+ knowledge=「退款政策」。
+    /// 数据半没有指标、没有时间 —— 它不是一道能算的题。照跑的后果是
+    /// `t_customer_balance` 上 200 行账余充值明细 + 口径复核不通过，
+    /// 而同一句话在合同判 knowledge 的那次答得很好（引用 6 条）。
+    #[test]
+    fn a_hybrid_with_an_empty_data_half_is_downgraded_to_knowledge() {
+        let q = "客户打款 退款政策";
+        let plan = decide(q, &hybrid(q, None, "客户打款", "退款政策"), None);
+        assert_eq!(
+            plan.route,
+            crate::intent::IntentRoute::Knowledge,
+            "空槽的数据半还在跑：用户要政策，会拿到 200 行账余明细"
+        );
+        assert!(plan.deterministic);
+        assert_eq!(plan.reason, "doc-topic");
+    }
+
+    /// 造一份 Hybrid 合同：`data_time` 给数据半的时间槽位（`None` = 数据半空槽）。
+    /// 两个 surface 必须是问句原文的子串，否则 grounding 会把整份合同判掉。
+    fn hybrid(
+        question: &str,
+        data_time: Option<&str>,
+        data_surface: &str,
+        kb_surface: &str,
+    ) -> crate::intent::IntentAttempt {
+        let sub = |mode, surface: &str, time: Option<&str>| crate::intent::IntentSubgoal {
+            mode,
+            surface: surface.to_string(),
+            time: time.map(|t| crate::intent::TimeSlot {
+                surface: t.to_string(),
+                start: "2026-08-01".into(),
+                end: "2026-08-14".into(),
+                grain: "day".into(),
+            }),
+            ..Default::default()
+        };
+        let intent = crate::intent::IntentV1 {
+            version: 2,
+            mode: crate::intent::IntentMode::Hybrid,
+            subgoals: vec![
+                sub(crate::intent::IntentMode::Data, data_surface, data_time),
+                sub(crate::intent::IntentMode::Knowledge, kb_surface, None),
+            ],
+            ..Default::default()
+        };
+        crate::intent::IntentAttempt::validated(intent, question)
+    }
+
+    /// R0：用户自己点的 chip 最大，一个信号都不许翻它。
+    #[test]
+    fn a_forced_chip_wins_over_every_signal() {
+        let q = "下载 押金转货款申请书";
+        let plan = decide(q, &crate::intent::IntentAttempt::Unavailable, Some(crate::intent::IntentRoute::Data));
+        assert_eq!(plan.route, crate::intent::IntentRoute::Data);
+        assert_eq!(plan.reason, "forced");
+    }
+
+    /// 🔴 裁决只有**一处**：入口不许再直接读合同的 `route()`。
+    ///
+    /// 五套入口各写一份分派，正是「修一处、从第五处复发」的成因；`PreparedQuestion::route()`
+    /// 是它们共同的唯一读法，绕开它就是又长出第六份判据。
+    #[test]
+    fn routing_has_exactly_one_decision_point() {
+        let src = include_str!("ask.rs");
+        let prod = src.split(concat!("\n#[cfg", "(test)]")).next().unwrap();
+        // `plan()` 是唯一构造点，`route()` 只转发它
+        assert!(
+            prod.contains("pub fn route(&self) -> crate::intent::IntentRoute {\n        self.plan().route\n    }"),
+            "PreparedQuestion::route 又直接读合同了 —— 确定性信号会被绕过"
+        );
+        assert_eq!(
+            prod.matches("fn decide(").count(),
+            1,
+            "`decide` 有了第二份实现：两份判据必漂"
+        );
     }
 }

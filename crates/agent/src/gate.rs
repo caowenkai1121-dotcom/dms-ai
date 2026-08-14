@@ -31,11 +31,12 @@ pub const GUARD: GuardConfig = GuardConfig::new(MAX_ROWS, dms_semantic::registry
 /// 新增生产业务点查 answerer 的唯一 SQL 入口。它不做行级权限注入；调用方仍必须先按 DMS
 /// 账号算出允许访问的编码，并把该编码作为精确 WHERE 条件。登录鉴权的 `fixed()` 查询不走这里。
 pub fn gate_dms_lookup(sql: &str, policy: &DmsLookupPolicy) -> anyhow::Result<DmsLookupSql> {
-    dms_kernel::sql::dms_lookup::gate_dms_lookup_with(
+    dms_kernel::sql::dms_lookup::gate_dms_lookup_registered_with(
         sql,
         &dms_kernel::MysqlDialect,
         GUARD.sensitive_cols,
         policy,
+        &dms_connector::dms_lookup::REGISTRY,
     )
     .map_err(anyhow::Error::new)
 }

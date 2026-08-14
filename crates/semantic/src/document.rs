@@ -15,6 +15,7 @@ pub enum DocumentKind {
     ShopReturn,
     Voucher,
     StockAdjustment,
+    CustomerBalance,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +175,20 @@ const VOUCHER_BIND: &[(&str, &str)] = &[("t_voucher_detail", "voucher_code")];
 const ADJ_BIND: &[(&str, &str)] = &[("t_wms_adj_detail", "adjust_code")];
 const NONE: &[(&str, &str)] = &[];
 
+/// 账余充值单（`CZ` + 8 位日期 + 流水）。**只登记数仓侧**：生产 MySQL 是否有这张表
+/// 没有证据，登记一个证明不了的源就是给点查埋一个必然报错的分支。
+///
+/// 🔴 列名不是推的，是 2026-08-14 在生产上 `exec-sql` 逐列跑通的
+/// （`CZ202608131914` 在 `dms_ods.t_customer_balance.balance_code` 里查得到 1 行）。
+/// 明细表不登记：账余充值是**单头**单据，没有行明细。
+const BALANCE_DORIS: DocumentSource = DocumentSource {
+    header_table: "dms_ods.t_customer_balance",
+    header_code_cols: &["balance_code"],
+    header_projection: "balance_code, customer_code, balance_type, balance_status, pay_type, amount, balance, receipt_date, pay_account, pay_bank, pay_statement_no, created_time",
+    header_deleted_flag: true,
+    details: &[],
+};
+
 macro_rules! family {
     ($kind:ident, $code:literal, $name:literal, $prefixes:expr, $table:literal, $key:literal,
      $details:expr, $evidence:literal, $production:expr, $warehouse:expr) => {
@@ -203,6 +218,7 @@ pub const DOCUMENT_FAMILIES: &[DocumentFamily] = &[
     family!(ShopReturn, "shop_return", "门店退货单", &["SHOP_TH"], "t_shop_order_return_header", "order_no", SHOP_RETURN_BIND, "SHOP_TH 流水号；生产权限未证明", None, None),
     family!(Voucher, "voucher", "库存凭证单", &["PZ"], "t_voucher_header", "voucher_code", VOUCHER_BIND, "PZ 流水号；生产权限未证明", None, None),
     family!(StockAdjustment, "stock_adjustment", "库存调整单", &["SHOP_TZ"], "t_wms_adj_header", "adjust_code", ADJ_BIND, "SHOP_TZ 流水号；生产权限未证明", None, None),
+    family!(CustomerBalance, "customer_balance", "账余充值单", &["CZ"], "t_customer_balance", "balance_code", NONE, "生产实测：CZ202608131914 在 dms_ods.t_customer_balance.balance_code 命中 1 行（2026-08-14）", None, Some(&BALANCE_DORIS)),
 ];
 
 #[derive(Debug)]
@@ -235,6 +251,9 @@ pub fn resolve_code(raw: &str, warehouse: bool) -> Option<ResolvedDocument> {
     else if local_shape(&code, "SHOP_TH") { DocumentKind::ShopReturn }
     else if local_shape(&code, "PZ") { DocumentKind::Voucher }
     else if local_shape(&code, "SHOP_TZ") { DocumentKind::StockAdjustment }
+    // `CZ` + 8 位日期 + 3~12 位流水。用 `dated_serial` 而不是 `numeric`：后者会把任何
+    // CZ 开头的长数字串都收进来，而这一族的形就是带日期的（业主实测 CZ202608131914）。
+    else if dated_serial(&code, "CZ", 3, 12) { DocumentKind::CustomerBalance }
     else { return None };
     resolved(code, kind)
 }

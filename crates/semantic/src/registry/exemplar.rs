@@ -15,10 +15,21 @@ use std::collections::HashSet;
 /// few-shot 语料：trgm 相似历史问答（返回 `(question, sql)`，最多 2 条，最相似在前）。
 /// 只用人工确认且在当前只读业务源真实执行通过的高质量语料。
 /// ds 谓词不可省：别的源的 SQL 当范例 = 把不存在的表名教给 LLM。
+/// few-shot 的相似度下限。
+///
+/// 没有它时 `ORDER BY … DESC LIMIT 8` 会把**完全不相干**的语料当 top2 塞进 prompt
+/// （问句只要非空就一定有人中选）——「报销政策是什么」也会被配上两条销售额 SQL 示例，
+/// 模型被示例带着往取数上写。示例的作用是「同类问法长这样」，不同类就不该出现。
+///
+/// 0.15 是保守值：中文 trigram 的 `word_similarity` 普遍偏低（同族问法常在 0.3-0.6），
+/// 这条闸只砍「一个词都不沾」的那批。调它要连带看 `tools/regression.py` 的 LLM 路题。
+const FEWSHOT_MIN_SIMILARITY: f32 = 0.15;
+
 pub async fn fewshot(pg: &PgPool, ds: &str, question: &str) -> Vec<(String, String)> {
     let rows: Vec<(String, String)> = sqlx::query_as(&format!(
         "SELECT question, sql FROM meta.sql_exemplar
-         WHERE question != $1 AND status = 'enabled' AND validation_status = 'valid'{ds_pred}
+         WHERE question != $1 AND status = 'enabled' AND validation_status = 'valid'
+           AND word_similarity($1, question) >= {FEWSHOT_MIN_SIMILARITY}{ds_pred}
          ORDER BY word_similarity($1, question) DESC LIMIT 8",
         ds_pred = ds_pred(2)
     ))
@@ -190,8 +201,8 @@ pub async fn suggest_questions(pg: &PgPool, ds: &str, limit: i64) -> Vec<String>
 }
 
 /// 语料沉淀（`status=pending` 待复核）。返回是否**新插入**——调用方靠它决定要不要起复核/存向量。
-pub async fn save(pg: &PgPool, ds: &str, question: &str, sql: &str) -> bool {
-    save_with_context(pg, ds, question, sql, "", "").await
+pub async fn save(pg: &PgPool, who: (&str, &str), ds: &str, question: &str, sql: &str) -> bool {
+    save_with_context(pg, who, ds, question, sql, "", "").await
 }
 
 /// 【A10】同构沉淀：连当轮的 schema 段（`schema_snapshot`）与口径卡（`side_info`）一起存。
@@ -199,31 +210,47 @@ pub async fn save(pg: &PgPool, ds: &str, question: &str, sql: &str) -> bool {
 /// 空串与旧行为逐字等价（`save` 就是两个空串调过来的）。
 pub async fn save_with_context(
     pg: &PgPool,
+    // `who` = (批次号, 操作者)：批次粒度钉死为「一轮问答 / 一次复核批」，不是会话。
+    // 🔴 空批次号写进账本 = **这条学习永远撤不回来**：`recent_batches` 的谓词是
+    // `batch_id <> ''`（管理员那张台账此前恒空），而 rollback 传空串又能撤光全部历史。
+    who: (&str, &str),
     ds: &str,
     question: &str,
     sql: &str,
     schema_snapshot: &str,
     side_info: &str,
 ) -> bool {
-    sqlx::query(
+    // 判官模式：观察系统不许改变系统（见 `registry::judge_mode`）
+    if super::judge_mode() {
+        return false;
+    }
+    // `RETURNING id`：账本要记下这一条的主键才撤得回来（`rows_affected` 撤不了具体哪一行）
+    let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO meta.sql_exemplar(question, sql, ds_id, schema_snapshot, side_info)
          SELECT $1, $2, $3, $4, $5
          WHERE NOT EXISTS (SELECT 1 FROM meta.sql_exemplar
-                           WHERE question = $1 AND ds_id = $3)",
+                           WHERE question = $1 AND ds_id = $3)
+         RETURNING id",
     )
     .bind(question)
     .bind(sql)
     .bind(ds)
     .bind(schema_snapshot)
     .bind(side_info)
-    .execute(pg)
+    .fetch_optional(pg)
     .await
-    .map(|r| r.rows_affected() > 0)
     .unwrap_or_else(|e| {
-        // PG 错误被当「已存在」会丢掉一次沉淀还零留痕（调用方据此跳过存向量）：warn 后再 false
         tracing::warn!(err = %e, "语料沉淀失败（按未插入处理）");
-        false
-    })
+        None
+    });
+    if let Some((id,)) = inserted {
+        super::learn::log_event(
+            pg, who.0, who.1, "meta.sql_exemplar", &id.to_string(), "insert", None,
+            Some(serde_json::json!({ "question": question })),
+        )
+        .await;
+    }
+    inserted.is_some()
 }
 
 /// 存问句向量（供语义缓存召回）。`qvec` 是 pgvector 字面量。
@@ -257,10 +284,13 @@ pub async fn set_embedding(pg: &PgPool, ds: &str, question: &str, qvec: &str) {
 /// 却照样返回「处理了 N 条」，运维看不出复核根本没生效。
 pub async fn set_status(
     pg: &PgPool,
+    // `who` = (批次号, 操作者)，见 `save_with_context`
+    who: (&str, &str),
     ds: &str,
     question: &str,
     status: &str,
 ) -> anyhow::Result<()> {
+    ledger_status_change(pg, who, ds, question, status).await;
     let affected = sqlx::query("UPDATE meta.sql_exemplar SET status = $1 WHERE question = $2 AND ds_id = $3")
         .bind(status)
         .bind(question)
@@ -275,10 +305,34 @@ pub async fn set_status(
     Ok(())
 }
 
+/// 语料状态变更的落账（两个写口共用）。**读前值 → 记一条 → 调用方再改**。
+///
+/// 读不到（问句打错/已删）就不记：账本里一条没有前值的 update 撤不回来，
+/// 记了反而给回滚一条假线索。落账失败只 warn —— 账本是观测面，学习是主路（模块头纪律）。
+async fn ledger_status_change(pg: &PgPool, who: (&str, &str), ds: &str, question: &str, after: &str) {
+    // ds:any —— 按 (question, ds_id) 读回自己下一句就要改的那一行
+    let before: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM meta.sql_exemplar WHERE question = $1 AND ds_id = $2")
+            .bind(question)
+            .bind(ds)
+            .fetch_optional(pg)
+            .await
+            .unwrap_or(None);
+    let Some((old, )) = before else { return };
+    super::learn::log_event(
+        pg, who.0, who.1, "meta.sql_exemplar", question, "update",
+        Some(serde_json::json!({ "status": old })),
+        Some(serde_json::json!({ "status": after })),
+    )
+    .await;
+}
+
 /// AI 初筛只记录意见：positive 保持 pending 等人工+执行验证，negative 才禁用。
 /// AI 不是业务口径授权人，不能直接把样例送进 few-shot。
 pub async fn set_ai_review(
     pg: &PgPool,
+    // `who` = (批次号, 操作者)，见 `save_with_context`
+    who: (&str, &str),
     ds: &str,
     question: &str,
     opinion: &str,
@@ -286,6 +340,9 @@ pub async fn set_ai_review(
     // 入参白名单：`"negativ"` 这类 typo 不许静默归 positive 侧（按 pending 放行）
     anyhow::ensure!(matches!(opinion, "positive" | "negative"), "未知 AI 复核意见 {opinion:?}");
     let negative = opinion == "negative";
+    // 账本要**前值**才撤得回来（同 `set_lesson_status`：两条往返换一次可回滚，值得）。
+    // AI 初筛会把语料打成 disabled —— 判错了得能一键撤回，否则只能人工去库里翻。
+    ledger_status_change(pg, who, ds, question, if negative { "disabled" } else { "pending" }).await;
     sqlx::query(
         "UPDATE meta.sql_exemplar
          SET ai_review = $1,
@@ -342,61 +399,6 @@ pub async fn nearest(
     })
 }
 
-/// 存候选教训（复盘产物）：status='candidate' 不参与召回，复核启用后生效；同 trigger+lesson 去重
-pub async fn save_lesson_candidate(
-    pg: &PgPool,
-    ds: &str,
-    trigger_tables: &str,
-    lesson: &str,
-) -> bool {
-    sqlx::query(
-        "INSERT INTO meta.pitfall(kind, trigger_words, lesson, status, ds_id)
-         SELECT 'pitfall', $1, $2, 'candidate', $3
-         WHERE NOT EXISTS (SELECT 1 FROM meta.pitfall
-                           WHERE trigger_words = $1 AND lesson = $2 AND ds_id = $3)",
-    )
-    .bind(trigger_tables)
-    .bind(lesson)
-    .bind(ds)
-    .execute(pg)
-    .await
-    .map(|r| r.rows_affected() > 0)
-    .unwrap_or_else(|e| {
-        // 错误谎报「已存在」会丢教训还零留痕（与 save_with_context 同一修法）
-        tracing::warn!(err = %e, "候选教训落库失败（按未插入处理）");
-        false
-    })
-}
-
-/// 待复核的候选教训 `(id, trigger_words, lesson)`。
-pub async fn candidate_lessons(
-    pg: &PgPool,
-    limit: i64,
-) -> anyhow::Result<Vec<(i64, String, String)>> {
-    // 标记必须紧贴 SQL：漂移守卫的窗口只往上看 2 行（`query_log` 那次就是标记离太远假红）。
-    // ds:any —— 跨源管理批处理（复核所有源的候选教训），按 id 逐条更新，不需要 ds 谓词
-    Ok(sqlx::query_as(
-        "SELECT id, trigger_words, lesson FROM meta.pitfall WHERE status = 'candidate' ORDER BY id LIMIT $1",
-    )
-    .bind(limit.max(0)) // 负 limit PG 直接报错，夹紧
-    .fetch_all(pg)
-    .await?)
-}
-
-/// 候选教训的复核结论：`active`（进召回）/ `disabled`
-pub async fn set_lesson_status(pg: &PgPool, id: i64, status: &str) -> anyhow::Result<()> {
-    let affected = sqlx::query("UPDATE meta.pitfall SET status = $1 WHERE id = $2")
-        .bind(status)
-        .bind(id)
-        .execute(pg)
-        .await?
-        .rows_affected();
-    if affected == 0 {
-        tracing::warn!("候选教训复核落库 0 行（id={id} 未命中）");
-    }
-    Ok(())
-}
-
 /// 纠错反哺日志（引擎 B+）：校正器出手即记录，供同错累计升格 pitfall（自进化，不静默修）
 ///
 /// `trace_id` 是本轮新增（AX29）：`correction_log` / `failure_log` / `query_log` 三张表
@@ -438,6 +440,13 @@ mod tests {
     #[test]
     fn only_execution_validated_exemplars_are_recalled() {
         let src = include_str!("exemplar.rs");
+        // 🔴 few-shot 必须有相似度下限：没有它，问句只要非空就一定有两条语料被塞进 prompt，
+        // 「报销政策是什么」也会被配上销售额 SQL 示例，模型被示例带着往取数上写（2026-08-13 审计）。
+        let fewshot_body = src.split("pub async fn fewshot").nth(1).unwrap();
+        assert!(
+            fewshot_body.contains("word_similarity($1, question) >= "),
+            "few-shot 没有相似度下限：不相干语料会进 prompt：{fewshot_body}"
+        );
         for fn_name in ["pub async fn fewshot", "pub async fn suggest_questions", "pub async fn nearest"] {
             let body = src.split(fn_name).nth(1).expect("召回函数被改名").split("\n///").next().unwrap();
             assert!(body.contains("status = 'enabled'") && body.contains("validation_status = 'valid'"),

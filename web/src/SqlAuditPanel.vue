@@ -8,9 +8,10 @@ import { authHeaders, authTail, errMessage, errText } from './panel-utils'
  *  字段做宽容归一（items/rows/records、at/created_at、elapsed_ms/ms 都可），接口未上线/空体按内联提示处理。
  *  Esc/遮罩关闭；401 交回父组件走会话过期。抽屉形态与 App.vue 的 Trace 抽屉同款。 */
 interface CtxCard { kind: string; name?: string; chars: number }
-interface CtxTrim { kind: string; dropped: number; kept: number; names?: string[] }
+// 2026-08-14：后端把恒空的 trimmed / 恒 false 的 summary_used 换成了 degraded（真会发生的那个）——
+// 口径卡缺席时这里要看得见，它同时决定了那一行的 trust 会不会降 review。
 /** 【D7】本轮实际进 prompt 的上下文摘要（结构/尺寸/表名，无数据值）；老行/无摘要 = null */
-interface CtxSummary { prompt_chars: number; cards: CtxCard[]; trimmed: CtxTrim[]; summary_used: boolean }
+interface CtxSummary { prompt_chars: number; cards: CtxCard[]; degraded: string[] }
 interface AuditRow {
   id: string; at: string; user: string; route: string; status: string
   ms: number | null; sql: string; error: string
@@ -100,23 +101,13 @@ function normCtx(raw: unknown): CtxSummary | null {
     Array.isArray(x) ? x.filter((i): i is Record<string, unknown> => !!i && typeof i === 'object') : []
   return {
     prompt_chars: promptChars,
-    summary_used: o.summary_used === true,
+    degraded: Array.isArray(o.degraded) ? o.degraded.map(String) : [],
     cards: list(o.cards).map(c => ({
       kind: String(c.kind ?? ''),
       name: typeof c.name === 'string' ? c.name : undefined,
       chars: num(c.chars),
     })),
-    trimmed: list(o.trimmed).map(t => ({
-      kind: String(t.kind ?? ''),
-      dropped: num(t.dropped),
-      kept: num(t.kept),
-      names: Array.isArray(t.names) ? t.names.map(String) : undefined,
-    })),
   }
-}
-/** 被裁卡总数：trimmed 是按卡种分组的，每组带自己的 dropped，求和才是实际裁掉的卡数。 */
-function ctxDropped(ctx: CtxSummary): number {
-  return ctx.trimmed.reduce((sum, t) => sum + t.dropped, 0)
 }
 function fmtMs(ms: number | null): string {
   if (ms == null) return '—'
@@ -245,18 +236,14 @@ onBeforeUnmount(() => {
                   <details v-if="row.ctx" class="sa-ctx">
                     <summary>
                       本轮上下文 {{ row.ctx.prompt_chars }} 字符 · {{ row.ctx.cards.length }} 张卡
-                      <template v-if="row.ctx.trimmed.length"> · 裁掉 {{ ctxDropped(row.ctx) }} 项</template>
-                      <template v-if="row.ctx.summary_used"> · 含历史摘要</template>
+                      <template v-if="row.ctx.degraded.length"> · <span class="sa-ctx-warn">召回降级 {{ row.ctx.degraded.length }} 项</span></template>
                     </summary>
                     <ul class="sa-ctx-list">
                       <li v-for="(c, i) in row.ctx.cards" :key="i">
                         {{ ctxKindLabel(c.kind) }}<template v-if="c.name">·{{ c.name }}</template>
                         <span class="sa-ctx-chars">{{ c.chars }} 字</span>
                       </li>
-                      <li v-for="(t, i) in row.ctx.trimmed" :key="'t' + i" class="sa-ctx-trim">
-                        裁掉 {{ ctxKindLabel(t.kind) }} ×{{ t.dropped }}（留 {{ t.kept }}）
-                        <template v-if="t.names?.length">：{{ t.names.join('、') }}</template>
-                      </li>
+                      <li v-for="(d, i) in row.ctx.degraded" :key="'d' + i" class="sa-ctx-trim">⚠️ {{ d }}</li>
                     </ul>
                   </details>
                 </td>
@@ -318,4 +305,5 @@ onBeforeUnmount(() => {
 .sa-ctx-list { margin: 6px 0 2px; padding-left: 18px; max-height: 180px; overflow: auto; color: var(--text-regular); font-size: 11.5px; line-height: 1.8; }
 .sa-ctx-chars { margin-left: 6px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .sa-ctx-trim { color: var(--warning-text); }
+.sa-ctx-warn { color: var(--warning-text); font-weight: 600; }
 </style>

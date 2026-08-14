@@ -31,6 +31,18 @@ export function toNum(v: unknown): number | null {
   return null
 }
 
+/** 毛利率列判定：DWS 的毛利率合同值是 0~1 的 ratio，展示前必须 ×100。
+ *
+ *  🔴 **全仓唯一一份**。此前三处各写一份且判据不同：BiChart 用 `includes('毛利率')`（宽），
+ *  ResultPanel / App.vue 用 `=== '毛利率' || === '销售毛利率'`（窄）——
+ *  列名一旦是变体（平均毛利率 / 毛利率（%） / 品类毛利率），同一屏图表画成 19.6%、
+ *  KPI 卡与明细表显示 0.2%，而 SQL、行数、口径全对，没有任何判据会红（2026-08-13 审计）。
+ *  取宽的那份：窄判据漏的都是真毛利率列；而「汇率/频率/功率/倍率/速率」不含「毛利率」，
+ *  本来就不会命中。 */
+export function isGrossMarginLabel(label: string): boolean {
+  return label.replace(/\s+/g, '').includes('毛利率')
+}
+
 export function semanticForLabel(label: string): Semantic {
   // 标识列优先于指标词：例如“税率编码”“状态码”必须原样显示，不能被当百分比。
   if (/单号|编号|编码|代码|条码|状态(?:码)?$|区划码|身份证|手机号|电话|批次号|ID$/i.test(label)) return 'order'

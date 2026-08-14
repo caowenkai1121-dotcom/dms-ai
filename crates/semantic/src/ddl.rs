@@ -150,6 +150,45 @@ CREATE TABLE IF NOT EXISTS meta.memory(
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_memory_ds ON meta.memory(ds_id, id DESC);
+-- 🔴 经验的作用域维度。空串 = ds 级公有（沿用本仓「空 = 全局」的既有约定，老行零回填）。
+-- 自动蒸馏一律只写个人层：一个用户的修正经验此前会直接进**全员** prompt（跨用户污染，
+-- 与 I4 同一条防线）；升格到公有层只走人工复核通道。这也是「不同用户用出不同效果」的
+-- 数据模型地基 —— prime-agent 的 local/global 两层作用域同构（2026-08-13 调研）。
+ALTER TABLE meta.memory ADD COLUMN IF NOT EXISTS login_name text NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_memory_scope ON meta.memory(ds_id, login_name, id DESC);
+
+-- ─────────────────── 学习事件账本（自我进化的安全网）───────────────────
+-- 🔴 四个学习写口（sql_exemplar / memory / pitfall 候选 / pitfall 状态）此前**全是裸写**：
+-- 无前值、无批次号、无 actor。于是「上周二系统学了什么」「哪条教训把 E05 带红了」
+-- 「怎么撤掉这一批」三个问题只能连 PG 手写 SQL 逐表对时间戳（2026-08-13 审计）。
+--
+-- 形态借 prime-agent 的 refinement：**模型只提案，改状态的是确定性代码**，每条改动逐条记
+-- before/after，回滚是纯机械的倒序重放（不再调模型）。本仓更简单：没有模型提案环节，
+-- 写口本来就是确定性的，只缺账本。
+--
+-- `before` 为 NULL = 这条是新增（回滚即删除）；非 NULL = 更新（回滚即还原）。
+CREATE TABLE IF NOT EXISTS meta.learn_event(
+  id bigserial PRIMARY KEY,
+  at timestamptz NOT NULL DEFAULT now(),
+  -- 一次问答/一次复核内的所有学习写入共用一个批次号（trace_id 或人工批次）
+  batch_id text NOT NULL DEFAULT '',
+  -- 谁触发的：login_name（自动蒸馏 = 提问人）或 'review'/'admin'
+  actor text NOT NULL DEFAULT '',
+  target_table text NOT NULL,
+  target_id text NOT NULL DEFAULT '',
+  action text NOT NULL,
+  before jsonb,
+  after jsonb,
+  trace_id text NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_learn_batch ON meta.learn_event(batch_id, id);
+CREATE INDEX IF NOT EXISTS idx_learn_at ON meta.learn_event(at DESC);
+-- 回滚标记独立成列：原来是把 action 覆盖成 'rolled_back'，于是
+-- ①撤**失败**（PG 抖 / 目标行已被删）也照样标上 → 那一批从此永久撤不回来；
+-- ②连「这条当初是新增还是改状态」都查不出来了（action 被覆盖）。
+ALTER TABLE meta.learn_event ADD COLUMN IF NOT EXISTS rolled_back_at timestamptz;
+ALTER TABLE meta.learn_event ADD COLUMN IF NOT EXISTS rolled_back_by text NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS meta.sql_exemplar(
   id bigserial PRIMARY KEY,
   question text NOT NULL,

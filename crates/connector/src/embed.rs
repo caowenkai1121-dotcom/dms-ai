@@ -48,6 +48,18 @@ impl Breaker {
     }
 }
 
+/// 熔断是否**正在**生效（按模式分槽）。
+///
+/// 🔴 为什么要有读取口（2026-08-14）：`/api/health` 的 `vector_ready` 查的是
+/// **库里有没有向量列**，不是**服务通不通** —— 于是 embed 服务挂了 5 分钟，
+/// 健康检查一路绿，知识库照常返回「用剩下几路凑出来」的答案。
+/// 只读一个原子，不造熔断中间件、不加指标系统。
+impl EmbedClient {
+    pub fn cooling(&self, mode: EmbedMode) -> bool {
+        crate::now() < self.cooldown_until.slot(mode).load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub struct EmbedClient {
     url: String,
@@ -161,21 +173,12 @@ impl EmbedClient {
     ///
     /// 任一批失败即整篇返 `None`（调用方降级到文本检索，向量由 `embed_service.py revec` 后补）——
     /// 返回半份向量会让 `ingest.rs` 只写前几批却把 doc 推到 embedded。
-    pub async fn embed_passages(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
-        self.embed_batched(texts, EmbedMode::Passage).await
-    }
-
-    /// 问句侧批量（Query 模式）：向量自愈补**语料问句**用（`embed_service.py` 的
-    /// `embed(texts, is_query=True)` 同款 —— 同一列不许混两种模式的向量）。
-    /// 与 `embed_passages` 同分批、同「任一批失败整篇 None」；超时同样按条数预算 ——
-    /// 调用方是后台批任务（server/src/embed_fill.rs，一批 64 条），3s 恒额必超时熔断，
-    /// 正是上面 4s 批那族问题在 query 侧的复刻。用户侧单条 `embed_query` 仍保持 3s。
-    pub async fn embed_queries(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
-        self.embed_batched(texts, EmbedMode::Query).await
-    }
-
-    /// 批处理公共形态：按 `BATCH` 分批、任一批失败整篇 `None`、批量预算按条数。
-    async fn embed_batched(&self, texts: &[String], mode: EmbedMode) -> Option<Vec<Vec<f32>>> {
+    /// 批量向量化。**模式必须由调用方显式写出**：此前这里是 `embed_passages` /
+    /// `embed_queries` 两个同形包装，于是「随手挑那个批量的」就成了默认动作 ——
+    /// `gather.rs` 的问句切片正是这么拿 passage 向量去比 query 标定的阈值的
+    /// （STRICT=0.35 / LOOSE=0.5 / DS_MAX_DIST 全是拿 query 向量标的）。
+    /// 少两个函数，这个错就犯不出来。
+    pub async fn embed_batch(&self, texts: &[String], mode: EmbedMode) -> Option<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return None;
         }
@@ -312,7 +315,7 @@ mod tests {
     async fn empty_texts_short_circuits() {
         let c = EmbedClient::new("http://127.0.0.1:1");
         assert!(c.embed(&[], EmbedMode::Query).await.is_none());
-        assert!(c.embed_passages(&[]).await.is_none());
+        assert!(c.embed_batch(&[], EmbedMode::Passage).await.is_none());
     }
 
     /// 问句向量 memo：同文本第二次不再发 HTTP（一轮问答里同一问句被取多次），
@@ -384,7 +387,7 @@ mod tests {
     async fn passages_are_batched_by_64() {
         let (base, seen) = stub(std::time::Duration::ZERO, |n| n).await;
         let c = EmbedClient::new(&base);
-        let got = c.embed_passages(&texts(200)).await.expect("200 块必须能入库");
+        let got = c.embed_batch(&texts(200), EmbedMode::Passage).await.expect("200 块必须能入库");
         assert_eq!(got.len(), 200, "少返一条就等于那些块永远没有向量");
         assert_eq!(*seen.lock().unwrap(), vec![64, 64, 64, 8], "200 块 → 64/64/64/8 共 4 次");
     }
@@ -394,7 +397,7 @@ mod tests {
     async fn ten_passages_go_out_in_one_request() {
         let (base, seen) = stub(std::time::Duration::ZERO, |n| n).await;
         let c = EmbedClient::new(&base);
-        assert_eq!(c.embed_passages(&texts(10)).await.unwrap().len(), 10);
+        assert_eq!(c.embed_batch(&texts(10), EmbedMode::Passage).await.unwrap().len(), 10);
         assert_eq!(*seen.lock().unwrap(), vec![10], "10 块只该发 1 次");
     }
 
@@ -403,7 +406,7 @@ mod tests {
     async fn a_four_second_batch_neither_degrades_nor_trips_the_breaker() {
         let (base, seen) = stub(std::time::Duration::from_secs(4), |n| n).await;
         let c = EmbedClient::new(&base);
-        assert!(c.embed_passages(&texts(10)).await.is_some(), "4s 就返 None = doc 停在 chunked");
+        assert!(c.embed_batch(&texts(10), EmbedMode::Passage).await.is_some(), "4s 就返 None = doc 停在 chunked");
         assert_eq!(*seen.lock().unwrap(), vec![10]);
         assert_eq!(c.cooldown_until.passage.load(Ordering::Relaxed), 0, "慢一次不许把全 app 熔断 300s");
         // 问句侧的 3s 预算一个字没动（p50/p95 靠它）
@@ -415,7 +418,7 @@ mod tests {
     async fn short_response_degrades_instead_of_writing_half_the_vectors() {
         let (base, _) = stub(std::time::Duration::ZERO, |n| n - 1).await;
         let c = EmbedClient::new(&base);
-        assert!(c.embed_passages(&texts(3)).await.is_none());
+        assert!(c.embed_batch(&texts(3), EmbedMode::Passage).await.is_none());
         assert_eq!(c.cooldown_until.passage.load(Ordering::Relaxed), 0, "形状不符不熔断（对齐历史）");
     }
 

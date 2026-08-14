@@ -1,10 +1,16 @@
 /* 皇家小虎 · 数据智能 — 设计 tokens（复刻旧 V1 index.html 靛蓝主题，明暗双主题） */
 :root {
   --primary: #4051d3; --primary-hover: #3445bd; --primary-active: #2b3aa6;
+  /* 主色底上的前景色。亮色 #fff 达标；暗色主色 #7b89f0 上的 #fff 只有 3.14:1（23 处主按钮
+     与用户气泡全部不过 AA），故暗色改深色前景 —— 两边共用这一个 token。 */
+  --on-primary: #ffffff; --on-error: #ffffff;
   --primary-light: rgba(64,81,211,.08); --primary-bg: #eef0fc; --primary-rgb: 64,81,211;
   --brand-ink: linear-gradient(120deg,#1c2342 0%,#36418f 100%);
   --bg-body: #f3f5f9; --bg-card: #ffffff; --bg-sunken: #eaedf4; --bg-main: #f6f8fb; --bg-hover: #f0f3f9;
-  --text-primary: #10162b; --text-regular: #3f4760; --text-muted: #646d87; --text-faint: #8d95ad;
+  /* 🔴 对比度实测（WCAG，theme-contrast.test.ts 现算）：原 --text-faint #8d95ad 对 --bg-card
+     只有 2.99:1，连非文本的 3:1 都不过，而它被 89 处小字复用（KPI 基期/变化额、表格行号、
+     子任务验收断言……恰好是判断数字可不可信要读的那批）。muted 同步压深以保住三级层次。 */
+  --text-primary: #10162b; --text-regular: #3f4760; --text-muted: #545c76; --text-faint: #616a85;
   --border: #e2e6ef; --divider: #edf0f6;
   --success: #2b8a4b; --success-text: #1f7a3f; --success-bg: #ecf7ef;
   --warning-text: #99610a; --warning-bg: #fdf4e3;
@@ -16,19 +22,29 @@
   --shadow-md: 0 1px 2px rgba(23,30,60,.05),0 6px 18px rgba(23,30,60,.09);
   --shadow-lg: 0 12px 28px rgba(23,30,60,.12);
   --ring: 0 0 0 3px rgba(64,81,211,.18);
+  /* 遮罩与浮层底盘：此前 4 个不同的硬编码 rgba 散在 10 处，暗色下遮罩几乎无效
+     （rgba(17,24,39,.38) 盖在 #11141d 上等于没盖），弹窗与背景糊成一片。 */
+  --scrim: rgba(17,24,39,.38); --bg-elevated: #ffffff;
+  /* 原生控件（select 下拉、滚动条槽、日期控件）跟随主题的唯一开关 */
+  color-scheme: light;
 }
 :root[data-theme="dark"] {
   --primary: #7b89f0; --primary-hover: #93a0f5; --primary-active: #a9b4f8;
+  --on-primary: #11141d; --on-error: #1a0f10;
   --primary-light: rgba(123,137,240,.14); --primary-bg: rgba(123,137,240,.16); --primary-rgb: 123,137,240;
-  --brand-ink: linear-gradient(120deg,#161c33 0%,#2b3673 100%);
+  /* 🔴 原值对 --bg-card #1a1e2b 只有 1.01:1~1.49:1 —— 暗色下侧栏 logo 与深度页 KPI 顶条
+     是**隐形的**（它走 -webkit-text-fill-color: transparent）。新值实测 8.78:1 / 13.95:1。 */
+  --brand-ink: linear-gradient(120deg,#aeb8ff 0%,#e8ebf6 100%);
   --bg-body: #11141d; --bg-card: #1a1e2b; --bg-sunken: #141823; --bg-main: #151926; --bg-hover: #222738;
-  --text-primary: #e8ebf6; --text-regular: #c3c9dd; --text-muted: #8b93ad; --text-faint: #6b7390;
+  --text-primary: #e8ebf6; --text-regular: #c3c9dd; --text-muted: #a6aec7; --text-faint: #8a92ad;
   --border: #2c3247; --divider: #232838;
   --success-text: #6fcb8d; --success-bg: rgba(76,181,110,.14);
   --warning-text: #ecb96a; --warning-bg: rgba(224,162,62,.14);
   --error-text: #ec8f8f; --error-bg: rgba(224,106,106,.14); --error-ring: rgba(224,106,106,.3);
   --shadow-sm: 0 1px 2px rgba(0,0,0,.4); --shadow-md: 0 6px 20px rgba(0,0,0,.4); --shadow-lg: 0 16px 48px rgba(0,0,0,.55);
   --ring: 0 0 0 3px rgba(123,137,240,.25);
+  --scrim: rgba(0,0,0,.62); --bg-elevated: #242a3a;
+  color-scheme: dark;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }

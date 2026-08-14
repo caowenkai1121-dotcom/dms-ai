@@ -27,7 +27,8 @@
 //!       {"kind":"artifact","id":5,"title":"…","preview_url":"/api/artifact/5/view"}
 //!     ] } ] }
 //! ```
-//! - `rounds[].status`：`succeeded`（chat.msg 成对落库的正常轮）/ `interrupted`（user 行
+//! - `rounds[].status`：`succeeded`（chat.msg 成对且可信终闸通过）/ `blocked`（回答已返回，
+//!   但 trust=review 或覆盖收据有缺口）/ `interrupted`（user 行
 //!   落库、ai 行没落 —— 两次 `save_msg` 之间崩了的唯一留痕）/ query_log 失败态
 //!   （`failed`/`timeout`/`blocked`：硬失败轮**不进** chat.msg，只能从 query_log 补回）。
 //! - 事件 `ms`：steps 逐阶段耗时与整轮 `elapsed_ms` **原样透出**；`null` = 该事件没有
@@ -39,13 +40,13 @@
 //! ### 【性能④】列表态的 payload 投影 + 截断标记
 //! 事件组装只需要 `route/steps/elapsed_ms/sql/row_count/artifact` 六个键，而 ai 行的全量
 //! payload 带着整份结果行（`AskResult.rows`，单条几十 KB 起）—— 逐行全拉是这个端点唯一的
-//! 体量来源。`MSGS_SQL` 因此在**库侧**只投出这六键（`jsonb_build_object`；缺键投成 JSON null，
+//! 体量来源。`MSGS_SQL` 因此在**库侧**只投出事件键与裁剪后的结果收据（`jsonb_build_object`；缺键投成 JSON null，
 //! 与「键缺席」在 `assemble` 里走同一条 `and_then` 降级链，事件输出与全量版**逐字相同**），
 //! 并按 3KB 阈值给每轮带回 `payload_truncated` 标记。要全文的按 `msg_id` 走下面的单条端点。
 //! 🔴 投影形状 = `assemble` 的读取面：`assemble` 哪天多读一个键，`MSGS_SQL` 必须一起加。
 //!
 //! ### `GET /api/chat/msg/{msg_id}/payload?login_name=&role_code=`
-//! 单条消息的**全量** payload（列表态只带六键投影，原文走这里）。已接线：
+//! 单条消息的**全量** payload（列表态只带事件投影，原文走这里）。已接线：
 //! `.route("/api/chat/msg/{msg_id}/payload", get(trace_api::msg_payload))`
 //! 身份与属主闸门同 `conv_trace`（401/403/500 同一判据同一文案）；msg 不存在 404。
 //! 口径取舍：`conv_trace` 对「会话不存在」与「非属主」同回 403（防会话 id 枚举，
@@ -77,7 +78,7 @@ use crate::AppState;
 /// 会话全部消息（id 升序 = 落库序）。与 `chat::conv_msgs` 同表同序，多取 id/created_at：
 /// 配对成轮与跨源对时都要。
 ///
-/// 【性能④】payload **库侧投影**成事件组装要的六键（详见文件头「列表态的 payload 投影」）：
+/// 【性能④】payload **库侧投影**成事件组装要的结果键（详见文件头「列表态的 payload 投影」）：
 /// 全量 payload 带整份结果行（`AskResult.rows`），逐行全拉曾把这个端点顶到秒级。
 /// `r` = `result_of` 的 SQL 版（`result` 键是对象才剥一层，与 Rust 侧逐字同义）；
 /// 内层保留 `payload` 本体只为取 `artifact`（它挂在包裹层，不在 `result` 里）。
@@ -94,6 +95,20 @@ const MSGS_SQL: &str =
                 'steps',      r->'steps',
                 'sql',        r->'sql',
                 'row_count',  r->'row_count',
+                'receipt', jsonb_build_object(
+                  'trust_level', r#>>'{trust,level}',
+                  'coverage_status', r#>>'{intent_summary,coverage,status}',
+                  'issues', COALESCE(r#>'{intent_summary,coverage,issues}', '[]'::jsonb),
+                  'subs', COALESCE((
+                    SELECT jsonb_agg(jsonb_build_object(
+                      'route', s#>>'{result,route}',
+                      'trust_level', s#>>'{result,trust,level}',
+                      'coverage_status', s#>>'{result,intent_summary,coverage,status}',
+                      'issues', COALESCE(s#>'{result,intent_summary,coverage,issues}', '[]'::jsonb)
+                    ))
+                    FROM jsonb_array_elements(COALESCE(r->'subs', '[]'::jsonb)) s
+                  ), '[]'::jsonb)
+                ),
                 'artifact',   payload->'artifact'
               ) END AS payload
        FROM (
@@ -121,7 +136,8 @@ const FAILED_SQL: &str =
             error, at
      FROM meta.query_log
      WHERE conv_id = $1
-       AND (status IN ('blocked','failed','timeout') OR (status = '' AND error <> ''))
+       AND error <> ''
+       AND (status IN ('blocked','failed','timeout') OR status = '')
      ORDER BY at";
 
 /// `chat.msg` 一行（`MSGS_SQL` 的列序）
@@ -130,7 +146,7 @@ pub struct MsgRow {
     pub role: String,
     /// user 行的问句原文（ai 行恒空串，见 `chat::save_msg` 调用点）
     pub question: String,
-    /// ai 行的结果载荷（**列表态为六键投影**，见 `MSGS_SQL` 头注；全文走 `msg_payload`）
+    /// ai 行的结果载荷（**列表态为事件投影**，见 `MSGS_SQL` 头注；全文走 `msg_payload`）
     pub payload: Option<Value>,
     pub at: DateTime<Utc>,
     /// 原 payload 是否超列表态阈值（3KB）：true = 完整 payload 可按 `id` 单条取
@@ -181,7 +197,16 @@ pub enum Event {
     /// 失败尝试（error=入库的脱敏原因，ms=那次尝试的耗时）。
     Retry { reason: String, ms: Option<i64>, error: String },
     /// AI 回答（一轮的收口）：sql/row_count 取自 payload；知识库文本答没有 sql → null
-    Answer { route: String, ms: Option<i64>, sql: Option<String>, row_count: Option<i64> },
+    Answer {
+        route: String,
+        ms: Option<i64>,
+        sql: Option<String>,
+        row_count: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trust_level: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        issues: Vec<String>,
+    },
     /// 产物生成（payload.artifact：深度模式固化出的报告页）
     Artifact { id: i64, title: String, preview_url: String },
 }
@@ -224,7 +249,7 @@ pub async fn conv_trace(
 }
 
 /// `GET /api/chat/msg/{msg_id}/payload` —— 单条消息的**全量** payload（只读）。
-/// 列表态（`conv_trace`）只带六键投影 + 截断标记，原文走这里；契约见文件头。
+/// 列表态（`conv_trace`）只带事件投影 + 截断标记，原文走这里；契约见文件头。
 pub async fn msg_payload(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -399,11 +424,22 @@ fn answered_round(user: Option<&MsgRow>, ai: &MsgRow) -> Round {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let row_count = r.and_then(|r| r.get("row_count")).and_then(Value::as_i64);
+    let (trust_level, issues) = r
+        .and_then(|r| r.get("receipt"))
+        .map(receipt_summary)
+        .unwrap_or_default();
+    let status = if trust_level.as_deref() == Some("review") || !issues.is_empty() {
+        "blocked"
+    } else {
+        "succeeded"
+    };
     events.push(Event::Answer {
         route: route.clone(),
         ms: elapsed,
         sql,
         row_count,
+        trust_level,
+        issues,
     });
     // 产物（深度模式报告）挂在轮末 —— 它由本轮结果固化而来
     if let Some(a) = p.and_then(|p| p.get("artifact")) {
@@ -426,11 +462,63 @@ fn answered_round(user: Option<&MsgRow>, ai: &MsgRow) -> Round {
         msg_id: Some(ai.id),
         question,
         at: asked_at,
-        status: "succeeded".into(),
+        status: status.into(),
         route,
         elapsed_ms: elapsed,
         payload_truncated: ai.payload_truncated,
         events,
+    }
+}
+
+fn receipt_summary(receipt: &Value) -> (Option<String>, Vec<String>) {
+    let trust_level = receipt
+        .get("trust_level")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut issues = receipt
+        .get("issues")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if receipt.get("coverage_status").and_then(Value::as_str) == Some("blocked")
+        && issues.is_empty()
+    {
+        issues.push("coverage:blocked".into());
+    }
+    if let Some(subs) = receipt.get("subs").and_then(Value::as_array) {
+        for sub in subs {
+            let route = sub.get("route").and_then(Value::as_str).unwrap_or("sub");
+            if sub.get("trust_level").and_then(Value::as_str) == Some("review") {
+                push_unique(&mut issues, format!("sub:{route}:trust-review"));
+            }
+            if sub.get("coverage_status").and_then(Value::as_str) == Some("blocked")
+                && sub
+                    .get("issues")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            {
+                push_unique(&mut issues, format!("sub:{route}:coverage:blocked"));
+            }
+            for issue in sub
+                .get("issues")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                push_unique(&mut issues, format!("sub:{route}:{issue}"));
+            }
+        }
+    }
+    (trust_level, issues)
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
     }
 }
 
@@ -514,7 +602,7 @@ mod tests {
         ai_msg_t(id, payload, secs, false)
     }
 
-    /// 带截断标记的 ai 行（【性能④】：原 payload 超 3KB 时列表态只带六键投影）
+    /// 带截断标记的 ai 行（【性能④】：原 payload 超 3KB 时列表态只带事件投影）
     fn ai_msg_t(id: i64, payload: Option<Value>, secs: i64, payload_truncated: bool) -> MsgRow {
         MsgRow {
             id,
@@ -561,13 +649,42 @@ mod tests {
         assert_eq!((stage.as_str(), result.as_str(), *ms), ("semantic-cache", "miss", 3));
         let Event::Route { stage, result, ms } = &r.events[3] else { panic!() };
         assert_eq!((stage.as_str(), result.as_str(), *ms), ("llm", "hit", 1180));
-        let Event::Answer { route, ms, sql, row_count } = &r.events[4] else { panic!() };
+        let Event::Answer { route, ms, sql, row_count, .. } = &r.events[4] else { panic!() };
         assert_eq!((route.as_str(), *ms), ("llm", Some(1234)), "整轮耗时原样透出");
         assert_eq!(sql.as_deref(), Some("SELECT sum(amt) FROM t"));
         assert_eq!(*row_count, Some(12));
         assert_eq!((r.status.as_str(), r.route.as_str(), r.elapsed_ms), ("succeeded", "llm", Some(1234)));
         assert_eq!(r.msg_id, Some(2));
         assert_eq!(r.at, at(10).to_rfc3339(), "轮时间 = 问句时间");
+    }
+
+    #[test]
+    fn answer_event_keeps_review_receipt_and_subgoal_issues() {
+        let payload = serde_json::json!({
+            "route": "compound",
+            "elapsed_ms": 20,
+            "row_count": 0,
+            "receipt": {
+                "trust_level": null,
+                "issues": [],
+                "subs": [{
+                    "route": "direct-agg",
+                    "trust_level": "review",
+                    "issues": ["result:detail-empty"]
+                }]
+            }
+        });
+        let rounds = assemble(&[user_msg(1, "销售额和明细", 1), ai_msg(2, Some(payload), 2)], &[]);
+        let Event::Answer { trust_level, issues, .. } = rounds[0].events.last().unwrap() else { panic!() };
+        assert_eq!(rounds[0].status, "blocked", "已返回的 review 答案不能在 trace 标成功");
+        assert_eq!(trust_level, &None);
+        assert_eq!(
+            issues,
+            &[
+                "sub:direct-agg:trust-review".to_string(),
+                "sub:direct-agg:result:detail-empty".to_string(),
+            ]
+        );
     }
 
     /// 降级①：payload 无 steps（本字段上线前的老消息形态）→ 恰好「问题→回答」两节点
@@ -580,7 +697,7 @@ mod tests {
         let rounds = assemble(&[user_msg(1, "报销上限", 10), ai_msg(2, Some(payload), 20)], &[]);
         let r = &rounds[0];
         assert_eq!(kinds(r), ["question", "answer"], "无 steps 一轮只剩两节点");
-        let Event::Answer { route, ms, sql, row_count } = &r.events[1] else { panic!() };
+        let Event::Answer { route, ms, sql, row_count, .. } = &r.events[1] else { panic!() };
         assert_eq!((route.as_str(), *ms), ("knowledge", Some(88)), "elapsed_ms 仍透出");
         assert_eq!((sql, row_count), (&None, &None), "文本答没有 sql/row_count 不编");
         let Event::Question { text, .. } = &r.events[0] else { panic!() };
@@ -593,7 +710,7 @@ mod tests {
         let rounds = assemble(&[user_msg(1, "q", 10), ai_msg(2, None, 20)], &[]);
         let r = &rounds[0];
         assert_eq!(kinds(r), ["question", "answer"]);
-        let Event::Answer { route, ms, sql, row_count } = &r.events[1] else { panic!() };
+        let Event::Answer { route, ms, sql, row_count, .. } = &r.events[1] else { panic!() };
         assert_eq!((route.as_str(), *ms), ("", None));
         assert_eq!((sql, row_count), (&None, &None));
     }
@@ -696,6 +813,19 @@ mod tests {
             id: 5, title: "t".into(), preview_url: "u".into(),
         }).unwrap();
         assert_eq!(v, serde_json::json!({"kind": "artifact", "id": 5, "title": "t", "preview_url": "u"}));
+        let v = serde_json::to_value(Event::Answer {
+            route: "llm".into(),
+            ms: Some(3),
+            sql: None,
+            row_count: Some(1),
+            trust_level: None,
+            issues: vec![],
+        }).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"kind":"answer","route":"llm","ms":3,"sql":null,"row_count":1}),
+            "无收据的老结果 wire 不应膨胀"
+        );
     }
 
     /// 🔴 属主闸门锚点：`ensure_owner` 必须在任何取数之前；非属主 403 与闸门读失败 500
@@ -730,12 +860,14 @@ mod tests {
         }
         // 失败行的口径：空串老行按 error 有无区分失败/成功（与 query_log.rs 的列注释同义）
         assert!(FAILED_SQL.contains("status IN ('blocked','failed','timeout')"), "{FAILED_SQL}");
-        assert!(FAILED_SQL.contains("(status = '' AND error <> '')"), "老行折算: {FAILED_SQL}");
+        assert!(FAILED_SQL.contains("error <> ''"), "软降级回答不许重复成失败轮: {FAILED_SQL}");
+        assert!(FAILED_SQL.contains("OR status = ''"), "老行折算: {FAILED_SQL}");
         assert!(FAILED_SQL.contains("conv_id = $1"), "会话过滤必须内联在 SQL 里: {FAILED_SQL}");
         assert!(MSGS_SQL.contains("WHERE conv_id = $1"), "{MSGS_SQL}");
         // 【性能④】列表态必须是库侧投影 + 3KB 截断标记：全量 payload（含整份结果行）
         // 逐行全拉曾把这个端点顶到秒级；`result` 剥层与 Rust 侧 `result_of` 逐字同义
         assert!(MSGS_SQL.contains("jsonb_build_object"), "库侧投影没了: {MSGS_SQL}");
+        assert!(MSGS_SQL.contains("'receipt', jsonb_build_object"), "结果收据投影没了: {MSGS_SQL}");
         assert!(MSGS_SQL.contains("3072"), "3KB 截断标记没了: {MSGS_SQL}");
         assert!(MSGS_SQL.contains("jsonb_typeof(payload->'result') = 'object'"), "剥层判据: {MSGS_SQL}");
         // user 行 payload 是 NULL：外层 CASE 保 NULL 透出，不许包成全 null 字段的对象

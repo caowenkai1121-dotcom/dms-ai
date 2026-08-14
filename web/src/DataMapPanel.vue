@@ -1029,8 +1029,8 @@ onBeforeUnmount(() => {
 .dm-btn { height: 30px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text-regular); font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
 .dm-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
 .dm-btn:disabled { opacity: .5; cursor: default; }
-.dm-btn.primary { border-color: var(--primary); background: var(--primary); color: #fff; }
-.dm-btn.primary:hover:not(:disabled) { color: #fff; opacity: .88; }
+.dm-btn.primary { border-color: var(--primary); background: var(--primary); color: var(--on-primary); }
+.dm-btn.primary:hover:not(:disabled) { color: var(--on-primary); opacity: .88; }
 .dm-btn.danger:hover:not(:disabled) { border-color: var(--error-text); color: var(--error-text); }
 
 .dm-error { margin: 0 20px 8px; padding: 7px 10px; border-left: 3px solid var(--error-text); background: var(--error-bg); color: var(--error-text); font-size: 12px; line-height: 1.6; }

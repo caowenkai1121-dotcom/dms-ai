@@ -26,36 +26,52 @@ struct Metric {
     unit: &'static str,
 }
 
-/// 省份→23 个标准省区。DMS 巡店表没有观远的 `province_region` 加工列，故按文档的
-/// “无有效省区时按 province 映射”规则执行；无法映射的一律排除，不编造“其他”。
+/// 省份→23 个标准省区的 SQL CASE。**由 `warehouse_catalog::standard_region_pairs` 生成**，
+/// 不再手抄。
+///
+/// 🔴 手抄那版漏了**上海与海南**（权威表里分别归浙江省区、广东省区），
+/// 而 `inspection_valid` 里那句 `IS NOT NULL` 会把映射不出来的行**整批静默排除** ——
+/// 于是「本月上海的巡店次数」恒 0、「今年各省区巡店次数」全国合计偏低，一个字的提示都没有。
+/// 无法映射的（港澳台）仍然排除，不编造「其他」——那是 fail-closed，不是漏。
 fn province_region(col: &str) -> String {
-    format!(
-        "CASE \
-         WHEN {col} REGEXP '福建' THEN '福建' WHEN {col} REGEXP '贵州' THEN '贵州' \
-         WHEN {col} REGEXP '广东' THEN '广东' WHEN {col} REGEXP '云南' THEN '云南' \
-         WHEN {col} REGEXP '湖南' THEN '湖南' WHEN {col} REGEXP '河北' THEN '河北' \
-         WHEN {col} REGEXP '天津' THEN '天津' WHEN {col} REGEXP '江苏' THEN '江苏' \
-         WHEN {col} REGEXP '北京' THEN '北京' WHEN {col} REGEXP '浙江' THEN '浙江' \
-         WHEN {col} REGEXP '湖北' THEN '湖北' WHEN {col} REGEXP '四川|重庆|西藏' THEN '川渝藏' \
-         WHEN {col} REGEXP '山西' THEN '山西' WHEN {col} REGEXP '山东' THEN '山东' \
-         WHEN {col} REGEXP '河南' THEN '河南' WHEN {col} REGEXP '广西' THEN '广西' \
-         WHEN {col} REGEXP '江西' THEN '江西' WHEN {col} REGEXP '安徽' THEN '安徽' \
-         WHEN {col} REGEXP '吉林' THEN '吉林' WHEN {col} REGEXP '辽宁' THEN '辽宁' \
-         WHEN {col} REGEXP '黑龙江' THEN '黑龙江' WHEN {col} REGEXP '内蒙' THEN '内蒙' \
-         WHEN {col} REGEXP '陕西|甘肃|青海|宁夏|新疆' THEN '西北' END"
-    )
+    let whens: String = region_pairs()
+        .iter()
+        .map(|(province, region)| format!("WHEN {col} REGEXP '{province}' THEN '{region}' "))
+        .collect();
+    format!("CASE {whens}END")
 }
+
+/// 省区值域（23 个短名，去重后保持首见顺序 —— 顺序即行为）。`activity_region` 的 IN 列表用它。
+fn standard_regions() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = vec![];
+    for (_, region) in region_pairs() {
+        if !out.contains(&region) {
+            out.push(region);
+        }
+    }
+    out
+}
+
+/// 单点取权威对照（本文件三处共用一份；改名只改这里）
+fn region_pairs() -> Vec<(&'static str, &'static str)> {
+    crate::warehouse_catalog::standard_region_pairs()
+}
+
 
 fn activity_region(alias: &str) -> String {
     let fallback = province_region(&format!("{alias}.store_province"));
     // REPLACE 归一链存局部复用（原来 IN 列表与 THEN 各写一份，漂移风险）
     let normalized = format!("REPLACE(REPLACE({alias}.department_name,'省区',''),'大区','')");
+    // 值域与 CASE 同源（原来 IN 列表是手抄的第三份，与 CASE 早已漂移）
+    let in_list = standard_regions()
+        .iter()
+        .map(|r| format!("'{r}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "CASE \
          WHEN {alias}.department_name IN ('苏南大区','苏北大区','江苏省区') THEN '江苏' \
-         WHEN {normalized} IN \
-              ('福建','贵州','广东','云南','湖南','河北','天津','江苏','北京','浙江','湖北',\
-               '川渝藏','山西','山东','河南','广西','江西','安徽','吉林','辽宁','黑龙江','内蒙','西北') \
+         WHEN {normalized} IN ({in_list}) \
          THEN {normalized} \
          ELSE {fallback} END"
     )
@@ -69,6 +85,20 @@ fn activity_valid(alias: &str) -> String {
     )
 }
 
+/// ⚠️ 已知口径相互作用（2026-08-14 记账，**待业务裁决**）：下面的排除子查询读 `t_employee`，
+/// 而该表已按 Java `EmployeeDao.java:35` 的 `@DataScope` 登记成 scoped（修的是「全员花名册
+/// 对受限账号可见」这个确定的越权）。注入是递归的，子查询同样会被加上
+/// `t_employee.employee_id IN (…)` —— 于是**受限身份**看运营看板时，
+/// 「巡店人是三方/副总则不计入」这条排除只对他可见的员工生效，方向是**少排除、数字偏高**。
+///
+/// 为什么先这样：花名册泄漏是**确定的**越权（任何受限账号一句话就能拿到全量姓名/登录名/
+/// 部门），而口径漂移只在「受限身份 + 运营看板」这个交叉面上出现（OPS 题集今天是 admin 跑的）。
+/// 两害相权先堵越权，并把这条相互作用显式写下来 —— 静默接受才是仓内反复记录的那类坏账。
+///
+/// 彻底解法有两条，都要业务点头：① 把三方/副总排除名单在口径装载期物化成常量清单
+/// （与权限无关，口径恒定）；② 该子查询走豁免通道（需要注入器支持「口径子查询不吃行权限」
+/// 这个新概念，那是 kernel 的语义扩展，不该顺手加）。`ops_caliber_notes_employee_scope`
+/// 钉板守着这段说明不被静默删掉。
 fn inspection_valid(alias: &str) -> String {
     format!(
         "{alias}.deleted_flag = 0 AND {alias}.inspection_date >= '{OPS_EPOCH}' \
@@ -87,22 +117,25 @@ fn time_and(question: Option<&str>, col: &str) -> String {
     }
 }
 
+/// 问句里的省/省区 → 标准省区短名。**同一份对照的第三种形态**（另两种是 SQL 的 CASE
+/// 与 `activity_region` 的 IN 列表），2026-08-14 一并收敛到
+/// `warehouse_catalog::standard_region_pairs`。
+///
+/// 🔴 手抄那版和 CASE 一样漏了上海与海南 —— 于是「上海运营活动费用」既筛不出省区、
+/// 又因为残留词判定而整条快路径不接。
+///
+/// 三类**只出现在问句里**的说法额外挂在这里（它们不是行政省名，映射表里没有）：
+/// 「苏南大区/苏北大区/江苏省区」→ 江苏、「川渝藏」自身、「西北」自身。
 fn region_of(question: &str) -> Option<(&'static str, &'static str)> {
-    const REGIONS: &[(&str, &str)] = &[
-        ("内蒙古自治区", "内蒙"), ("黑龙江省", "黑龙江"), ("川渝藏", "川渝藏"),
-        ("四川省", "川渝藏"), ("重庆市", "川渝藏"), ("西藏自治区", "川渝藏"),
+    const EXTRA: &[(&str, &str)] = &[
         ("苏南大区", "江苏"), ("苏北大区", "江苏"), ("江苏省区", "江苏"),
-        ("内蒙古", "内蒙"), ("黑龙江", "黑龙江"), ("西北", "西北"),
-        ("福建", "福建"), ("贵州", "贵州"), ("广东", "广东"), ("云南", "云南"),
-        ("湖南", "湖南"), ("河北", "河北"), ("天津", "天津"), ("江苏", "江苏"),
-        ("北京", "北京"), ("浙江", "浙江"), ("湖北", "湖北"), ("四川", "川渝藏"),
-        ("重庆", "川渝藏"), ("西藏", "川渝藏"), ("山西", "山西"), ("山东", "山东"),
-        ("河南", "河南"), ("广西", "广西"), ("江西", "江西"), ("安徽", "安徽"),
-        ("吉林", "吉林"), ("辽宁", "辽宁"), ("内蒙", "内蒙"),
-        ("陕西", "西北"), ("甘肃", "西北"), ("青海", "西北"), ("宁夏", "西北"),
-        ("新疆", "西北"),
+        ("川渝藏", "川渝藏"), ("西北", "西北"),
     ];
-    REGIONS.iter().find(|(word, _)| question.contains(word)).copied()
+    // 长词优先：「内蒙古自治区」必须先于「内蒙」命中，否则残留词判定会把「古自治区」当残留
+    let mut table: Vec<(&'static str, &'static str)> = EXTRA.to_vec();
+    table.extend(region_pairs());
+    table.sort_by_key(|(word, _)| std::cmp::Reverse(word.chars().count()));
+    table.into_iter().find(|(word, _)| question.contains(word))
 }
 
 fn region_and(region: Option<&str>, expr: String) -> String {
@@ -315,6 +348,20 @@ fn metrics_cached() -> &'static [Metric] {
 /// 运营口径的无维度确定性命中。只承接“一个指标 + 可选时间窗”；任何省区、城市、
 /// 客户等未兑现限定都会被残留守卫拒绝，交回完整组合/LLM 链。
 pub fn direct_metric(question: &str) -> Option<(String, String)> {
+    direct_metric_with_evidence(question).map(|(sql, name, _)| (sql, name))
+}
+
+/// 同上，外带**本条 SQL 已经兑现了哪些槽位**的证明。
+///
+/// 🔴 为什么必须显式声明（2026-08-14 回归 OPS04）：这条 SQL 是**代码写死**的，
+/// 时间窗写成字面日期（`a.start_date >= '2026-06-01'`）、省区写成 `CASE(...) = '湖南'`，
+/// 而覆盖闸是按 LLM SQL 的形状判的 —— 它认不出这两样，于是判
+/// `missing: time:2026年6月` 直接回落，整条运营口径路**平时根本不生效**。
+/// 声明的是「代码确实消化了这个槽」这一事实，不是放宽判据（销售快路径早就这么做，
+/// 见 `fastpath_intent` 里 Region/Time 两处 `resolve`）。
+pub fn direct_metric_with_evidence(
+    question: &str,
+) -> Option<(String, String, crate::direct_types::ExecutionEvidence)> {
     let ms = metrics_cached();
     let (m, hit) = ms
         .iter()
@@ -340,7 +387,21 @@ pub fn direct_metric(question: &str) -> Option<(String, String)> {
         return None;
     }
     let expr = metric_expr(m.code, Some(question), region.map(|(_, normalized)| normalized))?;
-    Some((format!("SELECT {expr} AS `{}`", m.name), m.name.into()))
+    let mut evidence = crate::direct_types::ExecutionEvidence::default()
+        .resolve(crate::direct_types::IntentSlotKind::Metric, m.name);
+    if let Some((word, _)) = region {
+        evidence = evidence.resolve(crate::direct_types::IntentSlotKind::Region, word);
+    }
+    // 时间窗由 `metric_expr` 里的 `time_and` 真的拼进了 SQL（没有时间词时它写的是注释占位，
+    // 那种情况下 `time_phrase_of` 也返 None，两边一致）
+    // 用与销售快路径同一份表面词提取（相对词 / 两个 ISO 日期 / 显式年月），
+    // **不用**它的整句兜底：那会把没处理的限定一起当成已消化
+    if let Some(surface) = crate::fastpath::intent_time_surface(question) {
+        if surface != question {
+            evidence = evidence.resolve(crate::direct_types::IntentSlotKind::Time, surface);
+        }
+    }
+    Some((format!("SELECT {expr} AS `{}`", m.name), m.name.into(), evidence))
 }
 
 const TERMS: &[(&str, &str, &[&str])] = &[
@@ -528,6 +589,33 @@ mod tests {
         let west = direct_metric("2026年6月陕西运营活动场次").unwrap().0;
         assert!(west.contains("= '西北'"));
         assert!(direct_metric("2026年6月长沙运营活动场次").is_none());
+        // 🔴 回归 OPS04 的原问句（费用族 + 「是多少」尾巴）：它此前落到自由 SQL
+        let cost = direct_metric("2026年6月湖南运营活动费用是多少").expect("OPS04 原问句必须走口径路");
+        assert!(cost.0.contains("= '湖南'"), "{}", cost.0);
+        // 🔴 代码写死的 SQL 必须**自己声明**兑现了哪些槽位：时间窗是字面日期、
+        // 省区是 CASE 比较，覆盖闸按 LLM SQL 的形状认不出来 → 判 missing → 整条路被挡回去
+        //（2026-08-14 实测 OPS04 就是这么掉的：`coverage=missing:["time:2026年6月"]`）。
+        let (_, _, ev) = direct_metric_with_evidence("2026年6月湖南运营活动费用是多少").unwrap();
+        use crate::direct_types::IntentSlotKind as K;
+        assert!(ev.proves(K::Time, "2026年6月"), "时间窗没声明：覆盖闸会判 missing");
+        assert!(ev.proves(K::Region, "湖南"), "省区没声明：覆盖闸会判 unverifiable");
+        assert!(ev.proves(K::Metric, "运营活动费用"), "指标没声明");
+        // 没有时间词时不许**凭空**声明（那才是放宽判据）
+        let (_, _, bare) = direct_metric_with_evidence("运营活动费用是多少").unwrap();
+        assert!(!bare.proves(K::Time, ""), "无时间词却声明了时间槽");
+        // 🔴 让路门二：`compose_hit` 里的 `warehouse_sales_question` 若判真，
+        // 整条 direct-agg 直接 return None —— 运营口径路连门都进不去。
+        assert!(
+            !crate::fastpath::warehouse_sales_question("2026年6月湖南运营活动费用是多少"),
+            "运营问句被 warehouse_sales_question 判成销售问句 → compose_hit 直接让路"
+        );
+        // 🔴 让路门：运营口径路排在数仓销售快路径**之后**（`try_compose_metric_only` 首行），
+        // 所以运营问句一旦被销售指标词表命中，就永远走不到这里。OPS04 实测就是这么掉的。
+        assert!(
+            crate::fastpath::warehouse_sales_metrics("2026年6月湖南运营活动费用是多少").is_empty(),
+            "运营口径问句被数仓销售指标词表劫走了：{:?}",
+            crate::fastpath::warehouse_sales_metrics("2026年6月湖南运营活动费用是多少")
+        );
         assert!(direct_metric("2026年6月活动费比").unwrap().0.contains("NULLIF"));
     }
 
@@ -592,4 +680,47 @@ mod tests {
         assert!(EDGES.iter().any(|e| e.0 == "t_shop_inspection_records" && e.2 == "t_customer"));
         assert!(EDGES.iter().any(|e| e.0 == "t_activity_main" && e.2 == "t_customer"));
     }
+}
+
+#[cfg(test)]
+mod scope_interaction {
+    /// 🔴 `t_employee` 转 scoped 与运营口径排除子查询的相互作用必须**有记录**。
+    /// 删掉那段说明 = 把一条已知的口径漂移变回静默（仓内反复抓到的那类坏账）。
+    #[test]
+    fn ops_caliber_notes_employee_scope() {
+        let src = include_str!("ops_caliber.rs");
+        let head = src.split("fn inspection_valid").next().expect("函数改名了");
+        assert!(head.contains("待业务裁决"), "口径相互作用的记账没了");
+        assert!(head.contains("EmployeeDao.java:35"), "缺 Java 侧证据出处");
+    }
+    /// 🔴 省区对照只有**一份**（`warehouse_catalog::standard_region_pairs`），
+    /// 且上海/海南必须在里面。
+    ///
+    /// 由来：手抄的 CASE 漏了这两地，而 `inspection_valid` 的 `IS NOT NULL` 会把映射不出来的行
+    /// **整批静默排除** —— 「本月上海的巡店次数」恒 0，没有任何提示。
+    #[test]
+    fn region_case_covers_every_mapped_province_including_shanghai_and_hainan() {
+        let case = super::province_region("s.province");
+        for (province, region) in super::region_pairs() {
+            assert!(
+                case.contains(&format!("REGEXP '{province}' THEN '{region}'")),
+                "CASE 少了 {province}→{region}"
+            );
+        }
+        // 两个特例逐字钉住（权威表就是这么记的）
+        assert!(case.contains("REGEXP '上海' THEN '浙江'"), "上海归浙江省区：{case}");
+        assert!(case.contains("REGEXP '海南' THEN '广东'"), "海南归广东省区：{case}");
+        // 港澳台不许出现（生产映射里没有，fail-closed）
+        for none in ["台湾", "香港", "澳门"] {
+            assert!(!case.contains(none), "未映射省份不许进 CASE：{none}");
+        }
+        // 值域与 CASE 同源：activity_region 的 IN 列表逐字来自它
+        let regions = super::standard_regions();
+        assert_eq!(regions.len(), 23, "省区值域应为 23 个：{regions:?}");
+        let activity = super::activity_region("a");
+        for r in &regions {
+            assert!(activity.contains(&format!("'{r}'")), "IN 列表少了 {r}");
+        }
+    }
+
 }

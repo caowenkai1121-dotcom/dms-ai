@@ -28,29 +28,50 @@ pub struct MemoryHit {
 /// 教材全文，截断同时是去重键的一部分）。
 /// 同 `(ds_id, kind, question)` 已存在则不重复沉（`NOT EXISTS`，与 `exemplar::save` 同形）：
 /// 同一问句再次回炉成功不产生孪生行 —— 旧条的 hit_count 还在涨， rerank 自然把它顶上来。
+// 归属人 `login`：空串 = ds 级公有（只有人工复核通道该写空串）；自动蒸馏一律写真实 login
+// —— 一个用户的修正经验此前会直接进全员 prompt（跨用户污染，与 I4 同一条防线）。
+#[allow(clippy::too_many_arguments)]
 pub async fn save_memory(
     pg: &PgPool,
+    // `who` = (批次号, 操作者)：账本用它定位「这一轮学了什么」。此前这里把 `conv_id` 当批次号
+    // 传给账本，而调用方给的又是空串 —— 两个坑叠在一起：账本撤不回来、`meta.memory.conv_id`
+    // 也恒空（追问链回看不到这条经验属于哪次会话）。现在两者分开各给各的。
+    who: (&str, &str),
     ds: &str,
+    login: &str,
     conv_id: &str,
     kind: &str,
     question: &str,
     content: &str,
 ) -> anyhow::Result<bool> {
+    // 判官模式：观察系统不许改变系统（见 `registry::judge_mode`）
+    if super::judge_mode() {
+        return Ok(false);
+    }
     let content: String = content.chars().take(400).collect();
     let question: String = question.chars().take(200).collect();
     let row: Option<(i64,)> = sqlx::query_as(
-        "INSERT INTO meta.memory(ds_id, conv_id, kind, question, content) \
-         SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS( \
-           SELECT 1 FROM meta.memory WHERE ds_id=$1 AND kind=$3 AND question=$4) \
+        "INSERT INTO meta.memory(ds_id, login_name, conv_id, kind, question, content) \
+         SELECT $1,$2,$3,$4,$5,$6 WHERE NOT EXISTS( \
+           SELECT 1 FROM meta.memory WHERE ds_id=$1 AND login_name=$2 AND kind=$4 AND question=$5) \
          RETURNING id",
     )
     .bind(ds)
+    .bind(login)
     .bind(conv_id)
     .bind(kind)
     .bind(&question)
     .bind(&content)
     .fetch_optional(pg)
     .await?;
+    // 学习账本：新增记 before=NULL（回滚即删除）。落账失败不拖垮学习（见 learn.rs 文件头）
+    if let Some((id,)) = row {
+        super::learn::log_event(
+            pg, who.0, who.1, "meta.memory", &id.to_string(), "insert", None,
+            Some(serde_json::json!({ "kind": kind, "question": question })),
+        )
+        .await;
+    }
     Ok(row.is_some())
 }
 
@@ -60,6 +81,7 @@ pub async fn save_memory(
 pub async fn recall_memories(
     pg: &PgPool,
     ds: &str,
+    login: &str,
     qvec: Option<&str>,
     limit: usize,
 ) -> anyhow::Result<Vec<MemoryHit>> {
@@ -69,11 +91,12 @@ pub async fn recall_memories(
                 (EXTRACT(EPOCH FROM (now() - created_at)) / 86400.0)::float8, \
                 1 - (embedding <=> $1::vector) \
          FROM meta.memory \
-         WHERE ds_id = $2 AND embedding IS NOT NULL \
+         WHERE ds_id = $2 AND (login_name = $3 OR login_name = '') AND embedding IS NOT NULL \
          ORDER BY embedding <=> $1::vector LIMIT 10",
     )
     .bind(v)
     .bind(ds)
+    .bind(login)
     .fetch_all(pg)
     .await?;
     let mut hits: Vec<MemoryHit> = rows
@@ -160,7 +183,9 @@ mod tests {
         let src = include_str!("memory.rs");
         let body = src.split("pub async fn save_memory").nth(1).expect("函数改名了");
         assert!(body.contains("NOT EXISTS"), "{body}");
-        assert!(body.contains("kind=$3 AND question=$4"), "{body}");
+        assert!(body.contains("kind=$4 AND question=$5"), "{body}");
+        // 作用域进了去重键：同一句话不同用户各留一条个人经验，互不覆盖也互不可见
+        assert!(body.contains("login_name=$2"), "去重键少了归属人：{body}");
         // 截长判据（经验是提示不是教材全文）
         assert!(body.contains(".take(400)"), "{body}");
     }
@@ -174,6 +199,11 @@ mod tests {
         assert!(body.contains("hit_count::bigint"), "INT4 列必须显式转 bigint：{body}");
         assert!(body.contains(")::float8"), "EXTRACT 是 NUMERIC，必须转 float8：{body}");
         assert!(body.contains("embedding IS NOT NULL"), "{body}");
+        // 🔴 作用域谓词：本人经验 + ds 级公有，别人的私人经验一条都不许召回（I4）
+        assert!(
+            body.contains("(login_name = $3 OR login_name = '')"),
+            "召回缺作用域谓词：全公司共用一个经验池：{body}"
+        );
         assert!(body.contains("LIMIT 10"), "近邻粗排取 10 再 rerank 的形状被改了：{body}");
     }
 }

@@ -33,6 +33,7 @@ use dms_knowledge::retrieve::Hit;
 use serde_json::Value;
 
 use crate::analysis::AnalysisKind;
+use crate::answer_contract::AnswerContract;
 
 /// 进 prompt 的数据行数上限（列名一行 + 这么多行）。解读要的是量级与头部，不是全表。
 const BRIEF_ROWS: usize = 5;
@@ -52,6 +53,14 @@ const SYSTEM: &str = "你把一次数据查询的结果解读成人话。\
     输出 2-4 句中文：先说这个结果说明了什么（量级、头部、差距、异常），\
     再用一句说清这个数是怎么算出来的（照口径说明里的来源表/过滤/去重/时间窗说，不许自己编）。\
     不要复述表格，不要输出任何网址或链接，数据里没有的事一个字都不要加。";
+
+fn with_contract(system: &str) -> String {
+    format!(
+        "{system}\n{}\n本次解读的事实域固定为：MAIN=主结果，DETAIL=补充明细，\
+         COMPARE=结构化比较，CONTEXT=同窗经营补充。只能引用当前断言所属事实域，禁止跨域借数。",
+        AnswerContract::instruction()
+    )
+}
 
 /// 【深度模式】解读系统提示：图表与表格已经在前面完成信息承载，这里只补最后的经营判断。
 /// 输出保持短、结构化，避免再把整页数据复述成一堵文字墙。
@@ -92,6 +101,16 @@ const SYSTEM_DEEP_ENTITY: &str = "你是一位严谨的业务实体分析师。\
 
 /// 深度解读的素材行数（精简版是 [`BRIEF_ROWS`] 5 行 —— 深度要看出形态就得看更多行）
 const DEEP_ROWS: usize = 15;
+/// 补充明细与同窗经营数据只用于解释主结果，最多各取 15 行，避免它们反客为主。
+const EXTRA_ROWS: usize = 15;
+
+/// AI 解读可引用的一张附加事实表。与主结果分开携带，避免补充数据覆盖 API 的主结果契约。
+#[derive(Clone, Copy)]
+pub struct ReadingTable<'a> {
+    pub columns: &'a [String],
+    pub rows: &'a [Vec<Value>],
+    pub row_count: usize,
+}
 
 /// 一次取数结果 + 它的口径素材。**借用**而不是拥有：调用方（HTTP handler）刚把请求体
 /// 反序列化出来，再克隆一遍纯属浪费。
@@ -107,6 +126,12 @@ pub struct Reading<'a> {
     /// 口径复核未通过的标注（`AskResult.caliber_note`）。有它就必须印在口径说明**最前面**：
     /// 那是既有的「这个数不可信」信号，一段解读绝不许把它盖掉。
     pub caliber_note: Option<&'a str>,
+    /// 主查询之外的结构或下钻明细，使用独立 DETAIL 事实域。
+    pub supplemental: Option<ReadingTable<'a>>,
+    /// 已执行出的同比/环比表（label/current/baseline/change/pct），使用独立 COMPARE 事实域。
+    pub comparisons: Option<ReadingTable<'a>>,
+    /// 与主指标同时间窗的成本、收入、毛利等经营补充，使用独立 CONTEXT 事实域。
+    pub sales_context: Option<ReadingTable<'a>>,
 }
 
 impl Reading<'_> {
@@ -137,10 +162,21 @@ impl Reading<'_> {
 
     /// 两段解读共用的素材组装：口径说明 + 结果简报（`n` = 简报行数）。
     fn briefing_hits(&self, n: usize) -> Vec<Hit> {
-        vec![
+        let mut hits = vec![
             hit(1, "口径说明", &self.caliber()),
-            hit(2, "查询结果", &brief_n(self.columns, self.rows, self.row_count, n)),
-        ]
+            hit(2, "MAIN 主结果", &brief_n(self.columns, self.rows, self.row_count, n)),
+        ];
+        for (source, table) in [
+            ("DETAIL 补充明细", self.supplemental),
+            ("COMPARE 结构化比较", self.comparisons),
+            ("CONTEXT 同窗经营补充", self.sales_context),
+        ] {
+            if let Some(table) = table {
+                let text = brief_n(table.columns, table.rows, table.row_count, EXTRA_ROWS);
+                hits.push(hit(hits.len() + 1, source, &text));
+            }
+        }
+        hits
     }
 
     /// 一段自然语言解读（fast LLM）。**失败一律 `None`**：调用失败 / 空串 / 含网址都丢，
@@ -149,9 +185,11 @@ impl Reading<'_> {
         // 口径说明也进不可信段：它由 `self.sql` 派生，而按需端点上那条 SQL 是调用方回传的。
         // 代价是 `<`/`>` 会被 `esc` 转成 `&lt;`（`order_time < '…'` 读起来别扭），
         // 换来的是「回传的串永远进不了 prompt 的可信段」这条不用讨论的边界。
-        let hits = self.briefing_hits(BRIEF_ROWS);
+        let mut hits = self.briefing_hits(BRIEF_ROWS);
+        let contract = self.answer_contract(BRIEF_ROWS);
+        hits.push(hit(hits.len() + 1, "可引用事实合同", &contract.render()));
         let user = format!("{}\n原问题：{}\n\n请按要求解读：", wrap_untrusted(&hits), self.question);
-        fast_guarded_checked(llm, SYSTEM, &user, "结果解读").await
+        fast_guarded_checked(llm, &with_contract(SYSTEM), &user, &contract, "结果解读").await
     }
 
     /// 【深度模式】深度解读：**Precise 档** + 短结论/证据表/行动表 +
@@ -167,7 +205,9 @@ impl Reading<'_> {
         llm: &dyn ChatModel,
         kind: AnalysisKind,
     ) -> Option<String> {
-        let hits = self.briefing_hits(DEEP_ROWS);
+        let mut hits = self.briefing_hits(DEEP_ROWS);
+        let contract = self.answer_contract(DEEP_ROWS);
+        hits.push(hit(hits.len() + 1, "可引用事实合同", &contract.render()));
         let system = match kind {
             AnalysisKind::Document => SYSTEM_DEEP_DOCUMENT,
             AnalysisKind::Entity => SYSTEM_DEEP_ENTITY,
@@ -179,22 +219,21 @@ impl Reading<'_> {
             self.question,
             kind.label(),
         );
-        let first = guarded(llm, system, &user, "深度解读", ModelTier::Precise).await?;
+        let system = with_contract(system);
+        let first = guarded(llm, &system, &user, "深度解读", ModelTier::Precise).await?;
         if !has_unsupported_business_inference(self.question, &first) {
-            // 无推断问题后再过数字断言对账（同一道「重试一次再丢」纪律，换 claim 清单作约束）
-            let bad = unmatched_claims(&first, &user);
-            if bad.is_empty() {
-                return Some(first);
+            match contract.validate(&first) {
+                Ok(display) => return Some(display),
+                Err(bad) => {
+                    tracing::warn!(claims = ?bad, "深度解读未通过事实合同 → 列清单精确重试一次");
+                    let retry = format!("{user}\n{}", AnswerContract::retry_note(&bad));
+                    let second = guarded(llm, &system, &retry, "深度解读事实重试", ModelTier::Precise).await?;
+                    if has_unsupported_business_inference(self.question, &second) {
+                        return None;
+                    }
+                    return contract.validate(&second).ok();
+                }
             }
-            tracing::warn!(claims = ?bad, "深度解读含与数据对不上的数字 → 列清单精确重试一次");
-            let retry = format!(
-                "{user}\n上一次输出里这些数字与给出的素材对不上：{}。\
-                 只许使用素材里出现过的数字（万/亿/%/元的单位换算允许）；对不上账的数字就不要写。请重新输出。",
-                bad.join("、")
-            );
-            return guarded(llm, system, &retry, "深度解读数字重试", ModelTier::Precise)
-                .await
-                .filter(|s| unmatched_claims(s, &user).is_empty());
         }
         tracing::warn!("深度解读含无数据支撑的业务推断 → 精确约束后重试一次");
         let retry = format!(
@@ -202,9 +241,41 @@ impl Reading<'_> {
              或把不同时间窗的板块误判成口径冲突。请重新生成：只陈述数据直接证明的事实，\
              以结构化比较证据为准；无法证明的业务含义改成‘需核实’，且不要猜测具体原因。"
         );
-        guarded(llm, system, &retry, "深度解读重试", ModelTier::Precise)
-            .await
-            .filter(|s| !has_unsupported_business_inference(self.question, s))
+        let second = guarded(llm, &system, &retry, "深度解读重试", ModelTier::Precise).await?;
+        if has_unsupported_business_inference(self.question, &second) {
+            None
+        } else {
+            contract.validate(&second).ok()
+        }
+    }
+
+    fn answer_contract(&self, n: usize) -> AnswerContract {
+        let mut contract = AnswerContract::new();
+        contract.push_table("MAIN", "主结果", self.columns, self.rows, n);
+        if let Some(table) = self.supplemental {
+            contract.push_table("DETAIL", "补充明细", table.columns, table.rows, EXTRA_ROWS);
+        }
+        if let Some(table) = self.comparisons {
+            // wire 与 prompt 保留稳定的 label/current/baseline/change/pct；事实合同换成用户会写的
+            // 中文指标名，否则正确的“基期/增幅”会因没有复述英文键而被误判为无证据。
+            let columns = table
+                .columns
+                .iter()
+                .map(|column| match column.as_str() {
+                    "label" => "比较类型".to_string(),
+                    "current" => "本期".to_string(),
+                    "baseline" => "基期".to_string(),
+                    "change" => "变化额".to_string(),
+                    "pct" => "增幅".to_string(),
+                    _ => column.clone(),
+                })
+                .collect::<Vec<_>>();
+            contract.push_table("COMPARE", "结构化比较", &columns, table.rows, EXTRA_ROWS);
+        }
+        if let Some(table) = self.sales_context {
+            contract.push_table("CONTEXT", "同窗经营补充", table.columns, table.rows, EXTRA_ROWS);
+        }
+        contract
     }
 }
 
@@ -293,148 +364,27 @@ fn unescape_newlines(s: &str) -> String {
     }
 }
 
-// ═══════════ 数字断言对账（DF validation 相位平移：claim 容差比对，对不上驳回）═══════════
-//
-// AI 文案（解读/汇总/综合）里的数字必须能在喂给模型的素材里找到出处：抽取数字断言，
-// 与素材全部数字按「1% 相对容差 + 万/亿/% 单位换算」对账。对不上 = 模型在编数（或记错），
-// 走 fast_guarded_checked 的「精确重试一次 → 仍对不上就丢」。
-
-/// 数字断言的尾附单位（影响换算）。`倍/成` 是派生比率——素材里本就没有，不抽。
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum ClaimUnit {
-    None,
-    Wan,  // 万 ×1e4
-    Yi,   // 亿 ×1e8
-    Pct,  // % 或 ％：素材可能是比值（×100 对账）也可能已是百分数
-    Bare, // 元/个/单/家/件/条/次/块/位/名 等纯计数单位：直接比对
-}
-
-/// 从文本抽数字断言（纯函数）。跳过：日期/时间片段（数字紧邻 `-` `:` `/` 或 年月日时分）、
-/// 列表序号（数字后跟 `.`、`、`）、序数（紧跟「第」）、比率（后跟 倍/成）、
-/// 无单位且无小数点/千分位的小整数（<100 的散文计数，如「2 个板块」——素材对不上是常态）。
-fn extract_claims(text: &str) -> Vec<(f64, ClaimUnit, String)> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if !chars[i].is_ascii_digit() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        let mut seen_dot = false;
-        while i < chars.len()
-            && (chars[i].is_ascii_digit() || chars[i] == ',' || (chars[i] == '.' && !seen_dot))
-        {
-            if chars[i] == '.' {
-                // 小数点后面必须还是数字，否则是列表序号/句号边界（「3.」「版本 2.0」的第二个点）
-                if i + 1 >= chars.len() || !chars[i + 1].is_ascii_digit() {
-                    break;
-                }
-                seen_dot = true;
-            }
-            i += 1;
-        }
-        let raw: String = chars[start..i].iter().collect();
-        let next = chars.get(i).copied();
-        let prev = start.checked_sub(1).map(|j| chars[j]);
-        // 单位允许隔一个空白（「100 元」「36.6 万」是常见行文）
-        let unit_at = match next {
-            Some(' ') => chars.get(i + 1).copied(),
-            other => other,
-        };
-        // 序号/日期/时间/序数/比率跳过
-        let date_like = matches!(next, Some('-' | ':' | '/' | '年' | '月' | '日' | '时' | '分'))
-            || matches!(prev, Some('-' | ':' | '/' | '第'));
-        let list_marker = matches!(next, Some('.' | '、'));
-        let ratio = matches!(unit_at, Some('倍' | '成'));
-        if date_like || list_marker || ratio {
-            continue;
-        }
-        let unit = match unit_at {
-            Some('万') => ClaimUnit::Wan,
-            Some('亿') => ClaimUnit::Yi,
-            Some('%') | Some('％') => ClaimUnit::Pct,
-            Some('元' | '块' | '个' | '单' | '家' | '件' | '条' | '次' | '位' | '名') => ClaimUnit::Bare,
-            _ => ClaimUnit::None,
-        };
-        let normalized: String = raw.chars().filter(|c| *c != ',').collect();
-        let Ok(v) = normalized.parse::<f64>() else {
-            continue;
-        };
-        // 无单位纯小整数（散文计数）不抽；带小数点/千分位或 ≥100 的才够「数字断言」的格
-        if unit == ClaimUnit::None && !seen_dot && !raw.contains(',') && v.abs() < 100.0 {
-            continue;
-        }
-        // 纯计数单位的小数目（「3 个板块」「2 大客户」）是散文结构不是取数断言，不抽
-        if unit == ClaimUnit::Bare && v.abs() < 10.0 {
-            continue;
-        }
-        out.push((v, unit, raw));
-    }
-    out
-}
-
-/// 相对容差 1%（数量级无关）；素材值与断言值都可能是 0 的情况由 max 兜底。
-fn close(a: f64, b: f64) -> bool {
-    (a - b).abs() <= 0.01 * b.abs().max(1e-9)
-}
-
-/// 一条断言是否与素材数字对得上账（含单位换算档）。
-fn claim_matches(v: f64, unit: ClaimUnit, material: &[f64]) -> bool {
-    material.iter().any(|m| {
-        close(v, *m)
-            || match unit {
-                ClaimUnit::Wan => close(v * 1e4, *m),
-                ClaimUnit::Yi => close(v * 1e8, *m),
-                ClaimUnit::Pct => close(v, m * 100.0),
-                _ => false,
-            }
-    })
-}
-
-/// 对账：返回 AI 文本里**对不上素材**的数字断言原文（空 = 全部有出处）。
-/// `material` 用调用方的完整 user prompt（简报 + 原问题都在里面，宁宽勿漏）。
-fn unmatched_claims(text: &str, material: &str) -> Vec<String> {
-    let material_nums: Vec<f64> = extract_claims(material).iter().map(|(v, _, _)| *v).collect();
-    extract_claims(text)
-        .iter()
-        .filter(|(v, unit, _)| !claim_matches(*v, *unit, &material_nums))
-        .map(|(_, unit, raw)| {
-            let suffix = match unit {
-                ClaimUnit::Wan => "万",
-                ClaimUnit::Yi => "亿",
-                ClaimUnit::Pct => "%",
-                _ => "",
-            };
-            format!("{raw}{suffix}")
-        })
-        .collect()
-}
-
 /// `fast_guarded` 的数字断言加固版（**生成侧默认入口**）：先照常生成，再对账；
 /// 对不上 → 把错数列清单精确重试一次 → 仍对不上 → None（宁可没有 AI 文案，不留错数字）。
-/// 素材即 `user`（简报在里头），调用方一个参数都不用多传。
+/// `contract` 与生成 prompt 明确分离：模型可以看到问题来组织语言，但事实只能从它引用的
+/// 原子事实中取，且主体/指标/子问作用域也必须一致。
 pub(crate) async fn fast_guarded_checked(
     llm: &dyn ChatModel,
     system: &str,
     user: &str,
+    contract: &AnswerContract,
     what: &str,
 ) -> Option<String> {
     let first = fast_guarded(llm, system, user, what).await?;
-    let bad = unmatched_claims(&first, user);
-    if bad.is_empty() {
-        return Some(first);
+    match contract.validate(&first) {
+        Ok(display) => Some(display),
+        Err(bad) => {
+            tracing::warn!(claims = ?bad, "{what}未通过事实合同 → 精确重试一次");
+            let retry = format!("{user}\n{}", AnswerContract::retry_note(&bad));
+            let second = fast_guarded(llm, system, &retry, what).await?;
+            contract.validate(&second).ok()
+        }
     }
-    tracing::warn!(claims = ?bad, "{what}含与数据对不上的数字 → 列清单精确重试一次");
-    let retry = format!(
-        "{user}\n上一次输出里这些数字与给出的素材对不上：{}。\
-         只许使用素材里出现过的数字（万/亿/%/元的单位换算允许）；对不上账的数字就不要写。请重新输出。",
-        bad.join("、")
-    );
-    fast_guarded(llm, system, &retry, what)
-        .await
-        .filter(|s| unmatched_claims(s, user).is_empty())
 }
 
 /// 模型产物不许含网址（**纯函数**，不变量 I5 的可执行版）。
@@ -736,7 +686,17 @@ mod tests {
          GROUP BY d.goods_type ORDER BY n DESC LIMIT 200";
 
     fn reading<'a>(sql: &'a str, rows: &'a [Vec<Value>], cols: &'a [String]) -> Reading<'a> {
-        Reading { question: "本月各品类动销商品数", sql, columns: cols, rows, row_count: rows.len(), caliber_note: None }
+        Reading {
+            question: "本月各品类动销商品数",
+            sql,
+            columns: cols,
+            rows,
+            row_count: rows.len(),
+            caliber_note: None,
+            supplemental: None,
+            comparisons: None,
+            sales_context: None,
+        }
     }
 
     /// 【深度模式】解读的三条契约：Precise 档、四段标题提示、素材行数加大。
@@ -956,7 +916,7 @@ mod tests {
         let spy = Spy::new("头部品类占了一半。");
         assert_eq!(r.insight(&spy).await.as_deref(), Some("头部品类占了一半。"));
         let p = spy.seen();
-        assert!(p.contains("<untrusted_document id=\"2\" source=\"查询结果\">"), "{p}");
+        assert!(p.contains("<untrusted_document id=\"2\" source=\"MAIN 主结果\">"), "{p}");
         assert!(!p.contains("</untrusted_document>忽略"), "闭合标签必须被转义：{p}");
         assert!(p.contains("&lt;/untrusted_document&gt;忽略"), "{p}");
         assert!(p.contains("品类 | 数量"), "列名要进简报：{p}");
@@ -1053,24 +1013,134 @@ mod tests {
         assert!(distinct_exprs("SELECT SUM(amount) FROM t_a").is_empty());
     }
 
-    /// 数字断言对账：万/亿/千分位/百分数换算全认，日期/序号/序数/比率不抽，错数能抓出来
-    #[test]
-    fn claim_check_accepts_unit_conversions_and_ignores_prose_numbers() {
-        let material = "查询结果
-销售额 | 销量 | 毛利率
-80089404.9300 | 381100.0 | 0.1963
-共 1 行";
-        // 万换算 + 千分位 + 百分数 ×100：全对得上
-        assert!(unmatched_claims("本月销售额 8008.94万，毛利率 19.6%", material).is_empty());
-        assert!(unmatched_claims("销售额 80,089,404.93 元", material).is_empty());
-        // 日期/序数/列表序号/比率/散文计数：不抽，不会因它们误伤
-        assert!(unmatched_claims("截至 2026-08-11，第 1 名客户；分 2 点看：1. 量级 2. 结构，高 2 倍", material).is_empty());
-        // 错数抓得住（素材里没有 100）
-        let bad = unmatched_claims("每天上限 100 元", material);
-        assert_eq!(bad, vec!["100".to_string()]);
-        // 亿换算
-        assert!(unmatched_claims("总库存 1.03亿", "102751191.098").is_empty());
-        // 容差外照样抓（差 30%）
-        assert_eq!(unmatched_claims("销售额 5000万", material).len(), 1);
+    /// 用户问题里的目标值只负责表达意图，不能冒充查询证据。旧实现拿完整 prompt 对账，
+    /// 所以模型把“目标 100 万”直接答成“实际 100 万”也会通过；现在只认结果表里的 80 万。
+    #[tokio::test]
+    async fn question_numbers_do_not_count_as_result_evidence() {
+        let cols = vec!["实际销售额".to_string()];
+        let rows = vec![vec![Value::from(800_000)]];
+        let reading = Reading {
+            question: "目标 100 万元，实际销售额是多少",
+            sql: "SELECT 800000 AS actual_sales",
+            columns: &cols,
+            rows: &rows,
+            row_count: 1,
+            caliber_note: None,
+            supplemental: None,
+            comparisons: None,
+            sales_context: None,
+        };
+
+        assert!(
+            reading.insight(&Fake(Some("实际销售额为 100 万元[MAIN:F001]。"))).await.is_none(),
+            "问题里的目标值不是执行结果，重试后仍引用它必须丢弃"
+        );
+        assert_eq!(
+            reading.insight(&Fake(Some("实际销售额为 80 万元[MAIN:F001]。"))).await.as_deref(),
+            Some("实际销售额为 80 万元。"),
+            "结果表里的值仍可正常生成"
+        );
+    }
+
+    /// 首次违反合同会精确重试一次，第二次通过后只返回移除内部引用的展示文本。
+    #[tokio::test]
+    async fn fact_contract_retries_once_then_returns_clean_text() {
+        struct Sequence {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ChatModel for Sequence {
+            fn chat<'a>(&'a self, _req: ChatRequest) -> BoxFut<'a, Result<ChatReply, LlmError>> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let content = if call == 0 {
+                    "实际销售额为100万元[MAIN:F001]。"
+                } else {
+                    "实际销售额为80万元[MAIN:F001]。"
+                };
+                Box::pin(async move {
+                    Ok(ChatReply { content: Some(content.into()), usage: Default::default() })
+                })
+            }
+        }
+        let cols = vec!["实际销售额".to_string()];
+        let rows = vec![vec![Value::from(800_000)]];
+        let reading = Reading {
+            question: "实际销售额是多少",
+            sql: "SELECT 800000 AS actual_sales",
+            columns: &cols,
+            rows: &rows,
+            row_count: 1,
+            caliber_note: None,
+            supplemental: None,
+            comparisons: None,
+            sales_context: None,
+        };
+        let llm = Sequence { calls: std::sync::atomic::AtomicUsize::new(0) };
+        assert_eq!(reading.insight(&llm).await.as_deref(), Some("实际销售额为80万元。"));
+        assert_eq!(llm.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn comparison_and_extra_facts_have_isolated_namespaces() {
+        let main_columns = vec!["销售额".to_string()];
+        let main_rows = vec![vec![Value::from(1_000_000)]];
+        let detail_columns = vec!["客户".to_string(), "订单金额".to_string()];
+        let detail_rows = vec![vec![Value::from("华东客户"), Value::from(250_000)]];
+        let comparison_columns = vec![
+            "label".to_string(), "current".to_string(), "baseline".to_string(),
+            "change".to_string(), "pct".to_string(),
+        ];
+        let comparison_rows = vec![vec![
+            Value::from("环比"), Value::from(1_000_000), Value::from(800_000),
+            Value::from(200_000), Value::from(0.25),
+        ]];
+        let context_columns = vec!["毛利额".to_string(), "毛利率".to_string()];
+        let context_rows = vec![vec![Value::from(300_000), Value::from(0.3)]];
+        let reading = Reading {
+            question: "本月销售额及环比、明细和毛利",
+            sql: "SELECT 1000000 AS sales",
+            columns: &main_columns,
+            rows: &main_rows,
+            row_count: 1,
+            caliber_note: None,
+            supplemental: Some(ReadingTable {
+                columns: &detail_columns, rows: &detail_rows, row_count: 1,
+            }),
+            comparisons: Some(ReadingTable {
+                columns: &comparison_columns, rows: &comparison_rows, row_count: 1,
+            }),
+            sales_context: Some(ReadingTable {
+                columns: &context_columns, rows: &context_rows, row_count: 1,
+            }),
+        };
+        let contract = reading.answer_contract(DEEP_ROWS);
+
+        for (text, display) in [
+            ("环比基期为80万元[COMPARE:F002]。", "环比基期为80万元。"),
+            ("环比变化额为20万元[COMPARE:F003]。", "环比变化额为20万元。"),
+            ("环比增幅为25%[COMPARE:F004]。", "环比增幅为25%。"),
+        ] {
+            assert_eq!(contract.validate(text).unwrap_or_else(|errors| {
+                panic!("比较事实应可引用：{errors:?}\n{}", contract.render())
+            }), display);
+        }
+        assert!(
+            contract.validate("环比基期为100万元[MAIN:F001]。").is_err(),
+            "主结果当前值不能冒充比较基期"
+        );
+        assert!(
+            contract.validate("华东客户订单金额为100万元[MAIN:F001]。").is_err(),
+            "主结果值不能冒充补充明细值"
+        );
+        assert!(
+            contract.validate("毛利额为100万元[MAIN:F001]。").is_err(),
+            "主结果值不能冒充同窗毛利值"
+        );
+
+        let spy = Spy::new("本月销售额为100万元[MAIN:F001]。");
+        assert_eq!(reading.insight_deep(&spy).await.as_deref(), Some("本月销售额为100万元。"));
+        let prompt = spy.seen();
+        for marker in ["MAIN 主结果", "DETAIL 补充明细", "COMPARE 结构化比较", "CONTEXT 同窗经营补充"] {
+            assert!(prompt.contains(marker), "AI prompt 缺事实域 {marker}: {prompt}");
+        }
     }
 }

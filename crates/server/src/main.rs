@@ -7,10 +7,8 @@ mod admin_api;
 mod artifact_api;
 mod auth;
 mod chat;
-mod corrector;
 mod db;
 mod embed;
-mod direct;
 mod ds_api;
 mod embed_fill;
 mod daily_digest;
@@ -85,7 +83,7 @@ use dms_policy::{principal, scope};
 use dms_semantic::registry::datasource as ds_reg;
 // 问答循环整块迁 dms-agent（`server/src/pipeline.rs` 与 `triage.rs` 随之删除，
 // AGE 图 IO 迁 `dms_connector::graph`）。server 侧只剩下面那层薄包装：观测 + 依赖注入。
-use dms_agent::triage;
+use dms_agent::intent::{IntentRoute, RoutedQuestion};
 
 struct AppState {
     /// DMS 身份与权限源。分析库切换后，本池仍固定读取 DMS 权限表。
@@ -610,6 +608,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // 判官模式总闸：`DMSAI_JUDGE=1` 的进程只读不学（`registry::judge_mode` 的唯一设置点）。
+    // 判官/评测走的就是生产 ask 链路，不关这道闸每跑一趟全量题集就把评测问句连同那一刻的
+    // SQL 灌进 few-shot 与经验池，再喂回真实用户（2026-08-13 审计）。
+    let judge = std::env::var("DMSAI_JUDGE").is_ok_and(|v| v == "1");
+    dms_semantic::registry::set_judge_mode(judge);
+    if judge {
+        tracing::info!("判官模式：学习面只读（不写 sql_exemplar / memory / pitfall 候选）");
+    }
+
     let cfg = db::load_settings()?;
 
     // args_os + 显式报错：`std::env::args()` 遇非 UTF-8 argv 直接 panic，连句人话都没有
@@ -772,7 +779,7 @@ async fn main() -> anyhow::Result<()> {
     // 子命令：check-sql "<sql>" —— SchemaCorrector 字段校验冒烟
     if args.len() >= 3 && args[1] == "check-sql" {
         let owned = owned_store(&cfg).await?;
-        match corrector::schema_check(owned.pool(), ds_reg::DMS_DS_ID, &args[2]).await? {
+        match dms_semantic::correct::schema::schema_check(owned.pool(), ds_reg::DMS_DS_ID, &args[2]).await? {
             Some(hint) => println!("发现幻觉列:\n{hint}"),
             None => println!("OK 字段全部合法"),
         }
@@ -906,7 +913,7 @@ async fn main() -> anyhow::Result<()> {
         //   tags       = 题库 tags，`;` 连接（分层统计）
         let mut rows: Vec<String> = vec![];
         for (i, (name, q, tags)) in cases.iter().enumerate() {
-            let why = direct::why_not_compose(pg, ds_reg::DMS_DS_ID, q).await;
+            let why = dms_agent::answerers::fastpath_intent::why_not_compose(pg, ds_reg::DMS_DS_ID, q).await;
             println!("{q}\n    {why}");
             let gate = why.chars().take(2).collect::<String>();
             *tally.entry(gate.clone()).or_default() += 1;
@@ -1362,6 +1369,9 @@ async fn main() -> anyhow::Result<()> {
         // 【S1】可信结果反馈 + 管理员质量控制面。反馈只绑定本人 trace，统计在 PG 内聚合。
         .route("/api/feedback", post(quality_api::feedback))
         .route("/api/admin/quality", get(quality_api::quality))
+        // 学习账本：列最近批次 / 撤回一批（自我进化的安全网，见 registry::learn）
+        .route("/api/admin/learn", get(admin_api::learn_batches))
+        .route("/api/admin/learn/{batch_id}/rollback", post(admin_api::learn_rollback))
         .route("/api/admin/feedback/{id}/status", post(quality_api::set_feedback_status))
         // 【A15】冷启动推荐问句（enabled 语料 + 兜底四条）
         .route("/api/suggest", get(api_suggest))
@@ -2055,24 +2065,27 @@ async fn ask_data_payload(
     st: &AppState,
     req: &AskReq,
     gate: &AskGate,
+    prepared: &PreparedAsk,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
-    let history: Vec<&str> = gate.history.iter().map(String::as_str).collect();
     let r = ask_data_run(
         st,
         &gate.p,
-        gate.prev
-            .as_ref()
-            .map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice(), history.as_slice())),
         req.ds.as_deref(),
         req.conv_id.map(|c| c.to_string()).as_deref(),
         // 【深度模式】SC 抬到 ≥3：多数派投票是现成的「AI 深度参与生成」件
         //（配置 sc_samples 已 ≥3 时不降 —— max 不是 overwrite）
-        if req.mode.as_deref() == Some("deep") { st.sc_samples.max(3) } else { st.sc_samples },
-        &req.question,
+        if req.mode.as_deref() == Some("deep") {
+            st.sc_samples.max(3)
+        } else {
+            st.sc_samples
+        },
+        prepared,
     )
     .await?;
-    Ok(serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"))
+    let mut payload =
+        serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+    insight_api::attach_analysis_receipt(&mut payload, &req.question, &gate.p);
+    Ok(payload)
 }
 
 /// 问数半的执行体（`AskResult` 本体，未序列化）：`ask_data_payload` 与混合查询编排共用，
@@ -2082,14 +2095,13 @@ async fn ask_data_payload(
 async fn ask_data_run(
     st: &AppState,
     p: &principal::Principal,
-    prev: Option<dms_agent::ask::PrevTurn<'_>>,
     ds: Option<&str>,
     conv_id: Option<&str>,
     sc_samples: usize,
-    question: &str,
+    prepared: &PreparedAsk,
 ) -> Result<dms_agent::AskResult, (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
-    let (r, _log) = ask(
+    let (r, _log) = ask_prepared(
         &st.llm,
         &st.auth_mysql,
         &st.mysql,
@@ -2097,8 +2109,7 @@ async fn ask_data_run(
         st.owned.pool(),
         &st.embed,
         p,
-        question,
-        prev,
+        prepared,
         ds,
         // 会话 id 透传到 `query_log` 与三张日志表 —— `chat.rs` 的亏就是
         // 「query_log 当年没有 conv_id，从它拿不回本会话上一轮」
@@ -2130,8 +2141,6 @@ pub(crate) struct HybridAsk<'a> {
     /// 用户原问：AI 综合（`hybrid_summary`）与 warn 留痕用；喂给两路的是 kb_q/data_q 两半
     pub(crate) question: &'a str,
     pub(crate) p: &'a principal::Principal,
-    /// 上一轮（问句, 那一轮执行的 SQL, 证据引用）：与 `ask` 的 `prev` 同一类型
-    pub(crate) prev: Option<dms_agent::ask::PrevTurn<'a>>,
     /// 显式选源；小程序恒 None（后端选源）
     pub(crate) ds: Option<&'a str>,
     /// 会话 id（透传 `query_log` 三表）
@@ -2141,77 +2150,134 @@ pub(crate) struct HybridAsk<'a> {
     pub(crate) sc_samples: usize,
 }
 
-/// 【混合查询】两级判据（web 与小程序同一份，判据两处必漂）：子句级命中（明确的两半
-/// 问句）→ 两半各喂一路；否则整句级 both-hit（意图不明确，2026-08-11 用户裁决：问数与
-/// 知识库一起查、综合输出）→ 整句喂两路。都不命中 = `None`，单路分诊照旧。
-pub(crate) fn hybrid_split(question: &str) -> Option<(String, String)> {
-    triage::hybrid_clauses(question)
-        .or_else(|| triage::unclear_both_hit(question).then(|| (question.to_string(), question.to_string())))
-}
-
 /// 【混合查询】问数 + 知识库两路并行（`tokio::join!` 总耗时 = 两路较大者，不相加），
 /// AI 综合落 `view.insight`、知识库答案落 `kb` 键（老前端 serde 兼容：多出的键被忽略）。
 /// 一路挂了不拖死另一路：退化为单路答案（warn 留痕），与复合子问「失败不算整体失败」同族。
 /// `pub(crate)`：小程序（`xcx_api`）复用同一编排，应答形状由各自入口包。
+
+/// 把 `AppState` 装成 agent 的 `AskDeps`（含知识库半）后交给 `dms_agent::hybrid::run`。
+///
+/// 与 `ask_prepared` 共用同一套依赖构造：混合问句的问数半就是它，
+/// 差别只在多给一个 `KbArm`（知识库那一路的 store / RRF 权重 / 显式空间）。
+async fn ask_hybrid_run(
+    st: &AppState,
+    h: &HybridAsk<'_>,
+    prepared: &PreparedAsk,
+) -> Result<dms_agent::hybrid::HybridOutcome, (StatusCode, Json<serde_json::Value>)> {
+    let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
+    let trace = query_log::Trace::default();
+    let trace_id = uuid::Uuid::new_v4().to_string();
+    let conv_id = h.conv_id.map(str::to_string).unwrap_or_else(|| trace_id.clone());
+    let llm: Arc<dyn dms_kernel::ChatModel> = Arc::new(st.llm.clone());
+    let on_usage = |u: &dms_kernel::llm::Usage| trace.add(u);
+    let on_ds = |ds: &str| trace.set_ds(ds);
+    let main_source_name = st.mysql.target_name();
+    let weights = st.cfg().kb_rrf_weights.clone();
+    let deps = dms_agent::AskDeps {
+        llm: &llm,
+        auth: &st.auth_mysql,
+        dms: &st.mysql,
+        registry: &st.sources,
+        pg: st.owned.pool(),
+        embed: &st.embed,
+        detect: dms_semantic::fastpath::relation::detect_relation,
+        compose_hit: dms_agent::answerers::fastpath_intent::compose_hit,
+        direct_hit: dms_agent::answerers::fastpath_intent::direct_hit,
+        kb: Some(dms_agent::hybrid::KbArm {
+            owned: &st.owned,
+            weights: &weights,
+            space: h.space_id,
+        }),
+        main_source_name: &main_source_name,
+        on_usage: &on_usage,
+        on_ds: &on_ds,
+        trace_id,
+        conv_id,
+        sc_samples: h.sc_samples,
+    };
+    dms_agent::hybrid::run(&deps, h.p, &prepared.question, h.ds)
+        .await
+        .map_err(|e| {
+            tracing::warn!(err = %e, "混合查询两路皆失败");
+            err(StatusCode::UNPROCESSABLE_ENTITY, "混合查询执行失败".to_string())
+        })
+}
+
 pub(crate) async fn hybrid_payload(
     st: &AppState,
     h: &HybridAsk<'_>,
-    kb_q: &str,
-    data_q: &str,
+    prepared: &PreparedAsk,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let data = ask_data_run(st, h.p, h.prev, h.ds, h.conv_id, h.sc_samples, data_q);
-    let kb = kb_answer(st, h.p, h.space_id, kb_q);
-    let (data_r, kb_r) = tokio::join!(data, kb);
-    match (data_r, kb_r) {
-        (Ok(r), Ok(a)) => {
-            let summary = dms_agent::compound::hybrid_summary(&st.llm, h.question, &r, &a).await;
-            let mut v =
-                serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
-            if let Some(s) = summary {
+    // 🔴 编排在 agent（`dms_agent::hybrid::run`），协议在这里。此前整套编排住在本文件，
+    // 而 `ask_prepared` 把 Hybrid 挡在门外 —— CLI/判官与 HTTP 对同一份合同行为相反，
+    // 回归结构上覆盖不到混合路径。收口之后两条路来自**同一次执行**。
+    let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
+    let outcome = ask_hybrid_run(st, h, prepared).await?;
+    if let Some(card) = outcome.clarification {
+        return Ok(serde_json::to_value(&card)
+            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"));
+    }
+    let (data_receipt, knowledge_receipt) = (outcome.data, outcome.knowledge);
+    let mut payload = match (&data_receipt, &knowledge_receipt) {
+        (Some(r), Some(a)) => {
+            let mut v = serde_json::to_value(r)
+                .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+            if let Some(s) = &outcome.summary {
                 v["view"]["insight"] = serde_json::json!(s);
             }
-            v["kb"] = serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
-            Ok(v)
+            v["kb"] = serde_json::to_value(a)
+                .expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+            v
         }
-        (Ok(r), Err(e)) => {
-            tracing::warn!(err = %e, question = %h.question, "混合查询知识库路失败 → 退化纯问数");
-            Ok(serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"))
+        (Some(r), None) => serde_json::to_value(r)
+            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+        (None, Some(a)) => serde_json::to_value(a)
+            .expect("Answer 是纯数据 struct，派生 Serialize 不会失败"),
+        (None, None) => {
+            return Err(err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "混合查询两路都没有产出".to_string(),
+            ))
         }
-        (Err(_), Ok(a)) => {
-            tracing::warn!(question = %h.question, "混合查询问数路失败 → 退化纯知识库");
-            Ok(serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败"))
-        }
-        (Err(e), Err(_)) => Err(e),
+    };
+    payload["intent_summary"] =
+        hybrid_summary_value(prepared, data_receipt.as_ref(), knowledge_receipt.as_ref());
+    if prepared.question.effective_question != prepared.question.original_question {
+        payload["resolved_question"] = serde_json::json!(prepared.question.effective_question);
     }
+    if data_receipt.is_some() {
+
+        insight_api::attach_analysis_receipt(&mut payload, h.question, h.p);
+    }
+    Ok(payload)
 }
 
-/// `api_ask` 与 `api_ask_stream` 共用的混合查询前段：自动模式（未点 chip）且 `hybrid_split`
-/// 命中 → `Some(两路编排结果)`；点了 chip 或两级判据都不命中 → `None`（单路分诊照旧）。
+/// `api_ask` 与 `api_ask_stream` 共用的 typed 混合查询分支。进不进由**合同的 route** 决定，
+/// 能不能执行由 `hybrid::split` 决定（N 条问数 + 恰好 1 条资料；Unknown 一票否决）。
+/// 多条问数子结果折进 `AskResult.subs`，wire 形状不变 —— 前端按既有复合问句渲染。
 async fn hybrid_branch(
     st: &AppState,
     req: &AskReq,
     gate: &AskGate,
+    prepared: &PreparedAsk,
 ) -> Option<Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)>> {
     if req.intent.is_some() {
         return None;
     }
-    let (kb_q, data_q) = hybrid_split(&req.question)?;
-    let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
-    let history: Vec<&str> = gate.history.iter().map(String::as_str).collect();
+    if prepared.question.route() != IntentRoute::Hybrid {
+        return None;
+    }
     let conv_id = req.conv_id.map(|c| c.to_string());
     let h = HybridAsk {
         question: &req.question,
         p: &gate.p,
-        prev: gate.prev
-            .as_ref()
-            .map(|(q, s)| (q.as_str(), s.as_deref(), refs.as_slice(), history.as_slice())),
         ds: req.ds.as_deref(),
         conv_id: conv_id.as_deref(),
         space_id: req.space_id.as_deref(),
         // 深度模式的 SC 抬档与问数单路同一口径（见 `ask_data_payload`）
         sc_samples: if req.mode.as_deref() == Some("deep") { st.sc_samples.max(3) } else { st.sc_samples },
     };
-    Some(hybrid_payload(st, &h, &kb_q, &data_q).await)
+    Some(hybrid_payload(st, &h, prepared).await)
 }
 
 /// 存会话消息（用户问 + AI 结果），首问顺手设标题。失败 warn 留痕后吞掉：
@@ -2223,39 +2289,357 @@ async fn ask_persist(st: &AppState, conv_id: Option<i64>, question: &str, payloa
     }
 }
 
+/// 一次用户请求只做一遍追问改写与结构化意图解析。Fast 用量先暂存在这里，进入 Data
+/// 执行时再计入同一条 query_log；纯 Knowledge/澄清没有 Data query_log，保持现有落账口径。
+struct PreparedAsk {
+    question: dms_agent::ask::PreparedQuestion,
+    usage: Vec<dms_kernel::llm::Usage>,
+    started_at: std::time::Instant,
+}
+
+impl PreparedAsk {
+    fn project(&self, routed: &RoutedQuestion) -> Self {
+        Self {
+            question: self.question.project(routed),
+            usage: self.usage.clone(),
+            started_at: self.started_at,
+        }
+    }
+}
+
+async fn prepare_ask(
+    st: &AppState,
+    question: &str,
+    prev: Option<dms_agent::ask::PrevTurn<'_>>,
+) -> PreparedAsk {
+    let started_at = std::time::Instant::now();
+    let usage = std::sync::Mutex::new(Vec::new());
+    let mut question = dms_agent::ask::prepare_question(
+        &st.llm,
+        &|item| usage.lock().unwrap_or_else(|p| p.into_inner()).push(*item),
+        question,
+        prev,
+    )
+    .await;
+    // 模型超时、传输失败或协议输出不完整，都不能把一个已被确定性销售事实完整证明的
+    // 明确问题变成反问。这里只恢复 NotReady；模型明确给出歧义的 Ready/Unknown 合同仍
+    // 保持 fail-closed，绝不覆盖用户真实歧义。
+    if !question.intent_attempt.is_ready() {
+        if let Some(recovered) =
+            dms_agent::answerers::fastpath_intent::recover_sales_intent(&question.effective_question, st.mysql.is_warehouse())
+        {
+            tracing::warn!(
+                question = %question.effective_question,
+                "结构化意图不合约，但确定性销售事实完整接住 → 使用原文最小合同"
+            );
+            question.intent_attempt = recovered;
+        }
+    }
+    PreparedAsk {
+        question,
+        usage: usage.into_inner().unwrap_or_else(|p| p.into_inner()),
+        started_at,
+    }
+}
+
+fn forced_route(intent: Option<&str>) -> Option<IntentRoute> {
+    match intent
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("data") => Some(IntentRoute::Data),
+        Some("knowledge") => Some(IntentRoute::Knowledge),
+        _ => None,
+    }
+}
+
+fn forced_routed_question(
+    attempt: &dms_agent::intent::IntentAttempt,
+    effective_question: &str,
+    route: IntentRoute,
+) -> Option<RoutedQuestion> {
+    match attempt.route() {
+        // Hybrid 强制路由必须落到唯一 typed child，不能把完整复合问题改标签后执行。
+        IntentRoute::Hybrid => {
+            let mut matched = attempt
+                .routed_questions(effective_question)
+                .into_iter()
+                .filter(|child| child.route == route);
+            let only = matched.next()?;
+            matched.next().is_none().then_some(only)
+        }
+        // Data 可显式切到 Knowledge；Knowledge 不能反向“生造”数据合同。
+        IntentRoute::Data if matches!(route, IntentRoute::Data | IntentRoute::Knowledge) => {
+            Some(RoutedQuestion {
+                route,
+                question: effective_question.to_string(),
+            })
+        }
+        IntentRoute::Knowledge if route == IntentRoute::Knowledge => Some(RoutedQuestion {
+            route,
+            question: effective_question.to_string(),
+        }),
+        IntentRoute::Data | IntentRoute::Knowledge | IntentRoute::Unknown => None,
+    }
+}
+
+fn projected_forced(prepared: &PreparedAsk, route: IntentRoute) -> Option<PreparedAsk> {
+    forced_routed_question(
+        &prepared.question.intent_attempt,
+        &prepared.question.effective_question,
+        route,
+    )
+    .map(|routed| prepared.project(&routed))
+}
+
+fn knowledge_has_citation(answer: &dms_kernel::Answer) -> bool {
+    matches!(&answer.body, dms_kernel::AnswerBody::Text { citations, .. } if !citations.is_empty())
+}
+
+fn knowledge_receipt_value(
+    mut summary: serde_json::Value,
+    has_citation: bool,
+) -> serde_json::Value {
+    let Some(object) = summary.as_object_mut() else {
+        return summary;
+    };
+    object.insert("mode".into(), serde_json::json!("knowledge"));
+    let coverage = object
+        .entry("coverage")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(coverage) = coverage.as_object_mut() else {
+        return summary;
+    };
+    coverage.insert(
+        "status".into(),
+        serde_json::json!(if has_citation { "complete" } else { "blocked" }),
+    );
+    coverage.insert(
+        "issues".into(),
+        if has_citation {
+            serde_json::json!([])
+        } else {
+            serde_json::json!(["knowledge:no-citation"])
+        },
+    );
+    summary
+}
+
+fn knowledge_summary_value(
+    prepared: &PreparedAsk,
+    answer: &dms_kernel::Answer,
+) -> serde_json::Value {
+    let summary = serde_json::to_value(prepared.question.intent_summary())
+        .expect("IntentSummary 是纯数据 struct，派生 Serialize 不会失败");
+    knowledge_receipt_value(summary, knowledge_has_citation(answer))
+}
+
+fn hybrid_intent_summary(
+    prepared: &PreparedAsk,
+    data: Option<&dms_agent::AskResult>,
+    knowledge: Option<&dms_kernel::Answer>,
+) -> dms_agent::IntentSummary {
+    let mut summary = prepared.question.intent_summary();
+    summary.mode = IntentRoute::Hybrid;
+    summary.coverage.status = "blocked";
+    summary.coverage.issues.clear();
+    match data {
+        Some(result) => match result.intent_summary.as_ref() {
+            Some(child) if child.coverage.status == "complete" => {}
+            Some(child) => {
+                summary
+                    .coverage
+                    .issues
+                    .push("hybrid:data-incomplete".into());
+                summary.coverage.issues.extend(
+                    child
+                        .coverage
+                        .issues
+                        .iter()
+                        .map(|issue| format!("data:{issue}")),
+                );
+            }
+            None => summary
+                .coverage
+                .issues
+                .push("hybrid:data-unverified".into()),
+        },
+        None => summary.coverage.issues.push("hybrid:data-failed".into()),
+    }
+    match knowledge {
+        Some(answer) if knowledge_has_citation(answer) => {}
+        Some(_) => summary
+            .coverage
+            .issues
+            .push("hybrid:knowledge:no-citation".into()),
+        None => summary
+            .coverage
+            .issues
+            .push("hybrid:knowledge-failed".into()),
+    }
+    if summary.coverage.issues.is_empty() {
+        summary.coverage.status = "complete";
+    }
+    summary
+}
+
+fn hybrid_summary_value(
+    prepared: &PreparedAsk,
+    data: Option<&dms_agent::AskResult>,
+    knowledge: Option<&dms_kernel::Answer>,
+) -> serde_json::Value {
+    serde_json::to_value(hybrid_intent_summary(prepared, data, knowledge))
+        .expect("IntentSummary 是纯数据 struct，派生 Serialize 不会失败")
+}
+
+/// forced chip 只能覆盖一个已就绪、无歧义且本身可路由的合同；不能把 Unknown/解析失败
+/// “洗”成可执行请求。Data 投影后还会再校验 `is_data_executable`。
+fn prepared_contract_ready(prepared: &PreparedAsk) -> bool {
+    // 🔴 **确定性车道不需要合同**（2026-08-14 架构级体检）。
+    //
+    // 这道早退是知识库/文件类问句的主出卡口：fast 模型一次抖动（`Unavailable`/`Invalid`），
+    // 或者资料问句天生没有指标/时间（`Unknown`），都会让「线下设备申请政策」变成
+    // 一张「请补充明确的对象、指标和时间」——而那张卡的措辞本身就是合同结构的镜像，
+    // 合同只有那三样可问。
+    //
+    // fail-closed 一个字没松：`decide` 的确定性规则（R1/R2）**只产 Knowledge**，
+    // 结构上到不了 SQL 生成（不变量由 `ask::deterministic_rules_never_produce_data` 钉住）。
+    if prepared.question.plan().deterministic {
+        return true;
+    }
+    intent_contract_ready(&prepared.question.intent_attempt)
+}
+
+fn intent_contract_ready(attempt: &dms_agent::intent::IntentAttempt) -> bool {
+    attempt
+        .ready()
+        .is_some_and(|intent| intent.ambiguities.is_empty())
+        && attempt.route() != IntentRoute::Unknown
+}
+
 async fn api_ask(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<AskReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let gate = ask_gate(&st, &headers, &req).await?;
-    // 【混合查询】自动模式（未点「问数/知识库」chip）：子句级两半各喂一路，整句级
-    // both-hit（意图不明确）整句喂两路 —— 两路并行 + AI 综合（`hybrid_payload`），
-    // 不再二选一丢掉另一半。
-    if let Some(payload) = hybrid_branch(&st, &req, &gate).await {
+    let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
+    let history: Vec<&str> = gate.history.iter().map(String::as_str).collect();
+    let prev = gate.prev.as_ref().map(|(q, s)| {
+        (
+            q.as_str(),
+            s.as_deref(),
+            refs.as_slice(),
+            history.as_slice(),
+        )
+    });
+    let prepared = prepare_ask(&st, &req.question, prev).await;
+    let forced = forced_route(req.intent.as_deref());
+    // Invalid/Unavailable/歧义/Unknown 不因 forced chip 越过 fail-closed；forced 只在可路由合同上覆盖。
+    // 🔴 合同不可用**不等于**知识库不能答（2026-08-14 业主连续三次实测）。
+    //
+    // 这道早退在 `match route` 之前，于是上一版加在 Unknown 臂上的知识库兜底是**死代码** ——
+    // 用户看到的还是「先问清再查」。而合同不可用的最常见成因恰恰是
+    // ①fast 模型间歇吐坏 JSON（`Invalid`）②知识库问句天生没有指标/时间/实体（`Unknown`），
+    // 两种都**不代表**用户问了一个答不了的问题。
+    //
+    // fail-closed 一个字没松：这条路**不生成任何 SQL**，只做检索；
+    // 只有真的检索到带引用的内容才顶替卡片，否则照旧出卡。
+    if !prepared_contract_ready(&prepared) {
+        let payload = match unknown_route_kb_fallback(
+            &st,
+            &gate.p,
+            req.space_id.as_deref(),
+            &prepared.question.effective_question,
+        )
+        .await
+        {
+            Some(a) => {
+                let mut v = serde_json::to_value(&a)
+                    .expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+                v["intent_summary"] = knowledge_summary_value(&prepared, &a);
+                v
+            }
+            None => serde_json::to_value(prepared.question.clarification_result())
+                .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+        };
+        ask_persist(&st, req.conv_id, &req.question, &payload).await;
+        return Ok(Json(payload));
+    }
+    if let Some(payload) = hybrid_branch(&st, &req, &gate, &prepared).await {
         let payload = payload?;
         ask_persist(&st, req.conv_id, &req.question, &payload).await;
         return Ok(Json(payload));
     }
-    // 【K5】意图分诊。`ds` 用主源：判据只读 `meta.metric/dimension/term`（谓词 `IN (ds,'*')`），
-    // 而选源发生在 `dms_agent::ask` 内部——分诊只决定「问数还是查文档」，不决定问哪个源。
-    // 分诊不会失败（内部一律降级 Data），故这里没有 `?`：存量问数链路一步不变。
-    let intent =
-        triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &req.question, req.intent.as_deref())
-            .await;
-    let payload = match intent {
-        triage::Intent::Data => ask_data_payload(&st, &req, &gate).await?,
+    let prepared = match forced {
+        Some(route) => match projected_forced(&prepared, route) {
+            Some(projected) => projected,
+            None => {
+                let payload = serde_json::to_value(prepared.question.clarification_result())
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+                ask_persist(&st, req.conv_id, &req.question, &payload).await;
+                return Ok(Json(payload));
+            }
+        },
+        None => prepared,
+    };
+    let route = prepared.question.route();
+    if route == IntentRoute::Data && !prepared.question.intent_attempt.is_data_executable() {
+        let payload = serde_json::to_value(prepared.question.clarification_result())
+            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+        ask_persist(&st, req.conv_id, &req.question, &payload).await;
+        return Ok(Json(payload));
+    }
+    let payload = match route {
+        IntentRoute::Data => ask_data_payload(&st, &req, &gate, &prepared).await?,
         // `Answer` 带 `kind:"text"`，前端 K2 的 `KbAnswer` 分支按它分派；`route` 是 `"knowledge"`
-        triage::Intent::Knowledge => {
-            let a = kb_answer(&st, &gate.p, req.space_id.as_deref(), &req.question)
-                .await
-                .map_err(|_| {
-                    (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Json(serde_json::json!({ "error": "暂时无法完成知识检索，请稍后重试" })),
-                    )
-                })?;
-            serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败")
+        IntentRoute::Knowledge => {
+            let a = kb_answer(
+                &st,
+                &gate.p,
+                req.space_id.as_deref(),
+                &prepared.question.effective_question,
+            )
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "error": "暂时无法完成知识检索，请稍后重试" })),
+                )
+            })?;
+            let mut payload =
+                serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+            payload["intent_summary"] = knowledge_summary_value(&prepared, &a);
+            if prepared.question.effective_question != req.question {
+                payload["resolved_question"] =
+                    serde_json::json!(prepared.question.effective_question);
+            }
+            payload
+        }
+        IntentRoute::Hybrid | IntentRoute::Unknown => {
+            // 先问一次知识库（见 `unknown_route_kb_fallback` 的红字）；查到才顶替澄清卡
+            match unknown_route_kb_fallback(
+                &st,
+                &gate.p,
+                req.space_id.as_deref(),
+                &prepared.question.effective_question,
+            )
+            .await
+            {
+                Some(a) => {
+                    let mut payload = serde_json::to_value(&a)
+                        .expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+                    payload["intent_summary"] = knowledge_summary_value(&prepared, &a);
+                    if prepared.question.effective_question != req.question {
+                        payload["resolved_question"] =
+                            serde_json::json!(prepared.question.effective_question);
+                    }
+                    payload
+                }
+                None => serde_json::to_value(prepared.question.clarification_result())
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+            }
         }
     };
     ask_persist(&st, req.conv_id, &req.question, &payload).await;
@@ -2275,23 +2659,79 @@ async fn api_ask_stream(
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     use axum::response::IntoResponse;
     let gate = ask_gate(&st, &headers, &req).await?;
-    // 【混合查询】与 `/api/ask` 同一判据（`hybrid_branch` 一处收口）：命中即回普通 JSON
-    //（前端按 handleSync 处理，与 Data 臂同一个传输约定，SSE 协议一字不动）。
-    if let Some(payload) = hybrid_branch(&st, &req, &gate).await {
+    let refs: Vec<&str> = gate.refs.iter().map(String::as_str).collect();
+    let history: Vec<&str> = gate.history.iter().map(String::as_str).collect();
+    let prev = gate.prev.as_ref().map(|(q, s)| {
+        (
+            q.as_str(),
+            s.as_deref(),
+            refs.as_slice(),
+            history.as_slice(),
+        )
+    });
+    let prepared = prepare_ask(&st, &req.question, prev).await;
+    let forced = forced_route(req.intent.as_deref());
+    // 🔴 合同不可用**不等于**知识库不能答（2026-08-14 业主连续三次实测）。
+    //
+    // 这道早退在 `match route` 之前，于是上一版加在 Unknown 臂上的知识库兜底是**死代码** ——
+    // 用户看到的还是「先问清再查」。而合同不可用的最常见成因恰恰是
+    // ①fast 模型间歇吐坏 JSON（`Invalid`）②知识库问句天生没有指标/时间/实体（`Unknown`），
+    // 两种都**不代表**用户问了一个答不了的问题。
+    //
+    // fail-closed 一个字没松：这条路**不生成任何 SQL**，只做检索；
+    // 只有真的检索到带引用的内容才顶替卡片，否则照旧出卡。
+    if !prepared_contract_ready(&prepared) {
+        let payload = match unknown_route_kb_fallback(
+            &st,
+            &gate.p,
+            req.space_id.as_deref(),
+            &prepared.question.effective_question,
+        )
+        .await
+        {
+            Some(a) => {
+                let mut v = serde_json::to_value(&a)
+                    .expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+                v["intent_summary"] = knowledge_summary_value(&prepared, &a);
+                v
+            }
+            None => serde_json::to_value(prepared.question.clarification_result())
+                .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+        };
+        ask_persist(&st, req.conv_id, &req.question, &payload).await;
+        return Ok(Json(payload).into_response());
+    }
+    if let Some(payload) = hybrid_branch(&st, &req, &gate, &prepared).await {
         let payload = payload?;
         ask_persist(&st, req.conv_id, &req.question, &payload).await;
         return Ok(Json(payload).into_response());
     }
-    let intent =
-        triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &req.question, req.intent.as_deref())
-            .await;
-    match intent {
-        triage::Intent::Data => {
-            let payload = ask_data_payload(&st, &req, &gate).await?;
+    let prepared = match forced {
+        Some(route) => match projected_forced(&prepared, route) {
+            Some(projected) => projected,
+            None => {
+                let payload = serde_json::to_value(prepared.question.clarification_result())
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+                ask_persist(&st, req.conv_id, &req.question, &payload).await;
+                return Ok(Json(payload).into_response());
+            }
+        },
+        None => prepared,
+    };
+    let route = prepared.question.route();
+    if route == IntentRoute::Data && !prepared.question.intent_attempt.is_data_executable() {
+        let payload = serde_json::to_value(prepared.question.clarification_result())
+            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+        ask_persist(&st, req.conv_id, &req.question, &payload).await;
+        return Ok(Json(payload).into_response());
+    }
+    match route {
+        IntentRoute::Data => {
+            let payload = ask_data_payload(&st, &req, &gate, &prepared).await?;
             ask_persist(&st, req.conv_id, &req.question, &payload).await;
             Ok(Json(payload).into_response())
         }
-        triage::Intent::Knowledge => {
+        IntentRoute::Knowledge => {
             // `Principal` → `Viewer` 与同步分支同一个映射（`kb_answer` 内部也是它）
             let v = dms_agent::answerers::knowledge::viewer(&gate.p);
             let mut extra = serde_json::Map::new();
@@ -2301,12 +2741,53 @@ async fn api_ask_stream(
             if let Some(sp) = req.space_id.as_deref() {
                 extra.insert("space_id".into(), serde_json::json!(sp));
             }
+            extra.insert(
+                "intent_summary".into(),
+                serde_json::to_value(prepared.question.intent_summary())
+                    .expect("IntentSummary 是纯数据 struct，派生 Serialize 不会失败"),
+            );
+            if prepared.question.effective_question != req.question {
+                extra.insert(
+                    "resolved_question".into(),
+                    serde_json::json!(prepared.question.effective_question),
+                );
+            }
             // 持久化在工人里做（答案落定后存 user/ai 两条，与同步分支同一条 save_msg_logged）；
             // 错误文案与同步 Knowledge 分支的 422 同一句
-            let rx = kb_api::spawn_kb_worker(&st, v, req.space_id.clone(), &req.question, req.conv_id, |_| {
-                "暂时无法完成知识检索，请稍后重试".to_string()
-            });
+            let rx = kb_api::spawn_kb_worker(
+                &st,
+                v,
+                req.space_id.clone(),
+                &prepared.question.effective_question,
+                Some(&req.question),
+                Some(extra.clone()),
+                req.conv_id,
+                |_| "暂时无法完成知识检索，请稍后重试".to_string(),
+            );
             Ok(kb_api::sse_response(rx, extra).into_response())
+        }
+        IntentRoute::Hybrid | IntentRoute::Unknown => {
+            // 与 `/api/ask` 同一条兜底：两端行为必须一致（流式与非流式对同一句话
+            // 给出不同答案，是本仓反复付过账的那类分叉）
+            let payload = match unknown_route_kb_fallback(
+                &st,
+                &gate.p,
+                req.space_id.as_deref(),
+                &prepared.question.effective_question,
+            )
+            .await
+            {
+                Some(a) => {
+                    let mut payload = serde_json::to_value(&a)
+                        .expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+                    payload["intent_summary"] = knowledge_summary_value(&prepared, &a);
+                    payload
+                }
+                None => serde_json::to_value(prepared.question.clarification_result())
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+            };
+            ask_persist(&st, req.conv_id, &req.question, &payload).await;
+            Ok(Json(payload).into_response())
         }
     }
 }
@@ -2363,11 +2844,15 @@ async fn ask(
     // 门禁 ④「server 的 HTTP 客户端只许出现在身份面文件」不过滤注释行 —— 那个库名连写在
     // 注释里都会判红，本文件刻意不提它（实测撞过一次）。
     let llm: Arc<dyn dms_kernel::ChatModel> = Arc::new(llm.clone());
-    let correctors = corrector::DmsCorrectors;
     // 两个观测回调必须先绑定成局部：直接写 `&|u| ...` 是临时值，`deps` 借它会活不过这条语句
     let on_usage = |u: &dms_kernel::llm::Usage| trace.add(u);
     let on_ds = |ds: &str| trace.set_ds(ds);
     let main_source_name = dms.target_name();
+    // 知识库臂的两个借用要活过 `deps`：`PgPool` 是 Arc，clone 只加引用计数。
+    // 权重取默认值 —— 这条链（CLI/MCP/深度子问）没有 settings 快照；HTTP 主链走
+    // `ask_hybrid_run`，那里用的是页面可配的 `st.cfg().kb_rrf_weights`。
+    let kb_store = dms_connector::owned::OwnedStore::from_pool(pg.clone());
+    let kb_weights = dms_knowledge::retrieve::RrfWeights::default();
     let deps = dms_agent::AskDeps {
         llm: &llm,
         auth,
@@ -2375,11 +2860,20 @@ async fn ask(
         registry,
         pg,
         embed,
-        correctors: &correctors,
         // Router 三个成员的产出方（顺序由 agent 的 `router()` 定，这里只给实现）
-        detect: direct::detect_relation,
-        compose_hit: direct::compose_hit,
-        direct_hit: direct::direct_hit,
+        detect: dms_semantic::fastpath::relation::detect_relation,
+        compose_hit: dms_agent::answerers::fastpath_intent::compose_hit,
+        direct_hit: dms_agent::answerers::fastpath_intent::direct_hit,
+        // 混合问句的知识库半：编排在 agent，依赖由 wire 侧交（协议/装配分工不变）。
+        // 🔴 这里此前是 `None` —— 于是 CLI / MCP / 深度子问这条链**答不了任何文档问题**：
+        // 混合问句的知识半被静默丢掉（实测 `route=compound, subs=1`），纯资料问句退澄清卡。
+        // 从已有池借一个 store（`from_pool` 不新建池），不为它给十个调用点各加一个形参。
+        kb: Some(dms_agent::hybrid::KbArm {
+            owned: &kb_store,
+            weights: &kb_weights,
+            // 不限空间：被授权看别人空间的人也得检索得到，ACL 由 retrieve 在 SQL 内把关
+            space: None,
+        }),
         main_source_name: &main_source_name,
         on_usage: &on_usage,
         on_ds: &on_ds,
@@ -2389,6 +2883,82 @@ async fn ask(
     };
     let out = dms_agent::ask(&deps, p, question, prev, explicit_ds).await;
     let log = query_log::finish(pg, &trace, &p.login_name, question, &out, t0.elapsed().as_millis());
+    (out, log)
+}
+
+/// 与 `ask` 共用同一套依赖和 query_log，只跳过已经完成的追问改写/意图解析。
+#[allow(clippy::too_many_arguments)]
+async fn ask_prepared(
+    llm: &llm::LlmClient,
+    auth: &ReadOnlyMySql,
+    dms: &ReadOnlyMySql,
+    registry: &SourceRegistry,
+    pg: &sqlx::PgPool,
+    embed: &dms_connector::embed::EmbedClient,
+    p: &principal::Principal,
+    prepared: &PreparedAsk,
+    explicit_ds: Option<&str>,
+    conv_id: Option<&str>,
+    sc_samples: usize,
+) -> (
+    anyhow::Result<dms_agent::AskResult>,
+    tokio::task::JoinHandle<()>,
+) {
+    let t0 = prepared.started_at;
+    let trace = query_log::Trace::default();
+    let trace_id = uuid::Uuid::new_v4().to_string();
+    let conv_id = conv_id
+        .map(str::to_string)
+        .unwrap_or_else(|| trace_id.clone());
+    trace.set_trace(&trace_id, &conv_id);
+    for usage in &prepared.usage {
+        trace.add(usage);
+    }
+    let llm: Arc<dyn dms_kernel::ChatModel> = Arc::new(llm.clone());
+    let on_usage = |usage: &dms_kernel::llm::Usage| trace.add(usage);
+    let on_ds = |ds: &str| trace.set_ds(ds);
+    let main_source_name = dms.target_name();
+    // 知识库臂的两个借用要活过 `deps`：`PgPool` 是 Arc，clone 只加引用计数。
+    // 权重取默认值 —— 这条链（CLI/MCP/深度子问）没有 settings 快照；HTTP 主链走
+    // `ask_hybrid_run`，那里用的是页面可配的 `st.cfg().kb_rrf_weights`。
+    let kb_store = dms_connector::owned::OwnedStore::from_pool(pg.clone());
+    let kb_weights = dms_knowledge::retrieve::RrfWeights::default();
+    let deps = dms_agent::AskDeps {
+        llm: &llm,
+        auth,
+        dms,
+        registry,
+        pg,
+        embed,
+        detect: dms_semantic::fastpath::relation::detect_relation,
+        compose_hit: dms_agent::answerers::fastpath_intent::compose_hit,
+        direct_hit: dms_agent::answerers::fastpath_intent::direct_hit,
+        // 混合问句的知识库半：编排在 agent，依赖由 wire 侧交（协议/装配分工不变）。
+        // 🔴 这里此前是 `None` —— 于是 CLI / MCP / 深度子问这条链**答不了任何文档问题**：
+        // 混合问句的知识半被静默丢掉（实测 `route=compound, subs=1`），纯资料问句退澄清卡。
+        // 从已有池借一个 store（`from_pool` 不新建池），不为它给十个调用点各加一个形参。
+        kb: Some(dms_agent::hybrid::KbArm {
+            owned: &kb_store,
+            weights: &kb_weights,
+            // 不限空间：被授权看别人空间的人也得检索得到，ACL 由 retrieve 在 SQL 内把关
+            space: None,
+        }),
+        main_source_name: &main_source_name,
+        on_usage: &on_usage,
+        on_ds: &on_ds,
+        trace_id,
+        conv_id,
+        sc_samples,
+    };
+    let out = dms_agent::ask::ask_prepared(&deps, p, &prepared.question, explicit_ds).await;
+    let log = query_log::finish(
+        pg,
+        &trace,
+        &p.login_name,
+        &prepared.question.original_question,
+        &out,
+        t0.elapsed().as_millis(),
+    );
     (out, log)
 }
 
@@ -2413,6 +2983,66 @@ async fn kb_answer(
 #[derive(serde::Deserialize)]
 struct ConvQuery {
     login_name: Option<String>,
+}
+
+/// 合同判 Unknown 时的兜底：**先问一次知识库，再决定要不要出澄清卡**。
+///
+/// 🔴 由来（2026-08-14 业主实测「线下设备申请的政策」）：知识库问句天生没有指标、
+/// 没有时间、没有实体 —— 正是数据合同最容易判 `Unknown/Invalid` 的那一类。
+/// 而 `IntentRoute::Unknown` 那一臂**直接返回澄清卡、一次都不查知识库**，
+/// 于是「问知识库无论问什么都不回答」。那张卡还写着「请补充明确的对象、指标和时间」，
+/// 对一句政策问句毫无意义 —— 用户被要求补充一个根本不存在的东西。
+///
+/// 合同不可用 ≠ 知识库不能答：检索本身是 fail-safe 的（查不到就说「知识库里没有相关内容」），
+/// 拿它兜底严格优于一张答非所问的卡。**问数侧一个字不变**：这条路不生成任何 SQL。
+/// 只有真的检索到带引用的内容才顶替澄清卡；没查到就照旧出卡（数据问句的体验不变）。
+pub(crate) async fn unknown_route_kb_fallback(
+    st: &AppState,
+    p: &principal::Principal,
+    space: Option<&str>,
+    question: &str,
+) -> Option<dms_kernel::Answer> {
+    match kb_answer(st, p, space, question).await {
+        // 有引用 = 真的在库里找到了依据。没有引用的那两种（NO_HIT / 模型没给带角标的结论）
+        // 都不顶替澄清卡：那时卡片至少还给了下一步怎么问。
+        Ok(a) => match &a.body {
+            dms_kernel::AnswerBody::Text { citations, markdown }
+                if !citations.is_empty() && !reads_as_not_found(markdown) =>
+            {
+                Some(a)
+            }
+            _ => None,
+        },
+        Err(e) => {
+            // 兜底路失败不许影响主结论：照旧出澄清卡，但要留痕（否则这条路哑了没人知道）
+            tracing::warn!(err = %e, "Unknown 合同的知识库兜底失败 → 回澄清卡");
+            None
+        }
+    }
+}
+
+
+/// 「答了，但答的是『查不到』」—— **带引用的非答案**。
+///
+/// 🔴 业主 2026-08-14 实测：发一个单号 `HJXH-DXO2026081300138`，知识库兜底把
+/// 「该订单号未出现在任何资料中，无法查询其订单状态、商品明细或金额」连同 **2 条引用**
+/// 返回，顶掉了本该走问数的路。模型一边说查不到、一边照样打了角标 ——
+/// **有引用 ≠ 有答案**，上一版只判 `citations.is_empty()` 拦不住这种。
+///
+/// 只扫开头 160 字（「直接结论」那一段）：正文后段出现「未提及」是正常的行文，
+/// 拿它判非答案会把大量真答案误杀。
+fn reads_as_not_found(markdown: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "未出现在任何资料",
+        "知识库里没有相关内容",
+        "未找到相关",
+        "没有相关资料",
+        "资料中未提及",
+        "无法查询",
+        "无法回答",
+    ];
+    let head: String = markdown.chars().take(160).collect();
+    MARKERS.iter().any(|m| head.contains(m))
 }
 
 /// 可选角色列表：多角色账号必须显式选角色（1:1 对齐 DMS「请选择登录角色」，
@@ -2688,6 +3318,21 @@ fn business_health_status(connected: bool, read_only: bool, timed_out: bool) -> 
     }
 }
 
+fn doc_service_ready(health: Option<&serde_json::Value>) -> bool {
+    health.is_some_and(|health| {
+        health.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+            && health
+                .get("parse_ok")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|caps| {
+                    caps.get("text").and_then(serde_json::Value::as_bool) == Some(true)
+                        && ["pdf", "docx", "xlsx"].iter().any(|name| {
+                            caps.get(*name).and_then(serde_json::Value::as_bool) == Some(true)
+                        })
+                })
+    })
+}
+
 async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     // 业务池拥塞时旧实现会让 `/api/health` 一起排队，前端最后误报“后端未连接”。
     // 两秒只用于体检止损，不改变业务查询超时；无法确认只读仍 fail-closed。
@@ -2714,8 +3359,9 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
             .collect::<Vec<String>>()
     };
     let vec_probe = dms_semantic::ddl::vector_ready(st.owned.pool());
-    let ((mysql_ok, mysql_readonly, mysql_busy), pg_exts, vec_ready) =
-        tokio::join!(mysql_probe, pg_exts_probe, vec_probe);
+    let doc_probe = st.doc.health();
+    let ((mysql_ok, mysql_readonly, mysql_busy), pg_exts, vec_ready, doc_health) =
+        tokio::join!(mysql_probe, pg_exts_probe, vec_probe, doc_probe);
     // 🔴 修恒真判定：原来第三项是「扩展列表非空」——任何 PG 都非空（`plpgsql` 恒在），
     // 这一项从来没有为假过，等于 `ok` 只在报 MySQL 的状态。改成三个扩展逐个校验。
     let pg_exts_ok = REQUIRED_PG_EXTS.iter().all(|n| pg_exts.iter().any(|e| e == n));
@@ -2728,10 +3374,30 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     // `datasource` 4 行 active / 0 行有向量 —— 而系统从上线起一直这样跑。
     // 体检取不到（PG 挂了）时报 `null` 并让 `ok` 为假：「查不出来」不许算通过。
     let vec_ready = vec_ready.ok();
-    let vec_ok = vec_ready.as_ref().is_some_and(|v| v.table_doc && v.element && v.datasource);
+    let vec_ok = vec_ready
+        .as_ref()
+        .is_some_and(|v| v.table_doc && v.element && v.datasource);
+    let doc_ok = doc_service_ready(doc_health.as_ref());
+    // 🔴 熔断态必须进健康检查（2026-08-14）：`vector_ready` 查的是**库里有没有向量列**，
+    // 不是**服务通不通** —— embed 服务挂 5 分钟，这里一路绿，而知识库正在用剩下几路
+    // 凑答案（答案里现在会挂一行降级提示，但运维侧此前完全看不见）。
+    // 只读三个原子，不造熔断中间件、不加指标系统。
+    //
+    // ⚠️ 这里**只报 embed**：`RerankClient` 今天是 `retrieve.rs:614` 每次调用
+    // `from_env()` 现建的 —— 它的 `Arc<AtomicU64>` 熔断槽随实例一起销毁，
+    // 也就是说 **rerank 的熔断从来没真正生效过**（每次都是全新的冷却计时器）。
+    // 报一个恒 false 的字段比不报更糟（那是把「没接」伪装成「一切正常」）。
+    // 真要接：`RerankClient` 得进 `AppState` 与 embed 同规格共享，见 PROGRESS 的已知项。
+    let breakers = serde_json::json!({
+        "embed_query": st.embed.cooling(dms_connector::embed::EmbedMode::Query),
+        "embed_passage": st.embed.cooling(dms_connector::embed::EmbedMode::Passage),
+    });
+    let breakers_ok = breakers
+        .as_object()
+        .is_some_and(|m| m.values().all(|v| v == &serde_json::Value::Bool(false)));
 
     Json(serde_json::json!({
-        "ok": mysql_ok && mysql_readonly && pg_exts_ok && vec_ok,
+        "ok": mysql_ok && mysql_readonly && pg_exts_ok && vec_ok && doc_ok && breakers_ok,
         "mysql": {
             "connected": mysql_ok,
             "session_read_only": mysql_readonly,
@@ -2747,11 +3413,14 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
             }),
             None => serde_json::Value::Null,
         },
+        "doc_service": doc_health.unwrap_or_else(|| serde_json::json!({ "ok": false })),
         // F3 自检（只读源角色看不见 meta/kb/chat）。本轮**还没有**建 PG 只读源，
         // 故报 null 而不是 true —— 没做过的检查不许报成通过。K3 接上 `PostgresSource` 后
         // 这里改报 `!st.ro_source.owned_schema_visible().await?`（那个方法每次重查，
         // 因为授权可以在启动之后被 GRANT 改坏）。
         "ro_source_isolated": serde_json::Value::Null,
+        // 三个外部服务的熔断态：为真 = 这一路正在冷却中（本轮请求会走降级路径）
+        "breakers": breakers,
         "graph_sync": st.graph_status.lock().map(|s| s.clone()).unwrap_or_default(),
     }))
 }
@@ -3100,6 +3769,26 @@ mod tests {
     }
 
     #[test]
+    fn health_requires_a_reachable_document_service_with_core_parse_capability() {
+        let ready = serde_json::json!({
+            "ok": true,
+            "parse_ok": { "text": true, "pdf": true, "docx": false, "xlsx": false }
+        });
+        assert!(super::doc_service_ready(Some(&ready)));
+        for unavailable in [
+            serde_json::json!({ "ok": false, "parse_ok": { "text": true, "pdf": true } }),
+            serde_json::json!({ "ok": true, "parse_ok": { "text": false, "pdf": true } }),
+            serde_json::json!({ "ok": true, "parse_ok": { "text": true, "pdf": false, "docx": false, "xlsx": false } }),
+        ] {
+            assert!(
+                !super::doc_service_ready(Some(&unavailable)),
+                "{unavailable}"
+            );
+        }
+        assert!(!super::doc_service_ready(None));
+    }
+
+    #[test]
     fn cli_keeps_auth_source_separate_from_analysis_source() {
         let src = include_str!("main.rs");
         let cli = src
@@ -3149,6 +3838,297 @@ mod tests {
         assert!(
             src.contains(concat!("Some(\"deep\") { st.sc_samples.", "max(3) }")),
             "deep 时 SC 必须 max(3) —— 直接写成 3 会把配置里的更高值拉低"
+        );
+    }
+
+    #[test]
+    fn every_server_ask_entry_uses_one_prepared_question_without_raw_triage() {
+        let main = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        let xcx = include_str!("xcx_api.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        let mcp = include_str!("mcp_api.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        // deep_api 在生产辅助函数上有局部 `#[cfg(test)]` 诊断函数，不能用“第一个 cfg(test)”
+        // 截断整个文件；真正测试模块以换行后的 `mod tests` 为边界。
+        let deep_src = include_str!("deep_api.rs");
+        let deep = deep_src
+            .split("\nmod tests {")
+            .next()
+            .unwrap_or(deep_src);
+        for (name, source) in [("web", main), ("xcx", xcx), ("mcp", mcp), ("deep", deep)] {
+            assert!(
+                source.contains("prepare_ask("),
+                "{name} 入口没有统一准备问题"
+            );
+            assert!(
+                !source.contains("triage::triage("),
+                "{name} 仍绕过 PreparedQuestion 做 raw triage"
+            );
+            assert!(
+                !source.contains("hybrid_split("),
+                "{name} 仍用字符串启发式拆混合问题"
+            );
+        }
+        assert!(
+            main.contains("ask_prepared("),
+            "web Data 执行应复用已准备合同"
+        );
+        assert!(
+            xcx.contains("crate::ask_prepared("),
+            "小程序 Data 执行应复用已准备合同"
+        );
+        assert!(
+            mcp.contains("crate::ask_prepared("),
+            "MCP Data 执行应复用已准备合同"
+        );
+        assert!(
+            deep.contains("let primary_future = crate::ask_prepared("),
+            "深度主查询不得二次解析"
+        );
+    }
+
+    #[test]
+    fn streaming_kb_keeps_original_question_for_history_and_effective_question_for_search() {
+        let main = include_str!("main.rs");
+        let xcx = include_str!("xcx_api.rs");
+        let kb = include_str!("kb_api.rs");
+        for (name, source, original) in [
+            ("web", main, "Some(&req.question)"),
+            ("xcx", xcx, "Some(&gate.question)"),
+        ] {
+            assert!(
+                source.contains("&prepared.question.effective_question"),
+                "{name} 知识检索没有使用生效问句"
+            );
+            assert!(source.contains(original), "{name} 流式会话没有另传用户原问");
+            assert!(
+                source.contains("Some(extra.clone())"),
+                "{name} 会话终态没有持久化意图摘要"
+            );
+        }
+        assert!(
+            kb.contains("persisted_question")
+                && kb.contains(".unwrap_or(query_question.as_str())"),
+            "持久化原问的实现被删除或改写成执行问句"
+        );
+        assert!(
+            kb.contains("&persisted_question"),
+            "会话 user 消息不得保存改写后的执行问句"
+        );
+        assert!(
+            kb.contains("extra.get(\"intent_summary\")")
+                && kb.contains("extra.get(\"resolved_question\")"),
+            "done.answer 必须保留 meta 中的意图解释字段"
+        );
+    }
+
+    #[test]
+    fn forced_route_never_turns_unknown_or_empty_data_contract_into_execution() {
+        use dms_agent::intent::{parse_intent_strict, IntentAttempt, IntentRoute};
+
+        let knowledge = parse_intent_strict(
+            r#"{"mode":"knowledge","goals":["查询保修期"],"metrics":[],"entity_mentions":[{"surface":"美的烤箱","kind":"product"}],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#,
+        )
+        .expect("合法知识意图");
+        let knowledge = IntentAttempt::validated(knowledge, "美的烤箱保修期多久");
+        assert!(super::intent_contract_ready(&knowledge));
+        assert!(
+            super::forced_routed_question(&knowledge, "美的烤箱保修期多久", IntentRoute::Data,)
+                .is_none()
+        );
+
+        let data = parse_intent_strict(
+            r#"{"mode":"data","goals":["查询销售额"],"metrics":["销售额"],"entity_mentions":[],"filters":[],"regions":[],"time":{"surface":"本月","start":"","end":"","grain":"month"},"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#,
+        )
+        .expect("合法数据意图");
+        let data = IntentAttempt::validated(data, "本月销售额");
+        assert_eq!(
+            super::forced_routed_question(&data, "本月销售额", IntentRoute::Data)
+                .expect("Data 可保留原路由")
+                .question,
+            "本月销售额",
+        );
+        assert_eq!(
+            data.project("本月销售额", IntentRoute::Knowledge).route(),
+            IntentRoute::Unknown,
+            "强制切路由不能把 Data 合同重新包装成伪 Knowledge Ready"
+        );
+
+        assert!(!super::intent_contract_ready(&IntentAttempt::Unavailable));
+        let ambiguous = parse_intent_strict(
+            r#"{"mode":"data","goals":["查询销售额"],"metrics":["销售额"],"entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":["请明确时间"]}"#,
+        )
+        .expect("合法歧义意图");
+        assert!(!super::intent_contract_ready(&IntentAttempt::validated(
+            ambiguous,
+            "销售额，请明确时间"
+        )));
+    }
+
+    #[test]
+    fn forced_hybrid_route_selects_only_the_matching_typed_child() {
+        use dms_agent::intent::{parse_intent_strict, IntentAttempt, IntentRoute};
+
+        let intent = parse_intent_strict(
+            r#"{"mode":"hybrid","subgoals":[{"mode":"knowledge","surface":"美的烤箱保修期多久"},{"mode":"data","surface":"海尔冰箱库存多少"}],"goals":[],"metrics":["库存量"],"entity_mentions":[{"surface":"美的烤箱","kind":"product"},{"surface":"海尔冰箱","kind":"product"}],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#,
+        )
+        .expect("合法 Hybrid 意图");
+        let question = "美的烤箱保修期多久，海尔冰箱库存多少";
+        let attempt = IntentAttempt::validated(intent, question);
+
+        let data = super::forced_routed_question(&attempt, question, IntentRoute::Data)
+            .expect("应选择唯一 Data 子问");
+        assert_eq!(data.question, "海尔冰箱库存多少");
+        let knowledge = super::forced_routed_question(&attempt, question, IntentRoute::Knowledge)
+            .expect("应选择唯一 Knowledge 子问");
+        assert_eq!(knowledge.question, "美的烤箱保修期多久");
+    }
+
+    /// 🔴 合同判 Unknown 时**必须先问一次知识库**，不许直接出澄清卡。
+    ///
+    /// 业主 2026-08-14 实测「线下设备申请的政策」：知识库问句天生没有指标/时间/实体，
+    /// 正是数据合同最容易判 Unknown 的那一类 —— 而 `IntentRoute::Unknown` 那一臂
+    /// 直接返回澄清卡、**一次都不查知识库**，于是「问知识库无论问什么都不回答」。
+    /// 卡上还写着「请补充明确的对象、指标和时间」，对一句政策问句毫无意义。
+    ///
+    /// 判据同时守两件事：兜底真的存在；**两个端点都接上**（流式与非流式对同一句话
+    /// 给出不同答案，是本仓反复付过账的那类分叉）。
+    #[test]
+    fn unknown_contract_consults_the_kb_before_giving_up() {
+        let src = include_str!("main.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap();
+        // 兜底函数在，且只在「查到带引用的内容」时才顶替卡片
+        let f = prod
+            .split("async fn unknown_route_kb_fallback")
+            .nth(1)
+            .expect("Unknown 的知识库兜底没了：知识库问句会重新被澄清卡挡死")
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(f.contains("kb_answer("), "兜底没真去查知识库：{f}");
+        assert!(f.contains("citations") && f.contains("is_empty"), "没判「有没有引用」：{f}");
+        // 有引用**不等于**有答案：模型会一边说「未出现在任何资料中」一边打角标
+        assert!(
+            f.contains("reads_as_not_found("),
+            "没判「答的是不是『查不到』」：带引用的非答案会顶掉正确的路（实测单号那次）：{f}"
+        );
+        assert!(f.contains("tracing::warn!"), "兜底失败必须留痕，否则这条路哑了没人知道");
+    }
+
+    /// 带引用的**非答案**不许顶替卡片。
+    #[test]
+    fn a_cited_not_found_is_not_an_answer() {
+        assert!(super::reads_as_not_found(
+            "## 直接结论
+该订单号未出现在任何资料中，无法查询其订单状态、商品明细或金额。"
+        ));
+        assert!(super::reads_as_not_found("知识库里没有相关内容。已检索 104 篇文档"));
+        // 真答案不许被误杀 —— 「未提及」出现在正文后段是正常行文
+        assert!(!super::reads_as_not_found(
+            "## 直接结论
+客户打款退款政策分两类：结束合作走云之家【线下客户退出申请】；             继续合作仅打款错误走人人费用通用报销 [^1][^2]。
+
+## 关键要点
+             * 文中未提及跨主体充值的例外情形。"
+        ));
+    }
+
+    /// 🔴 **判据的扫描面必须覆盖缺陷面** —— 本仓为这条付了三次账。
+    ///
+    /// 上一版判据写成「`main.rs` 里 `unknown_route_kb_fallback(` 出现 5 次」：
+    /// 单文件、且是硬编码次数。于是 `deep_api.rs` 与 `xcx_api.rs::ask_stream` 天然漏网，
+    /// 业主从深度模式进来，同一句「下载 押金转货款申请书」拿到 38 行账余充值明细 ——
+    /// 「我修一个入口，你从第五个入口进来又复发」的结构成因就是这个：
+    /// **判据只扫了 1/4 的入口**。
+    ///
+    /// 现在按**形状**扫四个入口文件：每一个 `Unknown` 臂、每一道合同就绪闸，
+    /// 后面都必须跟一次知识库兜底。新增入口只要抄了这两个形状就会被自动纳入判据。
+    ///
+    /// 自匹配说明：本测试自身的字面量也会被 `include_str!` 扫到，形成两处恒真的匹配 ——
+    /// 无害（每个匹配点各自独立判定，真站点漏了仍然会红），不值得为它引入剥离测试模块的
+    /// 逻辑（`deep_api.rs` 有多个 `#[cfg(test)]` 标记，按标记切会切错）。
+    #[test]
+    fn every_entry_consults_the_kb_before_showing_a_card() {
+        const ENTRIES: [(&str, &str); 4] = [
+            ("main.rs", include_str!("main.rs")),
+            ("deep_api.rs", include_str!("deep_api.rs")),
+            ("xcx_api.rs", include_str!("xcx_api.rs")),
+            ("mcp_api.rs", include_str!("mcp_api.rs")),
+        ];
+        // 两个出卡形状 → 各自的检查窗口（够装下 match 臂/守卫体，不至于跨到下一个分支）
+        const SHAPES: [(&str, usize); 2] = [
+            (concat!("IntentRoute::Unknown", " => {"), 600),
+            (concat!("prepared_contract", "_ready(&prepared) {"), 800),
+        ];
+        // 🔴 深度模式的**臂序**：知识臂必须在「转问数」之前。它是 fall-through 结构
+        // （没有 `IntentRoute::Unknown =>` 臂），一旦有人把知识臂挪到问数之后，
+        // 「下载 押金转货款申请书」又会掉回 38 行账余表 —— 而上面按形状扫的判据看不见这个。
+        // 收窄到那一个 handler 再比先后：`deep_api.rs` 有多个端点，全文件 `find` 拿到的
+        // `ProgressStage::Query` 是别人的（第一版就是这么误红的）。
+        let deep = include_str!("deep_api.rs");
+        let at = deep
+            .find(concat!("if !crate::prepared_contract", "_ready(&prepared) {"))
+            .expect("深度模式的合同闸没了");
+        let handler = &deep[at..];
+        let knowledge_arm = handler
+            .find("if route == dms_agent::intent::IntentRoute::Knowledge {")
+            .expect("深度模式没有知识臂了：文档/资料问句会直接掉进问数");
+        let to_data = handler
+            .find("note(&rid, ProgressStage::Query);")
+            .unwrap_or(usize::MAX);
+        assert!(knowledge_arm < to_data, "深度模式的知识臂被挪到问数之后了");
+
+        for (name, src) in ENTRIES {
+            for (shape, window) in SHAPES {
+                for (at, _) in src.match_indices(shape) {
+                    // 按**字符**取窗口：`&src[at..at+window]` 会切在中文注释的 UTF-8 中间
+                    // 直接 panic（第一版就是这么红的，且报的是切片越界不是判据不满足）。
+                    let body: String = src[at..].chars().take(window).collect();
+                    assert!(
+                        body.contains("unknown_route_kb_fallback("),
+                        "{name} 有一条出卡路径没问过知识库就出卡了（形状 `{shape}`）：{body}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 混合问句的**基数合同**已随编排一起收进 agent（`hybrid::split` / `cardinality_note`），
+    /// 判据也在那里。这里只钉一件本层的事：server 不许再长出第二份配对逻辑 ——
+    /// 2026-08-14 删掉的 `hybrid_pair`/`hybrid_cardinality_clarification` 就是这么留下的
+    /// （编排搬走后没人删，规则还与 agent 侧不一致：它连「2 数 1 知」都拒）。
+    #[test]
+    fn server_keeps_no_second_hybrid_pairing() {
+        let src = include_str!("main.rs");
+        let prod = src.split("
+#[cfg(test)]").next().unwrap();
+        for banned in ["fn hybrid_pair", "fn hybrid_cardinality"] {
+            assert!(!prod.contains(banned), "编排收在 agent，server 不许再有 {banned}");
+        }
+    }
+
+    #[test]
+    fn knowledge_receipt_requires_a_citation() {
+        let base = serde_json::json!({
+            "mode": "knowledge",
+            "coverage": { "status": "blocked", "issues": [] }
+        });
+        let cited = super::knowledge_receipt_value(base.clone(), true);
+        assert_eq!(cited["coverage"]["status"], "complete");
+        assert_eq!(cited["coverage"]["issues"], serde_json::json!([]));
+
+        let uncited = super::knowledge_receipt_value(base, false);
+        assert_eq!(uncited["coverage"]["status"], "blocked");
+        assert_eq!(
+            uncited["coverage"]["issues"],
+            serde_json::json!(["knowledge:no-citation"]),
         );
     }
 

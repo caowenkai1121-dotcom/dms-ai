@@ -52,7 +52,7 @@ use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 /// 目录内容、字段合同或禁用规则变化时必须递增。日期对齐本轮业务交接日，避免未来版本。
-pub const VERSION: &str = "2026.08.06-warehouse-catalog-v1";
+pub const VERSION: &str = "2026.08.13-warehouse-catalog-v2";
 const VERSION_KEY: &str = "warehouse_catalog_version";
 
 pub struct Asset {
@@ -338,8 +338,8 @@ pub const ASSETS: &[Asset] = &[
         "禁止默认同比/环比：现行表无快照轴，历史比较需专门快照资产"),
     asset!("dms_ods", "t_customer", "ODS", "客户主数据", "一客户一 customer_code",
         "当前主数据，无经营时间轴",
-        "客户档案、类型、分类、渠道、区域和启停状态",
-        "禁止汇总敏感字段；禁止从主数据推算销售额/余额；默认展示必须脱敏和按权限过滤",
+        "客户档案、类型、分类、渠道、行政区划和启停状态；province 是行政区划码，不是门店业务省区",
+        "禁止汇总敏感字段；禁止从主数据推算销售额/余额；t_customer.department_id 是客户所属部门且生产可为空，禁止作为门店业务省区依据；默认展示必须脱敏和按权限过滤",
         "禁止默认同比/环比；历史变化需专门快照资产"),
     asset!("dms_ods", "t_goods", "ODS", "商品主数据", "一商品一 goods_code",
         "当前主数据，无经营时间轴",
@@ -348,9 +348,14 @@ pub const ASSETS: &[Asset] = &[
         "禁止默认同比/环比；历史变化需专门快照资产"),
     asset!("dms_ods", "t_master_shop", "ODS", "门店主数据", "一门店一 shop_code，归属 customer_code",
         "当前主数据，必须过滤删除状态",
-        "门店档案、客户归属、地域、面积和门店类型",
-        "monthly_sales/area 覆盖不足，禁止默认计算销售额、店效、坪效、人效",
+        "门店档案、客户归属、面积和门店类型；province=行政省份，province_department/province_department_name=已落库的业务省区部门ID/名称，业务省区筛选必须使用 province_department_name",
+        "monthly_sales/area 覆盖不足，禁止默认计算销售额、店效、坪效、人效；禁止用 t_customer.department_id、行政 province 拼接“省区”或模糊裁剪后缀推断业务省区；映射特例包括上海→浙江省区、海南→广东省区",
         "禁止默认同比/环比；历史变化需专门快照资产"),
+    asset!("dms_ods", "t_shop_province_department_mapping", "ODS", "门店业务省区映射", "一省份×城市一映射；有效数据中同一省份只能对应一个业务省区部门ID和名称",
+        "当前映射配置，必须过滤 deleted_flag=0；无经营时间轴",
+        "行政 province/city 到业务 province_department_name/department_id 的权威映射；生产特例：上海→浙江省区、海南→广东省区；department_id 必须按名称唯一命中 status=1 且 deleted_flag=0 的 t_department",
+        "禁止按 province 拼接“省区”、删除行政区后缀或模糊匹配；禁止用 t_customer.department_id 推断门店业务省区；禁止只按 province 与本表明细直接 JOIN 造成一省多城市扇出，门店查询优先读取 t_master_shop 已落库的 province_department_name",
+        "禁止默认同比/环比；这是当前映射配置，历史变化需专门版本资产"),
     asset!("dms_ods", "t_activity_main", "ODS", "市场活动", "活动单头，一活动一 activity_no",
         "时间用 created_time；状态范围必须由问题明确",
         "活动场次、活动申请金额和状态结构",
@@ -382,6 +387,69 @@ pub const ASSETS: &[Asset] = &[
         "单查新流会漏存量；禁止把申请中/失败计入；必须与旧流 UNION ALL 才是总开票",
         "条件允许：新旧两流使用相同状态和 apply_time 窗口后比较"),
 ];
+
+/// 行政省份 → DMS 门店业务省区的省级合同。
+///
+/// 生产表的 463 个省市行仍是唯一明细事实源；初始化脚本已强校验“同一省份只能对应一个
+/// 业务省区”，所以运行时只投影 32 个省级结果，不复制城市配置。未进入生产映射的台湾、
+/// 港澳返回 `None`，调用方必须 fail closed，不能拼出不存在的“台湾省区”等值。
+pub fn shop_business_region_for_province(province: &str) -> Option<&'static str> {
+    match province.trim() {
+        "北京" | "北京市" => Some("北京省区"),
+        "天津" | "天津市" => Some("天津省区"),
+        "河北" | "河北省" => Some("河北省区"),
+        "山西" | "山西省" => Some("山西省区"),
+        "内蒙古" | "内蒙古自治区" => Some("内蒙省区"),
+        "辽宁" | "辽宁省" => Some("辽宁省区"),
+        "吉林" | "吉林省" => Some("吉林省区"),
+        "黑龙江" | "黑龙江省" => Some("黑龙江省区"),
+        "上海" | "上海市" => Some("浙江省区"),
+        "江苏" | "江苏省" => Some("江苏省区"),
+        "浙江" | "浙江省" => Some("浙江省区"),
+        "安徽" | "安徽省" => Some("安徽省区"),
+        "福建" | "福建省" => Some("福建省区"),
+        "江西" | "江西省" => Some("江西省区"),
+        "山东" | "山东省" => Some("山东省区"),
+        "河南" | "河南省" => Some("河南省区"),
+        "湖北" | "湖北省" => Some("湖北省区"),
+        "湖南" | "湖南省" => Some("湖南省区"),
+        "广东" | "广东省" => Some("广东省区"),
+        "广西" | "广西壮族自治区" => Some("广西省区"),
+        "海南" | "海南省" => Some("广东省区"),
+        "重庆" | "重庆市" => Some("川渝藏大区"),
+        "四川" | "四川省" => Some("川渝藏大区"),
+        "贵州" | "贵州省" => Some("贵州省区"),
+        "云南" | "云南省" => Some("云南省区"),
+        "西藏" | "西藏自治区" => Some("川渝藏大区"),
+        "陕西" | "陕西省" => Some("西北大区"),
+        "甘肃" | "甘肃省" => Some("西北大区"),
+        "青海" | "青海省" => Some("西北大区"),
+        "宁夏" | "宁夏回族自治区" => Some("西北大区"),
+        "新疆" | "新疆维吾尔自治区" => Some("西北大区"),
+        _ => None,
+    }
+}
+
+/// 省份短名的完整定义域（`shop_business_region_for_province` 的入参那一半）。
+/// 港澳台不在内：生产映射里就没有它们，调用方必须 fail-closed。
+const STANDARD_PROVINCES: &[&str] = &["北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江", "上海", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南", "湖北", "湖南", "广东", "广西", "海南", "重庆", "四川", "贵州", "云南", "西藏", "陕西", "甘肃", "青海", "宁夏", "新疆"];
+
+/// 省份 → 省区**短名**（剥掉「省区/大区」后缀）的完整对照，唯一来源是
+/// [`shop_business_region_for_province`]。
+///
+/// 🔴 为什么要有这一份：下游此前各自手抄 CASE / IN 列表，而手抄的那份**漏了上海与海南**
+/// （权威表里它们分别归浙江省区、广东省区）。漏掉的后果不是报错，是
+/// `ops_caliber::inspection_valid` 里那句 `IS NOT NULL` 把这两地的巡店记录**整批静默排除** ——
+/// 「本月上海的巡店次数」恒 0，「今年各省区巡店次数」全国合计偏低，一个字的提示都没有。
+pub fn standard_region_pairs() -> Vec<(&'static str, &'static str)> {
+    STANDARD_PROVINCES
+        .iter()
+        .filter_map(|p| {
+            shop_business_region_for_province(p)
+                .map(|r| (*p, r.trim_end_matches("省区").trim_end_matches("大区")))
+        })
+        .collect()
+}
 
 /// 库名是资产自身合同，不能由 DWS/ADS 层级推断。
 pub const fn database_of(asset: &Asset) -> &'static str {
@@ -1036,7 +1104,7 @@ mod tests {
             assert!(comment.contains(&format!("{}.{}", asset.database, asset.table)));
             assert!(comment.contains("必须使用完整库表名"));
         }
-        assert_eq!(ASSETS.len(), 58, "运行时白名单数量变化必须同步资产文档");
+        assert_eq!(ASSETS.len(), 59, "运行时白名单数量变化必须同步资产文档");
         assert_eq!(metadata_assets().len(), ASSETS.len());
         for (database, expected) in [
             ("sales_dw", 21usize),
@@ -1044,7 +1112,7 @@ mod tests {
             ("fin_dw", 4),
             ("fin_ads", 5),
             ("hr_dw", 1),
-            ("dms_ods", 16),
+            ("dms_ods", 17),
             // 业务中台域首表（2026-08-11 用户指定库存源）：ywzt_ods.scm_warehous_manage
             ("ywzt_ods", 1),
         ] {
@@ -1086,6 +1154,33 @@ mod tests {
         let receivable = relevant_contracts("本月应收收入和成本", 4);
         assert!(!receivable[0].contains(crate::sales_fact::TABLE), "{receivable:?}");
         assert!(relevant_contracts("", 4).is_empty());
+    }
+
+    #[test]
+    fn shop_business_region_contract_uses_the_production_mapping() {
+        let customer = crate::registry::warehouse_contract("t_customer").unwrap();
+        let shop = crate::registry::warehouse_contract("t_master_shop").unwrap();
+        let mapping = crate::registry::warehouse_contract("t_shop_province_department_mapping")
+            .expect("门店业务省区映射必须进入运行时资产目录");
+
+        for expected in ["上海→浙江省区", "海南→广东省区"] {
+            assert!(shop.contains(expected), "门店合同缺少生产特例 {expected}：{shop}");
+            assert!(mapping.contains(expected), "映射合同缺少生产特例 {expected}：{mapping}");
+        }
+        assert!(shop.contains("province_department_name"), "门店业务省区必须读取落库字段：{shop}");
+        assert!(customer.contains("t_customer.department_id"), "客户合同必须声明 department_id 陷阱：{customer}");
+        assert!(shop.contains("禁止用 t_customer.department_id"), "门店合同必须拒绝客户部门推断：{shop}");
+        assert!(mapping.contains("禁止用 t_customer.department_id"), "映射合同必须拒绝客户部门推断：{mapping}");
+        assert!(metadata_assets().iter().any(|asset| {
+            asset.database() == "dms_ods" && asset.table() == "t_shop_province_department_mapping"
+        }), "映射表必须进入 metadata 白名单");
+        assert_eq!(shop_business_region_for_province("上海"), Some("浙江省区"));
+        assert_eq!(shop_business_region_for_province("上海市"), Some("浙江省区"));
+        assert_eq!(shop_business_region_for_province("海南"), Some("广东省区"));
+        assert_eq!(shop_business_region_for_province("海南省"), Some("广东省区"));
+        assert_eq!(shop_business_region_for_province("四川省"), Some("川渝藏大区"));
+        assert_eq!(shop_business_region_for_province("新疆"), Some("西北大区"));
+        assert_eq!(shop_business_region_for_province("台湾"), None, "生产未映射省份必须 fail closed");
     }
 
     /// direct-derive 候选层判据：ODS/DIM 才算明细层（大小写不敏感），合同层一律不算。

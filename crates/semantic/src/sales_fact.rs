@@ -923,3 +923,15 @@ mod tests {
         assert!(!sql.contains("ORDER BY") && !sql.contains("LIMIT"), "{sql}");
     }
 }
+
+/// 有效订单口径的**兜底字面量**（`meta.table_scope` 的 `t_sales_order` 声明的同形副本）。
+///
+/// 🔴 单一事实源：此前这串 `NOT IN ('0','108','199')` 在手工模板里散写了 8 处，
+/// 运营侧新增一个作废状态码时，装配器路径（读 `meta.table_scope`）当天自愈，
+/// 手工模板路径继续把作废单算进订单数 —— 两条路给同一个「订单数」两个答案。
+///
+/// `ponytail:` 这仍是**副本**，不是声明本身。终态是手工模板也吃 `table_scopes` 形参
+/// （装配器路径已经在传同一份），读不到声明就 fail-closed 回落；那一步会改行为，
+/// 必须连库跑 `evaluation.py` 验收，故与本次纯搬运分开走。
+/// 判据 `no_inline_order_scope_literals` 钉住「不许再出现第 9 处散写」。
+pub const ORDER_SCOPE: &str = "deleted_flag = 0 AND order_status NOT IN ('0','108','199')";

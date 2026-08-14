@@ -355,3 +355,16 @@ pub async fn load_table_snapshots(pg: &PgPool, ds: &str) -> anyhow::Result<Vec<T
         })
         .collect())
 }
+
+/// 【T8-B9】指标名 + 物理表（推导闸 1 通道②的语料）。
+///
+/// 逐字带走 `server/src/direct.rs` 里那条 `SELECT name, source_table FROM meta.metric …` ——
+/// 它随 `ods_derive` 迁到了 agent，而**agent 不许写 SQL**（`check-arch.ps1` 的 FAIL 级红线：
+/// 每一条 `meta.*` 查询都必须落在本 crate）。刻意不复用 `load_metrics`：那条带 `ORDER BY name`、
+/// 另一套 ds 谓词与 `catalog_allows_metric_record` 过滤，行集与行序都不同 —— 复用就不是纯搬运了。
+pub async fn load_metric_sources(pg: &PgPool, ds: &str) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as("SELECT name, source_table FROM meta.metric WHERE ds_id IN ($1, '*') AND status='active'")
+        .bind(ds)
+        .fetch_all(pg)
+        .await
+}

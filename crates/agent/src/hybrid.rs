@@ -1,0 +1,315 @@
+//! 混合问句（一句话里既有问数又有知识库）的**唯一编排点**。
+//!
+//! 为什么在 agent：此前整套住在 `server/src/main.rs`（`hybrid_payload`），而 `ask_prepared`
+//! 开头一句「route 不是 Data 就返回澄清卡」把 Hybrid 挡在门外 —— 于是
+//! **CLI/判官链路与 HTTP 服务链路对同一个合同行为相反**：判官问混合问句永远得到澄清卡，
+//! 回归题集结构上覆盖不到这条路，而线上走的是另一套代码。第二套编排器是 ARCHITECTURE
+//! 明令禁止的（「禁止再造平行编排器」），这里把它收回来。
+//!
+//! 边界：**编排在这里，协议在 server**。本模块返回类型化的 [`HybridOutcome`]，
+//! wire 形状（`v["kb"]` / `view.insight` 那几个键）仍由 server 塑 —— 那是协议层的事，
+//! 且三端（Web / 小程序 / MCP）的应答包各不相同。
+//!
+//! 失败语义与 `compound` 同族：**一路挂了不拖死另一路**，退化成单路答案并留 warn；
+//! 两路都挂才整体失败。
+
+use dms_kernel::Answer;
+use dms_policy::principal::Principal;
+
+use crate::ask::{ask_prepared, AskDeps, PreparedQuestion};
+use crate::ctx::AskResult;
+use crate::intent::{IntentRoute, RoutedQuestion};
+
+/// 知识库那一路的依赖。`None` = 调用方不提供 KB（深度报告子问、定时任务等），
+/// 此时 Hybrid 合同只执行问数半并在收据里留缺口，而不是整轮澄清 ——
+/// 「拿不到 KB」是调用方的能力边界，不是用户问错了。
+pub struct KbArm<'a> {
+    pub owned: &'a dms_connector::owned::OwnedStore,
+    pub weights: &'a dms_knowledge::retrieve::RrfWeights,
+    /// 显式知识空间；`None` = 不限空间（小程序恒 None）
+    pub space: Option<&'a str>,
+}
+
+/// 两路并行的类型化产物。三个字段各自可缺席，调用方据此决定 wire 形状。
+pub struct HybridOutcome {
+    pub data: Option<AskResult>,
+    pub knowledge: Option<Answer>,
+    /// AI 综合（fast 档）。两路都在才生成；失败降级为 `None`，不拖垮主结果。
+    pub summary: Option<String>,
+    /// 归属不唯一等无法执行的原因；非空时 `data`/`knowledge` 都为 `None`。
+    pub clarification: Option<AskResult>,
+}
+
+/// typed subgoal → (问数半 N 条, 知识库半 1 条)。
+///
+/// 此前这里要求**恰好两条**（一数一知），于是「本月销售额和毛利各多少？另外退货政策怎么规定」
+/// 这种再普通不过的问法直接吃澄清卡 —— 用户看到的就是业主截图里那张「先问清再查」。
+/// 问数半多条并不需要新载体：复合问句本来就走 `AskResult::compound(subs)`，wire 与前端零改动。
+///
+/// **知识库半仍限 1 条**，这是载体上限不是懒：`Answer` 的角标 = `citations` 下标 + 1，
+/// 合并两份答案得整体重编号，编错就是「点开引用跳到别的原文」——比澄清卡更伤。
+/// 触发条件写进澄清文案（下面 `cardinality_note`），用户拆一次就能问到。
+///
+/// 任何 `Unknown` 子任务照旧一票否决：归属都没证明，谈不上并行执行。
+pub fn split<'a>(routed: &'a [RoutedQuestion]) -> Option<(Vec<&'a RoutedQuestion>, &'a RoutedQuestion)> {
+    if routed.iter().any(|item| item.route == IntentRoute::Unknown) {
+        return None;
+    }
+    let data: Vec<&RoutedQuestion> =
+        routed.iter().filter(|item| item.route == IntentRoute::Data).collect();
+    let mut kb = routed.iter().filter(|item| item.route == IntentRoute::Knowledge);
+    let knowledge = kb.next()?;
+    if data.is_empty() || kb.next().is_some() {
+        return None;
+    }
+    Some((data, knowledge))
+}
+
+/// 澄清卡上那句话：**说清是几条、为什么执行不了**，而不是笼统「请说得更具体」。
+/// 用户据此知道该拆成几次问，而不是换个说法再撞一次同一堵墙。
+pub fn cardinality_note(routed: &[RoutedQuestion]) -> String {
+    let count = |r: IntentRoute| routed.iter().filter(|item| item.route == r).count();
+    let (data, knowledge) = (count(IntentRoute::Data), count(IntentRoute::Knowledge));
+    let unknown = routed.len().saturating_sub(data + knowledge);
+    if unknown > 0 {
+        return format!("我识别到 {unknown} 个子任务归属仍不明确（数据 {data} 个、资料 {knowledge} 个），先确认这几个再查。");
+    }
+    if knowledge > 1 {
+        return format!("我识别到 {knowledge} 个资料子任务；一次混合回答只能带 1 个资料问题（引用角标要保证点得开），请把资料部分拆成 {knowledge} 次问。");
+    }
+    format!("我识别到数据 {data} 个、资料 {knowledge} 个子任务，这个组合无法一次可靠回答，请拆开问。")
+}
+
+/// 执行一份 Hybrid 合同。`d.kb` 缺席时只跑问数半（见 [`KbArm`] 的文档）。
+pub async fn run(
+    d: &AskDeps<'_>,
+    p: &Principal,
+    prepared: &PreparedQuestion,
+    explicit_ds: Option<&str>,
+) -> anyhow::Result<HybridOutcome> {
+    let routed = prepared.routed_questions();
+    let Some((data_qs, kb_q)) = split(&routed) else {
+        let mut card = prepared.clarification_result();
+        card.caliber_note = Some(cardinality_note(&routed));
+        return Ok(HybridOutcome {
+            data: None,
+            knowledge: None,
+            summary: None,
+            clarification: Some(card),
+        });
+    };
+    let data_prepared: Vec<_> = data_qs.iter().map(|q| prepared.project(q)).collect();
+    //  → 本函数 →  是递归 async，必须装箱（编译器要求）。
+    // 递归只有一层：投影后的子问 route 恒为 Data，不会再进 Hybrid 分支。
+    // 多条问数子问**彼此也并行**：它们各自打一次库，串行等于白等（与 compound 同一条）。
+    let data_fut = async {
+        let mut out = Vec::with_capacity(data_prepared.len());
+        for r in futures::future::join_all(
+            data_prepared.iter().map(|q| Box::pin(ask_prepared(d, p, q, explicit_ds))),
+        )
+        .await
+        {
+            out.push(r?);
+        }
+        anyhow::Ok(out)
+    };
+    let kb_question = kb_q.question.clone();
+    let kb_fut = async {
+        let Some(kb) = d.kb.as_ref() else { return None };
+        match crate::answerers::knowledge::answer(
+            kb.owned,
+            d.embed,
+            &**d.llm,
+            p,
+            kb.space,
+            &kb_question,
+            kb.weights,
+        )
+        .await
+        {
+            Ok(a) => Some(a),
+            Err(e) => {
+                // 与 compound 子问同一条纪律：单路失败留痕但不拖垮整轮
+                tracing::warn!(err = %e, question = %kb_question, "混合查询知识库路失败 → 退化纯问数");
+                None
+            }
+        }
+    };
+    // 两路**并行**：总耗时 = 两路较大者，不相加（公网 Doris + 向量检索各自都是秒级）
+    let (data_r, knowledge) = tokio::join!(data_fut, kb_fut);
+    let data = match data_r {
+        Ok(rs) => fold_data(rs, prepared, &data_qs),
+        Err(e) => {
+            if knowledge.is_none() {
+                // 两路皆挂：原样上抛（fail-closed，不伪造半个答案）
+                return Err(e);
+            }
+            tracing::warn!(err = %e, "混合查询问数路失败 → 退化纯知识库");
+            None
+        }
+    };
+    let summary = match (&data, &knowledge) {
+        (Some(r), Some(a)) => {
+            crate::compound::hybrid_summary(&**d.llm, &prepared.effective_question, r, a).await
+        }
+        _ => None,
+    };
+    Ok(HybridOutcome { data, knowledge, summary, clarification: None })
+}
+
+
+/// 纯资料问句（`IntentRoute::Knowledge`）：直接走知识库半。
+///
+/// `None` = 本次调用没有 KB 臂或知识库这一路失败 → 由调用方出澄清卡。
+/// 失败也返 `None` 而不是伪造空答案：知识库答不出来时编一段话，比说不知道糟得多。
+pub async fn knowledge_only(
+    d: &AskDeps<'_>,
+    p: &Principal,
+    prepared: &PreparedQuestion,
+) -> Option<AskResult> {
+    let kb = d.kb.as_ref()?;
+    let answer = crate::answerers::knowledge::answer(
+        kb.owned,
+        d.embed,
+        &**d.llm,
+        p,
+        kb.space,
+        &prepared.effective_question,
+        kb.weights,
+    )
+    .await
+    .map_err(|e| tracing::warn!(err = %e, "纯资料问句的知识库路失败 → 退回澄清卡"))
+    .ok()?;
+    Some(into_ask_result(
+        HybridOutcome { data: None, knowledge: Some(answer), summary: None, clarification: None },
+        prepared,
+    ))
+}
+
+/// 类型化产物 → `AskResult`。**CLI/判官那条路的出口**：HTTP 侧另有自己的 wire 形状
+/// （`v["kb"]` 等键位由 server 塑），但两条路必须来自**同一次执行**，这正是收口的意义。
+///
+/// 形状选 `compound` 容器：问数半原样进 `subs[0]`，知识库半包成文本结果进 `subs[1]`，
+/// AI 综合落 `view.insight` —— 与既有复合问句的前端渲染同构，前端零改动。
+pub fn into_ask_result(outcome: HybridOutcome, prepared: &PreparedQuestion) -> AskResult {
+    if let Some(card) = outcome.clarification {
+        return card;
+    }
+    let HybridOutcome { data, knowledge, summary, .. } = outcome;
+    // 问数半可能**已经是**多子问的 compound（`fold_data`）：此时把它的 subs 直接抬上来，
+    // 不再套第二层 —— 嵌套 compound 前端只渲染第一层，第二层的表格就这么消失了
+    // （AX115 那次「深度轮嵌套产物」是同一个坑）。
+    let mut subs = Vec::with_capacity(2);
+    match data {
+        Some(r) if !r.subs.is_empty() => subs.extend(r.subs),
+        Some(r) => subs
+            .push(crate::ctx::SubResult { question: prepared.effective_question.clone(), result: r }),
+        None => {}
+    }
+    // 问数半缺席（纯资料问句）时耗时取本轮真实用时 —— 子结果没有就写 0，
+    // 收据上会显示「0ms 答完」，那是明摆着的假数。
+    let ms = if subs.is_empty() { prepared.started_at().elapsed().as_millis() } else { data_ms(&subs) };
+    let mut out = AskResult::compound(subs, ms);
+    if out.subs.is_empty() {
+        // 路由标签要说实话：没有问数半的那次就不是 compound
+        out.route = "knowledge".into();
+    }
+    // 知识库半不折成表格：它的载体是 `AnswerBody::Text{markdown, citations}`，硬塞进
+    // 行列会把引用角标丢掉（角标 = citations 下标 + 1，丢了就点不开原文）。
+    // CLI/判官这条路只需要「知识库半答了什么」，故落 `caliber_note`；
+    // HTTP 侧仍由 server 把整份 `Answer` 塞进 `v["kb"]`（协议归 server）。
+    if let Some(a) = knowledge {
+        if let dms_kernel::AnswerBody::Text { markdown, citations } = &a.body {
+            out.caliber_note = Some(format!(
+                "知识库：{}（引用 {} 条）",
+                markdown.chars().take(400).collect::<String>(),
+                citations.len()
+            ));
+        }
+    }
+    out.view.insight = summary;
+    out
+}
+
+/// N 条问数子结果 → 一个可承载的 `AskResult`。
+///
+/// 一条时**原样返回**（不套壳）：套一层 compound 会让原本直出表格的单问句多一层子结果，
+/// 前端渲染与收据都跟着变形 —— 这是「一条也走通用路径」最常见的回归。
+/// 多条时折进既有 compound 容器：子问题名用**投影后的子问句**，不是父问句
+/// （父问句在每个 sub 上重复一遍，用户根本分不清哪块是哪块）。
+fn fold_data(
+    mut rs: Vec<AskResult>,
+    prepared: &PreparedQuestion,
+    qs: &[&RoutedQuestion],
+) -> Option<AskResult> {
+    match rs.len() {
+        0 => None,
+        1 => rs.pop(),
+        _ => {
+            let subs: Vec<crate::ctx::SubResult> = rs
+                .into_iter()
+                .zip(qs.iter())
+                .map(|(result, q)| crate::ctx::SubResult { question: q.question.clone(), result })
+                .collect();
+            let ms = subs.iter().map(|s| s.result.elapsed_ms).max().unwrap_or(0);
+            let _ = prepared; // 容器本身不带问句字段；子问句已逐条落在 SubResult 上
+            Some(AskResult::compound(subs, ms))
+        }
+    }
+}
+
+/// 复合容器的耗时取子结果里最大的那个（两路并行，总耗时 = 较大者，不是相加）。
+fn data_ms(subs: &[crate::ctx::SubResult]) -> u128 {
+    subs.iter().map(|s| s.result.elapsed_ms).max().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rq(route: IntentRoute, q: &str) -> RoutedQuestion {
+        RoutedQuestion { route, question: q.to_string() }
+    }
+
+    /// 🔴 可执行的边界：**N 条问数 + 恰好 1 条资料**。
+    ///
+    /// 「两个数据问题 + 一个资料问题」以前吃澄清卡 —— 而它是最普通的问法之一
+    /// （业主截图里那张「先问清再查」就是这么来的）。资料半仍限 1 条是载体上限（角标重编号）。
+    #[test]
+    fn split_takes_many_data_but_exactly_one_knowledge() {
+        let one = [rq(IntentRoute::Data, "本月销售额"), rq(IntentRoute::Knowledge, "保修期")];
+        let (data, kb) = split(&one).expect("一数一知");
+        assert_eq!(data.len(), 1);
+        assert_eq!(kb.question, "保修期");
+        let many = [
+            rq(IntentRoute::Data, "本月销售额"),
+            rq(IntentRoute::Data, "本月毛利"),
+            rq(IntentRoute::Knowledge, "退货政策"),
+        ];
+        assert_eq!(split(&many).expect("多数一知可执行").0.len(), 2);
+        // 没有问数半 / 资料半 2 条 / 带 Unknown → 都不可执行
+        assert!(split(&[rq(IntentRoute::Knowledge, "a")]).is_none());
+        assert!(split(&[rq(IntentRoute::Data, "a"), rq(IntentRoute::Data, "b")]).is_none());
+        assert!(split(&[
+            rq(IntentRoute::Data, "a"),
+            rq(IntentRoute::Knowledge, "b"),
+            rq(IntentRoute::Knowledge, "c")
+        ])
+        .is_none());
+        assert!(split(&[rq(IntentRoute::Data, "a"), rq(IntentRoute::Unknown, "b")]).is_none());
+    }
+
+    /// 澄清文案必须说清**是几条、卡在哪**：笼统一句「请说得更具体」用户只会换个说法再撞一次。
+    #[test]
+    fn cardinality_note_says_which_side_overflowed() {
+        let two_kb = [
+            rq(IntentRoute::Data, "a"),
+            rq(IntentRoute::Knowledge, "b"),
+            rq(IntentRoute::Knowledge, "c"),
+        ];
+        let note = cardinality_note(&two_kb);
+        assert!(note.contains("2 个资料子任务") && note.contains("拆成 2 次"), "{note}");
+        let unknown = [rq(IntentRoute::Data, "a"), rq(IntentRoute::Unknown, "b")];
+        assert!(cardinality_note(&unknown).contains("归属仍不明确"), "未知子任务要单独说");
+    }
+}

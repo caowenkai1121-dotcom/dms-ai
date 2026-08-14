@@ -5,21 +5,24 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "build": "npm run typecheck && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
-    "ant-design-vue": "^4.2.6",
-    "echarts": "^5.5.1",
-    "pinia": "^2.2.6",
-    "vue": "^3.5.13",
-    "vue-router": "^4.5.0",
-    "xlsx": "^0.18.5"
+    "echarts": "^6.1.0",
+    "vue": "^3.5.13"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "~5.6.3",
     "vite": "^6.0.3",
     "vue-tsc": "^2.1.10"
+  },
+  "overrides": {
+    "brace-expansion": "2.1.4",
+    "nanoid": "3.3.18",
+    "postcss": "8.5.26"
   }
 }

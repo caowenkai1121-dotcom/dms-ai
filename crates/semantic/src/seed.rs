@@ -419,6 +419,10 @@ pub const TABLE_SCOPES: &[(&str, &str, &str)] = &[
      "有效订单：剔除暂存0/无效108/作废199。显式订单额、订单数或订单明细查询 JOIN 订单主表时同样适用（漏则订单口径虚增）"),
     ("t_customer", "deleted_flag = 0", "客户主档软删过滤"),
     ("t_goods", "deleted_flag = 0", "商品主档软删过滤"),
+    ("t_master_shop", "deleted_flag = 0",
+     "门店主档软删过滤；status=0 只在用户明确问启用门店/可用门店时追加。业务省区使用已落库的 province_department_name，禁止从 t_customer.department_id 或行政 province 推断"),
+    ("t_shop_province_department_mapping", "deleted_flag = 0",
+     "门店业务省区只读当前有效映射；同一省份必须唯一对应一个 province_department_name/department_id，上海→浙江省区、海南→广东省区"),
     // 订单明细表只留软删；`item_type` 属于显式订单明细指标，不能扩散到默认 DWS 销售指标。
     ("t_sales_order_detail",
      "deleted_flag = 0",
@@ -477,6 +481,10 @@ async fn seed_value_domains(pg: &PgPool) -> anyhow::Result<()> {
           cat.category_name LIKE '%X%' 并按 d.sku_code=g.goods_code→g.goods_category_code=cat.id 连过来，\
           【不要】写 d.sku_name LIKE '%X%'——商品名含「手抓饼」却属别的分类的商品会被算进来\
           （实测「手抓饼这个分类卖了多少箱」156847 vs 正确 115175，虚高 36%）"),
+        ("t_master_shop", "province_department_name",
+         "门店业务省区名称的权威落库字段。问门店省区/所属省区时必须过滤 t_master_shop.province_department_name；\
+          province 是行政省份，t_customer.province 是行政区划码，t_customer.department_id 是客户所属部门且生产可为空，三者都不得替代。\
+          生产映射存在非字面特例：上海→浙江省区、海南→广东省区；禁止用省份拼接“省区”或模糊裁剪后缀"),
     ];
     for (t, c, note) in DOMAINS {
         sqlx::query(
@@ -832,5 +840,39 @@ mod tests {
         ] {
             assert!(src.contains(edge), "高置信血缘缺失：{edge}");
         }
+    }
+
+    #[test]
+    fn shop_business_region_registry_rejects_customer_department_inference() {
+        let src = include_str!("seed.rs");
+        let scopes = src
+            .split("pub const TABLE_SCOPES:")
+            .nth(1)
+            .expect("TABLE_SCOPES 不见了")
+            .split("];")
+            .next()
+            .unwrap();
+        let domains = src
+            .split("const DOMAINS: &[(&str, &str, &str)] = &[")
+            .nth(1)
+            .expect("DOMAINS 不见了")
+            .split("];")
+            .next()
+            .unwrap();
+        let edges = src
+            .split("const EDGES: &[(&str, &str, &str, &str, &str, &str)] = &[")
+            .nth(1)
+            .expect("JOIN EDGES 不见了")
+            .split("];")
+            .next()
+            .unwrap();
+
+        assert!(scopes.contains("t_shop_province_department_mapping"));
+        assert!(domains.contains("t_master_shop\", \"province_department_name"));
+        assert!(domains.contains("上海→浙江省区") && domains.contains("海南→广东省区"));
+        assert!(!edges.contains("t_master_shop\", \"customer_code\", \"t_customer\", \"customer_code"),
+            "门店主档存在重复启用记录，未做基数探测前不得把门店→客户标成 N:1");
+        assert!(!edges.contains("t_customer\", \"department_id\", \"t_master_shop"));
+        assert!(!edges.contains("t_customer\", \"department_id\", \"t_shop_province_department_mapping"));
     }
 }

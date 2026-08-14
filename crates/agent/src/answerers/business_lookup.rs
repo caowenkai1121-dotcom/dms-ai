@@ -5,6 +5,11 @@
 
 use std::collections::HashMap;
 
+use dms_connector::dms_lookup::{
+    AFTER, AFTER_DETAIL, BILL, BILL_DETAIL, CUSTOMER, DEVICE, DEVICE_DELIVERY, DEVICE_RECEIVE,
+    GOODS, INVOICE, INVOICE_DETAIL, INVOICE_NEW, INVOICE_NEW_DETAIL, SALES, SALES_BY_CUSTOMER,
+    SALES_DETAIL,
+};
 use dms_connector::source::RowSet;
 use dms_kernel::present::{Block, ViewSpec};
 use dms_kernel::sql::dms_lookup::DmsLookupPolicy;
@@ -14,35 +19,6 @@ use dms_semantic::document::{resolve_document, DocumentFamily, DocumentKind};
 use crate::answerers::Answerer;
 use crate::ctx::{AskCtx, AskResult, SupplementalResult};
 use crate::gate::gate_dms_lookup;
-
-const SALES: DmsLookupPolicy = DmsLookupPolicy::new("t_sales_order", &["sales_order_code"]);
-const SALES_BY_CUSTOMER: DmsLookupPolicy =
-    DmsLookupPolicy::indexed("t_sales_order", &["customer_code"]);
-const SALES_DETAIL: DmsLookupPolicy =
-    DmsLookupPolicy::indexed("t_sales_order_detail", &["sales_order_code"]);
-const AFTER: DmsLookupPolicy =
-    DmsLookupPolicy::new("t_after_sales_order_header", &["after_sales_code"]);
-const AFTER_DETAIL: DmsLookupPolicy =
-    DmsLookupPolicy::indexed("t_after_sales_order_detail", &["after_sales_code"]);
-const BILL: DmsLookupPolicy = DmsLookupPolicy::new("t_account_bill_header", &["bill_code"]);
-const BILL_DETAIL: DmsLookupPolicy =
-    DmsLookupPolicy::indexed("t_account_bill_detail", &["bill_code"]);
-const DEVICE: DmsLookupPolicy =
-    DmsLookupPolicy::new("t_device_requisition", &["requisition_code"]);
-const DEVICE_RECEIVE: DmsLookupPolicy =
-    DmsLookupPolicy::indexed("t_device_receive_item", &["requisition_code"]);
-const DEVICE_DELIVERY: DmsLookupPolicy =
-    DmsLookupPolicy::indexed("t_device_delivery_item", &["requisition_code"]);
-const INVOICE: DmsLookupPolicy =
-    DmsLookupPolicy::new("t_invoice_apply_header", &["invoice_code"]);
-const INVOICE_DETAIL: DmsLookupPolicy =
-    DmsLookupPolicy::indexed("t_invoice_apply_detail", &["invoice_code"]);
-const INVOICE_NEW: DmsLookupPolicy =
-    DmsLookupPolicy::new("t_invoice_new_apply_header", &["invoice_code"]);
-const INVOICE_NEW_DETAIL: DmsLookupPolicy =
-    DmsLookupPolicy::indexed("t_invoice_new_apply_detail", &["invoice_code"]);
-const CUSTOMER: DmsLookupPolicy = DmsLookupPolicy::new("t_customer", &["customer_code"]);
-const GOODS: DmsLookupPolicy = DmsLookupPolicy::new("t_goods", &["goods_code"]);
 
 /// `table_result` 的「永不截断」档：SQL 自带 LIMIT 1 时行数判据只是兜底形状（usize::MAX 太魔法）。
 const NO_TRUNC: usize = usize::MAX;
@@ -62,11 +38,19 @@ impl Answerer for BusinessLookupAnswerer {
 
     fn accept(&self, cx: &AskCtx<'_>) -> bool {
         // 数仓模式用于补未同步单据；生产 MySQL 模式由 ask_single 独占调用，禁止其它分析路由。
-        cx.source.is_warehouse() || cx.ds == dms_semantic::registry::datasource::DMS_DS_ID
+        cx.intent
+            .map_or(true, crate::intent::IntentV1::business_lookup_compatible)
+            && (cx.source.is_warehouse() || cx.ds == dms_semantic::registry::datasource::DMS_DS_ID)
     }
 
     fn answer<'a>(&'a self, cx: &'a AskCtx<'a>) -> BoxFut<'a, anyhow::Result<Option<AskResult>>> {
         Box::pin(async move {
+            if !cx
+                .intent
+                .map_or(true, crate::intent::IntentV1::business_lookup_compatible)
+            {
+                return Ok(None);
+            }
             if let Some(doc) = resolve_document(cx.question, false) {
                 return document(cx, doc.family, &doc.code).await;
             }
@@ -265,8 +249,9 @@ async fn lookup(
 
 #[derive(Clone, Copy)]
 enum Visibility {
-    /// 纯客户维度可见性（仅单测构造；生产族没有只用 customer 单列裁决的档案）
-    #[allow(dead_code)]
+    /// 纯客户维度可见性。2026-08-14 起有了第一个生产族：账余充值单
+    /// （`dms_ods.t_customer_balance` 有 `customer_code`，**没有** manager 列 ——
+    /// 拿一个不存在的列做裁决只会恒 false，等于把这一族永久关死）。
     Customer,
     CustomerOrEmployee(&'static str),
     Employee(&'static str),
@@ -283,6 +268,9 @@ fn document_visibility(kind: DocumentKind) -> Visibility {
         DocumentKind::InvoiceApplyNew => Visibility::CustomerOrEmployee("manager"),
         DocumentKind::AccountBill => Visibility::AccountBillManager("manager"),
         DocumentKind::DeviceRequisition => Visibility::FailClosed,
+        // 账余充值单只有 `customer_code` 可裁决：行级权限按当轮用户的可见客户集判，
+        // 不因为「没有 manager 列」就放行（`scope_visible` 拿不到客户码时恒 false）。
+        DocumentKind::CustomerBalance => Visibility::Customer,
         DocumentKind::WarehouseShipment
         | DocumentKind::PurchaseTransfer
         | DocumentKind::ShopRequisition
@@ -565,6 +553,9 @@ fn header_policy(kind: DocumentKind) -> Option<&'static DmsLookupPolicy> {
         DocumentKind::InvoiceApply => &INVOICE,
         DocumentKind::InvoiceApplyNew => &INVOICE_NEW,
         DocumentKind::PurchaseTransfer => return None,
+        // 账余充值单只登记了数仓源（`document.rs` 的 `BALANCE_DORIS`）：
+        // 生产 MySQL 侧这张表的最左索引没核验过，访问业务库前必须失败关闭。
+        DocumentKind::CustomerBalance => return None,
     })
 }
 
@@ -614,7 +605,7 @@ fn merge_rowsets(parts: Vec<(&str, RowSet)>) -> RowSet {
     }
     redacted.sort();
     redacted.dedup();
-    RowSet { columns, rows: data, redacted }
+    RowSet { columns, rows: data, redacted, truncated: false }
 }
 
 fn supplemental(rows: RowSet, limit: usize) -> SupplementalResult {
@@ -729,7 +720,7 @@ fn result(
     view: ViewSpec,
     truncated: bool,
 ) -> AskResult {
-    let RowSet { columns, rows, redacted } = rows;
+    let RowSet { columns, rows, redacted, .. } = rows;
     let row_count = rows.len();
     AskResult {
         sql,
@@ -755,6 +746,7 @@ fn result(
         clarify_options: vec![],
         value_labels: vec![],
         sales_context: None,
+        intent_summary: None,
     }
 }
 
@@ -792,8 +784,7 @@ mod tests {
         let header = RowSet {
             columns: vec!["单号".into(), "客户".into()],
             rows: vec![vec![serde_json::json!("X1"), serde_json::json!("恒众")]],
-            redacted: vec![],
-        };
+            redacted: vec![], truncated: false };
         let pairs = header_pairs(document_identity_pairs(family, "X1"), &header);
         // 「单号」只在身份四件里出现一次（header 投影的同名列被滤掉）
         assert_eq!(pairs.iter().filter(|(l, _)| l == "单号").count(), 1, "{pairs:?}");

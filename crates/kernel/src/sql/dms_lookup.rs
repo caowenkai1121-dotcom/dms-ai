@@ -31,66 +31,12 @@ const DMS_SENSITIVE_FRAGMENTS: &[&str] = &[
     "tax_no", "tax_number", "taxpayer", "social_credit", "identity_card", "id_card",
 ];
 
-/// 尚无可核对 DMS 行权限合同的生产表。即使调用方自行构造 `DmsLookupPolicy`，也必须
-/// 在共享 gate 内 fail-closed，不能只依赖通用 `ScopedSql` 白名单。
-const UNCONTRACTED_PRODUCTION_TABLES: &[&str] = &["t_winc_purchase_transfer"];
-
-/// 通用 `ScopedSql` 在生产 DMS MySQL 上的执行白名单。未知表一律拒绝；这里只登记
-/// 由单列主键/唯一索引承载的头表业务键。明细外键只能由专用业务点查通道声明，
-/// 并在 connector 侧核验为物理索引的最左列。
-const SCOPED_LOOKUP_POLICIES: &[DmsLookupPolicy] = &[
-    DmsLookupPolicy::new("t_sales_order", &["sales_order_code"]),
-    DmsLookupPolicy::new("t_after_sales_order_header", &["after_sales_code"]),
-    DmsLookupPolicy::new("t_account_bill_header", &["bill_code"]),
-    DmsLookupPolicy::new("t_device_requisition", &["requisition_code"]),
-    DmsLookupPolicy::new("t_invoice_apply_header", &["invoice_code"]),
-    DmsLookupPolicy::new("t_invoice_new_apply_header", &["invoice_code"]),
-    DmsLookupPolicy::new("t_customer", &["customer_code"]),
-    DmsLookupPolicy::new("t_goods", &["goods_code"]),
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmsIndexKind {
     /// 主表/主档点查必须由单列主键或单列唯一索引承载。
     Unique,
     /// 一对多补充明细允许普通索引，但过滤列必须位于索引第一列。
     Leading,
-}
-
-const REGISTERED_LOOKUP_KEYS: &[(&str, &str, DmsIndexKind)] = &[
-    ("t_sales_order", "sales_order_code", DmsIndexKind::Unique),
-    ("t_sales_order", "customer_code", DmsIndexKind::Leading),
-    ("t_sales_order_detail", "sales_order_code", DmsIndexKind::Leading),
-    ("t_after_sales_order_header", "after_sales_code", DmsIndexKind::Unique),
-    ("t_after_sales_order_detail", "after_sales_code", DmsIndexKind::Leading),
-    ("t_account_bill_header", "bill_code", DmsIndexKind::Unique),
-    ("t_account_bill_detail", "bill_code", DmsIndexKind::Leading),
-    ("t_device_requisition", "requisition_code", DmsIndexKind::Unique),
-    ("t_device_receive_item", "requisition_code", DmsIndexKind::Leading),
-    ("t_device_delivery_item", "requisition_code", DmsIndexKind::Leading),
-    ("t_invoice_apply_header", "invoice_code", DmsIndexKind::Unique),
-    ("t_invoice_apply_detail", "invoice_code", DmsIndexKind::Leading),
-    ("t_invoice_new_apply_header", "invoice_code", DmsIndexKind::Unique),
-    ("t_invoice_new_apply_detail", "invoice_code", DmsIndexKind::Leading),
-    ("t_customer", "customer_code", DmsIndexKind::Unique),
-    ("t_goods", "goods_code", DmsIndexKind::Unique),
-];
-
-/// 连接器启动/热切换时核验这组代码登记键。运行期必须同时满足登记类型和物理索引，
-/// 任一条件缺失都 fail-closed。
-pub fn registered_lookup_keys(
-) -> impl Iterator<Item = (&'static str, &'static str, DmsIndexKind)> {
-    REGISTERED_LOOKUP_KEYS.iter().copied()
-}
-
-pub fn registered_lookup_kind(table: &str, column: &str) -> Option<DmsIndexKind> {
-    REGISTERED_LOOKUP_KEYS
-        .iter()
-        .find(|(registered_table, registered_column, _)| {
-            table.eq_ignore_ascii_case(registered_table)
-                && column.eq_ignore_ascii_case(registered_column)
-        })
-        .map(|(_, _, kind)| *kind)
 }
 
 /// 服务端代码登记的单表索引点查策略。请求参数只能提供值，不能提供表、键或索引类型。
@@ -107,6 +53,76 @@ impl DmsLookupPolicy {
 
     pub const fn indexed(table: &'static str, lookup_cols: &'static [&'static str]) -> Self {
         Self { table, lookup_cols, index_kind: DmsIndexKind::Leading }
+    }
+
+    pub const fn table(&self) -> &'static str {
+        self.table
+    }
+
+    pub const fn lookup_cols(&self) -> &'static [&'static str] {
+        self.lookup_cols
+    }
+}
+
+/// 业务层注入的点查键元数据。kernel 只解释这些约束，不保存任何业务表或字段目录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmsLookupKey {
+    table: &'static str,
+    column: &'static str,
+    kind: DmsIndexKind,
+}
+
+impl DmsLookupKey {
+    pub const fn new(
+        table: &'static str,
+        column: &'static str,
+        kind: DmsIndexKind,
+    ) -> Self {
+        Self { table, column, kind }
+    }
+}
+
+/// 业务层的点查策略快照。具体 DMS 表、业务键、索引要求与拒绝目录必须由上层注入；
+/// kernel 只保留通用 SQL AST、安全形状与 LIMIT 验证，避免业务目录反向固化进内核。
+pub struct DmsLookupRegistry {
+    scoped_policies: &'static [DmsLookupPolicy],
+    registered_keys: &'static [DmsLookupKey],
+    uncontracted_tables: &'static [&'static str],
+}
+
+impl DmsLookupRegistry {
+    pub const fn new(
+        scoped_policies: &'static [DmsLookupPolicy],
+        registered_keys: &'static [DmsLookupKey],
+        uncontracted_tables: &'static [&'static str],
+    ) -> Self {
+        Self { scoped_policies, registered_keys, uncontracted_tables }
+    }
+
+    pub fn scoped_policies(&self) -> &[DmsLookupPolicy] {
+        self.scoped_policies
+    }
+
+    pub fn registered_lookup_keys(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, &'static str, DmsIndexKind)> + '_ {
+        self.registered_keys.iter().map(|key| (key.table, key.column, key.kind))
+    }
+
+    pub fn registered_lookup_kind(&self, table: &str, column: &str) -> Option<DmsIndexKind> {
+        self.registered_keys
+            .iter()
+            .find(|key| {
+                table.eq_ignore_ascii_case(key.table)
+                    && column.eq_ignore_ascii_case(key.column)
+            })
+            .map(|key| key.kind)
+    }
+
+    fn rejects_table(&self, table: &str) -> bool {
+        self.uncontracted_tables
+            .iter()
+            .any(|denied| table.eq_ignore_ascii_case(denied))
     }
 }
 
@@ -181,7 +197,27 @@ pub fn gate_dms_lookup_with(
     policy: &DmsLookupPolicy,
 ) -> Result<DmsLookupSql, DmsLookupError> {
     let mut query = parse_query(sql, d, sensitive)?;
-    let (lookup_cols, table) = validate_query(&query, policy)?;
+    let (lookup_cols, table) = validate_query(&query, policy, None)?;
+    normalize_limit(&mut query);
+    Ok(DmsLookupSql {
+        wire: query.to_string(),
+        table,
+        lookup_cols,
+        index_kind: policy.index_kind,
+    })
+}
+
+/// 带业务注册表的严格点查 gate。`registry` 负责业务键类型与禁用表合同；不传时仅执行
+/// 调用方策略和通用 SQL 安全验证，供与具体业务无关的 kernel 调用方与单测使用。
+pub fn gate_dms_lookup_registered_with(
+    sql: &str,
+    d: &'static dyn Dialect,
+    sensitive: &[&str],
+    policy: &DmsLookupPolicy,
+    registry: &DmsLookupRegistry,
+) -> Result<DmsLookupSql, DmsLookupError> {
+    let mut query = parse_query(sql, d, sensitive)?;
+    let (lookup_cols, table) = validate_query(&query, policy, Some(registry))?;
     normalize_limit(&mut query);
     Ok(DmsLookupSql {
         wire: query.to_string(),
@@ -197,15 +233,17 @@ pub fn gate_dms_scoped_with(
     sql: &str,
     d: &'static dyn Dialect,
     sensitive: &[&str],
+    registry: &DmsLookupRegistry,
 ) -> Result<DmsLookupSql, DmsLookupError> {
     let mut query = parse_query(sql, d, sensitive)?;
     let table = lower_ident(query_table_name(&query)?).into_owned();
     // policy.table 是代码内全小写常量，table 已小写化：`==` 即可，不必 eq_ignore_ascii_case
-    let policy = SCOPED_LOOKUP_POLICIES
+    let policy = registry
+        .scoped_policies()
         .iter()
         .find(|policy| table == policy.table)
         .ok_or_else(|| reject(format!("表 {table} 未登记为生产 DMS 轻查询表")))?;
-    let (lookup_cols, _) = validate_query(&query, policy)?;
+    let (lookup_cols, _) = validate_query(&query, policy, Some(registry))?;
     normalize_limit(&mut query);
     Ok(DmsLookupSql {
         wire: query.to_string(),
@@ -259,6 +297,7 @@ fn normalize_limit(query: &mut Query) {
 fn validate_query(
     query: &Query,
     policy: &DmsLookupPolicy,
+    registry: Option<&DmsLookupRegistry>,
 ) -> Result<(Vec<String>, String), DmsLookupError> {
     // ── 查询级附加子句（与表形/投影无关，最先判）──
     if query.with.is_some() {
@@ -320,10 +359,7 @@ fn validate_query(
         return Err(reject("禁止分析型查询子句"));
     }
     let (actual_table, alias) = query_table_ref(query)?;
-    if UNCONTRACTED_PRODUCTION_TABLES
-        .iter()
-        .any(|table| actual_table.eq_ignore_ascii_case(table))
-    {
+    if registry.is_some_and(|registry| registry.rejects_table(actual_table)) {
         return Err(reject(format!("表 {actual_table} 缺少可核对的 DMS 行权限合同")));
     }
     if !actual_table.eq_ignore_ascii_case(policy.table) {
@@ -355,7 +391,7 @@ fn validate_query(
         return Err(reject("调用方未声明该表允许的索引点查列"));
     }
     let mut lookup_cols = BTreeSet::new();
-    validate_lookup_predicate(where_expr, policy, &mut lookup_cols)?;
+    validate_lookup_predicate(where_expr, policy, registry, &mut lookup_cols)?;
     if lookup_cols.is_empty() {
         return Err(reject("WHERE 缺少调用方声明的索引点查列"));
     }
@@ -524,12 +560,13 @@ fn is_aggregate(name: &str) -> bool {
 fn validate_lookup_predicate(
     expr: &Expr,
     policy: &DmsLookupPolicy,
+    registry: Option<&DmsLookupRegistry>,
     found: &mut BTreeSet<String>,
 ) -> Result<(), DmsLookupError> {
     match unnest(expr) {
         Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
-            validate_lookup_predicate(left, policy, found)?;
-            validate_lookup_predicate(right, policy, found)
+            validate_lookup_predicate(left, policy, registry, found)?;
+            validate_lookup_predicate(right, policy, registry, found)
         }
         Expr::BinaryOp { op: BinaryOperator::Or | BinaryOperator::Xor, .. } => {
             Err(reject("禁止 OR/XOR 条件"))
@@ -539,7 +576,7 @@ fn validate_lookup_predicate(
         {
             if let Some(column) = indexed_side(left, right, policy.lookup_cols) {
                 let literal = if is_column(left) { right } else { left };
-                require_registered_key_literal(policy.table, column, literal)?;
+                require_registered_key_literal(registry, policy.table, column, literal)?;
                 found.insert(column.to_ascii_lowercase());
                 return Ok(());
             }
@@ -556,7 +593,7 @@ fn validate_lookup_predicate(
         {
             if let Some(column) = indexed_column(expr, policy.lookup_cols) {
                 for literal in list {
-                    require_registered_key_literal(policy.table, column, literal)?;
+                    require_registered_key_literal(registry, policy.table, column, literal)?;
                 }
                 found.insert(column.to_ascii_lowercase());
                 return Ok(());
@@ -575,11 +612,14 @@ fn validate_lookup_predicate(
 /// 只认**单引号**字符串字面量：MySQL 默认下 `"SO-1"` 也是字符串，但这里不放行
 /// DoubleQuotedString（安全方向，双引号形态按拒绝处理，未见真实需求）。
 fn require_registered_key_literal(
+    registry: Option<&DmsLookupRegistry>,
     table: &str,
     column: &str,
     literal: &Expr,
 ) -> Result<(), DmsLookupError> {
-    if registered_lookup_kind(table, column).is_some()
+    if registry
+        .and_then(|registry| registry.registered_lookup_kind(table, column))
+        .is_some()
         && !matches!(unnest(literal), Expr::Value(Value::SingleQuotedString(_)))
     {
         return Err(reject("生产业务编码必须使用字符串常量，禁止隐式类型转换扫描"));
@@ -651,6 +691,18 @@ mod tests {
     use super::*;
     use crate::MysqlDialect;
 
+    const SCOPED_POLICIES: &[DmsLookupPolicy] = &[
+        DmsLookupPolicy::new("customer", &["customer_code"]),
+        DmsLookupPolicy::new("goods", &["goods_code"]),
+    ];
+    const REGISTERED_KEYS: &[DmsLookupKey] = &[
+        DmsLookupKey::new("customer", "customer_code", DmsIndexKind::Unique),
+        DmsLookupKey::new("goods", "goods_code", DmsIndexKind::Unique),
+    ];
+    const UNCONTRACTED: &[&str] = &["purchase_transfer"];
+    const REGISTRY: DmsLookupRegistry =
+        DmsLookupRegistry::new(SCOPED_POLICIES, REGISTERED_KEYS, UNCONTRACTED);
+
     fn gate(sql: &str) -> Result<DmsLookupSql, DmsLookupError> {
         const ORDERS: DmsLookupPolicy =
             DmsLookupPolicy::new("orders", &["id", "order_code", "code"]);
@@ -663,7 +715,12 @@ mod tests {
     }
 
     fn gate_scoped(sql: &str) -> Result<DmsLookupSql, DmsLookupError> {
-        gate_dms_scoped_with(sql, &MysqlDialect, &["login_pwd", "password"])
+        gate_dms_scoped_with(
+            sql,
+            &MysqlDialect,
+            &["login_pwd", "password"],
+            &REGISTRY,
+        )
     }
 
     fn rejected(sql: &str, fragment: &str) {
@@ -760,29 +817,29 @@ mod tests {
     #[test]
     fn scoped_gate_uses_fixed_table_and_business_key_registry() {
         let exact = gate_scoped(
-            "SELECT customer_code, customer_name FROM t_customer \
+            "SELECT customer_code, customer_name FROM customer \
              WHERE customer_code = 'C1' AND deleted_flag = 0 LIMIT 50",
         )
         .unwrap();
         assert!(exact.wire().ends_with("LIMIT 50"), "{}", exact.wire());
         for sql in [
-            "SELECT customer_code FROM t_customer WHERE customer_code = 123 LIMIT 1",
-            "SELECT customer_code FROM t_customer WHERE customer_code IN ('C1', 2) LIMIT 2",
+            "SELECT customer_code FROM customer WHERE customer_code = 123 LIMIT 1",
+            "SELECT customer_code FROM customer WHERE customer_code IN ('C1', 2) LIMIT 2",
         ] {
             assert!(gate_scoped(sql).is_err(), "生产字符业务键不应接受数值常量: {sql}");
         }
 
         for sql in [
-            "SELECT * FROM t_customer WHERE deleted_flag = 0 LIMIT 10",
-            "SELECT * FROM t_customer WHERE customer_name = '长沙客户' LIMIT 10",
-            "SELECT * FROM t_goods WHERE goods_name LIKE '长才%' LIMIT 10",
-            "SELECT * FROM t_goods WHERE goods_short_name = '长才' LIMIT 10",
-            "SELECT * FROM t_employee WHERE employee_id = 1 LIMIT 1",
-            "SELECT * FROM t_sales_order WHERE sales_order_code = 'SO-1' ORDER BY id",
-            "SELECT COUNT(*) FROM t_sales_order WHERE sales_order_code = 'SO-1'",
-            "SELECT * FROM t_sales_order a JOIN t_sales_order_detail b ON a.sales_order_code=b.sales_order_code WHERE a.sales_order_code='SO-1'",
-            "SELECT * FROM t_sales_order WHERE sales_order_code = 'SO-1' LIMIT 51",
-            "SELECT * FROM other_db.t_sales_order WHERE sales_order_code = 'SO-1' LIMIT 1",
+            "SELECT * FROM customer WHERE deleted_flag = 0 LIMIT 10",
+            "SELECT * FROM customer WHERE customer_name = '长沙客户' LIMIT 10",
+            "SELECT * FROM goods WHERE goods_name LIKE '长才%' LIMIT 10",
+            "SELECT * FROM goods WHERE goods_short_name = '长才' LIMIT 10",
+            "SELECT * FROM employee WHERE employee_id = 1 LIMIT 1",
+            "SELECT * FROM sales_order WHERE sales_order_code = 'SO-1' ORDER BY id",
+            "SELECT COUNT(*) FROM sales_order WHERE sales_order_code = 'SO-1'",
+            "SELECT * FROM sales_order a JOIN sales_order_detail b ON a.sales_order_code=b.sales_order_code WHERE a.sales_order_code='SO-1'",
+            "SELECT * FROM sales_order WHERE sales_order_code = 'SO-1' LIMIT 51",
+            "SELECT * FROM other_db.sales_order WHERE sales_order_code = 'SO-1' LIMIT 1",
         ] {
             assert!(gate_scoped(sql).is_err(), "生产通用 ScopedSql 不应放行: {sql}");
         }
@@ -791,15 +848,17 @@ mod tests {
     #[test]
     fn purchase_transfer_is_denied_even_with_a_caller_policy() {
         const TRANSFER: DmsLookupPolicy =
-            DmsLookupPolicy::new("t_winc_purchase_transfer", &["bill_code"]);
-        let sql = "SELECT bill_code FROM t_winc_purchase_transfer WHERE bill_code = 'PT-1' LIMIT 1";
-        let err = gate_dms_lookup_with(sql, &MysqlDialect, &[], &TRANSFER)
+            DmsLookupPolicy::new("purchase_transfer", &["bill_code"]);
+        let sql = "SELECT bill_code FROM purchase_transfer WHERE bill_code = 'PT-1' LIMIT 1";
+        let err = gate_dms_lookup_registered_with(sql, &MysqlDialect, &[], &TRANSFER, &REGISTRY)
             .err()
             .expect("缺少行权限合同的生产表必须拒绝")
             .to_string();
         assert!(err.contains("行权限合同"), "{err}");
         assert!(gate_scoped(sql).is_err());
-        assert!(registered_lookup_keys().all(|(table, _, _)| table != "t_winc_purchase_transfer"));
+        assert!(REGISTRY
+            .registered_lookup_keys()
+            .all(|(table, _, _)| table != "purchase_transfer"));
     }
 
     #[test]
@@ -819,12 +878,12 @@ mod tests {
     /// 策略表与登记键表是两份平行常量：漂移防线 = 策略里每个 (表,键) 必在登记键表里
     #[test]
     fn every_scoped_policy_key_is_a_registered_lookup_key() {
-        for policy in SCOPED_LOOKUP_POLICIES {
-            for col in policy.lookup_cols {
+        for policy in SCOPED_POLICIES {
+            for col in policy.lookup_cols() {
                 assert!(
-                    registered_lookup_kind(policy.table, col).is_some(),
-                    "SCOPED_LOOKUP_POLICIES 的 ({}, {}) 未在 REGISTERED_LOOKUP_KEYS 登记",
-                    policy.table,
+                    REGISTRY.registered_lookup_kind(policy.table(), col).is_some(),
+                    "SCOPED_POLICIES 的 ({}, {}) 未在 REGISTERED_KEYS 登记",
+                    policy.table(),
                     col
                 );
             }

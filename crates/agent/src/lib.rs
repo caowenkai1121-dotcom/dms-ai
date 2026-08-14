@@ -21,13 +21,17 @@
 
 pub mod answerers;
 pub mod analysis;
+pub mod answer_contract;
 pub mod ask;
 pub mod compound;
 pub mod ctx;
+pub mod entity_resolver;
 pub mod gate;
 pub mod gather;
 pub mod guard;
+pub mod hybrid;
 pub mod insight;
+pub mod intent;
 pub mod localize;
 pub mod prompt;
 pub mod review;
@@ -40,11 +44,16 @@ pub use answerers::{Answerer, ROUTER_ORDER, ROUTE_LABELS};
 pub use analysis::{AnalysisKind, AnalysisPlan, AnalysisShape, ReportSpec};
 // HTTP / CLI / 定时任务三入口共用的唯一入口。`AskDeps` 里的三个 `fn` 指针与 `correctors`
 // 是 T8/T10 的临时入参（实现仍在 `server/src/{direct,corrector}.rs`），那两处各有一行 ponytail 记账。
-pub use ask::{ask, is_followup, AskDeps, DetectFn, HitFn};
-pub use compound::{is_compound, try_compound};
+pub use ask::{
+    ask, ask_prepared, is_followup, prepare_question, AskDeps, DetectFn, HitFn, PreparedQuestion,
+};
 pub use ctx::{
     table_answer, truncation_note, AskCtx, AskResult, ClarifyOption, Step, SubResult, SupplementalResult,
     TrustEnvelope, ValueLabel,
+};
+pub use intent::{
+    ExecutionEvidence, IntentCoverageSummary, IntentRoute, IntentSlotKind, IntentSlotState,
+    IntentSlotSummary, IntentSummary, ResolvedIntent, RoutedQuestion,
 };
 // 问答参数常量与三段闸门：server 的 `exec-sql` 判官子命令与服务走同一条管道、同一组参数。
 pub use gate::{ensure_limit, gate, gate_on, is_guard_err, EXEC_TIMEOUT, GUARD, MAX_ROWS};
@@ -56,7 +65,5 @@ pub use prompt::{build_system_prompt, extract_sql, today_cn, PromptCtx};
 // 自评闭环的四个入口：HTTP 路径异步 spawn 两个，CLI/定时任务调另两个（`main.rs:165/174`）。
 pub use review::{review_all_pending, review_exemplar, review_failure, review_lessons};
 // LLM 路径：`run_llm` 是 wire 侧的直调入口（能传真的用量回调），`LlmAnswerer` 是 Router 末位成员。
-pub use run::{generate_sql, repair, run_llm, Correctors, Fix, LlmAnswerer, LlmDeps};
+pub use run::{generate_sql, repair, run_llm, LlmAnswerer, LlmDeps};
 pub use source::select_source;
-// `triage()` 走模块路径（`triage::triage`）——函数与模块同名再 re-export 只会让调用点读不出是哪个。
-pub use triage::Intent;

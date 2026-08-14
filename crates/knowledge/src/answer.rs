@@ -7,8 +7,7 @@
 //!    列出正文没引的 5 篇文档名是虚报有据，和编一段话是同一种谎。
 //! 2. **文档是资料不是指令**：每块包进 `<untrusted_document>` 且**块内容转义**
 //!    （不转义则块里一行 `</untrusted_document>` 就能闭合标签逃逸，后面的文字变成系统级指令）。
-//! 3. **截断三件套**：单块 1200 字上限，截断时附「原因 + 已展示范围 + 可从引用原文核对」——
-//!    模型知道自己只看到片段，才不会把「文中未提及」当成「制度未规定」。
+//! 3. **证据完整**：召回命中的块完整送入模型，避免块尾的限定条件、数值或例外被静默裁掉。
 
 use crate::qa_log;
 use crate::retrieve::{self, Hit};
@@ -17,16 +16,13 @@ use dms_connector::embed::EmbedClient;
 use dms_connector::owned::OwnedStore;
 use dms_kernel::{Answer, ChatModel, ChatRequest, Citation, ModelTier};
 
-/// 单块进 prompt 的上限（字符数，中文一字一符）
-const BLOCK_CHARS: usize = 1200;
-
 /// 问题长度上限（字符）：超大问题直接拼进 LLM 请求是成本/超时面，server 各入口未统一
-/// 限长，本层兜底。取 2000 与落账 clip（`qalog::CLIP_CHARS`）同口径——落账都装不下的
-/// 一定不是正常业务问题。
+/// 限长（`/api/kb/ask` 只校验非空），本层兜底。取 2000 与落账 clip（`dms_kernel::qalog::CLIP_CHARS`）
+/// 同口径——落账都装不下的一定不是正常业务问题。
 const MAX_QUESTION_CHARS: usize = 2000;
 
-/// 引用式回答的温度：压低发散，让模型贴着资料写（裸魔数不许再出现）
-const ANSWER_TEMPERATURE: f32 = 0.1;
+/// 引用式回答的温度：同一证据快照必须尽量生成同一答案；需要发散的是 SQL 修复，不是制度裁决。
+const ANSWER_TEMPERATURE: f32 = 0.0;
 
 /// 「没有」的基干文案。两条路都落它：检索零命中（**不调 LLM**，此时经 `no_hit_text`
 /// 带上检索范围与建议），以及模型一句带角标的话都没给出（无引用即无结论，
@@ -251,7 +247,7 @@ async fn respond(
     let Some(raw) = reply.content else {
         return (Err(KbError::Upstream("大模型没有返回内容".into())), obs);
     };
-    (finalize_markdown(&raw, hits, t0, trace_id), obs)
+    (finalize_markdown(&raw, hits, t0, trace_id, vec_down), obs)
 }
 
 /// `respond` 的流式变体（`answer_stream` 用）：LLM 改走 `chat_stream`，原始增量经
@@ -293,8 +289,12 @@ async fn respond_stream(
     let Some(raw) = reply.content else {
         return (Err(KbError::Upstream("大模型没有返回内容".into())), obs);
     };
-    (finalize_markdown(&raw, hits, t0, trace_id), obs)
+    (finalize_markdown(&raw, hits, t0, trace_id, vec_down), obs)
 }
+
+/// 向量路降级时挂在答案顶部的一行提示。**用户可见文案**，与 `NO_HIT` 同族纪律：
+/// 只说能力状态，不出现向量库名/熔断参数这类实现细节（I5 的同一条）。
+const VEC_DOWN_NOTICE: &str = "> 本次检索能力降级，结果可能不全，建议换个说法再问一次。";
 
 /// `respond`/`respond_stream` 共用前段：降级留痕 + 无命中早退。
 /// Some = 已落定（无命中，不调 LLM），None = 继续走 LLM。
@@ -330,6 +330,7 @@ fn finalize_markdown(
     hits: &[Hit],
     t0: std::time::Instant,
     trace_id: &str,
+    vec_down: bool,
 ) -> Result<Answer, KbError> {
     let md = keep_supported_only(&strip_internal_diagnostics(raw), hits);
     if !has_supported_content(&md) {
@@ -342,7 +343,16 @@ fn finalize_markdown(
         return Ok(Answer::text(NO_HIT.to_string(), vec![], t0.elapsed().as_millis()));
     }
     let md = disclose_versioned_sources(&md, hits);
+    let md = disclose_conflicting_numeric_claims(&md, hits);
     let (md, used) = compact_refs(&md, hits.len());
+    // 🔴 主语义召回缺席时**必须让用户看见**（2026-08-14）。
+    //
+    // 原来这件事只写进服务端日志（`no_hit_outcome` 里那句「不向业务答案泄露检索实现」）——
+    // 可剩下的四路仍能凑够块数，模型照样生成一份带角标的、看起来完全正常的答案。
+    // 用户没有任何线索知道这一次的召回面小了一截，而业主的第一轴是
+    // 「宁可 fail closed 也不能静默扩大/缩小范围」。提示只说**能力状态**、不泄露实现细节
+    //（不写向量库名、不写熔断参数），与问数侧「口径卡缺席」那条标注同族。
+    let md = if vec_down { format!("{VEC_DOWN_NOTICE}\n\n{md}") } else { md };
     Ok(Answer::text(
         md,
         citations(used.iter().map(|k| &hits[k - 1])),
@@ -517,7 +527,11 @@ fn strip_bare_internal_codes(line: &str) -> String {
 
 /// 只给**正文真引用过**的那几条 hit 建 `Citation`（挑哪几条见 `compact_refs`）。
 /// 收 `Iterator` 而不是 `&[Hit]`：调用方给的是「筛出来的那几条」，不是一段连续切片。
-fn citations<'a>(hits: impl Iterator<Item = &'a Hit>) -> Vec<Citation> {
+///
+/// `pub` 的理由：`agent::answerers::knowledge::documents`（文件清单卡）要建同一形状的
+/// 引用。抄第二份必漂 —— `Citation` 有 19 个字段，其中 `span`/`score`/`relations` 三条
+/// 各带一段「为什么这么填」的依据，复制过去就是两处各自演化。
+pub fn citations<'a>(hits: impl Iterator<Item = &'a Hit>) -> Vec<Citation> {
     hits.map(|h| Citation {
         doc_id: h.doc_id.clone(),
         doc_name: h.doc_name.clone(),
@@ -582,12 +596,8 @@ fn compact_refs(md: &str, n_hits: usize) -> (String, Vec<usize>) {
 /// `id` = 角标 n = `citations` 下标 + 1（两处必须同源，否则用户点到别人的原文）。
 pub fn wrap_untrusted(hits: &[Hit]) -> String {
     use std::fmt::Write as _;
-    // 容量预估：正文按 BLOCK_CHARS 截断后的长度 + 标签/属性开销，省得反复扩容
-    let mut out = String::with_capacity(
-        hits.iter().map(|h| h.text.len().min(BLOCK_CHARS * 4) + 256).sum(),
-    );
+    let mut out = String::with_capacity(hits.iter().map(|h| h.text.len() + 256).sum());
     for (i, h) in hits.iter().enumerate() {
-        let (body, note) = clip(&h.text);
         let structure_only = !h.channels.is_empty()
             && h.channels.iter().all(|channel| channel == "结构关联");
         let relation_context = if structure_only
@@ -606,8 +616,7 @@ pub fn wrap_untrusted(hits: &[Hit]) -> String {
             esc(&source_of(h)),
             relation_context
         );
-        out.push_str(&esc(&body));
-        out.push_str(&note);
+        out.push_str(&esc(&h.text));
         out.push_str("\n</untrusted_document>\n\n");
     }
     out
@@ -659,21 +668,6 @@ fn esc(s: &str) -> String {
         }
     }
     out
-}
-
-/// 截断三件套：返回（正文, 截断说明）。按字符截 —— 按字节截会把中文切成半个字。
-fn clip(text: &str) -> (String, String) {
-    // `nth(BLOCK_CHARS)` 一次定位截断点：未超长直接返回，不做 `chars().count()` 全扫
-    let Some((cut, _)) = text.char_indices().nth(BLOCK_CHARS) else {
-        return (text.to_string(), String::new());
-    };
-    // 超长才补算总长（进说明文案）：前 BLOCK_CHARS 字 + 截断点之后剩余
-    let total = BLOCK_CHARS + text[cut..].chars().count();
-    let note = format!(
-        "\n（本块过长已截断：共 {total} 字，此处仅展示第 1-{BLOCK_CHARS} 字；\
-         完整内容请从引用原文核对）"
-    );
-    (text[..cut].to_string(), note)
 }
 
 /// 空行是结构（分段/列表间隔），保留但不许连续两个
@@ -736,12 +730,11 @@ fn keep_supported_only(md: &str, hits: &[Hit]) -> String {
     join_trimmed(out)
 }
 
-/// 一条 hit 的合法源数字表。正文取**与模型所见同一窗口**（`clip` 后的 BLOCK_CHARS 字）：
-/// 截断点之后的数字模型读不到，放它过核验就是给编造背书。
+/// 一条 hit 的合法源数字表。正文与模型所见的完整块保持一致。
 /// 治理元数据（版本号/生效期）的数字一并算合法源是刻意的：允许模型复述这些元数据
 /// **本身**（SYSTEM 段约束的是「不能拿它们替代正文支撑业务数值」，复述日期/版本号不在其列）。
 fn source_numbers_of(hit: &Hit) -> Vec<String> {
-    let mut source = numbers(&clip(&hit.text).0);
+    let mut source = numbers(&hit.text);
     for governed in
         [hit.document_revision.as_deref(), hit.effective_from.as_deref(), hit.effective_to.as_deref()]
             .into_iter()
@@ -806,6 +799,10 @@ fn has_supported_content(md: &str) -> bool {
         !line.trim().is_empty()
             && !is_presentation_structure(&lines, index)
             && !strip_refs(line).is_empty()
+            // 🔴 整篇只剩「知识库里没有关于…」时**不算有实质内容**：那是一句否定断言，
+            // 该走 NO_HIT 的诚实失败，而不是被当成一个答案返回（豁免只让它在
+            // 「另有带角标结论」的那一篇里活下来，见 `is_partial_coverage_disclaimer`）。
+            && !is_partial_coverage_disclaimer(line)
     })
 }
 
@@ -917,6 +914,17 @@ fn strip_ordered_list_marker(s: &str) -> &str {
 /// 检索已同时命中旧版/新版等多版本资料时，即使模型静默只挑一份，也把所有版本重新带回
 /// 引用列表。这里只提示“需要核对”，不自行判断哪份生效，避免用文件名替代制度裁决。
 fn disclose_versioned_sources(md: &str, hits: &[Hit]) -> String {
+    // 🔴 只看**被引用过**的那些 hit（2026-08-14）。
+    //
+    // 同文件的 numeric 侧（版本冲突数值兜底）早就要求「该组至少一个成员被引用」，
+    // 而这里全程不扫角标 —— 可 `retrieve` 侧的 `preserve_governed_versions` /
+    // `preserve_textual_versions` 是**主动**把冲突版本追加进 TOP_K 的，
+    // 「上下文尾巴里躺着一对与本问题无关的新旧版」是被设计出来的常态。
+    // 于是用户问「报销要交哪些材料」，只因召回尾巴里有『培训报销 2023 旧版 / 2026 新版』，
+    // 就收到一张「请由制度负责人确认」的核对表 —— 这比答错更劝退（好答案被降级成了待办）。
+    let cited: std::collections::HashSet<usize> =
+        refs(md).into_iter().map(|(_, _, n)| n).collect();
+    let is_cited = |i: usize| cited.contains(&(i + 1));
     // 预计算一次，循环里查表：class 要对正文跑 8 个 marker `contains`、group 有
     // lowercase+多次 replace 分配、signature 是逐字段 format! —— O(n²) 比较里反复重算不值
     let textual: Vec<(String, Option<&'static str>)> =
@@ -928,10 +936,12 @@ fn disclose_versioned_sources(md: &str, hits: &[Hit]) -> String {
         else {
             continue;
         };
+        // 入选前提：这一族**至少有一个成员真的被引用了**（见函数头红字）
         if !conflicting_families.contains(&family)
-            && hits.iter().skip(i + 1).any(|other| {
+            && hits.iter().enumerate().skip(i + 1).any(|(j, other)| {
                 other.document_family.as_deref().map(str::trim) == Some(family)
                     && governed_versions_conflict(hit, other)
+                    && (is_cited(i) || is_cited(j))
             })
         {
             conflicting_families.push(family);
@@ -940,13 +950,17 @@ fn disclose_versioned_sources(md: &str, hits: &[Hit]) -> String {
     // 文件名“旧版/新版”只能在同一文档族或同一保守归一基名内配对。
     // 全局配对会把“采购制度旧版”和“报销制度新版”误报成一个口径冲突。
     let mut textual_conflict_groups: Vec<&str> = Vec::new();
-    for (group, class) in &textual {
+    for (i, (group, class)) in textual.iter().enumerate() {
         let Some(class) = class else { continue };
+        // 与上面的 family 侧同一条：这一组至少有一个成员被引用过（见函数头红字）
         if !textual_conflict_groups.contains(&group.as_str())
             && textual
                 .iter()
-                .any(|(other_group, other_class)| {
-                    other_group == group && other_class.is_some_and(|oc| oc != *class)
+                .enumerate()
+                .any(|(j, (other_group, other_class))| {
+                    other_group == group
+                        && other_class.is_some_and(|oc| oc != *class)
+                        && (is_cited(i) || is_cited(j))
                 })
         {
             textual_conflict_groups.push(group);
@@ -1024,6 +1038,148 @@ fn disclose_versioned_sources(md: &str, hits: &[Hit]) -> String {
         notice.push('\n');
     }
     notice
+}
+
+/// 检索证据里已经存在互斥数字口径时，即使模型静默只挑一份，也不能让它在「直接结论」
+/// 里替用户任选一边。按证据句的主体词保守配对；不同产品/部件的不同数字不在此裁决。
+fn disclose_conflicting_numeric_claims(md: &str, hits: &[Hit]) -> String {
+    if md.contains("系统不自动判定其中一份为现行标准") {
+        return md.to_string();
+    }
+    let cited_refs: Vec<usize> = refs(md).into_iter().map(|(_, _, n)| n).collect();
+    let claims = hit_numeric_claims(hits);
+    let mut conflict_refs = Vec::new();
+    for (i, left) in claims.iter().enumerate() {
+        for right in claims.iter().skip(i + 1) {
+            if left.refs.iter().any(|n| right.refs.contains(n))
+                || !left
+                    .refs
+                    .iter()
+                    .chain(&right.refs)
+                    .any(|n| cited_refs.contains(n))
+                || left
+                    .numbers
+                    .iter()
+                    .all(|number| right.numbers.contains(number))
+                || right
+                    .numbers
+                    .iter()
+                    .all(|number| left.numbers.contains(number))
+                || !same_claim_subject(&left.terms, &right.terms)
+            {
+                continue;
+            }
+            for n in left.refs.iter().chain(&right.refs) {
+                if !conflict_refs.contains(n) {
+                    conflict_refs.push(*n);
+                }
+            }
+        }
+    }
+    if conflict_refs.len() < 2 {
+        return md.to_string();
+    }
+    conflict_refs.sort_unstable();
+    let complementary = without_conflicting_claims(md, &conflict_refs);
+    let all_refs = conflict_refs
+        .iter()
+        .map(|n| format!("[^{n}]"))
+        .collect::<String>();
+    let mut notice = format!(
+        "## 直接结论\n\n资料对同一问题给出了不同数值，系统不自动选择其中一项；请结合具体产品、部件、版本与适用范围核对，并由资料负责人确认{all_refs}。\n\n\
+         ## 版本与差异\n\n| 资料 | 正文中的相关数字 | 核对状态 |\n| --- | --- | --- |\n",
+    );
+    for n in conflict_refs {
+        let hit = &hits[n - 1];
+        let values = source_numbers_of(hit).join("、");
+        notice.push_str(&format!(
+            "| {} | {} | 适用对象与口径需查看原文确认[^{n}] |\n",
+            table_cell(&hit.doc_name),
+            table_cell(if values.is_empty() {
+                "未可靠提取"
+            } else {
+                &values
+            }),
+        ));
+    }
+    if has_supported_content(&complementary) {
+        notice.push_str("\n## 其他相关信息\n\n");
+        notice.push_str(complementary.trim());
+        notice.push('\n');
+    }
+    notice
+}
+
+struct NumericClaim {
+    refs: Vec<usize>,
+    numbers: Vec<String>,
+    terms: Vec<String>,
+}
+
+fn hit_numeric_claims(hits: &[Hit]) -> Vec<NumericClaim> {
+    let mut claims = Vec::new();
+    for (i, hit) in hits.iter().enumerate() {
+        for sentence in hit.text.lines().flat_map(sentences) {
+            let mut claim_numbers = numbers(sentence);
+            claim_numbers.sort();
+            claim_numbers.dedup();
+            if claim_numbers.is_empty() {
+                continue;
+            }
+            claims.push(NumericClaim {
+                refs: vec![i + 1],
+                numbers: claim_numbers,
+                terms: claim_terms(sentence),
+            });
+        }
+    }
+    claims
+}
+
+fn claim_terms(sentence: &str) -> Vec<String> {
+    const GENERIC: &[&str] = &[
+        "资料",
+        "显示",
+        "规定",
+        "说明",
+        "版本",
+        "正文",
+        "其中",
+        "另外",
+        "一种",
+        "另一种",
+        "不同",
+        "冲突",
+        "需要",
+        "人工",
+        "确认",
+        "产品",
+        "设备",
+        "个月",
+        "保修期",
+        "质保期",
+    ];
+    let text = without_refs(sentence);
+    // 数值后的括注通常是起算方式/备注，不属于被比较的主体；只取首个数值前的
+    // “对象 + 属性”，也避免把同一产品的型号、重量等其他数字误配成保修期冲突。
+    let subject = text
+        .find(|ch: char| ch.is_ascii_digit())
+        .map_or(text.as_str(), |at| &text[..at]);
+    crate::store::terms_of(subject)
+        .into_iter()
+        .filter(|term| {
+            !GENERIC.contains(&term.as_str())
+                && !term.chars().all(|ch| ch.is_ascii_digit())
+                && !term
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '.'))
+        })
+        .collect()
+}
+
+fn same_claim_subject(left: &[String], right: &[String]) -> bool {
+    let shared = left.iter().filter(|term| right.contains(term)).count();
+    shared >= 2 && left.len() == shared && right.len() == shared
 }
 
 /// 版本冲突兜底只移除引用了冲突版本的句子/表格行；其他文档提供的互补事实继续展示。
@@ -1177,9 +1333,31 @@ fn table_cell(s: &str) -> String {
     out
 }
 
+/// 「部分覆盖」的那句声明：SYSTEM 硬性要求模型先说「知识库里没有关于 X 的规定」，
+/// 而它是**否定断言、天然没有角标** —— 一进 `keep_line` 的角标过滤就被整句剔掉。
+///
+/// 🔴 后果是本仓最坏的一类（2026-08-14）：用户问「住宿和打车各有什么上限」，
+/// 模型老老实实先说「知识库里没有关于市内打车费的规定」，这句被删掉，用户看到的是
+/// **只剩住宿那半**的答案 —— 他会把 Y 当成 X 的答案。SYSTEM 里写了要求、
+/// 唯一的测试却只断言「SYSTEM 里含这个字符串」，没有一条判据管它能不能活着到用户面前。
+///
+/// 豁免只此一条，且**必须无数字**：不许借这个壳夹带无据数值
+///（「知识库里没有关于打车的规定，但住宿是 800 元」——后半句没有角标，照旧删）。
+fn is_partial_coverage_disclaimer(sentence: &str) -> bool {
+    let body = strip_shell(sentence);
+    body.starts_with("知识库里没有关于") && !body.chars().any(|c| c.is_ascii_digit())
+}
+
+/// 剥列表符号与空白（`strip_refs` 的孪生：那个还剥角标，这里只剥外壳）
+fn strip_shell(s: &str) -> String {
+    s.trim().trim_start_matches(|c| SHELL_CHARS.contains(c) || c == ' ').trim().to_string()
+}
+
 fn keep_line(line: &str, n_citations: usize) -> String {
-    let kept: String =
-        sentences(line).into_iter().filter(|s| has_valid_ref(s, n_citations)).collect();
+    let kept: String = sentences(line)
+        .into_iter()
+        .filter(|s| has_valid_ref(s, n_citations) || is_partial_coverage_disclaimer(s))
+        .collect();
     // 🔴 剥掉角标与列表符号后一个字都不剩 → 这不是结论，是空壳，必须丢。
     //
     // 实测的翻车形态：模型把角标**单独放一行**，于是正文句（无角标）被上面那道过滤剔掉、
@@ -1623,6 +1801,35 @@ mod tests {
         assert!(out.contains("## 其他相关信息") && out.contains("## 操作步骤"), "{out}");
     }
 
+    /// 🔴 召回尾巴里那对**没被引用**的新旧版，不许把一个好答案降级成核对表。
+    ///
+    /// `retrieve` 侧的 `preserve_governed_versions` / `preserve_textual_versions` 是
+    /// **主动**把冲突版本追加进 TOP_K 的 —— 「上下文里躺着一对与本问题无关的新旧版」
+    /// 是被设计出来的常态。此前这里全程不扫角标（而同文件 numeric 侧早就要求「至少一个
+    /// 成员被引用」），于是用户问「报销要交哪些材料」，只因尾巴里有『培训报销 v1/v2』，
+    /// 就收到一张「请由制度负责人确认」的表 —— 比答错更劝退。
+    #[test]
+    fn unselected_version_conflict_in_retrieval_tail_does_not_replace_the_answer() {
+        // hits[0]/hits[1] 是另一族的新旧版，**一个都没被引用**
+        let mut current = hit("新版：年度上限 9000 元");
+        current.document_family = Some("培训报销".into());
+        current.document_revision = Some("v2".into());
+        let mut old = hit("旧版：年度上限 4000 元");
+        old.doc_id = "d2".into();
+        old.chunk_id = 43;
+        old.document_family = Some("培训报销".into());
+        old.document_revision = Some("v1".into());
+        // 真正回答问题的那一条，角标 [^3]
+        let mut process = hit("报销申请须附发票原件与审批单");
+        process.doc_id = "d3".into();
+        process.chunk_id = 44;
+
+        let md = "## 直接结论\n\n报销申请须附发票原件与审批单[^3]。";
+        let out = disclose_versioned_sources(md, &[current, old, process]);
+        assert_eq!(out, md, "没被引用的版本冲突不该改写答案：{out}");
+        assert!(!out.contains("核对"), "不该降级成核对表：{out}");
+    }
+
     #[test]
     fn version_comparison_that_auto_selects_one_side_is_replaced() {
         let mut current = hit("新版：年度上限 9000 元");
@@ -1637,6 +1844,103 @@ mod tests {
         let out = disclose_versioned_sources(md, &[current, old]);
         assert!(out.contains("系统不自动判定其中一份为现行标准"), "{out}");
         assert!(!out.contains("建议采用新版"), "{out}");
+    }
+
+    #[test]
+    fn ungoverned_conflicting_numbers_are_replaced_with_a_neutral_review_notice() {
+        let oven = hit("美的烤箱保修期为 1 年（自产产品生产日期起算）");
+        let mut other = hit("美的烤箱保修期为 3 个月");
+        other.doc_id = "d2".into();
+        other.doc_name = "设备政策说明（章节02）.md".into();
+        other.chunk_id = 43;
+        let md = "## 直接结论\n\n美的烤箱保修期为 1 年[^1]。美的烤箱保修期为 3 个月[^2]。";
+        let out = disclose_conflicting_numeric_claims(md, &[oven, other]);
+        assert!(out.contains("系统不自动选择其中一项"), "{out}");
+        assert!(out.contains("[^1]") && out.contains("[^2]"), "{out}");
+        assert!(
+            !out.contains("美的烤箱保修期为 1 年"),
+            "冲突时不得保留单边直接结论: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_selecting_one_conflicting_hit_is_still_replaced_with_a_neutral_notice() {
+        let oven = hit("美的烤箱保修期为 1 年（自产产品生产日期起算）");
+        let mut other = hit("美的烤箱保修期为 3 个月");
+        other.doc_id = "d2".into();
+        other.doc_name = "设备政策说明（章节02）.md".into();
+        other.chunk_id = 43;
+        let f = Fake::new("美的烤箱保修期为 1 年[^1]。");
+
+        let answer = call(&f, &[oven, other], "美的烤箱保修期多久")
+            .await
+            .0
+            .unwrap();
+        let (md, n) = text_of(&answer);
+        assert!(md.contains("系统不自动选择其中一项"), "{md}");
+        assert!(md.contains("[^1]") && md.contains("[^2]"), "{md}");
+        assert!(
+            !md.contains("美的烤箱保修期为 1 年[^1]。"),
+            "不得保留模型的单边裁决: {md}"
+        );
+        assert_eq!(n, 2, "模型未引用的冲突证据也必须进入引用列表");
+    }
+
+    #[test]
+    fn different_components_with_different_periods_are_not_a_conflict() {
+        let oven = hit("美的烤箱整机保修期为 1 年");
+        let mut thermostat = hit("美的烤箱温控器保修期为 3 个月");
+        thermostat.doc_id = "d2".into();
+        thermostat.doc_name = "部件保修说明.md".into();
+        thermostat.chunk_id = 43;
+        let md = "美的烤箱整机保修期为 1 年[^1]。美的烤箱温控器保修期为 3 个月[^2]。";
+        assert_eq!(
+            disclose_conflicting_numeric_claims(md, &[oven, thermostat]),
+            md
+        );
+    }
+
+    #[test]
+    fn unrelated_numeric_facts_are_not_a_conflict() {
+        let warranty = hit("美的烤箱保修期为 1 年");
+        let mut hotline = hit("美的售后电话为 400-1256868");
+        hotline.doc_id = "d2".into();
+        hotline.doc_name = "售后联系说明.md".into();
+        hotline.chunk_id = 43;
+        let md = "美的烤箱保修期为 1 年[^1]。美的售后电话为 400-1256868[^2]。";
+        assert_eq!(
+            disclose_conflicting_numeric_claims(md, &[warranty, hotline]),
+            md
+        );
+    }
+
+    #[test]
+    fn unselected_conflict_in_retrieval_tail_does_not_replace_the_answer() {
+        let warranty = hit("美的烤箱保修期为 1 年");
+        let mut other = hit("美的烤箱保修期为 3 个月");
+        other.doc_id = "d2".into();
+        other.chunk_id = 43;
+        let mut hotline = hit("美的售后电话为 400-1256868");
+        hotline.doc_id = "d3".into();
+        hotline.chunk_id = 44;
+        let md = "美的售后电话为 400-1256868[^3]。";
+        assert_eq!(
+            disclose_conflicting_numeric_claims(md, &[warranty, other, hotline]),
+            md
+        );
+    }
+
+    #[test]
+    fn compatible_claim_with_an_extra_number_is_not_a_conflict() {
+        let base = hit("美的烤箱保修期为 1 年");
+        let mut extended = hit("美的烤箱保修期为 1 年，购买延保后共 3 年");
+        extended.doc_id = "d2".into();
+        extended.chunk_id = 43;
+        let md = "美的烤箱保修期为 1 年[^1]。";
+        assert_eq!(
+            disclose_conflicting_numeric_claims(md, &[base, extended]),
+            md
+        );
     }
 
     #[test]
@@ -1803,17 +2107,31 @@ mod tests {
         assert_eq!(compact_refs("甲[^3]。乙[^3]。", 6), ("甲[^1]。乙[^1]。".into(), vec![3]));
     }
 
-    /// 检索降级属于服务端诊断，不应混进面向业务用户的答案。
+    /// 检索降级**必须让用户看见**，但只说能力状态、不说实现（2026-08-14 翻案）。
+    ///
+    /// 🔴 这条判据原来钉的是相反的合同（「降级属于服务端诊断，不应混进业务答案」）。
+    /// 翻案的理由：主语义召回缺席时，剩下几路仍能凑够块数，模型照样生成一份带角标的、
+    /// **看起来完全正常**的答案 —— 用户没有任何线索知道这一次的召回面小了一截。
+    /// 而业主的第一轴是「宁可 fail closed 也不能静默扩大/缩小范围」，问数侧同族的
+    /// 「口径卡缺席 → 用户可见标注 + trust 降 review」（AX126）已经这么做了。
+    ///
+    /// 旧判据反对的那一半仍然成立并继续钉着：**不许泄露检索实现** ——
+    /// 提示里不出现「向量」「关键词召回」「熔断」这类词，只说「检索能力降级」。
     #[tokio::test]
-    async fn retrieval_degradation_is_not_exposed_in_the_business_answer() {
+    async fn retrieval_degradation_is_disclosed_without_leaking_implementation() {
         let f = Fake::new("报销上限 800 元[^1]。");
         let hits = [hit("报销上限 800 元")];
         let t = std::time::Instant::now();
         let base = respond(&f, &hits, "上限", t, false, None, None, "tid-test").await.0.unwrap();
-        assert_eq!(text_of(&base).0, "报销上限 800 元[^1]。");
+        assert_eq!(text_of(&base).0, "报销上限 800 元[^1]。", "不降级时一个字都不许多");
         let down = respond(&f, &hits, "上限", t, true, None, None, "tid-test").await.0.unwrap();
         let down = text_of(&down).0;
-        assert_eq!(down, "报销上限 800 元[^1]。", "{down}");
+        assert!(down.starts_with("> "), "降级提示必须在顶部且是引用块：{down}");
+        assert!(down.contains("结果可能不全"), "{down}");
+        assert!(down.contains("报销上限 800 元[^1]"), "正文与角标不许受影响：{down}");
+        for leak in ["向量", "关键词", "熔断", "embed", "rerank"] {
+            assert!(!down.contains(leak), "提示泄露了检索实现（{leak}）：{down}");
+        }
         let no_hit = respond(&f, &[], "上限", t, true, None, None, "tid-test").await.0.unwrap();
         assert_eq!(text_of(&no_hit), (NO_HIT.to_string(), 0));
         let g = Fake::new("我猜是 5000 元。");
@@ -1844,20 +2162,15 @@ mod tests {
         assert!(s.contains("&quot;"));
     }
 
-    /// 纪律 3：截断说明必须带原因 + 已展示范围，但不得泄露内部块标识或偏移参数。
+    /// 纪律 3（现行）：命中块**整块**进 prompt。块尾的限定条件、例外和数值是最常被
+    /// 静默裁掉的那一段，裁掉后模型会把「文中未提及」当成「制度未规定」。
     #[test]
-    fn truncation_states_reason_range_and_resume() {
-        let long: String = "甲".repeat(BLOCK_CHARS + 500);
+    fn long_block_reaches_the_model_intact() {
+        let long = format!("{}{}", "甲".repeat(4000), "但节假日除外");
         let s = wrap_untrusted(&[hit(&long)]);
-        assert!(s.contains("已截断"));
-        assert!(s.contains(&format!("共 {} 字", BLOCK_CHARS + 500)));
-        assert!(s.contains(&format!("第 1-{BLOCK_CHARS} 字")));
-        assert!(s.contains("完整内容请从引用原文核对"));
-        assert!(!s.contains("chunk_id=") && !s.contains("offset="), "{s}");
-        // 正文按字符截而不是按字节（按字节会切出半个中文字）
-        assert_eq!(s.matches('甲').count(), BLOCK_CHARS);
-        // 短块不加说明
-        assert!(!wrap_untrusted(&[hit("短")]).contains("已截断"));
+        assert_eq!(s.matches('甲').count(), 4000);
+        assert!(s.contains("但节假日除外"), "块尾限定条件被裁掉：{s}");
+        assert!(!s.contains("已截断"), "不再有截断说明：{s}");
     }
 
     #[test]
@@ -1943,18 +2256,15 @@ mod tests {
         assert!(out.contains("## 关键要点") && out.contains("按制度执行[^1]"), "{out}");
     }
 
-    /// 截断区外的数字不作证：模型只看到 `clip` 窗口，窗口外的数放它过核验就是给编造背书
+    /// 长块块尾的数字**是**合法证据：整块进 prompt 之后模型确实读得到它，
+    /// 按「不在源数字表里」剔掉它等于把真答案当编造（旧的 1200 字窗口正是这么误判的）。
     #[tokio::test]
-    async fn numbers_beyond_the_clip_window_do_not_testify() {
-        let mut long = "甲".repeat(BLOCK_CHARS);
-        long.push_str(&format!("{}{}", "乙".repeat(10), "上限 9000 元"));
+    async fn numbers_at_the_tail_of_a_long_block_testify() {
+        let mut long = "甲".repeat(4000);
+        long.push_str("。上限 9000 元");
         let f = Fake::new("上限 9000 元[^1]。");
         let a = call(&f, &[hit(&long)], "上限").await.0.unwrap();
-        assert_eq!(
-            text_of(&a),
-            (NO_HIT.to_string(), 0),
-            "9000 只出现在截断区外，模型不可能读到 → 剔除"
-        );
+        assert_eq!(text_of(&a), ("上限 9000 元[^1]。".to_string(), 1));
     }
 
     /// 全角「＋」与半角同待遇；第二个小数点停下（`3.5.6` 不再产怪 token）
@@ -2090,6 +2400,35 @@ mod tests {
     /// 7 次里有 1 次通篇只答了「已含市内交通」而**一个字不提「没有单独上限」** ——
     /// 用户会把「180 元含交通」读成「打车费上限 180」。
     /// 原 SYSTEM 段只有「资料不足以回答时回一句没有」，管不到「部分覆盖」这一档。
+    #[test]
+    /// 🔴 SYSTEM 要求的那句「部分覆盖」声明必须**活着到达用户**。
+    ///
+    /// 它是否定断言、天然无角标 —— 角标过滤会整句剔掉它。后果是本仓最坏的一类：
+    /// 用户问「住宿和打车各有什么上限」，模型老实说了「知识库里没有关于市内打车费的规定」，
+    /// 这句被删，用户看到只剩住宿那半的答案 —— 他会把 Y 当成 X 的答案。
+    /// 此前唯一的测试只断言「SYSTEM 里含这个字符串」，没有一条判据管它能不能活下来。
+    #[test]
+    fn partial_coverage_disclaimer_survives_the_citation_filter() {
+        let md = "知识库里没有关于市内打车费的规定。\n住宿费上限每晚八百元[^1]。";
+        let kept: Vec<String> = md.lines().map(|l| keep_line(l, 1)).collect();
+        assert!(kept[0].contains("知识库里没有关于"), "声明被角标过滤删掉了：{kept:?}");
+        assert!(kept[1].contains("住宿费上限"), "带角标的结论不该受影响：{kept:?}");
+
+        // 反面①：借这个壳夹带**无据数值** —— 照旧删（无数字这条是豁免的前提）
+        let smuggle = "知识库里没有关于打车的规定，但住宿是 800 元。";
+        assert_eq!(keep_line(smuggle, 1), "", "带数字的句子不许借豁免活下来");
+
+        // 反面②：整篇**只剩**这句 → 不算有实质内容，走 NO_HIT 的诚实失败
+        assert!(
+            !has_supported_content("知识库里没有关于市内打车费的规定。"),
+            "只有一句否定断言时不该被当成答案返回"
+        );
+        assert!(
+            has_supported_content(md),
+            "另有带角标结论时整篇仍是有效答案"
+        );
+    }
+
     #[test]
     fn system_prompt_requires_disclosing_partial_coverage() {
         assert!(SYSTEM.contains("只覆盖了问题的**一部分**"), "{SYSTEM}");

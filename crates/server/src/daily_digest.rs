@@ -305,6 +305,9 @@ async fn generate(st: &AppState, today: NaiveDate) -> anyhow::Result<()> {
             rows: &rows,
             row_count: rows.len(),
             caliber_note: None,
+            supplemental: None,
+            comparisons: None,
+            sales_context: None,
         };
         r.insight(&st.llm).await
     } else {

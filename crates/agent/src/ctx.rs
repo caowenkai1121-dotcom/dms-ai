@@ -18,6 +18,7 @@ use dms_kernel::{llm::Usage, ChatModel, ChatRequest, ModelTier, ScopedSql};
 use dms_policy::{scope::Scope, Principal};
 
 use crate::gate::MAX_ROWS;
+use crate::intent::{ExecutionEvidence, IntentAttempt, IntentSummary, IntentV1};
 
 /// 一次问答（单问或复合的一个子问）的全部外部句柄。**只读上下文，不装状态**：
 /// 轮次、候选 SQL、route 这些会变的东西留在 `run.rs` 的显式循环里。
@@ -28,6 +29,9 @@ pub struct AskCtx<'a> {
     pub p: &'a Principal,
     pub scope: &'a Scope,
     pub question: &'a str,
+    /// Fast 模型提取的表面槽位合同；仅 `Ready` 可开放缓存与自由 SQL。
+    pub intent_attempt: &'a IntentAttempt,
+    pub intent: Option<&'a IntentV1>,
     pub ds: &'a str,
     /// 用户可见的实际查询目标名。主逻辑源 `dms` 可能热切到 `doris_warehouse`；
     /// 可信凭证必须写物理目标，不能让用户误以为仍在查原 DMS MySQL。
@@ -158,6 +162,9 @@ pub struct AskResult {
     /// 金标把它逐字钉死）。只有 sales_fact 标量命中会填它。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sales_context: Option<SalesContextResult>,
+    /// 面向回归和用户诊断的非敏感意图收据；不含 prompt、SQL AST 或内部实体 ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_summary: Option<IntentSummary>,
 }
 
 /// 反问候选（need-intent）：`label` 是短标签（≤6 字预期），`question` 是可直接重发的完整问句。
@@ -271,6 +278,7 @@ impl AskResult {
             clarify_options: vec![],
             value_labels: vec![],
             sales_context: None,
+            intent_summary: None,
         }
     }
 }
@@ -289,7 +297,12 @@ pub fn table_answer(
 ) -> AskResult {
     // `rs.redacted` 曾长期无消费者（裁决 二·D T4-5 记的那笔债），于是被脱敏的列在界面上
     // 只是一片空值 —— 用户把它当故障。现在带出去，前端按列名打「已脱敏」角标。
-    let RowSet { columns, rows, redacted } = rs; // 列全字段不写 `..`：RowSet 再加字段时编译期强制决策
+    let RowSet {
+        columns,
+        rows,
+        redacted,
+        truncated: cut,
+    } = rs; // 列全字段不写 `..`：RowSet 再加字段时编译期强制决策
     let row_count = rows.len();
     let view = dms_semantic::present::build(&columns, &rows);
     // wire() 取一次复用：sql 字段与 truncation_note 各要一份
@@ -297,7 +310,10 @@ pub fn table_answer(
     AskResult {
         sql: wire.to_string(),
         columns,
-        truncated: row_count >= MAX_ROWS,
+        // 🔴 两个来源取或：`cut` 是取数侧「我在上限处截断了」的**事实**，
+        // `row_count >= MAX_ROWS` 是行数撞上限的**推断**。ds 策略把上限压到 50/20 时
+        // 后者恒为假 —— 几十行的结果会被当成全量呈现，脚注一个字不提（2026-08-14 审计）。
+        truncated: cut || row_count >= MAX_ROWS,
         row_count,
         rows,
         elapsed_ms: t0.elapsed().as_millis(),
@@ -320,6 +336,7 @@ pub fn table_answer(
         clarify_options: vec![],
         value_labels: vec![],
         sales_context: None,
+        intent_summary: None,
     }
 }
 
@@ -341,13 +358,22 @@ fn trust_level(route: &str, risk: bool, deterministic: bool) -> &'static str {
 
 /// 在 Router 命中出口统一补可信凭证。放在这里避免七条 Answerer 各写一份等级和权限文案。
 pub(crate) fn attach_trust(cx: &AskCtx<'_>, r: &mut AskResult) {
+    attach_intent_summary(cx, r, &ExecutionEvidence::default());
+    attach_result_verification(cx, r);
     if r.sql.trim().is_empty() || matches!(r.route.as_str(), "need-intent" | "compound") {
         return;
     }
     // 主查询与补充明细任一截断都算风险（checks 文案用同一个 bit，等级与凭证不自相矛盾）
-    let any_truncated =
-        r.truncated || r.supplemental.as_ref().is_some_and(|detail| detail.truncated);
-    let risk = r.caliber_note.is_some() || any_truncated;
+    let any_truncated = r.truncated
+        || r.supplemental
+            .as_ref()
+            .is_some_and(|detail| detail.truncated);
+    let intent_unverified = !cx.intent_attempt.is_data_executable();
+    let receipt_blocked = r
+        .intent_summary
+        .as_ref()
+        .is_some_and(|summary| summary.coverage.status != "complete");
+    let risk = r.caliber_note.is_some() || any_truncated || intent_unverified || receipt_blocked;
     let deterministic = matches!(
         r.route.as_str(),
         "direct-agg"
@@ -374,6 +400,14 @@ pub(crate) fn attach_trust(cx: &AskCtx<'_>, r: &mut AskResult) {
         "DMS 账号行级权限".to_string()
     };
     let mut checks = vec!["只读执行通道".to_string(), "当前身份权限已校验".to_string()];
+    if intent_unverified {
+        checks.push("结构化意图未获有效合同；仅确定性路径执行，本结果需复核".to_string());
+    }
+    if receipt_blocked {
+        checks.push("执行结果未通过完整性或值级核验，请勿作为最终口径".to_string());
+    } else if cx.intent.is_some() {
+        checks.push("已核对返回行形状与请求指标的实际值".to_string());
+    }
     if business_lookup {
         checks.push("生产 DMS 单表轻查询：索引条件、小 LIMIT、2 秒超时".to_string());
     }
@@ -426,6 +460,310 @@ pub(crate) fn attach_trust(cx: &AskCtx<'_>, r: &mut AskResult) {
         fingerprint: sql_fingerprint(&r.sql),
         checks,
     });
+}
+
+/// 执行后的最终闸：SQL 覆盖只证明“查询计划表达了什么”，不能证明引擎真的返回了
+/// 可用值。这里复用 `IntentSummary.coverage` 作为唯一收据，把实际行集、指标值、比较值
+/// 和补充结果一起核验。任何问题都只会把 trust 降为 review，不伪造新的状态协议。
+fn attach_result_verification(cx: &AskCtx<'_>, r: &mut AskResult) {
+    let issues = result_verification_issues(cx.intent, r);
+    if issues.is_empty() {
+        return;
+    }
+    let Some(summary) = r.intent_summary.as_mut() else {
+        return;
+    };
+    summary.coverage.status = "blocked";
+    for issue in issues {
+        if !summary.coverage.issues.contains(&issue) {
+            summary.coverage.issues.push(issue);
+        }
+    }
+}
+
+fn result_verification_issues(intent: Option<&IntentV1>, r: &AskResult) -> Vec<String> {
+    let mut issues = Vec::new();
+    let mut add = |issue: String| {
+        if !issues.contains(&issue) {
+            issues.push(issue);
+        }
+    };
+
+    if r.row_count != r.rows.len() {
+        add("result:row-count-mismatch".into());
+    }
+    if r.rows.iter().any(|row| row.len() != r.columns.len()) {
+        add("result:column-shape-mismatch".into());
+    }
+    if let Some(detail) = &r.supplemental {
+        if detail.row_count != detail.rows.len() {
+            add("result:supplemental-row-count-mismatch".into());
+        }
+        if detail
+            .rows
+            .iter()
+            .any(|row| row.len() != detail.columns.len())
+        {
+            add("result:supplemental-column-shape-mismatch".into());
+        }
+    }
+    if let Some(context) = &r.sales_context {
+        if context
+            .rows
+            .iter()
+            .any(|row| row.len() != context.columns.len())
+        {
+            add("result:sales-context-shape-mismatch".into());
+        }
+    }
+
+    let Some(intent) = intent else { return issues };
+    if intent.route() != crate::intent::IntentRoute::Data {
+        return issues;
+    }
+    let has_primary_value = r.rows.iter().flatten().any(cell_has_value);
+    if !has_primary_value {
+        add("result:empty".into());
+    }
+    for metric in &intent.metrics {
+        if !metric_has_actual_value(metric, r) {
+            add(format!("result:metric-unverified:{metric}"));
+        }
+    }
+    if !intent.comparisons.is_empty() {
+        let structured = r
+            .comparisons
+            .iter()
+            .filter(|comparison| comparison_is_valid(comparison))
+            .count();
+        if structured != r.comparisons.len() {
+            add("result:comparison-invalid".into());
+        }
+        let inline = r
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(index, column)| {
+                comparison_column(column)
+                    && r.rows
+                        .iter()
+                        .any(|row| row.get(*index).is_some_and(cell_is_number))
+            })
+            .count();
+        if structured + inline < intent.comparisons.len() {
+            add("result:comparison-incomplete".into());
+        }
+    }
+    if intent.requested_detail {
+        let supplemental = r
+            .supplemental
+            .as_ref()
+            .is_some_and(|detail| detail.rows.iter().flatten().any(cell_has_value));
+        let primary_detail = has_primary_value && (r.columns.len() > 1 || r.rows.len() > 1);
+        if !primary_detail && !supplemental {
+            add("result:detail-empty".into());
+        }
+    }
+    if let Some(current) = primary_scalar(r) {
+        if r.comparisons
+            .iter()
+            .any(|comparison| (comparison.current - current).abs() > comparison_tolerance(current))
+        {
+            add("result:comparison-current-mismatch".into());
+        }
+    }
+    issues
+}
+
+fn cell_has_value(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        serde_json::Value::Array(values) => values.iter().any(cell_has_value),
+        serde_json::Value::Object(values) => values.values().any(cell_has_value),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
+}
+
+fn cell_is_number(value: &serde_json::Value) -> bool {
+    cell_number(value).is_some()
+}
+
+fn cell_number(value: &serde_json::Value) -> Option<f64> {
+    let number = match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(value) => value
+            .trim()
+            .trim_end_matches('%')
+            .replace(',', "")
+            .parse()
+            .ok(),
+        _ => None,
+    };
+    number.filter(|value| value.is_finite())
+}
+
+fn primary_scalar(r: &AskResult) -> Option<f64> {
+    (r.columns.len() == 1 && r.rows.len() == 1)
+        .then(|| r.rows.first()?.first().and_then(cell_number))?
+}
+
+fn comparison_tolerance(value: f64) -> f64 {
+    value.abs().max(1.0) * 1e-9
+}
+
+fn comparison_is_valid(comparison: &KpiComparison) -> bool {
+    if ![
+        comparison.current,
+        comparison.baseline,
+        comparison.change,
+        comparison.pct,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+        || (comparison.change - (comparison.current - comparison.baseline)).abs()
+            > comparison_tolerance(comparison.current)
+    {
+        return false;
+    }
+
+    let expected_pct = if comparison.baseline.abs() >= 1e-6 {
+        comparison.change / comparison.baseline * 100.0
+    } else {
+        0.0
+    };
+    (comparison.pct - (expected_pct * 10.0).round() / 10.0).abs() <= 0.051
+}
+
+fn metric_has_actual_value(metric: &str, r: &AskResult) -> bool {
+    let aliases: &[&str] = match metric {
+        "销售额" | "销售总额" | "销售金额" | "营业额" => {
+            &[
+                "销售额",
+                "销售总额",
+                "销售金额",
+                "营业额",
+                "sales_amount",
+                "amount",
+            ]
+        }
+        "销量" | "销售量" | "销售数量" => {
+            &[
+                "销量",
+                "销售量",
+                "销售数量",
+                "sales_qty",
+                "sales_quantity",
+                "qty",
+                "quantity",
+            ]
+        }
+        "库存量" | "库存数量" | "库存总量" => {
+            &["库存量", "库存数量", "库存总量", "in_stock_quantity"]
+        }
+        "订单数" | "订单数量" => &["订单数", "订单数量", "order_count"],
+        "毛利额" | "毛利润" => &["毛利额", "毛利润", "gross_profit"],
+        "毛利率" => &["毛利率", "gross_margin"],
+        "不含税成本" => &["不含税成本", "cost_excluding_tax"],
+        "不含税收入" => &["不含税收入", "revenue_excluding_tax"],
+        _ => return false,
+    };
+    let indices = r
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            aliases
+                .iter()
+                .any(|alias| metric_column_matches_alias(column, alias))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    indices.into_iter().any(|index| {
+        r.rows
+            .iter()
+            .any(|row| row.get(index).is_some_and(cell_is_number))
+    })
+}
+
+/// Result columns are evidence, not a hint: a numeric scalar only verifies a metric when its
+/// column carries that metric's controlled name. In particular, substring matching would let
+/// `discount_amount` satisfy `amount` and `account_count` satisfy `count`.
+fn metric_column_matches_alias(column: &str, alias: &str) -> bool {
+    let column = normalized_metric_column(column);
+    let alias = normalized_metric_column(alias);
+    column == alias
+}
+
+fn normalized_metric_column(value: &str) -> String {
+    let mut value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '`' | '"' | '\''))
+        .to_lowercase();
+    loop {
+        let Some((head, suffix)) = metric_unit_suffix(&value) else {
+            break;
+        };
+        if !matches!(
+            suffix,
+            "元" | "万元" | "亿元" | "个" | "件" | "箱" | "单" | "笔" | "%" | "百分比"
+        ) {
+            break;
+        }
+        value = head.trim_end_matches(['_', '-', ' ']).trim().to_string();
+    }
+    value
+}
+
+fn metric_unit_suffix(value: &str) -> Option<(&str, &str)> {
+    if let Some(head) = value.strip_suffix('）') {
+        let (head, suffix) = head.rsplit_once('（')?;
+        return Some((head, suffix.trim()));
+    }
+    if let Some(head) = value.strip_suffix(')') {
+        let (head, suffix) = head.rsplit_once('(')?;
+        return Some((head, suffix.trim()));
+    }
+    value
+        .rsplit_once(['_', '-', ' '])
+        .map(|(head, suffix)| (head, suffix.trim()))
+}
+
+fn comparison_column(column: &str) -> bool {
+    let folded = column.to_lowercase();
+    ["同比", "环比", "较上", "change", "delta", "growth", "pct"]
+        .iter()
+        .any(|word| folded.contains(word))
+}
+
+pub(crate) fn attach_intent_summary(
+    cx: &AskCtx<'_>,
+    r: &mut AskResult,
+    evidence: &ExecutionEvidence,
+) {
+    if r.intent_summary.is_some() {
+        return;
+    }
+    let coverage = if r.sql.trim().is_empty()
+        || matches!(
+            r.route.as_str(),
+            "need-intent" | "compound" | "graph" | "entity-card"
+        ) {
+        let mut report = crate::intent::CoverageReport::default();
+        if cx.intent.is_some() {
+            report
+                .unverifiable
+                .push(format!("route:{}:coverage-unverifiable", r.route));
+        }
+        Some(report)
+    } else {
+        Some(crate::intent::sql_coverage(
+            cx.intent,
+            &r.sql,
+            cx.source.dialect(),
+        ))
+    };
+    r.intent_summary = Some(cx.intent_attempt.summary(coverage.as_ref(), evidence));
 }
 
 /// FNV-1a 64 位偏移基（`sql_fingerprint` 与 `summary_cache_key` 共用同一算法起点）。
@@ -489,12 +827,6 @@ const EXTERNAL_CELL_CHARS: usize = 40;
 
 // 指针分支隐含不变量：上限必须大于头部行数，否则「前 5 行 / 其余 N-5 行」对不上
 const _: () = assert!(TABLE_EXTERNAL_ROWS > EXTERNAL_HEAD_ROWS);
-/// 喂给 fast 的早期轮材料总量上限（字符）：早期轮可以很多，摘要是压缩不是逐字搬家。
-const SUMMARY_INPUT_CAP_CHARS: usize = 6000;
-/// 摘要材料里单轮问句的截断长度（字符）：一句两万字符的历史问句不该独吞输入预算。
-const SUMMARY_TURN_QUESTION_CHARS: usize = 200;
-/// 摘要正文自身上限（字符）：它是要进预算的上下文，不是第二份历史。
-const SUMMARY_MAX_CHARS: usize = 800;
 /// fast 摘要的等待上限：超时 = 失败 = 回退硬截（与 `triage`/`ask` 的 fast 调用同族降级）。
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -656,8 +988,7 @@ async fn summarize_with_timeout(llm: &dyn ChatModel, early: &[Turn], budget: Dur
                   3. 没出现过的口径一个字都不编；4. 不写 SQL。";
     let mut user = String::from("#早期对话：\n");
     for (i, t) in early.iter().enumerate() {
-        // 单轮问句也截：一句两万字符的历史问句不该独吞摘要输入预算
-        user.push_str(&format!("{}. 问：{}\n", i + 1, t.question.chars().take(SUMMARY_TURN_QUESTION_CHARS).collect::<String>()));
+        user.push_str(&format!("{}. 问：{}\n", i + 1, t.question));
         if let Some(sql) = t.sql.as_deref().filter(|s| !s.trim().is_empty()) {
             user.push_str(&format!("   SQL：{}\n", externalize_sql(sql)));
         }
@@ -665,14 +996,8 @@ async fn summarize_with_timeout(llm: &dyn ChatModel, early: &[Turn], budget: Dur
             user.push_str(&format!("   结果：{n} 行\n"));
         }
     }
-    let user_chars = user.chars().count();
-    if user_chars > SUMMARY_INPUT_CAP_CHARS {
-        user = user.chars().take(SUMMARY_INPUT_CAP_CHARS).collect();
-        user.push_str("\n（材料过长，尾部已截）");
-    }
     user.push_str("#摘要：");
-    let mut req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
-    req.max_tokens = Some(600);
+    let req = ChatRequest::text(ModelTier::Fast, system, &user, Some(0.1));
     let reply = match tokio::time::timeout(budget, llm.chat(req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
@@ -684,11 +1009,11 @@ async fn summarize_with_timeout(llm: &dyn ChatModel, early: &[Turn], budget: Dur
             return None;
         }
     };
-    // 摘要是给 LLM 看的外部文本：剥控制字符（排版版权只在模板），自身长度也封顶
+    // 摘要是给 LLM 看的外部文本：只剥控制字符（排版版权只在模板），不再人工截断模型输出。
     let cleaned = reply
         .content
         .map(|c| c.chars().filter(|c| !c.is_control()).collect::<String>())
-        .map(|c| c.trim().chars().take(SUMMARY_MAX_CHARS).collect::<String>())
+        .map(|c| c.trim().to_string())
         .unwrap_or_default();
     if cleaned.is_empty() {
         tracing::warn!("早期轮摘要 fast 回空 → 回退硬截");
@@ -709,11 +1034,13 @@ pub struct ContextSummary {
     /// 预算裁剪后的实际进 prompt 总量（字节）
     pub prompt_chars: usize,
     pub cards: Vec<ContextCard>,
-    /// 预算护栏裁掉的项（未触发 = 空数组）
-    pub trimmed: Vec<TrimNote>,
-    /// 本轮上下文是否用了两级摘要（Y10）。历史装配点今天在 server 侧（见本文件 Y10 段头），
-    /// gather 组装的 LLM prompt 不含会话历史 —— 当前照实恒 false，接线后由装配方填。
-    pub summary_used: bool,
+    /// 本轮**召回降级**的项（未触发 = 空数组）。
+    ///
+    /// 换掉了这里原先的 `trimmed: Vec<TrimNote>` 与 `summary_used: bool` —— 两个都是死件：
+    /// `BudgetReport.notes` 恒 `vec![]`、`summary_used` 恒 `false`（历史摘要装配点在 server 侧），
+    /// 于是审计面板上那两行**永远不出现**。留着死件比没有更糟：读的人以为「没裁 = 一切正常」。
+    /// 现在这一格装真正会发生的事：口径卡缺席（见 `PromptCtx::degraded`）。
+    pub degraded: Vec<&'static str>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -725,15 +1052,6 @@ pub struct ContextCard {
     pub chars: usize,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq)]
-pub struct TrimNote {
-    pub kind: &'static str,
-    pub dropped: usize,
-    pub kept: usize,
-    /// 被裁掉的表名（只有 schema 类裁剪带名字 —— 表名是审计要的；卡正文一概不带）
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub names: Vec<String>,
-}
 
 /// gather 装配出的摘要按 `trace_id` 暂存在进程内（纯内存 —— 本 crate 门禁不许 `sqlx::query`），
 /// server 的 `query_log::finish` 在同一个 fire-and-forget 任务里取走落库，主链一个 `.await` 都不多。
@@ -848,8 +1166,7 @@ mod tests {
         RowSet {
             columns: vec!["分类".into()],
             rows: (0..n).map(|i| vec![serde_json::Value::from(i)]).collect(),
-            redacted: vec![],
-        }
+            redacted: vec![], truncated: false }
     }
 
     /// 🔴 serde 向后兼容：`caliber_note` 缺席时**不许出现在 JSON 里**。
@@ -880,16 +1197,32 @@ mod tests {
             clarify_options: vec![],
             value_labels: vec![],
             sales_context: None,
+            intent_summary: None,
         };
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("caliber_note").is_none(), "{j}");
-        assert!(j.get("subs").is_none(), "既有形状不许变（空 subs 同样不出现）：{j}");
-        assert!(j.get("route").is_some() && j.get("row_count").is_some(), "{j}");
+        assert!(
+            j.get("subs").is_none(),
+            "既有形状不许变（空 subs 同样不出现）：{j}"
+        );
+        assert!(
+            j.get("route").is_some() && j.get("row_count").is_some(),
+            "{j}"
+        );
         // 本轮新增的字段同样必须缺席（老前端不改也不崩）
         assert!(j.get("truncation_note").is_none(), "{j}");
-        assert!(j.get("redacted").is_none(), "空 redacted 不许出现在 JSON 里：{j}");
-        assert!(j.get("trust").is_none(), "未补凭证时 trust 不许占老 JSON 形状：{j}");
-        assert!(j.get("supplemental").is_none(), "无补充结果时不许改变老 JSON 形状：{j}");
+        assert!(
+            j.get("redacted").is_none(),
+            "空 redacted 不许出现在 JSON 里：{j}"
+        );
+        assert!(
+            j.get("trust").is_none(),
+            "未补凭证时 trust 不许占老 JSON 形状：{j}"
+        );
+        assert!(
+            j.get("supplemental").is_none(),
+            "无补充结果时不许改变老 JSON 形状：{j}"
+        );
         // 呈现中文化与反问候选同理：空 = 整键不上线
         assert!(j.get("clarify_options").is_none(), "空 clarify_options 不许上线：{j}");
         assert!(j.get("value_labels").is_none(), "空 value_labels 不许上线：{j}");
@@ -972,6 +1305,7 @@ mod tests {
             clarify_options: vec![ClarifyOption { label: "销售表现".into(), question: "本月销售额是多少".into() }],
             value_labels: vec![ValueLabel { column: "状态".into(), code: "100".into(), label: "待审核".into() }],
             sales_context: None,
+            intent_summary: None,
         };
         let j = serde_json::to_value(&r).unwrap();
         assert_eq!(j["clarify_options"], serde_json::json!([{"label": "销售表现", "question": "本月销售额是多少"}]));
@@ -1004,6 +1338,243 @@ mod tests {
         assert!(body.contains("未经合同口径复核"), "{body}");
     }
 
+    #[test]
+    fn result_verifier_requires_actual_metric_values_after_sql_execution() {
+        let intent = IntentV1 {
+            mode: crate::intent::IntentMode::Data,
+            metrics: vec!["销售额".into()],
+            ..Default::default()
+        };
+        let mut result = table_answer(
+            &scoped("SELECT SUM(amount) AS 销售额 FROM t_sales_order"),
+            RowSet {
+                columns: vec!["销售额".into()],
+                rows: vec![],
+                redacted: vec![], truncated: false },
+            "llm",
+            Instant::now(),
+        );
+        let issues = result_verification_issues(Some(&intent), &result);
+        assert!(issues.contains(&"result:empty".to_string()), "{issues:?}");
+        assert!(
+            issues.contains(&"result:metric-unverified:销售额".to_string()),
+            "SQL 别名不能冒充执行值：{issues:?}"
+        );
+
+        result.rows = vec![vec![serde_json::json!("203000000.00")]];
+        result.row_count = 1;
+        let issues = result_verification_issues(Some(&intent), &result);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.starts_with("result:metric-unverified")),
+            "{issues:?}"
+        );
+        assert!(!issues.contains(&"result:empty".to_string()), "{issues:?}");
+    }
+
+    #[test]
+    fn result_verifier_binds_scalar_values_to_exact_metric_columns() {
+        let result = |column: &str| {
+            table_answer(
+                &scoped("SELECT SUM(amount) AS metric_value FROM t_sales_order LIMIT 200"),
+                RowSet {
+                    columns: vec![column.into()],
+                    rows: vec![vec![serde_json::json!(100)]],
+                    redacted: vec![], truncated: false },
+                "direct-agg",
+                Instant::now(),
+            )
+        };
+        let issues_for = |metric: &str, column: &str| {
+            result_verification_issues(
+                Some(&IntentV1 {
+                    mode: crate::intent::IntentMode::Data,
+                    metrics: vec![metric.into()],
+                    ..Default::default()
+                }),
+                &result(column),
+            )
+        };
+
+        for (metric, wrong_column) in [
+            ("销售额", "discount_amount"),
+            ("订单数", "account_count"),
+            ("毛利率", "库存量"),
+        ] {
+            let issues = issues_for(metric, wrong_column);
+            assert!(
+                issues.contains(&format!("result:metric-unverified:{metric}")),
+                "{wrong_column} 不能冒充 {metric}: {issues:?}"
+            );
+        }
+
+        for (metric, column) in [
+            ("销售额", "amount"),
+            ("销售额", "销售额（万元）"),
+            ("订单数", "order_count"),
+            ("库存量", "in_stock_quantity"),
+            ("毛利率", "gross_margin"),
+        ] {
+            let issues = issues_for(metric, column);
+            assert!(
+                !issues
+                    .iter()
+                    .any(|issue| issue.starts_with("result:metric-unverified")),
+                "合法标量列 {column} 应验证 {metric}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn result_verifier_blocks_incomplete_or_inconsistent_comparisons() {
+        let intent = IntentV1 {
+            mode: crate::intent::IntentMode::Data,
+            metrics: vec!["销售额".into()],
+            comparisons: vec!["同比".into()],
+            ..Default::default()
+        };
+        let mut result = table_answer(
+            &scoped("SELECT SUM(amount) AS 销售额 FROM t_sales_order"),
+            RowSet {
+                columns: vec!["销售额".into()],
+                rows: vec![vec![serde_json::json!(100.0)]],
+                redacted: vec![], truncated: false },
+            "direct-agg",
+            Instant::now(),
+        );
+        let issues = result_verification_issues(Some(&intent), &result);
+        assert!(
+            issues.contains(&"result:comparison-incomplete".to_string()),
+            "{issues:?}"
+        );
+
+        result.comparisons.push(KpiComparison {
+            label: "同比".into(),
+            current: 99.0,
+            baseline: 80.0,
+            change: 19.0,
+            pct: 23.8,
+            dir: "up",
+        });
+        let issues = result_verification_issues(Some(&intent), &result);
+        assert!(
+            issues.contains(&"result:comparison-current-mismatch".to_string()),
+            "{issues:?}"
+        );
+        assert!(
+            !issues.contains(&"result:comparison-incomplete".to_string()),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn result_verifier_does_not_treat_scalar_as_requested_detail() {
+        let intent = IntentV1 {
+            mode: crate::intent::IntentMode::Data,
+            metrics: vec!["销售额".into()],
+            requested_detail: true,
+            ..Default::default()
+        };
+        let mut result = table_answer(
+            &scoped("SELECT SUM(amount) AS 销售额 FROM t_sales_order"),
+            RowSet {
+                columns: vec!["销售额".into()],
+                rows: vec![vec![serde_json::json!(100)]],
+                redacted: vec![], truncated: false },
+            "direct-agg",
+            Instant::now(),
+        );
+        assert!(
+            result_verification_issues(Some(&intent), &result)
+                .contains(&"result:detail-empty".to_string()),
+            "主 KPI 不能冒充逐笔明细"
+        );
+        result.supplemental = Some(SupplementalResult {
+            columns: vec!["单号".into(), "金额".into()],
+            rows: vec![vec![serde_json::json!("SO-1"), serde_json::json!(100)]],
+            row_count: 1,
+            truncated: false,
+            view: dms_semantic::present::build(
+                &["单号".into(), "金额".into()],
+                &[vec![serde_json::json!("SO-1"), serde_json::json!(100)]],
+            ),
+        });
+        assert!(
+            !result_verification_issues(Some(&intent), &result)
+                .contains(&"result:detail-empty".to_string())
+        );
+    }
+
+    #[test]
+    fn result_verifier_rejects_non_finite_numeric_strings_and_comparisons() {
+        for value in ["NaN", "inf", "-Infinity"] {
+            assert!(!cell_is_number(&serde_json::json!(value)), "{value}");
+        }
+        let intent = IntentV1 {
+            mode: crate::intent::IntentMode::Data,
+            metrics: vec!["销售额".into()],
+            comparisons: vec!["同比".into()],
+            ..Default::default()
+        };
+        let mut result = table_answer(
+            &scoped("SELECT SUM(amount) AS 销售额 FROM t_sales_order"),
+            RowSet {
+                columns: vec!["销售额".into()],
+                rows: vec![vec![serde_json::json!(100)]],
+                redacted: vec![], truncated: false },
+            "direct-agg",
+            Instant::now(),
+        );
+        result.comparisons.push(KpiComparison {
+            label: "同比".into(),
+            current: 100.0,
+            baseline: 80.0,
+            change: f64::NAN,
+            pct: 25.0,
+            dir: "up",
+        });
+        let issues = result_verification_issues(Some(&intent), &result);
+        assert!(issues.contains(&"result:comparison-invalid".to_string()), "{issues:?}");
+        assert!(issues.contains(&"result:comparison-incomplete".to_string()), "{issues:?}");
+
+        result.comparisons[0] = KpiComparison {
+            label: "同比".into(),
+            current: 100.0,
+            baseline: 80.0,
+            change: 20.0,
+            pct: 999.0,
+            dir: "up",
+        };
+        let issues = result_verification_issues(Some(&intent), &result);
+        assert!(issues.contains(&"result:comparison-invalid".to_string()), "{issues:?}");
+        assert!(issues.contains(&"result:comparison-incomplete".to_string()), "{issues:?}");
+    }
+
+    #[test]
+    fn result_verifier_rejects_wire_shape_drift() {
+        let mut result = table_answer(
+            &scoped("SELECT goods_type, SUM(amount) FROM t_sales_order GROUP BY goods_type"),
+            RowSet {
+                columns: vec!["品类".into(), "销售额".into()],
+                rows: vec![vec![serde_json::json!("烤肠"), serde_json::json!(100)]],
+                redacted: vec![], truncated: false },
+            "llm",
+            Instant::now(),
+        );
+        result.rows[0].pop();
+        result.row_count = 2;
+        let issues = result_verification_issues(None, &result);
+        assert!(
+            issues.contains(&"result:row-count-mismatch".to_string()),
+            "{issues:?}"
+        );
+        assert!(
+            issues.contains(&"result:column-shape-mismatch".to_string()),
+            "{issues:?}"
+        );
+    }
+
     /// 🔴 `table_answer` 必须把 `RowSet.redacted` **原样带出去**。
     /// 这个字段曾长期无消费者（裁决 二·D T4-5），于是被脱敏的列在界面上只是一片空值 ——
     /// 用户把「系统正确地拒绝了敏感列」当成「系统查不出来」。
@@ -1018,14 +1589,24 @@ mod tests {
         let rs = RowSet {
             columns: vec!["login_name".into()],
             rows: vec![vec![serde_json::Value::Null]],
-            redacted: vec!["login_name".into()],
-        };
+            redacted: vec!["login_name".into()], truncated: false };
         let r = table_answer(&s, rs, "llm", Instant::now());
-        assert_eq!(r.redacted, vec!["login_name".to_string()], "RowSet.redacted 又被 `..` 丢掉了");
-        assert_eq!(r.redacted[0], r.columns[0], "必须与 columns 逐字相同（前端按名定位列）");
+        assert_eq!(
+            r.redacted,
+            vec!["login_name".to_string()],
+            "RowSet.redacted 又被 `..` 丢掉了"
+        );
+        assert_eq!(
+            r.redacted[0], r.columns[0],
+            "必须与 columns 逐字相同（前端按名定位列）"
+        );
         // 这条 SQL 走的是 `ScopeSets::default()` + admin（`scoped()` 助手），即**不限制** →
         // 不许出现权限回显（否则超管每次都被告知「你看到的不是全量」）
-        assert!(r.scope_note.is_none(), "无限制却报了权限回显：{:?}", r.scope_note);
+        assert!(
+            r.scope_note.is_none(),
+            "无限制却报了权限回显：{:?}",
+            r.scope_note
+        );
     }
 
     /// 🔴 行级权限**生效时必须回显**。
@@ -1053,16 +1634,33 @@ mod tests {
             &dms_kernel::MysqlDialect,
         )
         .unwrap();
-        assert!(!limited.is_unrestricted(), "这条应当是受限的，测试前提就不成立了");
+        assert!(
+            !limited.is_unrestricted(),
+            "这条应当是受限的，测试前提就不成立了"
+        );
         let r = table_answer(&limited, rowset(3), "llm", Instant::now());
         let note = r.scope_note.as_deref().expect("行权限生效却没有回显");
         assert!(note.contains("数据权限"), "{note}");
-        assert!(note.contains("不是全量"), "必须说清「这不是全量」，否则等于没说：{note}");
+        assert!(
+            note.contains("不是全量"),
+            "必须说清「这不是全量」，否则等于没说：{note}"
+        );
         // JSON 形状：有值才出现（老前端与两个 runner 不受影响）
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("scope_note").is_some(), "{j}");
-        let r2 = table_answer(&scoped("SELECT 1 FROM t_sales_order"), rowset(3), "llm", Instant::now());
-        assert!(serde_json::to_value(&r2).unwrap().get("scope_note").is_none(), "无限制时不许出现这个键");
+        let r2 = table_answer(
+            &scoped("SELECT 1 FROM t_sales_order"),
+            rowset(3),
+            "llm",
+            Instant::now(),
+        );
+        assert!(
+            serde_json::to_value(&r2)
+                .unwrap()
+                .get("scope_note")
+                .is_none(),
+            "无限制时不许出现这个键"
+        );
     }
 
     /// 截断三件套：**未截断一句都不说，截断必须说全三件**。
@@ -1084,9 +1682,12 @@ mod tests {
         );
         // ③ MySQL 的 `LIMIT m, n` 与已有 OFFSET 同样只保留一份 limit 子句
         assert!(next_page_sql("SELECT a FROM t LIMIT 0, 200").ends_with("t LIMIT 200 OFFSET 200"));
-        assert!(next_page_sql("SELECT a FROM t LIMIT 200 OFFSET 0").ends_with("t LIMIT 200 OFFSET 200"));
+        assert!(
+            next_page_sql("SELECT a FROM t LIMIT 200 OFFSET 0").ends_with("t LIMIT 200 OFFSET 200")
+        );
         // 孤 OFFSET（没有第二个数字）不是纯 limit 子句：不剥，原样追加
-        assert!(next_page_sql("SELECT a FROM t LIMIT 200 OFFSET").contains("OFFSET LIMIT 200 OFFSET 200"));
+        assert!(next_page_sql("SELECT a FROM t LIMIT 200 OFFSET")
+            .contains("OFFSET LIMIT 200 OFFSET 200"));
         // ④ 尾部不是纯 limit 子句就不乱剥（提示串宁可多一段，也不能把 SQL 切坏）
         assert_eq!(
             next_page_sql("SELECT a FROM t WHERE b = 'limit 3'"),
@@ -1100,16 +1701,25 @@ mod tests {
     fn table_answer_shape_and_truncation() {
         let s = scoped("SELECT goods_type FROM t_sales_order");
         let r = table_answer(&s, rowset(MAX_ROWS), "direct-agg", Instant::now());
-        assert_eq!(r.route, "direct-agg", "route 必须取命中方给的值，不是表标签");
+        assert_eq!(
+            r.route, "direct-agg",
+            "route 必须取命中方给的值，不是表标签"
+        );
         assert_eq!((r.row_count, r.truncated), (MAX_ROWS, true));
         assert!(r.sql.ends_with("LIMIT 200"), "{}", r.sql);
         assert!(r.truncation_note.as_deref().unwrap().contains("OFFSET 200"));
-        assert!(serde_json::to_value(&r).unwrap().get("truncation_note").is_some());
+        assert!(serde_json::to_value(&r)
+            .unwrap()
+            .get("truncation_note")
+            .is_some());
         // 未满一页：既不算截断，也不带提示
         let r2 = table_answer(&s, rowset(3), "semantic-cache", Instant::now());
         assert_eq!((r2.row_count, r2.truncated), (3, false));
         assert!(r2.truncation_note.is_none());
-        assert!(serde_json::to_value(&r2).unwrap().get("truncation_note").is_none());
+        assert!(serde_json::to_value(&r2)
+            .unwrap()
+            .get("truncation_note")
+            .is_none());
     }
 
     /// `semantic::present::ROW_CAP` 复刻本常量（agent→semantic 单向依赖只能复刻），两侧不许漂。
@@ -1118,7 +1728,6 @@ mod tests {
         assert_eq!(dms_semantic::present::ROW_CAP, MAX_ROWS);
     }
 }
-
 
 #[cfg(test)]
 mod y10_tests {
@@ -1308,7 +1917,7 @@ mod y10_tests {
         FakeLlm { reply, delay, calls: AtomicUsize::new(0) }
     }
 
-    /// fast 摘要的全分支：成功 → Some（剥控制字符、自身封顶）；失败/超时/回空 → None（回退硬截）；
+    /// fast 摘要的全分支：成功 → Some（剥控制字符但不截断）；失败/超时/回空 → None（回退硬截）；
     /// 空 early 一次 LLM 都不调。
     #[tokio::test]
     async fn summarize_falls_back_on_failure_timeout_and_empty() {
@@ -1327,10 +1936,15 @@ mod y10_tests {
         // 回空 → None
         let empty = fake(Some("   ".into()), Duration::ZERO);
         assert!(summarize_with_timeout(&empty, &early, Duration::from_millis(500)).await.is_none());
-        // 摘要自身封顶
-        let huge = fake(Some("摘".repeat(SUMMARY_MAX_CHARS + 100)), Duration::ZERO);
-        let capped = summarize_with_timeout(&huge, &early, Duration::from_millis(500)).await.unwrap();
-        assert_eq!(capped.chars().count(), SUMMARY_MAX_CHARS);
+        let huge = "摘".repeat(1200);
+        let full = summarize_with_timeout(
+            &fake(Some(huge.clone()), Duration::ZERO),
+            &early,
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+        assert_eq!(full, huge, "摘要输出不应被应用层截断");
         // 空 early：一次 LLM 都不调
         let never = fake(Some("不该出现".into()), Duration::ZERO);
         assert!(summarize_with_timeout(&never, &[], Duration::from_millis(500)).await.is_none());
@@ -1368,32 +1982,20 @@ mod y10_tests {
         }
     }
 
-    /// D7 落账 JSON 的契约形状：{prompt_chars, cards, trimmed, summary_used}；
-    /// 无名卡的 `name` 键缺席、空 `names` 缺席（审计侧按这个形状解析）。
+    /// D7 落账 JSON 的契约形状：{prompt_chars, cards, degraded}。
+    /// （2026-08-14：`trimmed` 与 `summary_used` 两个恒空/恒 false 的死件换成了真会发生的
+    /// `degraded` —— 死件比没有更糟，读的人以为「没裁 = 一切正常」。）
     #[test]
-    fn context_summary_json_shape_is_the_audit_contract() {
+    fn context_summary_json_shape_is_stable() {
         let cs = ContextSummary {
-            prompt_chars: 1234,
-            cards: vec![
-                ContextCard { kind: "metric", name: Some("销售额".into()), chars: 120 },
-                ContextCard { kind: "value_hint", name: None, chars: 88 },
-            ],
-            trimmed: vec![
-                TrimNote { kind: "dim", dropped: 5, kept: 4, names: vec![] },
-                TrimNote { kind: "schema_recalled", dropped: 2, kept: 3, names: vec!["t_a".into(), "t_b".into()] },
-            ],
-            summary_used: false,
+            prompt_chars: 42,
+            cards: vec![ContextCard { kind: "metric", name: Some("销售额".into()), chars: 10 }],
+            degraded: vec!["指标召回失败 → 指标卡缺席"],
         };
         let j = serde_json::to_value(&cs).unwrap();
-        assert_eq!(j["prompt_chars"], 1234);
-        assert_eq!(j["summary_used"], false);
-        assert_eq!(
-            j["cards"][0],
-            serde_json::json!({"kind": "metric", "name": "销售额", "chars": 120})
-        );
-        assert!(j["cards"][1].get("name").is_none(), "无名卡的 name 键不许出现：{}", j["cards"][1]);
-        assert_eq!(j["cards"][1], serde_json::json!({"kind": "value_hint", "chars": 88}));
-        assert!(j["trimmed"][0].get("names").is_none(), "空 names 不许出现");
-        assert_eq!(j["trimmed"][1]["names"], serde_json::json!(["t_a", "t_b"]));
+        assert_eq!(j["prompt_chars"], 42);
+        assert_eq!(j["cards"][0]["kind"], "metric");
+        assert_eq!(j["degraded"][0], "指标召回失败 → 指标卡缺席");
+        assert!(j.get("trimmed").is_none() && j.get("summary_used").is_none(), "死件不许回来");
     }
 }

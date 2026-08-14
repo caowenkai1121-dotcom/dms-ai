@@ -2209,3 +2209,1394 @@ ENTITY_VIEW_TAILS 补裸形三词。生产终验：口语句 → entity-card + r
 - **清空会话历史**：`POST /api/conv/{id}/clear`（属主闸，清消息留会话）+ 侧栏 🧹 按钮
   （hover 可见，确认后清屏并重置追问上下文）。
 - workspace 1755 全绿；vue-tsc 0 错。
+
+## AX117（2026-08-13，接手首轮：全量架构审计 + 三个 P0 止血）
+
+前一轮（结构化意图 V2 / 结果终验 / 知识库整块证据 / 部署脚本加固，约 1 万行）交接时**未提交、
+测试红**：`knowledge/answer.rs` 删掉 1200 字块截断（`BLOCK_CHARS` + `clip`）后生产码改干净了，
+两个引用它的测试没跟上（lib 目标能编，test 目标炸），且顺手删掉的 `MAX_QUESTION_CHARS`
+让 KB 问答这条路对超长问题**没有任何长度闸**（`/api/kb/ask` 只校验非空）。
+收尾：两个失效测试改写成新纪律的钉板（整块必须原样到模型、块尾数字是合法证据）、
+长度闸在 `answer` 与 `answer_stream` 两个入口都加回。
+
+### P0-①：结构化意图合同拒 null → **每一个问句**都掉进 need-intent 反问卡
+提示词第 4 条明写「没提到的槽位用空数组、**null** 或 false」，而 `IntentV1`/`TimeSlot` 的字段是
+`#[serde(default, deny_unknown_fields)]` —— serde 的 `default` **只覆盖缺失字段**，显式 `null`
+落到 `String`/`Vec`/`bool` 上是 `invalid type: null`，整份合同判 Invalid → 自由 SQL 与语义缓存
+当轮关闭 → 全部问句 fail-closed。日志只说「JSON 不合约」。**回归实测 2/79。**
+修：`parse_intent_strict` 单一漏斗里先解析成 `Value`、递归删 null 键、再按合同反序列化；
+`deny_unknown_fields` 不放宽（拒的是模型编造表名/列名，不是模型写 null）。
+实测「本月销售额是多少」从反问卡 → `direct-agg` / 39ms / 95,099,953.08。**回归 2/80 → 25/80。**
+
+### P0-②：覆盖闸一票否决 → 答得出的题硬失败成 422
+`CoverageReport::complete()` 把 missing/extra/conflicts/unverifiable 一起当阻断，比
+`AGENT-ARCHITECTURE §9` 自己的合同更严（那里写的是「验证失败仍可展示结果，但收据必须
+blocked/review」）。叠加三处封闭判据，整批题结构上不可能通过：
+- `metric_proved` 写死 8 族 → 市场费用/开票金额/客单价/退款额那批一律硬失败；
+- 实体槽**只**认 `ExecutionEvidence`，而 LLM 路的 evidence 恒空 → 每个带客户名/商品名的
+  自由问句必挂（实测「山西省的烤肠卖给了哪些客户」：`无法证明:entity:烤肠、region:山西省`）；
+- 地区/筛选值用 `folded_eq` 精确等值，而业务口径写死「行政省份 ≠ 门店业务省区」，
+  正确 SQL 写的是 `province_department_name='山东省区'`、用户表面词是「山东」→ 恒假。
+修：①闸门分两级 —— `blocking()`（槽位被删/模型自报歧义/结构上证不了）走 repair→fail-closed，
+`needs_review()`（证不出来但没有删槽证据）放行执行、收据降 review（`receipt_blocked` 既有链路
+自动接住）；②护栏：投影里连一个聚合函数都没有仍维持硬阻断，防止 fail-closed 翻成 fail-open；
+③实体槽补 SQL 侧证明（名称/编码族列上的谓词绑定，含 `LIKE '%…%'` —— 系统提示词本来就要求
+名称走 LIKE）；④名称型值比对剥通配符后取「相等 ∨ 互为子串」，两侧各要 ≥2 字；
+**日期仍走精确等值**（放宽会让 `2026-08-1` 证明 `2026-08-10`）；⑤指标证明的第 9 族用同一条判据
+自证（表面词出现在聚合投影里）。
+
+### P0-③：容器凭据自锁（环境，非代码路径）
+未配 `DMS_SECRET_KEY` 时 settings 凭据密钥由机器指纹派生（`db/crypto.rs:157` 的 host+user），
+而 Docker 注入的 `HOSTNAME` **就是容器短 id**；启动路径又会拿当前钥匙把明文凭据加密写回
+挂载的 settings（`db.rs:487-511` 的幂等迁移）。于是**重建一次容器 = 凭据被上一个容器 id 锁死**，
+本轮实测撞上（只能翻旧日志找回那个 id 才解得开）。止血：`secrets/dms-secret.key`（.gitignore
+整目录忽略）+ `serve.ps1` 注入 `DMS_SECRET_KEY`，与 DEPLOY.md 的 `$DMS_RUNTIME_ROOT/.secret_key`
+同一条纪律。根因修法（机器指纹的 host 分量改成落盘随机指纹文件，`tools/settings.py`
+有一份必须同步的同款实现）进优化方案，未在本轮改。
+
+### 同批的准确性修复
+- **权限 fail-open**：`ads_off_sales_cost_customer_dnf` / `dws_mkt_app_place_order_dnf` 用的是
+  `CustomerKind::Codes`，而 Codes 臂在客户集合为空时**一个段都不 push**、这两张表又没有 owner
+  维度兜底 → segs 空 → 不注入 → **整表可见**；两行紧邻注释却都写着「fail-closed」。改
+  `RequiredCodes`（空集恒假）。两张是数仓自建表、不在 Java 对拍面，不与 `judge_scope.py` 分叉。
+  钉板一条直接读 `builtin_rules()`（改回 Codes 立刻红）。
+- **「最差」排序方向反了**：`rank_direction` 只认 最少/最小/最低 → 「卖得最差的 3 个商品」
+  确定性地给出卖得**最好**的三个。同刀把「最低/最差」补进 `detect_top_n` 的最高级词表与
+  `STRIP_WORDS`（90→92），并删掉 `ranking_limit` 里换词绕道的局部补丁。
+- **「当月」缺环比/同比**：`prev_window`/`yoy_window` 只认「本月|这个月」，`rule_relative` 却认
+  「当月」—— 同一个词三处判据两种口径。提 `MONTH_CUR_WORDS` 三处共用。
+- **反问候选越点越长**：候选问法拿**整句**拼模板尾词（生产截图：「…420g 的信息 和 拆单标准
+  的订单明细」，再点变成「…的订单明细 的订单明细」）。改成拿实体名本体拼
+  （`entity_form_surface`），且剥完仍含空白（＝半句话不是名字）时一个模板候选都不给。
+
+### 全量审计
+7 路并行代码审计 + 3 路参考系统对标（DataFoundry+pi / Yuxi+SuperSonic / DMS Java 本体）
++ 2 路对抗验伪 → `docs/OPTIMIZATION-PLAN-2026-08-13.md`（121 条候选收敛成 7 批）。
+三条结构性结论：①fail-open 与 fail-closed 同时装反；②声明写了判据不读它（59 表编译期目录
+在读取侧静默丢弃已播种的语义声明）；③上帝文件拖慢准确性迭代本身（T8/T10 未完成）。
+
+**验收**：workspace 1865 全绿（+5 条新钉板）、架构门禁全绿、web 33/33 + vue-tsc 0 错。
+
+## AX118（2026-08-13，学习面根因治理 + 实体族两条自相矛盾判据）
+
+第二轮深度研究（prime-agent 自学习机制 / Yuxi 知识库逐环 / Doris 能力面 / 本仓学习面盘点 /
+混合路由断点，5 路研究 + 3 路设计 + 2 路验伪）产出 `docs/EVOLUTION-PLAN-2026-08-13.md`。
+本条记录其中已落地的六项，全部是根因而非调用点补丁。
+
+### 学习面（业主诉求：真正能自我学习、不同用户效果不同）
+- **判官污染学习库**：`regression.py`/`evaluation.py` 走的就是生产 `ask` 链路 —— 每跑一趟全量
+  题集就把评测问句连同**那一刻**的 SQL 写进 `meta.sql_exemplar` 与 `meta.memory`，再由 few-shot
+  与经验召回喂回真实用户。跑得越勤，语料池被评测样本挤占越狠，学的还是评测当时的写法。
+  修：`registry::judge_mode()` 进程级总闸（`ponytail:` 标注了「判官本来就是独立进程」这个天花板），
+  三个学习写口入口各问一句；`DMSAI_JUDGE=1` 由 `main.rs` 设一次；`tools/cli.py` 给 docker exec
+  形态自动注入 `-e DMSAI_JUDGE=1`。判官从此观察系统而不改变系统。
+- **权限片段进共享语料**：`admin_api.rs` 的 HITL sql-edit 把 `scoped.wire()`（**注入后** SQL，
+  带复核人自己的客户编码/员工 ID）存进 ds 级共享的 `meta.sql_exemplar` 并丢进复核 prompt。
+  改存闸门前原文（与 LLM 路径的 `st.candidate` 同一条纪律），补源码级钉板。与 F6 同一条防线。
+- **两条学习路径两种诚实度**：语料沉淀过 `worth_learning`（`st.note.is_some()` 即否决 = 口径复核
+  未过不许学），十行之下的经验蒸馏只看「route 对 + 有行」。于是挂着 `caliber_note`（数字明示
+  不可信）的 SQL 照样落 `meta.memory`。两条路径改为共用同一判据。
+- **经验池无用户维度**：`meta.memory` 只有 `ds_id`，全公司共用一个池 —— 一个用户的修正经验直接
+  进所有人的 prompt（既是污染面也是 I4 越权面），而 `login_name` 一直在 `AskCtx` 手边。加
+  `login_name` 列（空串 = ds 级公有，沿用「空 = 全局」的既有约定，`ADD COLUMN IF NOT EXISTS`
+  随 `ddl::migrate` 幂等生效，现网零人工迁移）；召回谓词 `(login_name = $3 OR login_name = '')`；
+  去重键并入归属人；**自动蒸馏一律只写个人层**，升格公有只走人工复核。这就是 prime-agent 的
+  local/global 两层作用域在本仓的对应物 —— 它那套「不同用户效果不同」靠的正是作用域，不是微调
+  （顺带记：prime-agent 仓内 `reward|verifier|rollout|train` 零命中，RL 在它引用的另外两个仓）。
+
+### 实体族两条自相矛盾的判据（回归 15 题红的根因）
+- **模型拆散库内真实客户名**：「线下-广东华南食品供应链有限公司」是库里的真实客户名，模型拆成
+  `entity` + `filter:渠道类型=线下` → 覆盖闸去要一个根本不存在的列的谓词（收据恒 blocked）、
+  实体卡接不住、LLM 被逼着猜。此前的修法是在剥词层给「线下/线上」加特判（换个前缀照样拆错）。
+  改：`intent::merge_split_entity_names` 在 grounding 入口按**原问句**判 —— 两段在原文里紧邻成
+  一个词（直连或只隔一个连字符）就合回实体并撤掉那条筛选；中间隔字（「线下渠道的 X 公司」）
+  不合并。不探库、零新增 IO，对没见过的前缀天然同样有效。
+- **实体卡准入与自身能力矛盾**：`entity_card_compatible` 硬要求 `time.is_none()`，而实体卡本身
+  就渲染时间窗（`entity.rs:538-582` 读 `time_predicate`/`time_phrase_of`）—— 正好挡住 AX111
+  专门为它做的「X客户，本月的数据」。删掉该条件，其余槽位（指标/分组/比较）仍必须为空。
+
+### 服务器空间（业主：每次部署都浪费很多空间）
+部署链路此前**零保留策略**：每次 `deploy_update.sh` 新解一份 release、新建一个镜像（旧的同名
+镜像立刻变悬空 `<none>`，builder 阶段带整个 cargo target，每个几 GB）、BuildKit 缓存只涨不清。
+新增 `scripts/server-cleanup.sh`（默认 dry-run，`--apply` 才动手；永不触碰 kbdata/settings/
+.secret_key/在用镜像与运行中容器），并接进 `deploy_update.sh` 的**健康检查通过之后**
+（失败时旧镜像与旧 release 还是回滚材料）。releases 保留最近 3 个回滚位。
+
+**验收**：workspace 1869 全绿（本轮 +9 条钉板）、web 34/34、vue-tsc 0 错、架构门禁全绿。
+
+## AX119（2026-08-14，第 1 轮：数据权限与 DMS 角色逐条对拍）
+
+业主把「数据权限与 DMS 的角色权限保持一致」列为最主要方向。本轮**直接读 Java 源码**逐条核，
+不采信既有方案的结论 —— 结果三条全中，且方案本身有一处判断被证伪并订正。
+
+| 表 | Java 证据 | 我们此前 | 后果 |
+|---|---|---|---|
+| `t_employee` | `EmployeeDao.java:35` `@DataScope(joinSql = "t_employee.employee_id in (#employeeIds)")` | **global** | 任何受限账号一句话拿到全量花名册（姓名/登录名/部门归属）；`SENSITIVE_COLS` 那 9 词只挡凭据列 |
+| `t_customer_balance` | `CustomerBalanceMapper.java:36` `c.customer_code in (#customerCodes) #or c.area_manager_id in (#employeeIds)` | 只按 balance 自己的 `customer_code` | 丢 area_manager 分支 → 区域经理看不到本该可见的余额行 |
+| `t_device_inspection_header` | `DeviceInspectionHeaderMapper.java:25` `h.created_by in (#employeeCodes)` | 写成 `manager_code`（错列） | owner 段恒不命中，巡检单只按客户集合可见 |
+
+**订正方案的一处判断**：`t_customer_balance` 不能写成 `owner_col = area_manager_id` —— 那列
+**不在 balance 表上**，是 XML 里 `LEFT JOIN t_customer c ON b.customer_code = c.customer_code`
+带进来的。只能登记成 via 借 `t_customer` 的档案（它本身就是 `customer_code IN codes OR
+area_manager_id IN ids`），EXISTS 半连接与 Java 逐字等价。
+
+**已知口径相互作用（显式记账，待业务裁决）**：`t_employee` 转 scoped 后，`ops_caliber` 里
+「巡店人是三方/副总则不计入」的排除子查询也会被注入员工过滤（注入是递归的）→ 受限身份看
+运营看板时**少排除、数字偏高**。两害相权先堵确定的越权（花名册泄漏），并留钉板
+`ops_caliber_notes_employee_scope` 守着这段说明不被静默删掉。彻底解法两条都需业务点头：
+①口径装载期把三方/副总排除名单物化成常量清单；②注入器支持「口径子查询不吃行权限」。
+
+**判据整改**：计数钉板 `thirty_nine_tables_by_kind` 改名 `builtin_table_counts_by_kind`
+（函数名里写数字，39→41 那次就已腐烂成谎话），并补三条 Java 对拍断言（t_employee 必须 scoped
+且只按 employee_id、余额表必须 via t_customer、巡检单 owner 必须 created_by）。
+`empty_segments_allows_today` 的被测表换成 `t_customer_device_ledger`（余额表已不属那一族）。
+
+**验收**：workspace 1879 全绿、policy 26 条全绿、架构门禁 13/13。
+`judge_scope.py` 本轮**未能构成结论** —— 现网缺 visitor/shop_contact 可用账号，判官按设计
+拒绝下结论（exit 2 = 门没开，不是对拍失败）。这是环境缺口，与本轮改动无关；补上账号后需补跑。
+
+## AX120（2026-08-14，第 2–4 轮：自我学习三件套 —— 账本 / 习惯 / 失败读回）
+
+业主的「自我学习、自我进化、每个用户不一样」在本仓落地时缺的从来不是「写」，是**读回与撤回**。
+三轮各补一面，深度参考 prime-agent 的 refinement（两段式提案 + 确定性 apply + 机械回滚）。
+
+**第 2 轮 · 学到的东西撤不回来**（`registry/learn.rs`）。四个学习写口
+（`sql_exemplar` / `memory` / `pitfall` 及教训候选）此前只写不留前值：学错一条＝人工去库里翻。
+现在每次写落一条 `meta.learn_event`（`batch_id`/`actor`/`before`/`after`/`trace_id`），
+`rollback_batch` 是纯机械倒序重放，不再调模型。回滚 SQL 的表名只能取自 `LEDGERED_TABLES`
+（`&'static str`，满足 `sql_interpolation_is_allowlisted`）；接漏写口由钉板
+`learn_writes_are_all_ledgered` 抓。同轮加 `judge_mode()`：判官跑回归时学习写口整体停手 ——
+**判官的问句不是用户的问句**，此前它们等量齐观地污染语料池。
+
+**第 3 轮 · 学到的经验人人共享**（`registry/user_pref.rs` + `memory` 的 `login_name` 作用域）。
+个性化拆成两半：经验按人隔离（memory 加 login 作用域），习惯按人生效（`user_pref`）。
+习惯**不新建学习表** —— 直接从 `meta.query_log` 现算（谁、问了什么、出没出数），永远新鲜，
+且没有写入就没有回滚/复核/TTL 这三个面。三条硬约束写死在判据里：只在用户没明说时用、
+只进 prompt 参考段不改 SQL、同一习惯 <3 次视为噪声。候选词是固定字面量表，
+不从问句自由抽词（`only_fixed_candidates_can_become_habits` 钉住 —— 否则客户名会变成「习惯」）。
+
+**第 4 轮 · 同一个坑反复踩、系统一句话不说**（`registry/failure.rs`）。`meta.failure_log`
+全仓零 `SELECT`：写了没人读。后果两层 —— 用户感知是「同一个问法反复失败，系统学不会」；
+每次失败照样起一次 fast LLM 复盘（自动日报一天 7 次重复失败 = 7 次全量复盘，产出同一条候选教训，
+去重发生在写口，白烧的是模型调用）。现在 `failure_streak` 按 **同 kind + 错误前缀 60 字**
+数连续次数（不用全等：错误尾部的行号/耗时/连接 id 每次都不同，全等会让每次都算「新错」，
+判据恒返 1 等于没有这个功能），第 1 次只记日志，第 2 次起才惊动模型。
+
+**同轮抓出的 I4 泄漏面**：复盘素材传的是 `scoped.wire()` —— **注入后**的 SQL，行级权限条件
+（客户编码集合、员工 id 集合）会随教训进入 ds 级共享语料。两处落账（`exec-error` / `zero-rows`）
+都改成闸门前候选 `st.candidate`。判据第一版只切了 `exec-error` 那一段，当场漏掉 `zero-rows`；
+改成扫**全部**落账点后立刻抓出（并把生产段与测试段切开 —— `include_str!` 会把判据自己的
+断言文案也扫进去，那里面就写着 `scoped.wire()`）。
+
+**验收**：workspace 1886 全绿、`drift.rs` 3/3（`failure.rs` 的 `ERR_CLASS_CHARS` 已按
+「编译期常量、无外部入口」报备进插值白名单）。
+
+## AX121（2026-08-14，第 5 轮：18 个 Java @DataScope 逐个扫，补 5 张缺档案的表）
+
+第 1 轮只核了三张**已登记但列绑定错**的表。本轮换个问法：**Java 一共给几张表挂了
+`@DataScope`，我们是不是每一张都有档案？** 全仓 `grep joinSql` 出 18 个 mapper，逐个回到
+XML 确认别名指向哪张物理表 —— 抓出五张**我们一条档案都没有**的。
+
+缺档案不是「放行」，是 `UnregisteredTable` **整句拒**。所以症状是反的：DMS 页面里看得见的
+单据，问数一律回「未在权限档案登记」。方向是答少了，但同样是与 DMS 不一致。
+
+| 表 | Java 出处 | 档案形态 |
+|---|---|---|
+| `t_application_list_header` | `ApplicationListHeaderMapper.java:21`（别名 `invoice`，见同名 XML:47） | scoped `customer_code` + `manager`(Ids) |
+| `t_application_list_detail` | XML:51 `ON invoice.invoice_code = invoiceD.invoice_code` | via 头表 |
+| `t_device_transfer_order` | `DeviceTransferOrderMapper.java:20` | scoped `out_customer_code`，无 owner 段 |
+| `t_statement_apply` | `StatementApplicationMapper.java:23` | scoped `customer_code` + `created_by`(**Codes**，Java 用 `#employeeCodes`) |
+| `t_device_requisition` | `DeviceRequisitionMapper.xml:201` `INNER JOIN t_customer tc` | **via t_customer** |
+
+两个易踩的坑，都靠回读 XML/实体才没写错：
+- `ApplicationListHeaderDo` 的 `@TableName` 是 `t_application_list_header`，**不是**
+  `t_invoice_apply_header`。后者（旧开票页）Java 确实没有注解 —— 由 service 把数据范围员工写进
+  `p.managers`，XML 只过滤 `invoice.manager`（`InvoiceApplyHeaderMapper.xml:37-39`），
+  所以它保持 `owner_only("manager")`，此前那条注释是对的。
+- `StatementApplicationDO` 的 `@TableName` 是 **`t_statement_apply`**，不是类名暗示的
+  `t_statement_application`。
+
+**解除一条退役**：`t_device_requisition` 此前在 `RETIRED` 里，理由写的是「两个设备专职角色
+有全量例外，静态 Binding 携带不了该证明」。这个权衡站不住 —— 退役期间它是整句拒，
+**所有**角色都看不到，包括那两个本该看全量的。现在登记成 via t_customer：其余角色拿到与
+Java 逐字等价的范围，那两个角色仍偏严（精确单号通道另有
+`Scope::device_unrestricted_by_role` 的布尔证明，`business_lookup.rs:286`）。
+设备两张明细（receive_item / delivery_item）**仍拒**：头表现在是 via，而 via 的头必须是
+Scoped（`via_head_without_scoped_rule_is_rejected`），链式 via 表达不了。
+
+**三条查证后确认「不动」的**（记下来，免得下一轮又当 bug 修）：
+1. `t_activity_main` 的 `@DataScope` 在 Java 里是**注释掉的**（`ActivityMainMapper.java:29-31`），
+   即 DMS 活动列表不做行过滤。我们保持 scoped（`customer_code` + `created_id`）—— 比 DMS 严，
+   方向安全；活动表带客户编码，放全量是确定的越权面。
+2. `DefaultEmployee.getEmployeeCodesByCurrentUser():526` 判的是 `employeeCodeList.contains("-1")`
+   而不是 `subordinateCodes.contains("-1")`（Java 侧笔误），结果是把字面量 `"-1"` 混进登录名集合 ——
+   匹配不到任何行，行为等价。我们按语义写（判 sub 段），**不复刻这个笔误**。
+3. `CustomerDataScopeStrategy` 的第三个放行条件 `UserTypeEnum.ADMIN_SYSTEM` 我们没有对应项：
+   全仓只有 `SmartJobExecutor.java:103`（定时任务）会设成 ADMIN_SYSTEM，登录路径一律
+   `ADMIN_EMPLOYEE`。**不能**为了「对齐」给它加一条放行 —— 那是凭空多一个越权入口。
+
+注入器实际读的是 `getCustomerCodesByCurrentUser`（不是同类里那个会短路的 `getCustomerCodes`），
+段序 base → common → 102 组 → 103 团队 → 101 下属客户，与 `scope.rs::customer_codes` 逐段同序。
+
+**验收**：workspace 1888 全绿（新增行为面判据
+`java_scoped_tables_actually_inject_their_condition` 真注入五张表并比对 Java 条件片段）、
+架构门禁 16/16、档案计数钉板 41→46（scoped 18→21 / via 8→10 / global 15）。
+`judge_scope.py` 仍缺 visitor/shop_contact 账号，无法构成结论（与第 1 轮同一环境缺口）。
+
+## AX122（2026-08-14，第 6 轮：混合问句从「一数一知」放到「N 数一知」+ 纯资料问句真的去查知识库）
+
+业主截图里那张「先问清再查」的澄清卡，根因不是意图识别不准 —— **是执行侧的基数限制**。
+`hybrid::pair` 要求 typed 子任务**恰好两条**（一数一知），于是
+
+> 「本月销售额和毛利各多少？另外退货政策是怎么规定的」
+
+这种再普通不过的问法（2 数 + 1 知）被判为「归属无法唯一证明」，直接出卡。而它根本不需要新载体：
+复合问句本来就走 `AskResult::compound(subs)`，wire 与前端零改动。
+
+**改成 `split`**：N 条问数 + **恰好 1 条**资料。多条问数彼此也并行（各打一次库，串行是白等），
+折进既有 compound 容器；子问题名用**投影后的子问句**而不是父问句（父问句在每个 sub 上重复一遍，
+用户分不清哪块是哪块）。折的时候只在 >1 时套容器 —— 单条套壳会让直出表格的问句多一层子结果，
+前端渲染与收据跟着变形。`into_ask_result` 里再补一道：问数半**已经是** compound 时把它的 subs
+抬上来，不套第二层（嵌套 compound 前端只渲染第一层，第二层表格就这么消失 —— AX115 同一个坑）。
+
+**资料半仍限 1 条**，这是载体上限不是偷懒：`Answer` 的角标 = `citations` 下标 + 1，合并两份答案
+要整体重编号，编错就是「点开引用跳到别的原文」，比澄清卡更伤。所以澄清文案改成说清**是几条、
+卡在哪**（`cardinality_note`）：「我识别到 2 个资料子任务；一次混合回答只能带 1 个……请拆成 2 次问」。
+此前那句笼统的「请说得更具体」只会让用户换个说法再撞一次同一堵墙。
+
+**同一条收口的另一半**：`ask_prepared` 里 `IntentRoute::Knowledge` 是**无条件出澄清卡**的 ——
+可 `AskDeps` 早就带着 KB 臂了。于是纯资料问句在 CLI/判官链路永远得不到答案，而 HTTP 侧早接了知识库：
+又是一处「两条链路对同一问句行为相反」（Hybrid 那次收口只修了一半）。现在走
+`hybrid::knowledge_only`，KB 臂缺席（深度报告子问、定时任务）或知识库这一路失败才澄清 ——
+失败也返 `None` 而不是伪造空答案。顺带把该路的 `elapsed_ms` 从恒 0 改成真实用时、
+`route` 从 `compound` 改成 `knowledge`（没有问数半的那次就不是 compound，收据不该写假话）。
+
+**删掉第三套配对逻辑**：`server/src/main.rs` 的 `hybrid_pair` / `hybrid_cardinality_clarification`
+（47 行）—— 编排上一轮搬进 agent 后没人删，只剩它自己的测试在用，而规则已经与 agent 侧矛盾
+（它连「2 数 1 知」都拒）。换成钉板 `server_keeps_no_second_hybrid_pairing`：源码里再出现
+`fn hybrid_pair` 就红。
+
+**验收**：workspace 1889 全绿（新增 `split_takes_many_data_but_exactly_one_knowledge`、
+`cardinality_note_says_which_side_overflowed`）、架构门禁 16/16。
+
+## AX123（2026-08-14，第 7 轮：结果呈现六条，全部「用户可见」档）
+
+按 `docs/UI-POLISH-PLAN.md` 的 result-presentation 清单收了六条，选的都是**用户每次都会撞到**的：
+
+1. **AI 综合分析渲染两遍**。混合结果同时命中 `t.result?.kb && view.insight` 与
+   `subs?.length && compoundAnalysis(...)`，而后者返回的**正是** `view.insight` —— 同一段文字、
+   同一个标题，上下紧贴出两块。中间那块 `t.page?.insight` 改成 `v-else-if` 把三块串成一条链
+   （深度页恒有 `t.page`、混合恒无，互斥）。第 6 轮之后混合能带多条问数子问，`subs` 非空从
+   偶发变成常态 —— 不修的话这条会**更频繁**地出现。
+2. **流式不跟随滚动**。delta 分支只改 `aiTurn.result`，一次都不滚；正文从气泡顶往下长，
+   两屏之后全在视口下方 —— 10-20 秒的生成用户看到的是静止画面，流式最主要的感知收益整个白丢。
+   加 `followStream`：**不复用** `scrollDown`（它的 `behavior:'smooth'` 会和每帧新内容打架），
+   直接赋 `scrollTop`；120px 阈值保证用户手动上翻后不被拽回；120ms 节流。
+3. **知识库流式期间标题抖动**。`presentation()` 取第一个 heading 当标题、第一个非列表段落当结论，
+   而这两样都是逐 token 到的：标题从「直」「直接」跳到「知识库回答」，半截的 `-` 不匹配列表排除
+   规则会被当成结论塞进蓝框再弹掉。生成中冻结拆分（正文渲染一字不动，渐进排版照旧）。
+4. **单张 KPI 卡吃满整行**。`repeat(auto-fit, minmax(180px,1fr))` 的空轨道会塌，于是
+   「本月销售额趋势」这种单 KPI + 折线图的结果里，28px 的数字左挂在 800px 空白中。
+   补 `.kpi-row:not(.solo)` 一条上限 300px + 左对齐；`.solo` 大卡与两处窄屏覆写都在其后，仍胜出。
+5. **sticky 首列 hover 穿帮**。行号列/首列 hover 用 `--primary-light`（8% 透明）铺底，
+   横滚时压在下面的单元格文字直接透出来。改 `color-mix(in srgb, var(--primary) 8%, var(--bg-card))`
+   —— 同文件里本来就在用 color-mix，不是新技术。
+6. **删两条零消费者样式**（`.scope-note` / `.tbl-foot`）。权限回显早已改渲染进
+   `.foundation-body`、行数脚注改成 `.row-count`；留着会让下一个人以为存在两条并行呈现路径。
+
+**验收**：`npm run build` 通过，web 判据 41 → **47**（新增五条钉板：v-else-if 链、
+两处 color-mix、KPI 上限、死样式已删、流式冻结与跟随阈值）。
+
+## AX124（2026-08-14，第 8 轮：复合答案不再一条失败全轮 422 + 明细题不再被降级护栏误伤）
+
+两条都出自 `accuracy-next` 清单，都是**用户拿到 422** 那一档。
+
+**① typed 复合的三件事**（`ask.rs`）。此前 `one(question.clone()).await?` —— 一条子问失败，
+用户连另一条**已经查出来**的结果都看不到。而同一个仓里 `compound::try_compound` 早就不是这么做的：
+并行 + 失败点名 + 全挂才上抛。typed 这条是唯一的例外，抄过来即可（`missing_note` 提成
+`pub(crate)` 复用，措辞里写死「不是 0、也不是没有数据」—— 缺席的面板最容易被读成「那一项是零」）。
+顺带把串行改并行：每个子问各打一次库，串行是白等（`scope` 仍只算一次，I4 不变）。
+再顺带填上容器的 `intent_summary` —— 前端「问题理解与结果依据」对复合答案此前**整块空白**，
+而合同本来就在手上。**`trust` 仍留 None 且判据钉住不许造**：凭证要有 SQL 指纹、来源、执行方式，
+而容器一句 SQL 都没跑，编一份就是假收据（子结果各自带着自己的）。
+
+**② 降级护栏只在「用户要了指标」时开火**（`intent.rs`）。护栏原文是
+`!report.unverifiable.is_empty() && !projections_have_aggregate(..)` → `conflicts` → blocking。
+本意是「模型压根没算用户要的指标」，可它没判**用户有没有要指标**：于是
+「本月线下渠道的订单明细」这类 metrics 为空、投影是列不是聚合的明细题，被打成硬阻断，
+用户拿到 422「暂时无法完成本次问数」。这是 AX117 两级闸的副作用，当时的方案里没记。
+加前置合取项 `!intent.metrics.is_empty()`；明细题的形状另有 `detail_shape_proved` 兜着，
+不靠这条护栏。判据两条：要了指标 + 无聚合仍硬阻断（护栏不许松）；明细题 `blocking()==false`。
+
+**验收**：workspace 1891 全绿（新增 `typed_compound_degrades_instead_of_failing_the_round`、
+`no_aggregate_guardrail_only_fires_when_a_metric_was_asked_for`）。
+
+## AX125（2026-08-14，第 9 轮：Doris 执行计划别丢 + 问句切片用错向量空间）
+
+**① 全分区扫描判成可 repair 的缺时间谓词**（`connector::source::scan_verdict`）。
+语法合法但要扫全表的查询此前一路跑到 `EXEC_TIMEOUT` 才失败 —— 用户等满半分钟拿到一句「超时」，
+而执行计划**这一次往返已经付过了**（首轮 EXPLAIN），里面白纸黑字写着 `partitions=1358/1358`。
+现在把计划文本喂给纯函数判据，判词走与「数据库明确报错」同一个 `Some` 口子：
+`run.rs` 的 repair 轮零改动接住，**不** fail-closed（判错了只多花一次改写，不该拦住正确的 SQL）。
+三条防误伤写死在判据里：只认「已扫 == 总数」（扫子集说明分区裁剪生效了，一个字不说）、
+总分区数 <8 不判（小表全扫正常）、判词进回炉不直接拒。
+落点选 `source.rs` 而不是新开文件：`explain` 的 `Option<String>` 语义就定义在那几行上方
+（D3 同族），且 connector 的 `.rs` 预算已顶格、`mysql.rs` 已 1664 行。
+
+**② 问句切片拿 passage 向量去比 query 标定的阈值**（`gather.rs` + `connector::embed`）。
+元素卡（指标/维度/码值）的召回阈值 STRICT=0.35 / LOOSE=0.5 / DS_MAX_DIST **全是拿 query 向量
+标定的**，而切片走的是 `embed_passages` —— 两个空间的距离分布不同，口语化问法整体召回漂移；
+附带一个更隐蔽的面：passage 熔断槽是知识库入库在用的，**一次入库失败会顺手掐掉 5 分钟的切片召回**。
+改 `EmbedMode::Query` 只是一行；同刀把 `embed_passages` / `embed_queries` 两个同形包装删掉，
+只留 `embed_batch(texts, mode)`——「随手挑那个批量的」正是这个错的成因，少两个函数就犯不出来
+（五个调用点现在必须显式写模式）。`gather.rs` 的存在性判据同步从 `embed_passages` 改成
+`EmbedMode::Query`，钉的是**模式**而不是函数名。
+
+**验收**：workspace 1892 全绿（新增 `scan_verdict_only_fires_on_a_real_full_partition_scan`）。
+
+## AX126（2026-08-14，第 10 轮：口径卡缺席不许还显示 verified）
+
+「答错了还很自信」在本仓有**唯一一条结构性来源**：PG 抖一下 → 指标召回失败 → 指标卡缺席 →
+LLM 拿不到销售额的口径表达式 / 时间列 / 去重键 → 数字按错口径算出来 —— 而收据照样 verified/high。
+这件事此前**只写进日志**：`gather` 里 12 份手抄的 `map_err(|e| warn!(...)).unwrap_or_default()`，
+只有翻日志的人知道，用户和收据都不知道。
+
+**三步接线**：
+1. 12 份手抄收敛成一个 `degrade(r, what, &mut degraded)` —— `what` 同时是日志文案与降级项名
+   （同源，改一处两处一起变；抄漏一处就是一路静默降级）。
+2. `PromptCtx` 加 `degraded: Vec<&'static str>`，`run_llm` 用闭包在**三条返回路径**上统一挂标注
+   （单条 / SC 多数派 / SC 无多数派 —— 少接一条就是一次自信的错答）。
+3. 标注走既有的 `caliber_note` 通道：`attach_trust` 的 risk 判据本来就读它，trust 自动降 review。
+   **不新造字段、不新造状态**。
+
+**只有口径类算数**（`CALIBER_CARDS` = 指标卡 + 维度卡）。术语/关联图/经验缺席只是素材少、
+不改口径，拿它们去降 trust 会让「结果不可信」这条警告贬值 —— 用久了就没人看了。
+
+**顺手清掉两个死件**：`ContextSummary.trimmed`（`BudgetReport.notes` 恒 `vec![]`）与
+`summary_used`（恒 false，历史摘要装配点在 server 侧）。于是审计面板上那两行**永远不出现** ——
+死件比没有更糟：读的人以为「没裁 = 一切正常」。那一格现在装真会发生的事（降级项），
+`SqlAuditPanel.vue` 同步改成 `⚠️ 召回降级 N 项` 并列出每一条；`TrimNote` 结构体整体删除。
+
+**判据整改**：`gather_warns_on_every_recall_degradation` 从「`unwrap_or_default` 条数 ==
+`warn!` 条数」改成「≥9 处 `degrade(` 且**不许再出现手抄的 `map_err(|e| tracing::warn!`」——
+禁的是形态而不是 `unwrap_or_default()` 本身（后者在 `Option` 链上是正常写法，一刀切会把对的代码判红）。
+新增 `only_caliber_card_gaps_downgrade_the_answer`（非口径类不降级 / 两张都缺点全 / 合并不覆盖既有标注）
+与重写的 `context_summary_json_shape_is_stable`（死件不许回来）。
+
+**验收**：workspace 1893 全绿、架构门禁 16/16、web 47 全绿 + `npm run build` 通过。
+
+## AX127（2026-08-14，第 11 轮：学习账本从「摆设」变成真能撤 + 一次 79 题实测回归）
+
+第 2 轮建的账本有个致命细节没接：**四个写口写进去的 batch_id 全是空串**。后果两头都糟 ——
+管理员打开学习台账**永远是空列表**（`recent_batches` 的谓词是 `batch_id <> ''`）；
+反向更危险：POST 一次 rollback 传空串，`WHERE batch_id = ''` 匹配到所有没带批次号的历史事件，
+**一把撤光全部学习**。
+
+**批次粒度钉死为三族**（不是会话）：
+- 一轮问答 → `trace_id`（经验蒸馏、语料沉淀、失败复盘产出的教训都归这一轮）
+- 一次复核批 → `review-<秒>`（std 时间戳，零新增依赖）
+- 人工编辑 → `sql-edit`（管理员改的语料自成一族，要能整族撤回）
+
+四个写口（`save_with_context` / `save_lesson_candidate` / `set_lesson_status` / `save_memory`）
+各加一个 `who: (&str, &str)` = (批次号, 操作者)，五个调用点各传各的。
+`rollback_batch` 首行 `anyhow::ensure!(!batch_id.trim().is_empty(), ...)`，
+`log_event` 遇到空批次号 warn 一条「它将无法回滚」（不拒绝写入 —— 学习不许被账本拖垮）。
+
+**顺手补上 `meta.memory.conv_id`**：此前 `save_memory` 把 `conv_id` 位置当批次号传给账本，
+而调用方给的是 `""` —— 两个坑叠在一起（账本撤不回来 + 会话列恒空，追问链看不到这条经验属于哪次会话）。
+现在两者分开各给各的。
+
+**把幻影判据写出来**：`learn.rs` 文件头白纸黑字写着「接漏了由 `learn_writes_are_all_ledgered`
+钉板抓」，而这个测试**全仓零命中** —— 下一个人加第五个写口时不会有任何东西变红。现在它真的存在：
+扫 `exemplar.rs`/`memory.rs`，四类学习状态写口的**前后各 25 行**内必须有 `learn::log_event`，
+且账本调用不许写字面量空批次号。窗口双向是第一次跑就抓出来的 —— `set_lesson_status` 的落账在
+UPDATE **之前**（要先读前值才撤得回来），只往后看会假红。
+
+---
+
+### 本轮实测回归（80 题，容器内 08-14 01:14 构建的二进制 = 第 1–5 轮的状态）
+
+**59 通过 / 20 失败 / 1 跳过，耗时 2956s**。可见的九条失败聚成三族：
+
+| 族 | 题 | 现象 |
+|---|---|---|
+| 60s 速度门禁超时 | E16 / E18 / OPS01 / OPS02 / OPS04 | 五题都是**该拒答**的合同题（「不可由默认销售事实准确回答」），拒答本身跑了 >60s |
+| 图路由掉线 | F01 / F05 / F06 | `route=direct-doc ≠ graph`，且 F05/F06 行数 0 |
+| 进程非 0 退出 | F04 | stderr 尾部是 `t_master_shop` 的 shop_code 查询 |
+
+三族都还没修 —— 第 12 轮起按这份实测清单来，不再从计划文档里挑题目。
+（注：第 6–11 轮的改动**不在**这次回归所测的二进制里，下次跑前要先重建容器。）
+
+## AX128（2026-08-14，第 12 轮：按回归实测修 —— 图路由三题 + 权限查询打爆 MySQL）
+
+不再从计划文档挑题，直接修 AX127 那次 80 题回归里可见的失败。
+
+### ① F01/F05/F06：图路由被自己的合同挡在门外
+
+CLI 复现给出决定性证据（`steps: [{"stage":"graph","kind":"skip"}]`）：
+
+```text
+问：买过烤肠的客户
+合同：filters=[FilterSlot{name:"商品名称", value_surface:"烤肠"}]
+```
+
+`graph_intent_compatible` 要求 `filters.is_empty() && regions.is_empty()` —— 而这条 filter
+**正是关系自己的参数**。于是 graph 跳过、direct-doc 接走，答成 200 行订单聚合表
+（用户问的是「哪些客户」，拿到的是一张宽表）。省份那两题更亏：`resolved_buyers` 的
+IN_PROVINCE 通路是**专门为它们写的**（连 `cypher_carries_every_filter` 判据都写好了），
+却因为 `regions.is_empty()` 一次都没被走到过。
+
+判据改成「**关系本身已经表达了它**」：`filters`/`regions` 的每个槽面必须被关系的实体参数含住
+（`arg.contains(surface)`，**只判一个方向** —— 反过来判会把「非烤肠」这种取反槽面也算成被含住）。
+时间 / 同环比 / 明细 / 分组仍必须全空：那四类 Cypher 真的表达不了。
+放宽的失败方向仍是回落：万一含住了却没装进 Cypher，`into_slots` 的覆盖率判据会在出手前拒绝装配。
+
+这也顺带治了「同题不同答」的一个来源 —— 判据此前依赖 fast 模型**恰好没往 filters 里塞东西**，
+而 F02（共购）与 F01（买过）问的是同一个商品，一个进图一个没进。
+
+### ② F04：权限查询把生产 MySQL 打到 3024
+
+唯一一条**进程非 0 退出**的题。日志尾部：
+
+```text
+sql="SELECT DISTINCT shop_code FROM t_master_shop WHERE customer_code IN (…)"
+error returned from database: 3024 (HY000)   # max_statement_time exceeded
+```
+
+`city_manager` 的客户集合上千条，一次性 IN 进 `t_master_shop` 撞语句超时 —— 而这是**算权限**
+的一步，失败就是整轮问答失败。修法照抄 DMS Java 自己的手法（`getEmployeeCodesByIds` 的
+`batchSize = 800`）：`fetch_str_in` / `fetch_str_by_str_in` 两个 IN 辅助函数按 800 分批。
+判据 `in_batching_splits_but_never_truncates` 钉三件事：必须分批、**不许出现 LIMIT**
+（截断权限集合是 fail-open）、分批后要跨批去重（`DISTINCT` 只在批内成立）。
+
+**顺带记一笔现象**（不是本轮改动）：从开发机连生产 DMS MySQL，每条静态语句恒 ~1125ms ——
+这是跨公网 RTT，不是查询本身慢；一次受限身份的 scope 计算要 10+ 次串行往返 ≈ 11s。
+生产部署与库同机房，这一项不成立，故**不按它优化**，只记在这里以免下次误判。
+
+**验收**：workspace 1896 全绿（新增 `relations_own_argument_is_not_an_extra_constraint`、
+`in_batching_splits_but_never_truncates`）。
+
+## AX129（2026-08-14，第 13 轮：该拒答的题不必先烧 37 秒 —— 主题门前置，并实机验收第 12 轮）
+
+**测出来的账**（同一道题，改前 / 改后）：
+
+```text
+本月线下渠道客户分类的销售额
+改前：graph=skip, direct-agg=miss, direct-doc=miss(6.7s), llm=hit(37.5s) → route=no-topic  44.4s
+改后：graph=skip, direct-agg=miss, direct-doc=miss,       llm=skip       → route=no-topic   8.5s
+```
+
+**答案一个字没变**，路上白烧的是：一次 LLM 生成 + 一次执行 + 覆盖闸降级 + SC 再采样一遍。
+根因是那道「主题未接入」判据挂在**执行之后**（要 `row_count == 0` 才判），
+于是「这个主题压根没接入」这件在进 LLM 之前就已知的事，非要等模型编完一版 SQL 才说。
+
+现在在 llm 成员**之前**加同一道门，判据与命中后那道**逐字复用同一对函数**
+（`out_of_scope_topic` + `topic_covered`，只少一个 `row_count == 0` —— 那时还没执行）。
+两条独立证据同时成立才关门：确定性成员全 miss ＋ 残留主题在注册表三路召回/值域/维度探针里
+一路都不命中。`topic_covered` 全程**失败开放**（任一路读挂了都当有覆盖）：换文案是补救路径，
+它自己挂了不许把一次本可成立的回答换成另一副面孔。判据
+`topic_gate_runs_before_the_llm_member` 钉住「门在执行之前」且「不许出现第二份实现」。
+
+### 第 12 轮的实机验收（重建容器后）
+
+```text
+买过烤肠的客户       → route=graph rows=50   （改前 direct-doc 200 行订单宽表）
+湖南省买过烤肠的客户 → route=graph rows=50   sql=[AGE 图查询] BuyersOfGoods("湖南省烤肠")
+                       前 6 行：长沙鸣望 / 喜晨食品 / 湖南宁友 / 长沙红欢喜 / 长沙鼎坤 / 长沙吉鲜岛（衡阳仓）
+```
+
+省份**真的进了 Cypher**（全是湖南客户，不是全国名单）—— 那条 IN_PROVINCE 通路写好之后
+第一次被走到。
+
+### 记一笔：回归的 60s 门禁量的是**进程**，不是回答
+
+同题实测 `agent_ms=8547` 而 wall=57s —— 差的 48s 全是 CLI 每次启动都重跑一遍
+schema 同步（114 表 3099 列）+ 语义种子 + 数仓目录校验。80 题 × 48s ≈ 64 分钟纯启动开销，
+也是 AX127 那五道「超时」题的真正死因（它们并不慢，是启动费把它们推过了 60s）。
+这是**跑法**的问题不是产品的问题，下一轮单独治。
+
+**验收**：workspace 1897 全绿、架构门禁 16/16。
+
+## AX130（2026-08-14，第 14 轮：把「同题不同答」的最后一段黑箱照亮）
+
+第 13 轮把图准入改成只看问句之后，F03 仍在两次运行里给出两种路由（`graph` / `direct-doc`）。
+排查花了半小时，而结论是：**`steps` 只写一个 `skip`，六个合取项挂了哪一个无从得知**。
+
+三步收口：
+
+**① 准入判据脱离合同**（第 13 轮做的一半，这里说清）。`graph_intent_compatible(intent)`
+读的是 fast 模型产出的 `IntentV1` —— 而实测里同一个问句的合同时而 `Ready` 时而
+`IntentAttempt(Invalid)`（日志：`结构化意图 JSON 不合约 → 关闭自由查询路径`）。
+确定性路径的准入挂在非确定产物上，本身就是「同题不同答」的制造机。
+现在只看问句：`nl::time::time_predicate` 判时间窗、`COMPARISON_WORDS` 判同环比、
+维度切分仍由既有黑名单管。判错的方向仍是回落（`into_slots` 的覆盖率判据在装配前拒绝）。
+
+**② 图就绪标记读失败重来一次**（`connector::graph::adopt_if_current`）。CLI 是短生命周期进程，
+靠 PG 里的持久化标记接管图就绪状态；这条 AGE 读**抖一下**就等于「本进程没有图」。
+现在失败重试一次，两次都失败升 `warn`（原来是 `debug` —— 等于把一次路由漂移埋进最低日志级别）。
+标记与目标不符仍直接回落、不重试（重试也不会变）。
+
+**③ 六个不接理由各有名字**（`GraphAnswerer::skip_reason`）。`accept` 变成
+「问 `skip_reason`，有理由就 `info!` 一行再回 false」：
+`no-unrestricted-proof` / `source-not-warehouse` / `graph-not-ready` / `unverified-dimension` /
+`time-or-comparison-in-question` / `not-a-relation-question`。
+判据钉住六个字面量都在 —— 「为什么这题没走图」从此是一行日志，不是一次半小时的排查。
+
+**实测**：同一问句连跑 6 次全部 `route=graph`；F0 组回归连跑两轮 **6/6 通过**
+（改前同一批题在两次运行里给出两种结果）。
+
+**验收**：workspace 1899 全绿。
+
+## AX131（2026-08-14，第 15 轮：图例色块看不见 + 主色上的白字）
+
+`visual-system` 清单收尾两条（其余五条前几轮已做，这次一并在计划里打上标记）。
+
+**① BiChart 单色阶浅端看不见**。6 类以上走滚动图例、不画扇区标签 —— 色块是名字与扇区之间
+**唯一**的映射，而原来最浅两阶 `#aeb6f2` / `#d1d6f8` 对白卡只有 1.95:1 / 1.43:1。
+用户看到的是「有名字、找不到对应扇区」。两条色阶换成等对比步进版，
+判据现算 WCAG：每一阶对各自底色 ≥3:1（非文本对比度线），改回旧值立刻红。
+
+**② 主色/错误色上的前景改走 token**。`--on-primary` 早就有了，但还剩四处手写 `color: #fff`
+（DataMapPanel / KbAnswer 角标 / SkillsPanel / KbPanel 的 danger-btn）。
+暗色主色 `#7b89f0` 上白字只有 3.14:1。danger-btn 的底色是 `--error-text`（暗色 `#ec8f8f` 偏亮），
+白字更糟，所以另给一个 `--on-error`（亮色 `#ffffff` / 暗色 `#1a0f10`）。
+判据扫六个组件源码：`color: #fff` 一处都不许再出现。
+
+**验收**：web 判据 47 → **49**，`npm run build` 通过。
+
+## AX132（2026-08-14，第 16 轮：回滚只标真撤成功的，账本终于带时间）
+
+**① 撤失败也标 `rolled_back` → 那一批永久撤不回来**。原实现无条件
+`UPDATE meta.learn_event SET action='rolled_back'`，两个后果叠着：
+撤失败（PG 抖 / 目标行已被别处删）照样标上，重跑不再取那条；`action` 被覆盖之后，
+「这条当初是新增还是改状态」也查不出来了 —— 而那是人工复核第一眼要看的。
+
+改法：`ddl.rs` 加两条幂等 ALTER（`rolled_back_at timestamptz` / `rolled_back_by text`），
+取事件的谓词从 `action <> 'rolled_back'` 改成 `rolled_back_at IS NULL`，
+标记**只在 `rows_affected() > 0` 的分支里**落，且不再碰 `action`。
+返回值从 `u64` 换成 `Undone { undone, skipped, failed }` —— 三个数字分开报是刻意的：
+端点要能诚实地说「撤了 3 条、跳过 1 条（目标行已不在）、失败 1 条（库报错）」，
+而管理员正是靠这个差别决定要不要重跑。`/api/admin/learn/{batch}/rollback` 三个数字都进响应体。
+
+**② 账本列表带时间**。`recent_batches` 的 `min(at)` 原来只出现在 `ORDER BY`、**没进结果集**，
+于是它立项时写下的那句「回答上周二学了什么」在**结构上就答不了**。
+现在带 `first_at` / `last_at`（`::text`，与 `admin_api` 既有口径同源，零新增依赖），
+外加 `rolled_back` 计数 —— 撤过的批次界面不该再让人点一次「回滚」。
+
+**验收**：workspace 1901 全绿（新增 `rollback_marks_only_what_it_really_undid`、
+`batch_listing_carries_time_and_rollback_state`）。
+
+## AX133（2026-08-14，第 17 轮：语料状态变更补进账本 —— AI 把语料打成 disabled，此前撤不回来）
+
+账本此前只盖住「新增」那半：`sql_exemplar` / `pitfall` / `memory` 的 INSERT 与教训的状态变更。
+**语料自己的状态变更完全在账本之外** —— 而它恰恰是最该能撤的那一类：
+
+- `set_ai_review`：AI 初筛判 negative → 语料直接 `status='disabled'` + `validation_status='invalid'`。
+  模型判错一条，那条语料就此退出 few-shot，而没有任何记录能把它撤回来。
+- `set_status`：人工/自动复核的结论落库，同样只写不记。
+
+两个写口各加 `who: (批次号, 操作者)`，共用一个 `ledger_status_change`（**读前值 → 记一条 →
+调用方再改**）。读不到前值就不记 —— 账本里一条没有前值的 update 撤不回来，记了反而给回滚一条假线索。
+批次族补齐到四种：一轮问答 `trace_id`、教训复核 `review-<秒>`、
+**语料初筛 `screen-<秒>`**、人工编辑 `sql-edit`。
+
+`learn_writes_are_all_ledgered` 同步扩到 6 个写口，并接受两种落账形态
+（直接 `log_event`，或走共用的 `ledger_status_change` —— 三个状态写口共用一份读前值+落账，
+好过抄三遍）。
+
+**验收**：workspace 1901 全绿。
+
+## AX134（2026-08-14，第 18 轮：上海和海南的巡店记录被静默丢了三个月）
+
+`ops_caliber.rs` 的省份→省区 CASE 是**手抄**的，而手抄那版**漏了上海与海南**
+（权威表 `shop_business_region_for_province` 里它们分别归浙江省区、广东省区）。
+漏掉的后果不是报错：`inspection_valid` 里有一句
+
+```sql
+AND (CASE WHEN s.province REGEXP '福建' THEN … END) IS NOT NULL
+```
+
+映射不出来的行**整批被排除** —— 于是「本月上海的巡店次数」恒 0、
+「今年各省区巡店次数」全国合计偏低，**一个字的提示都没有**。
+
+同一份数据在仓里有三种形态：CASE（22 个分支）、`activity_region` 的 IN 列表（23 值）、
+`region_of` 的省名词表。三份各抄各的，早已漂移。
+
+**收敛成一份**：`warehouse_catalog::standard_region_pairs()` 把权威函数的定义域列出来
+（31 省 → 23 省区短名，剥掉「省区/大区」后缀），CASE 与 IN 列表都由它生成。
+港澳台仍然映射不出来 → 仍然排除，那是 fail-closed 不是漏。
+
+判据 `region_case_covers_every_mapped_province_including_shanghai_and_hainan`：
+逐条断言 CASE 覆盖 pairs 里每一对、上海→浙江与海南→广东逐字钉住、
+港澳台不许出现、IN 列表 23 值全部来自同一份。
+
+**验收**：workspace 1902 全绿。
+
+## AX135（2026-08-14，第 19 轮：账本收尾两条小的）
+
+**① 回滚分支抽成纯函数 `undo_stmt`**。`rollback_batch` 加上第 16 轮的三态返回后已 60+ 行
+（D1 是 40）；而那段 match 恰恰是**最不能出错**的一段（表名一旦来自数据就是把外部输入拼进 SQL）。
+抽成纯函数之后判据从「切源码字符串」升级成**直接调它**：新增走 DELETE、更新走 UPDATE、
+`meta.memory` 的更新分支返 `None`（它没有可撤的状态列 —— 不许静默当成功）、白名单外的表返 `None`。
+
+**② 不再写 `learn_event.trace_id`**。那一列与 `batch_id` **恒等**（同一个值 bind 了两遍），
+一列白存。列本身留在表里不删 —— 历史行还带着值，`DROP COLUMN` 会让旧账本少一列可读信息。
+
+**验收**：workspace 1902 全绿（`drift.rs` 的 ds 守卫顺带补了一处判据行豁免标记 ——
+它按行窗口扫，分不清「查询」和「断言里的 SQL 字面量」）。
+
+## AX136（2026-08-14，第 20 轮：回归打了脸 —— 撤掉第 13 轮的主题门，顺手把「拒绝」变成一张卡）
+
+80 题回归跑完：**68 通过 / 12 失败**（改前 59/80）。但里面有**四条是我自己第 13 轮打坏的**。
+
+### 撤回：进 LLM 前的主题门
+
+它省下的是真的（一道该拒答的题 44.4s → 8.5s，答案一字未变），但回归当场给出四条反例：
+
+| 题 | 应出 | 被换成 |
+|---|---|---|
+| H01「删除订单」/ H02「清空订单表」 | **红线拦截**卡（need-intent） | 主题未接入 |
+| E05 数仓缺开票事实 / E08 已开票不虚构表 | 「不可计算」降级卡（direct-doc） | 主题未接入 |
+
+根因是我把两件事当成了一件：**「这个主题没接入」与「这个问题我拒绝执行」不是同一种拒答**，
+而能区分它们的那个判据（`row_count == 0` + 路由白名单）**只有执行完才成立**。
+撤回，并在原地留一段说明 —— 想再省这 30 秒，得先有一条能在执行前区分四类拒答的证据，
+不是把其中一类提前。撤后 H01/H02/H03 三题即刻恢复 `route=need-intent`。
+
+### 顺手治好的：覆盖闸硬阻断从「抛错」改成「出卡」
+
+同一批回归里 B04/E09 是**进程非 0 退出**：
+
+```text
+本月各品牌销售额  →  Error: SQL 未覆盖结构化意图槽位：缺失:breakdown:品牌
+```
+
+系统的判断完全正确（品牌不在默认销售事实里，不许 JOIN 旧事实拼数），可用户拿到的是一条
+技术错误串：CLI 非 0 退出、HTTP 422、前端一条红杠。**而这本该是系统最该说清楚的一类回答。**
+
+回炉之后仍覆盖不了 → 出 `intent_reply` 卡 + `caliber_note` 说明哪个槽位证不了。
+**fail-closed 一个字没改**：那条 SQL 照样不执行（判据里显式钉住 `!body.contains("self.execute(")`）。
+实测 B04 / E09 双双从「崩」变成 `route=need-intent` 的说明卡。
+
+### 顺带：`exemplar.rs` 拆出 `pitfall.rs`
+
+第 17 轮往 `exemplar.rs` 里加落账之后它到了 588 行（D2 是 >500 必拆）。
+语料（喂 few-shot）与教训（喂 prompt 的「坑」段）是两条独立的学习链，拆开后 497 / 103。
+拆的当场 `learn_writes_are_all_ledgered` **变红**（只数到 5 个写口）—— 那条判据正是这么用的。
+
+**验收**：workspace 1902 全绿。
+
+## AX137（2026-08-14，第 21 轮：合同为什么被拒，得有人说）
+
+`IntentAttempt::Invalid` 是本仓最贵的一种降级：自由 SQL 关掉、语义缓存关掉、
+确定性路径的收据全降 review，严重时**同一个问句在两次进程里给出两条路由**
+（第 14 轮排查图路由漂移时，日志里只有一行 `结构化意图 JSON 不合约`，看不出是哪个字段）。
+
+根因不在模型，在观测：`intent_from_value` 是 `serde_json::from_value(value).ok()?` ——
+「模型多写了一个字段」和「模型压根没回 JSON」在日志里长得一模一样。
+
+现在两条拒绝路径各留各的痕：字段合同不符（带 serde 的原始错误，直接指出是哪个字段）、
+归一化判否（槽位不是原问句子串这一族）。**合同一个字没放宽** ——
+`deny_unknown_fields` 是刻意的（脏字段不许偷偷带 canonical id 进来），
+判据正反两条钉住：合同外字段继续拒、`null` 字段仍按缺省处理（AX117 那条不许回退）。
+
+**验收**：workspace 1903 全绿。
+
+## AX138（2026-08-14，第 22 轮：「这个数仓里没有」的那张卡，被覆盖闸挡回去了）
+
+回归 E05/E08 的根因不在触发词，在**闸门顺序**：
+
+```text
+本月开票金额
+  direct-doc 命中 → 「不可计算」卡（SELECT '不可计算' AS `数据状态` … FROM dms_ods.t_dict_value LIMIT 1）
+  → 覆盖闸判 blocking（这张卡没有时间谓词、没有指标）
+  → 回落下一成员 → 自由 SQL 接手
+  → 答成 fin_ads.ads_fin_profit_loss_dnf.financial_income 的合计，收据 verified
+```
+
+**自由 SQL 去找了一个「名字像」的字段替代** —— 正是这张卡当初要拦的那件事。
+
+根因是拿「回答」的判据去判一张**明确说「我不回答」的卡**：它按设计就不覆盖用户槽位。
+`derive::is_unavailable_card` 这个识别口径本来就有（三张降级卡同一个投影头），
+`land()` 里加一道：识别到它就跳过覆盖闸直接落地。豁免**只给这一张卡**，
+其余确定性模板照旧过闸（判据同时钉住「覆盖闸整条不许消失」——那是另一个方向的错）。
+
+**验收**：workspace 1904 全绿。
+
+### 记一笔：B01W 的失败是**判据脆**，不是产品错（2026-08-14 第 23 轮查证）
+
+`山东省 2026-08-10 到 2026-08-11 销售额` 实测：`route=direct-agg`、SQL 与金文件一致，
+收据里三个槽位是
+
+```text
+metric:销售额 = resolved
+region:山东省 = resolved
+time:2026-08-10 到 2026-08-11 = grounded
+```
+
+而题目钉的是 `time:2026-08-10:resolved` —— 它把 **fast 模型输出的 surface 字面量**写进了断言。
+模型这次把两个日期连成一个 surface（合理），断言就红了。
+
+**不改产品、也不改题**：改题会掩盖真回归（surface 变化有时确实是错的），
+改产品去迎合一个字面量更糟。留在这里当已知项：这条断言该换成「按 kind+state 判、surface 只判前缀」，
+属于判据形态整改，需要连带复核另外几条同形态的题。
+
+## AX139（2026-08-14，第 24 轮：把这一批新增文件写回 ARCHITECTURE 的落点清单）
+
+本批新增/搬迁的六个文件此前不在 §4 的文件表里 —— 而那张表是「落点清单」，
+下一个人按它找东西、门禁按它数预算。补齐并同步改了两行已漂的描述：
+
+| 文件 | 说明 |
+|---|---|
+| `registry/pitfall.rs`（新） | 教训表的唯一读写口，2026-08-14 从 exemplar 拆出（D2 >500 必拆 + D3 两条独立学习链） |
+| `registry/learn.rs`（新） | 学习事件账本：前值/后值/批次号 + 三态回滚 + 纯函数 `undo_stmt` |
+| `registry/user_pref.rs`（新） | 用户习惯层，从 `query_log` 现算、只进 prompt 参考段 |
+| `registry/failure.rs`（新） | 失败经验的读回半（连续次数判据） |
+| `agent/hybrid.rs`（搬迁） | 混合问句的唯一编排点（原在 server，两条链路行为相反） |
+| `registry/exemplar.rs`（订正） | 行数 120 → 497；补「三个状态写口共用 `ledger_status_change`」 |
+| `answerers/graph.rs`（订正） | 准入判据改成 `skip_reason()` 六项、只看问句不读合同 |
+
+## AX140（2026-08-14，第 25 轮：一次**作废**的回归 + 它暴露的一件真事）
+
+第 20 轮之后重跑 80 题，结果 `31 通过 / 48 失败`。**这个数字作废** —— 48 条失败全是同一句：
+
+```text
+dms_connector::mysql: 建只读池失败 reason="mysql_pool_connect_failed"
+Error: DMS 身份/权限库连接失败（连接失败 [dms-auth] 数据库连接不可用）
+```
+
+跑到一半远端库开始拒连（`ping on idle connection returned error: expected to read 4 bytes, got 0`
+= 服务端主动断开）。容器内 TCP 探测 9030 **通**，说明不是网络断，是**握手被拒** ——
+一次回归 = 80 个 CLI 进程各建一次连接池，叠加常驻服务，撞上了远端的连接数上限/限流。
+冷却几分钟后自动恢复。
+
+**这是跑法的代价，不是产品缺陷**，但它确认了一件事：**fail-closed 的方向是对的** ——
+库连不上时服务拒绝启动、健康检查照实报 `unavailable`，而不是带着空权限或旧快照继续answering。
+
+**给下一轮的操作纪律**（写进这里免得再踩）：
+1. 全量回归**不要连着跑**。80 题 × 每题一个新进程，对公网库是一次小规模压测。
+2. 跑之前先看 `/api/health` 的 `mysql.connected`；跑完之后再看一次 —— 中途掉线的那次数字没有意义。
+3. 真要连跑，先把 CLI 换成 HTTP（走常驻服务的连接池），那才是与线上同构的跑法；
+   现在的 `docker exec` 形态每题都重建全套连接（还附带 ~30s 启动费，见 AX129）。
+
+**第 22 轮的实机验收**（重建容器后单跑）：
+
+```text
+E05-数仓缺开票事实明确降级 · route=direct-doc 2823ms  ✅（改前 llm+schema-fix，用 financial_income 顶开票金额）
+E08-已开票不虚构不存在的表 · route=direct-doc 2868ms  ✅
+```
+
+---
+
+## 本批（AX119–AX140，2026-08-14）收尾状态
+
+**验收**：workspace **1904** 全绿 / 架构门禁 **16/16** / web **49** 全绿 / `npm run build` 通过。
+远端库连接在第 25 轮的压测中被打限流，冷却后已恢复（`mysql.connected: true`）。
+
+**未提交**：按业主「所有开发完后一起提交」的指示，本批**一次未提交** ——
+工作区累计 104 文件 / 约 19k 行。下一位接手前请先确认要不要落一个存档提交。
+
+**已知未修（有据可查，不是遗忘）**：
+| 项 | 状态 |
+|---|---|
+| OPS01/OPS02 运营口径两题 | 回归里超时；本机 CLI 每题 ~30s 启动费是主因（AX129），需换 HTTP 跑法再判 |
+| OPS04 湖南运营省区归一 | `route=llm+schema-fix ≠ direct-agg`，第 18 轮的省区收敛改的是口径不是路由 |
+| E10 库存取中台现行库存 | `intent.mode=unknown` —— fast 合同偶发不合约（AX137 已让理由可见，尚未治因） |
+| B01T 客户名带类别前缀 | 实体探针没命中「批发-董会琴」，依赖线上数据 |
+| B01W 周报单省显式周窗 | **判据脆**，非产品错（详见 AX139 前那段记录） |
+| accuracy-next #1/#5/#6 | ODS 表补录 / 深度报告板块继承 / `allowed_dimensions` 进 CaliberRule，均未动 |
+| learning-ledger #3/#6 | 回滚的乐观并发守卫 / `set_lesson_status` 改 CTE，未动 |
+| visual-system #8–#14 | 遮罩层、触控热区、嵌入双层壳、圆角档位等七条，未动 |
+
+## AX141（2026-08-14，第 26 轮：运营看板那条口径路，平时根本不生效）
+
+OPS 四题实测：**0/4 → 4/4**，且全部落在 ~200ms 的确定性路径上
+（改前三题「超时」、一题路由错 —— 那三条超时的真身就是这个：口径路被挡回去后去跑自由 SQL）。
+
+### 根因：代码写死的 SQL，被按 LLM SQL 的形状判了
+
+```text
+2026年6月湖南运营活动费用是多少
+  compose_hit → ops_caliber::direct_metric 命中 ✅（SQL 里时间窗、省区都在）
+  → 覆盖闸：CoverageReport { missing: ["time:2026年6月"], unverifiable: ["region:湖南"] }
+  → blocking → 回落下一成员 → 自由 SQL
+```
+
+闸门认不出这两样，因为运营口径的 SQL 是**代码写死**的：时间窗写成字面日期
+（`a.start_date >= '2026-06-01'`）、省区写成 `CASE(...) = '湖南'`，而闸门是按
+「LLM 会怎么写」的模板形状判的。于是这条**每次都对**的路，平时一次都走不到。
+
+### 修法：让它自己声明兑现了哪些槽位
+
+`direct_metric_with_evidence` 返回 `ExecutionEvidence`（指标 / 省区 / 时间窗三个 `resolve`），
+`compose/metric.rs` 把它挂到 `DirectHit.intent_evidence` 上。
+**这不是放宽判据**：销售快路径早就这么做（`fastpath_intent` 里 Region/Time 两处 `resolve`），
+声明的是「代码确实消化了这个槽」这一事实。判据反面也钉住：没有时间词时不许凭空声明。
+
+### 顺带补上的两个缺口
+
+1. **显式年月的表面词提取**（`year_month_surface`）。`time_phrase_of` 见到 `20` 就返 None
+   （它只认相对词），两个 ISO 日期那支也不匹配 —— 而「2026年6月」正是运营看板最常见的问法。
+   放在**整句兜底之前**：兜底返回整个问句，拿它当「已消化」会把「长沙」这种没处理的限定
+   一起吞掉（第一版就是这么写的，被既有判据 `direct_metric("2026年6月长沙…").is_none()` 当场抓住）。
+2. **`region_of` 收敛**（第 18 轮那条的第三种形态）。问句侧的省名词表也是手抄的、
+   同样漏了上海与海南，现在同样从 `standard_region_pairs` 生成，只额外挂三个
+   「只出现在问句里」的说法（苏南/苏北大区、江苏省区）。长词优先排序，
+   免得「内蒙古自治区」被「内蒙」截胡后留下残留词。
+
+**验收**：workspace 1904 全绿；OPS 组 4/4 实机通过。
+
+### E10 查清了但**不改**（2026-08-14 第 26 轮）
+
+「现在库存量是多少」：路由与 SQL 都对（`direct-agg` 211ms，命中中台现行库存模板），
+只有收据判 `mode=unknown / status=blocked`。连跑三次**稳定复现**，且
+**没有**合同解析失败的日志（AX137 那两条 warn 一条没出）—— 说明不是 JSON 不合约，
+是 fast 模型自己把 `mode` 标成 unknown 或填了 `ambiguities`。
+
+而它标得**有道理**：「库存」在本库确实有两个来源（中台现行库存 / 门店进销存），
+`seed.rs` 的警告里白纸黑字写着这件事。系统按业务裁决选了默认源、答对了，收据照实说
+「模型当时不确定」—— 这正是 `AGENT-ARCHITECTURE §3.1` 要的行为。
+
+**不改的理由**：让确定性模板反过来把合同「升级」成 grounded，等于用我们自己的判断
+盖掉模型报告的歧义 —— 下一次真歧义就没人报了。要治该治**输入**（让意图提示知道
+「库存量」是已登记指标、默认源已裁决），那是 prompt/词表侧的活，需要连带过一遍
+`tools/regression.py` 的 LLM 路题，不在本轮范围。
+
+## AX142（2026-08-14，第 27–28 轮：知识库两条 critical/high —— 该说的话被删了，不该说的话被说了）
+
+W4 清单前两条，都是「答案本身没错、但呈现给用户的那一份是错的」。
+
+### ① 「部分覆盖」声明结构性活不下来（critical）
+
+SYSTEM 里白纸黑字要求：资料只覆盖问题一部分时，**第一条**必须以「知识库里没有关于」开头。
+可它是**否定断言、天然没有角标** —— 一进 `keep_line` 的角标过滤就被整句剔掉。
+
+```text
+用户：出差住宿和市内打车各有什么上限
+模型：知识库里没有关于市内打车费的规定。      ← 被删
+      住宿费上限每晚八百元[^1]。              ← 只剩这句
+用户看到的：一个只答了住宿的答案 —— 他会把 Y 当成 X 的答案。
+```
+
+此前唯一相关的测试只断言「SYSTEM 里含这个字符串」，**没有一条判据管它能不能活到用户面前**。
+
+豁免只开这一条，且**必须无数字**：不许借这个壳夹带无据数值
+（「知识库里没有关于打车的规定，但住宿是 800 元」→ 后半句无角标，照旧删）。
+同刀在 `has_supported_content` 里把它排除在「有实质内容」之外 ——
+整篇只剩这句时仍退回 NO_HIT，那是诚实的失败。
+
+### ② 版本冲突兜底不看有没有被引用（high）
+
+`retrieve` 侧的 `preserve_governed_versions` / `preserve_textual_versions` 是**主动**
+把冲突版本追加进 TOP_K 的，所以「上下文尾巴里躺着一对与本问题无关的新旧版」
+**是被设计出来的常态**。而 `disclose_versioned_sources` 全程不扫角标：
+
+```text
+用户：报销要交哪些材料
+召回尾巴：培训报销 v1 / 培训报销 v2（一个都没被引用）
+返回：一张「请由制度负责人确认」的核对表 —— 好答案被降级成了待办
+```
+
+同文件的 numeric 侧早就要求「该组至少一个成员被引用」——两个兄弟函数口径不一致。
+现在 family 与 textual 两条入选条件各追加同一句判据（共用一个 `refs(md)` 扫描结果）。
+
+**验收**：workspace 1907 全绿、架构门禁 16/16。新增判据两条：
+`partial_coverage_disclaimer_survives_the_citation_filter`（含两条反面：带数字不许豁免、
+整篇只剩它时不算有内容）、`unselected_version_conflict_in_retrieval_tail_does_not_replace_the_answer`。
+既有的 `version_conflict_keeps_complementary_facts_from_other_documents` 等全绿不变。
+
+## AX143（2026-08-14，业主实测：知识库问什么都不回答 —— 根因与修法）
+
+### 现象
+
+业主在**服务器**上问「线下设备申请的政策」，拿到的是问数口吻的澄清卡：
+
+```
+先问清再查
+意图解析结果未通过一致性校验。为避免误解你的问题，我没有执行模型生成的查询；
+请补充明确的对象、指标和时间后重试。
+理解缺口：尚未确定应使用问数还是知识检索，需要补充问题限定
+```
+
+「请补充明确的对象、指标和时间」对一句政策问句毫无意义 —— 用户被要求补充一个根本不存在的东西。
+
+### 根因（`server/src/main.rs` 的 `/api/ask` 与 `/api/ask/stream`）
+
+```rust
+IntentRoute::Hybrid | IntentRoute::Unknown => {
+    prepared.question.clarification_result()   // ← 知识库一次都不查
+}
+```
+
+**知识库问句天生没有指标、没有时间、没有实体** —— 正是数据合同最容易判 `Unknown/Invalid`
+的那一类。而 Unknown 那一臂直接返回澄清卡，`kb_answer` 一次都不调。
+于是「问知识库无论问什么都不回答」——**不是知识库坏了，是问句根本没被送到知识库**。
+
+这条判据的立意本身没错（合同不可用时不许自由生成 SQL），错在把「不能问数」当成了
+「不能回答」。**合同不可用 ≠ 知识库不能答**：`answerers::knowledge::answer` 对 intent
+**零依赖**（只吃 store/embed/llm/principal/space/question/weights，本文件已逐行确认），
+而检索本身 fail-safe —— 查不到就说「知识库里没有相关内容」。
+
+### 修法
+
+`unknown_route_kb_fallback`：Unknown 臂先问一次知识库，**只有真的检索到带引用的内容**
+才顶替澄清卡；没查到就照旧出卡（数据问句的体验一个字不变）。兜底失败留 warn。
+**问数侧零改动**：这条路不生成任何 SQL。两个端点（`/api/ask` 与 `/api/ask/stream`）
+同时接上 —— 流式与非流式对同一句话给出不同答案，是本仓反复付过账的那类分叉。
+
+判据 `unknown_contract_consults_the_kb_before_giving_up` 钉三件事：兜底存在且真调
+`kb_answer`、判了「有没有引用」、**两个端点各接一次**（`unknown_route_kb_fallback(` 恰好出现 3 次）。
+
+### 同刀补上的一处排查盲区
+
+`retrieve.rs` 的「可见文档为 0 → 一条召回查询都不发」早退，此前**一行日志都没有**
+（那句「检索零命中：各路召回数」写在早退之后，永远走不到）。于是「库里没有 / 权限看不到 /
+状态没就绪」三种情况在服务端长得一模一样。现在打 `login + roles + space` 三个变量并指明
+该去查哪几张表。
+
+### 还没做的一半（明确记账，不是遗漏）
+
+MCP / CLI / 深度报告子问走的是 agent 的 `ask_prepared`，那条路的 Unknown 分支同样不查知识库；
+接它需要 `AskDeps.kb` 在两处 `kb: None` 的构造点补上，而那两处的宿主函数
+（`main.rs` 的 `ask()`）签名里没有 `OwnedStore` 与 rrf 权重，要多穿两个形参。
+本轮先修用户实际撞到的 HTTP 面；这一半连同「为什么回归题集从来没盖住知识库」一起下轮做。
+
+### 现场事实（存档）
+
+- 生产健康检查全绿：mysql 只读连通、vector_ready 三项 true、doc_service.ok、graph 已同步
+- 生产跑的是**本次会话之前**的二进制（health 响应里没有本会话新增的 `breakers` 字段）
+  → 本批改动**不是**这个 bug 的成因，修完必须部署才生效
+- 本地开发库 kb.doc 0 行 / kb.chunk 0 行，但 `/kbdata` 下有 3 个真实文档文件
+  —— 本地环境自身的语料状态问题，与生产无关，单独查
+
+## AX144（2026-08-14，业主三条：文件下载 / 混合查询 / 不够智能 —— 同一个根因）
+
+### 决定性证据：v2 合同在生产上 **100% 被拒**
+
+从生产日志抓到三条，模型每一次都**理解得完全正确**：
+
+```
+01:20  {"version":2,"mode":"data",  "subgoals":[{"mode":"data",     "surface":"本月销售额是多少"   ...}]}  → 不合约
+01:22  {"version":2,"mode":"hybrid","subgoals":[{"mode":"knowledge","surface":"线下设备申请政策"   ...}]}  → 不合约
+01:27  {"version":2,"mode":"hybrid","subgoals":[{"mode":"data",     "surface":"查一下最近的设备订单"...}]}  → 不合约
+```
+
+**连「本月销售额是多少」都被拒** —— 也就是说整套 IntentV1 v2 subgoal 机制**从上线起就没生效过**，
+所有问句都退化成 Unknown 或最小合同兜底。业主的三个抱怨因此是同一个根因：
+
+| 症状 | 为什么 |
+|---|---|
+| 知识库问什么都不回答 | 合同被拒 → Unknown → 澄清卡，问句根本进不了知识库 |
+| 混合查询不支持 | `mode:hybrid` + 两个子任务的合同被拒，hybrid 两路并行从没被触发过 |
+| 不够智能、要先用大模型理解意图 | 大模型**已经**理解了，是我们把它的理解丢了 |
+| 要文件下载 | 下载能力后端前端**早就完备**（`/api/kb/doc/{id}/download`、预览票据、`downloadSource()`）—— 只是没有 citations 就没有来源文档卡，也就没有下载按钮 |
+
+### 根因：格式洁癖丢掉了正确的理解
+
+提示词规则 3 要求「version=2 且存在 subgoals 时，根级执行槽位必须为空」，
+而模型**同时**填了根级与子任务槽位 —— 那是它表达「共享条件」最自然的方式。
+`v2_root_slots_assigned` 判否 → `ground()` 整份返 `None` → `IntentAttempt::Invalid`。
+
+而 `ground()` **一条日志都不打**：外层只说一句「JSON 不合约」，定位这件事花了半小时。
+
+### 修法
+
+**① 根级槽位按归属下推**（`push_down_root_slots`）。归属判据与本仓其它地方同源：
+该槽位原文出现在子任务的 `surface` 或 `evidence_surfaces` 里才算它的。
+归属不到任何子任务的**原样留在根级** → 仍然被拒 —— 那才是真歧义（提示词原话：禁止让系统猜归属）。
+方向只会**收窄**（子任务多带一个条件），不会放宽，fail-closed 不破。
+
+**② 拒绝理由有名字**（`grounding_reject_reason`）。十条判据各一个字面量
+（`root-slots-left-after-pushdown` / `mode-does-not-match-subgoal-route` / …），进 `warn!`。
+纯函数，与 `ground` 共用同一批判据 —— 诊断自己重判一遍就会漂（`why_not_compose` 上付过这个账）。
+
+**判据**：`v2_contracts_with_root_slots_survive_by_pushdown` 用**生产真实合同形态**钉三条：
+最简单那条活下来、混合合同活下来且 `route() == Hybrid`、归属不明的根级槽位继续拒且理由有名字。
+
+### 顺带修好的部署脚本两个真缺陷
+
+1. **MSYS 路径改写**：Git-Bash 把 `/opt/dms-ai/src.tar.gz` 改写成 `D:/Program Files/Git/opt/...`，
+   远端写不进去，客户端只看到一句莫名的 `OSError: Socket is closed`。已 `export MSYS_NO_PATHCONV=1`。
+2. **长构建挂在一条 SSH 长连接上**：服务器 Docker 构建 5-10 分钟，这条链路撑不住，
+   一断脚本退出、远端构建收到 SIGHUP 一起死 —— 表现是「跑了十分钟镜像还是旧的」，
+   **退出码还可能是 0**（管道吞掉）。改成 nohup 后台 + 客户端短连接轮询 rc 文件，
+   构建失败则不切换 app（生产保持旧版本）。实测这次一次通过。
+
+**验收**：workspace 1910 全绿；生产已上线 `20260814T014655Z-9993`，健康检查 ok:true，
+新二进制含 `结构化意图未通过 grounding` 字符串。
+
+## AX145（2026-08-14，知识库/混合问句：三层叠加的根因，生产实测全通）
+
+AX144 只对了一半。日志上线后真相是**三层叠加**，缺一条都答不出来：
+
+| 层 | 现象 | 修法 |
+|---|---|---|
+| ① fast 模型**间歇性**吐出解析不了的 JSON | 合同 `Invalid` → 自由 SQL/语义缓存/知识库路由全关 → 澄清卡 | 解析失败**重试一次**（调用失败/超时不重试 —— 那是链路问题，重试只把 10s 变 20s） |
+| ② Unknown 臂直接出卡、一次不查库 | 知识库问句天生 Unknown（无指标/时间/实体） | 先问一次库，**查到带引用的内容**才顶替卡片 |
+| ③ CLI/MCP/深度子问 `kb: None` | 混合问句知识半被静默丢掉（实测 `route=compound, subs=1` —— 问两件事只拿回一件） | `OwnedStore::from_pool` 从已有池借 store，十个调用点一个没动 |
+
+**为什么之前判断错**：`clip()` 只留 200 字符，v2 合同的第一个 subgoal 都放不下 ——
+看不到完整回包，就把「JSON 被截断/畸形」误判成「grounding 太严」。
+`ground()` 又是纯黑盒（十条拒绝判据零日志）。两个盲区叠在一起，方向就歪了。
+
+**观测面补全**（否则下次还得再挖一遍）：
+- `ground()` 十条判据各起名字（`root-slots-left-after-pushdown` / `mode-does-not-match-subgoal-route` / …）进 warn
+- 拒绝时打**完整**回包（4000 字符）+ 长度 + `completion_tokens`（被供应商上限截断时它顶在整数上）
+- JSON 严格解析失败打 serde 报错位置（`EOF while parsing` = 截断的直接证据）
+- 容错解析也全军覆没时说一句（此前完全静默）
+
+### 生产实测（`20260814T0...` 部署后，容器内 CLI 直打）
+
+```text
+线下设备申请政策                         → route=knowledge，答出多级审批流程/价格填写/投放方式，带角标
+查一下最近的设备订单，并且最近的线下设备政策 → 两路都跑：数据半 no-topic + 知识半完整答出
+下载 押金转货款申请书                     → route=knowledge，给出模板与办理流程，并明说「库里没有该文件实体」
+```
+
+### 记两件与本轮无关但暴露出来的事
+
+1. **「设备订单」主题数仓没接入** —— 混合问句的数据半答不出来是这个原因，不是链路问题。
+2. **文件下载能力本来就完备**（`/api/kb/doc/{id}/download` + 15 分钟预览票据 + 前端 `downloadSource()`）；
+   「下载押金转货款申请书」拿不到文件，是**那份文件没作为原件入过库**（库里只有正文模板）。
+
+### 顺带修好部署脚本两个真缺陷
+
+- **MSYS 路径改写**：Git-Bash 把 `/opt/dms-ai/src.tar.gz` 改成 `D:/Program Files/Git/opt/...`，
+  远端写不进去，客户端只看到 `OSError: Socket is closed`。已 `export MSYS_NO_PATHCONV=1`。
+- **长构建挂在一条 SSH 长连接上**：服务器 Docker 构建 5-10 分钟，链路撑不住，一断脚本退出、
+  远端构建收 SIGHUP 一起死，**退出码还可能是 0**（管道吞掉）→「跑了十分钟镜像还是旧的」。
+  改 nohup 后台 + 客户端短连接轮询 rc 文件；构建失败不切换 app。实测一次通过。
+
+**验收**：workspace 1909 全绿、架构门禁 16/16；生产已上线并逐句复验。
+
+## AX146（2026-08-14，业主：「你不能头疼医头，这类问题的本质你还是没有解决」）
+
+### 最有价值的一张截图
+
+问「下载 押金转货款申请书」→ 系统返回 **38 行账余充值明细** + 深度 BI 板块。
+用户要一份**文档**，系统给了一堆**数据行**，而且很自信（生成了分析页）。
+
+### 两条决定性证据
+
+**① 同一个问句，不同入口不同答案**
+
+```text
+容器 CLI            → route=knowledge
+HTTP（深度模式）    → 38 行数据表 + 深度 BI
+```
+
+**② 路由决策抄了五份**（`grep` 实测）
+
+| 判据 | 出现次数 |
+|---|---|
+| `prepared_contract_ready(&prepared)` | 4 |
+| `projected_forced(&prepared` | 3 |
+| `is_data_executable()` | 3 |
+| `clarification_result()`（出卡点） | **14** |
+
+`api_ask` / `api_ask_stream` / `mcp_api::tool_ask` / `xcx_api` / `deep_api` 各有一份**逐字复制**的
+决策链。前几轮我每次修 1–2 处，业主换个入口就复发 —— 这就是「头疼医头」的物理成因，
+不是态度问题，是**决策没有单一落点**。
+
+### 本质（初判，待体检确认）
+
+1. **路由 = 单次 LLM 输出的 `mode` 字段**，没有一致性保障 —— 同一句话两次判不同。
+2. **合同没有「用户要做什么」这一维**：`IntentMode` 只有 `data|knowledge|hybrid|unknown`。
+   「下载 X」「导出 X」「给我 X 的文件」**无处安放**，模型只能硬塞进 `data` ——
+   于是「押金转货款」匹到账余充值表，38 行数据就出来了。
+3. **快路径按「词的存在性」抢答**，不看用户要什么。
+4. **合同主要用于事后否决**（coverage 闸），而不是驱动决策 —— 模型理解对了也没用。
+
+已启动架构级体检（五套入口测绘 / 快路径准入 / 合同表达力 / 澄清面 / 开源对标 yuxi·SuperSonic·Adaptive-RAG），
+出方案后分批实施，不再逐点打补丁。
+
+## AX147（2026-08-14）架构级整改·批次 1+2：路由从「一维 × 五份分派」改成「两维 × 一次裁决」
+
+### 本质诊断（体检结论，28 条findings 核实 12 条）
+
+1. **合同缺「交付面」这一维**。`IntentV1` 13 个槽位全是取数面，`IntentMode` 只有
+   `data|knowledge|hybrid|unknown`。「下载/发我一份/打印」**无处安放** ——
+   `EntityKind::Document` 定义了但**零消费者**，`route()` 的 `has_data_slots` 只判
+   `entity_mentions` 非空，把最有区分力的那一位扔了。
+2. **路由 = 一次 fast LLM 采样的 `mode` 字段**，确定性信号零参与。同一句问两次两条路。
+3. **裁决点唯一但分派复制五份**，兜底只接了其中一部分；守卫测试按 `main.rs` **单文件**扫描，
+   `deep_api` / `xcx_api::ask_stream` 天然漏网 —— 判据的扫描面比缺陷面小。
+4. **失败模式只有一种**：同一张无信息澄清卡，且文案是合同结构的镜像（只会问指标/时间/对象）。
+5. **执行层判据是裸 `contains`**：`kw_force` 种子 `("押金","t_customer_balance")` 让
+   「下载 押金转货款申请书」把账余表钉成 schema 上下文第一张卡 → **38 行账余充值明细**。
+
+### 改了什么
+
+| 文件 | 动作 |
+|---|---|
+| `kernel/src/nl/doc.rs` | 新增：文档名词/扩展名/取件动词三张词表 + `signals()` / `is_document_request()`（纯函数、零 IO） |
+| `agent/src/ask.rs` | 新增 `Deliverable` / `AskPlan` / **`decide()`** ——★ 全系统唯一裁决点；`PreparedQuestion::route()` 改读 `plan().route` |
+| `agent/src/answerers/knowledge.rs` | `answer()` 首行分流；新增 `documents()`：检索 → 按 `doc_id` 去重 → 文件清单卡，**0 次 LLM** |
+| `knowledge/src/answer.rs` | `citations` 改 `pub`（不抄第二份，`Citation` 19 个字段抄了必漂） |
+| `server/src/main.rs` | `prepared_contract_ready`：确定性车道免合同；守卫测试扫描面扩到**四个入口文件** + 深度模式臂序钉板 |
+| `server/src/deep_api.rs` | 合同闸早退先问一次知识库（此前唯一没接的入口） |
+| `server/src/xcx_api.rs` | 流式 Unknown 臂同上（流式/非流式此前对同一句给两种答案） |
+
+### 决策规则表（首条命中即止）
+
+| # | 条件 | 结果 | deterministic |
+|---|---|---|---|
+| R0 | `forced` 非空（前端 chip） | `{forced, Answer}` | false |
+| R1 | 动词 × (文档名词 \| 扩展名) | `{Knowledge, Document}` | **true** |
+| R2 | 有文档名词、无可度量槽位、且合同没说 Hybrid | `{Knowledge, Answer}` | **true** |
+| R3 | 合同有意见 | `{合同的路, Answer}` | false |
+| R4 | 其余 | `{Unknown, Answer}` | false |
+
+**fail-closed 不变量**：`deterministic == true` 时 `route` 只可能是 `Knowledge`，永不是 `Data` ——
+确定性规则只能把问句**推离** SQL 生成，永不能推入。单测 `deterministic_rules_never_produce_data` 钉住。
+
+**「导出」刻意不收进动词表**：它是问数的既有功能（结果集导出 Excel），收了就会让
+「导出标准成本明细」「导出上月合同金额」被 `标准`/`合同` 撞成文档诉求 —— 一个词换一整类误路由。
+
+### 生产验收（release `20260814T042450Z-29625`，容器 CLI 实测）
+
+| 问句 | 路由 | 耗时 | 结果 |
+|---|---|---|---|
+| 下载 押金转货款申请书 | `knowledge` | **5.3s** | 文件清单卡，首条 `押金转货款申请书(1).docx`，带下载引用；**无 38 行账余表** |
+| 线下设备申请政策 | `knowledge` | 26s | 带引用政策答案，无澄清卡 |
+| 本月销售额 | `direct-agg` | **93ms** | 1.005 亿 + KPI + 环比 17.2% + 明细（问数一字未动） |
+| 查设备订单 + 线下设备政策 | `compound` | 20s | 两半都跑；数据半 no-topic（设备主题未接入数仓，既有缺口） |
+
+workspace 1919 绿。
+
+### 判据（防复发）
+
+- `ask.rs::a_document_request_routes_the_same_whatever_the_contract_says` —— 同一句喂四份不同合同
+  （data / knowledge / Unavailable / Invalid），plan 必须恒为 `{Knowledge, Document, deterministic}`。
+- `ask.rs::deterministic_rules_never_produce_data` —— fail-closed 不变量。
+- `ask.rs::routing_has_exactly_one_decision_point` —— `route()` 只许转发 `plan()`；`decide` 只许有一份。
+- `main.rs::every_entry_consults_the_kb_before_showing_a_card` —— **四个入口文件**按形状扫，
+  每个 `Unknown` 臂与每道合同闸后面必须跟一次知识库兜底；外加深度模式知识臂必须在转问数之前。
+
+### 待办（后续批次）
+
+- 批次 3：五份分派前缀收敛成 `guard_or_fallback` / `knowledge_payload` 两个函数（纯重构，净减 ~80 行）。
+- 批次 4：mixed 双路（有文档名词 + 有数据槽位 + 合同没拆出知识子任务）→ 用既有 `Answer.subs` 出两块面板。
+- 批次 5：澄清卡文案去内部术语（「意图解析」「生成 SQL」「一致性校验」）；`intent_summary` 增
+  `plan_reason`（收据显示「按什么定的路」，误路由自证）；删 `triage` 死代码
+  （`triage`/`rule_intent`/`kb_hit`/`strong_doc_intent`/`hybrid_clauses`/`llm_intent`）；
+  `recall/schema.rs` 加一行 `is_document_request` 守卫防绕过。
+- 「设备订单」主题数仓仍未接入（本轮未动，属数据面缺口不是路由缺口）。
+
+## AX148（2026-08-14）三条实测反例：Hybrid 后门 / 裸单号 / 文件清单精度
+
+业主三张截图，三个不同的洞，其中两个是我上一批（AX147）自己留的。
+
+### ① 「客户打款 退款政策」→ 200 行账余充值明细
+
+**不是检索不到**。同一句话在容器 CLI 上答得很好：
+
+```text
+Q: 客户打款 退款政策 → route=knowledge，引用 6 条
+「结束合作走云之家【线下客户退出申请】；继续合作仅打款错误走人人费用通用报销，
+ 费用项目选"销售.销售_销售打款错误"…」
+```
+
+生产 PG 实测也证明标题**在**检索面上 —— `kb.chunk.embedding_text` 的开头就是：
+
+```text
+文件：客户打款退款指引.docx 目录：/指引合集/后勤财务 章节：客户打/退货款
+```
+
+真正的成因：AX147 的 R2 **给 Hybrid 开了后门**（「模型说这句有两件事，别压成单路」）。
+合同这次判 hybrid，data 子任务是「客户打款」—— 没有指标、没有时间、不是一道能算的题 ——
+照跑，在 `dms_ods.t_customer_balance` 上拉回 200 行、口径复核还不通过。
+**同一句话，合同判 knowledge 就答对，判 hybrid 就出垃圾**：非确定性从这个后门原样回来了。
+
+**修**：删掉那条豁免。`has_measurable_slots` 本来就同时看根与 subgoals，所以判据自动变成
+「**数据半必须自带可度量槽位**（指标/时间/分组/对比），否则它不是混合问句，
+是一句被劈成两半的政策问题」。真混合问句不受影响 ——
+「查最近的设备订单，并且最近的线下设备政策」的数据半带时间槽位。
+
+### ② 裸单号 `CZ202608131914` → 走了知识库
+
+合同判 Unknown（一个裸号抽不出任何槽位）→ 触发 AX147 加的 `unknown_route_kb_fallback` →
+知识库拿一份讲「账余记录」的文档**答了出来**、还带引用 → 顶替卡片上线。
+用户要查一张单，拿到的是「账余记录页面位于财务 > 客户账余记录」。
+
+**修**：新增 **R1.5 单据号点查** —— 单号是全系统最不含糊的问数信号，判 `Data` 且 deterministic。
+
+判据从「单号」这个**词**上摘开：`triage::doc_code_hit` 拆出 `code_token_hit`（只认真的
+字母数字混排 token）。「账余记录单号是什么意思」是口径问句，不许判成点查。
+
+**fail-closed 口径同步纠正**：此前写的是「确定性规则永不判 Data」。这条口径是错的 ——
+真正的护栏在 `run.rs:1455`：`LlmAnswerer::accept == is_data_executable()`，
+合同没 Ready 时自由 SQL 那一路**结构上不接单，与 route 判成什么无关**。
+判据改成 `deterministic_rules_never_open_free_sql`：确定性 Data 只许有 `code-lookup`
+一个理由，且那道合同闸必须还在原处。
+
+### ③ 文件清单 5 条只有第 1 条相关
+
+「下载 押金转货款申请书」返回 5 份，第 2-5 份是《线下设备物资处置申请单流程指引》
+《客户退出申请流程填写详细指引》—— 靠正文里的「申请」两个字挤进向量召回。
+
+**修**：加一条 yuxi 式的**文件名信号**。`kernel::nl::text::longest_common_run`
+（最长公共子串，朴素 DP、零依赖），`documents()` 按它重排并剪枝：
+
+| 文档 | 与问句的最长公共子串 |
+|---|---|
+| 押金转货款申请书(1).docx | **8** |
+| 客户退出申请流程填写详细指引.docx | ≤2 |
+| 线下设备物资处置申请单流程指引.docx | ≤2 |
+
+剪枝只在「真有人对上了」时发生（最佳 ≥3 字），保留最佳的一半以上；一个字都对不上就全留 ——
+宁可多给，不可给空。
+
+### 词表补充
+
+`DOC_NOUNS` 加「指引」「细则」：生产知识库的一级目录就叫**指引合集**，
+104 份文档里大量以「指引」结尾（客户打款退款指引 / 客户退出申请流程填写详细指引 / …）。
+
+### 现在的规则表
+
+| # | 条件 | 结果 | deterministic |
+|---|---|---|---|
+| R0 | `forced`（前端 chip） | `{forced, Answer}` | false |
+| R1 | 动词 × (文档名词 \| 扩展名) | `{Knowledge, Document}` | **true** |
+| R1.5 | 有单据号 token | `{Data, Answer}` | **true** |
+| R2 | 有文档名词 **且** 全局无可度量槽位 | `{Knowledge, Answer}` | **true** |
+| R3 | 合同有意见 | `{合同的路, Answer}` | false |
+| R4 | 其余 | `{Unknown, Answer}` | false |
+
+workspace 1922 绿。
+
+### 记一笔工具账
+
+本轮的知识库体检 workflow（6 个 agent）**全部挂在 `403 Please run /login`**，零产出。
+诊断是自己连生产做出来的：先查 `kb.chunk.embedding_text` 证明标题在检索面上，
+再用容器 CLI 跑同一句话证明检索没问题 —— 两步就把「检索不到」这个错误假设排除了。
+教训：症状指向 A（检索），先花两条命令证伪 A，再去找 B（路由）。
+
+### AX148 补记：部署脚本被我自己打限流
+
+第二次部署死在**构建轮询**：
+
+```text
+paramiko.ssh_exception.SSHException: No existing session
+```
+
+轮询每 15 秒开一条**新** SSH 连接，一次构建最多 120 条 —— 打满 `sshd` 的
+`MaxStartups`（默认 `10:30:100`）后新连接被直接拒。而 `deploy_update.sh` 开着 `set -e`，
+一次失败整个脚本退出：**镜像已经建好、`app` 却没切**（实测镜像 7 分钟前、容器还是一小时前的）。
+
+两处一起修：
+
+1. `tools/_deploy.py::client()` 加退避重试（0/5/15/30 秒，四次）。放在**共用的连接函数**里，
+   不在十几个调用点各写一份。
+2. `tools/deploy_update.sh` 轮询间隔 15s → 30s，`seq 1 120` → `seq 1 60`：
+   一次构建最多开 ~20 条连接而不是 120 条。
+
+同一类账本轮已经付过两次（先是远程 DB 被我反复跑回归压垮，再是 SSH）：
+**自动化的探测频率本身就是一种负载**，探测方要为它设上限。
+
+### 知识库的现状，用数字说话
+
+`tools/kb_bench.py` 的既有基线（18 题，k=6）：
+
+| 指标 | 值 |
+|---|---|
+| recall@6 | **1.00** |
+| MRR | **1.00** |
+| precision@6 | 0.41 |
+
+召回是满的，弱的是**精度**。这与本轮实测互相印证：「知识库明明有却没查到」
+**不是检索问题**，是路由没走到知识库。所以本轮把力气花在
+①路由（R1.5/R2）②文件清单精度（`rank_by_name`），而不是去动召回链路 ——
+动它是在改一个已经 1.00 的指标。
+
+（该基线的题集是 08-08 生成的，语料 08-13 重新入过库，金块 chunk_id 已失效，
+需要重跑 `kb_bench.py generate` 才能对当前语料给出新数字。这条列为待办，
+需要一个能登录的账号或 `DMSAI_KB_TOKEN`。）
+
+### AX148 续：裸单号为什么还是出卡（两处，都值得记）
+
+R1.5 判了 `Data`，`prepared_contract_ready` 也放行了，生产实测**仍然**出澄清卡。
+带日志跑一次就看清了，是两层：
+
+**① `ground()` 的静默拒绝（intent.rs:806）**
+
+```rust
+if self.route() == IntentRoute::Unknown || !self.ambiguities.is_empty() { return None; }
+```
+
+模型对 `HJXH-DXO2026081300138` 的回答是**完全正确**的：
+
+```json
+{"mode":"unknown","entity_mentions":[{"surface":"HJXH-DXO2026081300138","kind":"other"}],
+ "ambiguities":["仅提供了疑似单据号或ID的字符串，未指明具体业务意图"]}
+```
+
+它诚实地说了「我不确定你要看什么」。系统把这份**格式完好、理解正确**的合同判成
+`Invalid`＝「模型输出不合约」，再对用户说「意图解析结果未通过一致性校验」。
+而这条拒绝是**静默**的 —— 外层只印一句「JSON 两次都不合约」，于是
+「模型吐坏 JSON」与「模型理解对了但诚实存疑」在日志里长得一模一样。
+
+**修**：把这两条搬进 `grounding_reject_reason`，给出名字
+`mode-unknown` / `model-flagged-ambiguity`。结论不变（仍 fail-closed），但留下名字。
+为这一条静默花了一小时。
+
+**② 子问闸读合同、路由读裁决 —— 两者在我搬走决策那一刻就分叉了（ask.rs）**
+
+```rust
+let routed = prepared.routed_questions();      // ← 读**合同**
+if !deterministic_fallback && routed.iter().any(|c| c.route != Data) {
+    return Ok(prepared.clarification_result());
+}
+```
+
+`routed_questions()` 对 `Invalid` 合同**恒返回一条 `route=Unknown` 的子问**。
+于是 R1.5 明明把单号判成了问数点查，这道闸又把它退成澄清卡。
+
+**修**：`&& !plan.deterministic` —— 确定性车道没有 typed 子问。
+
+**教训**（本轮第三次付同一种账）：把一个决策搬到新地方时，**所有读旧决策的判据都是待查清单**。
+`route()` 改读 `plan()` 之后，仓库里还有 `intent_attempt.routed_questions()` /
+`is_data_executable()` 这些仍在读合同的判据 —— 它们不会报错，只会在某个入口悄悄给出旧答案。
+
+### AX148 三续：把 `CZ` 单据族补上 + 「带引用的非答案」不许顶替卡片
+
+修完前两层后生产实测：
+
+| 单号 | 结果 |
+|---|---|
+| `HJXH-DXO2026081300138` | `direct-doc`，**6 行**，真查到单了 |
+| `CZ202608131914` | 走了问数（router 全跑完），但四个成员逐个 miss |
+
+`CZ` 这个前缀**从来没登记过单据族** —— `resolve_code` 返 `None`，business-lookup 接不了。
+业主截图里那条错误 SQL 反而给了证据：`cb.balance_code AS 账余充值单号 FROM dms_ods.t_customer_balance`。
+
+生产 `exec-sql` 逐列核实（不猜）：
+
+```text
+SELECT balance_code FROM dms_ods.t_customer_balance WHERE balance_code='CZ202608131914'
+→ row_count=1
+```
+
+登记 `DocumentKind::CustomerBalance`：
+
+- 形：`dated_serial(code, "CZ", 3, 12)` —— `CZ` + 8 位日期 + 流水。
+  用 `dated_serial` 不用 `numeric`：后者会把任何 `CZ` 开头的长数字串都收进来。
+- 源：**只登记数仓**（`BALANCE_DORIS`）。生产 MySQL 侧这张表没证明过，
+  `header_policy` 里显式 `return None` —— 访问业务库前失败关闭。
+- 行级权限：`Visibility::Customer`。这张表有 `customer_code`、**没有** manager 列 ——
+  拿一个不存在的列裁决只会恒 false，等于把这一族永久关死。
+  这也是 `Visibility::Customer` 的第一个生产消费者（此前挂着 `#[allow(dead_code)]`）。
+- 明细表不登记：账余充值是单头单据，没有行明细。
+
+### 另一处：有引用 ≠ 有答案
+
+`unknown_route_kb_fallback` 此前只判 `citations.is_empty()`。而业主截图里那条
+「该订单号未出现在任何资料中，无法查询其订单状态、商品明细或金额」**带 2 条引用** ——
+模型一边说查不到、一边照样打角标，于是这句「查不到」顶掉了本该走问数的路。
+
+加 `reads_as_not_found(markdown)`：只扫开头 160 字（「直接结论」那一段），
+命中「未出现在任何资料 / 知识库里没有相关内容 / 无法查询 / …」即不顶替卡片。
+只扫开头是有意的 —— 正文后段出现「未提及」是正常行文，拿它判非答案会误杀大量真答案。
+判据同时进了兜底钉板（`f.contains("reads_as_not_found(")`）。
+
+workspace 1923 绿。

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { intentIssueText } from './result-receipt'
 
 /** 【Trace 时间线】会话问答过程回放面板（A10，DataFoundry trace-dag 对应物）。
  * 竖向时间线：每轮问答一组节点 —— 提问 → 路由链 →（重试）→ 回答 →（产物），
@@ -17,7 +18,8 @@ import { ref } from 'vue'
  *     { kind:'question', at: string, text: string }
  *     { kind:'route',    stage: string, result:'hit'|'miss'|'skip', ms: number }
  *     { kind:'retry',    reason:'repair'|'failed'|'timeout'|'blocked', ms: number|null, error: string }
- *     { kind:'answer',   route: string, ms: number|null, sql: string|null, row_count: number|null }
+ *     { kind:'answer',   route: string, ms: number|null, sql: string|null, row_count: number|null,
+ *                        trust_level?: string, issues?: string[] }
  *     { kind:'artifact', id: number, title: string, preview_url: string }
  * 空数组 = 会话还没有可回放的问答，组件显示空态。加载中/失败由挂载方自己挡（v-if）。
  * （接口里事件级 at、产物 id 等字段当前不展示，故未收进下方 interface。） */
@@ -32,6 +34,8 @@ interface TraceEvent {
   route?: string
   sql?: string | null
   row_count?: number | null
+  trust_level?: string | null
+  issues?: string[]
   title?: string
   preview_url?: string
 }
@@ -73,6 +77,9 @@ const STATUS_LABEL: Record<string, string> = {
   failed: '失败',
   timeout: '超时',
   blocked: '被拦截',
+}
+const TRUST_LABEL: Record<string, string> = {
+  verified: '已验证', high: '已校验', review: '需复核',
 }
 /** 节点类型标记（单字徽标，与状态色配合 —— 本仓组件不引图标库） */
 const KIND_BADGE: Record<TraceEvent['kind'], string> = {
@@ -130,7 +137,7 @@ function nodeTitle(ev: TraceEvent): string {
 function nodeTone(ev: TraceEvent): string {
   if (ev.kind === 'route') return ev.result === 'hit' ? 'ok' : ev.result === 'miss' ? 'dim' : 'faint'
   if (ev.kind === 'retry') return ev.reason === 'repair' ? 'warn' : 'bad'
-  if (ev.kind === 'answer') return 'ok'
+  if (ev.kind === 'answer') return ev.trust_level === 'review' || ev.issues?.length ? 'warn' : 'ok'
   if (ev.kind === 'artifact') return 'art'
   return 'dim'
 }
@@ -181,7 +188,11 @@ function roundTone(r: TraceRound): string {
             <div v-else-if="ev.kind === 'answer' && (ev.row_count != null || ev.route || ev.sql)" class="tl-detail">
               <template v-if="ev.row_count != null">{{ ev.row_count }} 行</template>
               <template v-if="ev.route"> · {{ ev.route }}</template>
+              <template v-if="ev.trust_level"> · {{ TRUST_LABEL[ev.trust_level] ?? ev.trust_level }}</template>
               <template v-if="ev.sql"> · {{ sqlOpen(roundKey(r, ri)) ? '收起 SQL ▾' : '展开 SQL ▸' }}</template>
+            </div>
+            <div v-if="ev.kind === 'answer' && ev.issues?.length" class="tl-issues">
+              <span v-for="issue in ev.issues" :key="issue">{{ intentIssueText(issue) }}</span>
             </div>
             <div v-else-if="ev.kind === 'artifact'" class="tl-detail">
               <button v-if="ev.preview_url" type="button" class="tl-link" @click.stop="emit('preview', ev.preview_url, ev.title || '产物预览')">{{ ev.title || '产物预览' }}</button>
@@ -228,6 +239,7 @@ function roundTone(r: TraceRound): string {
 .tl-node.ok .tl-label { color: var(--text-primary); }
 .tl-detail { color: var(--text-muted); font-size: 11px; line-height: 1.5; word-break: break-all; }
 .tl-detail.bad { color: var(--error-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-issues { display: grid; gap: 2px; margin-top: 3px; color: var(--warning-text); font-size: 10.5px; line-height: 1.45; }
 .tl-link { padding: 0; border: none; background: none; font: inherit; font-size: 11px; color: var(--primary); cursor: pointer; }
 .tl-link:hover { text-decoration: underline; }
 .tl-sql { margin: 4px 0 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-sunken); color: var(--text-regular); font-family: var(--font-mono); font-size: 10.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto; }

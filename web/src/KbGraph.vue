@@ -1081,7 +1081,7 @@ onBeforeUnmount(() => {
 }
 .secondary-btn { padding: 0 13px; background: var(--bg-card); color: var(--text-regular); white-space: nowrap; }
 .secondary-btn:hover, .icon-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
-.primary-btn { padding: 0 13px; border-color: var(--primary); background: var(--primary); color: #fff; }
+.primary-btn { padding: 0 13px; border-color: var(--primary); background: var(--primary); color: var(--on-primary); }
 .primary-btn:hover { background: var(--primary-hover); }
 .icon-btn { width: 24px; height: 24px; padding: 0; background: var(--bg-card); color: var(--text-regular); font-size: 14px; }
 button:disabled { cursor: not-allowed; opacity: .55; }

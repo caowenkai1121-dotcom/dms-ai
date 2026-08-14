@@ -135,7 +135,7 @@ pub fn is_ready_for(target: &str) -> bool {
 /// 建的」—— 标记只由完整重建成功写入，重建中的 drop_graph 会先抹掉它（缺席 = 不可信，
 /// 直接回落到非图路径，与未同步行为一致）。
 pub async fn adopt_if_current(pg: &PgPool, target: &str) -> bool {
-    let read = async {
+    let read = || async {
         let mut conn = age_conn(pg).await?;
         let cy = format!(
             "SELECT target::text FROM (SELECT * FROM cypher('{GRAPH}', $$ MATCH (m:GraphMeta) RETURN m.target LIMIT 1 $$) AS (target agtype)) sub"
@@ -146,18 +146,32 @@ pub async fn adopt_if_current(pg: &PgPool, target: &str) -> bool {
         let value = value.ok_or_else(|| anyhow::anyhow!("图就绪标记读不出"))?;
         anyhow::Ok(unquote(&value))
     };
-    match read.await {
-        Ok(marker) if marker == target => {
-            availability().write().unwrap_or_else(|e| e.into_inner()).adopt(target);
-            true
-        }
-        Ok(_) => false, // 标记与目标不符：图是别的目标建的，不可信
-        Err(e) => {
-            // 真实 DB 错误（断网/权限）与「无标记」都落这里：留痕但不放行
-            tracing::debug!(err = %e, "图就绪标记读取失败，按不可信处理");
-            false
+    // 🔴 读一次不够（2026-08-14 实测）：同一个问句在两次 CLI 进程里一次走 graph、
+    // 一次走 direct-doc —— 差别只是这条 AGE 读**抖了一下**（PG 忙 / `LOAD 'age'` 争用）。
+    // 「同题不同答」不许由一次瞬时读失败决定，所以失败重来一次；两次都不成才算不可信。
+    // 判据本身一个字没松：标记必须存在**且**等于当前目标。
+    let mut last_err = None;
+    for attempt in 0..2 {
+        match read().await {
+            Ok(marker) if marker == target => {
+                availability().write().unwrap_or_else(|e| e.into_inner()).adopt(target);
+                return true;
+            }
+            Ok(other) => {
+                // 标记与目标不符：图是别的目标建的，不可信 —— 重试也不会变，直接回落
+                tracing::debug!(marker = %other, target, "图就绪标记不是当前目标，按不可信处理");
+                return false;
+            }
+            Err(e) => {
+                tracing::debug!(attempt, err = %e, "图就绪标记读取失败");
+                last_err = Some(e);
+            }
         }
     }
+    // 升到 warn：这条一旦发生，用户看到的是「图问句这次没走图」——
+    // 原来只有 debug，等于把一次路由漂移埋进最低日志级别里。
+    tracing::warn!(err = ?last_err, target, "图就绪标记两次都读不到 → 本进程回落非图路径");
+    false
 }
 
 /// AGE 连接准备：每连接需 LOAD age + search_path（放 fetch 前）
@@ -1128,5 +1142,27 @@ mod tests {
         // ④ 单引号必须被转义（实体名来自图，但图里的名字是业务数据，不是可信输入）
         let q = buyers_cypher(Some("O'Brien"), None, None, 50).unwrap();
         assert!(q.contains("O\\'Brien"), "{q}");
+    }
+    /// 🔴 图就绪标记的读取**不许让一次抖动决定路由**（2026-08-14 实测：同一个问句
+    /// 在两次 CLI 进程里一次 graph、一次 direct-doc，差别只是这条 AGE 读失败了一次）。
+    ///
+    /// 判据打源码：这条路径要 PG + AGE 才跑得起来，但「失败要重来一次、且失败要吼一声」是可判的。
+    #[test]
+    fn graph_marker_read_retries_and_is_loud_on_failure() {
+        let src = include_str!("graph.rs");
+        let body = src
+            .split("pub async fn adopt_if_current")
+            .nth(1)
+            .expect("函数改名了")
+            .split("
+}")
+            .next()
+            .unwrap();
+        assert!(body.contains("for attempt in 0..2"), "读失败没有重试：一次抖动就改路由：{body}");
+        assert!(body.contains("tracing::warn!"), "两次都失败必须 warn —— debug 等于把路由漂移藏起来");
+        assert!(
+            body.contains("Ok(other)") && body.contains("return false"),
+            "标记不是当前目标必须直接回落（重试也不会变），不许重试掩盖"
+        );
     }
 }

@@ -18,29 +18,12 @@ use dms_kernel::BoxFut;
 use crate::answerers::Answerer;
 use crate::ctx::{table_answer, AskCtx, AskResult, SalesContextResult, SupplementalResult};
 use crate::gate::{gate_on, is_guard_err, EXEC_TIMEOUT, MAX_ROWS};
+use crate::intent::ExecutionEvidence;
 
-/// 确定性命中：SQL（未注入）+ 路由标签 + 可选上期查询（KPI 环比）。
-/// 逐行搬 `server/src/direct.rs:11-17`。
-///
-/// ponytail: 这是**本轮唯一允许的临时重复**。`direct.rs` 的解体是 T8（`compose/*` + `fastpath/*`
-/// 迁 semantic），届时本类型删掉、全仓改引 `dms_semantic::DirectHit`（ARCHITECTURE §4.4 `lib.rs` 行）。
-/// 今天 agent 引不了 server（那是反向依赖边），所以在这里放一份同形结构 + 由调用方产出。
-pub struct DirectHit {
-    pub sql: String,
-    pub route: String,
-    /// (上期 SQL, 环比标签如"较上月")——仅高频聚合单指标时有
-    pub prev: Option<(String, String)>,
-    /// 额外基期查询（销售类通常为同比）。第一基期继续走 `prev`，保证旧调用与精简模式兼容。
-    pub comparisons: Vec<(String, String)>,
-    /// 补充明细 SQL：单据保留 Entity 头卡，聚合保留 KPI 卡，再追加图表/表格。
-    /// CSV 与 AI 分析使用补充明细行，SQL 展示保留两次查询。
-    pub detail: Option<String>,
-    /// 销售单指标 KPI 的同窗补充 SQL（一条五值：销售额/不含税成本/不含税收入/毛利额/毛利率，
-    /// 指标集＝`sales_fact::CONTEXT_METRICS`）。**只有 sales_fact 标量命中**（无维度、单指标）
-    /// 由装配方给出；取数/落账一切失败 = None，主回答一个字符不变（`r.sql` 不追加它——
-    /// 金标把展示 SQL 逐字钉死）。
-    pub sales_context: Option<String>,
-}
+// T8-B5：`DirectOutcome` / `DirectHit` 已下沉 `dms_semantic::direct_types`
+// （那两条 ponytail 注记说的「届时本类型删掉」就是此刻）。这里只 re-export，
+// 让 `answerers::hits::DirectHit` 这条既有路径继续可用。
+pub use dms_semantic::{DirectHit, DirectOutcome};
 
 /// 「谁产出 `DirectHit`」是入参：`try_compose`（异步，读注册表）与 `try_direct`（同步，手工模板）
 /// 都住在 `server/src/direct.rs`，agent 调不到。
@@ -109,7 +92,52 @@ pub async fn land(
     hit: DirectHit,
     t0: Instant,
 ) -> anyhow::Result<Option<AskResult>> {
-    let DirectHit { sql, route, prev, comparisons, detail, sales_context } = hit;
+    if let DirectOutcome::Clarification(note) = &hit.outcome {
+        let mut r = crate::ask::intent_reply(cx.question, t0, vec![]);
+        r.caliber_note = Some(note.clone());
+        return Ok(Some(r));
+    }
+    let mut planned_evidence = hit.intent_evidence.clone();
+    planned_evidence.comparison_count = usize::from(hit.prev.is_some()) + hit.comparisons.len();
+    planned_evidence.detail = hit.detail.is_some();
+    // 🔴 「不可计算」卡**不过覆盖闸**（2026-08-14 回归 E05/E08）：
+    //
+    // 它按设计就不覆盖用户槽位 —— 那张卡的 SQL 是
+    // `SELECT '不可计算' AS 数据状态 … FROM dms_ods.t_dict_value LIMIT 1`，
+    // 没有时间谓词、没有指标，因为它**不是在回答**，是在明确地说「这个事实数仓里没有」。
+    // 拿覆盖闸判它必然 blocking → 回落下一成员 → 最后由自由 SQL 接手，
+    // 而自由 SQL 会去找一个**名字像**的字段替代（实测「本月开票金额」被答成
+    // `fin_ads.ads_fin_profit_loss_dnf.financial_income` 的合计，收据还是 verified）——
+    // 正是这张卡当初要拦的那件事。
+    let unavailable = dms_semantic::fastpath::is_unavailable_card(&hit);
+    if unavailable {
+        tracing::info!(route = %hit.route, "「不可计算」卡直接落地（按设计不覆盖槽位，不过覆盖闸）");
+    }
+    let coverage =
+        crate::intent::direct_coverage(cx.intent, &hit.sql, &planned_evidence, cx.source.dialect());
+    // 确定性模板：硬阻断才回落下一成员。软降级（证不出来但没删槽）继续执行 ——
+    // 模板 SQL 是代码写死的，它「证不出来」通常是闸门读不懂而不是模板错了；
+    // 收据仍会因 `unverifiable` 降到 review（`attach_intent_summary` 重算同一份）。
+    if !unavailable && coverage.blocking() {
+        tracing::warn!(route = %hit.route, ?coverage, "确定性路径未证明结构化意图覆盖 → 回落下一成员");
+        return Ok(None);
+    }
+    if !unavailable && coverage.needs_review() {
+        tracing::warn!(route = %hit.route, ?coverage, "确定性路径部分槽位证不出来 → 执行但收据标 review");
+    }
+    let DirectHit {
+        outcome: DirectOutcome::Data,
+        sql,
+        route,
+        prev,
+        comparisons,
+        detail,
+        sales_context,
+        intent_evidence,
+    } = hit
+    else {
+        unreachable!("澄清分支已提前返回")
+    };
     let gated = match gate_on(cx.p, &sql, cx.scope, cx.ds_global, cx.source.dialect()) {
         Ok(s) => Some(s),
         Err(e) if is_guard_err(&e) => {
@@ -204,6 +232,17 @@ pub async fn land(
     if let Some(c) = context_rows {
         attach_sales_context(c, &mut r);
     }
+    // prev/detail 的计划存在不等于执行成功；终态收据只认真正落到账上的结果。
+    let mut executed_evidence = intent_evidence;
+    executed_evidence.comparison_count = r.comparisons.len();
+    executed_evidence.detail =
+        r.supplemental.is_some() || (r.route == "direct-doc" && r.sql.contains("-- 明细"));
+    let final_coverage =
+        crate::intent::direct_coverage(cx.intent, &r.sql, &executed_evidence, cx.source.dialect());
+    r.intent_summary = Some(
+        cx.intent_attempt
+            .summary(Some(&final_coverage), &executed_evidence),
+    );
     Ok(Some(r))
 }
 
@@ -294,6 +333,7 @@ fn attach_detail(detail: (String, dms_connector::source::RowSet), replace_primar
         ))
         .collect();
     if blocks.is_empty() {
+        #[rustfmt::skip]
         blocks.push(dms_kernel::present::Block::Entity { pairs: header_pairs });
     }
     blocks.extend(dview.blocks);
@@ -595,5 +635,33 @@ mod tests {
         let built = land.find("table_answer(&scoped, rs, route, t0)").expect("land 构造点没了");
         let marked_at = land.find("mark_derived_sql(&r.route").expect("land 里没给推导 SQL 打标");
         assert!(built < marked_at, "打标必须在 table_answer 之后");
+    }
+}
+
+#[cfg(test)]
+mod unavailable_card_tests {
+    /// 🔴 「不可计算」卡不许被覆盖闸挡回去（2026-08-14 回归 E05/E08）。
+    ///
+    /// 那张卡按设计就不覆盖用户槽位（没有时间谓词、没有指标，因为它不是在回答，
+    /// 是在说「这个事实数仓里没有」）。被挡回去之后由自由 SQL 接手，而自由 SQL 会去找一个
+    /// **名字像**的字段替代 —— 实测「本月开票金额」被答成
+    /// `fin_ads.ads_fin_profit_loss_dnf.financial_income` 的合计，收据还是 verified。
+    /// 正是这张卡当初要拦的那件事。
+    #[test]
+    fn unavailable_card_bypasses_the_coverage_gate() {
+        let src = include_str!("hits.rs");
+        let prod = src.split("
+#[cfg(test)]").next().unwrap();
+        let body = prod.split("pub async fn land(").nth(1).expect("land 改名了");
+        assert!(
+            body.contains("is_unavailable_card(&hit)"),
+            "没识别「不可计算」卡：它会被覆盖闸挡回去，然后自由 SQL 拿相似字段顶上"
+        );
+        assert!(
+            body.contains("if !unavailable && coverage.blocking()"),
+            "硬阻断分支没排除「不可计算」卡：{body}"
+        );
+        // 其它模板仍必须过闸（这条豁免只给「明确说没有」的那一张）
+        assert!(body.contains("coverage.blocking()"), "覆盖闸整条没了 —— 那是另一个方向的错");
     }
 }

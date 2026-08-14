@@ -367,8 +367,18 @@ fn looks_like_goods_spec(value: &str) -> bool {
 /// 不再交给 fast-LLM 二分类抛硬币 —— 实测同一句「线下-揭阳市和利食品有限公司」17 秒内
 /// 被判成 knowledge 两次、entity-card 一次（query_log 2026-08-10 01:18）。
 pub(crate) fn entity_form_hit(question: &str) -> bool {
-    let Some(parsed) = parse_entity(question) else { return false };
-    looks_like_company(&parsed.value) || looks_like_goods_spec(&parsed.value)
+    entity_form_surface(question).is_some()
+}
+
+/// 同一份形态证据，另外把**实体名本体**交出来（前缀/时间词/尾部语义已剥）。
+///
+/// 反问卡的候选问法必须拿它拼，不能拿整句拼：整句拼出来的是
+/// 「小虎青菜香菇薄皮包子420g 的信息 和 拆单标准 的订单明细」，点一次长一截，
+/// 再点就是「… 的订单明细 的订单明细」（2026-08-13 生产截图）。
+pub(crate) fn entity_form_surface(question: &str) -> Option<String> {
+    let parsed = parse_entity(question)?;
+    (looks_like_company(&parsed.value) || looks_like_goods_spec(&parsed.value))
+        .then_some(parsed.value)
 }
 
 /// auto 模式（无「客户/商品/员工」显式前缀）的类型收窄：公司形态证据只留组织类实体。
@@ -611,13 +621,28 @@ impl Answerer for EntityAnswerer {
     /// 词法门（同步无 IO）：只解析“实体本身/实体资料”问法；带指标或关系的长问句交给分析链。
     /// （`answer` 会复跑一次完整 `parse_entity` —— Router 形状要求 accept/answer 分离，
     ///   同 graph.rs 的「第二次识别」注释；词法门本就为省 IO，重复 CPU 解析是有意付的。）
+    // 🔴 合同缺席（`Unknown`/`Invalid`/`Unavailable`）时按**词法门**放行，不是拒绝：
+    // `AGENT-ARCHITECTURE §3.1` 写的是「已有确定性路径仍可尝试，但只能标记为 review」。
+    // `is_some_and` 在 None 时恒 false ＝ 无合同就一个确定性成员都不出手，于是 fast 模型
+    // 一次抖动整轮掉进反问卡（同题不同答，2026-08-13 实测）。收据侧无需另加判据：
+    // `attach_trust` 的 `intent_unverified` 已经把这一档钉成 review。
     fn accept(&self, cx: &AskCtx<'_>) -> bool {
-        parse_entity(cx.question).is_some()
+        cx.intent
+            .map_or(true, crate::intent::IntentV1::entity_card_compatible)
+            && parse_entity(cx.question).is_some()
     }
 
     fn answer<'a>(&'a self, cx: &'a AskCtx<'a>) -> dms_kernel::BoxFut<'a, anyhow::Result<Option<AskResult>>> {
         Box::pin(async move {
-            let Some(parsed) = parse_entity(cx.question) else { return Ok(None) };
+            if !cx
+                .intent
+                .map_or(true, crate::intent::IntentV1::entity_card_compatible)
+            {
+                return Ok(None);
+            }
+            let Some(parsed) = parse_entity(cx.question) else {
+                return Ok(None);
+            };
             if parsed.kind == Some(Kind::Category) {
                 return category::card(cx, &parsed.value, true).await;
             }
@@ -725,6 +750,31 @@ async fn candidates_for(
     if kind == Kind::Employee && !can_view_employee(cx) {
         return Ok(Vec::new());
     }
+    if kind == Kind::Customer {
+        let field = match field {
+            MatchField::Code => crate::entity_resolver::CustomerMatchField::Code,
+            MatchField::Name => crate::entity_resolver::CustomerMatchField::Name,
+            MatchField::Alias => crate::entity_resolver::CustomerMatchField::Alias,
+            MatchField::Auto | MatchField::Model => {
+                crate::entity_resolver::CustomerMatchField::Auto
+            }
+        };
+        return match crate::entity_resolver::customer_candidates(cx, value, field, exact).await {
+            Ok(bindings) => Ok(bindings
+                .into_iter()
+                .map(|binding| Candidate {
+                    kind,
+                    code: binding.canonical_code,
+                    name: binding.canonical_name,
+                })
+                .collect()),
+            Err(error) => {
+                // 实体卡原有降级语义：主档探针不可用时交给后续成员，不把辅助解析故障拖成整问失败。
+                tracing::warn!(err = %error, value, "共享客户解析失败 → 实体卡按零候选回落");
+                Ok(Vec::new())
+            }
+        };
+    }
     let safe = esc(value);
     if kind == Kind::Goods && field == MatchField::Model {
         // 型号嵌在商品**名称**里（2026-08-07 实测数仓：DHT150-6 只在 goods_name/sku_name
@@ -748,10 +798,7 @@ async fn candidates_for(
     }
     let condition = candidate_condition(kind, field, &safe, exact);
     let sql = match kind {
-        Kind::Customer => format!(
-            "SELECT c.customer_code, c.customer_name FROM t_customer c \
-             WHERE c.deleted_flag = 0 AND ({condition}) ORDER BY c.customer_name LIMIT 8"
-        ),
+        Kind::Customer => unreachable!("客户候选已由共享 resolver 处理"),
         Kind::Goods => format!(
             "SELECT DISTINCT g.goods_code, g.goods_name FROM t_goods g \
              WHERE g.deleted_flag = 0 AND ({condition}) ORDER BY g.goods_name LIMIT 8"
@@ -898,6 +945,7 @@ fn candidate_card(cx: &AskCtx<'_>, query: &str, candidates: Vec<Candidate>) -> A
         clarify_options: vec![],
         value_labels: vec![],
         sales_context: None,
+        intent_summary: None,
     }
 }
 
@@ -1522,8 +1570,7 @@ fn merge_distribution(customers: Option<RowSet>, regions: Option<RowSet>) -> Opt
         RowSet {
             columns: vec!["分布维度".into(), "编码".into(), "名称".into(), "销量".into(), "销售额".into()],
             rows,
-            redacted: vec![],
-        },
+            redacted: vec![], truncated: false },
         truncated,
     ))
 }
@@ -1560,7 +1607,7 @@ fn build_card(
     drill: Vec<String>,
     cx: &AskCtx<'_>,
 ) -> AskResult {
-    let RowSet { columns, rows, redacted } = recent;
+    let RowSet { columns, rows, redacted, .. } = recent;
     let row_count = rows.len();
     AskResult {
         sql: sql.to_string(),
@@ -1615,6 +1662,7 @@ fn build_card(
         clarify_options: vec![],
         value_labels: vec![],
         sales_context: None,
+        intent_summary: None,
     }
 }
 
@@ -1951,8 +1999,7 @@ mod tests {
         let rs = RowSet {
             columns: vec!["联系人".into(), "联系电话".into(), "首次下单".into(), "订单数".into()],
             rows: vec![vec![serde_json::Value::String(String::new()), serde_json::Value::Null, serde_json::Value::Null, serde_json::json!(0)]],
-            redacted: vec!["联系电话".into()],
-        };
+            redacted: vec!["联系电话".into()], truncated: false };
         assert_eq!(
             entity_pairs(Some(&rs)),
             vec![
@@ -2112,6 +2159,7 @@ mod tests {
                 })
                 .collect(),
             redacted: vec![],
+            truncated: false,
         };
         // 6+6=12 行：合并后 ≥10 但两路都没顶到 LIMIT —— 不许误报截断
         let (merged, truncated) = merge_distribution(Some(mk(6)), Some(mk(6))).unwrap();

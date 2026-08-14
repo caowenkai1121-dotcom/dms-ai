@@ -56,8 +56,7 @@ use serde_json::{json, Value};
 
 use crate::dms_policy::principal;
 use crate::{chat, AppState};
-use dms_agent::triage;
-use dms_semantic::registry::datasource as ds_reg;
+use dms_agent::intent::IntentRoute;
 
 /// 与 mcp_api 同款：(HTTP 状态码, 协议体)。HTTP 码给网关/抓包看，body.code 给小程序拦截器看。
 type ApiErr = (StatusCode, Json<Value>);
@@ -446,7 +445,7 @@ pub struct XcxAskReq {
     prev_sql: Option<String>,
 }
 
-/// `POST /api/xcx/ask`：与 `/api/ask` 完全同一条问答管道（分诊 → `crate::ask` /
+/// `POST /api/xcx/ask`：与 `/api/ask` 完全同一条问答管道（统一意图准备 → Data/Knowledge /
 /// `kb_answer`），只是身份来源从 Bearer 会话换成 `x-access-token`，响应套小程序协议。
 pub async fn ask(
     State(st): State<Arc<AppState>>,
@@ -454,28 +453,50 @@ pub async fn ask(
     Json(req): Json<XcxAskReq>,
 ) -> Result<Json<Value>, ApiErr> {
     let gate = ask_gate(&st, &headers, &req).await?;
-    // 【混合查询】小程序无 chip、恒自动模式，与 `/api/ask` 同一份两级判据（`hybrid_split`）：
-    // 命中走两路并行 + AI 综合，payload 带 `kb` 键（老客户端按未知键忽略，向后兼容）。
-    if let Some((kb_q, data_q)) = crate::hybrid_split(&gate.question) {
-        let payload = xcx_hybrid_payload(&st, &gate, &kb_q, &data_q).await?;
-        return Ok(ask_finish(&st, &gate, payload).await);
-    }
-    // 分诊（同 api_ask：无强制 chip，主源元数据判 Data/Knowledge；分诊内部不失败）
-    let intent = triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &gate.question, None).await;
-    let payload = match intent {
-        triage::Intent::Data => ask_data_payload(&st, &gate).await?,
-        triage::Intent::Knowledge => {
-            let a = crate::kb_answer(&st, &gate.p, None, &gate.question).await.map_err(|_| {
-                fail(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    422,
-                    "暂时无法完成知识检索，请稍后重试",
-                )
-            })?;
-            serde_json::to_value(&a).unwrap_or_else(|e| {
+    let prev = gate
+        .prev
+        .as_ref()
+        .map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
+    let prepared = crate::prepare_ask(&st, &gate.question, prev).await;
+    let payload = match prepared.question.route() {
+        // 合同不可用 ≠ 知识库不能答（同 `/api/ask`，见 `unknown_route_kb_fallback` 的红字）。
+        // 只做检索、不生成任何 SQL；查到带引用的内容才顶替卡片。
+        IntentRoute::Unknown => {
+            match crate::unknown_route_kb_fallback(
+                &st,
+                &gate.p,
+                None,
+                &prepared.question.effective_question,
+            )
+            .await
+            {
+                Some(a) => serde_json::to_value(&a)
+                    .expect("Answer 是纯数据 struct，派生 Serialize 不会失败"),
+                None => serde_json::to_value(prepared.question.clarification_result())
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+            }
+        }
+        IntentRoute::Hybrid => xcx_hybrid_payload(&st, &gate, &prepared).await?,
+        IntentRoute::Data => ask_data_payload(&st, &gate, &prepared).await?,
+        IntentRoute::Knowledge => {
+            let a = crate::kb_answer(&st, &gate.p, None, &prepared.question.effective_question)
+                .await
+                .map_err(|_| {
+                    fail(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        422,
+                        "暂时无法完成知识检索，请稍后重试",
+                    )
+                })?;
+            let mut payload = serde_json::to_value(&a).unwrap_or_else(|e| {
                 tracing::warn!(conv_id = gate.conv_id, reason = %e, "知识检索结果序列化失败，回空对象");
                 json!({})
-            })
+            });
+            payload["intent_summary"] = crate::knowledge_summary_value(&prepared, &a);
+            if prepared.question.effective_question != gate.question {
+                payload["resolved_question"] = json!(prepared.question.effective_question);
+            }
+            payload
         }
     };
     Ok(ask_finish(&st, &gate, payload).await)
@@ -493,27 +514,65 @@ pub async fn ask_stream(
 ) -> Result<axum::response::Response, ApiErr> {
     use axum::response::IntoResponse;
     let gate = ask_gate(&st, &headers, &req).await?;
-    // 【混合查询】与 `/api/xcx/ask` 同一判据：命中即回普通 JSON（协议与 Data 臂逐字相同，
-    // 客户端按 content-type 分派），SSE 协议一字不动。
-    if let Some((kb_q, data_q)) = crate::hybrid_split(&gate.question) {
-        let payload = xcx_hybrid_payload(&st, &gate, &kb_q, &data_q).await?;
-        return Ok(ask_finish(&st, &gate, payload).await.into_response());
-    }
-    let intent = triage::triage(&st.llm, st.owned.pool(), ds_reg::DMS_DS_ID, &gate.question, None).await;
-    match intent {
-        triage::Intent::Data => {
-            let payload = ask_data_payload(&st, &gate).await?;
+    let prev = gate
+        .prev
+        .as_ref()
+        .map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
+    let prepared = crate::prepare_ask(&st, &gate.question, prev).await;
+    match prepared.question.route() {
+        // 与同文件非流式版逐字同义：合同不可用先问一次库，查到带引用的内容才顶替卡片。
+        // 少了这一处，同一个人在小程序里换个开关（流式/非流式）就得到两种答案。
+        IntentRoute::Unknown => {
+            let payload = match crate::unknown_route_kb_fallback(
+                &st,
+                &gate.p,
+                None,
+                &prepared.question.effective_question,
+            )
+            .await
+            {
+                Some(a) => serde_json::to_value(&a)
+                    .expect("Answer 是纯数据 struct，派生 Serialize 不会失败"),
+                None => serde_json::to_value(prepared.question.clarification_result())
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+            };
             Ok(ask_finish(&st, &gate, payload).await.into_response())
         }
-        triage::Intent::Knowledge => {
+        IntentRoute::Hybrid => {
+            let payload = xcx_hybrid_payload(&st, &gate, &prepared).await?;
+            Ok(ask_finish(&st, &gate, payload).await.into_response())
+        }
+        IntentRoute::Data => {
+            let payload = ask_data_payload(&st, &gate, &prepared).await?;
+            Ok(ask_finish(&st, &gate, payload).await.into_response())
+        }
+        IntentRoute::Knowledge => {
             // `Principal` → `Viewer` 与同步分支同一个映射（`kb_answer` 内部也是它）
             let v = dms_agent::answerers::knowledge::viewer(&gate.p);
             let mut extra = serde_json::Map::new();
             extra.insert("conv_id".into(), json!(gate.conv_id));
+            extra.insert(
+                "intent_summary".into(),
+                serde_json::to_value(prepared.question.intent_summary())
+                    .expect("IntentSummary 是纯数据 struct，派生 Serialize 不会失败"),
+            );
+            if prepared.question.effective_question != gate.question {
+                extra.insert(
+                    "resolved_question".into(),
+                    json!(prepared.question.effective_question),
+                );
+            }
             // 持久化在工人里做（答案落定后存 user/ai 两条）；错误文案与同步分支的 422 同一句
-            let rx = crate::kb_api::spawn_kb_worker(&st, v, None, &gate.question, Some(gate.conv_id), |_| {
-                "暂时无法完成知识检索，请稍后重试".to_string()
-            });
+            let rx = crate::kb_api::spawn_kb_worker(
+                &st,
+                v,
+                None,
+                &prepared.question.effective_question,
+                Some(&gate.question),
+                Some(extra.clone()),
+                Some(gate.conv_id),
+                |_| "暂时无法完成知识检索，请稍后重试".to_string(),
+            );
             Ok(crate::kb_api::sse_response(rx, extra).into_response())
         }
     }
@@ -598,12 +657,15 @@ async fn ask_gate(
     Ok(XcxAskGate { p, conv_id, question: question.to_string(), prev })
 }
 
-/// `ask` / `ask_stream` 共用的问数分支：`crate::ask` → 错误映射（403/422 逐字同 api_ask
+/// `ask` / `ask_stream` 共用的问数分支：`crate::ask_prepared` → 错误映射（403/422 逐字同 api_ask
 /// 口径）→ payload。观测写入句柄丢弃（fire-and-forget，同 api_ask / mcp_api）。
-async fn ask_data_payload(st: &AppState, gate: &XcxAskGate) -> Result<Value, ApiErr> {
+async fn ask_data_payload(
+    st: &AppState,
+    gate: &XcxAskGate,
+    prepared: &crate::PreparedAsk,
+) -> Result<Value, ApiErr> {
     let conv_id_str = gate.conv_id.to_string();
-    let prev_turn = gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
-    let (r, _log) = crate::ask(
+    let (r, _log) = crate::ask_prepared(
         &st.llm,
         &st.auth_mysql,
         &st.mysql,
@@ -611,8 +673,7 @@ async fn ask_data_payload(st: &AppState, gate: &XcxAskGate) -> Result<Value, Api
         st.owned.pool(),
         &st.embed,
         &gate.p,
-        &gate.question,
-        prev_turn,
+        prepared,
         None, // ds：小程序侧不提供选源，后端选源（可见源只有一个时直通主源）
         Some(&conv_id_str),
         st.sc_samples,
@@ -645,26 +706,26 @@ async fn ask_data_payload(st: &AppState, gate: &XcxAskGate) -> Result<Value, Api
 async fn xcx_hybrid_payload(
     st: &AppState,
     gate: &XcxAskGate,
-    kb_q: &str,
-    data_q: &str,
+    prepared: &crate::PreparedAsk,
 ) -> Result<Value, ApiErr> {
     let conv_id = gate.conv_id.to_string();
     let h = crate::HybridAsk {
         question: &gate.question,
         p: &gate.p,
-        prev: gate.prev.as_ref().map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..])),
         ds: None, // 小程序侧不提供选源，后端选源（同 `ask_data_payload`）
         conv_id: Some(conv_id.as_str()),
         space_id: None,
         sc_samples: st.sc_samples,
     };
-    crate::hybrid_payload(st, &h, kb_q, data_q).await.map_err(|(status, _)| {
-        if status == StatusCode::FORBIDDEN {
-            fail(status, 403, "当前账号无权访问该数据源")
-        } else {
-            fail(status, 422, "暂时无法完成本次问数，请调整问题后重试")
-        }
-    })
+    crate::hybrid_payload(st, &h, prepared)
+        .await
+        .map_err(|(status, _)| {
+            if status == StatusCode::FORBIDDEN {
+                fail(status, 403, "当前账号无权访问该数据源")
+            } else {
+                fail(status, 422, "暂时无法完成本次问数，请调整问题后重试")
+            }
+        })
 }
 
 /// `ask` / `ask_stream` 共用的收尾（问数分支；知识库流式的持久化在工人里做）：

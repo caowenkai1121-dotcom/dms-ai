@@ -4,6 +4,7 @@ import KbDocPreview from './KbDocPreview.vue'
 import KbEval from './KbEval.vue'
 import KbGraph from './KbGraph.vue'
 import KbMindmap from './KbMindmap.vue'
+import { ingestUploadState, isActiveIngest, isTerminalIngest } from './ingest-state'
 
 interface DsTable { sheet: string; table: string; rows: number }
 interface Ds { ds_id: string; schema: string; tables: DsTable[]; skipped: string[] }
@@ -11,7 +12,8 @@ interface Ds { ds_id: string; schema: string; tables: DsTable[]; skipped: string
 // 空则回退 directory_path，再退化到 folder_id 现拼路径（SearchHit 同口径）。
 interface Doc {
   doc_id: string; name: string; mime: string; bytes: number
-  status: string; error?: string | null; notice?: string | null
+  status: string; error?: string | null; notice?: string | null; last_ingest_error?: string | null
+  last_ingest_status?: string | null
   enabled?: boolean
   page_count?: number | null; chunk_count?: number | null
   uploaded_by?: string; created_at?: string; updated_at?: string
@@ -49,6 +51,9 @@ interface UploadRow {
   /** doing 的细分阶段：upload=网络传输中（行内百分比），parse=服务端秒回后后台解析中（轮询跟踪） */
   phase?: 'upload' | 'parse'
 }
+interface UploadPollTarget {
+  rowId: number; docId: string; baselineUpdatedAt: string; deadline: number
+}
 
 // 上传支持清单：与服务端 `ingest::EXTS`（23 项）同口径——这里只做选择器过滤与提前反馈，
 // 权威判定永远在服务端 `classify`（两份清单漂移时服务端仍是闸）。
@@ -81,7 +86,7 @@ interface Grant {
 interface RoleOption { role_code: string; role_name: string }
 /** 部门目录项（share_config v2 部门授权）：dept_id 是 t_department.department_id 的字符串形 */
 interface DeptOption { dept_id: string; dept_name: string }
-type Filter = 'all' | 'ready' | 'processing' | 'attention' | 'disabled'
+type Filter = 'all' | 'ready' | 'processing' | 'failed' | 'attention' | 'disabled'
 type WorkbenchTab = 'documents' | 'retrieval' | 'graph' | 'mindmap' | 'eval'
 interface SearchHit {
   chunk_id: number; doc_id: string; doc_name: string
@@ -310,10 +315,11 @@ function statusText(status?: string): string {
   }
 }
 function docStatusText(d: Doc): string {
-  return d.enabled === false ? '已停用' : statusText(d.status)
+  return d.enabled === false ? '已停用' : d.last_ingest_error ? '处理失败' : statusText(d.status)
 }
 function statusHint(d: Doc): string {
   if (d.enabled === false) return '不参与知识检索，原文件与索引仍保留'
+  if (d.last_ingest_error) return d.last_ingest_error
   if (d.error) return d.error
   if (d.notice) return d.notice
   if (d.status === PARTIAL) return '文本已入库，向量索引尚未完成'
@@ -321,11 +327,7 @@ function statusHint(d: Doc): string {
   if (d.status === OK) return '解析与向量索引均已完成'
   return `服务端状态：${d.status || '空'}`
 }
-function uploadState(status?: string): UploadRow['state'] {
-  if (status === OK) return 'ok'
-  if (status === PARTIAL) return 'partial'
-  return 'fail'
-}
+function uploadState(source: IngestOutcome): UploadRow['state'] { return ingestUploadState(source) }
 function updateUpload(id: number, patch: Partial<UploadRow>) {
   const row = uploads.value.find((item) => item.id === id)
   if (row) Object.assign(row, patch)
@@ -383,6 +385,7 @@ function hitLocation(hit: SearchHit): string {
  *  「第 N 页无文本层已用 OCR 补」这类**系统已自动消化**的提示不算（留痕展示即可，没什么可处理的）。 */
 function attentionInfo(d: Doc): { actionable: boolean; reason: string } | null {
   if (d.enabled === false) return null
+  if (d.last_ingest_error) return { actionable: true, reason: d.last_ingest_error.trim() }
   const level = d.quality?.level
   if (!level || level === 'processing' || level === 'good') return null
   const reason = (d.error || d.notice || d.quality?.label || '').trim()
@@ -405,7 +408,7 @@ type PillState = 'ready' | 'processing' | 'attention' | 'disabled' | 'failed'
 /** 状态 pill 配色态：失败从「需处理」里单独染红，其余沿用 displayState 口径。 */
 function pillState(d: Doc): PillState {
   if (d.enabled === false) return 'disabled'
-  if (d.status === 'failed') return 'failed'
+  if (d.status === 'failed' || d.last_ingest_error) return 'failed'
   return displayState(d)
 }
 /** pill 文案：需处理档直接亮服务端质量标签（待向量化/待生效/无可检索内容…），不笼统说「可检索」。 */
@@ -419,7 +422,7 @@ function pillClickable(d: Doc): boolean {
 /** 各状态档的「该怎么处理」指引（pill hover 与原因行同源）：每个非就绪档都要有明确动作。 */
 function statusGuidance(d: Doc): string {
   const writable = canWrite.value
-  if (d.status === 'failed') {
+  if (d.status === 'failed' || d.last_ingest_error) {
     return writable ? '点击本状态重新处理；反复失败请检查原文件后重新上传' : '处理失败，请联系空间管理员重新处理'
   }
   if (d.status === PARTIAL) {
@@ -433,7 +436,7 @@ function statusGuidance(d: Doc): string {
     case '已失效': return '有效期已过、不参与检索：⋯ 菜单「元数据」里调整或清除失效日期'
     case '状态待确认': return '服务端状态未能确认：点击本状态重新处理一次试试'
     default:
-      if (/失败|请重新|重试|不可用/.test(d.error || d.notice || '')) {
+      if (/失败|请重新|重试|不可用/.test(d.last_ingest_error || d.error || d.notice || '')) {
         return writable ? '点击本状态重新处理；仍失败请按提示调整后重新上传' : '请联系空间管理员处理'
       }
       return ''
@@ -450,7 +453,7 @@ function pillTitle(d: Doc): string {
 /** 文件名下的原因行：需处理文档亮原因（错误>提示>质量标签），hover 给完整处理指引；
  *  已消化的提示淡色留痕。 */
 function issueText(d: Doc): string {
-  return attentionInfo(d)?.reason ?? (d.notice || d.error || '')
+  return attentionInfo(d)?.reason ?? (d.last_ingest_error || d.notice || d.error || '')
 }
 /** 原因行的悬浮：原因 + 处理指引（与 pill hover 同一份）。 */
 function issueTitle(d: Doc): string {
@@ -943,11 +946,12 @@ function grantName(g: Grant): string {
 }
 
 const counts = computed(() => {
-  // 单趟聚合：不对 docs 跑 5 趟 filter
-  const c = { all: 0, ready: 0, processing: 0, attention: 0, disabled: 0 }
+  // 单趟聚合：失败独立计数；「需处理」保留非失败的待向量/空内容/有效期等动作项。
+  const c = { all: 0, ready: 0, processing: 0, failed: 0, attention: 0, disabled: 0 }
   for (const d of docs.value) {
     c.all++
-    c[displayState(d)]++
+    if (d.enabled !== false && (d.status === 'failed' || !!d.last_ingest_error)) c.failed++
+    else c[displayState(d)]++
   }
   return c
 })
@@ -958,6 +962,7 @@ const filters = computed<{ value: Filter; label: string; count: number }[]>(() =
   { value: 'all', label: '全部', count: counts.value.all },
   { value: 'ready', label: '可检索', count: counts.value.ready },
   { value: 'processing', label: '处理中', count: counts.value.processing },
+  { value: 'failed', label: '处理失败', count: counts.value.failed },
   { value: 'attention', label: '需处理', count: counts.value.attention },
   { value: 'disabled', label: '已停用', count: counts.value.disabled },
 ])
@@ -966,12 +971,12 @@ const visibleDocs = computed(() => {
   return docs.value.filter((d) => {
     if (selectedFolderId.value === '__unfiled__' && d.folder_id) return false
     if (selectedFolderId.value && selectedFolderId.value !== '__unfiled__' && d.folder_id !== selectedFolderId.value) return false
-    const state = displayState(d)
+    const state: Filter = d.enabled !== false && (d.status === 'failed' || !!d.last_ingest_error) ? 'failed' : displayState(d)
     const inFilter = filter.value === 'all'
       || filter.value === state
     if (!inFilter) return false
     if (!needle) return true
-    return [d.name, d.mime, d.status, d.error, d.notice, d.uploaded_by,
+    return [d.name, d.mime, d.status, d.last_ingest_error, d.error, d.notice, d.uploaded_by,
       d.business_domain, d.source_uri, d.document_family, d.document_revision, folderPath(d), ...(d.tags ?? [])]
       .some((v) => String(v ?? '').toLocaleLowerCase().includes(needle))
   })
@@ -1015,6 +1020,7 @@ async function load(space: string, requestId: number, epoch: number): Promise<bo
     if (!resp.ok) throw new Error(data.error ?? `HTTP ${resp.status}`)
     if (requestId !== assetsRequestId || !contextIsCurrent(epoch, space)) return null
     docs.value = data.docs ?? []
+    resumeUploadPollForActiveDocs(space, docs.value)
     const hasEmbeddedFolders = Array.isArray(data.folders)
     const embeddedFolders = normalizeFolders(data.folders)
     if (hasEmbeddedFolders) {
@@ -1029,7 +1035,6 @@ async function load(space: string, requestId: number, epoch: number): Promise<bo
   } catch (e) {
     if (requestId !== assetsRequestId || !contextIsCurrent(epoch, space)) return null
     listErr.value = errorText(e)
-    docs.value = []
     return null
   } finally {
     if (requestId === assetsRequestId && contextIsCurrent(epoch, space)) loading.value = false
@@ -1105,6 +1110,7 @@ async function loadSpaces(preferred?: string) {
           : (spaces.value[0]?.space_id ?? '')
     const changed = next !== spaceId.value
     if (changed) {
+      clearUploadPolls()
       contextEpoch++
       assetsRequestId++
       retrievalRequestId++
@@ -1122,23 +1128,14 @@ async function loadSpaces(preferred?: string) {
     }
   } catch (e) {
     if (requestId !== spacesRequestId) return
-    contextEpoch++
-    assetsRequestId++
-    retrievalRequestId++
-    metadataRequestId++
-    grantsRequestId++
-    uploadRequestId++
     spacesErr.value = errorText(e)
-    spaces.value = []
-    kbManager.value = false
-    spaceId.value = ''
     loading.value = false
     foldersLoading.value = false
-    resetSpaceScopedState()
   }
 }
 
 async function changeSpace() {
+  clearUploadPolls()
   const requestSpace = spaceId.value
   spacesRequestId++
   contextEpoch++
@@ -1345,12 +1342,6 @@ async function saveFolderEdit() {
 async function deleteSelectedFolder() {
   const folder = selectedFolder.value
   if (!folder || folderDeletingId.value) return
-  const childCount = folderChildren.value.get(folder.folder_id) ?? 0
-  const docCount = Math.max(folder.doc_count ?? 0, folderCounts.value.get(folder.folder_id) ?? 0)
-  if (childCount || docCount) {
-    actionErr.value = `无法删除“${folderLabel(folder)}”：目录中还有 ${childCount} 个子文件夹、${docCount} 份文档，请先移动后再删除。`
-    return
-  }
   folderDeleteErr.value = ''
   folderDeleteConfirm.value = true
 }
@@ -1546,58 +1537,109 @@ function uploadViaXhr(file: File, space: string, folderId: string, onProgress: (
 /** 上传/文档详情的公共字段子集（秒回响应与列表行都按这个口径读）。 */
 interface IngestOutcome {
   status?: string; chunk_count?: number | null; page_count?: number | null
-  error?: string | null; notice?: string | null
-}
-/** 是否终态：embedded/failed 直接落定；chunked 带降级文案（error/notice）也算落定——无文案说明向量还在补。 */
-function isTerminalIngest(source: IngestOutcome): boolean {
-  if (source.status === OK || source.status === 'failed') return true
-  return source.status === PARTIAL && !!(source.error || source.notice)
+  error?: string | null; notice?: string | null; last_ingest_error?: string | null
+  updated_at?: string | null
 }
 /** 终态行的统一文案：与异步化之前同步处理的展示口径一致（状态 + 切片/页数 + 降级文案）。 */
 function ingestOutcomeText(source: IngestOutcome): string {
-  const parts = [statusText(source.status), `${source.chunk_count ?? 0} 个切片`]
+  const parts = [source.last_ingest_error ? '处理失败' : statusText(source.status), `${source.chunk_count ?? 0} 个切片`]
   if (source.page_count) parts.push(`${source.page_count} 页`)
-  if (source.error) parts.push(String(source.error))
+  if (source.last_ingest_error) parts.push(String(source.last_ingest_error))
+  else if (source.error) parts.push(String(source.error))
   else if (source.notice) parts.push(String(source.notice))
   return parts.join(' · ')
 }
 
-const uploadPollTimers = new Set<number>()
-/** 秒回（parsing 等进行态）后的轮询：每 2s 复用列表加载按 doc_id 对状态，终态落定或 5 分钟超时即停。
- *  epoch/space 防护与组件内其他异步同款：切空间/卸载后不再续 poll（contextEpoch 单调递增）。 */
-function pollUploadDoc(rowId: number, docId: string, space: string, epoch: number) {
-  const deadline = Date.now() + UPLOAD_POLL_TIMEOUT_MS
-  const schedule = () => {
-    const timer = window.setTimeout(() => {
-      uploadPollTimers.delete(timer)
-      void tick()
-    }, UPLOAD_POLL_MS)
-    uploadPollTimers.add(timer)
-  }
-  const tick = async () => {
-    if (!contextIsCurrent(epoch, space)) return
-    if (Date.now() > deadline) {
-      updateUpload(rowId, {
-        state: 'partial', phase: undefined,
-        msg: '后台处理超过 5 分钟未落定：可能仍在处理，请稍后刷新列表查看。',
-      })
-      return
-    }
-    try {
-      await loadKnowledgeAssets(space, epoch)
-      if (!contextIsCurrent(epoch, space)) return
-      const doc = docs.value.find((item) => item.doc_id === docId)
-      if (doc && isTerminalIngest(doc)) {
-        updateUpload(rowId, {
-          state: uploadState(doc.status), msg: ingestOutcomeText(doc),
-          ds: doc.datasource ?? null, phase: undefined,
-        })
-        return
+const uploadPolls = new Map<string, Map<number, UploadPollTarget>>()
+const resumedUploadPolls = new Map<string, number>()
+let uploadPollTimer: number | undefined
+let uploadPollRunning = false
+
+function scheduleUploadPoll() {
+  if (uploadPollTimer !== undefined || uploadPollRunning || (!uploadPolls.size && !resumedUploadPolls.size)) return
+  uploadPollTimer = window.setTimeout(() => {
+    uploadPollTimer = undefined
+    void tickUploadPolls()
+  }, UPLOAD_POLL_MS)
+}
+
+/** 同一空间的全部异步入库共用一次列表刷新，避免 N 份文档产生 N 个全量轮询。 */
+async function tickUploadPolls() {
+  if (uploadPollRunning) return
+  uploadPollRunning = true
+  try {
+    const spaces = new Set([...uploadPolls.keys(), ...resumedUploadPolls.keys()])
+    for (const space of spaces) {
+      const targets = uploadPolls.get(space)
+      if (space !== spaceId.value || (!targets?.size && !resumedUploadPolls.has(space))) {
+        uploadPolls.delete(space)
+        resumedUploadPolls.delete(space)
+        continue
       }
-    } catch { /* 本轮拉取失败：下趟再试，不当作上传失败 */ }
-    schedule()
+      const epoch = contextEpoch
+      try { await loadKnowledgeAssets(space, epoch) } catch { /* 刷新失败下轮再试 */ }
+      if (!contextIsCurrent(epoch, space)) {
+        uploadPolls.delete(space)
+        resumedUploadPolls.delete(space)
+        continue
+      }
+      const now = Date.now()
+      for (const [rowId, target] of [...(targets ?? [])]) {
+        if (now > target.deadline) {
+          updateUpload(rowId, {
+            state: 'partial', phase: undefined,
+            msg: '后台处理超过 5 分钟未落定：可能仍在处理，请稍后刷新列表查看。',
+          })
+          targets?.delete(rowId)
+          continue
+        }
+        const doc = docs.value.find((item) => item.doc_id === target.docId)
+        const changed = !target.baselineUpdatedAt || (!!doc?.updated_at && doc.updated_at !== target.baselineUpdatedAt)
+        if (doc && changed && isTerminalIngest(doc)) {
+          updateUpload(rowId, {
+            state: uploadState(doc), msg: ingestOutcomeText(doc),
+            ds: doc.datasource ?? null, phase: undefined,
+          })
+          targets?.delete(rowId)
+        }
+      }
+      if (!targets?.size) uploadPolls.delete(space)
+      const resumedDeadline = resumedUploadPolls.get(space)
+      if (resumedDeadline !== undefined
+        && (now > resumedDeadline || !docs.value.some(isActiveIngest))) resumedUploadPolls.delete(space)
+    }
+  } finally {
+    uploadPollRunning = false
+    scheduleUploadPoll()
   }
-  schedule()
+}
+
+function clearUploadPolls() {
+  if (uploadPollTimer !== undefined) window.clearTimeout(uploadPollTimer)
+  uploadPollTimer = undefined
+  uploadPolls.clear()
+  resumedUploadPolls.clear()
+}
+
+/** load 成功后从服务端真状态恢复轮询；已有登记不续期，避免僵尸任务无限刷新。 */
+function resumeUploadPollForActiveDocs(space: string, list: Doc[]) {
+  if (!contextIsCurrent(contextEpoch, space)) return
+  if (!list.some(isActiveIngest)) {
+    resumedUploadPolls.delete(space)
+    return
+  }
+  if (!resumedUploadPolls.has(space)) {
+    resumedUploadPolls.set(space, Date.now() + UPLOAD_POLL_TIMEOUT_MS)
+  }
+  scheduleUploadPoll()
+}
+
+function pollUploadDoc(rowId: number, docId: string, space: string, epoch: number, baselineUpdatedAt = '') {
+  if (!contextIsCurrent(epoch, space)) return
+  const targets = uploadPolls.get(space) ?? new Map<number, UploadPollTarget>()
+  targets.set(rowId, { rowId, docId, baselineUpdatedAt, deadline: Date.now() + UPLOAD_POLL_TIMEOUT_MS })
+  uploadPolls.set(space, targets)
+  scheduleUploadPoll()
 }
 
 // route：按文件给出目标文件夹与目的地文案（文件夹层级上传用）；不传则全部进 uploadFolderId 当前选择
@@ -1666,18 +1708,20 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
           updateUpload(rowId, { state: 'fail', msg: why, progress: null, phase: undefined })
           continue
         }
-        if (isTerminalIngest(data)) {
+        // 同名覆盖响应带回的是切换前的旧线上行（通常已 embedded），不能按旧终态
+        // 立即收口；必须继续轮询到 updated_at 变化，才知道本次覆盖成功还是失败。
+        if (!data.replaced && isTerminalIngest(data)) {
           // 终态（同步处理完/失败/带降级文案的 chunked）：按原口径落行；同名覆盖带「已覆盖旧版本」
           const coverNote = data.replaced ? ' · 已覆盖旧版本' : ''
           updateUpload(rowId, {
-            state: uploadState(String(data.status ?? '')), msg: ingestOutcomeText(data) + coverNote,
+            state: uploadState(data), msg: ingestOutcomeText(data) + coverNote,
             ds: data.datasource ?? null, progress: null, phase: undefined,
           })
         } else {
           // 进行态（秒回 parsing / 无降级文案的 chunked）：行挂「解析中」，轮询跟踪到终态
           const docId = String(data.doc_id ?? data.id ?? '')
           updateUpload(rowId, { msg: '解析中…（后台建立索引）', progress: null, phase: 'parse' })
-          if (docId) pollUploadDoc(rowId, docId, requestSpace, requestEpoch)
+          if (docId) pollUploadDoc(rowId, docId, requestSpace, requestEpoch, String(data.updated_at ?? ''))
           else updateUpload(rowId, { state: 'partial', phase: undefined, msg: '已提交后台处理：服务端未返回文档标识，请稍后刷新列表查看结果。' })
         }
       } catch (e) {
@@ -1850,10 +1894,14 @@ async function ingestUrl() {
       updateUpload(rowId, { state: 'fail', msg: data.error ?? `HTTP ${resp.status}` })
       return
     }
-    const parts = [statusText(data.status), `${data.chunk_count ?? 0} 个切片`]
-    if (data.page_count) parts.push(`${data.page_count} 页`)
-    if (data.error) parts.push(data.error)
-    updateUpload(rowId, { state: uploadState(data.status), msg: parts.join(' · ') })
+    if (isTerminalIngest(data)) {
+      updateUpload(rowId, { state: uploadState(data), msg: ingestOutcomeText(data), phase: undefined })
+    } else {
+      const docId = String(data.doc_id ?? data.id ?? '')
+      updateUpload(rowId, { state: 'doing', msg: '解析中…（后台建立索引）', phase: 'parse' })
+      if (docId) pollUploadDoc(rowId, docId, requestSpace, requestEpoch, String(data.updated_at ?? ''))
+      else updateUpload(rowId, { state: 'partial', phase: undefined, msg: '已提交后台处理：服务端未返回文档标识，请稍后刷新列表查看结果。' })
+    }
     urlInput.value = ''
     if (contextIsCurrent(requestEpoch, requestSpace)) await loadSpaces(requestSpace)
   } catch (e) {
@@ -1900,7 +1948,14 @@ async function reprocess(d: Doc) {
     })
     const data = await responseJson(response)
     if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`)
-    if (contextIsCurrent(requestEpoch, requestSpace)) await loadSpaces(requestSpace)
+    const baseline = String(data.updated_at ?? d.updated_at ?? '')
+    const deadline = Date.now() + UPLOAD_POLL_TIMEOUT_MS
+    while (contextIsCurrent(requestEpoch, requestSpace) && Date.now() <= deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, UPLOAD_POLL_MS))
+      await loadKnowledgeAssets(requestSpace, requestEpoch)
+      const current = docs.value.find((item) => item.doc_id === d.doc_id)
+      if (current?.updated_at && current.updated_at !== baseline && isTerminalIngest(current)) break
+    }
   } catch (e) {
     if (contextIsCurrent(requestEpoch, requestSpace)) actionErr.value = `重新处理《${d.name}》失败：${errorText(e)}`
   } finally {
@@ -2097,9 +2152,7 @@ onBeforeUnmount(() => {
   metadataRequestId++
   grantsRequestId++
   uploadRequestId++
-  // 在途的轮询定时器也要清：epoch 防护只能阻止续 poll，已在队列的 setTimeout 仍会空发一次
-  for (const timer of uploadPollTimers) window.clearTimeout(timer)
-  uploadPollTimers.clear()
+  clearUploadPolls()
   document.removeEventListener('click', closeMenus)
 })
 
@@ -2245,7 +2298,10 @@ void loadSpaces(props.initialSpace)
               <button type="button" class="stat-card" :class="{ active: filter === 'processing' }" @click="filter = 'processing'">
                 <strong>{{ counts.processing }}</strong><span>处理中</span>
               </button>
-              <button type="button" class="stat-card" :class="{ active: filter === 'attention' }" title="需要重新处理或调整的文档（解析失败/待向量化/内容为空/已失效等，原因显示在文档名下方）；OCR 补页这类已自动消化的提示不计入" @click="filter = 'attention'">
+              <button type="button" class="stat-card failed" :class="{ active: filter === 'failed' }" title="解析或处理失败的文档；点击进入失败列表查看原因并重新处理" @click="filter = 'failed'">
+                <strong>{{ counts.failed }}</strong><span>处理失败</span>
+              </button>
+              <button type="button" class="stat-card" :class="{ active: filter === 'attention' }" title="需要调整的非失败文档（待向量化、内容为空、已失效等，原因显示在文档名下方）；OCR 补页这类已自动消化的提示不计入" @click="filter = 'attention'">
                 <strong>{{ counts.attention }}</strong><span>需处理</span>
               </button>
               <button type="button" class="stat-card" :class="{ active: filter === 'all' }" @click="filter = 'all'">
@@ -2380,11 +2436,11 @@ void loadSpaces(props.initialSpace)
             <span>{{ listErr }}</span>
             <button class="secondary-btn" type="button" :disabled="loading" @click="loadSpaces(spaceId)">重新加载</button>
           </div>
-          <div v-else-if="loading && !docs.length" class="list-state">
+          <div v-if="loading && !docs.length" class="list-state">
             <strong>正在读取知识库</strong>
             <span>请稍候。</span>
           </div>
-          <div v-else-if="!docs.length" class="list-state empty">
+          <div v-else-if="!listErr && !docs.length" class="list-state empty">
             <strong>知识库还是空的</strong>
             <span>上传制度、产品资料、合同模板或业务表格后，即可在对话中检索和引用。</span>
             <button v-if="canWrite" class="primary-btn" type="button" :disabled="busy" @click="openFilePicker">上传第一份文档</button>
@@ -2394,7 +2450,7 @@ void loadSpaces(props.initialSpace)
             <span>调整关键词或切换状态筛选。</span>
             <button class="secondary-btn" type="button" @click="search = ''; filter = 'all'; selectFolder('')">清除筛选</button>
           </div>
-          <template v-else>
+          <template v-if="docs.length && visibleDocs.length">
             <!-- 批量条：勾选后出现；批量操作逐条走既有单文档端点 -->
             <div v-if="checkedIds.length" class="batch-bar" aria-live="polite">
               <span>已选 {{ checkedIds.length }} 项</span>
@@ -2475,7 +2531,7 @@ void loadSpaces(props.initialSpace)
                           @click="toggleState(d); menuDocId = ''"
                         >{{ d.enabled === false ? '启用' : '停用' }}</button>
                         <button
-                          v-if="stateOf(d.status) !== 'ready'" type="button" role="menuitem"
+                          v-if="stateOf(d.status) !== 'ready' || !!d.last_ingest_error" type="button" role="menuitem"
                           :disabled="!!reprocessingId" title="使用服务器保存的原文件重新解析并建立索引"
                           @click="reprocess(d); menuDocId = ''"
                         >重新处理</button>
@@ -2768,7 +2824,7 @@ void loadSpaces(props.initialSpace)
       <div v-if="folderDeleteConfirm && selectedFolder" class="confirm-mask" @click.self="closeFolderDeleteConfirm()">
         <div class="confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="delete-folder-title" @keydown.esc.stop="closeFolderDeleteConfirm()">
           <h3 id="delete-folder-title">删除文件夹？</h3>
-          <p>仅空文件夹可以删除。「{{ folderLabel(selectedFolder) }}」将被删除，且无法撤销。</p>
+          <p>仅没有文档的目录树可以删除。「{{ folderLabel(selectedFolder) }}」及其空子文件夹将被删除，且无法撤销。</p>
           <div v-if="folderDeleteErr" class="action-error" role="alert">{{ folderDeleteErr }}</div>
           <div class="confirm-actions">
             <button class="secondary-btn" type="button" :disabled="!!folderDeletingId" @click="closeFolderDeleteConfirm()">取消</button>
@@ -3135,7 +3191,7 @@ void loadSpaces(props.initialSpace)
 .folder-create-box input { height: 34px; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; outline: 0; background: var(--bg-card); color: var(--text-primary); font: inherit; font-size: 12px; }
 .folder-create-box input:focus { border-color: var(--primary); box-shadow: var(--ring); }
 /* 页头统计卡：点击即筛选（Yuxi 可点统计卡思路） */
-.stat-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px; }
+.stat-cards { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px; }
 .stat-card {
   display: flex; align-items: baseline; gap: 7px; padding: 8px 12px; border: 1px solid var(--border);
   border-radius: 8px; background: var(--bg-card); cursor: pointer; font: inherit; text-align: left;
@@ -3144,6 +3200,8 @@ void loadSpaces(props.initialSpace)
 .stat-card.active { border-color: var(--primary); background: var(--primary-light); box-shadow: inset 0 0 0 1px var(--primary); }
 .stat-card strong { color: var(--text-primary); font-size: 17px; font-variant-numeric: tabular-nums; }
 .stat-card span { color: var(--text-muted); font-size: 11px; }
+.stat-card.failed strong, .stat-card.failed span { color: var(--error-text); }
+.stat-card.failed.active { border-color: var(--error-text); background: var(--error-bg); box-shadow: inset 0 0 0 1px var(--error-text); }
 /* 列表工具条：左面包屑、右搜索 + 筛选下拉 + 刷新（幽灵按钮） */
 .doc-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .doc-toolbar .folder-breadcrumb { flex: 1; min-width: 0; min-height: 0; margin: 0; padding: 0; border: 0; background: transparent; }
@@ -3288,12 +3346,13 @@ td.col-ops { position: relative; overflow: visible; }
 .primary-btn, .secondary-btn, .danger-btn, .icon-btn {
   height: 32px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px;
 }
-.primary-btn { padding: 0 13px; border-color: var(--primary); background: var(--primary); color: #fff; }
+.primary-btn { padding: 0 13px; border-color: var(--primary); background: var(--primary); color: var(--on-primary); }
 .primary-btn:hover { background: var(--primary-hover); }
 .upload-action { flex: 0 0 auto; display: inline-flex; align-items: center; pointer-events: none; }
 .secondary-btn { padding: 0 13px; background: var(--bg-card); color: var(--text-regular); }
 .secondary-btn:hover, .icon-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
-.danger-btn { padding: 0 13px; border-color: var(--error-ring); background: var(--error-text); color: #fff; }
+/* 底色是 --error-text（暗色下 #ec8f8f 偏亮），前景另给一个 token：白字在它上面不过 AA */
+.danger-btn { padding: 0 13px; border-color: var(--error-ring); background: var(--error-text); color: var(--on-error); }
 .icon-btn { width: 32px; padding: 0; background: var(--bg-card); color: var(--text-regular); font-size: 17px; }
 button:disabled { cursor: not-allowed; opacity: .55; }
 .confirm-mask { position: absolute; inset: 0; z-index: 2; display: grid; place-items: center; background: rgba(16, 22, 43, .42); }

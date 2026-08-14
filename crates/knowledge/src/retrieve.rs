@@ -427,6 +427,17 @@ pub async fn search_report(
     // 可见集合为空 → 一条检索查询都不发（`scan_mode` 返 None）。
     // 这里不算降级：一篇可见文档都没有时「没有相关内容」是实话。
     let Some(scan) = scan_mode(visible_n) else {
+        // 🔴 这条早退**必须吼一声**（2026-08-14）：它在九路召回之前，
+        // 于是下面那句「检索零命中：各路召回数」永远走不到 —— 一个可见文档都没有时，
+        // 服务端日志里**一行痕迹都没有**，而用户侧看到的是每一问都「没有相关内容」。
+        // 排查时最贵的正是这一步：分不清「库里没有」「权限看不到」「状态没就绪」。
+        // 三个变量一起打：谁在问、问的哪个空间、可见集为什么是 0 只能靠这三样定位。
+        tracing::warn!(
+            login = %v.login,
+            roles = ?v.roles,
+            space = space.unwrap_or("*"),
+            "知识库可见文档为 0 → 不发任何召回查询，本次必然「没有相关内容」             （查 kb.doc 的 enabled/status/生效期，以及 kb.acl / kb.user_dept 的授权行）"
+        );
         return Ok(SearchReport {
             normalized_query: query,
             hits: Vec::new(),
@@ -786,7 +797,7 @@ fn scan_mode(visible: usize) -> Option<Scan> {
 const VEC_SQL: &str = "SELECT chunk_id FROM kb.chunk \
                        WHERE doc_id = ANY($1::text[]) AND embedding IS NOT NULL \
                          AND (embedding <=> $2::vector) < $4 \
-                       ORDER BY embedding <=> $2::vector LIMIT $3";
+                       ORDER BY embedding <=> $2::vector, chunk_id LIMIT $3";
 
 /// `Scan::Exact` 版：`+ 0` 让排序表达式不再匹配 HNSW 的索引形态，规划器只能「过滤 + 排序」，
 /// 于是召回的是**可见集合内**的真最近邻（这正是 `scan_mode` 要的东西）。
@@ -798,7 +809,7 @@ const VEC_SQL: &str = "SELECT chunk_id FROM kb.chunk \
 const VEC_SQL_EXACT: &str = "SELECT chunk_id FROM kb.chunk \
                              WHERE doc_id = ANY($1::text[]) AND embedding IS NOT NULL \
                                AND (embedding <=> $2::vector) < $4 \
-                             ORDER BY (embedding <=> $2::vector) + 0 LIMIT $3";
+                             ORDER BY (embedding <=> $2::vector) + 0, chunk_id LIMIT $3";
 
 async fn vector_ids(
     store: &OwnedStore,
@@ -2073,7 +2084,14 @@ mod tests {
         // 下限必须真的进了**两条**向量 SQL：漏掉 EXACT 那条等于「小可见集合下没有下限」，
         // 而那正是本仓最常走的一支（`scan_mode`：可见 doc < 50 篇走 Exact）。
         for sql in [VEC_SQL, VEC_SQL_EXACT] {
-            assert!(sql.contains("AND (embedding <=> $2::vector) < $4"), "缺相关度下限：{sql}");
+            assert!(
+                sql.contains("AND (embedding <=> $2::vector) < $4"),
+                "缺相关度下限：{sql}"
+            );
+            assert!(
+                sql.contains("chunk_id LIMIT $3"),
+                "向量距离并列时必须用 chunk_id 决胜：{sql}"
+            );
         }
     }
 

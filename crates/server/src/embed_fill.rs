@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 
-use dms_connector::embed::to_pgvector;
+use dms_connector::embed::{to_pgvector, EmbedMode};
 use dms_semantic::registry::datasource::list_datasources;
 use dms_semantic::registry::embed_fill::{null_vec_rows, write_vec, MetaVecTarget, FILL_BATCH};
 
@@ -106,8 +106,8 @@ async fn fill_target(st: &AppState, t: MetaVecTarget, ds: &str) -> anyhow::Resul
     // 语料问句是**问句侧**向量，其余是文档侧 —— 与离线 `_revec(.., is_query)` 逐条一致，
     // 混一种模式 = 同一列两套不可比向量（语义缓存按问句近邻召回，对模式最敏感）。
     let vecs = match t.is_query_side() {
-        true => st.embed.embed_queries(&texts).await,
-        false => st.embed.embed_passages(&texts).await,
+        true => st.embed.embed_batch(&texts, EmbedMode::Query).await,
+        false => st.embed.embed_batch(&texts, EmbedMode::Passage).await,
     }
     // 缺席即报错（warn 留痕）；kb 侧同款缺席是静默跳过（见 fill_kb）—— 两处不对称是刻意的。
     .with_context(|| format!("{t:?} embed 服务缺席（ds={ds}），本轮跳过"))?;
@@ -131,7 +131,7 @@ async fn fill_kb(st: &AppState) -> anyhow::Result<u64> {
     if !rows.is_empty() {
         // 块长已由 ingest 定界，不再截断；meta 侧文本无界才截 TEXT_CHAR_CAP（见 fill_target）。
         let texts: Vec<String> = rows.iter().map(|row| row.text.clone()).collect();
-        if let Some(vecs) = st.embed.embed_passages(&texts).await {
+        if let Some(vecs) = st.embed.embed_batch(&texts, EmbedMode::Passage).await {
             anyhow::ensure!(
                 vecs.len() == rows.len(),
                 "kb embed 返回条数不符（{} ≠ {}）",

@@ -7,12 +7,12 @@ $fail = 0
 # 而那也是一种「规则静默消失」。两道闸形态不同，都留着。
 $rules = 0
 
-function Deny($label, $path, $pattern, [switch]$WarnOnly) {
+function Deny($label, $path, $pattern, [switch]$WarnOnly, [switch]$ProductionOnly) {
     $script:rules++
     if (-not (Test-Path $path)) {
         # 🔴 原来是 `return`：缺席既不打 [ok] 也不打 [FAIL]，$fail 保持 0。
-        # T1-T10 正在成批搬 crate —— 目录改名或搬走的那一刻，10 条 Deny 会**一条不剩地
-        # 静默消失**，报告照旧「架构门禁全绿」。消失的里头包括红线
+        # T1-T10 正在成批搬 crate：目录改名或搬走的那一刻，10 条 Deny 会一条不剩地
+        # 静默消失，报告照旧「架构门禁全绿」。消失的里头包括红线
         # 「knowledge 结构上不得产 SQL」（不变量 I5 的唯一结构性保证）。
         # 规则无法执行 ≠ 规则通过：本项目已经栽在这个形态上四次（见 ⑤ 的 cargo tree 那段）。
         Write-Host "[FAIL] $label：$path 不存在（规则无法执行 ≠ 规则通过）" -ForegroundColor Red
@@ -23,8 +23,21 @@ function Deny($label, $path, $pattern, [switch]$WarnOnly) {
     # 边界要自知：过滤只认行首的 //、*、/* —— 块注释中间行以别的字符开头、或代码行尾
     # 注释里含关键词仍会命中（假红方向，需人工看行内容）；代码行不会因此漏检。
     $hit = Get-ChildItem -Path $path -Recurse -Filter *.rs -ErrorAction SilentlyContinue |
-        Select-String -Pattern $pattern |
-        Where-Object { $_.Line.Trim() -notmatch '^(//|\*|/\*)' }
+        ForEach-Object {
+            $file = $_
+            # kernel 的“零业务语料”约束针对生产内核；测试必须能用真实业务样例证明
+            # 泛化算法没有误判。Rust 文件的 #[cfg(test)] 模块统一置于文件末尾，因此只在
+            # ProductionOnly 规则中截掉该模块，其他依赖/SQL 红线仍扫描完整源码。
+            $testStart = if ($ProductionOnly) {
+                (Select-String -Path $file.FullName -Pattern '^\s*#\[cfg\(test\)\]' |
+                    Select-Object -First 1).LineNumber
+            }
+            Select-String -Path $file.FullName -Pattern $pattern |
+                Where-Object {
+                    $_.Line.Trim() -notmatch '^(//|\*|/\*)' -and
+                    (-not $testStart -or $_.LineNumber -lt $testStart)
+                }
+        }
     if ($hit) {
         if ($WarnOnly) {
             Write-Host "[warn] $label（$($hit.Count) 处，迁移中）" -ForegroundColor Yellow
@@ -55,7 +68,10 @@ Deny 'semantic 不得造连接池' 'crates/semantic/src' 'MySqlPoolOptions|PgPoo
 # server 是唯一剩下的 WarnOnly：业务代码全部搬出（T10）后删掉 -WarnOnly。
 # knowledge 已于 T4 转正（OwnedStore::fixed 通道落地，25 处 → 0），从此按 FAIL 守——
 # 再出现一行 sqlx::query 就意味着有人绕开了字面量通道，那是「把问句拼进 SQL」的入口。
-Deny 'server 不得造连接池 / 不得 sqlx::query*' 'crates/server/src' 'MySqlPoolOptions|PgPoolOptions|sqlx::query' -WarnOnly
+# T8/T10 收尾（2026-08-13）：direct.rs(7363) 与 corrector.rs(1758) 整文件删除后，server 只剩
+# 装配、协议与认证；剩下的 sqlx 命中全是 FromRow 派生与 server 自有表（chat/artifact/日志面），
+# 不是业务算法。**去掉 -WarnOnly** —— 没有这一步，搬完也拿不出「真的搬完了」的凭据。
+Deny 'server 不得造连接池' 'crates/server/src' 'MySqlPoolOptions|PgPoolOptions'
 Deny 'knowledge 不得造连接池 / 不得 sqlx::query*' 'crates/knowledge/src' 'MySqlPoolOptions|PgPoolOptions|sqlx::query'
 # 🔴 不变量 I5 的结构性保证：知识库路径**产不出 SQL**。此前它只由两行注释支撑，零守卫。
 # 注意措辞：不是「依赖树里没有 sqlparser」——`dms-kernel` 就依赖它，传递必然在树里；
@@ -65,8 +81,8 @@ Deny 'knowledge 不得造连接池 / 不得 sqlx::query*' 'crates/knowledge/src'
 Deny 'knowledge 结构上不得产 SQL' 'crates/knowledge/src' 'use sqlparser|sqlparser::|RawSql|CheckedSql|ScopedSql'
 # ② kernel 纯度：零 IO 依赖、零 DMS 业务语料
 Deny 'kernel 不得引 IO 依赖' 'crates/kernel/src' 'sqlx|reqwest|axum::|tokio::|chrono::'
-Deny 'kernel 不得含 DMS 表名' 'crates/kernel/src' '\bt_[a-z_]{3,}\b'
-Deny 'kernel 不得含 DMS 业务名词' 'crates/kernel/src' '销售额|客单价|门店|经销商|有效订单'
+Deny 'kernel 生产代码不得含 DMS 表名' 'crates/kernel/src' '\bt_[a-z_]{3,}\b' -ProductionOnly
+Deny 'kernel 生产代码不得含 DMS 业务名词' 'crates/kernel/src' '销售额|客单价|门店|经销商|有效订单' -ProductionOnly
 # ③ agent 不配 HTTP；semantic/knowledge 不依赖 policy
 Deny 'agent 不得引 axum' 'crates/agent/src' 'axum'
 foreach ($c in 'semantic', 'knowledge') {

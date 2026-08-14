@@ -15,6 +15,10 @@ const CN_DIGITS: &str = "零一两二三四五六七八九十";
 /// 「今天/昨天」词组（prev_window / yoy_window / rule_relative 三处共用，不抄第三份）
 const TODAY_WORDS: &[&str] = &["今天", "今日"];
 const YESTERDAY_WORDS: &[&str] = &["昨天", "昨日"];
+/// 「当月」此前只有 `rule_relative` 认，`prev_window`/`yoy_window` 不认 —— 同一个词在三处
+/// 判据里两种口径：「当月销售额」算得出窗口，却拿不到「较上月」和同比两个角标。
+/// 三处共用这一份（2026-08-13 审计）。
+const MONTH_CUR_WORDS: &[&str] = &["本月", "这个月", "当月"];
 
 fn contains_any(q: &str, words: &[&str]) -> bool {
     words.iter().any(|w| q.contains(w))
@@ -71,7 +75,9 @@ pub fn detect_top_n(q: &str) -> usize {
     // 判据刻意窄：必须是「最高/最多/最大/最少/最小/最好」+（可选「的」）+ 数字/中文数字 +「个/名/条/项」。
     // 不认光秃秃的「5个」—— 那可能是「5个仓库的库存」这类**值过滤**里的数量词，
     // 按它截断就等于悄悄改了语义。
-    for sup in ["最高", "最多", "最大", "最少", "最小", "最好"] {
+    // 「最低/最差」与上面六个同族：不认它们，「销售额最低的5个客户」「卖得最差的3个商品」
+    // 的 TopN 认不出来 → 确定性路要么按 200 行截断、要么行数不符判红（2026-08-13 审计）。
+    for sup in ["最高", "最多", "最大", "最少", "最小", "最好", "最低", "最差"] {
         // 循环**所有**出现位置（与「前」分支同形）：「最高…最好5个…」里真正带数字的
         // 可能在第二次出现才命中
         for (pos, _) in q.match_indices(sup) {
@@ -112,7 +118,7 @@ pub fn prev_window(q: &str) -> Option<(&'static str, &'static str)> {
         Some(("DATE({}) = CURDATE() - INTERVAL 1 DAY", "较昨天"))
     } else if contains_any(q, YESTERDAY_WORDS) {
         Some(("DATE({}) = CURDATE() - INTERVAL 2 DAY", "较前天"))
-    } else if q.contains("本月") || q.contains("这个月") {
+    } else if contains_any(q, MONTH_CUR_WORDS) {
         // 右端 `CURDATE() - INTERVAL 1 MONTH` 存在月末压缩（3/31→2/28：当期 31 天 vs 上期
         // 28 天）—— 同进度比较下这一折中接受（逐档核过见函数文档）
         Some(("{} >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH,'%Y-%m-01') AND {} < CURDATE() - INTERVAL 1 MONTH", "较上月"))
@@ -212,7 +218,7 @@ pub fn yoy_window(q: &str) -> Option<(&'static str, &'static str)> {
         Some(("DATE({}) = CURDATE() - INTERVAL 1 YEAR", "同比"))
     } else if contains_any(q, YESTERDAY_WORDS) {
         Some(("DATE({}) = CURDATE() - INTERVAL 1 YEAR - INTERVAL 1 DAY", "同比"))
-    } else if q.contains("本月") || q.contains("这个月") {
+    } else if contains_any(q, MONTH_CUR_WORDS) {
         Some(("{} >= DATE_FORMAT(CURDATE() - INTERVAL 1 YEAR,'%Y-%m-01') AND {} < CURDATE() - INTERVAL 1 YEAR", "同比"))
     } else if q.contains("上月") || q.contains("上个月") {
         Some(("{} >= DATE_FORMAT(CURDATE() - INTERVAL 1 YEAR - INTERVAL 1 MONTH,'%Y-%m-01') AND {} < DATE_FORMAT(CURDATE() - INTERVAL 1 YEAR,'%Y-%m-01')", "同比"))
@@ -514,7 +520,7 @@ fn rule_relative(q: &str) -> Option<String> {
         "DATE({}) = CURDATE() - INTERVAL 1 DAY"
     } else if q.contains("前天") {
         "DATE({}) = CURDATE() - INTERVAL 2 DAY"
-    } else if q.contains("本月") || q.contains("这个月") || q.contains("当月") {
+    } else if contains_any(q, MONTH_CUR_WORDS) {
         "{} >= DATE_FORMAT(CURDATE(),'%Y-%m-01') AND {} < DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'), INTERVAL 1 MONTH)"
     } else if q.contains("上月") || q.contains("上个月") {
         "{} >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH,'%Y-%m-01') AND {} < DATE_FORMAT(CURDATE(),'%Y-%m-01')"
@@ -750,6 +756,21 @@ mod tests {
         assert!(yoy_window("近三个月销售额").is_none());
     }
 
+    /// 🔴「当月」与「本月/这个月」必须是同一档：此前只有 `rule_relative` 认它，
+    /// 于是「当月销售额」算得出窗口却拿不到「较上月」和同比两个角标（2026-08-13 审计）。
+    #[test]
+    fn current_month_synonyms_share_one_caliber() {
+        for q in ["本月销售额", "这个月销售额", "当月销售额"] {
+            assert_eq!(
+                time_predicate(q),
+                time_predicate("本月销售额"),
+                "{q} 的时间窗与「本月」不同"
+            );
+            assert_eq!(prev_window(q), prev_window("本月销售额"), "{q} 缺环比");
+            assert_eq!(yoy_window(q), yoy_window("本月销售额"), "{q} 缺同比");
+        }
+    }
+
     #[test]
     fn recent_n_units_and_bounds() {
         assert_eq!(recent_n("近7天"), Some((7, "DAY")));
@@ -806,6 +827,9 @@ mod tests {
         assert_eq!(detect_top_n("销量最高的三十五个分类"), 35);
         assert_eq!(detect_top_n("库存最少的2项"), 2);
         assert_eq!(detect_top_n("本月卖得最好的10个商品"), 10);
+        // 「最低/最差」与同族六词同等待遇（少了它们，这两句的 TopN 认不出来 → 按 200 行出数）
+        assert_eq!(detect_top_n("销售额最低的5个客户"), 5);
+        assert_eq!(detect_top_n("卖得最差的3个商品"), 3);
         // 🔴 判据刻意窄：**不认光秃秃的「N个」** —— 那可能是值过滤里的数量词，
         // 按它截断就是悄悄改语义
         assert_eq!(detect_top_n("5个仓库的库存金额"), 200, "不许把值过滤当 TopN");

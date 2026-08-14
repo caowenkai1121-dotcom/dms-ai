@@ -60,7 +60,11 @@ fn device_tables_fail_closed_in_generic_injection() {
         manager_customer_codes: vec!["C1".into(), "C2".into()],
         ..Default::default()
     };
-    for table in ["t_device_requisition", "t_device_receive_item", "t_device_delivery_item"] {
+    // t_device_requisition 2026-08-14 起**有档案**（via t_customer，Java 条件挂在 JOIN 进来的
+    // t_customer 上，DeviceRequisitionMapper.xml:201）—— 行为面判据在
+    // `fail_closed_tests::java_scoped_tables_actually_inject_their_condition`。
+    // 留在这里的两张明细仍拒：它们的头表是 via，而 via 的头必须 Scoped（链式 via 表达不了）。
+    for table in ["t_device_receive_item", "t_device_delivery_item"] {
         let err = inject(&format!("SELECT * FROM {table} d"), &s).unwrap_err();
         assert!(err.to_string().contains("未在权限档案登记"), "{table}: {err}");
     }

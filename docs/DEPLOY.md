@@ -17,12 +17,17 @@
 ### 1. 配置
 
 ```bash
-cp settings.example.json settings.docker.json   # 容器部署；裸机用 settings.json
+# 运行时状态目录与源码目录分开：app 是指向 releases/<版本> 的稳定链接
+export DMS_RUNTIME_ROOT=/opt/dms-ai
+mkdir -p "$DMS_RUNTIME_ROOT/kbdata"
+cp settings.example.json "$DMS_RUNTIME_ROOT/settings.docker.json"   # 容器部署；裸机用 settings.json
 ```
 
-必填：`pg_url`（自有 PG）、`mysql_targets`（数仓目标 `type: warehouse`）、`mysql_url`（DMS 身份源）、`llm_keys`（各家模型供应商 key）。`service_url`（embed/parser 服务地址）默认 `http://127.0.0.1:8077`，裸机同机部署不必填，容器/跨机时才需改。
+容器部署必须把 `settings.docker.json` 的 `kb_root` 改为精确的 `"/kbdata"`。启动脚本会硬校验这一项；保留示例默认值 `data/kb` 会把原件写进容器镜像层，解析服务和下次重建后的容器都看不到。
 
-**必须设置环境变量 `DMS_SECRET_KEY`（≥32 字节随机串）**：settings 里的凭据落盘即 AES-256-GCM 加密（enc:v1）。不配则密钥由机器指纹派生——容器重建/换机后密文解不开，需重填明文凭据。
+必填：`pg_url`（自有 PG）、`mysql_targets`（数仓目标 `type: warehouse`）、`mysql_url`（DMS 身份源）、`llm_keys`（各家模型供应商 key）。`service_url` 指向解析/向量服务：Rust API 在容器、Python 服务在宿主机时使用宿主机可达地址（例如 `http://host.docker.internal:8077`），不能沿用容器内的 `127.0.0.1`。
+
+**必须把 `DMS_SECRET_KEY`（≥32 字节随机串）持久化到 `$DMS_RUNTIME_ROOT/.secret_key`**。启动脚本从这里注入容器；settings 里的凭据落盘即 AES-256-GCM 加密（enc:v1）。运行时密钥丢失后，容器重建/换机将无法解密既有配置。
 
 ### 2. 起依赖
 
@@ -31,7 +36,20 @@ cp settings.example.json settings.docker.json   # 容器部署；裸机用 setti
 .\scripts\run.ps1
 ```
 
-裸机 Linux（PG 仍走容器）：`docker compose -f docker/age/docker-compose.yml up -d`；embed 服务 `python tools/embed_service.py serve 8077`（模型自动下载，离线环境先备 `BAAI/bge-small-zh-v1.5`）。
+裸机 Linux（PG 仍走容器）：`docker compose -f docker/age/docker-compose.yml up -d`；embed 服务 `python3 tools/embed_service.py serve 8077`（模型自动下载，离线环境先备 `BAAI/bge-small-zh-v1.5`）。生产脚本显式使用 `python3`，不兼容仍把 `python` 指向 Python 2 的旧系统。
+
+知识库解析接口接收的是 `/kbdata/<doc_id>.<ext>` **路径，不是文件字节**，所以 Rust 容器和解析服务必须读取同一宿主目录：
+
+- 解析服务运行在宿主机：`scripts/server-restart.sh` 会幂等建立 `/kbdata -> $DMS_RUNTIME_ROOT/kbdata`；若 `/kbdata` 已指向别处则在停止旧服务前失败，不会覆盖。
+- 解析服务使用名为 `dms-ai-parser` 的容器：该容器必须把 `$DMS_RUNTIME_ROOT/kbdata` 以 bind mount 挂到 `/kbdata`。启动脚本会核对 mount 类型、真实源目录和读探针。
+
+启动 API 容器：
+
+```bash
+DMS_RUNTIME_ROOT=/opt/dms-ai bash /opt/dms-ai/app/scripts/server-restart.sh
+```
+
+脚本启动前会验证：配置 `kb_root=/kbdata`、密钥至少 32 字节、持久目录可写；随后向配置中的真实 `service_url` 发送最小 `/parse` 请求，必须从 `/kbdata` 读回同一份唯一探针，再检查该服务 `/health` 的 `ok=true`、文本解析可用且 xlsx/pdf/docx 至少一种可用。即使机器上另有一个健康的 `dms-ai-parser`，配置指错服务或指向另一份目录也会在停止旧 API 前失败。
 
 ⚠️ 若元数据库不是 compose 默认库（另建的库）：age/vector/pg_trgm 三个扩展都只由初始化脚本建在默认库上，需手动补齐：`psql -d <库> -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm"`。缺 age 图谱功能不可用，缺 vector/pg_trgm 向量与模糊召回不可用。
 
@@ -41,9 +59,9 @@ cp settings.example.json settings.docker.json   # 容器部署；裸机用 setti
 
 ```bash
 # 现网导出一次（随部署包私下传递，勿进公开仓库——含业务字典值）
-python tools/registry_snapshot.py export registry_snapshot.json
+python3 tools/registry_snapshot.py export registry_snapshot.json
 # 新部署导入（幂等，重复跑/与代码种子混跑都收敛；--pg-url 可显式指目标库）
-python tools/registry_snapshot.py import registry_snapshot.json
+python3 tools/registry_snapshot.py import registry_snapshot.json
 ```
 
 导入后由服务的「向量自愈」自动回填 embedding：启动即跑一轮，之后每 10 分钟一轮（embed 服务需先就绪；`/api/health` 的 `vector_ready` 三个 true 即完成）。
@@ -60,14 +78,25 @@ dms-ai-server meta datamap-calibrate   # 使用轨迹校准（query_log → co_o
 ### 4. 验证
 
 ```bash
-curl http://127.0.0.1:8100/api/health
+curl -fsS http://172.17.0.1:8100/api/health | python3 -c \
+  'import json,sys; d=json.load(sys.stdin); print(d); raise SystemExit(0 if d.get("ok") is True else 1)'
 # ok:true；mysql.connected:true 且 mysql.session_read_only:true；vector_ready 三个 true；pg.extensions 含 age/vector/pg_trgm
 ```
+
+`tools/deploy_update.sh` 使用严格 SSH 主机密钥校验。首次部署前请从可信渠道核对服务器指纹，
+再把主机键写入 `~/.ssh/known_hosts`；也可用 `DEPLOY_KNOWN_HOSTS=/path/to/known_hosts`
+指定专用文件。脚本不会自动接受陌生主机，避免密码部署被中间人劫持。
+部署包来自当前工作区中受 Git 管理且仍存在的文件，以及未忽略的新文件，而不是只取 `HEAD`；
+因此可先在本机完成测试再直接发布尚未提交的修复，待提交删除也不会让 tar 因缺文件失败。
+`.gitignore` 排除的密钥、配置、`kbdata`、构建缓存不会进入包。源码先解到独立
+`$DMS_RUNTIME_ROOT/releases/<版本>` 并完成镜像构建，再原子切换 `$DMS_RUNTIME_ROOT/app` 链接；
+重启失败会恢复旧容器和旧 release，不会在原目录混合覆盖。
+若 `dms-ai-web` 容器存在，部署脚本读取其 `/usr/share/nginx/html` 的宿主 bind 源，在宿主解包并校验 `index.html`，原子切换目录后重启容器；新目录未就绪或哈希不一致会自动恢复旧目录。这样兼容容器内只读挂载，不再尝试向只读 nginx 根目录复制。只有该容器确实不存在时才明确打印 `SKIP`，留给现网的独立 Web 发布流程处理。
 
 判官回归（问数正确性的验收尺，76 题）：
 
 ```bash
-DMS_REGRESSION_TIMEOUT=240 python tools/regression.py
+DMS_REGRESSION_TIMEOUT=240 python3 tools/regression.py
 ```
 
 三道人工冒烟：「本月销售额」（应 direct-agg/verified）→「销售额按门店」（应 direct-derive 带推导标注）→「待确认对账单有多少」（应明确不可计算卡）。知识库：上传一篇 PDF 问一句内容题，回答应带引用。
@@ -75,5 +104,7 @@ DMS_REGRESSION_TIMEOUT=240 python tools/regression.py
 ## 运维注意
 
 - `insecure_login_fallback` 保持缺省/false；对外调用用 `mcp_keys` 发 API key（`X-API-Key` 头）。
-- 知识库原文目录（`kb_root`）要持久化卷，且与解析服务看到的字符串路径一致。
+- `/opt/dms-ai/app` 是当前 release 的稳定符号链接；实际源码在 `/opt/dms-ai/releases/<版本>`。`settings.docker.json`、`.secret_key`、`kbdata` 必须留在 `DMS_RUNTIME_ROOT`，不要复制进 release 目录。首次从旧版实体 `app/` 升级时，脚本会把它迁入 releases 并保留为回滚版本。
+- `git archive` 和 `registry_snapshot.py` 都不包含 `kbdata`。迁移 `kb.doc/kb.chunk` 所在 PG 时，必须同时备份并恢复整个 `$DMS_RUNTIME_ROOT/kbdata`，否则数据库有记录但原件永久缺失。
+- 旧版错误脚本可能把失败上传写到 `/opt/dms-ai/app/kbdata`。修复部署前先只读核对；确认是同批原件后用 `cp -an /opt/dms-ai/app/kbdata/. /opt/dms-ai/kbdata/` 恢复，校验数量/大小后再在页面点“重新处理”，不要直接覆盖或删除旧目录。
 - 日志脱敏已内建；`meta.query_log` 是全状态审计面（`/api/audit/sql`），别清。

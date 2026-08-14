@@ -9,9 +9,13 @@ import SkillsPanel from './SkillsPanel.vue'
 import DataMapPanel from './DataMapPanel.vue'
 import SqlAuditPanel from './SqlAuditPanel.vue'
 import TracePanel from './TracePanel.vue'
-import { fmt, semanticForLabel, toNum, uuid, type Semantic } from './format'
+import { fmt, isGrossMarginLabel, semanticForLabel, toNum, uuid, type Semantic } from './format'
 import { ANALYSIS_URL, ANALYSIS_REPORT_URL } from './api'
 import { SseParser, parseEventData } from './kb-stream'
+import { createSessionExpiryGuard, runAskTransport } from './ask-transport'
+import type { IntentSummary } from './result-receipt'
+import { projectKnowledgeReceipt } from './result-receipt'
+import { snapshotQueuedAsk, type QueuedAskSnapshot } from './ask-queue'
 
 const BiChart = defineAsyncComponent(() => import('./BiChart.vue'))
 
@@ -31,6 +35,10 @@ interface SupplementalResult {
   columns: string[]; rows: unknown[][]; row_count: number
   truncated: boolean; view: ViewSpec
 }
+interface KpiComparison {
+  label: string; current: number; baseline: number; change: number; pct: number
+}
+interface SalesContextResult { columns: string[]; rows: unknown[][] }
 interface SubResult { question: string; result: AskResult }
 /** 与 KbAnswer.vue 的本地 Citation 双份声明：字段增减两边同步（来源行位置徽标口径在 citation.ts）。 */
 interface Citation {
@@ -53,6 +61,10 @@ interface AskResult {
   truncated: boolean; elapsed_ms: number; route: string; view?: ViewSpec
   /** 主结果之外的结构/明细数据。它有独立数据集与视图，不能替换主结果。 */
   supplemental?: SupplementalResult
+  /** 已执行出的同比/环比原值；AI 解读按独立 COMPARE 事实域使用。 */
+  comparisons?: KpiComparison[]
+  /** 与主指标同时间窗的收入/成本/毛利补充；AI 解读按独立 CONTEXT 事实域使用。 */
+  sales_context?: SalesContextResult
   subs?: SubResult[]
   markdown?: string; citations?: Citation[]
   /** 【Y2】一次问答的关联键：知识库回答由 Answer 自带（👍/👎 反馈绑它）；
@@ -74,16 +86,24 @@ interface AskResult {
    *  老服务端不带这个键 = 纯问数，渲染分支不出现。AI 综合落在 `view.insight`。 */
   kb?: AskResult
   scope_note?: string
+  reinterpret_note?: string
+  resolved_question?: string
+  /** 后端同一份结构化意图合同的安全摘要：只含用户表面词与覆盖状态，不含 SQL、prompt 或内部 ID。 */
+  intent_summary?: IntentSummary
   trust?: {
     level: 'verified' | 'high' | 'review'; trace_id: string; source: string; route: string
     access: string; execution: string; fingerprint: string; checks: string[]
   }
+  /** `/api/ask` 对可供 AI 解读/报表使用的完整事实集签发；客户端只原样回传。 */
+  analysis_receipt?: string
 }
 /** AI 解读（按需拉取，不随 /api/ask 同步等模型）。
  *  `caliber` 恒有（零 LLM 的口径说明）、`insight` 可缺（模型那段话）——
  *  两者分开存，因为「模型没给解读」不等于「这次解读失败」。 */
 interface Analysis {
   open: boolean; loading: boolean; caliber?: string; insight?: string; error?: string
+  /** `/api/analysis` 对事实材料和 insight 整体签发，生成报表时原样回传。 */
+  reportReceipt?: string
   /** 【S2】报表固化中 / 已固化的 artifact（点击走深链拦截开预览面板） */
   saving?: boolean; artifact?: { url: string; title: string }
 }
@@ -120,6 +140,8 @@ interface Turn {
   /** 【SSE 流式】知识库回答生成中：result 里是增量预览（meta 的候选引用 + delta 拼的正文），
    *  done 事件到达时整体替换成过完口径后处理的最终 Answer。 */
   streaming?: boolean
+  /** 该轮被用户、会话生命周期或超时中止；中止后不得继续提交排队问题。 */
+  abortReason?: 'user' | 'session' | 'lifecycle' | 'timeout'
   /** 周报错误重试必须保留完整提示词与强制深度参数，不能拿短展示标题重新查询。 */
   retryQuestion?: string
   retryOptions?: SendOptions
@@ -1073,13 +1095,16 @@ const turns = computed<Turn[]>({
     else turnsByConv.set(curConvId.value, v)
   },
 })
+function turnRunning(t: Turn): boolean { return t.loading === true || t.streaming === true }
 const chatEl = ref<HTMLElement>()
 // 移动端（≤820px）侧栏改为抽屉：顶栏 ☰ 拉开，遮罩/点会话收起；桌面端恒为 false 不影响布局
 const sideOpen = ref(false)
 const health = ref('检查中…')
 const healthOk = ref(false)
 const healthBusy = ref(false)
-const theme = ref(localStorage.getItem('theme') || 'light')
+// 与 index.html 的首帧内联脚本**同一表达式**：没存过偏好时跟随系统，否则暗色系统的新用户第一次进来是亮色
+const theme = ref(localStorage.getItem('theme')
+  || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'))
 // 知识库管理面（上传/列表/删除）。此前前端**没有任何上传入口** ——
 // 后端 `/api/kb/upload` 早通了、`kb_eval.py` 也在用，但用户在界面上传不了文件。
 const kbOpen = ref(false)
@@ -1103,7 +1128,7 @@ function rememberKnowledgeSpace(value: { space_id: string; name: string }) {
   localStorage.setItem('dms-kb-space', value.space_id)
   localStorage.setItem('dms-kb-space-name', value.name)
 }
-const sending = computed(() => turns.value.some((t) => t.loading))
+const sending = computed(() => turns.value.some(turnRunning))
 /** 【子任务面板】当前会话最近一轮有进度数据的深度问答（进行中或刚完成；历史会话不存进度，不显示）。 */
 const deepTaskTurn = computed(() => {
   for (let i = turns.value.length - 1; i >= 0; i--) {
@@ -1112,19 +1137,24 @@ const deepTaskTurn = computed(() => {
   }
   return null
 })
-function convRunning(id: number): boolean { return turnsByConv.get(id)?.some((t) => t.loading) ?? false }
+function convRunning(id: number): boolean { return turnsByConv.get(id)?.some(turnRunning) ?? false }
 
 // ── 【排队追问】每个会话一条独立队列（key = convId，切换会话不串）──
 // 当前 run 还在跑时，输入框/快捷 pill 的新问句进本会话队列；run 结束（成败都算）
 // 在 send 的 finally 里出队续发。重试/下钻/周报这类带参调用不排队（语义已固定，维持直接早退）。
-interface QueuedAsk { id: string; text: string; refs: string[] }
+type QueuedAsk = QueuedAskSnapshot
 const queueByConv = reactive(new Map<number, QueuedAsk[]>())
+const activeAskControllers = new Map<string, { controller: AbortController; turn: Turn }>()
 const curQueue = computed<QueuedAsk[]>(() => (curConvId.value == null ? [] : (queueByConv.get(curConvId.value) ?? [])))
 function enqueueAsk(text: string, refs: string[]) {
   const convId = curConvId.value
   if (convId == null) return
   const queue = queueByConv.get(convId) ?? []
-  queue.push({ id: uuid(), text, refs })
+  queue.push(snapshotQueuedAsk(uuid(), text, refs, {
+    intent: intent.value,
+    mode: deepMode.value ? 'deep' : 'lite',
+    spaceId: knowledgeSpaceId.value || null,
+  }))
   queueByConv.set(convId, queue)
 }
 function cancelQueued(id: string) {
@@ -1135,7 +1165,30 @@ function cancelQueued(id: string) {
 }
 function drainQueue(convId: number) {
   const next = queueByConv.get(convId)?.shift()
-  if (next) void send(next.text, { targetConvId: convId, refs: next.refs })
+  if (next) void send(next.text, {
+    targetConvId: convId, refs: next.refs,
+    forceIntent: next.forceIntent, forceMode: next.forceMode, spaceId: next.spaceId,
+  })
+}
+
+function abortTurn(t: Turn, reason: Turn['abortReason']) {
+  if (t.convId != null) queueByConv.delete(t.convId)
+  const active = t.turnKey ? activeAskControllers.get(t.turnKey) : undefined
+  if (!active || active.controller.signal.aborted) return
+  t.abortReason = reason
+  active.controller.abort()
+}
+
+function abortAllTurns(reason: Turn['abortReason']) {
+  queueByConv.clear()
+  for (const { controller, turn } of activeAskControllers.values()) {
+    turn.abortReason = reason
+    if (!controller.signal.aborted) controller.abort()
+  }
+}
+
+function stopGeneration(t: Turn) {
+  abortTurn(t, 'user')
 }
 
 // ── 【Y5 插话】运行中给当前任务插一条修正指令（「不是这个口径，按 X 重算」）──
@@ -1240,6 +1293,8 @@ interface TraceEvent {
   route?: string
   sql?: string | null
   row_count?: number | null
+  trust_level?: string | null
+  issues?: string[]
   id?: number
   title?: string
   preview_url?: string
@@ -1349,7 +1404,8 @@ async function validateSession(): Promise<boolean> {
   }
 }
 
-async function handleSessionExpired() {
+const expireSession = createSessionExpiryGuard(async () => {
+  abortAllTurns('session')
   kbOpen.value = false
   if (embedded.value && dmsToken.value) {
     if (await reSsoWithRole(roleCode.value || null)) return
@@ -1359,6 +1415,9 @@ async function handleSessionExpired() {
   const origin = parentOrigin()
   if (embedded.value && origin) window.parent.postMessage({ type: 'dms-ai:ready', reason: 'expired' }, origin)
   else embedded.value = false
+})
+async function handleSessionExpired() {
+  await expireSession(sessionToken.value || `login:${loginName.value}`)
 }
 
 async function openKnowledge() {
@@ -1387,6 +1446,7 @@ async function passwordLogin() {
   finally { loginBusy.value = false }
 }
 function logout() {
+  abortAllTurns('lifecycle')
   clearSession(); closePreview(); draftTurns.value = []; turnsByConv.clear(); queueByConv.clear(); pendingRefs.value = []; usageOpen.value = false; skillsOpen.value = false; datamapOpen.value = false; auditOpen.value = false; closeTrace(); convs.value = []; curConvId.value = null
   // 账号级状态一并清：换账号后旧账号的设置缓存/插话计数/质量数据不许滞留在内存里
   steerText.value = ''; steerCountByConv.clear(); llmCfg.value = null; settingsCat.value = null; quality.value = null; exemplars.value = []
@@ -1430,21 +1490,25 @@ function errMsg(resp: Response, body: unknown, raw: string): string {
  *  delta → 追加正文预览（KbAnswer 本来就渲半成品 markdown；未过口径后处理）；
  *  done  → 整体替换成过完口径后处理的最终 Answer（最终 citations/trace_id 在这里才挂）；
  *  error → 服务端已收口的友好文案，直接透出（重试同错，不回退）；
- *  返回 'fallback' 只发生在**传输级失败且内容还没出来**（调用方回退老端点重试一次）；
- *  已有内容后断流 = 半成品不作数，出友好错误。返回 'done' = 终态已写好，调用方不再处理。 */
-async function consumeAskStream(resp: Response, aiTurn: Turn): Promise<'done' | 'fallback'> {
+ *  HTTP 2xx 已代表服务端接受请求：无论首帧是否到达，之后断流都只报错，绝不自动重放。 */
+async function consumeAskStream(resp: Response, aiTurn: Turn, signal: AbortSignal): Promise<void> {
   const reader = resp.body?.getReader()
-  if (!reader) return 'fallback' // 响应体不可流（老浏览器/代理整段缓冲）：回退同步
+  if (!reader) {
+    aiTurn.error = '服务响应无法读取，请重试'
+    aiTurn.streaming = false
+    aiTurn.result = undefined
+    return
+  }
   const parser = new SseParser()
   const decoder = new TextDecoder()
   let draft = ''
-  let started = false // meta 到达 = 内容面已开始（这之前的失败才能回退同步）
+  let streamIntentSummary: IntentSummary | undefined
+  let streamResolvedQuestion: string | undefined
   /** 半成品预览不作数：最终答案只有过完口径后处理的那份（角标/冲突披露不许有第二形态） */
-  const failWith = (msg: string): 'done' => {
+  const failWith = (msg: string) => {
     aiTurn.error = msg
     aiTurn.streaming = false
     aiTurn.result = undefined
-    return 'done'
   }
   try {
     for (;;) {
@@ -1454,7 +1518,12 @@ async function consumeAskStream(resp: Response, aiTurn: Turn): Promise<'done' | 
         const data = parseEventData(ev)
         if (!data) continue // 坏帧跳过，不炸整条流
         if (ev.event === 'meta') {
-          started = true
+          streamIntentSummary = data.intent_summary && typeof data.intent_summary === 'object'
+            ? data.intent_summary as IntentSummary
+            : undefined
+          streamResolvedQuestion = typeof data.resolved_question === 'string'
+            ? data.resolved_question
+            : undefined
           aiTurn.loading = false
           aiTurn.streaming = true
           aiTurn.result = {
@@ -1463,6 +1532,8 @@ async function consumeAskStream(resp: Response, aiTurn: Turn): Promise<'done' | 
             markdown: '',
             citations: (Array.isArray(data.citations) ? data.citations : []) as Citation[],
             trace_id: typeof data.trace_id === 'string' ? data.trace_id : undefined,
+            intent_summary: streamIntentSummary,
+            resolved_question: streamResolvedQuestion,
           }
         } else if (ev.event === 'delta') {
           const piece = typeof data.text === 'string' ? data.text : ''
@@ -1470,28 +1541,38 @@ async function consumeAskStream(resp: Response, aiTurn: Turn): Promise<'done' | 
             draft += piece
             // 新对象触发响应式（KbAnswer 按 answerKey 监听内容变化）
             aiTurn.result = { ...aiTurn.result, markdown: draft }
+            // 正文从气泡顶往下长，两屏之后全在视口下方 —— 不跟随的话「流式」这 10-20 秒
+            // 用户看到的是静止画面，最主要的感知收益整个白丢。120ms 节流够跟上人眼。
+            const now = Date.now()
+            if (now - lastFollow >= 120) {
+              lastFollow = now
+              void nextTick(followStream)
+            }
           }
         } else if (ev.event === 'done') {
           const answer = data.answer as AskResult | undefined
-          if (!answer || typeof answer !== 'object') return failWith('服务响应异常，请稍后重试')
-          aiTurn.result = answer
+          if (!answer || typeof answer !== 'object') { failWith('服务响应异常，请稍后重试'); return }
+          // 最终帧通常已带齐上下文；兼容只在 meta 帧提供结构化意图的服务端，避免替换时丢失。
+          aiTurn.result = {
+            ...answer,
+            intent_summary: answer.intent_summary ?? streamIntentSummary,
+            resolved_question: answer.resolved_question ?? streamResolvedQuestion,
+          }
           aiTurn.streaming = false
-          return 'done'
+          return
         } else if (ev.event === 'error') {
           const msg = typeof data.message === 'string' ? data.message.trim() : ''
-          return failWith(msg || '暂时无法完成知识检索，请稍后重试')
+          failWith(msg || '暂时无法完成知识检索，请稍后重试')
+          return
         }
       }
       if (done) break
     }
     // 流结束却没有 done/error 终止帧 = 断流
-    if (!started && !draft) return 'fallback'
-    return failWith('回答生成中断，请重试')
-  } catch {
-    // 网络断流 / 超时 abort：内容没出来回退同步（abort 时同步那次也会立刻失败，
-    // 由外层 catch 落成「查询超时」文案）；已有内容出错误
-    if (!started && !draft) return 'fallback'
-    return failWith('回答生成中断，请重试')
+    failWith('回答生成中断，请重试')
+  } catch (error) {
+    if (signal.aborted) throw error
+    failWith('回答生成中断，请重试')
   }
 }
 
@@ -1526,11 +1607,11 @@ async function loadConvs() {
     const r = await okJson<{ convs?: Conv[] }>(
       await fetch(`/api/convs${loginQuery()}`, { headers: authHeaders(false) }),
       '会话列表加载失败', () => true, showToast)
-    convs.value = r?.convs || []
+    if (r) convs.value = r.convs || []
     // 网络级失败（fetch 自己抛）不弹气泡：侧栏底部的 `health` 已经写着「后端未连接」，
     // 而 loadConvs 是 onMounted 就跑的 —— 在这里弹会把首屏欢迎语顶掉，换来一条
     // 与健康灯重复的红字。okJson 那一路（服务端**答了**一个错误却被无视）才是要弹的。
-  } catch { convs.value = [] }
+  } catch { /* 保留上次成功的会话列表，健康灯已给出网络状态 */ }
 }
 
 let conversationNavigationId = 0
@@ -1699,6 +1780,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  abortAllTurns('lifecycle')
   closePreview()
   window.removeEventListener('hashchange', handleHashChange)
   window.removeEventListener('message', receiveParentSso)
@@ -1806,7 +1888,7 @@ async function generateWeeklyReport() {
     weeklyProvinceInput.value?.focus()
     return
   }
-  if (turns.value.some((t) => t.loading) || curQueue.value.length) {
+  if (turns.value.some(turnRunning) || curQueue.value.length) {
     // 队列里还有排队问题：周报带参调用不排队，直接跑会插队 —— 提示用户等队列排空
     weeklyError.value = '当前会话仍有分析中或排队的问题，完成后再生成周报'
     return
@@ -1903,6 +1985,17 @@ async function scrollDown() {
   chatEl.value?.scrollTo({ top: chatEl.value.scrollHeight, behavior: 'smooth' })
 }
 
+// 流式跟随。**不复用 scrollDown**：`behavior:'smooth'` 的动画会和每帧新内容打架，
+// 越滚越跟不上；这里直接赋 scrollTop。
+// 120px 阈值 = 用户手动上翻后就不再被拽回底部（正在读上文时被拉走比不跟随更糟）。
+let lastFollow = 0
+function followStream() {
+  const el = chatEl.value
+  if (!el) return
+  if (el.scrollHeight - el.scrollTop - el.clientHeight > 120) return
+  el.scrollTop = el.scrollHeight
+}
+
 async function send(q?: string, options: SendOptions = {}) {
   const text = (q ?? question.value).trim()
   if (!text) return
@@ -1911,7 +2004,7 @@ async function send(q?: string, options: SendOptions = {}) {
   // 重试/下钻/周报等带参调用语义已固定，不排队也不带走引用（维持原来的直接早退）。
   const isPlainAsk = Object.keys(options).length === 0
   const targetTurns = options.targetConvId == null ? turns.value : turnsByConv.get(options.targetConvId)
-  if (targetTurns?.some((t) => t.loading)) {
+  if (targetTurns?.some(turnRunning)) {
     // 【排队追问】本会话有进行中的问答：新问句带着引用快照进队列，run 结束由 finally 续发。
     if (isPlainAsk && curConvId.value != null) {
       enqueueAsk(text, pendingRefs.value.splice(0))
@@ -1966,8 +2059,9 @@ async function send(q?: string, options: SendOptions = {}) {
   const t0 = Date.now()
   const tick = setInterval(() => { aiTurn.elapsed = Math.floor((Date.now() - t0) / 1000) }, 1000)
   const ctrl = new AbortController()
+  activeAskControllers.set(aiTurn.turnKey!, { controller: ctrl, turn: aiTurn })
   // 深度模式多两份等待：SC×3 生成 + 之后的深度解读，超时相应放宽
-  const timer = setTimeout(() => ctrl.abort(), isDeep ? 180000 : 100000)
+  const timer = setTimeout(() => abortTurn(aiTurn, 'timeout'), isDeep ? 180000 : 100000)
   try {
     // 【深度模式】单入口：/api/deep/compose 一次返回 {result, artifact}（总值+拆解+趋势+明细+图+AI 全在服务端同管线出）
     // 【引用上轮】chip 区快照随 body 发出；带参调用（含队列出队）用 options 里那份。
@@ -1994,6 +2088,7 @@ async function send(q?: string, options: SendOptions = {}) {
       method: 'POST', headers: authHeaders(), signal: ctrl.signal,
       body: JSON.stringify(bodyFields),
     })
+    const askSessionKey = sessionToken.value || `login:${loginName.value}`
     // 🔴 同步响应走同一套 `readBody`/`errMsg`，与会话面四处一致：
     // 原来是 `await resp.json()` + `data.error || '请求失败'` —— 两个洞。
     // ① 401 只显示服务端那三个字「未认证」，用户不知道该做什么，而认证本轮改成默认拒、
@@ -2005,6 +2100,7 @@ async function send(q?: string, options: SendOptions = {}) {
       const [body, raw] = await readBody(resp)
       if (!resp.ok) {
         aiTurn.error = errMsg(resp, body, raw)
+        if (resp.status === 401) await expireSession(askSessionKey)
         // 多角色账号被 fail-closed 拒（那是**正确**的安全行为，不许放宽）——
         // 角色选择由 `/api/roles` 提供，选择后服务端重新校验角色归属并换签。
         if (aiTurn.error.includes(ROLE_AMBIGUOUS)) await offerRoles(aiTurn)
@@ -2024,35 +2120,33 @@ async function send(q?: string, options: SendOptions = {}) {
     if (isDeep) {
       await handleSync(await post('/api/deep/compose'))
     } else {
-      // 【SSE 流式】KB 问答走流式端点：分诊落 knowledge 回 text/event-stream（边收边渲），
-      // 落 data 回普通 JSON（与 /api/ask 同 wire，走 handleSync）。
-      const resp = await post('/api/ask/stream')
-      const contentType = resp.headers.get('content-type') ?? ''
-      if (resp.ok && contentType.includes('text/event-stream')) {
-        // 传输级失败且内容还没出来 → 'fallback'：回退老端点重试一次（用户无感）
-        if ((await consumeAskStream(resp, aiTurn)) === 'fallback') await handleSync(await post('/api/ask'))
-      } else if (resp.status === 404 || resp.status === 405) {
-        // 服务端/反代还没有流式路由（版本错位）：静默回退同步端点
-        await handleSync(await post('/api/ask'))
-      } else {
-        await handleSync(resp)
-      }
+      await runAskTransport(post, (resp) => consumeAskStream(resp, aiTurn, ctrl.signal), handleSync, ctrl.signal)
     }
   } catch (e) {
-    aiTurn.error = ctrl.signal.aborted ? '查询超时，请重试或换个问法' : '查询失败（网络），请重试'
+    aiTurn.error = aiTurn.abortReason === 'user'
+      ? '已停止生成'
+      : aiTurn.abortReason === 'session'
+        ? '登录已失效，请重新登录'
+        : ctrl.signal.aborted
+          ? '查询超时，请重试或换个问法'
+          : '查询失败（网络），请重试'
   } finally {
     clearTimeout(timer)
     clearInterval(tick)
     progressStop()
+    if (aiTurn.turnKey && activeAskControllers.get(aiTurn.turnKey)?.controller === ctrl) {
+      activeAskControllers.delete(aiTurn.turnKey)
+    }
     aiTurn.loading = false
+    aiTurn.streaming = false
     // 【D4】深度轮出错：查服务端账本是否可断点续跑（可 → 错误气泡出「续跑」入口）
     if (isDeep && aiTurn.error && rid) checkResumable(rid, aiTurn)
     if (curConvId.value === convId) scrollDown()
     // 刷新侧栏标题/时间。本轮已经报过错就别刷：认证挂掉时 `/api/ask` 与 `loadConvs`
     // 会各弹一条 401 气泡，一次提问两条同源错误；且此时侧栏本来也没有新标题可刷。
     if (!aiTurn.error) loadConvs()
-    // 【排队追问】成败都续发下一条：一次查询失败不该卡住后面排好的问题。
-    drainQueue(convId)
+    // 主动停止、超时、注销与 401 都不再提交下一条，避免用户已终止后后台继续消费队列。
+    if (!aiTurn.abortReason) drainQueue(convId)
   }
 }
 
@@ -2142,13 +2236,9 @@ function metricSemantic(name: string): Semantic {
   const semantic = semanticForLabel(name)
   return semantic === 'none' ? 'count' : semantic
 }
-function isGrossMarginValueLabel(label: string): boolean {
-  const normalized = label.replace(/\s+/g, '')
-  return normalized === '毛利率' || normalized === '销售毛利率'
-}
 function formatMetricValue(label: string, value: unknown): string {
   const number = toNum(value)
-  if (isGrossMarginValueLabel(label) && number !== null) return fmt(number * 100, 'percent')
+  if (isGrossMarginLabel(label) && number !== null) return fmt(number * 100, 'percent')
   return fmt(value, metricSemantic(label))
 }
 function secCols(sec: DeepSection) {
@@ -2179,7 +2269,7 @@ function secCell(sec: DeepSection, row: unknown[], ci: number): string {
 }
 function formatCell(columns: string[], value: unknown, ci: number): string {
   const label = columns[ci] ?? ''
-  return isGrossMarginValueLabel(label) ? formatMetricValue(label, value) : fmt(value, semanticForLabel(label))
+  return isGrossMarginLabel(label) ? formatMetricValue(label, value) : fmt(value, semanticForLabel(label))
 }
 function formatLabeledValue(label: string, value: unknown): string {
   return formatMetricValue(label, value) || '—'
@@ -2214,7 +2304,7 @@ function comparisonNumber(value: number | undefined, label: string): string {
 }
 function signedComparison(value: number | undefined, label: string): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-'
-  if (isGrossMarginValueLabel(label)) {
+  if (isGrossMarginLabel(label)) {
     const points = (Math.abs(value) * 100).toFixed(1)
     return `${value > 0 ? '+' : value < 0 ? '-' : ''}${points} 个百分点`
   }
@@ -2274,8 +2364,21 @@ function userFacingMarkdown(text: string): string {
   }
   return visible.join('\n').replace(/\n{3,}/g, '\n\n').trim()
 }
-function knowledgePresentation(result: AskResult): { markdown?: string; citations?: Citation[] } {
-  return { markdown: userFacingMarkdown(result.markdown ?? ''), citations: result.citations }
+function knowledgePresentation(result: AskResult): {
+  markdown?: string; citations?: Citation[]; intent_summary?: IntentSummary; resolved_question?: string
+} {
+  return {
+    markdown: userFacingMarkdown(result.markdown ?? ''), citations: result.citations,
+    intent_summary: result.intent_summary, resolved_question: result.resolved_question,
+  }
+}
+function hybridKnowledgePresentation(result: AskResult): ReturnType<typeof knowledgePresentation> {
+  const kb = result.kb!
+  return {
+    ...knowledgePresentation(kb),
+    intent_summary: kb.intent_summary ?? projectKnowledgeReceipt(result.intent_summary, !!kb.citations?.length),
+    resolved_question: kb.resolved_question ?? result.resolved_question,
+  }
 }
 function dataOnlyResult(result: AskResult): AskResult {
   if (!result.view?.insight) return result
@@ -2368,25 +2471,55 @@ function onKey(e: KeyboardEvent) {
  *
  *  为什么是 POST + 回传素材、而不是 `GET /记录id/analysis`：服务端**不存**这次结果，
  *  也就没有 id 可给（`AskResult` 里没有 `record_id`，`meta.query_log` 的行号拿不到）。
- *  素材（问句/SQL/列/前几行/口径告警）全在前端手上，回传比服务端再存一份便宜且无越权面。
- *  ⚠️ `row_count` 必须给**总行数**（`t.result.row_count`）而不是 `rows.length` ——
- *  只回传前几行时给 `rows.length` 会让解读把「前 5 行」当成全部。
+ *  素材全在前端手上，但必须连同 `/api/ask` 签发的 receipt 原样回传；服务端会拒绝被
+ *  截断或改写的问句/SQL/列/行/补充明细/比较/经营上下文。这样无需再存一份结果，也不会
+ *  把客户端自造数字送进模型。`row_count` 必须仍给服务端返回的总行数。
  *
- *  响应是 `{caliber, insight}` 两个键：
+ *  响应是 `{caliber, insight, report_receipt}`：
  *  - `caliber` **恒有**（确定性、零 LLM）：这个数是怎么算的（来源表/过滤/时间窗/去重）。
  *    这正是计划 D2-3 点名要的「解读必须带口径说明」，**不许因为 insight 为 null 就整块不显示**。
  *  - `insight` 可能是 `null`（模型挂了/回了网址/开关关着）→ 只显示 caliber，**不标成失败**。
  *    解读失败绝不能让一次已经成功的取数看起来失败。
+ *  - `report_receipt` 绑定事实与 insight，报表入口据此拒绝客户端改写后的“AI 解读”。
  *
  *  失败一律**原样显示服务端消息**：端点没上线时 axum 兜底 404 是**空体**，
  *  `resp.json()` 会当场抛 `Unexpected end of JSON input` —— 那句话对用户毫无意义。
  *  所以先取 text 再试解析，解析不出就把状态码/原文当消息。 */
+function analysisMaterialOf(question: string, r: AskResult): Record<string, unknown> {
+  return {
+    question,
+    sql: r.sql,
+    columns: r.columns,
+    rows: r.rows ?? [],
+    row_count: r.row_count,
+    caliber_note: r.caliber_note ?? null,
+    supplemental: r.supplemental ? {
+      columns: r.supplemental.columns,
+      rows: r.supplemental.rows ?? [],
+      row_count: r.supplemental.row_count,
+    } : null,
+    comparisons: (r.comparisons ?? []).map(({ label, current, baseline, change, pct }) => ({
+      label, current, baseline, change, pct,
+    })),
+    sales_context: r.sales_context ? {
+      columns: r.sales_context.columns,
+      rows: r.sales_context.rows ?? [],
+      row_count: r.sales_context.rows?.length ?? 0,
+    } : null,
+    subs: (r.subs ?? []).map((sub) => analysisMaterialOf(sub.question, sub.result)),
+  }
+}
+
 async function toggleAnalysis(t: Turn) {
   const a = (t.analysis ??= { open: false, loading: false })
   a.open = !a.open
   if (!a.open || a.loading || a.caliber || a.insight) return
   const r = t.result
   if (!r) return
+  if (!r.analysis_receipt) {
+    a.error = '该结果缺少分析素材凭证，请重新查询后再解读'
+    return
+  }
   a.loading = true
   a.error = undefined
   try {
@@ -2394,12 +2527,8 @@ async function toggleAnalysis(t: Turn) {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify({
-        question: t.question ?? '',
-        sql: r.sql,
-        columns: r.columns,
-        rows: (r.rows ?? []).slice(0, 5),   // 解读只看前几行，别把 200 行搬过去
-        row_count: r.row_count,             // ← 总行数，不是 rows.length
-        caliber_note: r.caliber_note ?? null,
+        ...analysisMaterialOf(t.question ?? '', r),
+        analysis_receipt: r.analysis_receipt,
         // 深度模式：Precise 档四段式（结论/关键发现/口径与可信度/建议）；精简 = fast 2-4 句
         deep: t.mode === 'deep' ? true : null,
         login_name: sessionToken.value ? null : loginName.value,
@@ -2407,11 +2536,12 @@ async function toggleAnalysis(t: Turn) {
       }),
     })
     const raw = await resp.text()
-    let d: { caliber?: string; insight?: string | null; error?: string } = {}
+    let d: { caliber?: string; insight?: string | null; report_receipt?: string; error?: string } = {}
     try { d = raw ? JSON.parse(raw) : {} } catch { /* 非 JSON（404 空体 / 网关 HTML）：按原文报 */ }
     if (resp.ok && (d.caliber || d.insight)) {
       a.caliber = d.caliber
       a.insight = d.insight ?? undefined
+      a.reportReceipt = d.report_receipt
     } else {
       a.error = d.error || (raw.trim() ? raw.trim().slice(0, 300) : `HTTP ${resp.status}`)
     }
@@ -2422,12 +2552,14 @@ async function toggleAnalysis(t: Turn) {
   }
 }
 
-// 【S2】把这次解读固化成报表 artifact（零 LLM：服务端重算口径，insight 原样回声）。
+// 【S2】把这次解读固化成报表 artifact（零 LLM：服务端重算口径，并验 facts + insight receipt）。
 // 成功后只生成产物卡；预览必须由用户点击卡片触发，完成回调不得抢占当前页面。
 async function saveReport(t: Turn) {
   const a = t.analysis, r = t.result
   if (!a || !r || a.saving) return
   if (t.convId == null) { a.error = '该历史消息缺少会话归属，无法生成报表'; return }
+  if (!r.analysis_receipt) { a.error = '该结果缺少分析素材凭证，请重新查询后再生成报表'; return }
+  if (!a.reportReceipt) { a.error = '该解读缺少报表凭证，请重新生成解读'; return }
   a.saving = true
   a.error = undefined
   try {
@@ -2435,13 +2567,10 @@ async function saveReport(t: Turn) {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify({
-        question: t.question ?? '',
-        sql: r.sql,
-        columns: r.columns,
-        rows: (r.rows ?? []).slice(0, 50),   // 报表数据段上限 50 行（服务端同限）
-        row_count: r.row_count,
-        caliber_note: r.caliber_note ?? null,
+        ...analysisMaterialOf(t.question ?? '', r),
+        analysis_receipt: r.analysis_receipt,
         insight: a.insight ?? null,
+        report_receipt: a.reportReceipt,
         // 【图表】view.blocks 的 Chart 块回声（只是下标与图型 —— 数据服务端用 columns/rows 自取）
         charts: (r.view?.blocks ?? [])
           .filter((b) => b.type === 'chart')
@@ -2854,6 +2983,7 @@ function exportSupplementalCsv(t: Turn) {
                 <span class="spin"></span><span>分析中… <b class="elapsed">{{ t.elapsed ?? 0 }}s</b></span>
                 <span class="thinking-hint">大数据量查询约需 10~60 秒</span>
               </template>
+              <button type="button" class="stop-generation" @click="stopGeneration(t)">停止生成</button>
             </div>
             <div v-else-if="t.error" class="bubble err">
               <div>⚠️ {{ t.error }}</div>
@@ -2876,7 +3006,7 @@ function exportSupplementalCsv(t: Turn) {
               </div>
               <p v-if="t.promoted.note" class="promote-note">{{ t.promoted.note }}</p>
             </div>
-            <div v-else-if="t.result" class="bubble ai" :class="{ 'knowledge-bubble': t.result.kind === 'text', 'result-bubble': t.result.kind !== 'text' && t.mode !== 'deep' }">
+            <div v-else-if="t.result" class="bubble ai" :class="{ 'knowledge-bubble': t.result.kind === 'text', 'result-bubble': t.result.kind !== 'text' }">
               <div class="res-meta">
                 <!-- 知识库只展示面向业务的回答与关联资料概览，不暴露内部引用编号/调试计数。 -->
                 <span v-if="t.result.kind === 'text'">{{ t.streaming ? '已命中资料，正在生成…' : '已关联资料' }}</span>
@@ -2894,6 +3024,7 @@ function exportSupplementalCsv(t: Turn) {
                   <button v-if="t.result.supplemental" type="button" class="sql-toggle" @click="exportSupplementalCsv(t)">⬇ 导出明细 CSV</button>
                   <button v-if="turnSqls(t).length" type="button" class="sql-toggle" @click="t.showSql = !t.showSql">{{ t.showSql ? '隐藏' : '查看' }} SQL</button>
                 </template>
+                <button v-if="t.streaming" type="button" class="stop-generation" @click="stopGeneration(t)">停止生成</button>
                 <!-- 【引用上轮】该轮问题+结论摘要进输入框上方的引用 chip 区，随下一条提问发出 -->
                 <button type="button" class="sql-toggle" title="引用该轮问答作为下一条提问的上下文" @click="quoteTurn(t)">↩ 引用</button>
                 <!-- 【分支会话】只挂在持久会话的轮上（draft 轮没有 convId 可分支）；from_seq 是该轮的 1 基序号 -->
@@ -3061,7 +3192,7 @@ function exportSupplementalCsv(t: Turn) {
               <div v-if="t.result?.kb" class="ai-panel hybrid-kb-panel">
                 <div class="ai-hd"><span class="ai-mark">📚</span> 知识库资料<span class="ai-hint">同一问题的资料侧回答</span></div>
                 <KbAnswer
-                  :result="knowledgePresentation(t.result.kb)"
+                  :result="hybridKnowledgePresentation(t.result)"
                   :token="sessionToken"
                   :login="loginName"
                   :trace-id="t.result.kb.trace_id"
@@ -3074,8 +3205,13 @@ function exportSupplementalCsv(t: Turn) {
                 <KbAnswer :result="{ markdown: userFacingMarkdown(t.result.view.insight) }" />
               </div>
 
-              <!-- 所有深度/复合数据渲染完成后，AI 分析统一收尾。 -->
-              <div v-if="t.page?.insight" class="ai-panel deep-insight">
+              <!-- 所有深度/复合数据渲染完成后，AI 分析统一收尾。
+                   🔴 `v-else-if` 不是笔误：上面那块（混合查询的 AI 综合）与下面那块
+                   （复合汇总）都可能命中同一段文字 —— `compoundAnalysis` 返回的正是
+                   `view.insight`。混合问句现在还能带多条问数子问（`hybrid::split`），
+                   `subs` 非空是常态，三块必须串成一条链，否则同一段结论上下贴着出两遍。
+                   深度页恒有 `t.page`、混合恒无，两者互斥，链接安全。 -->
+              <div v-else-if="t.page?.insight" class="ai-panel deep-insight">
                 <div class="ai-hd"><span class="ai-mark">AI</span> 经营分析<span class="ai-hint">基于本次查询数据，聚焦变化、异常与行动</span></div>
                 <KbAnswer :result="{ markdown: userFacingMarkdown(t.page.insight) }" />
               </div>
@@ -3296,7 +3432,7 @@ function exportSupplementalCsv(t: Turn) {
 .sec-t { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: .4px; display: flex; align-items: center; justify-content: space-between; }
 .weekly-sec { padding-block: 11px; }
 .weekly-create { height: 27px; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; border: 1px solid var(--primary); border-radius: 5px; background: var(--primary-bg); color: var(--primary); font-family: inherit; font-size: 12px; font-weight: 650; line-height: 1; cursor: pointer; }
-.weekly-create:hover { background: var(--primary); color: #fff; }
+.weekly-create:hover { background: var(--primary); color: var(--on-primary); }
 .weekly-create:disabled { opacity: .62; cursor: wait; }
 .weekly-create .spin { width: 11px; height: 11px; border-width: 1.5px; }
 .weekly-caption { margin-top: 7px; color: var(--text-faint); font-size: 11px; line-height: 1.45; }
@@ -3341,7 +3477,7 @@ function exportSupplementalCsv(t: Turn) {
 .tgt-protected { font-size: 11px; color: var(--text-muted); font-weight: 600; }
 .btn-mini { height: 26px; padding: 0 10px; font-size: 12px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-regular); border-radius: 6px; cursor: pointer; }
 .btn-mini:hover { border-color: var(--primary); color: var(--primary); }
-.btn-mini.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+.btn-mini.primary { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
 .btn-mini.primary:disabled { opacity: .5; cursor: not-allowed; }
 .btn-mini.danger { color: var(--error-text); }
 .btn-mini.danger:hover { border-color: var(--error-ring); background: var(--error-bg); }
@@ -3360,7 +3496,7 @@ function exportSupplementalCsv(t: Turn) {
 .f-actions { display: flex; gap: 8px; }
 .btn { height: 32px; padding: 0 14px; font-size: 13px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-regular); border-radius: 7px; cursor: pointer; }
 .btn:hover { border-color: var(--primary); color: var(--primary); }
-.btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
+.btn.primary { background: var(--primary); border-color: var(--primary); color: var(--on-primary); font-weight: 600; }
 .btn.primary:hover { filter: brightness(1.06); }
 .btn:disabled { opacity: .55; cursor: not-allowed; }
 .f-test { margin-top: 10px; font-size: 12.5px; border-radius: 7px; padding: 7px 12px; background: var(--primary-bg); color: var(--primary); }
@@ -3435,17 +3571,20 @@ function exportSupplementalCsv(t: Turn) {
 .topbar .sp { flex: 1; }
 .dms-user { font-size: 12px; color: var(--text-muted); }
 /* 对话流 */
-.chat { flex: 1; overflow-y: auto; padding: 20px 24px; min-height: 0; }
-.turn { margin-bottom: 16px; display: flex; flex-direction: column; }
+.chat { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 24px; min-height: 0; }
+.turn { width: 100%; min-width: 0; margin-bottom: 16px; display: flex; flex-direction: column; }
 .bubble { max-width: 82%; padding: 12px 16px; font-size: 14px; line-height: 1.65; word-break: break-word; }
-.bubble.user { margin-left: auto; width: fit-content; background: var(--primary); color: #fff; white-space: pre-wrap; border-radius: 12px 12px 4px 12px; }
+.bubble.user { margin-left: auto; width: fit-content; background: var(--primary); color: var(--on-primary); white-space: pre-wrap; border-radius: 12px 12px 4px 12px; }
 .bubble.ai { margin-right: auto; width: fit-content; max-width: min(100%, 1120px); background: var(--bg-card); border: 1px solid var(--border); box-shadow: var(--shadow-sm); border-radius: 12px 12px 12px 4px; }
-/* 精简模式取数结果：fit-content 会把单行 KPI/少行表格挤成一小条，结果卡撑满聊天区宽（深度模式布局不动） */
-.bubble.ai.result-bubble { width: min(100%, 1120px); }
+/* 结构化结果（含深度模式返回的澄清卡）按主栏比例伸缩，不按最短内容或固定像素收缩。 */
+.bubble.ai.result-bubble { align-self: flex-start; width: 82%; max-width: 100%; min-width: 0; }
+.bubble.ai.result-bubble > .result-panel { width: 100%; min-width: 0; }
 .bubble.err { margin-right: auto; background: var(--error-bg); border: 1px solid var(--error-ring); color: var(--error-text); border-radius: 12px; }
 .thinking { display: inline-flex; align-items: center; gap: 10px; background: var(--bg-card); border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; font-size: 13px; color: var(--text-regular); box-shadow: var(--shadow-sm); width: fit-content; }
 .thinking .elapsed { color: var(--primary); font-variant-numeric: tabular-nums; }
 .thinking-hint { font-size: 11px; color: var(--text-faint); border-left: 1px solid var(--divider); padding-left: 10px; }
+.stop-generation { margin-left: auto; border: 0; background: none; color: var(--error-text); font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.stop-generation:hover { text-decoration: underline; }
 .thinking.deep { width: min(100%, 620px); display: grid; gap: 7px; padding: 10px 12px; align-items: start; border-radius: 6px; box-shadow: none; }
 .think-state { display: flex; gap: 10px; align-items: flex-start; min-width: 0; }
 .think-state .spin { width: 16px; height: 16px; margin-top: 2px; flex: 0 0 auto; }
@@ -3517,18 +3656,14 @@ function exportSupplementalCsv(t: Turn) {
 .ask-q { font-size: 13px; color: var(--text-regular); line-height: 1.7; margin-bottom: 10px; white-space: pre-wrap; }
 .ask-opts { display: flex; flex-wrap: wrap; gap: 8px; }
 .ask-opt { border: 1px solid var(--primary); background: var(--bg-card); color: var(--primary); border-radius: var(--radius-full); padding: 6px 14px; font-size: 13px; cursor: pointer; }
-.ask-opt:hover { background: var(--primary); color: #fff; }
+.ask-opt:hover { background: var(--primary); color: var(--on-primary); }
 .ask-hint { font-size: 12px; color: var(--text-faint); margin-top: 8px; }
 .trunc-note { background: var(--warning-bg); border-left: 3px solid var(--warning-text); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 12px; font-size: 12px; color: var(--text-regular); line-height: 1.6; word-break: break-all; }
 /* 脱敏回显：用中性底而非 error 底 —— 它说的是「按策略不给看」，不是出错。
    用户误判的方向恰恰相反（把空列当故障），所以措辞要正面说明「已脱敏」。 */
 .redact-note { background: var(--bg-main); border-left: 3px solid var(--text-muted); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 12px; font-size: 12px; color: var(--text-regular); line-height: 1.6; }
-/* 行权限回显：与脱敏同族（都是「这份结果有什么前提」），共用一套视觉，只换左边条颜色 */
-.scope-note { background: var(--bg-main); border-left: 3px solid var(--primary); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 12px; font-size: 12px; color: var(--text-regular); line-height: 1.6; }
 .redact-lock { margin-left: 4px; font-size: 10px; }
 .tbl-wrap td.redact-cell { color: var(--text-faint); font-style: italic; text-align: center; }
-/* 行数脚注：恒显示。此前界面对「后面还有 100 行」一个字都没有 */
-.tbl-foot { margin: -6px 0 12px; font-size: 11.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 /* AI 解读折叠面板 */
 .ai-panel { border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg-main); padding: 10px 12px; margin-bottom: 12px; }
 .ai-hd { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; font-weight: 650; color: var(--text-primary); margin-bottom: 6px; }
@@ -3540,7 +3675,7 @@ function exportSupplementalCsv(t: Turn) {
 .deep-insight { background: var(--bg-card); border-color: var(--border); border-left: 4px solid var(--primary); color: var(--text-regular); padding: 0; overflow: hidden; box-shadow: var(--shadow-sm); margin-top: 18px; }
 .deep-insight .ai-hd { color: var(--text-primary); font-size: 14px; padding: 13px 16px; margin: 0; border-bottom: 1px solid var(--divider); background: var(--bg-main); }
 .deep-insight .ai-hint { color: var(--text-muted); }
-.deep-insight .ai-mark { display: inline-grid; place-items: center; width: 27px; height: 20px; border-radius: 4px; background: var(--primary); color: #fff; font-size: 10px; font-weight: 750; }
+.deep-insight .ai-mark { display: inline-grid; place-items: center; width: 27px; height: 20px; border-radius: 4px; background: var(--primary); color: var(--on-primary); font-size: 10px; font-weight: 750; }
 .deep-insight .kb { color: var(--text-regular) !important; padding: 12px 16px 15px; }
 .deep-insight .kb-body p, .deep-insight .kb-body li { color: var(--text-regular) !important; }
 .deep-insight .kb-body h3, .deep-insight .kb-body h4, .deep-insight .kb-body h5, .deep-insight .kb-body h6, .deep-insight .kb-body b { color: var(--text-primary) !important; }
@@ -3629,7 +3764,7 @@ function exportSupplementalCsv(t: Turn) {
 .inputbar { display: flex; gap: 8px; align-items: flex-end; padding: 12px 16px; }
 .inputbar textarea { flex: 1; min-height: 42px; max-height: 160px; resize: none; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-card); color: var(--text-regular); font-family: inherit; font-size: 14px; line-height: 1.55; }
 .inputbar textarea:focus { border-color: var(--primary); box-shadow: var(--ring); outline: none; }
-.send { flex: 0 0 auto; height: 42px; padding: 0 22px; background: var(--primary); color: #fff; border: 1px solid var(--primary); border-radius: var(--radius-md); font-size: 14px; font-weight: 600; cursor: pointer; }
+.send { flex: 0 0 auto; height: 42px; padding: 0 22px; background: var(--primary); color: var(--on-primary); border: 1px solid var(--primary); border-radius: var(--radius-md); font-size: 14px; font-weight: 600; cursor: pointer; }
 .send:disabled { opacity: .55; cursor: not-allowed; }
 .toast { position: fixed; right: 18px; bottom: 18px; z-index: 1300; background: var(--text-primary); color: var(--bg-card); font-size: 13px; padding: 9px 14px; border-radius: 9px; box-shadow: var(--shadow-md, 0 4px 16px rgba(0,0,0,.18)); animation: toastIn .18s ease-out; }
 @keyframes toastIn { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
@@ -3652,7 +3787,7 @@ function exportSupplementalCsv(t: Turn) {
 .weekly-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 20px 24px 22px; }
 .weekly-cancel, .weekly-submit { height: 36px; padding: 0 17px; border-radius: 6px; font-size: 13px; font-weight: 650; cursor: pointer; }
 .weekly-cancel { border: 1px solid var(--border); background: var(--bg-card); color: var(--text-regular); }
-.weekly-submit { border: 1px solid var(--primary); background: var(--primary); color: #fff; }
+.weekly-submit { border: 1px solid var(--primary); background: var(--primary); color: var(--on-primary); }
 .weekly-cancel:hover { border-color: var(--primary); color: var(--primary); }
 .weekly-submit:disabled { opacity: .5; cursor: not-allowed; }
 /* 【思维过程】Codex 风格：已完成步骤收敛，当前步骤高亮 */
@@ -3732,7 +3867,7 @@ function exportSupplementalCsv(t: Turn) {
 .dsec-seg { height: 28px; display: inline-flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
 .dsec-seg button { min-width: 46px; border: 0; border-right: 1px solid var(--border); background: var(--bg-card); color: var(--text-muted); font-size: 11.5px; cursor: pointer; }
 .dsec-seg button:last-child { border-right: 0; }
-.dsec-seg button.on { background: var(--primary); color: #fff; }
+.dsec-seg button.on { background: var(--primary); color: var(--on-primary); }
 .dsec-icon { width: 28px; height: 28px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg-card); color: var(--text-muted); cursor: pointer; font-size: 14px; }
 .dsec-icon:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-bg); }
 .dtable-wrap { max-height: 460px; overflow: auto; border: 1px solid var(--divider); border-radius: 5px; background: var(--bg-card); }
@@ -3745,6 +3880,8 @@ function exportSupplementalCsv(t: Turn) {
 .dtable tr:nth-child(even) td { background: var(--bg-main); }
 .dtable tr:last-child td { border-bottom: 0; }
 .dtable tr:hover td { background: var(--primary-light); }
+/* 首列 sticky（见上）：半透明底会让横滚时压在下面的单元格文字透出来，与 ResultPanel 同解 */
+.dtable tr:hover td:first-child { background: color-mix(in srgb, var(--primary) 8%, var(--bg-card)); }
 .dmore { padding-top: 7px; color: var(--text-faint); font-size: 10.5px; text-align: right; }
 .contribution-sec { border-left: 3px solid var(--primary); }
 .bi-focus { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; padding: 28px; background: rgba(17, 24, 39, .42); backdrop-filter: blur(5px); }
@@ -3758,7 +3895,7 @@ function exportSupplementalCsv(t: Turn) {
 /* 【深度模式】精简|深度 segmented */
 .mode-seg { display: flex; border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; flex: 0 0 auto; height: 42px; }
 .mode-seg button { display: flex; align-items: center; padding: 0 12px; border: 0; font: inherit; font-size: 13px; color: var(--text-muted); cursor: pointer; background: var(--bg-card); }
-.mode-seg button.on { background: var(--primary); color: #fff; font-weight: 600; }
+.mode-seg button.on { background: var(--primary); color: var(--on-primary); font-weight: 600; }
 .mode-seg.disabled { opacity: .48; }
 .mode-seg.disabled button { cursor: not-allowed; }
 /* 按钮 */
@@ -3807,6 +3944,7 @@ function exportSupplementalCsv(t: Turn) {
   .side-mask { display: block; position: fixed; inset: 0; z-index: 1140; background: rgba(17, 24, 39, .38); backdrop-filter: blur(5px); }
   .mobile-kb, .mobile-weekly { display: inline-flex; align-items: center; }
   .bubble { max-width: 94%; }
+  .bubble.ai.result-bubble { width: 100%; max-width: 100%; }
   .pv { position: fixed; inset: 0; z-index: 1200; display: flex; width: 100%; min-width: 0; max-width: none; flex-basis: auto !important; border-left: 0; }
   .pv-drag { display: none; }
   .pv-hd { padding: 9px 10px; overflow-x: auto; }

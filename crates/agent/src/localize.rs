@@ -88,6 +88,7 @@ mod tests {
             clarify_options: vec![],
             value_labels: vec![],
             sales_context: None,
+            intent_summary: None,
         }
     }
 

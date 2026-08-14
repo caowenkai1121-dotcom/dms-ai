@@ -3,6 +3,7 @@
 > 版本：2026-07-27 ｜ 状态：可开工 ｜ 产出方式：7 crate 并行文件级设计 + 跨 crate 契约裁决 + 4 路对抗评审（过度设计 / 上帝文件与函数肥胖 / 功能不许丢 / 红线不破）
 > 关系：本文是 v1 spec（6-crate 受控内核）与 v2 spec（多数据源 + 知识库）的**合并终稿**。三者冲突处以本文为准；两份 spec 保留为设计过程记录，`plans/_DECISIONS.md` 的裁决除本文 §8 明确推翻的以外继续有效。
 > 目标形态：通用 Agent 运行时。NL2SQL 与企业知识库是两个能力包，多数据源是取数能力包的地基。
+> 2026-08-12 修订：业务已明确要求模型主导的结构化意图与受控工具循环，原 §8 对 ReAct 的延期条件已经满足；迁移边界、pi 对照和验收见 [`AGENT-ARCHITECTURE.md`](AGENT-ARCHITECTURE.md)。在 typed tool 与覆盖闸完成前，不以新增平行状态机冒充完整 Agent。
 
 ---
 
@@ -180,7 +181,11 @@ seeds/*.sql (11 个)                330   9 组 const 种子 + 32 表权限档�
 | `registry/mod.rs` | 140 | `Registry`（持 `PgPool`+`DsId`+`EmbedClient`）+ `with_ds` + `DS_PRED`/`VIS_PRED` 两个谓词常量 | 新增 |
 | `registry/model.rs` | 150 | 装配侧行类型与读取：`MetricDef/DimensionDef/JoinEdge/TableScope` | `direct.rs:24-51`、`meta.rs` 各 load |
 | `registry/lexicon.rs` | 130 | 文本命中侧：`ValueMap/TermDef/DocBinding` | 同上 |
-| `registry/exemplar.rs` | 120 | **语料与教训表的唯一读写口**（few-shot trgm 召回 / 向量最近邻 / pending 复核 / 状态更新），带 `VIS_PRED`（F6）—— 消灭 agent 直写 `meta.*` | `pipeline.rs:206-218/653-679/815-869` |
+| `registry/exemplar.rs` | 497 | **语料表 `meta.sql_exemplar` 的唯一读写口**（few-shot trgm 召回 / 向量最近邻 / pending 复核 / 状态更新），带 `VIS_PRED`（F6）—— 消灭 agent 直写 `meta.*`。三个状态写口共用 `ledger_status_change`（读前值→落账→再改） | `pipeline.rs:206-218/653-679/815-869` |
+| `registry/pitfall.rs` | 103 | **教训表 `meta.pitfall` 的唯一读写口**（候选落库 / 待复核清单 / 复核结论）。2026-08-14 从 exemplar 拆出：D2（>500 必拆）+ D3（语料与教训是两条独立学习链） | 拆自 `registry/exemplar.rs` |
+| `registry/learn.rs` | 300 | **学习事件账本**：`log_event`（前值/后值/批次号）+ `recent_batches`（带 first_at/last_at/rolled_back）+ `rollback_batch`（三态 `Undone`）+ 纯函数 `undo_stmt`。形态借 prime-agent 的 refinement | 新增（2026-08-14） |
+| `registry/user_pref.rs` | 170 | **用户习惯层**：从 `meta.query_log` 现算高频时间/分组说法（`MIN_SUPPORT=3`），只进 prompt 参考段、不改 SQL、不覆盖用户显式表达 | 新增（2026-08-14） |
+| `registry/failure.rs` | 66 | 失败经验的**读回**半：`failure_streak`（同 kind + 错误前缀 60 字），第 2 次起才惊动模型复盘 | 新增（2026-08-14） |
 | `registry/element.rs` | 120 | 四注册表 → `meta.element` 幂等派生 | `meta.rs:414-494` |
 | `registry/datasource.rs` | 150 | 【K3】`meta.datasource` CRUD + `visible(&Viewer)`（ACL 内联 SQL）+ `authorize→DsGrant` + `nearest(q,k)` 向量选源候选 + `register_datasource(&TabularSource)` | 新增 |
 | `ingest/mod.rs` | 110 | 准入规则：备份表识别、敏感列黑名单、按名前缀分域、**`sanitize_comment` + `origin`**（F4） | `meta.rs:164-205` |
@@ -242,7 +247,7 @@ seeds/*.sql (11 个)                330   9 组 const 种子 + 32 表权限档�
 | `ctx.rs` | 120 | `AskCtx`（**`source: &dyn SqlSource`** 而非具名 MySQL —— ds_id 断链的头号修法；`llm: &Arc<dyn ChatModel>` 供 spawn）+ `table_answer`（`view` 恒 Some） | 新增 |
 | `answerers/mod.rs` | 110 | `Answerer` trait + `Router` 有序表 `[graph, compose, fastpath, cache, llm]`（逐条转写 `pipeline.rs:537/546/586/593`）+ `route_label_map` 断言 | `pipeline.rs:527-624` |
 | `answerers/hits.rs` | 160 | 组合器/模板两成员的共同落地：check→inject→fetch→view→KPI 环比 | `pipeline.rs:551-584` |
-| `answerers/graph.rs` | 80 | 图成员：`Relation` → 三列表格（`accept = proof.is_some() && detect_relation().is_some()`） | `pipeline.rs:878-920` |
+| `answerers/graph.rs` | 80 | 图成员：`Relation` → 三列表格。准入判据 `skip_reason()` 六项**只看问句、不读合同**（读 fast 产物会让同题两次进程两条路由，2026-08-14 实测）；六个不接理由各有名字并进 `info!` | `pipeline.rs:878-920` |
 | `answerers/cache.rs` | 100 | 语义缓存：调 `registry::exemplar::nearest` + 时间/数字词护栏 + 回放三关（注入失败仍回落但必须 warn，且不吞 `ConditionParse`/`UnregisteredTable`） | `pipeline.rs:812-860` |
 | `answerers/knowledge.rs` | 65 | 【K5】知识库适配器（`Answerer` 在 agent，故适配器只能在 agent）；**不进 `default_router()`**，由 triage 直接分派（进链会让文档问句回落到 SQL 生成，破 I5） | 新增 |
 | `run.rs` | 200 | `route="llm"` 的 IO 落地：**显式 `for round in 0..=budget.max_repair_rounds` 循环**（不是状态机回调）+ 五个 async 步骤 + schema-fix 在循环外（不占预算）+ **`correction_log` 九个 kind 一个不少**（含 `schema-fix`/`explain-fail` 与 guard 的三个 caliber-*） | `pipeline.rs:593-716` |
@@ -252,6 +257,7 @@ seeds/*.sql (11 个)                330   9 组 const 种子 + 32 表权限档�
 | `compound.rs` | 150 | `Composite` 生产：并行拆解 + 汇总步（fast LLM，失败降级 `None`）+ hybrid 合并。**`SubBrief` 的文本段必须过 `wrap_untrusted`，summary 不许含 URL** | `pipeline.rs:507-521` + 补今天空的汇总 |
 | `review.rs` | 95 | 自评闭环：三类复核的 prompt + 三个 parse 纯函数 + 四个 10 行编排（SQL 全走 `registry::exemplar`） | `pipeline.rs:718-875` |
 | `triage.rs` | 135 | 【K5】意图分诊 data/knowledge/hybrid：规则优先 0-LLM，fast 兜底，失败默认 data | 新增 |
+| `hybrid.rs` | 180 | 【2026-08-14】混合问句的**唯一编排点**（原在 `server/main.rs`，两条链路对同一合同行为相反）：`split()` = N 条问数 + 恰好 1 条资料、两路并行、一路挂了不拖死另一路；`knowledge_only()` 供纯资料问句 | 收自 `server/src/main.rs::hybrid_payload` |
 | `source.rs` | 110 | 【K3】向量选源：显式选源优先 → `registry::datasource::visible` 候选 → 距离差 >0.08 直接用 → 否则 fast LLM 选一次 | 新增 |
 | `prompts/system.md` `prompts/repair.md` | 32 | **只外置这两个**（需要 golden 逐字守）；其余 2-8 行 fast 提示保持 `format!` 字面量；方言段用 `Dialect::name()` 插值 | `pipeline.rs:189-201` |
 

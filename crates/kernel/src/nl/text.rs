@@ -164,6 +164,28 @@ pub fn has_residue_with(question: &str, consumed: &[String], strip_words: &[&str
 /// 上限 8 字：图里最长的省份名/分类名都在 8 字内，再长的窗口只是白查库/白 embed。
 /// 注意：重复子串会产出重复窗口（如「 sales sales 」），去重由调用方自理
 /// （graph 侧靠 `taken`、gather 侧靠 `seen`）。
+/// 两段文本的**最长公共子串**长度（按字符计，不是字节）。
+///
+/// 用途（2026-08-14）：要文件的人几乎总是在**念文件名**。
+/// 「押金转货款申请书」对《押金转货款申请书(1).docx》拿到 8，
+/// 对《客户退出申请流程填写详细指引》只有 2（「申请」）——
+/// 一条纯词法信号就能把文件清单从 5 条弱相关压到 1 条真命中。
+///
+/// 朴素 DP，两行滚动。文件名与问句都是几十字量级，不值得为它上后缀自动机。
+pub fn longest_common_run(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (mut prev, mut cur) = (vec![0usize; b.len() + 1], vec![0usize; b.len() + 1]);
+    let mut best = 0;
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            cur[j] = if a[i - 1] == b[j - 1] { prev[j - 1] + 1 } else { 0 };
+            best = best.max(cur[j]);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    best
+}
+
 pub fn candidate_windows(text: &str) -> Vec<(usize, String)> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -267,5 +289,16 @@ mod tests {
         assert!(!has_residue_with("丙丁", &long, &[]));
         // 纯数字/标点不算实义残留
         assert!(!has_residue_with("甲乙 100，", &consumed, &[]));
+    }
+
+    /// 文件名信号：真命中远高于蹭到一个词的弱相关。
+    #[test]
+    fn the_longest_common_run_separates_the_real_file_from_the_noise() {
+        let q = "下载 押金转货款申请书";
+        assert_eq!(longest_common_run(q, "押金转货款申请书(1).docx"), 8);
+        // 这三份是实测里挤进清单的弱相关，全靠正文里的「申请」蹭进来
+        assert!(longest_common_run(q, "客户退出申请流程填写详细指引.docx") <= 2);
+        assert!(longest_common_run(q, "线下设备物资处置申请单流程指引.docx") <= 2);
+        assert_eq!(longest_common_run("", "任何东西"), 0);
     }
 }

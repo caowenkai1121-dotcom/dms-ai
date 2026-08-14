@@ -15,7 +15,7 @@
 use sqlx::PgPool;
 
 use dms_kernel::{ChatModel, ChatRequest, ModelTier};
-use dms_semantic::registry::{exemplar, extract_tables};
+use dms_semantic::registry::{exemplar, extract_tables, pitfall};
 
 /// 失败复盘（引擎 C）的判词
 const FAILURE_SYSTEM: &str = "你是资深数据工程师，复盘一条执行失败的取数 SQL。判断根因类别：\
@@ -54,6 +54,8 @@ async fn fast(llm: &dyn ChatModel, system: &str, user: &str) -> Option<String> {
 /// 教训格式对齐存量 pitfall（一句话口径知识）；判无教训（纯权限无数据/问题无解）则 NO_LESSON 不落。
 pub async fn review_failure(
     llm: &dyn ChatModel,
+    // `who` = (批次号, 操作者)：批次号是本轮 trace_id，管理员据此撤回这一轮学到的东西
+    who: (&str, &str),
     pg: &PgPool,
     ds: &str,
     question: &str,
@@ -70,7 +72,7 @@ pub async fn review_failure(
     };
     let tables = extract_tables(sql);
     if !tables.is_empty()
-        && !exemplar::save_lesson_candidate(pg, ds, &tables, lesson).await
+        && !pitfall::save_lesson_candidate(pg, who, ds, &tables, lesson).await
     {
         tracing::warn!("候选教训落库失败（save_lesson_candidate 返回 false）");
     }
@@ -79,7 +81,16 @@ pub async fn review_failure(
 /// 候选教训复核（对齐 MemoryReviewTask 思想）：LLM 判候选教训是否正确通用 → active/disabled。
 pub async fn review_lessons(llm: &dyn ChatModel, pg: &PgPool, limit: i64) -> anyhow::Result<usize> {
     // 跨源管理批处理（复核所有源的候选教训），按 id 逐条更新，不需要 ds 谓词（判据在 exemplar 侧）
-    let rows = exemplar::candidate_lessons(pg, limit).await?;
+    let rows = pitfall::candidate_lessons(pg, limit).await?;
+    // 复核批的批次号：粒度是「这一次复核批」（与问答轮的 trace_id 同族，只是另一种事件源）。
+    // 用 std 的秒级时间戳，零新增依赖。
+    let batch = format!(
+        "review-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
     let mut n = 0;
     let mut misses = 0;
     for (id, tables, lesson) in rows {
@@ -98,7 +109,7 @@ pub async fn review_lessons(llm: &dyn ChatModel, pg: &PgPool, limit: i64) -> any
         // 落库失败整批上抛是**有意的**（与 `review_all_pending` 的逐条容错不同）：
         // 复核结论只有写进库才有意义，PG 写不进时逐条继续也是各烧一次必败写，
         // 不如整批报错让人看见；已成功的计数 n 随 Err 丢弃可接受（下批会重扫）。
-        exemplar::set_lesson_status(pg, id, parse_verdict(&resp)).await?;
+        pitfall::set_lesson_status(pg, (&batch, "review"), id, parse_verdict(&resp)).await?;
         n += 1;
     }
     Ok(n)
@@ -113,6 +124,8 @@ pub async fn review_lessons(llm: &dyn ChatModel, pg: &PgPool, limit: i64) -> any
 /// 与兄弟函数 `review_lessons`（`?` 传播、成功后才 `n += 1`）现在同一种诚实度。
 pub async fn review_exemplar(
     llm: &dyn ChatModel,
+    // `who` = (批次号, 操作者)。AI 初筛会把语料打成 disabled —— 判错了得能整批撤回。
+    who: (&str, &str),
     pg: &PgPool,
     ds: &str,
     question: &str,
@@ -122,7 +135,7 @@ pub async fn review_exemplar(
     let user = format!("问题：{question}\nSQL：\n{sql}\n审核结论：");
     // 复核失败保持 pending，下次再议
     let Some(resp) = fast(llm, EXEMPLAR_SYSTEM, &user).await else { return false };
-    if let Err(e) = exemplar::set_ai_review(pg, ds, question, parse_opinion(&resp)).await {
+    if let Err(e) = exemplar::set_ai_review(pg, who, ds, question, parse_opinion(&resp)).await {
         // 带问句：批量复核一次扫 100 条，不带问句就查不出是哪条卡住
         // （问句截定长：整句塞结构化字段会让日志行膨胀到 KB 级）
         let q: String = question.chars().take(120).collect();
@@ -141,8 +154,17 @@ pub async fn review_all_pending(
 ) -> anyhow::Result<usize> {
     // 跨源批处理：每行带着自己的 ds_id 回来（复核是逐条的，不需要 ds 谓词）
     let rows = exemplar::pending(pg, limit).await?;
+    // 一次批量复核 = 一个批次（与 `review_lessons` 同一形态）
+    let batch = format!(
+        "screen-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    let who = (batch.as_str(), "ai-screen");
     Ok(count_reviewed(rows, |(ds, q, sql)| async move {
-        review_exemplar(llm, pg, &ds, &q, &sql).await
+        review_exemplar(llm, who, pg, &ds, &q, &sql).await
     })
     .await)
 }
@@ -247,7 +269,7 @@ mod tests {
         let (llm, pg) = (&fake as &dyn ChatModel, &pool);
         let rs = rows(2);
         let n = count_reviewed(rs.clone(), |(ds, q, sql): (String, String, String)| async move {
-            review_exemplar(llm, pg, &ds, &q, &sql).await
+            review_exemplar(llm, ("t-batch", "test"), pg, &ds, &q, &sql).await
         })
         .await;
         assert_ne!(n, rs.len(), "写不进库还报「处理了 N 条」＝ 投毒语料继续当范例传播");

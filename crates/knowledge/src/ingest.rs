@@ -8,7 +8,7 @@ use crate::store::{self, CharSpan, DocInsert, DocStatus, NewDoc};
 use crate::tabular::{self, TabularSource};
 use crate::{acl, KbError, Viewer};
 use dms_connector::doc::{Block, Chunk, DocService, ParsedDoc, Sheet};
-use dms_connector::embed::{to_pgvector, EmbedClient};
+use dms_connector::embed::{to_pgvector, EmbedClient, EmbedMode};
 use dms_connector::owned::OwnedStore;
 use std::future::Future;
 use std::pin::Pin;
@@ -373,8 +373,8 @@ pub async fn prepare(
 }
 
 /// 入库重活分派（后台任务里跑）。`Fresh` 失败把文案落库（用户在文档列表里看得见）；
-/// `Rebuild`/`Overwrite` 走影子构建，失败时线上版本原样保留（`reprocess`/`overwrite` 语义），
-/// 错误由调用方记日志。
+/// `Rebuild`/`Overwrite` 走影子构建，失败时线上版本原样保留，且把本次失败
+/// 另行落库（不改线上 `status`），让列表可见但旧版本仍可检索。
 /// 返回通道②数据源（Fresh/Overwrite 且新内容真是表格时非空）——登记/授权是 server 侧的事，
 /// 随任务后台化。Overwrite 返回 `None` 表示新内容无表：旧版本登记过的数据源由调用方退役。
 pub async fn run_job(
@@ -403,11 +403,30 @@ pub async fn run_job(
             }
         }
         IngestJob::Rebuild { req } => {
-            reprocess(st, doc, embed, v, cfg, req.as_req(), doc_id, image_ocr).await.map(|_| None)
+            match reprocess(st, doc, embed, v, cfg, req.as_req(), doc_id, image_ocr).await {
+                Ok(()) => Ok(None),
+                Err(e) => {
+                    persist_shadow_failure(st, v, doc_id, &e).await;
+                    Err(e)
+                }
+            }
         }
         IngestJob::Overwrite { req } => {
-            overwrite(st, doc, embed, v, cfg, req.as_req(), doc_id, image_ocr).await
+            match overwrite(st, doc, embed, v, cfg, req.as_req(), doc_id, image_ocr).await {
+                Ok(source) => Ok(source),
+                Err(e) => {
+                    persist_shadow_failure(st, v, doc_id, &e).await;
+                    Err(e)
+                }
+            }
         }
+    }
+}
+
+async fn persist_shadow_failure(st: &OwnedStore, viewer: &Viewer, doc_id: &str, error: &KbError) {
+    let message = dms_kernel::qalog::sanitize(&error.to_string());
+    if let Err(e) = store::set_last_ingest_error(st, viewer, doc_id, &message).await {
+        tracing::warn!(doc_id, error = %e, "影子入库失败状态落库失败（旧版本仍保留）");
     }
 }
 
@@ -530,11 +549,18 @@ pub async fn reprocess(
     let stage_id = uuid::Uuid::new_v4().to_string();
     let staged_path = doc_path(cfg, &stage_id, req.file_name);
     let staged = build_shadow(doc, embed, &req, &current, &staged_path, image_ocr, kind).await;
-    remove_staged_file(&staged_path, doc_id).await;
     let built = match staged {
         Ok(v) => v,
-        Err(e) => return Err(e),
+        Err(e) => {
+            remove_staged_file(&staged_path, doc_id).await;
+            return Err(e);
+        }
     };
+    // 纯重建通常不换原件；但 failed 文档可能只剩 DB 元数据、原件已丢。此时同 hash
+    // 重传的影子文件就是可恢复原件：先原子补回 live，再切索引；live 尚在则只清 stage。
+    let live_path = doc_path(cfg, doc_id, &current.name);
+    let _switch_guard = FILE_SWITCH_LOCK.lock().await;
+    restore_missing_live_file(&staged_path, &live_path, doc_id).await?;
     store::replace_chunks(
         st,
         viewer,
@@ -555,6 +581,32 @@ pub async fn reprocess(
     Ok(())
 }
 
+/// `reprocess` 的原件自愈：live 已存在时保持分毫不动；缺失时把同 hash 的影子文件原子
+/// 提升为 live。任一文件操作失败都清 stage，且发生在 DB 影子切换前，故不改变切库语义。
+async fn restore_missing_live_file(
+    staged_path: &std::path::Path,
+    live_path: &std::path::Path,
+    doc_id: &str,
+) -> Result<(), KbError> {
+    match tokio::fs::metadata(live_path).await {
+        Ok(_) => {
+            remove_staged_file(staged_path, doc_id).await;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(e) = tokio::fs::rename(staged_path, live_path).await {
+                remove_staged_file(staged_path, doc_id).await;
+                return Err(io_err(e));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            remove_staged_file(staged_path, doc_id).await;
+            Err(io_err(e))
+        }
+    }
+}
+
 /// staged 临时文件的收尾清理：文件可能根本没写出来（build_shadow 在写盘前就失败），
 /// NotFound 不算事，其余留诊断。
 async fn remove_staged_file(path: &std::path::Path, doc_id: &str) {
@@ -565,12 +617,11 @@ async fn remove_staged_file(path: &std::path::Path, doc_id: &str) {
     }
 }
 
-/// 覆盖链「换文件 → 切库 → 通道②」临界区的进程内互斥：连续重传同名文件的修正版会产
-/// 生两个并发的 Overwrite 任务，它们的 rename 与 replace_chunks 一旦交错，就会把
-/// 「A 任务的 sha + B 任务的文件」钉成两半状态（此后同内容重传被 sha 去重弹回，不再自愈）。
-/// 临界区只有 一次 rename + 一条 SQL +（表格时）建表灌数，且上传闸本就只放 4 并发，
-/// 全局串行的代价可忽略。Rebuild 链不换文件、不带文件元数据，不在此锁内。
-static OVERWRITE_SWITCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// 文件 → DB 切换临界区的进程内互斥：Overwrite 恒换文件，Rebuild 在 live 缺失时补文件；
+/// 两者任一与另一任务的 `replace_chunks` 交错，都会把文件和 DB 元数据/索引钉成两半状态。
+/// 临界区只有一次文件收尾 + 一条 SQL +（覆盖表格时）建表灌数，上传闸本就只放 4 并发，
+/// 全局串行的代价可忽略。
+static FILE_SWITCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 同名覆盖的后台重建（`IngestJob::Overwrite`）：影子构建 → 换文件 → 一条语句切换索引与
 /// 文件元数据 → 通道②随新内容重建。与 `reprocess` 同族的失败语义：影子切换之前任何一步
@@ -608,20 +659,21 @@ async fn overwrite(
         }
     };
     // 切换前两步都可以失败，失败后旧版本仍完整：sha 先算（此刻 live 文件还是旧内容，
-    // 库内文件元数据也还是旧值，两半一致）；文件先换（同目录 rename 原子）再切库——
+    // 库内文件元数据也还是旧值，两半一致）；文件先换（旧原件暂存回滚副本）再切库——
     // 顺序不许反：先切库会把「新 sha + 旧文件」钉进库里，同内容重传被 sha 去重秒传弹回，
-    // 旧文件永无自愈；先换文件时切换若失败（撤权/抖动），库内仍是旧 sha，
-    // 重传同名文件再走一遍覆盖链即收敛。
+    // 旧文件永无自愈；先换文件时切换若失败（撤权/抖动），当场恢复回滚副本，
+    // 不留下“旧索引 + 新原件”的错版。
     let sha = store::sha256_hex(st, req.bytes).await?;
     // 临界区全程互斥（并发覆盖同一文档的交错防护，见锁定义注释）；守卫随作用域/早退释放
-    let _switch_guard = OVERWRITE_SWITCH_LOCK.lock().await;
+    let _switch_guard = FILE_SWITCH_LOCK.lock().await;
     let live_path = doc_path(cfg, doc_id, req.file_name);
-    if let Err(e) = tokio::fs::rename(&staged_path, &live_path).await {
-        remove_staged_file(&staged_path, doc_id).await;
-        return Err(io_err(e));
-    }
-    let meta = store::DocFileMeta { sha256: &sha, bytes: req.bytes.len() as i64, mime: req.mime };
-    store::replace_chunks(
+    let rollback_path = install_staged_file(&staged_path, &live_path, doc_id).await?;
+    let meta = store::DocFileMeta {
+        sha256: &sha,
+        bytes: req.bytes.len() as i64,
+        mime: req.mime,
+    };
+    let switched = store::replace_chunks(
         st,
         viewer,
         doc_id,
@@ -635,10 +687,106 @@ async fn overwrite(
         &built.notice,
         Some(&meta),
     )
-    .await?;
+    .await;
+    if let Err(e) = switched {
+        if let Err(restore_error) =
+            restore_live_file(&live_path, rollback_path.as_deref(), doc_id).await
+        {
+            return Err(KbError::Db(format!(
+                "影子索引切换失败（{e}），且旧原件回滚失败：{restore_error}"
+            )));
+        }
+        return Err(e);
+    }
+    if let Some(path) = rollback_path {
+        remove_rollback_file(&path, doc_id).await;
+    }
     // 通道② 排在索引切换之后：切换失败时旧数据源必须还在服役（旧版本保持可检索/可问数）。
     // 版本元数据不重新推断——覆盖保留原文档元数据，名字没变，推断结果也不会变。
-    overwrite_tabular(st, viewer, &current.space_id, doc_id, &built.sheets).await
+    match overwrite_tabular(st, viewer, &current.space_id, doc_id, &built.sheets).await {
+        Ok(source) => Ok(source),
+        Err(e) => {
+            // 文件 + chunks 已原子提交，这里已越过 commit boundary，不能再宣称
+            // “旧版本保留”或走 last_ingest_error。通道②失败只降级提示，新文本版仍可检索。
+            let msg = format!(
+                "新版文档已可检索，但问数数据源重建失败：{}",
+                dms_kernel::qalog::sanitize(&e.to_string())
+            );
+            if let Err(notice_error) = store::append_notice(st, viewer, doc_id, &msg).await {
+                tracing::warn!(doc_id, error = %notice_error, "覆盖后问数降级提示落库失败");
+            }
+            tracing::warn!(doc_id, error = %e, "同名覆盖已切换新版，问数数据源重建失败");
+            Ok(None)
+        }
+    }
+}
+
+/// 先把旧 live 移到同目录回滚副本，再将 stage 提升为 live。不直接覆盖是为了
+/// 在紧随其后的 DB 影子切换失败时还能精确恢复旧原件，也兼容 Windows rename 不覆盖目标。
+async fn install_staged_file(
+    staged_path: &std::path::Path,
+    live_path: &std::path::Path,
+    doc_id: &str,
+) -> Result<Option<std::path::PathBuf>, KbError> {
+    let rollback_path = live_path.with_file_name(format!(
+        ".{}.rollback-{}",
+        live_path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or(doc_id),
+        uuid::Uuid::new_v4()
+    ));
+    let rollback = match tokio::fs::rename(live_path, &rollback_path).await {
+        Ok(()) => Some(rollback_path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            remove_staged_file(staged_path, doc_id).await;
+            return Err(io_err(e));
+        }
+    };
+    if let Err(e) = tokio::fs::rename(staged_path, live_path).await {
+        let switch_error = io_err(e);
+        if let Some(path) = rollback.as_deref() {
+            if let Err(restore_error) = tokio::fs::rename(path, live_path).await {
+                return Err(KbError::Db(format!(
+                    "新原件切换失败（{switch_error}），且旧原件恢复失败：{restore_error}"
+                )));
+            }
+        }
+        remove_staged_file(staged_path, doc_id).await;
+        return Err(switch_error);
+    }
+    Ok(rollback)
+}
+
+/// DB 切换失败：先移除已提升的新 live，再把旧原件放回原位。恢复失败不能吞，
+/// 否则日志会误报成普通 DB 抖动，而实际已变成文件/索引不一致的高危状态。
+async fn restore_live_file(
+    live_path: &std::path::Path,
+    rollback_path: Option<&std::path::Path>,
+    doc_id: &str,
+) -> Result<(), KbError> {
+    if let Err(e) = tokio::fs::remove_file(live_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(io_err(e));
+        }
+    }
+    if let Some(path) = rollback_path {
+        tokio::fs::rename(path, live_path).await.map_err(|e| {
+            KbError::Db(format!(
+                "数据库切换失败后旧原件恢复失败（文档 {doc_id}）：{e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+async fn remove_rollback_file(path: &std::path::Path, doc_id: &str) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(doc_id, error = %e, "覆盖成功后旧原件回滚副本删除失败");
+        }
+    }
 }
 
 /// 覆盖的通道②收尾：旧物理表（schema `up_<doc_id>`）随旧版本退役——`drop_source` 幂等，
@@ -700,7 +848,7 @@ async fn build_shadow(
         .iter()
         .map(|c| store::chunk_embedding_text(&current.name, &current.folder_path, &c.heading_path, &c.text))
         .collect();
-    let vecs = match embed.embed_passages(&embedding_texts).await {
+    let vecs = match embed.embed_batch(&embedding_texts, EmbedMode::Passage).await {
         Some(v) if v.len() == spanned.chunks.len() => v,
         got => {
             // 计数日志与 run 的同款 warn 对齐；两类失败文案分开（服务不可用 / 条数不符）
@@ -768,12 +916,12 @@ async fn run(
 
     let jobs = store::chunk_embedding_jobs(st, doc_id).await?;
     let texts: Vec<String> = jobs.iter().map(|j| j.text.clone()).collect();
-    // 分批在 `EmbedClient::embed_passages` 里（64 一批，对齐 `embed_service.py` 的 KB_BATCH）——
+    // 分批在 `EmbedClient::embed_batch` 里（64 一批，对齐 `embed_service.py` 的 KB_BATCH）——
     // 这里曾把全部块塞进一个请求，而语料侧和问句侧共用 3s 超时：275 块的 Word / 2500 块的 PDF
     // 必超时 ⇒ 文档永久停在 chunked。
     // 条数不符也走同一条降级（`ids` 是事实源）：`zip` 会静默只写前 k 个块的向量，
     // doc 却推到 embedded —— 那就是「界面显示已入库、其实一个字检索不到」。
-    let vecs = match embed.embed_passages(&texts).await {
+    let vecs = match embed.embed_batch(&texts, EmbedMode::Passage).await {
         Some(v) if v.len() == jobs.len() => v,
         got => {
             if let Some(v) = &got {
@@ -2057,6 +2205,70 @@ mod tests {
         assert_eq!(dedup_action(None), DedupAction::Reprocess);
     }
 
+    /// failed 文档同 hash 重传走 Rebuild；影子构建成功后必须先补回缺失原件，再切 DB。
+    /// 构建失败仍只清 stage，线上文件/索引保持原样。
+    #[test]
+    fn failed_dedup_rebuild_restores_original_before_database_switch() {
+        assert_eq!(dedup_action(Some("failed")), DedupAction::Reprocess);
+        let src = include_str!("ingest.rs");
+        let body = src.split("pub async fn reprocess").nth(1).unwrap();
+        let body = body.split("/// `reprocess` 的原件自愈").next().unwrap();
+        let build = body.find("build_shadow(").expect("Rebuild 必须走影子构建");
+        let failed_cleanup = body
+            .find("remove_staged_file(")
+            .expect("影子构建失败必须清 stage");
+        let restore = body
+            .find("restore_missing_live_file(")
+            .expect("Rebuild 必须自愈缺失原件");
+        let switch = body
+            .find("store::replace_chunks(")
+            .expect("Rebuild 必须切换 DB 影子索引");
+        let lock = body
+            .find("FILE_SWITCH_LOCK")
+            .expect("原件自愈与 DB 切换必须持互斥锁");
+        assert!(
+            build < failed_cleanup && failed_cleanup < lock && lock < restore && restore < switch,
+            "顺序必须是 影子构建 → 失败清理/原件自愈 → DB 切换: {body}"
+        );
+        assert!(
+            body.contains("doc_path(cfg, doc_id, &current.name)"),
+            "live 扩展名必须按库内文档名生成，不能随重传文件名漂移: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_live_promotes_stage_and_existing_live_discards_stage() {
+        let root = std::env::temp_dir().join(format!("dms-ai-rebuild-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let live = root.join("doc.pdf");
+        let stage = root.join("stage.pdf");
+
+        tokio::fs::write(&stage, b"recovered original")
+            .await
+            .unwrap();
+        restore_missing_live_file(&stage, &live, "doc")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&live).await.unwrap(), b"recovered original");
+        assert!(
+            !tokio::fs::try_exists(&stage).await.unwrap(),
+            "rename 后 stage 必须消失"
+        );
+
+        tokio::fs::write(&live, b"keep live").await.unwrap();
+        tokio::fs::write(&stage, b"discard stage").await.unwrap();
+        restore_missing_live_file(&stage, &live, "doc")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&live).await.unwrap(), b"keep live");
+        assert!(
+            !tokio::fs::try_exists(&stage).await.unwrap(),
+            "live 已存在时必须清 stage"
+        );
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
     /// 同名覆盖命中分派：进行态（pending/parsing）的旧版本首入链还在跑，此时覆盖会与在跑的
     /// `insert_chunks` 互踩（那条链 `ON CONFLICT` 不重入）→ Conflict 拒绝；其余状态
     /// （含 failed/未知）一律 Overwrite——影子切换是全量替换，对任何起始状态都安全，
@@ -2098,7 +2310,7 @@ mod tests {
     }
 
     /// 覆盖链的失败方向（源码钉住）：先建后切——影子构建成功前旧版本的文件/索引/数据源
-    /// 分毫不动；换文件（rename）必须排在切库（replace_chunks）之前（反了会把
+    /// 分毫不动；换文件（带回滚副本）必须排在切库（replace_chunks）之前（反了会把
     /// 「新 sha + 旧文件」钉死进库，秒传去重被毒化、旧文件永无自愈）；通道②退役/重建
     /// 排在索引切换之后（切换失败时旧数据源还在服役）。
     #[test]
@@ -2107,20 +2319,64 @@ mod tests {
         let body = src.split("async fn overwrite(").nth(1).unwrap();
         let body = body.split("/// 覆盖的通道②收尾").next().unwrap();
         let build = body.find("build_shadow(").expect("覆盖必须走影子构建");
-        let rename = body.find("tokio::fs::rename").expect("覆盖必须原子换文件");
-        let switch = body.find("store::replace_chunks(").expect("覆盖必须走影子切换");
+        let rename = body
+            .find("install_staged_file(")
+            .expect("覆盖必须保留旧原件回滚副本");
+        let switch = body
+            .find("store::replace_chunks(")
+            .expect("覆盖必须走影子切换");
         let tabular = body.find("overwrite_tabular(").expect("覆盖必须重建通道②");
         assert!(
             build < rename && rename < switch && switch < tabular,
             "覆盖链顺序必须是 影子构建 → 换文件 → 切库 → 通道②: {body}"
         );
-        assert!(!body.contains("insert_chunks("), "覆盖链不许走首入链落块（ON CONFLICT 不重入）: {body}");
-        assert!(body.contains("Some(&meta)"), "文件元数据必须随索引同语句切换: {body}");
+        assert!(
+            !body.contains("insert_chunks("),
+            "覆盖链不许走首入链落块（ON CONFLICT 不重入）: {body}"
+        );
+        assert!(
+            body.contains("Some(&meta)"),
+            "文件元数据必须随索引同语句切换: {body}"
+        );
+        assert!(
+            body.contains("restore_live_file("),
+            "DB 切换失败必须当场恢复旧原件: {body}"
+        );
         // 并发覆盖同一文档：rename→切库→通道② 的临界区必须互斥（两半状态不自愈，见锁注释）
-        let lock = body.find("OVERWRITE_SWITCH_LOCK").expect("覆盖临界区必须持互斥锁");
+        let lock = body
+            .find("FILE_SWITCH_LOCK")
+            .expect("覆盖临界区必须持互斥锁");
         assert!(lock < rename, "锁必须在换文件之前拿: {body}");
         // 覆盖保留原文档元数据（需求语义）——名字没变，版本推断结果也不会变，不许顺手重推
         assert!(!body.contains("try_apply_inferred_version"), "覆盖保留既有版本元数据: {body}");
+    }
+
+    #[tokio::test]
+    async fn overwrite_file_swap_can_restore_old_live_after_database_failure() {
+        let root = std::env::temp_dir().join(format!("dms-ai-overwrite-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let live = root.join("doc.pdf");
+        let stage = root.join("stage.pdf");
+        tokio::fs::write(&live, b"old live").await.unwrap();
+        tokio::fs::write(&stage, b"new staged").await.unwrap();
+
+        let rollback = install_staged_file(&stage, &live, "doc").await.unwrap();
+        assert_eq!(tokio::fs::read(&live).await.unwrap(), b"new staged");
+        assert_eq!(
+            tokio::fs::read(rollback.as_ref().unwrap()).await.unwrap(),
+            b"old live"
+        );
+
+        // 模拟 replace_chunks Err：文件回滚后旧索引再次指向旧原件。
+        restore_live_file(&live, rollback.as_deref(), "doc")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&live).await.unwrap(), b"old live");
+        assert!(!tokio::fs::try_exists(&stage).await.unwrap());
+        assert!(!tokio::fs::try_exists(rollback.as_ref().unwrap())
+            .await
+            .unwrap());
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     /// 覆盖的通道②（源码钉住）：旧物理表先退役（drop 幂等，旧版本非表格时 no-op），
@@ -2133,6 +2389,16 @@ mod tests {
         let drop = body.find("tabular::drop_source(").expect("旧物理表必须先退役");
         let rebuild = body.find("tabular_channel(").expect("重建必须复用 tabular_channel");
         assert!(drop < rebuild, "先退役旧表再建新表: {body}");
+        let overwrite = src.split("async fn overwrite(").nth(1).unwrap();
+        let overwrite = overwrite.split("/// 覆盖的通道②收尾").next().unwrap();
+        assert!(
+            overwrite.contains("已越过 commit boundary"),
+            "切库后的问数失败必须降级，不能冒充影子失败: {overwrite}"
+        );
+        assert!(
+            overwrite.contains("store::append_notice("),
+            "问数降级原因必须在 UI 可见: {overwrite}"
+        );
     }
 
     /// 并发删除窗口（锚点）：find_by_sha 命中后 get_doc 为 None 时必须直接 NotFound，
@@ -2175,13 +2441,13 @@ mod tests {
     /// - `prepare` 只做快路径（不含 parse/chunk/embed 调用），且把状态推进到 parsing、完成落盘——
     ///   响应的进行态与「doc 行可见即文件可读」都靠这两行；
     /// - `run_job` 的 Fresh 臂失败必须落 `failed`（不许静默），Rebuild 臂必须走 `reprocess`
-    ///   影子链、Overwrite 臂必须走 `overwrite` 覆盖链（两者失败都不动线上版本）。
+    ///   影子链、Overwrite 臂必须走 `overwrite` 覆盖链；两者失败另落最近入库错误。
     #[test]
     fn prepare_is_fast_path_and_run_job_owns_heavy_work() {
         let src = include_str!("ingest.rs");
         let prep = src.split("pub async fn prepare").nth(1).unwrap();
         let prep = prep.split("/// 入库重活分派").next().unwrap();
-        for heavy in ["parse_input(", "chunk_with_preset(", "embed_passages(", "insert_chunks("] {
+        for heavy in ["parse_input(", "chunk_with_preset(", "embed_batch(", "insert_chunks("] {
             assert!(!prep.contains(heavy), "快路径不许碰重活 {heavy}");
         }
         assert!(prep.contains("DocStatus::Parsing"), "快路径必须先推进到 parsing 再交还");
@@ -2194,7 +2460,24 @@ mod tests {
         let rebuild = job.split("IngestJob::Rebuild").nth(1).unwrap();
         assert!(rebuild.contains("reprocess("), "Rebuild 必须走影子重建链: {rebuild}");
         let overwrite = job.split("IngestJob::Overwrite").nth(1).unwrap();
-        assert!(overwrite.contains("overwrite("), "Overwrite 必须走同名覆盖链: {overwrite}");
+        assert!(
+            overwrite.contains("overwrite("),
+            "Overwrite 必须走同名覆盖链: {overwrite}"
+        );
+        assert!(
+            job.matches("persist_shadow_failure(").count() >= 2,
+            "Rebuild/Overwrite 失败都必须持久化: {job}"
+        );
+        let persist = src.split("async fn persist_shadow_failure").nth(1).unwrap();
+        let persist = persist.split("/// 版本元数据自动补全").next().unwrap();
+        assert!(
+            persist.contains("set_last_ingest_error"),
+            "影子失败不许覆盖线上 status: {persist}"
+        );
+        assert!(
+            !persist.contains("set_status"),
+            "影子失败不许把可检索旧版改成 failed: {persist}"
+        );
     }
 
     /// 落库形状契约：Rust preset 的 chunks 与 spans 等长平行，tokens 按统一口径估算

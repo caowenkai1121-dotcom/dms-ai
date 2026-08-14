@@ -21,17 +21,8 @@ use crate::ctx::{AskCtx, AskResult};
 
 /// 图关系问题类型（AGE 图查询）。逐行搬 `server/src/direct.rs:19-27`，**变体名一字不改**：
 /// `Debug` 输出进 `AskResult.sql`（`[AGE 图查询] BuyersOfGoods("烤肠")`），改名即改前端可见的字节。
-/// ponytail: 与 `DirectHit` 同一笔临时重复 —— 识别函数与本枚举的终态在 semantic
-/// （T8 的 `fastpath/relation.rs`），届时本枚举删掉。
-#[derive(Debug, PartialEq, Eq)]
-pub enum Relation {
-    /// 买过某商品的客户（含实体名）
-    BuyersOfGoods(String),
-    /// 某客户买过什么
-    GoodsOfCustomer(String),
-    /// 买某商品还买什么（共购）
-    Copurchase(String),
-}
+// T8-B5：`Relation` 已下沉 `dms_semantic::direct_types`（识别函数同批迁 fastpath）。
+pub use dms_semantic::Relation;
 
 /// 问句 → 关系。实现（`direct::detect_relation`，顺序敏感）仍在 server，故由 wire 侧注入：
 /// `GraphAnswerer::new(Box::new(detect))`。用具名 `fn` 强转，理由同 `hits::Produce`。
@@ -50,6 +41,32 @@ impl GraphAnswerer {
     pub fn hit(&self, question: &str) -> Option<Relation> {
         (self.detect)(question)
     }
+
+    /// 不接的**唯一理由**（`None` = 接）。顺序即判据顺序：越前面的越是硬门槛。
+    ///
+    /// 六项里只有 `graph-not-ready` 是**会变的**（图快照按目标绑定、CLI 靠持久化标记接管），
+    /// 其余五项对同一个问句恒定 —— 所以「同题不同答」只可能出在它身上，日志必须说得出来。
+    fn skip_reason(&self, cx: &AskCtx<'_>) -> Option<&'static str> {
+        if !has_proof(cx.p, cx.scope) {
+            return Some("no-unrestricted-proof");
+        }
+        if !cx.source.is_warehouse() {
+            return Some("source-not-warehouse");
+        }
+        if !graph::is_ready_for(cx.source_name) {
+            return Some("graph-not-ready");
+        }
+        if has_unverified_graph_dimension(cx.question) {
+            return Some("unverified-dimension");
+        }
+        if !graph_question_compatible(cx.question) {
+            return Some("time-or-comparison-in-question");
+        }
+        if self.hit(cx.question).is_none() {
+            return Some("not-a-relation-question");
+        }
+        None
+    }
 }
 
 /// 该身份这一轮是否**有资格免注入**（＝能不能铸出 `UnrestrictedProof`）。
@@ -65,12 +82,18 @@ impl Answerer for GraphAnswerer {
     }
 
     /// 图关系快路径（AGE，0-LLM）：仅全权限用户，且当前数仓目标已有同目标成功快照。
+    ///
+    /// 判据本体在 [`Self::skip_reason`]：**「为什么这题没走图」必须能从日志看出来**。
+    /// 2026-08-14 花了半小时才定位一次路由漂移，就是因为六个合取项挂了哪一个无从得知
+    /// （`steps` 只写 `skip`）。
     fn accept(&self, cx: &AskCtx<'_>) -> bool {
-        has_proof(cx.p, cx.scope)
-            && cx.source.is_warehouse()
-            && graph::is_ready_for(cx.source_name)
-            && !has_unverified_graph_dimension(cx.question)
-            && self.hit(cx.question).is_some()
+        match self.skip_reason(cx) {
+            None => true,
+            Some(why) => {
+                tracing::info!(reason = why, question = %cx.question, "图快路径不接");
+                false
+            }
+        }
     }
 
     fn answer<'a>(&'a self, cx: &'a AskCtx<'a>) -> BoxFut<'a, anyhow::Result<Option<AskResult>>> {
@@ -94,6 +117,28 @@ impl Answerer for GraphAnswerer {
         })
     }
 }
+
+/// 问句里有没有图**表达不了**的限定。判据**只看问句**，不看合同。
+///
+/// 🔴 为什么不看合同（2026-08-14 两次实测，同一批题两种路由）：判据一旦读
+/// fast 模型产出的 `IntentV1`，**同一个问句在两次进程里会走两条路** ——
+/// 「客户买过什么」「湖南省买过烤肠的客户」上午还是 `graph`，重建一次容器就变成 `direct-doc`，
+/// 因为模型这一次多塞了一个 filter/breakdown。确定性路径的准入不许挂在非确定产物上（D9）。
+///
+/// 三类真的表达不了的限定，都能从问句直接判：
+/// - **时间窗**：`nl::time::time_predicate` 是全仓同一份规则时间解析（图里没有时间维度）；
+/// - **同环比**：Cypher 只有一次聚合，没有基期；
+/// - **维度切分**：`has_unverified_graph_dimension` 那份黑名单已经在 `accept` 里判过（分类/省区/渠道…）。
+///
+/// 判错的方向仍是回落：`into_slots` 的覆盖率判据会在装配前拒绝没被理解的残留。
+fn graph_question_compatible(question: &str) -> bool {
+    dms_kernel::nl::time::time_predicate(question).is_none()
+        && !COMPARISON_WORDS.iter().any(|w| question.contains(w))
+}
+
+/// 同环比词：图查询只有一次聚合、没有基期，出现任何一个都交给 SQL 路径。
+const COMPARISON_WORDS: &[&str] = &["同比", "环比", "对比", "相比", "较上", "比上"];
+
 
 /// 三条 Cypher 的行上限（`graph::*` 四个调用点同一个值）。
 const GRAPH_ROW_LIMIT: usize = 50;
@@ -187,6 +232,7 @@ pub async fn try_graph(pg: &PgPool, rel: &Relation, t0: Instant) -> Option<AskRe
         clarify_options: vec![],
         value_labels: vec![],
         sales_context: None,
+        intent_summary: None,
     })
 }
 
@@ -448,15 +494,24 @@ mod tests {
     #[test]
     fn accept_is_bound_to_current_warehouse_graph() {
         let src = include_str!("graph.rs");
+        // 判据体 2026-08-14 从 `accept` 挪进 `skip_reason`（每条不接的理由都要能进日志）
         let body = src
-            .split("fn accept(&self, cx: &AskCtx<'_>) -> bool {")
+            .split("fn skip_reason(&self, cx: &AskCtx<'_>) -> Option<&'static str> {")
             .nth(1)
-            .expect("accept 不见了")
-            .split("\n    }")
+            .expect("skip_reason 改名了")
+            .split("
+    }")
             .next()
             .unwrap();
         assert!(body.contains("cx.source.is_warehouse()"), "production_lookup 仍可能进图：{body}");
         assert!(body.contains("graph::is_ready_for(cx.source_name)"), "图未绑定当前目标：{body}");
+        // 六个理由各有独立字面量：日志里看到哪一个，就知道卡在哪一步
+        for why in [
+            "no-unrestricted-proof", "source-not-warehouse", "graph-not-ready",
+            "unverified-dimension", "time-or-comparison-in-question", "not-a-relation-question",
+        ] {
+            assert!(body.contains(why), "少了不接理由 {why}：{body}");
+        }
     }
 
     /// `Relation` 是从 `server/src/direct.rs` 复制过来的第二份定义，
@@ -469,4 +524,35 @@ mod tests {
         assert_eq!(format!("{:?}", Relation::GoodsOfCustomer("恒众".into())), "GoodsOfCustomer(\"恒众\")");
         assert_eq!(format!("{:?}", Relation::Copurchase("烤肠".into())), "Copurchase(\"烤肠\")");
     }
+    /// 🔴 准入判据只看问句，**不看合同**（2026-08-14 两次实测，同一批题两种路由）。
+    ///
+    /// 上午「客户买过什么」「湖南省买过烤肠的客户」走 `graph`，重建一次容器就变成 `direct-doc` ——
+    /// 因为判据读的是 fast 模型产出的 `IntentV1`，而它这一次多塞了一个 filter/breakdown。
+    /// 确定性路径的准入挂在非确定产物上，就是「同题不同答」的制造机。
+    #[test]
+    fn admission_is_deterministic_and_only_reads_the_question() {
+        // 关系问句本身：全放行（合同里有什么都不影响）
+        for q in ["买过烤肠的客户", "湖南省买过烤肠的客户", "恒众餐饮买过什么"] {
+            assert!(graph_question_compatible(q), "{q} 被挡住了");
+        }
+        // 图表达不了的三类：时间窗 / 同环比（维度切分由 has_unverified_graph_dimension 管）
+        for q in ["本月买过烤肠的客户", "上月买过烤肠的客户", "买过烤肠的客户同比"] {
+            assert!(!graph_question_compatible(q), "{q} 不该进图");
+        }
+        assert!(has_unverified_graph_dimension("按省区看买过烤肠的客户"));
+        // 判据体内不许再出现合同字样：读 intent 就等于把非确定性接回来
+        let src = include_str!("graph.rs");
+        let prod = src.split("
+#[cfg(test)]").next().unwrap();
+        let accept = prod
+            .split("fn accept(&self, cx: &AskCtx<'_>) -> bool {")
+            .nth(1)
+            .expect("accept 改名了")
+            .split("
+    }")
+            .next()
+            .unwrap();
+        assert!(!accept.contains("cx.intent"), "准入又读回合同了：{accept}");
+    }
+
 }

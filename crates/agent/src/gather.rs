@@ -15,7 +15,7 @@ use std::fmt::Write;
 
 use sqlx::PgPool;
 
-use dms_connector::embed::{to_pgvector, EmbedClient};
+use dms_connector::embed::{to_pgvector, EmbedClient, EmbedMode};
 use dms_kernel::nl::time::time_predicate;
 use dms_semantic::recall::{self, RecallCtx, TableCtx};
 use dms_semantic::registry::exemplar;
@@ -23,7 +23,7 @@ use dms_semantic::registry::model::{
     load_dimensions, load_join_edges, load_metrics, DimensionDef, JoinEdge, MetricDef,
 };
 
-use crate::ctx::{AskCtx, ContextCard, ContextSummary, TrimNote};
+use crate::ctx::{AskCtx, ContextCard, ContextSummary};
 use crate::prompt::PromptCtx;
 
 /// 表召回/教训召回的条数上限：波1 `rc0`、波3 `rc_pitfalls`、回炉 `schema_section` 三处同一值
@@ -53,7 +53,10 @@ pub async fn gather(
     //   波4：吃「链好术语映射的前三路」的元素召回，与 JOIN 对面表卡片（吃关联图 + 召回表）
     // 【A8】问句切片向量：整句向量被长问句稀释时，专名片段（「烤肠」「湖南省」）照样打得中。
     // 滑窗用 kernel 那份（与图路径实体抽取同一个函数）；批量 embed 一次打完
-    // （`embed_passages` 内部 64 一批），N 片只多一次往返。整句仍在首位 ——
+    // （`embed_batch` 内部 64 一批），N 片只多一次往返。整句仍在首位 ——
+    // 🔴 模式必须是 `Query`：元素卡的召回阈值（STRICT=0.35 / LOOSE=0.5 / DS_MAX_DIST）
+    // 全是拿 **query 向量**标定的，拿 passage 向量去比会让口语化问法整体召回漂移；
+    // 且 passage 熔断槽是知识库入库在用的 —— 一次入库失败会顺手掐掉 5 分钟的切片召回。
     // 短问句时整句本来就是最好的那片。embed 缺席 → 两个调用都快速熔断返 None，
     // `slice_vecs` 为空，`recall_elements` 退回「embed=None ⇒ 空」的老降级。
     const MAX_SLICES: usize = 24; // 20 字问句全窗口 60+ 片：embed 服务单线程，封顶（长词优先取前）
@@ -83,7 +86,7 @@ pub async fn gather(
     let (qvec, slice_vecs, metric_hits, dims, terms, fewshot, value_hints, domain_hits, edges, ds_row) =
         tokio::join!(
             embed.embed_query(cx.question),
-            embed.embed_passages(&slice_texts),
+            embed.embed_batch(&slice_texts, EmbedMode::Query),
             recall::recall_metric_hits(cx.pg, &rc0),
             recall::recall_dimensions(cx.pg, &rc0),
             recall::recall_terms(cx.pg, &rc0),
@@ -93,6 +96,8 @@ pub async fn gather(
             load_join_edges(cx.pg, cx.ds),
             dms_semantic::registry::datasource::get_datasource(cx.pg, cx.ds),
         );
+    // 本轮召回降级清单（见 `PromptCtx::degraded`）：每条同时是日志文案
+    let mut degraded: Vec<&'static str> = vec![];
     let qvec = qvec.map(|v| to_pgvector(&v));
     // `slice_vecs` 与 `qvec` 同一降级类（embed 缺席，熔断器自己记日志），不是 PG 召回失败 ——
     // 所以这里与上一行同类（都不进召回降级的 warn 判据），形态随各自类型（`.map` / `match`）。
@@ -103,32 +108,24 @@ pub async fn gather(
     // 🔴 每一路召回失败一律**降级成「这张卡缺席」而不是 `?`**：少几张卡最多让 LLM 少看点素材，
     // 让整轮问答失败是过度反应（裁决 二·G 同族）。但**每一路都要吼一声** ——
     // 「召回为什么是空的」是本仓最高频的排查题，而原来这几行是纯静默 `unwrap_or_default()`：
-    // （warn 点后来已不止当初的六路：多了源背景 / 经验 / 术语递归。）
     // PG 抖一下 / 谓词写错 / 表没建，日志里与「本来就没命中」完全无法区分。
-    // 形态与本文件 `gather_all_cards` 的两行 `map_err(warn)` 一致（那两行是裁决 二·AE 修的，
-    // 一趟评测才把静默的注册表读失败照出来）；下面 `gather_warns_on_every_recall_degradation`
-    // 钉着「本函数里 `unwrap_or_default()` 的条数 == `warn!` 的条数」。
+    // 2026-08-14 起统一走 `degrade(...)`：**日志与 `PromptCtx::degraded` 同源**，
+    // 口径卡（指标/维度）缺席时 `run_llm` 会给结果挂标注、trust 降 review ——
+    // 「答错了还很自信」这条路就是这么堵上的。判据 `gather_warns_on_every_recall_degradation`
+    // 钉着「本函数里再没有手抄的 map_err(warn)」。
     // 指标召回走 `MetricHit`（不走卡片版）：`time_cap` 只在结构化形态上 ——
     // 有指标声明「算到昨天」时，规则时间窗的右端必须当场压掉（实测：卡片提示与
     // 规则窗并排时，模型照抄规则窗，含今天虚 1.8%）。卡片仍由 `metric_card` 渲染。
-    let metric_hits = metric_hits
-        .map_err(|e| tracing::warn!(err = %e, "指标召回失败 → 指标卡缺席"))
-        .unwrap_or_default();
+    let metric_hits = degrade(metric_hits, "指标召回失败 → 指标卡缺席", &mut degraded);
     // `time_cap` 的 `.any()` 挪进 `time_tpl` 的闭包惰性算：问句无时间词时这一扫纯白跑
     let metrics: Vec<String> = metric_hits
         .iter()
         .map(|hit| recall::metric_card_for(cx.ds, hit))
         .collect();
-    let dims = dims
-        .map_err(|e| tracing::warn!(err = %e, "维度召回失败 → 维度卡缺席"))
-        .unwrap_or_default();
-    let terms = terms
-        .map_err(|e| tracing::warn!(err = %e, "术语召回失败 → 术语卡缺席"))
-        .unwrap_or_default();
+    let dims = degrade(dims, "维度召回失败 → 维度卡缺席", &mut degraded);
+    let terms = degrade(terms, "术语召回失败 → 术语卡缺席", &mut degraded);
     // 码值提示（SuperSonic value mapping 的生成前置版）：问句里的中文值 → 该列真实码。
-    let value_hints = value_hints
-        .map_err(|e| tracing::warn!(err = %e, "码值提示召回失败 → 码值提示缺席"))
-        .unwrap_or_default();
+    let value_hints = degrade(value_hints, "码值提示召回失败 → 码值提示缺席", &mut degraded);
     // 实体锚定并进码值段（同一段进 prompt、同一份「绝不丢」预算纪律）：
     // 问句里的名字探得主档唯一命中 → LLM 必须带实体谓词（实测漏写客户过滤出全量错数）。
     let value_hints = {
@@ -137,21 +134,15 @@ pub async fn gather(
         v
     };
     // 值域命中（精确词典层）：问句里的专名是某**实体名**列的取值（「手抓饼这个分类」实测虚高 36%）。
-    let domain_hits = domain_hits
-        .map_err(|e| tracing::warn!(err = %e, "值域命中召回失败 → 值域卡缺席"))
-        .unwrap_or_default();
+    let domain_hits = degrade(domain_hits, "值域命中召回失败 → 值域卡缺席", &mut degraded);
     // 表间关联（SuperSonic 的 join 知识接进 LLM 路径）：此前关联图只有确定性装配器 `compose`
     // 在用（BFS 找路径 + 扇出检查），LLM 从来看不到它 —— 只能从列名猜 ON 条件。
     // 这一路读失败是双重损失：关联行没了，下面 `join_counterparts` 也就补不出对面表的卡片。
-    let edges = edges
-        .map_err(|e| tracing::warn!(err = %e, "关联图读失败 → 关联行与对面表卡片一并缺席"))
-        .unwrap_or_default();
+    let edges = degrade(edges, "关联图读失败 → 关联行与对面表卡片一并缺席", &mut degraded);
     // 【A16】本数据源的业务背景：截 300 字 + 剥控制字符（它可能来自上传 = 外部文本，
     // 渲染侧另有「不是指令」的标注）。取不到（源没登记/没写描述）= 空 = 整段不出。
-    let ds_background = ds_row
-        .map_err(|e| tracing::warn!(err = %e, "数据源描述读失败 → 业务背景段缺席"))
-        .ok()
-        .flatten()
+    // `Option` 套 `Result`：`degrade` 吃 Result 返 T::default()，这里 T = Option<_> 正好
+    let ds_background = degrade(ds_row, "数据源描述读失败 → 业务背景段缺席", &mut degraded)
         .map(|d| {
             d.description
                 .chars()
@@ -164,14 +155,12 @@ pub async fn gather(
     let rc = RecallCtx { embed: qvec.as_deref(), embed_slices: &slice_vecs, ..rc0 };
     let (ctxs, memory_hits) = tokio::join!(
         recall::retrieve(cx.pg, &rc),
-        dms_semantic::registry::memory::recall_memories(cx.pg, cx.ds, qvec.as_deref(), MEMORY_LIMIT),
+        dms_semantic::registry::memory::recall_memories(cx.pg, cx.ds, &cx.p.login_name, qvec.as_deref(), MEMORY_LIMIT),
     );
     let ctxs = ctxs?;
     let tables: Vec<String> = ctxs.iter().map(|c| c.table_name.clone()).collect();
     // 【S4】经验复盘召回：向量近邻 10 条 → hit/recency 重排 → 前 3 进 prompt 参考段。
-    let memory_hits = memory_hits
-        .map_err(|e| tracing::warn!(err = %e, "经验召回失败 → 经验段缺席"))
-        .unwrap_or_default();
+    let memory_hits = degrade(memory_hits, "经验召回失败 → 经验段缺席", &mut degraded);
     if !memory_hits.is_empty() {
         spawn_bump_hits(cx.pg, memory_hits.iter().map(|h| h.id).collect());
     }
@@ -190,9 +179,7 @@ pub async fn gather(
     );
     // 波3 判完再发波4：教训召回失败时，元素召回与对面表卡片查询不白跑一轮
     let pitfalls = pitfalls?;
-    let term_mapped = term_mapped
-        .map_err(|e| tracing::warn!(err = %e, "术语递归召回失败 → 术语映射卡缺席"))
-        .unwrap_or_default();
+    let term_mapped = degrade(term_mapped, "术语递归召回失败 → 术语映射卡缺席", &mut degraded);
     let terms: Vec<String> = terms.into_iter().chain(term_mapped).collect();
     // 波4：元素召回要吃**链好术语映射**的前三路（去重口径与串行版相同），
     // 与对面表卡片（吃关联图 + 召回表）互不依赖，一起发。
@@ -235,7 +222,23 @@ pub async fn gather(
         v.extend(added.iter().map(|t| (*t).to_string()));
         v
     };
-    let mut pc = PromptCtx {
+    // 【个性化】用户习惯：**只在本轮问句自己没给时间/分组时**才带 —— 习惯不覆盖显式表达。
+    // 判据用现成的两把尺：时间看 `nl::time` 认不认得出窗口，分组看问句有没有「按X」的说法。
+    // 取不到/证据不足 = 空串 = 整段不出（`user_pref` 内部已经守住 MIN_SUPPORT）。
+    let asked_time = dms_kernel::nl::time::time_predicate(cx.question).is_some();
+    let asked_breakdown = cx.question.contains('按') || cx.question.contains("各");
+    let user_habits = if asked_time && asked_breakdown {
+        String::new()
+    } else {
+        let pref = dms_semantic::registry::user_pref::load(cx.pg, &cx.p.login_name).await;
+        // 本轮已经给了的那一维不再提（提了就是噪声，还可能与用户这轮的说法打架）
+        let pref = dms_semantic::registry::user_pref::UserPref {
+            time_word: if asked_time { None } else { pref.time_word },
+            breakdown_word: if asked_breakdown { None } else { pref.breakdown_word },
+        };
+        pref.prompt_section()
+    };
+    let pc = PromptCtx {
         metrics,
         dims,
         terms,
@@ -260,8 +263,13 @@ pub async fn gather(
         fewshot,
         memories,
         ds_background,
+        user_habits,
+        degraded,
     };
-    let budget = enforce_prompt_budget(&mut pc, &ctxs, counter_cards.len());
+    let budget = BudgetReport {
+        kept_recalled: ctxs.len(),
+        kept_counters: !counter_cards.is_empty(),
+    };
     // 【D7】本轮上下文落账：实际进 prompt 的卡 + 被裁项（脱敏：只结构/尺寸/表名），
     // 按 trace_id 进程内暂存，server `query_log::finish` 取走落 `meta.query_log.context_summary`。
     let summary = build_context_summary(&pc, &ctxs, &added, &counter_cards, &budget);
@@ -290,15 +298,31 @@ fn spawn_bump_hits(pg: &PgPool, ids: Vec<i64>) {
     });
 }
 
-/// 【A10】prompt 总量预算（**字节**，比较用的是 `str::len()`）。超了按段优先级丢：
-/// ⓪ 经验段整段 → ① 维度卡尾部 → ② 值域卡 → ③ JOIN 对面表卡片 → ④ 召回表卡片尾部 →
-/// ⑤ 维度卡清零+元素卡留 2。
-/// **绝不丢**：指标/术语/时间/码值/关联/教训/few-shot（教训是「连库验证过必须遵守」那批）。
-/// 今天首轮 ≈9KB、回炉 ≈33KB 都远低于它 —— 它守的是表与声明越来越多的明天；
-/// 不设的话 prompt 随表数线性涨，撞模型上下文那天是静默退化（少几张卡没人看得出）。
-const PROMPT_BUDGET_BYTES: usize = 40_000;
+/// 一路召回失败 → 降级成「这张卡缺席」，并**留痕两处**：日志一行 + `degraded` 一项。
+///
+/// `what` 同时是日志文案与降级项名（同源，改一处两处一起变）。此前这里是 12 份
+/// `map_err(|e| tracing::warn!(...)).unwrap_or_default()` 手抄 —— 抄漏一处就是一路静默降级，
+/// 而「召回为什么是空的」是本仓最高频的排查题。
+fn degrade<T: Default, E: std::fmt::Display>(
+    r: Result<T, E>,
+    what: &'static str,
+    degraded: &mut Vec<&'static str>,
+) -> T {
+    match r {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(err = %e, "{}", what);
+            degraded.push(what);
+            T::default()
+        }
+    }
+}
 
-/// 各段字节量合计（预算的口径是护栏不是审计，渲染开销忽略不计）
+/// 口径类降级：缺了这几张卡，模型就是在**没有口径定义**的情况下写 SQL。
+/// 判据据此把 `trust` 降 review —— 其余几路（术语/关联图/经验…）缺席只是素材少，不改口径。
+pub(crate) const CALIBER_CARDS: &[&str] = &["指标召回失败 → 指标卡缺席", "维度召回失败 → 维度卡缺席"];
+
+/// 各段字节量合计（只用于审计实际送入模型的上下文体量，不参与裁剪）。
 fn section_chars(pc: &PromptCtx) -> usize {
     let v = |xs: &[String]| xs.iter().map(|s| s.len()).sum::<usize>();
     v(&pc.metrics)
@@ -316,80 +340,15 @@ fn section_chars(pc: &PromptCtx) -> usize {
         + v(&pc.memories)
 }
 
-/// 预算护栏的执行回报（D7 落账的「被裁项」来源）：裁了哪些段、schema 段最终留了几张表。
+/// 预算护栏的执行回报：schema 段最终留了几张表、对面表卡片还在不在。
+///（原先还有一个 `notes: Vec<TrimNote>` —— 恒 `vec![]` 的死件，2026-08-14 随
+/// `ContextSummary.trimmed` 一起删掉。）
 #[derive(Debug)]
 struct BudgetReport {
-    notes: Vec<TrimNote>,
     /// 最终 schema 段里召回表保留的张数（④ 没开火 = 全部）
     kept_recalled: usize,
     /// JOIN 对面表卡片是否还在 schema 段里（③ 没开火 = 在）
     kept_counters: bool,
-}
-
-/// 预算执行（只在超限时动手，丢一步看一步 —— 顺序即行为，见 const 注释）。
-/// `ctxs`/`n_counter_cards` 只为重渲 schema 段：③ 丢对面表卡片、④ 召回表砍尾部留 3。
-/// 丢弃序一个字没改；新增的是**回报**：每丢一步记一条 `TrimNote`（D7 落账的 trimmed 段）。
-fn enforce_prompt_budget(pc: &mut PromptCtx, ctxs: &[TableCtx], n_counter_cards: usize) -> BudgetReport {
-    let mut report = BudgetReport {
-        notes: vec![],
-        kept_recalled: ctxs.len(),
-        kept_counters: n_counter_cards > 0,
-    };
-    let before = section_chars(pc);
-    if before <= PROMPT_BUDGET_BYTES {
-        return report;
-    }
-    // ⓪ 经验段先丢（S4：未连库验证的二手参考材料，信任级最低）
-    if !pc.memories.is_empty() {
-        report.notes.push(TrimNote { kind: "memory", dropped: pc.memories.len(), kept: 0, names: vec![] });
-    }
-    pc.memories.clear();
-    // ① 维度卡砍尾部留 4（recall 序 = 相关度序，尾部最不重要）
-    if pc.dims.len() > 4 {
-        report.notes.push(TrimNote { kind: "dim", dropped: pc.dims.len() - 4, kept: 4, names: vec![] });
-    }
-    pc.dims.truncate(4);
-    // ② 值域卡清零
-    if !pc.domain_hits.is_empty() {
-        report.notes.push(TrimNote { kind: "domain_hit", dropped: pc.domain_hits.len(), kept: 0, names: vec![] });
-    }
-    pc.domain_hits.clear();
-    // ③ JOIN 对面表卡片整段丢（它们本就是「顺带补的」，见上面的拼接注释）
-    if section_chars(pc) > PROMPT_BUDGET_BYTES && n_counter_cards > 0 {
-        report.notes.push(TrimNote { kind: "schema_counter", dropped: n_counter_cards, kept: 0, names: vec![] });
-        pc.schema = schema_text(ctxs);
-        report.kept_counters = false;
-    }
-    // ④ 召回表卡片砍尾部留 3；再不够就维度卡清零、元素卡留 2
-    if section_chars(pc) > PROMPT_BUDGET_BYTES {
-        let keep = ctxs.len().min(3);
-        if ctxs.len() > keep {
-            report.notes.push(TrimNote {
-                kind: "schema_recalled",
-                dropped: ctxs.len() - keep,
-                kept: keep,
-                // 表名是审计要的结构信息（不是数据值）：被裁的是哪几张表必须说得出来
-                names: ctxs[keep..].iter().map(|c| c.table_name.clone()).collect(),
-            });
-            // 只在真砍时重渲：keep == ctxs.len() 时重渲与现值逐字节相同，纯浪费一次全量分配
-            pc.schema = schema_text(&ctxs[..keep]);
-            report.kept_recalled = keep;
-        }
-    }
-    if section_chars(pc) > PROMPT_BUDGET_BYTES {
-        if !pc.dims.is_empty() {
-            report.notes.push(TrimNote { kind: "dim", dropped: pc.dims.len(), kept: 0, names: vec![] });
-        }
-        pc.dims.clear();
-        if pc.elems.len() > 2 {
-            report.notes.push(TrimNote { kind: "elem", dropped: pc.elems.len() - 2, kept: 2, names: vec![] });
-        }
-        pc.elems.truncate(2);
-    }
-    let after = section_chars(pc);
-    tracing::warn!(before, after, budget = PROMPT_BUDGET_BYTES,
-        dims = pc.dims.len(), schema_bytes = pc.schema.len(), "prompt 超预算，按段优先级丢卡");
-    report
 }
 
 /// 卡片头里的注册表名（`【指标·销售额】…` → `销售额`）：剥【】、剥四类前缀、剥版本后缀
@@ -493,9 +452,7 @@ fn build_context_summary(
     ContextSummary {
         prompt_chars: section_chars(pc),
         cards,
-        trimmed: report.notes.clone(),
-        // 会话历史的两级摘要（Y10）装配点今天在 server 侧，LLM prompt 不含历史段 —— 照实 false
-        summary_used: false,
+        degraded: pc.degraded.clone(),
     }
 }
 
@@ -545,20 +502,17 @@ pub async fn gather_all_cards(cx: &AskCtx<'_>, embed: &EmbedClient) -> anyhow::R
         load_metrics(cx.pg, cx.ds),
         load_dimensions(cx.pg, cx.ds),
         load_join_edges(cx.pg, cx.ds),
-        dms_semantic::registry::memory::recall_memories(cx.pg, cx.ds, qvec.as_deref(), MEMORY_LIMIT),
+        dms_semantic::registry::memory::recall_memories(cx.pg, cx.ds, &cx.p.login_name, qvec.as_deref(), MEMORY_LIMIT),
     );
     let (schema, recalled) = schema?;
-    let metrics = metrics
-        .map_err(|e| tracing::warn!(err = %e, "回炉全量指标读失败 → 指标段缺席"))
-        .unwrap_or_default();
-    let dims = dims
-        .map_err(|e| tracing::warn!(err = %e, "回炉全量维度读失败 → 维度段缺席"))
-        .unwrap_or_default();
+    // 回炉路的降级**只留日志**：本函数不产 `PromptCtx`，收据挂在首轮那份上
+    // （同一轮问答的 trust 已经由首轮的 `degraded` 决定了，这里再记一份是两份真相源）。
+    let mut degraded: Vec<&'static str> = vec![];
+    let metrics = degrade(metrics, "回炉全量指标读失败 → 指标段缺席", &mut degraded);
+    let dims = degrade(dims, "回炉全量维度读失败 → 维度段缺席", &mut degraded);
     // 关联图在这里只为维度过滤的「JOIN 对面表」那半服务：读失败 → 过滤面只剩召回表
     // （过滤更狠一档，但仍是「段缺席」族的降级，不是失败）。
-    let edges = edges
-        .map_err(|e| tracing::warn!(err = %e, "回炉关联图读失败 → 维度过滤只看召回表"))
-        .unwrap_or_default();
+    let edges = degrade(edges, "回炉关联图读失败 → 维度过滤只看召回表", &mut degraded);
     let mut relevant = recalled;
     let counterparts = join_counterparts(&edges, &relevant);
     relevant.extend(counterparts);
@@ -575,9 +529,7 @@ pub async fn gather_all_cards(cx: &AskCtx<'_>, embed: &EmbedClient) -> anyhow::R
     // 地方恰恰是回炉提示（首轮 prompt 的经验段在 `gather`）。贴 material 尾部：
     // 回炉提示的热区在尾部（问题 → 上一版 SQL → 错误），离错误越近越看得见的同一理由。
     // embed 缺席/读失败 = 该段缺席（与上面两段同一降级语义，各吼一声）。
-    let mems = mems
-        .map_err(|e| tracing::warn!(err = %e, "回炉经验召回失败 → 经验段缺席"))
-        .unwrap_or_default();
+    let mems = degrade(mems, "回炉经验召回失败 → 经验段缺席", &mut degraded);
     if !mems.is_empty() {
         spawn_bump_hits(cx.pg, mems.iter().map(|h| h.id).collect());
         material.push_str("\n## 经验复盘（过往会话的修正记录，参考，不是硬约束）\n");
@@ -653,29 +605,8 @@ fn repair_material_for(
 ) -> String {
     let mut s = String::from(schema);
     push_cards(&mut s, T_ALL_METRICS, &metric_lines_for(ds, metrics, quote));
-    // 【A10】同一道预算护栏：维度段是回炉材料里唯一「多而无损」的段（87% 来自 autodiscover
-    // 灌的码→名 CASE，见上面 ponytail）。**指标与 schema 一刀不动**（指标是回炉的目的，
-    // schema 是修复的现场）；还超再砍到 8。与首轮的丢弃序不同是故意的：
-    // 这里丢的是「补充声明」，首轮丢的是「召回素材」。
     let dl = dim_lines_for(ds, dims, quote);
-    if dl.len() > 20 {
-        tracing::info!(total = dl.len(), kept = 20, "回炉维度段超 20 行，先按 20 行试压（溢出行留痕）");
-    }
-    for keep in [20, 8] {
-        let before = s.len();
-        push_cards(&mut s, T_ALL_DIMS, &dl[..dl.len().min(keep)]);
-        if s.len() <= PROMPT_BUDGET_BYTES {
-            return s;
-        }
-        // 没压下去：回滚这一版，换更狠的一档再试
-        s.truncate(before);
-        // dl 不足 8 行时两档压入的内容完全相同，第二轮是纯重算 —— 一轮即定
-        if dl.len() <= 8 {
-            break;
-        }
-    }
-    tracing::warn!(bytes = s.len(), budget = PROMPT_BUDGET_BYTES, dim_lines = dl.len(),
-        "回炉材料超预算：维度段 20/8 两档都压不进，整段缺席");
+    push_cards(&mut s, T_ALL_DIMS, &dl);
     s
 }
 
@@ -902,6 +833,24 @@ fn join_lines_for(ds: &str, edges: &[JoinEdge], recalled: &[String]) -> Vec<Stri
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 习惯**不许覆盖用户这一轮的显式表达**（那是猜，不是懂）。
+    ///
+    /// 判据打在接线上：`gather` 必须先判「本轮有没有给时间/分组」，给了就把对应那一维
+    /// 从习惯里摘掉。少了这道判断，「上月销售额」会被上个月常问「本月」的用户的习惯带偏。
+    #[test]
+    fn user_habits_never_override_what_the_user_just_said() {
+        let src = include_str!("gather.rs");
+        let body = src.split("let user_habits =").nth(1).expect("习惯接线没了");
+        let head = body.split("let pc = PromptCtx").next().unwrap();
+        assert!(head.contains("if asked_time { None }"), "本轮给了时间还带习惯：{head}");
+        assert!(head.contains("if asked_breakdown { None }"), "本轮给了分组还带习惯：{head}");
+        // 两个都给了就整段不取（连那次 PG 往返都省掉）
+        assert!(
+            body.contains("if asked_time && asked_breakdown {"),
+            "两维都给全时应整段跳过：{body}"
+        );
+    }
     use super::*;
 
     fn ctx(name: &str, text: &str) -> TableCtx {
@@ -944,55 +893,9 @@ mod tests {
         }
     }
 
-    /// 【A10】预算丢弃序：⓪ 经验段整段 → ① 维度卡尾 → ② 值域卡 → ③ 对面表卡片 →
-    /// ④ 召回表尾部 → ⑤ 维度清零+元素留 2；
-    /// 指标/术语/时间/码值/关联/教训/few-shot **永远不动**（教训是「连库验证过」那批）。
+    /// 回炉材料不按人工预算裁掉维度声明：模型应看到本轮相关表的全部口径。
     #[test]
-    fn prompt_budget_drops_in_priority_order_and_never_touches_the_kept() {
-        let big = |n: usize| "x".repeat(n); // ASCII：len() 是字节不是字符（本仓踩过三次的那个坑）
-        let mk = |dims: usize, domains: usize, schema_each: usize, tables: usize| {
-            let pc = PromptCtx {
-                metrics: vec![big(10)],
-                dims: (0..dims).map(|_| big(4000)).collect(),
-                terms: vec!["术语".into()],
-                time_tpl: Some("tpl".into()),
-                value_hints: vec!["hv".into()],
-                domain_hits: (0..domains).map(|_| big(4000)).collect(),
-                elems: vec![big(100); 5],
-                joins: vec!["j".into()],
-                schema: (0..tables).map(|_| big(schema_each)).collect::<Vec<_>>().join(""),
-                pitfalls: vec!["教训不许丢".into()],
-                fewshot: "fs".into(),
-                ds_background: String::new(),
-                memories: vec![],
-            };
-            let ctxs: Vec<TableCtx> =
-                (0..tables).map(|_| ctx("t_x", &big(schema_each))).collect();
-            (pc, ctxs)
-        };
-        // ① 维度+值域足够大：维度砍到 4、值域清零，其余原样
-        let (mut pc, ctxs) = mk(9, 3, 10, 2);
-        enforce_prompt_budget(&mut pc, &ctxs, 1);
-        assert_eq!(pc.dims.len(), 4, "维度卡没砍到 4");
-        assert!(pc.domain_hits.is_empty(), "值域卡没清零");
-        assert_eq!(pc.pitfalls, vec!["教训不许丢".to_string()], "教训被动了");
-        assert_eq!(pc.fewshot, "fs");
-        // ② 表卡片大：③ 先丢对面表（schema 重渲为纯召回表），④ 还超再砍召回表留 3
-        let (mut pc2, ctxs2) = mk(0, 0, PROMPT_BUDGET_BYTES / 2, 5);
-        pc2.schema.push_str(&"对".repeat(PROMPT_BUDGET_BYTES)); // 对面表卡片
-        enforce_prompt_budget(&mut pc2, &ctxs2, 1);
-        assert_eq!(pc2.schema, schema_text(&ctxs2[..3]), "召回表没砍到 3：{}", pc2.schema.len());
-        // ③ 未超预算：一个字不动（今天 ~9KB 的常态路径 —— 防「护栏改行为」）
-        let (mut pc3, ctxs3) = mk(1, 1, 10, 1);
-        let before = format!("{:?}{}", pc3.dims, pc3.schema);
-        enforce_prompt_budget(&mut pc3, &ctxs3, 0);
-        assert_eq!(before, format!("{:?}{}", pc3.dims, pc3.schema));
-    }
-
-    /// 回炉材料的预算：只砍维度段（20 → 8），指标段与 schema 一字不动；
-    /// 未超时与旧形态**逐字节相同**（`repair_prompt_is_byte_identical_to_pre_split` 的同族闸）。
-    #[test]
-    fn repair_material_budget_trims_only_dims() {
+    fn repair_material_keeps_all_relevant_dims() {
         let m = || MetricDef {
             name: "销量".into(),
             aliases: vec![],
@@ -1004,15 +907,10 @@ mod tests {
         };
         let dims: Vec<DimensionDef> =
             (0..30).map(|i| dim(&format!("维度{i:02}"), "t_a", &"长".repeat(3000))).collect();
-        // 未超：全量 30 行照旧（旧形态）
-        let full = repair_material(&[m()], &dims[..2], "SCHEMA", "`");
-        assert!(full.contains("维度00") && full.contains("维度01"));
-        // 超：维度砍到 20 或 8，指标段与 schema 一字不动
-        let trimmed = repair_material(&[m()], &dims, &"S".repeat(PROMPT_BUDGET_BYTES / 2), "`");
-        assert!(trimmed.contains("SUM(qty)"), "指标段被动了");
-        assert!(trimmed.starts_with(&"S".repeat(100)), "schema 被截了");
-        let dim_lines_kept = trimmed.matches("【维度·维度").count();
-        assert!(dim_lines_kept <= 20, "维度段没砍：{dim_lines_kept}");
+        let full = repair_material(&[m()], &dims, &"S".repeat(50_000), "`");
+        assert!(full.contains("SUM(qty)"), "指标段被动了");
+        assert!(full.starts_with(&"S".repeat(100)), "schema 被截了");
+        assert_eq!(full.matches("【维度·维度").count(), dims.len());
     }
 
     /// 🔴 全量维度段的两条性质：**同名同表达式跨表并成一行** + **输出定序**。
@@ -1162,13 +1060,17 @@ mod tests {
         // 判的是**下一个函数的签名**而不是它的名字：本函数体的注释里就提到了 `gather_all_cards`
         // （第一版按名字判，当场红 —— 那次红得其所，说明这条判据真的在看内容）。
         assert!(!body.contains("pub async fn gather_all_cards"), "切过头了，吃进了下一个函数");
-        let degraded = body.matches(".unwrap_or_default()").count();
-        let warns = body.matches("tracing::warn!").count();
+        // 2026-08-14：12 份手抄的 `map_err(warn).unwrap_or_default()` 收敛成一个 `degrade(...)`
+        // —— 日志与 `PromptCtx::degraded` 从此同源（抄漏一处就是一路静默降级，而
+        // 「召回为什么是空的」是本仓最高频的排查题）。判的从「两数相等」变成「一个都没漏」。
+        let calls = body.matches("degrade(").count();
         // 防恒真②：这九路（指标/维度/术语/码值/值域/关联图/源背景/经验/术语递归）本来就在，数不到就是切歪了
-        assert!(degraded >= 9, "只数到 {degraded} 处降级 —— 既有召回路哪去了？");
-        assert_eq!(
-            degraded, warns,
-            "有 {degraded} 处 unwrap_or_default 但只有 {warns} 条 warn：静默降级又回来了"
+        assert!(calls >= 9, "只数到 {calls} 处降级 —— 既有召回路哪去了？");
+        // 禁的是**手抄形态**（`map_err(|e| tracing::warn!(...))`），不是 `unwrap_or_default()` 本身：
+        // 后者在 `Option` 链上是正常写法（ds_background 那条），一刀切会把对的代码判红。
+        assert!(
+            !body.contains("map_err(|e| tracing::warn!"),
+            "又出现手抄的降级：一律走 degrade(...)，否则 trust 收不到口径卡缺席"
         );
     }
 
@@ -1180,7 +1082,11 @@ mod tests {
         let s = src.split("pub async fn gather(").nth(1).expect("函数改名了");
         let body = s.split("\n///").next().unwrap();
         assert!(body.contains("candidate_windows"), "滑窗没了（该用 kernel 那份）");
-        assert!(body.contains("embed_passages"), "批量 embed 没了 —— 逐片单调是 N 倍往返");
+        assert!(body.contains("embed_batch"), "批量 embed 没了 —— 逐片单调是 N 倍往返");
+        assert!(
+            body.contains("EmbedMode::Query"),
+            "切片必须用 query 向量：阈值是拿 query 标的，passage 会整体漂移"
+        );
         assert!(body.contains("embed_slices"), "切片没进 RecallCtx —— 上面两步白做");
         assert!(body.contains("MAX_SLICES"), "片数上限没了（embed 服务单线程）");
     }
@@ -1303,68 +1209,6 @@ mod tests {
         assert!(join_counterparts(&[], &recalled).is_empty());
     }
 
-    /// 【D7】预算回报的 trimmed 段：每丢一步一条 TrimNote，dropped/kept 对得上；
-    /// schema ④ 带被裁表名；未超预算零 notes（常态路径 —— 防「护栏改行为」的第二只眼）。
-    #[test]
-    fn budget_report_records_every_trim_step() {
-        let big = |n: usize| "x".repeat(n);
-        // ⓪①②④ 开火：经验清零、维度 6→4、值域清零、召回表 5→3（带被裁表名）
-        let ctxs: Vec<TableCtx> = (0..5).map(|i| ctx(&format!("t_{i}"), &big(9000))).collect();
-        let mut pc1 = PromptCtx {
-            metrics: vec!["【指标·销售额】= SUM(qty)".into()],
-            dims: (0..6).map(|i| format!("【维度·d{i}】{}", big(3000))).collect(),
-            terms: vec![],
-            time_tpl: None,
-            value_hints: vec![],
-            domain_hits: (0..2).map(|_| big(3000)).collect(),
-            elems: vec![big(100); 4],
-            joins: vec![],
-            schema: schema_text(&ctxs),
-            pitfalls: vec!["教训".into()],
-            fewshot: String::new(),
-            ds_background: String::new(),
-            memories: (0..3).map(|i| format!("经验{i}")).collect(),
-        };
-        let r1 = enforce_prompt_budget(&mut pc1, &ctxs, 0);
-        assert!(
-            r1.notes.iter().any(|n| n.kind == "memory" && n.dropped == 3 && n.kept == 0),
-            "⓪ 经验段没记：{:?}", r1.notes
-        );
-        assert!(
-            r1.notes.iter().any(|n| n.kind == "dim" && n.dropped == 2 && n.kept == 4),
-            "① 维度卡没记：{:?}", r1.notes
-        );
-        assert!(
-            r1.notes.iter().any(|n| n.kind == "domain_hit" && n.dropped == 2 && n.kept == 0),
-            "② 值域卡没记：{:?}", r1.notes
-        );
-        assert_eq!(r1.kept_recalled, 3, "④ 召回表砍到 3：{r1:?}");
-        let schema_note = r1.notes.iter().find(|n| n.kind == "schema_recalled").expect("④ 没记");
-        assert_eq!((schema_note.dropped, schema_note.kept), (2, 3), "{schema_note:?}");
-        assert_eq!(schema_note.names, vec!["t_3".to_string(), "t_4".to_string()], "被裁表名必须带：{schema_note:?}");
-        // ③ 开火：只剩对面表卡片超预算 → schema_counter 记一条，kept_counters 翻 false
-        let ctxs2 = vec![ctx("t_a", "表 t_a\n")];
-        let mut pc2 = PromptCtx {
-            metrics: vec![], dims: vec![], terms: vec![], time_tpl: None, value_hints: vec![],
-            domain_hits: vec![], elems: vec![], joins: vec![],
-            schema: format!("{}{}", schema_text(&ctxs2), "对".repeat(PROMPT_BUDGET_BYTES)),
-            pitfalls: vec![], fewshot: String::new(), ds_background: String::new(), memories: vec![],
-        };
-        let r2 = enforce_prompt_budget(&mut pc2, &ctxs2, 1);
-        assert_eq!(r2.notes.len(), 1, "只有 ③ 该开火：{:?}", r2.notes);
-        assert_eq!((r2.notes[0].kind, r2.notes[0].dropped), ("schema_counter", 1));
-        assert!(!r2.kept_counters && r2.kept_recalled == 1, "{r2:?}");
-        // 未超预算：零 notes、全留（今天 ~9KB 的常态路径）
-        let mut pc3 = PromptCtx {
-            metrics: vec![big(10)], dims: vec![big(10)], terms: vec![], time_tpl: None,
-            value_hints: vec![], domain_hits: vec![], elems: vec![], joins: vec![],
-            schema: big(10), pitfalls: vec![], fewshot: String::new(), ds_background: String::new(),
-            memories: vec!["m".into()],
-        };
-        let r3 = enforce_prompt_budget(&mut pc3, &ctxs2, 1);
-        assert!(r3.notes.is_empty() && r3.kept_counters && r3.kept_recalled == 1, "{r3:?}");
-    }
-
     /// 【D7】卡清单 = **预算后实际进 prompt 的那些**：注册表口径名与表名带出、版本后缀剥掉、
     /// 含数据值的卡种只有 kind+chars、schema 按 report 的留存记。
     #[test]
@@ -1384,19 +1228,17 @@ mod tests {
             pitfalls: vec!["教训：不许猜时间列".into()],
             fewshot: "问：上月销售额\n```sql\nSELECT 1\n```\n".into(),
             ds_background: "源背景".into(),
+            user_habits: String::new(),
             memories: vec!["[fix] 上次把 order_time 写成了 create_time".into()],
+            degraded: vec!["指标召回失败 → 指标卡缺席"],
         };
-        let report = BudgetReport {
-            notes: vec![TrimNote { kind: "dim", dropped: 2, kept: 4, names: vec![] }],
-            kept_recalled: 2,
-            kept_counters: true,
-        };
+        let report = BudgetReport { kept_recalled: 2, kept_counters: true };
         let cs = build_context_summary(&pc, &ctxs, &["t_goods"], &counter_cards, &report);
         let j = serde_json::to_value(&cs).unwrap();
         // 合同形状（审计侧按这个解析）
         assert_eq!(j["prompt_chars"], section_chars(&pc));
-        assert_eq!(j["summary_used"], false);
-        assert_eq!(j["trimmed"][0]["kind"], "dim");
+        // 降级项照实带出（trust 与审计面板都读它）
+        assert_eq!(j["degraded"][0], "指标召回失败 → 指标卡缺席");
         // 注册表口径名与表名带出（版本后缀 ·v2 必须剥掉）
         let names: Vec<&str> = j["cards"]
             .as_array()
@@ -1413,7 +1255,7 @@ mod tests {
         let vh = j["cards"].as_array().unwrap().iter().find(|c| c["kind"] == "value_hint").unwrap();
         assert!(vh.get("name").is_none(), "{vh}");
         assert_eq!(vh["chars"], pc.value_hints[0].len());
-        // 卡种全覆盖：每一类素材都要么在清单里、要么在 trimmed 里
+        // 卡种全覆盖：每一类素材都要在清单里
         for k in [
             "metric", "dim", "term", "time", "value_hint", "domain_hit", "elem", "join",
             "pitfall", "memory", "schema", "schema_counter", "fewshot", "ds_background",
@@ -1421,7 +1263,7 @@ mod tests {
             assert!(j["cards"].as_array().unwrap().iter().any(|c| c["kind"] == k), "缺卡种 {k}");
         }
         // 预算砍掉的表不进清单：report 说只留 1 张时 t_customer 不许出现
-        let trimmed_report = BudgetReport { notes: vec![], kept_recalled: 1, kept_counters: false };
+        let trimmed_report = BudgetReport { kept_recalled: 1, kept_counters: false };
         let j2 = serde_json::to_value(&build_context_summary(&pc, &ctxs, &["t_goods"], &counter_cards, &trimmed_report)).unwrap();
         let names2: Vec<&str> = j2["cards"]
             .as_array()
@@ -1451,9 +1293,11 @@ mod tests {
             pitfalls: vec!["教训：客户 南京苏宇食品有限公司 的码容易写错".into()],
             fewshot: "问：南京苏宇食品有限公司上月销量\n```sql\nSELECT ... /* hunter2 */\n```\n".into(),
             ds_background: String::new(),
+            user_habits: String::new(),
             memories: vec!["[fix] C0093 这个码上次写错了".into()],
+            degraded: vec![],
         };
-        let report = BudgetReport { notes: vec![], kept_recalled: 1, kept_counters: false };
+        let report = BudgetReport { kept_recalled: 1, kept_counters: false };
         let json = serde_json::to_string(&build_context_summary(&pc, &ctxs, &[], &[], &report)).unwrap();
         for v in ["南京苏宇食品有限公司", "手抓饼", "hunter2", "C0093"] {
             assert!(!json.contains(v), "数据值 {v} 落账了：{json}");
@@ -1497,7 +1341,7 @@ mod tests {
             .split("\n///")
             .next()
             .unwrap();
-        assert!(body.contains("enforce_prompt_budget"), "预算护栏没了");
+        assert!(!body.contains("enforce_prompt_budget"), "不应再按人工预算丢弃 prompt 卡片");
         assert!(body.contains("build_context_summary"), "摘要组装没了 —— context_summary 列会永远空着");
         assert!(body.contains("stash_context("), "暂存没了 —— 摘要组了也到不了 query_log");
     }

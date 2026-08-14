@@ -7,7 +7,6 @@
 use crate::KbError;
 use dms_connector::doc::Chunk;
 use dms_connector::owned::OwnedStore;
-use sqlx::Executor;
 
 pub const KB_EMBEDDING_RECIPE: i16 = 1;
 
@@ -117,6 +116,7 @@ const KB_DDL_DELTA: &str = "\
 ALTER TABLE kb.chunk ADD COLUMN IF NOT EXISTS start_char_pos int;
 ALTER TABLE kb.chunk ADD COLUMN IF NOT EXISTS end_char_pos int;
 ALTER TABLE kb.doc ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
+ALTER TABLE kb.doc ADD COLUMN IF NOT EXISTS last_ingest_error text NOT NULL DEFAULT '';
 ";
 
 /// `DocRow` 的列清单。`created_at` 取 `::text`——为一个纯展示字段给 knowledge 引 chrono 不值当。
@@ -127,7 +127,7 @@ ALTER TABLE kb.doc ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT ''
 macro_rules! doc_cols {
     () => {
         "doc_id,space_id,folder_id,folder_path,name,mime,bytes,sha256,status,enabled,tags,business_domain,\
-         effective_from,effective_to,source_uri,document_family,document_revision,error,notice,description,\
+         effective_from,effective_to,source_uri,document_family,document_revision,error,notice,description,last_ingest_error,\
          page_count,chunk_count,uploaded_by,created_at::text AS created_at,\
          updated_at::text AS updated_at"
     };
@@ -142,14 +142,16 @@ pub const DOC_COLS: &str = doc_cols!();
 /// 按 `;` 切分后在同一 PG 事务逐条执行：切分器跳过 `DO $$`/函数体内的分号，
 /// 其余静态 DDL 不含内部语句分隔符（`ddl_splits_without_breaking_statements` 钉住该前提）。
 ///
-/// `pool()` 只在这里用于事务边界；执行文本仍全部来自 `include_str!` 的 `&'static str`，
-/// 没有接收请求内容或运行时 SQL 的入口。
+/// 事务只经 `OwnedStore::begin_fixed` 暴露的字面量语句通道执行；迁移文本全部来自
+/// `include_str!` 的 `&'static str`，没有接收请求内容或运行时 SQL 的入口。
 ///
 /// **装配顺序**：依赖 `vector` 与 `pg_trgm` 两个扩展，由 `meta::migrate` 先建 —— 必须在它之后跑。
 pub async fn migrate(store: &OwnedStore) -> Result<(), KbError> {
     // 多实例同时启动会并发跑这份 DDL：事务内顾问锁收口，避免锁等/约束名撞车
-    let mut tx = store.pool().begin().await?;
-    (&mut *tx).execute("SELECT pg_advisory_xact_lock(hashtext('kb.migrate'))").await?;
+    let mut tx = store.begin_fixed().await?;
+    tx.fixed("SELECT pg_advisory_xact_lock(hashtext('kb.migrate'))")
+        .execute()
+        .await?;
     for ddl in [KB_DDL, KB_DDL_DELTA] {
         // 防御：切分器只认裸 `$$`；迁移若引入 `$tag$` 形式会被从函数体内切坏，
         // 在这里明确报错，而不是带着切坏的语句执行
@@ -157,7 +159,7 @@ pub async fn migrate(store: &OwnedStore) -> Result<(), KbError> {
             return Err(KbError::Db("迁移 DDL 含 $tag$ dollar-quote，切分器不支持".into()));
         }
         for stmt in statements(ddl) {
-            (&mut *tx).execute(stmt).await?;
+            tx.fixed(stmt).execute().await?;
         }
     }
     tx.commit().await?;
@@ -283,6 +285,8 @@ pub struct DocRow {
     pub notice: String,
     /// AI 生成的摘要/描述（Y7）；空串＝未生成。写回走 `set_doc_description`（写复核内联）。
     pub description: String,
+    /// 最近一次影子重建/覆盖失败原因；不改 `status`，因此旧线上版本仍可检索。
+    pub last_ingest_error: String,
     pub page_count: i32,
     pub chunk_count: i32,
     pub uploaded_by: String,
@@ -398,6 +402,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for DocRow {
             error: row.try_get("error")?,
             notice: row.try_get("notice")?,
             description: row.try_get("description")?,
+            last_ingest_error: row.try_get("last_ingest_error")?,
             page_count: row.try_get("page_count")?,
             chunk_count: row.try_get("chunk_count")?,
             uploaded_by: row.try_get("uploaded_by")?,
@@ -735,38 +740,28 @@ pub async fn delete_folder(
     folder_id: &str,
     expected_space_id: Option<&str>,
 ) -> Result<(), KbError> {
-    let deleted = store
+    // 父目录 FK 是 RESTRICT，空树需在同一事务里按最深层优先删除；空间锁与权限复核同语句。
+    let mut tx = store.begin_fixed().await?;
+    let target: Option<(String,)> = tx
         .fixed(
-            "WITH RECURSIVE target AS (SELECT f.folder_id,f.space_id FROM kb.folder f \
-               JOIN kb.space s ON s.space_id=f.space_id WHERE f.folder_id=$1 \
-               AND ($4::text IS NULL OR f.space_id=$4) \
-               AND (s.owner=$2 OR EXISTS (SELECT 1 FROM kb.acl a WHERE a.scope='space' \
-                 AND a.target_id=s.space_id AND a.perm='write' AND \
-                 ((a.grantee_kind='login' AND a.grantee=$2) OR \
-                   (a.grantee_kind='role' AND a.grantee=ANY($3::text[])))))), \
-             guard AS (SELECT pg_advisory_xact_lock(hashtextextended(space_id,0)) FROM target), \
-             descendants AS ( \
-               SELECT f.folder_id,f.space_id,ARRAY[f.folder_id]::text[] AS seen \
-               FROM kb.folder f JOIN target t ON t.folder_id=f.folder_id AND t.space_id=f.space_id \
-               CROSS JOIN guard g UNION ALL \
-               SELECT c.folder_id,d.space_id,d.seen||c.folder_id FROM kb.folder c \
-               JOIN descendants d ON c.parent_id=d.folder_id AND c.space_id=d.space_id \
-               WHERE NOT c.folder_id=ANY(d.seen) \
-             ), empty AS ( \
-               SELECT t.folder_id FROM target t \
-               WHERE NOT EXISTS (SELECT 1 FROM descendants d WHERE d.folder_id<>t.folder_id) \
-                 AND NOT EXISTS (SELECT 1 FROM kb.doc doc \
-                   WHERE doc.folder_id IN (SELECT folder_id FROM descendants)) \
-             ) DELETE FROM kb.folder f USING empty e WHERE f.folder_id=e.folder_id \
-             RETURNING folder_id",
+        "WITH target AS (SELECT f.space_id FROM kb.folder f \
+           WHERE f.folder_id=$1 AND ($4::text IS NULL OR f.space_id=$4)), \
+         guard AS (SELECT pg_advisory_xact_lock(hashtextextended(space_id,0)) FROM target) \
+         SELECT f.space_id FROM kb.folder f JOIN kb.space s ON s.space_id=f.space_id \
+         CROSS JOIN guard g WHERE f.folder_id=$1 \
+         AND (s.owner=$2 OR EXISTS (SELECT 1 FROM kb.acl a WHERE a.scope='space' \
+           AND a.target_id=s.space_id AND a.perm='write' AND \
+           ((a.grantee_kind='login' AND a.grantee=$2) OR \
+             (a.grantee_kind='role' AND a.grantee=ANY($3::text[])))))",
         )
         .bind(folder_id)
         .bind(&viewer.login)
         .bind(&viewer.roles)
         .bind(expected_space_id)
-        .fetch_optional::<(String,)>()
+        .fetch_optional()
         .await?;
-    if deleted.is_none() {
+    let Some((space_id,)) = target else {
+        tx.rollback().await?;
         let Some(current) = get_folder(store, folder_id).await? else {
             return Err(KbError::Forbidden("目录不存在或无权删除".into()));
         };
@@ -774,7 +769,41 @@ pub async fn delete_folder(
             return Err(KbError::Forbidden("目录不存在或无权删除".into()));
         }
         return Err(KbError::BadInput("目录不存在或目录非空，不能删除".into()));
+    };
+    let descendants: Vec<(String, i32)> = tx
+        .fixed(
+            "WITH RECURSIVE tree(folder_id,depth,seen) AS ( \
+           SELECT folder_id,0,ARRAY[folder_id]::text[] FROM kb.folder WHERE folder_id=$1 AND space_id=$2 \
+           UNION ALL SELECT c.folder_id,t.depth+1,t.seen||c.folder_id FROM kb.folder c \
+             JOIN tree t ON c.parent_id=t.folder_id AND c.space_id=$2 \
+             WHERE NOT c.folder_id=ANY(t.seen) \
+         ) SELECT folder_id,depth FROM tree ORDER BY depth DESC,folder_id",
+        )
+        .bind(folder_id)
+        .bind(&space_id)
+        .fetch_all()
+        .await?;
+    let ids: Vec<String> = descendants.iter().map(|(id, _)| id.clone()).collect();
+    let (has_docs,): (bool,) = tx
+        .fixed("SELECT EXISTS(SELECT 1 FROM kb.doc WHERE space_id=$1 AND folder_id=ANY($2::text[]))")
+        .bind(&space_id)
+        .bind(&ids)
+        .fetch_one()
+        .await?;
+    if has_docs {
+        tx.rollback().await?;
+        return Err(KbError::BadInput(
+            "目录树中还有文档，请先移动或删除文档".into(),
+        ));
     }
+    for (id, _) in descendants {
+        tx.fixed("DELETE FROM kb.folder WHERE folder_id=$1 AND space_id=$2")
+            .bind(id)
+            .bind(&space_id)
+            .execute()
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1010,6 +1039,33 @@ pub async fn set_status(
         .await?;
     if n == 0 {
         return Err(KbError::Forbidden(format!("文档 {doc_id} 不存在或写权限已失效")));
+    }
+    Ok(())
+}
+
+/// 影子重建/覆盖的失败状态与线上版本状态分开：只记录本次失败，
+/// 不改 `status/error/notice`，因此旧 chunks 仍可检索且旧版本降级信息不丢。
+pub async fn set_last_ingest_error(
+    store: &OwnedStore,
+    viewer: &crate::Viewer,
+    doc_id: &str,
+    error: &str,
+) -> Result<(), KbError> {
+    let n = store
+        .fixed(concat!(
+            "UPDATE kb.doc d SET last_ingest_error=$1,updated_at=now()",
+            doc_write_acl_tail!("$2", "$3", "$4")
+        ))
+        .bind(error)
+        .bind(doc_id)
+        .bind(&viewer.login)
+        .bind(&viewer.roles)
+        .execute()
+        .await?;
+    if n == 0 {
+        return Err(KbError::Forbidden(format!(
+            "文档 {doc_id} 不存在或写权限已失效"
+        )));
     }
     Ok(())
 }
@@ -1538,8 +1594,8 @@ pub async fn replace_chunks(
                  end_char_pos=EXCLUDED.end_char_pos,terms=EXCLUDED.terms RETURNING embedding IS NULL AS missing), trimmed AS ( \
                DELETE FROM kb.chunk WHERE doc_id=$1 AND ord >= $13 \
                  AND EXISTS (SELECT 1 FROM upserted) RETURNING 1) \
-             UPDATE kb.doc SET status=CASE WHEN EXISTS(SELECT 1 FROM upserted WHERE missing) \
-                                            THEN 'chunked' ELSE $9 END,error=$10,notice=$11,page_count=$12, \
+              UPDATE kb.doc SET status=CASE WHEN EXISTS(SELECT 1 FROM upserted WHERE missing) \
+                                             THEN 'chunked' ELSE $9 END,error=$10,notice=$11,last_ingest_error='',page_count=$12, \
                                sha256=COALESCE($20::text,sha256),bytes=COALESCE($21::bigint,bytes), \
                                mime=COALESCE($22::text,mime), \
                                chunk_count=(SELECT count(*) FROM upserted),updated_at=now() \
@@ -1890,23 +1946,14 @@ pub fn spawn_terms_backfill(store: OwnedStore) {
 }
 
 async fn terms_backfill_round(store: &OwnedStore) -> Result<u64, KbError> {
-    // 锁必须握在同一条连接上（会话级锁；换连接 unlock 解的是空气）—— embed_fill 同款注释
-    let mut conn = store.pool().acquire().await.map_err(KbError::from)?;
-    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(TERMS_FILL_LOCK)
-        .fetch_one(&mut *conn)
-        .await?;
-    if !locked {
+    // guard 在 connector 内绑定锁与解锁的物理连接；任务取消/崩溃也会关闭专用会话释放锁。
+    let Some(lock) = store.try_advisory_lock(TERMS_FILL_LOCK).await? else {
         tracing::debug!("词级路回填：advisory 锁由其他实例持有，本轮跳过");
         return Ok(0);
-    }
+    };
     let r = terms_backfill_all(store).await;
-    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(TERMS_FILL_LOCK)
-        .execute(&mut *conn)
-        .await
-    {
-        tracing::warn!("词级路回填：advisory 解锁失败，该连接将带锁还回池: {e:#}");
+    if let Err(e) = lock.release().await {
+        tracing::warn!("词级路回填：advisory 解锁失败，专用连接将关闭: {e:#}");
     }
     r
 }
@@ -2325,7 +2372,7 @@ mod tests {
     #[test]
     fn doc_cols_match_row_fields() {
         // 列清单与 DocRow 字段一一对应（FromRow 靠名字取列，漏一列是运行时错，钉在这里）
-        assert_eq!(DOC_COLS.split(',').count(), 25);
+        assert_eq!(DOC_COLS.split(',').count(), 26);
         for col in [
             "folder_id",
             "folder_path",
@@ -2337,6 +2384,7 @@ mod tests {
             "document_family",
             "document_revision",
             "description",
+            "last_ingest_error",
         ] {
             assert!(DOC_COLS.split(',').any(|item| item.trim() == col));
         }
@@ -2511,7 +2559,13 @@ mod tests {
         assert!(body.contains("ON CONFLICT (doc_id,ord) DO UPDATE"));
         assert!(body.contains("DELETE FROM kb.chunk WHERE doc_id=$1 AND ord >= $13"));
         assert!(body.contains("INSERT INTO kb.chunk"));
-        assert!(body.contains("UPDATE kb.doc SET status=CASE WHEN EXISTS(SELECT 1 FROM upserted WHERE missing)"));
+        assert!(body.contains(
+            "UPDATE kb.doc SET status=CASE WHEN EXISTS(SELECT 1 FROM upserted WHERE missing)"
+        ));
+        assert!(
+            body.contains("last_ingest_error=''"),
+            "影子切换成功必须清除上次失败"
+        );
     }
 
     /// 同名覆盖的文件元数据（sha256/bytes/mime）必须与分块**同一条语句**切换——拆两条语句
@@ -2566,6 +2620,20 @@ mod tests {
     }
 
     #[test]
+    fn delete_folder_accepts_only_document_free_subtrees() {
+        let src = include_str!("store.rs");
+        let body = src.split("pub async fn delete_folder").nth(1).unwrap();
+        let body = body.split("pub async fn ").next().unwrap();
+        assert!(body.contains("pg_advisory_xact_lock(hashtextextended(space_id,0))"));
+        assert!(body.contains("folder_id=ANY($2::text[])"));
+        assert!(body.contains("ORDER BY depth DESC"));
+        assert!(body.contains("tx.commit()"));
+        assert!(body.contains("store.begin_fixed()"), "事务必须经 OwnedStore 固定 SQL 边界");
+        assert!(!body.contains(concat!("sqlx", "::", "query")), "knowledge 不得重新拿裸数据库语句");
+        assert!(!body.contains("d.folder_id<>t.folder_id"));
+    }
+
+    #[test]
     fn hierarchy_reads_and_role_grants_are_fail_closed_in_sql() {
         let src = include_str!("store.rs");
         for name in ["list_folders", "list_docs"] {
@@ -2598,6 +2666,10 @@ mod tests {
         // 宏化六份：谓词在宏定义里（下方单独钉定义），这里钉调用点的占位符编号
         for (name, tail) in [
             ("set_status", "doc_write_acl_tail!(\"$3\", \"$4\", \"$5\")"),
+            (
+                "set_last_ingest_error",
+                "doc_write_acl_tail!(\"$2\", \"$3\", \"$4\")",
+            ),
             ("set_notice", "doc_write_acl_tail!(\"$2\", \"$3\", \"$4\")"),
             ("set_enabled", "doc_write_acl_tail!(\"$2\", \"$3\", \"$4\")"),
             ("set_doc_source_uri", "doc_write_acl_tail!(\"$2\", \"$3\", \"$4\")"),
@@ -2635,12 +2707,18 @@ mod tests {
     #[test]
     fn chunk_char_pos_migration_is_idempotent_and_wired() {
         let stmts: Vec<&str> = statements(KB_DDL_DELTA).collect();
-        assert_eq!(stmts.len(), 3);
-        assert!(stmts[..2].iter().all(|s| s.starts_with("ALTER TABLE kb.chunk ADD COLUMN IF NOT EXISTS")));
+        assert_eq!(stmts.len(), 4);
+        assert!(stmts[..2]
+            .iter()
+            .all(|s| s.starts_with("ALTER TABLE kb.chunk ADD COLUMN IF NOT EXISTS")));
         assert!(KB_DDL_DELTA.contains("start_char_pos int"));
         assert!(KB_DDL_DELTA.contains("end_char_pos int"));
         // Y7：第三条是 doc.description（AI 描述列），同样幂等
-        assert!(stmts[2].starts_with("ALTER TABLE kb.doc ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT ''"));
+        assert!(stmts[2].starts_with(
+            "ALTER TABLE kb.doc ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT ''"
+        ));
+        // 影子入库失败不能改线上 status：独立字段保留旧版可检索性。
+        assert!(stmts[3].starts_with("ALTER TABLE kb.doc ADD COLUMN IF NOT EXISTS last_ingest_error text NOT NULL DEFAULT ''"));
         let src = include_str!("store.rs");
         let migrate = src.split("pub async fn migrate").nth(1).unwrap();
         let migrate = migrate.split("pub async fn ").next().unwrap();
@@ -2937,11 +3015,10 @@ mod tests {
         let src = include_str!("store.rs");
         let body = src.split("async fn terms_backfill_round(").nth(1).expect("terms_backfill_round 没了");
         let body = body.split("\nasync fn ").next().unwrap();
-        assert!(body.contains("pg_try_advisory_lock"), "阻塞锁会把替补实例睡死：{body}");
-        assert!(body.contains("pg_advisory_unlock"), "没有解锁：{body}");
-        assert_eq!(body.matches(".acquire()").count(), 1, "锁与解锁不在同一条连接上：{body}");
+        assert!(body.contains("try_advisory_lock"), "必须走 connector 的非阻塞会话锁：{body}");
+        assert!(body.contains("lock.release().await"), "没有释放锁 guard：{body}");
         let fill = body.find("terms_backfill_all(store).await").expect("terms_backfill_all 调用没了");
-        let unlock = body.find("pg_advisory_unlock").unwrap();
+        let unlock = body.find("lock.release().await").unwrap();
         assert!(fill < unlock, "失败路径不解锁会终身占锁：{body}");
 
         let migrate = src.split("pub async fn migrate").nth(1).unwrap();

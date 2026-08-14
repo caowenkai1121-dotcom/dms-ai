@@ -4,6 +4,7 @@ import { escHtml, sessionHeaders } from './panel-utils'
 import { uuid } from './format'
 import { dedupeFirstIndex, dedupeKey, locationParts } from './citation'
 import KbDocPreview from './KbDocPreview.vue'
+import { intentIssueText, isReceiptBlocked, type IntentSummary } from './result-receipt'
 
 // 与 App.vue 的 interface Citation 双份声明：字段增减两边同步（位置徽标口径在 citation.ts）
 interface Citation {
@@ -15,12 +16,20 @@ interface Citation {
   document_family?: string | null; document_revision?: string | null
   source_hash?: string; doc_updated_at?: string
 }
-interface TextResult { markdown?: string; citations?: Citation[] }
+interface TextResult {
+  markdown?: string; citations?: Citation[]
+  intent_summary?: IntentSummary
+  resolved_question?: string
+}
 
 const props = defineProps<{ result: TextResult; token?: string; login?: string; traceId?: string; streaming?: boolean }>()
 const emit = defineEmits<{ (e: 'auth-expired'): void }>()
 const citations = computed<Citation[]>(() => props.result.citations ?? [])
 const sourceDocs = computed(() => new Set(citations.value.map((c) => c.doc_id)).size)
+const receipt = computed(() => props.result.intent_summary)
+const resolvedQuestion = computed(() => (props.result.resolved_question ?? '').trim())
+const receiptBlocked = computed(() => isReceiptBlocked(receipt.value))
+const receiptIssues = computed(() => (receipt.value?.coverage.issues ?? []).map(intentIssueText))
 function governedVersionsConflict(left: Citation, right: Citation): boolean {
   return [
     [left.document_revision, right.document_revision],
@@ -87,7 +96,6 @@ function openOriginal(c: Citation) {
 }
 
 const answerKey = computed(() => JSON.stringify({
-  markdown: props.result.markdown ?? '',
   citations: citations.value.map((c) => [
     c.doc_id, c.chunk_id, c.span ?? 1, c.source_hash ?? '', c.doc_updated_at ?? '',
     c.doc_name, c.folder_path ?? '', c.document_revision ?? '',
@@ -117,6 +125,9 @@ function loadFeedback() {
 
 async function sendFeedback(kind: FeedbackKind) {
   if (!props.traceId || feedbackBusy.value || feedback.value === kind) return
+  const generation = answerGeneration
+  const traceId = props.traceId
+  const storageKey = feedbackKey.value
   feedbackBusy.value = true
   feedbackError.value = ''
   try {
@@ -128,18 +139,19 @@ async function sendFeedback(kind: FeedbackKind) {
     const response = await fetch('/api/feedback', {
       method: 'POST',
       headers,
-      body: JSON.stringify({ trace_id: props.traceId, kind, detail: '', login_name: props.login ?? null }),
+      body: JSON.stringify({ trace_id: traceId, kind, detail: '', login_name: props.login ?? null }),
     })
     // 401 已交回父组件走会话过期：直接返回，不再补一条误导性的「反馈提交失败」
     if (response.status === 401) { emit('auth-expired'); return }
     if (!response.ok) throw new Error('feedback_failed')
+    if (generation !== answerGeneration || props.traceId !== traceId) return
     feedback.value = kind
     // setItem 配额满/隐私模式抛错不影响成功态（服务端已落账），单独兜住
-    try { if (feedbackKey.value) localStorage.setItem(feedbackKey.value, kind) } catch { /* 忽略本地缓存失败 */ }
+    try { if (storageKey) localStorage.setItem(storageKey, kind) } catch { /* 忽略本地缓存失败 */ }
   } catch {
-    feedbackError.value = '反馈提交失败，请稍后重试。'
+    if (generation === answerGeneration && props.traceId === traceId) feedbackError.value = '反馈提交失败，请稍后重试。'
   } finally {
-    feedbackBusy.value = false
+    if (generation === answerGeneration && props.traceId === traceId) feedbackBusy.value = false
   }
 }
 
@@ -333,7 +345,15 @@ const hasVersionRisk = computed(() => {
 const versionRiskText = computed(() => conflictingFamilies.value.length
   ? `本回答同时参考了“${conflictingFamilies.value.join('、')}”文档族的多个版本。系统不会自动选用其中一份，请并列核对差异并由制度负责人确认。`
   : '回答中包含版本或口径差异。系统不会自动选用其中一份，请并列核对并人工确认。')
-const presented = computed(() => presentation(displayMarkdown.value))
+// 生成中**冻结标题与摘要拆分**：`presentation` 取第一个 heading 当标题、第一个非列表段落当
+// 结论，而这两样都是逐 token 到的 —— 标题会从「直」「直接」跳到「知识库回答」，半截的「-」
+// 又不匹配列表排除规则，会被当成结论塞进蓝框再弹掉。生成中标题区反复重排比不动更糟。
+// markdown 正文（`html`）一字不动，渐进排版照旧；只把拆分推迟到收尾做一次。
+const presented = computed(() =>
+  props.streaming
+    ? { title: '知识库回答', summary: '', body: displayMarkdown.value }
+    : presentation(displayMarkdown.value),
+)
 const summaryHtml = computed(() => inline(escHtml(presented.value.summary)))
 const html = computed(() => render(presented.value.body))
 
@@ -467,6 +487,12 @@ function onSourcesToggle(e: Event) {
 
 <template>
   <section class="kb-answer">
+    <div v-if="receipt || resolvedQuestion" class="answer-receipt" :class="{ blocked: receiptBlocked }" role="status">
+      <strong>{{ receiptBlocked ? '需要核验' : '问题理解' }}</strong>
+      <span v-if="resolvedQuestion">本轮实际按「{{ resolvedQuestion }}」检索。</span>
+      <span v-if="receiptBlocked && !receiptIssues.length">部分条件尚未通过验证，请结合来源谨慎使用。</span>
+      <ul v-if="receiptIssues.length"><li v-for="(issue, index) in receiptIssues" :key="index">{{ issue }}</li></ul>
+    </div>
     <template v-if="displayMarkdown">
       <header class="answer-lead">
         <div class="answer-topline">
@@ -634,20 +660,27 @@ function onSourcesToggle(e: Event) {
   background: var(--primary-bg); color: var(--primary); cursor: pointer;
   font: inherit; font-size: 10.5px; font-weight: 700; line-height: 20px; vertical-align: 1px;
 }
-.answer-summary :deep(button.cite:hover), .answer-body :deep(button.cite:hover) { background: var(--primary); color: #fff; }
+.answer-summary :deep(button.cite:hover), .answer-body :deep(button.cite:hover) { background: var(--primary); color: var(--on-primary); }
 .evidence-alert {
   margin-top: 14px; padding: 10px 12px; display: flex; align-items: flex-start; gap: 9px;
   border: 1px solid var(--border); border-left-width: 3px; background: var(--bg-main);
 }
 .evidence-alert .alert-mark {
   width: 20px; height: 20px; flex: 0 0 20px; display: grid; place-items: center;
-  border-radius: 50%; color: #fff; font-size: 11px; font-weight: 800;
+  border-radius: 50%; color: var(--on-primary); font-size: 11px; font-weight: 800;
 }
 .evidence-alert div { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .evidence-alert strong { color: var(--text-primary); font-size: 12px; line-height: 1.5; }
 .evidence-alert span:last-child { color: var(--text-muted); font-size: 11px; line-height: 1.55; }
 .evidence-alert.version { border-left-color: #d38b19; background: rgba(211, 139, 25, .06); }
 .evidence-alert.version .alert-mark { background: #d38b19; }
+.answer-receipt {
+  margin-bottom: 12px; padding: 9px 11px; display: flex; flex-direction: column; gap: 3px;
+  border-left: 3px solid var(--primary); background: var(--primary-bg); color: var(--text-muted); font-size: 11.5px;
+}
+.answer-receipt strong { color: var(--text-primary); font-size: 12px; }
+.answer-receipt ul { margin: 2px 0 0; padding-left: 18px; }
+.answer-receipt.blocked { border-left-color: #d38b19; background: rgba(211, 139, 25, .08); }
 .evidence { max-width: 100%; margin-top: 16px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--bg-card); }
 .evidence-head { min-height: 42px; display: flex; align-items: center; gap: 8px; padding: 0 11px; cursor: pointer; list-style: none; }
 .evidence-head::-webkit-details-marker { display: none; }

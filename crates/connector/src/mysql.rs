@@ -21,12 +21,12 @@ use sqlx::mysql::MySqlConnectOptions;
 use sqlx::{Column, FromRow, Row, TypeInfo};
 
 use dms_kernel::sql::dms_lookup::{
-    gate_dms_scoped_with, registered_lookup_keys, registered_lookup_kind, DmsIndexKind,
-    DmsLookupSql, DMS_LOOKUP_MAX_ROWS,
+    gate_dms_scoped_with, DmsIndexKind, DmsLookupSql, DMS_LOOKUP_MAX_ROWS,
 };
 use dms_kernel::{BoxFut, Dialect, DsId, MysqlDialect, ScopedSql};
 
 use crate::error::ConnectorError;
+use crate::dms_lookup::{registered_lookup_keys, registered_lookup_kind, REGISTRY};
 use crate::fixed::FixedStmt;
 use crate::source::{ColumnInfo, DsPolicy, RowSet, SchemaSnapshot, SourceKind, SqlSource, TableInfo};
 
@@ -34,6 +34,13 @@ pub const DMS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DMS_LOOKUP_MAX_CONCURRENCY: u32 = 2;
 /// 生产点查索引的启动核验预算：一次性、逐表 SHOW INDEX，与用户点查的 2s 红线分开。
 const LOOKUP_INDEX_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+/// 会话只读位核验的启动预算。**一次性**，同样与用户点查的 2s 红线分开（同 `LOOKUP_INDEX_VERIFY_TIMEOUT`）。
+///
+/// 🔴 由来（2026-08-14）：这条核验原来借用 `DMS_LOOKUP_TIMEOUT`（2s），而公网链路上
+/// 一次 RTT 就 1.1s、连接池获取偶尔 2.4s —— 于是核验超时 → 按「无法核验」拒绝 → **服务起不来**
+/// （实测三次重建里两次挂在这里）。判据本身仍 fail-closed：超时照旧拒绝，只是别把
+/// 「链路慢」误判成「不是只读」。
+const SESSION_READ_ONLY_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 // 数仓目录探针只读 information_schema。公网链路实测单条 ~27s（2026-08-08 切换公网后），
 // 10s 在内网够用、公网必超时 —— 探针失败是启动硬失败，超时要按链路预算给。
 const WAREHOUSE_CATALOG_TIMEOUT: Duration = Duration::from_secs(60);
@@ -245,9 +252,9 @@ impl ReadOnlyMySql {
             if elapsed > Duration::from_millis(500) {
                 tracing::warn!(ds = at, elapsed_ms = elapsed.as_millis(), "生产业务点查偏慢");
             }
-            let (columns, mut data) = to_table(&rows, max);
+            let (columns, mut data, truncated) = to_table(&rows, max);
             let redacted = redact(self.sensitive, &columns, &mut data);
-            Ok(RowSet { columns, rows: data, redacted })
+            Ok(RowSet { columns, rows: data, redacted, truncated })
         })
         .await
         .map_err(|_| ConnectorError::timeout(at, DMS_LOOKUP_TIMEOUT))?
@@ -456,7 +463,29 @@ async fn connect_read_only(
             .no_engine_substitution(false)
             .timezone(None)
             .set_names(false);
-        pool.connect_with(opts).await
+        // 🔴 服务端也要有超时闸。客户端 `EXEC_TIMEOUT`（30s）只是**本地放弃等待**：
+        // 连接被丢回池里之前那条查询在 Doris 上仍然跑到底，白烧数仓资源，几条并发大查询
+        // 会互相拖垮（生产点查那条分支一直有 `MAX_EXECUTION_TIME=2000`，数仓这条一条都没设）。
+        // 上限取客户端超时 + 余量：先让客户端超时报出可读文案，服务端兜底收尸。
+        // 两条 SET 都**失败不阻断建连**：`query_timeout` 是 Doris 原生（秒），
+        // `max_execution_time` 是 MySQL 兼容口（毫秒），同构数仓未必两个都认 ——
+        // `after_connect` 返 Err 会让整条连接建不起来，那是把「少一道兜底」升级成「连不上」。
+        pool.after_connect(|conn, _| {
+            Box::pin(async move {
+                use sqlx::Executor;
+                for stmt in [
+                    "SET query_timeout = 45",
+                    "SET SESSION MAX_EXECUTION_TIME=45000",
+                ] {
+                    if let Err(e) = conn.execute(stmt).await {
+                        tracing::debug!(stmt, err = %e, "数仓会话超时设置未生效（该方言不认，忽略）");
+                    }
+                }
+                Ok(())
+            })
+        })
+        .connect_with(opts)
+        .await
     } else {
         pool.after_connect(|conn, _| {
             Box::pin(async move {
@@ -712,7 +741,7 @@ fn ensure_verified_lookup(
 /// 都没有写权限。两条路径都 fail-closed，SQL 语法闸门仍只允许单条查询。
 async fn mysql_session_read_only(pool: &sqlx::MySqlPool) -> bool {
     if tokio::time::timeout(
-        DMS_LOOKUP_TIMEOUT,
+        SESSION_READ_ONLY_VERIFY_TIMEOUT,
         sqlx::query_scalar::<_, i64>("SELECT @@SESSION.transaction_read_only").fetch_one(pool),
     )
         .await
@@ -758,6 +787,19 @@ async fn pool_read_only(pool: &sqlx::MySqlPool, capability: MysqlCapability) -> 
                 matches!(privilege.as_str(), "SELECT" | "SHOW VIEW" | "USAGE")
             })
         })
+}
+
+/// 全分区扫描判据的下限：分区数少于它一律不判（小表全扫是正常的，不该逼用户加时间条件）。
+const FULL_SCAN_PARTITION_FLOOR: u32 = 8;
+
+/// EXPLAIN 结果行 → 一段纯文本。Doris 的计划是单列多行；列名各版本不同，故按**位置**取第 0 列，
+/// 取不出来的行跳过（计划里混进非文本列不该让整条判据失效）。
+fn plan_text(rows: &[sqlx::mysql::MySqlRow]) -> String {
+    rows.iter()
+        .filter_map(|row| row.try_get::<String, _>(0).ok())
+        .collect::<Vec<_>>()
+        .join("
+")
 }
 
 impl SqlSource for ReadOnlyMySql {
@@ -817,7 +859,7 @@ impl SqlSource for ReadOnlyMySql {
             if elapsed > Duration::from_millis(500) {
                 tracing::warn!(ds = at, elapsed_ms = elapsed.as_millis(), warehouse, "scoped fetch 偏慢");
             }
-            let (columns, mut data) = to_table(&rows, max);
+            let (columns, mut data, truncated) = to_table(&rows, max);
             // Doris 的 0 行结果补列名；生产点查禁止额外 DESCRIBE 往返。
             let columns = match columns.is_empty() {
                 true if warehouse => describe_columns(&pool, wire, at, t).await?,
@@ -825,7 +867,7 @@ impl SqlSource for ReadOnlyMySql {
                 false => columns,
             };
             let redacted = redact(self.sensitive, &columns, &mut data);
-            Ok(RowSet { columns, rows: data, redacted })
+            Ok(RowSet { columns, rows: data, redacted, truncated })
         })
     }
 
@@ -856,7 +898,10 @@ impl SqlSource for ReadOnlyMySql {
             // 非数仓已在上面早退（Ok(None)），这里只剩 Doris 的通用分析 EXPLAIN。
             let stmt = format!("EXPLAIN {wire}");
             match tokio::time::timeout(t, sqlx::raw_sql(&stmt).fetch_all(&pool)).await {
-                Ok(Ok(_)) => Ok(None),
+                // 计划文本已经付过这次往返了 —— 里面写着 partitions=N/N 的就别再让用户
+                // 等满 EXEC_TIMEOUT 才拿到一句「超时」。判据是纯函数（`source::scan_verdict`），
+                // 判词走的是与「数据库明确报错」同一个 `Some` 口子：进 repair 回炉，不 fail-closed。
+                Ok(Ok(rows)) => Ok(crate::source::scan_verdict(&plan_text(&rows), FULL_SCAN_PARTITION_FLOOR)),
                 // 只有数据库**明确判定**语句有问题才给 Some（可拿去 repair）
                 Ok(Err(e)) => Ok(e.as_database_error().map(|db| db.message().to_string())),
                 // 超时/抖动 = None：不触发改写（可能把本来对的 SQL 改坏，还多花一次 LLM）
@@ -1093,7 +1138,7 @@ fn guard_scoped_wire<'a>(
     if capability.is_warehouse() {
         return Ok(GuardedWire::Borrowed(wire));
     }
-    let checked = gate_dms_scoped_with(wire, &MysqlDialect, sensitive)
+    let checked = gate_dms_scoped_with(wire, &MysqlDialect, sensitive, &REGISTRY)
         .map_err(|e| ConnectorError::query(at, e))?;
     ensure_verified_lookup(&checked, indexes, at)?;
     Ok(GuardedWire::Checked(checked))
@@ -1226,7 +1271,9 @@ async fn describe_columns(
 }
 
 /// 行集 → (列名, JSON 行)。列名取自首行（无行则空列，与拆分前逐行等价）；`max` 行即截断不报错。
-fn to_table(rows: &[sqlx::mysql::MySqlRow], max: usize) -> (Vec<String>, Vec<Vec<Value>>) {
+/// 返回 `(列名, 行, 是否在上限处截断)`。第三位是 2026-08-14 补的：截断此前没有出口，
+/// 调用方只能拿 `row_count >= MAX_ROWS` 反推，而 ds 策略把上限压到 50 时那条恒为假。
+fn to_table(rows: &[sqlx::mysql::MySqlRow], max: usize) -> (Vec<String>, Vec<Vec<Value>>, bool) {
     let mut columns: Vec<String> = vec![];
     let mut data: Vec<Vec<Value>> = vec![];
     for (i, row) in rows.iter().enumerate() {
@@ -1245,7 +1292,9 @@ fn to_table(rows: &[sqlx::mysql::MySqlRow], max: usize) -> (Vec<String>, Vec<Vec
                 .collect(),
         );
     }
-    (columns, data)
+    // 「取回来的行数 > 允许放进结果的行数」＝这次确实被截断了
+    let truncated = rows.len() > data.len();
+    (columns, data, truncated)
 }
 
 /// 列类型名 → 取值路径。抽成纯函数**只为无库可单测**（`MySqlRow` 造不出来），
@@ -1308,6 +1357,47 @@ fn cell_to_json(row: &sqlx::mysql::MySqlRow, i: usize, ty: &str) -> Value {
 /// 无库无网：脱敏与类型映射都是纯函数。
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 截断必须有出口：`to_table` 到上限就 break，而「截断了」此前只能靠
+    /// `row_count >= MAX_ROWS` 反推 —— ds 策略把上限压到 50/20 时那条**恒为假**，
+    /// 于是几十行的结果被当成全量呈现（2026-08-14 审计）。
+    #[test]
+    fn to_table_reports_truncation_at_the_cap() {
+        // `MySqlRow` 造不出来，判据打在源码形状上：截断标志必须来自「取回行数 > 放行行数」，
+        // 不能是别的推断（比如 `data.len() == max` —— 恰好等于上限但没被截断时会假报）。
+        let src = include_str!("mysql.rs");
+        let body = src.split("fn to_table(").nth(1).expect("to_table 改名了");
+        let head = body.split("
+}
+").next().unwrap();
+        assert!(
+            head.contains("let truncated = rows.len() > data.len();"),
+            "截断判据不对或没了：{head}"
+        );
+        assert!(head.contains("(columns, data, truncated)"), "截断标志没交出去：{head}");
+    }
+    /// 🔴 数仓连接必须带**服务端**超时闸：客户端 `EXEC_TIMEOUT` 只是本地放弃等待，
+    /// 连接归池前那条查询在 Doris 上仍跑到底 —— 几条并发大查询互相拖垮（2026-08-13 审计）。
+    /// 判据打在源码上：这段要连库才能跑，而「有没有设」是形状问题。
+    #[test]
+    fn warehouse_pool_sets_a_server_side_timeout() {
+        let src = include_str!("mysql.rs");
+        let body = src
+            .split("let out = if capability.is_warehouse() {")
+            .nth(1)
+            .expect("建池分支改名了 —— 顺手把这条判据一起改")
+            .split("} else {")
+            .next()
+            .unwrap();
+        assert!(body.contains("after_connect"), "数仓分支没有 after_connect：{body}");
+        assert!(body.contains("query_timeout"), "缺 Doris 原生超时闸：{body}");
+        // 失败不阻断建连：返 Err 会把「少一道兜底」升级成「连不上」
+        assert!(
+            body.contains("if let Err(e) = conn.execute(stmt).await"),
+            "方言不认这两个变量时必须忽略而不是让整条连接建不起来：{body}"
+        );
+    }
+
     use super::*;
 
     /// F5：`SELECT *` 拿不到列名文本，靠结果列脱敏兜底（断言取自 pipeline.rs 同名测试）

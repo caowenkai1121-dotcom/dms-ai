@@ -43,6 +43,13 @@ pub struct RowSet {
     /// 被敏感列防线整列置空的列名（F5：`SELECT *` 的唯一收口）。
     /// 空 = 没有命中，非空 = 这些列的值全是 `Null`，调用方据此提示用户而不是当成没数据。
     pub redacted: Vec<String>,
+    /// 🔴 本次取数**在行上限处被截断**。
+    ///
+    /// 由来：`to_table` 到上限就 `break`，而「截断了」这件事此前没有任何出口 ——
+    /// 调用方只能用 `row_count >= MAX_ROWS` 反推，那条在 `DsPolicy.max_rows` 把上限压到
+    /// 50/20 时**恒为假**（`effective_limits` 取两者更紧的那个），于是几十行的结果被当成
+    /// 全量呈现，前端脚注一个字都不提（2026-08-14 审计）。
+    pub truncated: bool,
 }
 
 // 手写 Debug：derive 会把全部行数据（业务值）打进任何 `{:?}` 日志
@@ -151,12 +158,63 @@ pub trait SqlSource: Send + Sync {
     fn probe_schema<'a>(&'a self) -> BoxFut<'a, Result<SchemaSnapshot, ConnectorError>>;
 }
 
+/// 全分区扫描判据（**纯函数、无 IO**）。`Some` = 计划显示要扫全部分区，可拿去 repair。
+///
+/// 为什么值得判：语法合法但要扫全表的查询今天一路跑到 `EXEC_TIMEOUT` 才失败 ——
+/// 用户等满半分钟，拿到的是一句「超时」。而执行计划**已经付过一次往返**了
+/// （`explain` 那次），里面白纸黑字写着 `partitions=1358/1358`。
+///
+/// 落在本文件而不是新开一个：`explain` 的 `Option<String>` 语义就定义在上面几行，
+/// 变更原因同族（D3）；`mysql.rs` 已 1664 行，不再往里加东西。
+///
+/// 三条防误伤：
+/// - 只认「已扫 == 总数」，扫了子集说明分区裁剪生效了，一个字不说；
+/// - 总分区数 < `total_floor` 一律不判：小表全扫是正常的，不该逼用户加时间条件；
+/// - 判词进 repair 回炉，**不** fail-closed —— 判错了只多花一次改写，不该拦住正确的 SQL。
+pub fn scan_verdict(plan: &str, total_floor: u32) -> Option<String> {
+    for line in plan.lines() {
+        let Some(rest) = line.split("partitions=").nth(1) else { continue };
+        let digits = |s: &str| s.chars().take_while(char::is_ascii_digit).collect::<String>();
+        let scanned = digits(rest);
+        let Some(after) = rest[scanned.len()..].strip_prefix('/') else { continue };
+        let total = digits(after);
+        let (Ok(scanned), Ok(total)) = (scanned.parse::<u32>(), total.parse::<u32>()) else {
+            continue;
+        };
+        if scanned == total && total >= total_floor {
+            return Some(format!(
+                "计划显示全分区扫描 {total}/{total}，请补上时间过滤条件（按分区列限定范围）后重试"
+            ));
+        }
+    }
+    None
+}
+
 /// 契约自守：trait 必须是 object-safe（`&dyn SqlSource` 是 agent 侧的持有形态），
 /// 且 `redacted` 能原样穿过。无库无网 —— 假实现直接返回内存里的 `RowSet`。
 #[cfg(test)]
 mod tests {
     use super::*;
     use dms_kernel::policy::scope::ScopeSets;
+
+    /// 🔴 三条防误伤各一条 + 真实 Doris 计划文本一条。
+    #[test]
+    fn scan_verdict_only_fires_on_a_real_full_partition_scan() {
+        let full = "  0:VOLAP SCAN NODE
+     TABLE: dws_off_offline_sale_dfn
+     partitions=1358/1358
+     cardinality=90000000";
+        let hit = scan_verdict(full, 8).expect("全分区扫描要判");
+        assert!(hit.contains("1358"), "判词要带上真实分区数：{hit}");
+        assert!(hit.contains("时间过滤"), "要告诉用户怎么改：{hit}");
+        // 裁剪生效 → 一个字不说
+        assert_eq!(scan_verdict("partitions=3/1358", 8), None);
+        // 小表全扫是正常的
+        assert_eq!(scan_verdict("partitions=4/4", 8), None);
+        // 没有分区信息的计划（非分区表 / 别的引擎）
+        assert_eq!(scan_verdict("0:OlapScanNode
+  TABLE: t_goods", 8), None);
+    }
     use dms_kernel::sql::guard::GuardConfig;
     use dms_kernel::{check, MysqlDialect, RawSql, UnrestrictedProof};
 
@@ -191,8 +249,7 @@ mod tests {
                 Ok(RowSet {
                     columns: vec!["id".into(), "login_pwd".into()],
                     rows: rows.into_iter().take(_max).collect(),
-                    redacted: vec!["login_pwd".into()],
-                })
+                    redacted: vec!["login_pwd".into()], truncated: false })
             })
         }
         fn explain<'a>(
@@ -281,8 +338,7 @@ mod tests {
         let rs = RowSet {
             columns: vec!["secret_col".into()],
             rows: vec![vec![serde_json::Value::from("业务值不该出现")]],
-            redacted: vec![],
-        };
+            redacted: vec![], truncated: false };
         let dbg = format!("{rs:?}");
         assert!(dbg.contains("secret_col"), "{dbg}");
         assert!(dbg.contains("1 行"), "{dbg}");

@@ -19,6 +19,9 @@
 pub mod cache;
 pub mod business_lookup;
 pub mod entity;
+pub mod fastpath_intent;
+#[cfg(test)]
+pub mod fastpath_tests;
 pub mod graph;
 pub mod hits;
 pub mod knowledge;
@@ -128,5 +131,38 @@ mod tests {
         assert!(!is_subsequence(&["llm", "graph"]), "换位必须红");
         assert!(!is_subsequence(&["graph", "graph"]), "重复必须红");
         assert!(!is_subsequence(&["knowledge"]), "白名单外的标签必须红");
+    }
+}
+
+#[cfg(test)]
+mod order_scope_drift {
+    /// 🔴 有效订单口径不许出现第 9 处**不同形**的散写。
+    ///
+    /// 由来：这串过滤在手工模板里散写了 8 处，而装配器路径读的是 `meta.table_scope`。
+    /// 运营侧新增一个作废状态码时，装配器当天自愈、手工模板继续把作废单算进订单数 ——
+    /// 同一个「订单数」两个答案（2026-08-13 审计）。
+    ///
+    /// 这条判据只保证**所有副本逐字相同**（漂了就红）；让模板真正去读声明是 T8 之后的
+    /// 独立一笔（要改行为，必须连库跑 evaluation.py）。
+    #[test]
+    fn no_inline_order_scope_literals() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("entity.rs", include_str!("entity.rs")),
+            ("fastpath_intent.rs", include_str!("fastpath_intent.rs")),
+        ];
+        let canon = dms_semantic::sales_fact::ORDER_SCOPE;
+        let core = canon.split("NOT IN ").nth(1).expect("口径常量形状变了");
+        for (name, src) in SOURCES {
+            for (i, line) in src.lines().enumerate() {
+                if !line.contains("order_status NOT IN") {
+                    continue;
+                }
+                assert!(
+                    line.contains(core),
+                    "{name}:{} 的有效订单口径与 sales_fact::ORDER_SCOPE 漂了：{line}",
+                    i + 1
+                );
+            }
+        }
     }
 }

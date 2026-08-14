@@ -103,7 +103,7 @@ pub(super) async fn card(cx: &AskCtx<'_>, name: &str, explicit: bool) -> anyhow:
     // 清单查询失败不丢整卡：分类名与商品数已在手，降级出无清单卡（空 RowSet 走正常拼装）
     let goods = fetch_rows(cx, &goods_sql)
         .await?
-        .unwrap_or_else(|| dms_connector::source::RowSet { columns: vec![], rows: vec![], redacted: vec![] });
+        .unwrap_or_else(|| dms_connector::source::RowSet { columns: vec![], rows: vec![], redacted: vec![], truncated: false });
     let items = vec![
         Kpi { label: "商品分类".into(), value: serde_json::Value::from(category.clone()), semantic: Semantic::Goods, delta: None },
         Kpi { label: "分类商品数".into(), value: serde_json::Value::from(goods_n), semantic: Semantic::Count, delta: None },

@@ -508,7 +508,7 @@ void reload()
 .primary-btn, .secondary-btn {
   height: 32px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px;
 }
-.primary-btn { padding: 0 13px; border-color: var(--primary); background: var(--primary); color: #fff; white-space: nowrap; }
+.primary-btn { padding: 0 13px; border-color: var(--primary); background: var(--primary); color: var(--on-primary); white-space: nowrap; }
 .primary-btn:hover { background: var(--primary-hover); }
 .secondary-btn { padding: 0 13px; background: var(--bg-card); color: var(--text-regular); white-space: nowrap; }
 .secondary-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }

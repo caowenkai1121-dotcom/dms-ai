@@ -858,7 +858,7 @@ onBeforeUnmount(() => { mindmapEpoch++ })
 }
 .secondary-btn { padding: 0 13px; background: var(--bg-card); color: var(--text-regular); white-space: nowrap; }
 .secondary-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
-.primary-btn { padding: 0 13px; border-color: var(--primary); background: var(--primary); color: #fff; }
+.primary-btn { padding: 0 13px; border-color: var(--primary); background: var(--primary); color: var(--on-primary); }
 .primary-btn:hover { background: var(--primary-hover); }
 button:disabled { cursor: not-allowed; opacity: .55; }
 .mindmap-note { margin-top: 8px; padding: 7px 10px; border-left: 3px solid var(--warning-text); background: var(--warning-bg); color: var(--warning-text); font-size: 11.5px; }

@@ -282,8 +282,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onEsc))
 .sk-btn { padding: 4px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text-regular); font-size: 12px; cursor: pointer; }
 .sk-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
 .sk-btn:disabled { opacity: .5; cursor: not-allowed; }
-.sk-btn.primary { border-color: var(--primary); background: var(--primary); color: #fff; }
-.sk-btn.primary:hover:not(:disabled) { color: #fff; opacity: .88; }
+.sk-btn.primary { border-color: var(--primary); background: var(--primary); color: var(--on-primary); }
+.sk-btn.primary:hover:not(:disabled) { color: var(--on-primary); opacity: .88; }
 .sk-btn.danger:hover:not(:disabled) { border-color: var(--error-text); color: var(--error-text); }
 
 .sk-item { margin: 0 22px 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-main); }

@@ -97,6 +97,9 @@ const EXTRA_FORBIDDEN: &[&str] = &[
     "messages",
     "model",
     "temperature",
+    // 用户明确要求全系统不设置应用层输出 token 上限；同时禁止配置 extra 偷偷加回。
+    "max_tokens",
+    "max_completion_tokens",
     "stream",
     "authorization",
     "api_key",
@@ -278,7 +281,8 @@ impl LlmClient {
         user: &str,
     ) -> anyhow::Result<(String, dms_kernel::llm::Usage)> {
         let c = self.conf();
-        self.chat_with_conf(&c, model, system, user).await
+        self.chat_with_conf(&c, model, system, user, Some(0.1))
+            .await
     }
 
     async fn chat_with_conf(
@@ -287,8 +291,9 @@ impl LlmClient {
         model: &str,
         system: &str,
         user: &str,
+        temperature: Option<f32>,
     ) -> anyhow::Result<(String, dms_kernel::llm::Usage)> {
-        let body = build_body(model, system, user, &c.extra);
+        let body = build_body(model, system, user, temperature, &c.extra);
         // 吞错纪律：reqwest/serde 真因只进服务端 tracing 日志，错误链保持笼统文案
         // （上游细节不回浏览器 —— 红线），排障去日志里查。
         let resp = self
@@ -337,9 +342,10 @@ impl LlmClient {
         model: &str,
         system: &str,
         user: &str,
+        temperature: Option<f32>,
         on_delta: &mut (dyn FnMut(&str) + Send),
     ) -> anyhow::Result<(String, dms_kernel::llm::Usage)> {
-        let body = build_stream_body(model, system, user, &c.extra);
+        let body = build_stream_body(model, system, user, temperature, &c.extra);
         let mut resp = self
             .http
             .post(format!("{}/chat/completions", c.base_url))
@@ -680,6 +686,7 @@ fn build_body(
     model: &str,
     system: &str,
     user: &str,
+    temperature: Option<f32>,
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -688,7 +695,7 @@ fn build_body(
             Msg { role: "system", content: system },
             Msg { role: "user", content: user },
         ],
-        "temperature": 0.1,
+        "temperature": f64::from(temperature.unwrap_or(0.1)),
     });
     // `extra` 空时这个循环一次都不转。保留键已在统一配置校验入口拦掉，
     // 所以这里的 insert 不可能覆盖基础请求字段 —— 那条不变量由 `forbidden_keys_panic` 守。
@@ -708,9 +715,10 @@ fn build_stream_body(
     model: &str,
     system: &str,
     user: &str,
+    temperature: Option<f32>,
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> serde_json::Value {
-    let mut body = build_body(model, system, user, extra);
+    let mut body = build_body(model, system, user, temperature, extra);
     if let Some(o) = body.as_object_mut() {
         o.insert("stream".to_string(), serde_json::Value::Bool(true));
         o.insert(
@@ -822,10 +830,8 @@ fn read_usage(v: &serde_json::Value) -> dms_kernel::llm::Usage {
 /// 【K2】给现有客户端戴上 kernel 的 `ChatModel` 帽子——**不新建第二个 HTTP 客户端**
 /// （T4 才把实现整体搬进 `connector/llm.rs`，那之前两份客户端＝两份超时/重试语义）。
 ///
-/// 一处刻意的语义收窄，随 T4 消失：`req.temperature` 被忽略（HTTP body 里写死 0.1，
-/// 而全部调用点传的正是 `Some(0.1)`）。错误一律落 `LlmError::Transport`，其 Display 是 `{m}`
-/// 原样透传，所以 `e.to_string()` 与迁移前的 anyhow 文案逐字相同
-/// （repair 轮把它喂给 LLM，文案是契约）。
+/// 请求级 `temperature` 必须原样进入 HTTP body：意图解析与知识问答用 0 温度追求稳定，
+/// SQL 自修/自一致性采样会显式升温。应用层不发送模型输出 token/费用上限。
 ///
 /// 🔴 **usage 必须原样填回**：这里曾经写 `usage: Default::default()`（全 0）。T9 之后**所有**
 /// LLM 调用都走本 trait，那个 0 就等于把 `meta.query_log` 的 token 列静默清空 ——
@@ -843,8 +849,9 @@ impl dms_kernel::ChatModel for LlmClient {
                 dms_kernel::ModelTier::Precise => c.model_precise.clone(),
             };
             let (system, user) = split_roles(&req.messages);
+            let temperature = req.temperature;
             let (content, usage) = self
-                .chat_with_conf(&c, &model, &system, &user)
+                .chat_with_conf(&c, &model, &system, &user, temperature)
                 .await
                 .map_err(|e| dms_kernel::LlmError::Transport(e.to_string()))?;
             Ok(dms_kernel::ChatReply { content: Some(content), usage })
@@ -866,8 +873,16 @@ impl dms_kernel::ChatModel for LlmClient {
                 dms_kernel::ModelTier::Precise => c.model_precise.clone(),
             };
             let (system, user) = split_roles(&req.messages);
+            let temperature = req.temperature;
             let (content, usage) = self
-                .chat_stream_with_conf(&c, &model, &system, &user, &mut *on_delta)
+                .chat_stream_with_conf(
+                    &c,
+                    &model,
+                    &system,
+                    &user,
+                    temperature,
+                    &mut *on_delta,
+                )
                 .await
                 .map_err(|e| dms_kernel::LlmError::Transport(e.to_string()))?;
             Ok(dms_kernel::ChatReply { content: Some(content), usage })
@@ -959,13 +974,13 @@ mod tests {
 
     #[test]
     fn empty_extra_changes_nothing() {
-        let got = build_body("m1", "sys", "usr", &serde_json::Map::new());
+        let got = build_body("m1", "sys", "usr", Some(0.1), &serde_json::Map::new());
         let o = got.as_object().expect("body 必须是对象");
         let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["messages", "model", "temperature"], "键集合变了：{got}");
         assert_eq!(o["model"], "m1");
-        assert_eq!(o["temperature"], serde_json::json!(0.1));
+        assert!((o["temperature"].as_f64().unwrap() - 0.1).abs() < 1e-6);
         assert_eq!(
             o["messages"],
             serde_json::json!([
@@ -976,15 +991,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_sampling_reaches_the_wire_without_output_limit() {
+        let deterministic = build_body(
+            "m1",
+            "sys",
+            "usr",
+            Some(0.0),
+            &serde_json::Map::new(),
+        );
+        assert_eq!(deterministic["temperature"], serde_json::json!(0.0));
+        assert!(deterministic.get("max_tokens").is_none());
+
+        let retry = build_body("m1", "sys", "usr", Some(0.5), &serde_json::Map::new());
+        assert_eq!(retry["temperature"], serde_json::json!(0.5));
+        assert!(retry.get("max_tokens").is_none());
+    }
+
     /// 千问要的那个键真的进得去，且**不动**原有三个键。
     #[test]
     fn extra_merges_without_touching_the_base() {
         let mut e = serde_json::Map::new();
         e.insert("enable_thinking".into(), serde_json::Value::Bool(false));
-        let got = build_body("m1", "sys", "usr", &e);
+        let got = build_body("m1", "sys", "usr", Some(0.1), &e);
         assert_eq!(got["enable_thinking"], serde_json::json!(false));
         assert_eq!(got["model"], "m1");
-        assert_eq!(got["temperature"], serde_json::json!(0.1));
+        assert!((got["temperature"].as_f64().unwrap() - 0.1).abs() < 1e-6);
         assert_eq!(got["messages"][1]["content"], "usr");
         // 实测账：这个键关掉思考后同一道 SQL 题 780ms/65tok，不关 16626ms/2281tok，产出一样。
         assert_eq!(got.as_object().unwrap().len(), 4, "只该多出一个键：{got}");
@@ -1016,7 +1048,7 @@ mod tests {
     fn stream_body_adds_stream_keys_on_top_of_build_body() {
         let mut e = serde_json::Map::new();
         e.insert("enable_thinking".into(), serde_json::Value::Bool(false));
-        let got = build_stream_body("m1", "sys", "usr", &e);
+        let got = build_stream_body("m1", "sys", "usr", Some(0.1), &e);
         assert_eq!(got["stream"], serde_json::json!(true));
         assert_eq!(got["stream_options"], serde_json::json!({ "include_usage": true }));
         assert_eq!(got["model"], "m1");

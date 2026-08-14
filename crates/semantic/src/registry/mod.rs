@@ -12,9 +12,36 @@ pub mod datasource;
 pub mod element;
 pub mod embed_fill;
 pub mod exemplar;
+pub mod pitfall;
+pub mod failure;
+pub mod learn;
 pub mod lexicon;
 pub mod memory;
 pub mod model;
+pub mod user_pref;
+
+// ─────────────────────────── 判官模式（学习写口总闸） ───────────────────────────
+
+/// 判官/评测进程不许往学习面写字。
+///
+/// 由来：`tools/regression.py` 与 `tools/evaluation.py` 走的就是生产 `ask` 链路，于是每跑一趟
+/// 全量题集就把 79 条评测问句连同**那一刻**的 SQL 写进 `meta.sql_exemplar` 与 `meta.memory`，
+/// 再由 few-shot 与经验召回喂回给真实用户。跑得越勤，语料池被评测样本挤占得越狠，而且学的是
+/// 评测当时的写法（口径一改就成了错教材）。判官必须能观察系统而不改变系统（2026-08-13 审计）。
+///
+/// `ponytail:` 进程级全局而不是把 `learn: bool` 一路穿到 `AskCtx` —— 判官本来就是独立进程，
+/// 「这个进程不学习」正是进程级事实；真需要同进程内分会话开关时再改成 ctx 字段。
+static JUDGE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 由 server 启动时按 `DMSAI_JUDGE=1` 设一次（`main.rs`），其余地方只读。
+pub fn set_judge_mode(on: bool) {
+    JUDGE_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 学习写口（`exemplar::save*` / `memory::save_memory` / 教训候选）统一在入口处问它一句。
+pub fn judge_mode() -> bool {
+    JUDGE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 // ─────────────────────────── 【K3-B ②】ds 谓词 ───────────────────────────
 
@@ -190,7 +217,7 @@ pub fn element_asset_live_pred_at(alias: &str, n: usize) -> String {
 }
 
 /// Doris 运行时目录的共享读取口。物理存在/启停仍由 `meta.table_doc` 决定；这里仅把
-/// 已验证的 57 项白名单复用到召回、注册表投影与历史样例，避免各模块复制表清单。
+/// 已验证的静态白名单复用到召回、注册表投影与历史样例，避免各模块复制表清单。
 /// pub(crate)：`recall::ods` 的 JOIN 证据 forms 归一复用同一判定（去空白/反引号）。
 pub(crate) fn catalog_ident(value: &str) -> &str {
     value

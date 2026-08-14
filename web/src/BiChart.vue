@@ -6,7 +6,7 @@ import { AriaComponent, GridComponent, LegendComponent, TooltipComponent } from 
 // 轴选项类型只从主入口导出（components 子包没有）；type-only 导入不影响打包体积
 import type { YAXisComponentOption } from 'echarts'
 import { CanvasRenderer } from 'echarts/renderers'
-import { toNum, fmt, semanticForLabel, type Semantic } from './format'
+import { toNum, fmt, semanticForLabel, isGrossMarginLabel, type Semantic } from './format'
 
 echarts.use([
   BarChart,
@@ -60,8 +60,11 @@ let lastWidth = -1
 
 const LIGHT_SERIES = ['#4051d3', '#168a8a', '#c77917', '#7352b9', '#b24778', '#358552', '#c64c4c', '#4771c7']
 const DARK_SERIES = ['#7b89f0', '#4fc7c7', '#e2a653', '#a98ae4', '#de7aaa', '#75bd8d', '#e37f7f', '#7596df']
-const LIGHT_MONO = ['#3343ba', '#4051d3', '#6573df', '#8994ea', '#aeb6f2', '#d1d6f8']
-const DARK_MONO = ['#7b89f0', '#8e9af3', '#a1abf5', '#b4bcf7', '#c7cdf9', '#daddfb']
+// 单色阶：**每一阶都必须对底色 ≥3:1**（非文本对比度线）。
+// 🔴 由来：6 类以上走滚动图例、不画扇区标签，色块是名字与扇区之间**唯一**的映射；
+// 原来最浅两阶 #aeb6f2/#d1d6f8 对白卡只有 1.95/1.43 —— 用户看到的是「有名字、找不到对应扇区」。
+const LIGHT_MONO = ['#2b3aa6', '#3e4cae', '#505db6', '#626ebd', '#747dc4', '#8790cd']
+const DARK_MONO = ['#6776ee', '#818ef1', '#98a3f4', '#aeb7f6', '#c3c9f8', '#d6dafb']
 
 function cssToken(name: string, fallback: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
@@ -108,13 +111,6 @@ function displayAxisMetric(value: unknown, yi: number): string {
   return displayMetric(value, yi).replace(/^¥/, '')
 }
 
-/** 毛利率列判定（0~1 ratio ×100 合同的触发条件）：包含「毛利率」即命中
- *  （平均毛利率、毛利率(%)、毛利率（净）等变体都覆盖）。
- *  ⚠️ 同款逻辑还复制在 App.vue / ResultPanel.vue 两处，判据改动需三处同步（待抽进 format.ts）。 */
-function isGrossMarginLabel(label: string): boolean {
-  return label.replace(/\s+/g, '').includes('毛利率')
-}
-
 /** DWS 毛利率合同值为 0~1，这里 ×100 还原成百分数；⚠️ 该合同只覆盖毛利率列 ——
  *  其它 percent 语义列（如税率）若后端也给 0~1 ratio，图与表会同时差 100 倍且无告警，
  *  后端口径改动时必须点检。只变换图表数据副本，原始 rows/CSV/SQL 不动。 */
@@ -152,7 +148,12 @@ function byValueDesc(yi: number): (a: number, b: number) => number {
 function render() {
   if (!chart) return
   // 空数据/空指标列直接不画：y=[] 时 sort/轴/series 会静默产出一张空图
-  if (!props.rows.length || !props.y.length) return
+  // 🔴 必须 clear：直接 return 会把**上一轮**的柱子和坐标轴留在屏上 —— 追问把结果打成
+  // 0 行时（权限收窄/时间窗改空），用户看到的是一张与当前数字无关的图，且没有任何提示。
+  if (!props.rows.length || !props.y.length) {
+    chart.clear()
+    return
+  }
   const theme = themeTokens()
   const compact = isCompact()
   // TOP 收纳：>top 类按首个 y 值降序取前 top，否则全量

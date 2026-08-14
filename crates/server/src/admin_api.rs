@@ -1176,14 +1176,22 @@ pub async fn sql_edit_exec(
         ))?;
     // ③ 沉淀 pending + 复核通道（人改的也要过 `review_exemplar` 判词 —— 投毒对策不设后门）。
     //    `save` 返回 false = 同问句已有语料（不重复复核，与线上一致的省法）。
+    // 🔴 落语料的是**闸门前原文**，不是 `scoped.wire()`。`wire()` 里带着本次注入的行级权限
+    // 条件（复核人自己的客户编码/员工 ID 列表），而 `meta.sql_exemplar` 是 ds 级共享 few-shot：
+    // 存注入后 SQL ＝ ①把复核人的权限集合泄漏给全员；②教会模型把权限条件硬写进 SQL。
+    // 与 LLM 路径同一条纪律（`agent/src/run.rs` 的经验蒸馏用 `st.candidate`＝闸门前原文）。
+    // 批次号 `sql-edit`：人工编辑是一族独立的学习来源，管理员要能整族撤回
+    //（问答轮的批次是 trace_id，复核批是 `review-<秒>`，三族互不混淆）。
     let review = if dms_semantic::registry::exemplar::save(
-        st.owned.pool(), ds_reg::DMS_DS_ID, question, scoped.wire(),
+        st.owned.pool(), ("sql-edit", p.login_name.as_str()), ds_reg::DMS_DS_ID, question, sql,
     ).await {
         let llm: Arc<dyn dms_kernel::ChatModel> = Arc::new(st.llm.clone());
         let (pg, ds, q, s) =
-            (st.owned.pool().clone(), ds_reg::DMS_DS_ID.to_string(), question.to_string(), scoped.wire().to_string());
+            (st.owned.pool().clone(), ds_reg::DMS_DS_ID.to_string(), question.to_string(), sql.to_string());
+        // 与上面 `save` 同一批次族：人工编辑要能整族撤回
+        let who = p.login_name.clone();
         tokio::spawn(async move {
-            dms_agent::review::review_exemplar(llm.as_ref(), &pg, &ds, &q, &s).await;
+            dms_agent::review::review_exemplar(llm.as_ref(), ("sql-edit", &who), &pg, &ds, &q, &s).await;
         });
         "pending"
     } else {
@@ -1783,6 +1791,39 @@ mod tests {
                 "question/sql 无长度上限：巨型 SQL 直接进闸门+执行+沉淀：{body}");
     }
 
+    /// 🔴 落 `meta.sql_exemplar` 的必须是**闸门前原文**，不是 `scoped.wire()`。
+    ///
+    /// `wire()` 带着本次注入的行级权限条件（复核人自己的客户编码/员工 ID）；语料是 ds 级共享
+    /// few-shot，存注入后 SQL ＝ 把复核人的权限集合泄漏给全员，且教会模型把权限条件硬写进 SQL
+    /// （2026-08-13 审计；与 F6「few-shot 跨用户明文泄漏」同一条防线）。
+    #[test]
+    fn sql_edit_learns_pre_injection_sql_only() {
+        let src = include_str!("admin_api.rs");
+        let body = src
+            .split("pub async fn sql_edit_exec(")
+            .nth(1)
+            .expect("sql_edit_exec 不见了")
+            .split("\n}")
+            .next()
+            .unwrap();
+        let learn = body
+            .split("exemplar::save(")
+            .nth(1)
+            .expect("语料沉淀调用不见了")
+            .split(')')
+            .next()
+            .unwrap();
+        assert!(!learn.contains("wire()"), "语料沉淀吃了注入后 SQL：{learn}");
+        let review = body
+            .split("review_exemplar")
+            .next()
+            .expect("复核调用不见了");
+        assert!(
+            !review.rsplit("let (pg, ds, q, s) =").next().unwrap_or("").contains("wire()"),
+            "复核素材吃了注入后 SQL：{review}"
+        );
+    }
+
     /// revoke 不验源存在：源已删的遗留 kb.acl 行也必须能收回（target_id 无外键）；
     /// grant 仍须先验源存在（幽灵授权对策）。
     #[test]
@@ -1842,4 +1883,66 @@ mod tests {
         assert!(body.matches("\"column\": column").count() >= 2,
                 "column 行失败记录仍不带 column_name：{body}");
     }
+}
+
+// ─────────────────── 学习账本（自我进化的安全网）───────────────────
+
+#[derive(serde::Deserialize)]
+pub struct LearnQuery {
+    login_name: Option<String>,
+    role_code: Option<String>,
+    days: Option<i32>,
+}
+
+/// `GET /api/admin/learn?days=7` —— 最近的学习批次（谁、什么时候、动了哪些表、几条）。
+///
+/// 回答「上周二系统学了什么」。此前四个学习写口全是裸写，这个问题只能连 PG 手写 SQL
+/// 逐表对时间戳（2026-08-13 审计）。
+pub async fn learn_batches(
+    State(st): St,
+    h: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<LearnQuery>,
+) -> ApiRes {
+    admin(&st, &h, (&q.login_name, &q.role_code)).await?;
+    let days = q.days.unwrap_or(7).clamp(1, 90);
+    let rows = dms_semantic::registry::learn::recent_batches(st.owned.pool(), days, 200)
+        .await
+        .map_err(db_err)?;
+    Ok(Json(serde_json::json!({ "days": days, "batches": rows })))
+}
+
+/// `POST /api/admin/learn/{batch_id}/rollback` —— 撤回一个学习批次。
+///
+/// 机械回滚：倒序重放每条事件的 `before`（新增即删除、更新即还原），**不调模型**
+/// —— 与 prime-agent 的 `rollbackProposal` 同形。幂等：重复回滚第二次返回 0。
+pub async fn learn_rollback(
+    State(st): St,
+    h: HeaderMap,
+    axum::extract::Path(batch_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LearnQuery>,
+) -> ApiRes {
+    let p = admin(&st, &h, (&q.login_name, &q.role_code)).await?;
+    if batch_id.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "batch_id 不能为空"));
+    }
+    let undone = dms_semantic::registry::learn::rollback_batch(st.owned.pool(), &batch_id)
+        .await
+        .map_err(db_err)?;
+    // 三个数字分开报：一个总数说不清「没撤成」和「本来就没有」的差别，
+    // 而管理员正是靠这个差别决定要不要重跑一次回滚。
+    tracing::warn!(
+        batch_id,
+        undone = undone.undone,
+        skipped = undone.skipped,
+        failed = undone.failed,
+        actor = %p.login_name,
+        "学习批次已回滚"
+    );
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "batch_id": batch_id,
+        "undone": undone.undone,
+        "skipped": undone.skipped,
+        "failed": undone.failed,
+    })))
 }
