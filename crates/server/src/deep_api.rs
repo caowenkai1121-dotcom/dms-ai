@@ -1667,6 +1667,29 @@ fn factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
     Some(out)
 }
 
+/// 周报板块名 —— **生产者与消费者的唯一事实源**。
+///
+/// 🔴 由来：`weekly_factual_insight` 用 `item.label == "核心经营指标"` 这类**精确串**
+/// 去捞证据，而生产者散在三处（`weekly_core_section` / `weekly_report_plan` /
+/// `weekly_evidence_items`）各自写一份字面量。任一处改一个字（哪怕「客户结构」→
+/// 「客户销售结构」），消费者拿到 `None` → 整行输出「本次数据未覆盖 | 暂不判断」——
+/// **数据查到了、SQL 跑通了、页面照样是空壳**，而且没有任何判据会红。
+///
+/// 名字放一处，两边都从这里取；`weekly_section_names_have_one_source` 钉住不许再写字面量。
+mod weekly {
+    pub const CORE: &str = "核心经营指标";
+    pub const CURRENT: &str = "本周销售结构";
+    pub const PREVIOUS: &str = "上周销售结构";
+    pub const YEAR_AGO: &str = "去年同期销售结构";
+    pub const SKU: &str = "单品表现";
+    pub const SHOP: &str = "客户结构";
+    pub const MARKETING: &str = "营销费用";
+    pub const STOCK: &str = "库存与缺货风险";
+    pub const ORDER_CALIBER: &str = "订单数与客单价口径";
+    pub const STORE_CALIBER: &str = "门店效率口径";
+    pub const EFFICIENCY_CALIBER: &str = "坪效与人效口径";
+}
+
 fn weekly_factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
     fn available(item: Option<&EvidenceItem>) -> Option<&EvidenceItem> {
         item.filter(|item| !item.is_gap())
@@ -1676,17 +1699,17 @@ fn weekly_factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
         return None;
     }
     let section = |label: &str| evidence.iter().find(|item| item.label == label);
-    let core = section("核心经营指标");
-    let current = section("本周销售结构");
-    let previous = section("上周销售结构");
-    let year_ago = section("去年同期销售结构");
-    let sku = section("单品表现");
-    let shop = section("客户结构");
-    let marketing = section("营销费用");
-    let stock = section("库存与缺货风险");
-    let order_caliber = section("订单数与客单价口径");
-    let store_caliber = section("门店效率口径");
-    let efficiency_caliber = section("坪效与人效口径");
+    let core = section(weekly::CORE);
+    let current = section(weekly::CURRENT);
+    let previous = section(weekly::PREVIOUS);
+    let year_ago = section(weekly::YEAR_AGO);
+    let sku = section(weekly::SKU);
+    let shop = section(weekly::SHOP);
+    let marketing = section(weekly::MARKETING);
+    let stock = section(weekly::STOCK);
+    let order_caliber = section(weekly::ORDER_CALIBER);
+    let store_caliber = section(weekly::STORE_CALIBER);
+    let efficiency_caliber = section(weekly::EFFICIENCY_CALIBER);
     let sales_complete = available(core).is_some()
         || [current, previous, year_ago]
             .into_iter()
@@ -1714,6 +1737,9 @@ fn weekly_factual_insight(evidence: &[EvidenceItem]) -> Option<String> {
         "| 销售表现 | {sales_change} | {sales_reason} | {sales_action} |"
     ));
     for (label, item, action) in [
+        // 元组首项是**展示名**，与查找名（`weekly::*`）刻意可以不同：
+        // 「库存与缺货风险」是证据 label，表格里写「库存与缺货」更短。
+        // 查找一律走常量，展示各写各的 —— 这两件事混在一起正是本轮要拆的东西。
         ("单品表现", sku, "复核头部单品贡献与异常波动"),
         ("客户结构", shop, "跟进头部客户贡献与集中风险"),
         ("营销费用", marketing, "核对费用投入与活动产出"),
@@ -1780,15 +1806,15 @@ fn weekly_evidence_items(
     }
     for (label, body) in [
         (
-            "订单数与客单价口径",
+            weekly::ORDER_CALIBER,
             "数据状态=当前未取得同周期订单事实的去重订单数；订单数必须按订单号去重，客单价必须用同周期销售额除以该订单数，禁止用销售宽表行数推算",
         ),
         (
-            "门店效率口径",
+            weekly::STORE_CALIBER,
             "数据状态=销售事实表的 storecode/storename 表示客户，不是真实门店；当前未取得真实门店编码、面积或人员证据，禁止把客户销售结构包装成门店效率",
         ),
         (
-            "坪效与人效口径",
+            weekly::EFFICIENCY_CALIBER,
             "数据状态=当前元数据未提供可按省区归属的周度坪效或人效证据；禁止猜测或使用全国值替代",
         ),
     ] {
@@ -2440,7 +2466,7 @@ fn weekly_core_section(
         ]
     };
     Section {
-        title: "核心经营指标".into(),
+        title: weekly::CORE.into(),
         question: "同一销售事实、同一账号权限下的本周、上周与去年同期经营指标".into(),
         kind: "table",
         columns: [
@@ -3803,43 +3829,43 @@ fn weekly_report_plan(question: &str) -> Option<(Option<String>, Vec<PlanSection
             PlanSection {
                 question: format!("{current}销售额按商品"),
                 chart: "bar".into(),
-                title: "本周销售结构".into(),
+                title: weekly::CURRENT.into(),
                 assertion: None,
             },
             PlanSection {
                 question: format!("{previous}销售额按商品"),
                 chart: "bar".into(),
-                title: "上周销售结构".into(),
+                title: weekly::PREVIOUS.into(),
                 assertion: None,
             },
             PlanSection {
                 question: format!("{year_ago}销售额按商品"),
                 chart: "bar".into(),
-                title: "去年同期销售结构".into(),
+                title: weekly::YEAR_AGO.into(),
                 assertion: None,
             },
             PlanSection {
                 question: format!("{current}销量最高的10个商品"),
                 chart: "bar".into(),
-                title: "单品表现".into(),
+                title: weekly::SKU.into(),
                 assertion: None,
             },
             PlanSection {
                 question: format!("{current}销售额按客户"),
                 chart: "bar".into(),
-                title: "客户结构".into(),
+                title: weekly::SHOP.into(),
                 assertion: None,
             },
             PlanSection {
                 question: format!("{}库存金额按商品类型", scope.province),
                 chart: "bar".into(),
-                title: "库存与缺货风险".into(),
+                title: weekly::STOCK.into(),
                 assertion: None,
             },
             PlanSection {
                 question: format!("{current}运营活动费用"),
                 chart: "bar".into(),
-                title: "营销费用".into(),
+                title: weekly::MARKETING.into(),
                 assertion: None,
             },
         ],
@@ -5016,11 +5042,25 @@ async fn compose_inner(
             title: Some(sec.title.clone()),
         };
         let display_rows = chart_display_rows(&sec.columns, &sec.rows);
-        svgs.push(crate::chart_svg::chart_svg(&sp, &sec.columns, &display_rows));
+        // Section 只带裸列名（没有 ViewSpec）→ 语义未声明，图内数值落回按列名猜
+        svgs.push(crate::chart_svg::chart_svg(
+            &sp,
+            &sec.columns,
+            &display_rows,
+            dms_kernel::present::Semantic::None,
+        ));
     }
     if let Some(sp) = &kpi_chart {
         let display_rows = chart_display_rows(&primary.columns, &primary.rows);
-        let svg = crate::chart_svg::chart_svg(sp, &primary.columns, &display_rows);
+        // 主结果**带 ViewSpec**：y 轴列的语义是声明过的，别再让图去猜列名
+        // （`display_number_semantic` 的红字：声明优先于猜测）。
+        let value_semantic = sp
+            .y
+            .first()
+            .and_then(|y| primary.view.columns.get(*y))
+            .map(|column| column.semantic)
+            .unwrap_or(dms_kernel::present::Semantic::None);
+        let svg = crate::chart_svg::chart_svg(sp, &primary.columns, &display_rows, value_semantic);
         if !svg.is_empty() {
             if sections.is_empty() {
                 svgs.push(svg);
@@ -6659,6 +6699,11 @@ mod tests {
         assert!(understanding.unwrap().contains("湖南省"));
         assert_eq!(sections.iter().map(|section| section.title.as_str()).collect::<Vec<_>>(),
             vec!["本周销售结构", "上周销售结构", "去年同期销售结构", "单品表现", "客户结构", "库存与缺货风险", "营销费用"]);
+        // 生产者产出的名字必须**就是**消费者查找的那份常量（写死真名 + 对齐常量，两头都钉）
+        assert_eq!(sections.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), vec![
+            weekly::CURRENT, weekly::PREVIOUS, weekly::YEAR_AGO,
+            weekly::SKU, weekly::SHOP, weekly::STOCK, weekly::MARKETING,
+        ]);
         assert!(sections[0].question.contains(&actual_scope.current));
         assert!(sections[1].question.contains(&actual_scope.previous));
         assert!(sections[2].question.contains(&actual_scope.year_ago));
@@ -6778,6 +6823,35 @@ mod tests {
         assert!(dms.contains("销售费用"), "{dms}");
         let other = planning_catalog("other", "本周省区营销费用和费销比", &metrics, &dimensions);
         assert!(!other.contains("相关已验证数仓资产合同"), "{other}");
+    }
+
+    /// 板块名只有一处事实源：生产者与消费者都从 `weekly::*` 取。
+    ///
+    /// 🔴 由来：`weekly_factual_insight` 按**精确串**去捞证据，而生产者散在三处各写一份
+    /// 字面量。任一处改一个字，消费者拿 `None` → 整行输出「本次数据未覆盖 | 暂不判断」，
+    /// 数据其实查到了、SQL 也跑通了，页面照样是空壳，且没有任何判据会红。
+    #[test]
+    fn weekly_section_names_have_one_source() {
+        // 只扫**非测试段**：测试里写死真名是有意的（常量被改名时它当场红）。
+        let src = include_str!("deep_api.rs");
+        let src = src.split("#[cfg(test)]").next().expect("非测试段");
+        // 消费/生产两侧都必须用常量取名
+        for name in [
+            weekly::CORE, weekly::CURRENT, weekly::PREVIOUS, weekly::YEAR_AGO,
+            weekly::SKU, weekly::SHOP, weekly::MARKETING, weekly::STOCK,
+            weekly::ORDER_CALIBER, weekly::STORE_CALIBER, weekly::EFFICIENCY_CALIBER,
+        ] {
+            // 常量定义本身 1 处 + 测试里这份清单 1 处；其余出现都必须是 `weekly::X`
+            let literal = format!("\"{name}\"");
+            // 常量定义 1 处 + 文件头注释里举的那个例子，其余出现都必须是 `weekly::X`
+            let hits = src.matches(&literal).count();
+            assert!(
+                hits <= 2,
+                "板块名 {name} 又被写成字面量了（{hits} 处）—— 改一个字就让页面出空壳"
+            );
+        }
+        // 生产者↔常量那一半由 `weekly_report_contract_pins_three_periods_and_modules` 钉着
+        // （它逐字断言计划里的七个 title）；本条钉的是「两侧都不许再写字面量」。
     }
 
     #[test]

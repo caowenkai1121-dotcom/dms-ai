@@ -757,24 +757,17 @@ fn source_numbers_of(hit: &Hit) -> Vec<String> {
 }
 
 /// 标题与表头只负责组织答案，不承载业务事实，可以不带角标；表格数据行仍走引用过滤。
-/// 允许集合刻意收窄，避免模型把“报销上限 900 元”伪装成标题绕过证据校验。
+///
+/// 🔴 标题判据是**结构性**的，不认文案：是 markdown 标题（`#{1,6} ` 或整行加粗）
+/// 且整行不含任何数字，就豁免。原先是一张 7 条中文标题白名单（直接结论/关键要点/…），
+/// 模型写「## 常见问题」「## 计算示例」这类白名单外的标题时，标题行走普通 `keep_line`
+/// → 没有角标 → 被删；连带 `has_supported_content` 可能判「无实质内容」让整篇退成 NO_HIT。
+/// 白名单原本担心的「把『报销上限 900 元』伪装成标题绕过校验」由数字判据直接挡住，
+/// 比词表更严，也不误伤。
 fn is_presentation_structure(lines: &[&str], index: usize) -> bool {
     let line = lines[index].trim();
-    if let Some(title) = line
-        .strip_prefix("#### ")
-        .or_else(|| line.strip_prefix("### "))
-        .or_else(|| line.strip_prefix("## "))
-    {
-        return [
-            "直接结论",
-            "关键要点",
-            "操作步骤",
-            "对比说明",
-            "适用范围",
-            "注意事项",
-            "版本与差异",
-        ]
-        .contains(&title.trim());
+    if is_heading_line(line) {
+        return numbers(line).is_empty();
     }
     if line.len() < 3 || !(line.starts_with('|') && line.ends_with('|')) {
         return false;
@@ -789,6 +782,15 @@ fn is_presentation_structure(lines: &[&str], index: usize) -> bool {
         // GFM 里表头与分隔符之间不允许空行：只认**紧挨的下一行**，
         // 跳空行会把远处无关的 `| --- |` 认成本表分隔符
         && lines.get(index + 1).is_some_and(|next| is_table_separator(next.trim()))
+}
+
+/// markdown 标题行：`#{1,6} ` 前缀，或整行加粗 `**…**`
+fn is_heading_line(line: &str) -> bool {
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
+        return true;
+    }
+    line.len() > 4 && line.starts_with("**") && line.ends_with("**")
 }
 
 fn is_table_separator(line: &str) -> bool {
@@ -2206,6 +2208,25 @@ mod tests {
         assert!(!is_presentation_structure(&["## 报销上限 900 元"], 0));
         assert!(!has_supported_content("## 直接结论\n\n| 项目 | 标准 |\n| --- | --- |"));
         assert!(has_supported_content("## 直接结论\n\n报销上限 800 元[^1]。"));
+    }
+
+    /// 🔴 标题豁免认「是标题 + 不含数字」，不认文案（2026-08-14）。
+    ///
+    /// 由来：原判据是 7 条中文标题白名单，模型写「## 常见问题」这类白名单外的标题时，
+    /// 标题行走普通角标过滤 → 无角标 → 被删；整篇可能因此判「无实质内容」退成 NO_HIT。
+    #[test]
+    fn digit_free_headings_are_exempt_regardless_of_wording() {
+        let md = "## 常见问题\n\n发票丢失可按规定补开[^1]。\n\n**计算示例**\n\n补贴按实际出差天数计[^1]。";
+        let out = keep_cited_only(md, 1);
+        assert!(out.contains("## 常见问题"), "白名单外的标题被删了：{out}");
+        assert!(out.contains("**计算示例**"), "整行加粗的标题被删了：{out}");
+        assert!(has_supported_content(&out), "标题活下来后整篇仍是有效答案：{out}");
+
+        // 反面①：带数字的行不吃标题豁免，照旧要角标
+        assert!(!is_presentation_structure(&["## 报销上限 900 元"], 0));
+        assert_eq!(keep_cited_only("## 报销上限 900 元", 1), "", "带数字的伪标题不许无据活下来");
+        // 反面②：`#` 后无空格不是 markdown 标题
+        assert!(!is_presentation_structure(&["##常见问题"], 0));
     }
 
     /// 🔴 `citations` 不许虚报，且角标必须与它**同源**。

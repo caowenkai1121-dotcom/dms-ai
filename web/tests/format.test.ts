@@ -43,6 +43,9 @@ test('semanticForLabel：money 补营收/售价/现价，库存允许裸词', ()
   assert.equal(semanticForLabel('现价'), 'money')
   assert.equal(semanticForLabel('库存'), 'count')
   assert.equal(semanticForLabel('库存量'), 'count')
+  // 后端 chart_svg::label_kind 的 count 词表有「行数」（deep_api 用 display_number("行数", …)），
+  // 这里原本漏了 —— 两份兜底词表必须同族。
+  assert.equal(semanticForLabel('行数'), 'count')
 })
 
 test('semanticForLabel：标识列优先于指标词', () => {

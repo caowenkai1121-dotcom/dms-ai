@@ -293,7 +293,7 @@ pub async fn dual_outcome(
 
 /// 问数臂**答出东西了**吗。反问卡、出界卡、不可计算卡与空结果都不算 ——
 /// 它们是「我答不了」的四种说法，不该和一份真资料并排展示成「综合结论」。
-fn data_has_substance(r: &AskResult) -> bool {
+pub fn data_has_substance(r: &AskResult) -> bool {
     if matches!(r.route.as_str(), crate::ask::NEED_INTENT | crate::ask::NO_TOPIC)
         || crate::ask::is_unavailable_card_result(r)
     {
@@ -382,6 +382,11 @@ pub fn into_ask_result(outcome: HybridOutcome, prepared: &PreparedQuestion) -> A
                 citations.len()
             ));
         }
+        // 🔴 整份 `Answer` **也**带出去：`caliber_note` 只是 CLI 的 400 字摘要，
+        // 引用角标全丢了。HTTP 侧要按 `kind:"text"` + `citations` 重新塑形（角标点得开
+        // 才叫有引用），拿不到原件就只能退回自己再查一次知识库 —— 那就又是两条链路
+        // 对同一问句各查各的，`hybrid::run` 当初收口要根治的正是这个。
+        out.kb = Some(a);
     }
     out.view.insight = summary;
     out

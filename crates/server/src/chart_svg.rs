@@ -7,6 +7,8 @@
 //! 数据纪律与 `semantic::present` / `BiChart.vue` 对齐：克制的业务色板（非彩虹）、
 //! pie 只在非负时出、TOP 收纳多出来的并入「其他」、标签一律 escape（它们是数据）。
 
+use dms_kernel::present::Semantic;
+
 /// 克制的业务色板：主蓝、增长绿、提醒金、结构紫、风险红、辅助青。
 const PALETTE: [&str; 6] = ["#3567d6", "#2f8f72", "#c8842f", "#7b61a8", "#c65757", "#3c7f91"];
 /// pie 最多几片（多出来的并入「其他」—— 与 present.rs 的 TOP 收纳同一纪律）
@@ -27,10 +29,13 @@ pub struct ChartSpec {
 }
 
 /// 列/行 → SVG。退化输入（空行、y 缺列、全不可解析）一律空串 —— 缺图不许塌报表。
+/// `value_semantic` = y 轴列**已声明**的语义（`ColumnSpec.semantic`）。
+/// `Semantic::None` = 调用方拿不到声明，图内数值落回按列名猜（`label_kind`）。
 pub fn chart_svg(
     spec: &ChartSpec,
     columns: &[String],
     rows: &[Vec<serde_json::Value>],
+    value_semantic: Semantic,
 ) -> String {
     let Some(&y0) = spec.y.first() else { return String::new() };
     if spec.x >= columns.len() || y0 >= columns.len() || rows.is_empty() {
@@ -38,8 +43,8 @@ pub fn chart_svg(
     }
     let title = spec.title.clone().unwrap_or_else(|| columns[y0].clone());
     match spec.kind.as_str() {
-        "pie" => pie_svg(&title, &columns[y0], &points(spec, columns, rows, y0)),
-        "bar" => bar_svg(&title, &columns[y0], &points(spec, columns, rows, y0)),
+        "pie" => pie_svg(&title, &columns[y0], value_semantic, &points(spec, columns, rows, y0)),
+        "bar" => bar_svg(&title, &columns[y0], value_semantic, &points(spec, columns, rows, y0)),
         "line" => line_svg(&title, spec, columns, rows, y0),
         _ => String::new(),
     }
@@ -72,7 +77,7 @@ fn points(
 
 /// pie：非负才画（present.rs 的 all_nonneg 纪律 —— 负值切片的几何意义是错的）；
 /// 超 PIE_TOP 并入「其他」。
-fn pie_svg(title: &str, value_label: &str, pts: &[(String, f64)]) -> String {
+fn pie_svg(title: &str, value_label: &str, semantic: Semantic, pts: &[(String, f64)]) -> String {
     let mut pts: Vec<(String, f64)> = pts.iter().filter(|(_, v)| *v >= 0.0).cloned().collect();
     if pts.is_empty() {
         return String::new();
@@ -124,7 +129,7 @@ fn pie_svg(title: &str, value_label: &str, pts: &[(String, f64)]) -> String {
             PALETTE[i % PALETTE.len()],
             y,
             escape(&clip_label(label)),
-            escape(&display_number(value_label, *v)),
+            escape(&display_number_semantic(&semantic, value_label, *v)),
             v / total * 100.0
         ));
     }
@@ -138,7 +143,7 @@ fn pie_svg(title: &str, value_label: &str, pts: &[(String, f64)]) -> String {
 }
 
 /// bar：横条（中文标签长，横条不用旋转）。负值支持：零线按 [min(0,min), max] 定位。
-fn bar_svg(title: &str, value_label: &str, pts: &[(String, f64)]) -> String {
+fn bar_svg(title: &str, value_label: &str, semantic: Semantic, pts: &[(String, f64)]) -> String {
     if pts.is_empty() {
         return String::new();
     }
@@ -175,7 +180,7 @@ fn bar_svg(title: &str, value_label: &str, pts: &[(String, f64)]) -> String {
             y,
             PALETTE[i % PALETTE.len()],
             y + 13,
-            display_number(value_label, *v)
+            display_number_semantic(&semantic, value_label, *v)
         ));
     }
     // 零线（有负值时才画，全非负时它就是左边界）
@@ -383,6 +388,9 @@ fn clip_label(s: &str) -> String {
     s.chars().take(9).collect::<String>() + "…"
 }
 
+/// 【兜底，不是权威】按列名猜单位。只在**没有声明语义**时被问到
+/// （入口见 `display_number_semantic`）—— 有 `ColumnSpec.semantic` 就用声明的，
+/// 别在这张词表上继续堆词来「修」某一列。
 fn label_kind(label: &str) -> &'static str {
     let label = label.trim();
     let lower = label.to_ascii_lowercase();
@@ -420,8 +428,14 @@ fn label_kind(label: &str) -> &'static str {
     } else if ["占比", "比例", "同比", "环比", "百分比", "增幅", "降幅"]
         .iter()
         .any(|word| label.ends_with(word))
-        || label.ends_with('率')
+        // 「率」按词尾认，但排除汇率/频率/功率/倍率/速率 —— 那些不是 0-100 的百分数，
+        // 把 6.45 的汇率显示成「6.45%」就是错数。判据与 web/src/format.ts::semanticForLabel
+        // 的同名排除逐字同源，改一处必须改两处。
+        || (label.ends_with('率')
+            && !["汇率", "频率", "功率", "倍率", "速率"].iter().any(|word| label.ends_with(word)))
+        // 全角％也算（`毛利率（％）` 这类列名前端 isGrossMarginLabel 认，后端不能漏）
         || label.contains('%')
+        || label.contains('％')
         || matches!(lower.as_str(), "rate" | "ratio" | "pct" | "percent")
         || ["_rate", "_ratio", "_pct", "_percent"].iter().any(|suffix| lower.ends_with(suffix))
     {
@@ -507,8 +521,38 @@ fn money_number(v: f64) -> String {
     }
 }
 
+/// 【声明优先于猜测】列语义**已经声明**时按声明格式化；`Semantic::None`（= 没声明）
+/// 才落回 `label_kind` 词表去猜。
+///
+/// `ColumnSpec.semantic` 由 `dms_semantic::present::infer_semantic` 推断，是「这一列是什么
+/// 单位」这份知识的上游；词表是没有上游时的兜底，不是第二个事实源。
+///
+/// ⚠️ 现状（2026-08-14 查证）：`chart_svg()` 的列入参是 `&[String]` 裸列名，四个调用点
+/// （deep_api ×2、insight_api、daily_digest）都没把 `ViewSpec.columns: Vec<ColumnSpec>`
+/// 传进来 —— 图内数值因此仍走词表。本函数就是那条声明通道的落点：调用方哪天拿得到
+/// ColumnSpec，把 `&col.semantic` 传进来即可，格式化逻辑不必再动，也别再加第三份判据。
+pub(crate) fn display_number_semantic(semantic: &Semantic, label: &str, v: f64) -> String {
+    format_kind(semantic_kind(semantic).unwrap_or_else(|| label_kind(label)), v)
+}
+
+/// 已声明的语义 → 格式化口径。`None` = 这一列没声明语义，交给词表。
+fn semantic_kind(semantic: &Semantic) -> Option<&'static str> {
+    match semantic {
+        Semantic::Money => Some("money"),
+        Semantic::Count => Some("count"),
+        Semantic::Percent => Some("percent"),
+        // 编码/客户/商品/地理是非数值语义：原样上屏，不许按业务数值压成「万」。
+        Semantic::Geo | Semantic::Customer | Semantic::Goods | Semantic::Order => Some("identity"),
+        Semantic::None => None,
+    }
+}
+
 pub(crate) fn display_number(label: &str, v: f64) -> String {
-    match label_kind(label) {
+    format_kind(label_kind(label), v)
+}
+
+fn format_kind(kind: &str, v: f64) -> String {
+    match kind {
         "percent" => format!("{}%", grouped(v)),
         "money" => format!("¥{}", money_number(v)),
         "identity" => v.to_string(),
@@ -609,7 +653,7 @@ mod tests {
             kind: "bar".into(), x: 0, y: vec![1], series: None, top: None, title: None,
         };
         let rows = vec![vec![json!("<script>alert(1)</script>"), json!(100.0)]];
-        let svg = chart_svg(&spec, &cols(), &rows);
+        let svg = chart_svg(&spec, &cols(), &rows, dms_kernel::present::Semantic::None);
         assert!(!svg.contains("<script>"), "{svg}");
         assert!(svg.contains("&lt;script&gt;"), "{svg}");
     }
@@ -624,13 +668,13 @@ mod tests {
             .map(|i| vec![json!(format!("p{i}")), json!(100.0 - i as f64)])
             .chain(std::iter::once(vec![json!("负"), json!(-5.0)]))
             .collect();
-        let svg = chart_svg(&spec, &cols(), &rows);
+        let svg = chart_svg(&spec, &cols(), &rows, dms_kernel::present::Semantic::None);
         assert!(!svg.contains(">负<"), "负值切片必须丢弃：{svg}");
         assert!(svg.contains("其他"), "8 片必须并出「其他」：{svg}");
         assert!(svg.contains("100.0%") || svg.contains('%'), "{svg}");
         // 全负 = 空串（缺图不许塌报表）
         let neg = vec![vec![json!("a"), json!(-1.0)]];
-        assert!(chart_svg(&spec, &cols(), &neg).is_empty());
+        assert!(chart_svg(&spec, &cols(), &neg, dms_kernel::present::Semantic::None).is_empty());
     }
 
     /// bar：负值出零线；top 收纳并「其他」。
@@ -645,7 +689,7 @@ mod tests {
             vec![json!("c"), json!(2.0)],
             vec![json!("d"), json!(1.0)],
         ];
-        let svg = chart_svg(&spec, &cols(), &rows);
+        let svg = chart_svg(&spec, &cols(), &rows, dms_kernel::present::Semantic::None);
         assert!(svg.contains("stroke=\"#bbb\""), "有负值必须画零线：{svg}");
         assert!(svg.contains("其他"), "top=2 必须并出「其他」：{svg}");
     }
@@ -662,21 +706,21 @@ mod tests {
             vec![json!("07-01"), json!(3.0), json!("乙")],
             // 乙在 07-02 缺测：那个序列必须断开而不是连到 0
         ];
-        let svg = chart_svg(&spec, &cols(), &rows);
+        let svg = chart_svg(&spec, &cols(), &rows, dms_kernel::present::Semantic::None);
         // 甲两个点连成线；乙只有一个点 → 出点**不出线**（单点不成线，连到 0 是编造数据）
         assert_eq!(svg.matches("<polyline").count(), 1, "只有够两点的序列才出线：{svg}");
         assert_eq!(svg.matches("<circle").count(), 3, "三个实测点都在（含乙的孤立点）：{svg}");
         assert!(svg.contains("甲") && svg.contains("乙"), "{svg}");
         // 单点不成线
         let one = vec![vec![json!("07-01"), json!(1.0), json!("甲")]];
-        assert!(chart_svg(&spec, &cols(), &one).is_empty());
+        assert!(chart_svg(&spec, &cols(), &one, dms_kernel::present::Semantic::None).is_empty());
         // 无 series 列：单列单序列
         let spec2 = ChartSpec { series: None, ..spec };
         let rows2 = vec![
             vec![json!("07-01"), json!(1.0), json!("甲")],
             vec![json!("07-02"), json!(2.0), json!("甲")],
         ];
-        assert!(chart_svg(&spec2, &cols(), &rows2).contains("<polyline"));
+        assert!(chart_svg(&spec2, &cols(), &rows2, dms_kernel::present::Semantic::None).contains("<polyline"));
     }
 
     /// 退化输入一律空串：未知 kind / 空行 / 列下标越界 / 值不可解析
@@ -686,14 +730,14 @@ mod tests {
             kind: "radar".into(), x: 0, y: vec![1], series: None, top: None, title: None,
         };
         let rows = vec![vec![json!("a"), json!(1.0)]];
-        assert!(chart_svg(&spec, &cols(), &rows).is_empty(), "radar 不在 v1");
+        assert!(chart_svg(&spec, &cols(), &rows, dms_kernel::present::Semantic::None).is_empty(), "radar 不在 v1");
         let spec = ChartSpec { kind: "bar".into(), ..spec };
-        assert!(chart_svg(&spec, &cols(), &[]).is_empty());
+        assert!(chart_svg(&spec, &cols(), &[], dms_kernel::present::Semantic::None).is_empty());
         let spec = ChartSpec { y: vec![9], ..spec };
-        assert!(chart_svg(&spec, &cols(), &rows).is_empty());
+        assert!(chart_svg(&spec, &cols(), &rows, dms_kernel::present::Semantic::None).is_empty());
         let bad = vec![vec![json!("a"), json!("不是数")]];
         let spec = ChartSpec { y: vec![1], ..spec };
-        assert!(chart_svg(&spec, &cols(), &bad).is_empty());
+        assert!(chart_svg(&spec, &cols(), &bad, dms_kernel::present::Semantic::None).is_empty());
     }
 
     /// 占位符 survives md_to_html（inline 不动它）；渲染失败必须给用户空态，不能暴露内部标记。
@@ -710,6 +754,19 @@ mod tests {
 
     #[test]
     fn user_numbers_keep_metric_and_identity_semantics() {
+        // 【声明优先于猜测】同一个列名，声明了语义就按声明走，词表说了不算。
+        // 由来：这份「列是什么单位」的知识散在四处（本词表 / format.ts / Metric::unit()
+        // / 注册表），权威源存在却没人读；`daily_digest` 更是靠传假标签「金额」来操纵词表。
+        assert_eq!(display_number_semantic(&Semantic::Count, "销售额", 10_000.0), "1.00万");
+        assert_eq!(display_number_semantic(&Semantic::Money, "随便什么列名", 10_000.0), "¥1.00万");
+        assert_eq!(display_number_semantic(&Semantic::Order, "销售额", 10_000.0), display_number("单号", 10_000.0));
+        // 没声明才落回词表（`Semantic::None` = 上游没给）
+        assert_eq!(display_number_semantic(&Semantic::None, "销售额", 10_000.0), "¥1.00万");
+        // 「率」的物理/金融比率不许被当百分数（6.45 的汇率显示成 6.45% 就是错数）
+        assert_eq!(label_kind("毛利率"), "percent");
+        for physical in ["汇率", "频率", "功率", "倍率", "速率"] {
+            assert_ne!(label_kind(physical), "percent", "{physical} 不是 0-100 的百分数");
+        }
         assert_eq!(display_number("销售额", 12_345_678.9), "¥1234.57万");
         assert_eq!(display_number("客户销售额", 10_000.0), "¥1.00万");
         assert_eq!(display_number("商品销量", 10_000.0), "1.00万");
@@ -732,5 +789,47 @@ mod tests {
         // 2026-08-11 裁决：金额不足一万也收紧到最多两位小数；非金额语义仍最多三位
         assert_eq!(display_number("销售额", 1_234.567), "¥1,234.57");
         assert_eq!(display_number("商品销量", 1_234.567), "1,234.567");
+    }
+
+    /// 【声明优先于猜测】同一个列名，声明了语义就按声明走，没声明才落回词表。
+    /// 这条钉死的是纪律本身：谁把 `display_number_semantic` 改回「先问词表」谁就红。
+    #[test]
+    fn declared_semantic_wins_over_label_guess() {
+        // 「退货额」词表猜成金额（词尾「额」）
+        assert_eq!(display_number("退货额", 12_345.0), "¥1.23万");
+        // 同一个列名，声明 Count → 按计数走，不加 ¥
+        assert_eq!(display_number_semantic(&Semantic::Count, "退货额", 12_345.0), "1.23万");
+        // 声明 Percent → 加 %，哪怕词表说这是金额
+        assert_eq!(display_number_semantic(&Semantic::Percent, "退货额", 12.34), "12.34%");
+        // 声明 Money → 加 ¥，哪怕词表说这是计数
+        assert_eq!(display_number_semantic(&Semantic::Money, "订单数", 12_345.0), "¥1.23万");
+        // 非数值语义（编码/地理/客户/商品）原样上屏，不压成「万」
+        assert_eq!(display_number_semantic(&Semantic::Geo, "销售额", 430_000.0), "430000");
+        assert_eq!(display_number_semantic(&Semantic::Order, "销售额", 202_608_060_001.0), "202608060001");
+        // Semantic::None = 没声明 → 与词表路径逐字同结果
+        for label in ["退货额", "订单数", "毛利率", "状态码"] {
+            assert_eq!(
+                display_number_semantic(&Semantic::None, label, 12_345.0),
+                display_number(label, 12_345.0),
+                "{label}：没声明时必须落回词表"
+            );
+        }
+    }
+
+    /// 词表与 web/src/format.ts::semanticForLabel 的两处对齐（改一处必须改两处）。
+    #[test]
+    fn label_guess_matches_web_percent_rules() {
+        // 物理/金融比率不是百分数：6.45 的汇率显示成「6.45%」是错数
+        assert_eq!(display_number("汇率", 6.45), "6.45");
+        assert_eq!(display_number("频率", 6.45), "6.45");
+        assert_eq!(display_number("功率", 6.45), "6.45");
+        assert_eq!(display_number("倍率", 6.45), "6.45");
+        assert_eq!(display_number("速率", 6.45), "6.45");
+        // 真·百分比列不受影响
+        assert_eq!(display_number("毛利率", 19.6), "19.6%");
+        assert_eq!(display_number("费用率", 19.6), "19.6%");
+        // 全角括注百分号也认（前端 isGrossMarginLabel 认的变体，后端不能漏）
+        assert_eq!(display_number("毛利率（％）", 19.6), "19.6%");
+        assert_eq!(display_number("毛利率（%）", 19.6), "19.6%");
     }
 }

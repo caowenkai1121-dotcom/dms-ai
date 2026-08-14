@@ -728,7 +728,13 @@ pub async fn report(
     // 图表回声 → SVG（退化规格 = 空串 = 占位符原样留，报表不塌）；先渲染再替换，
     // 顺序反了 SVG 会被 md_to_html 当文本转义掉。
     let svgs: Vec<String> =
-        req.charts.iter().map(|c| crate::chart_svg::chart_svg(c, &req.columns, &req.rows)).collect();
+        // 请求体只带裸列名（`Semantic` 没上过 wire）→ 语义未声明，落回按列名猜
+        req.charts
+            .iter()
+            .map(|c| {
+                crate::chart_svg::chart_svg(c, &req.columns, &req.rows, dms_kernel::present::Semantic::None)
+            })
+            .collect();
     let html_body = crate::chart_svg::fill_charts(&crate::artifact_api::md_to_html(&md), &svgs);
     let html = crate::artifact_api::page_shell(&title, &html_body);
     // conv_id 落库用解析校验过的主键（`"012"` 这类写法不该原样进库）

@@ -52,6 +52,14 @@ export function isGrossMarginLabel(label: string): boolean {
   return clean.endsWith('毛利率') || clean.endsWith('毛利占比')
 }
 
+/** 列名 → 语义的**猜测**（兜底）。
+ *
+ *  🔴 声明优先：后端 `ColumnSpec.semantic`（`dms_semantic::present::infer_semantic` 推断）
+ *  随 view 一起下发，拿得到就用它，别在这里堆词去「修」某一列。
+ *  后端同族兜底是 `crates/server/src/chart_svg.rs::label_kind`：
+ *  「率」的物理/金融比率排除（汇率/频率/功率/倍率/速率）与 money/count 词表两边逐字同源，
+ *  改一处必须改两处。仍未对齐的是标识列判据 —— 后端 label_kind 的 identity 分支还多认
+ *  一批中英文词尾（`_at`/`日期`/`品牌`…），这里只认编码族；对齐需要两边同时改，暂留此注。 */
 export function semanticForLabel(label: string): Semantic {
   // 标识列优先于指标词：例如“税率编码”“状态码”必须原样显示，不能被当百分比。
   if (/单号|编号|编码|代码|条码|状态(?:码)?$|区划码|身份证|手机号|电话|批次号|ID$/i.test(label)) return 'order'
@@ -63,7 +71,7 @@ export function semanticForLabel(label: string): Semantic {
   // 不许加 % —— 交给后面的 money/count 词表或 none 原样。
   if (/同比|环比/.test(label) && !/(?:额|量|数)$/.test(label)) return 'percent'
   if (/销售额|金额|费用|余额|单价|客单价|成本|利润|收入|支出|货值|资产|坪效|人效|营收|售价|现价/.test(label)) return 'money'
-  if (/数量|销量|订单数|订单量|单量|笔数|客户数|门店数|商品数|件数|箱数|袋数|台数|人数|次数|库存(?:数|量)?|总数|总量|合计数/.test(label)) return 'count'
+  if (/数量|销量|订单数|订单量|单量|笔数|客户数|门店数|商品数|件数|箱数|袋数|台数|人数|次数|行数|库存(?:数|量)?|总数|总量|合计数/.test(label)) return 'count'
   return 'none'
 }
 

@@ -2058,6 +2058,57 @@ async fn ask_gate(
     let refs: Vec<String> = req.refs.clone().unwrap_or_default();
     Ok(AskGate { p, prev, refs, history })
 }
+/// 两臂产物 → wire 形状。**`/api/ask` 与 `/api/ask/stream` 唯一的 Data/Knowledge/Unknown 出口。**
+///
+/// 🔴 2026-08-14：此前这里是 `match route` 的三个分支，`Knowledge` 直接调 `kb_answer`、
+/// `Unknown` 调 `unknown_route_kb_fallback` —— **完全绕过 agent 的两臂编排**。
+/// 于是「线下-浏阳品元商贸有限公司」在 web 上仍然只问知识库、只答「知识库里没有这家
+/// 公司的规定」，而这家公司在业务库里有客户卡。CLI 侧修好了、web 侧照旧，
+/// 又是一处「两条链路对同一问句行为相反」。
+///
+/// 形状分档（与 `hybrid_payload` 同一套，前端零改动）：
+/// - 问数半有实质 → 问数 `AskResult` 原样序列化，资料半挂 `kb` 键（`AskResult.kb`
+///   自带 `skip_serializing_if`，没有资料半时整键不上线）。
+/// - 只有资料半 → 整份 `Answer`（`kind:"text"` + `citations`）—— 角标要点得开。
+/// - 两边都没有 → 澄清卡。
+async fn ask_arms_payload(
+    st: &AppState,
+    req: &AskReq,
+    gate: &AskGate,
+    prepared: &PreparedAsk,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let r = ask_data_run(
+        st,
+        &gate.p,
+        req.ds.as_deref(),
+        req.conv_id.map(|c| c.to_string()).as_deref(),
+        if req.mode.as_deref() == Some("deep") { st.sc_samples.max(3) } else { st.sc_samples },
+        prepared,
+        true,
+    )
+    .await?;
+    // 纯资料答案：`route == "knowledge"` 时问数半没有实质内容，`kb` 里是原件
+    if r.route == "knowledge" {
+        if let Some(a) = &r.kb {
+            let mut payload =
+                serde_json::to_value(a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+            payload["intent_summary"] = knowledge_summary_value(prepared, a);
+            if prepared.question.effective_question != req.question {
+                payload["resolved_question"] =
+                    serde_json::json!(prepared.question.effective_question);
+            }
+            return Ok(payload);
+        }
+        // 两臂都空：澄清卡（`hybrid::fuse` 只在两边都没实质时走到这里）
+        return Ok(serde_json::to_value(prepared.question.clarification_result())
+            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"));
+    }
+    let mut payload =
+        serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+    insight_api::attach_analysis_receipt(&mut payload, &req.question, &gate.p);
+    Ok(payload)
+}
+
 
 /// `/api/ask` 与 `/api/ask/stream` 共用的问数分支：`crate::ask` → 错误映射 → payload。
 /// 「无权访问数据源」是权限拒绝 → 403，其余 422（与迁移前逐字一致）。
@@ -2080,6 +2131,7 @@ async fn ask_data_payload(
             st.sc_samples
         },
         prepared,
+        true,
     )
     .await?;
     let mut payload =
@@ -2099,6 +2151,9 @@ async fn ask_data_run(
     conv_id: Option<&str>,
     sc_samples: usize,
     prepared: &PreparedAsk,
+    // `false` = 只跑问数臂。流式 Knowledge 分支拿它**先探一次数据**：探到实质就整轮走
+    // 同步双臂答案，探不到才把知识库流式推给前端（见 `api_ask_stream` 的 Knowledge 臂）。
+    dual_arms: bool,
 ) -> Result<dms_agent::AskResult, (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
     let (r, _log) = ask_prepared(
@@ -2115,7 +2170,7 @@ async fn ask_data_run(
         // 「query_log 当年没有 conv_id，从它拿不回本会话上一轮」
         conv_id,
         sc_samples,
-        true,
+        dual_arms,
     )
     .await;
     // 服务侧 fire-and-forget：`_log` 句柄直接丢弃，HTTP 主链路一个 `.await` 都不多
@@ -2592,57 +2647,9 @@ async fn api_ask(
         ask_persist(&st, req.conv_id, &req.question, &payload).await;
         return Ok(Json(payload));
     }
-    let payload = match route {
-        IntentRoute::Data => ask_data_payload(&st, &req, &gate, &prepared).await?,
-        // `Answer` 带 `kind:"text"`，前端 K2 的 `KbAnswer` 分支按它分派；`route` 是 `"knowledge"`
-        IntentRoute::Knowledge => {
-            let a = kb_answer(
-                &st,
-                &gate.p,
-                req.space_id.as_deref(),
-                &prepared.question.effective_question,
-            )
-            .await
-            .map_err(|_| {
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({ "error": "暂时无法完成知识检索，请稍后重试" })),
-                )
-            })?;
-            let mut payload =
-                serde_json::to_value(&a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
-            payload["intent_summary"] = knowledge_summary_value(&prepared, &a);
-            if prepared.question.effective_question != req.question {
-                payload["resolved_question"] =
-                    serde_json::json!(prepared.question.effective_question);
-            }
-            payload
-        }
-        IntentRoute::Hybrid | IntentRoute::Unknown => {
-            // 先问一次知识库（见 `unknown_route_kb_fallback` 的红字）；查到才顶替澄清卡
-            match unknown_route_kb_fallback(
-                &st,
-                &gate.p,
-                req.space_id.as_deref(),
-                &prepared.question.effective_question,
-            )
-            .await
-            {
-                Some(a) => {
-                    let mut payload = serde_json::to_value(&a)
-                        .expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
-                    payload["intent_summary"] = knowledge_summary_value(&prepared, &a);
-                    if prepared.question.effective_question != req.question {
-                        payload["resolved_question"] =
-                            serde_json::json!(prepared.question.effective_question);
-                    }
-                    payload
-                }
-                None => serde_json::to_value(prepared.question.clarification_result())
-                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
-            }
-        }
-    };
+    // Data / Knowledge / Unknown 三档共用两臂编排：`route` 只决定问数臂开不开自由 SQL
+    // 与谁排前面，不再决定「谁不许跑」（见 `ask_arms_payload` 的红字）。
+    let payload = ask_arms_payload(&st, &req, &gate, &prepared).await?;
     ask_persist(&st, req.conv_id, &req.question, &payload).await;
     Ok(Json(payload))
 }
@@ -2733,6 +2740,42 @@ async fn api_ask_stream(
             Ok(Json(payload).into_response())
         }
         IntentRoute::Knowledge => {
+            // 🔴 **先探一次问数臂**（2026-08-14）。此前这条分支直接开 KB 流，
+            // 完全绕过两臂编排 —— 业主实测「线下-浏阳品元商贸有限公司」在 web 上就是
+            // 只答「知识库里没有这家公司的规定」，而这家公司在业务库里有客户卡。
+            //
+            // 探的是**确定性车道**（Knowledge 档不开自由 SQL，只有实体卡/单据点查这些
+            // 代码写死的成员会接单），探到实质就整轮走同步双臂答案；探不到才把知识库
+            // 流式推给前端 —— 纯资料问句的流式体验一点没变。
+            let probe = ask_data_run(
+                &st,
+                &gate.p,
+                req.ds.as_deref(),
+                req.conv_id.map(|c| c.to_string()).as_deref(),
+                st.sc_samples,
+                &prepared,
+                false,
+            )
+            .await
+            .ok()
+            .filter(dms_agent::hybrid::data_has_substance);
+            if let Some(mut r) = probe {
+                // 这一档已经不是纯资料问句了，流式意义不大：资料半同步取一次挂 `kb` 键，
+                // wire 与混合问句同形（前端 `t.result?.kb` 分支现成）。
+                r.kb = kb_answer(
+                    &st,
+                    &gate.p,
+                    req.space_id.as_deref(),
+                    &prepared.question.effective_question,
+                )
+                .await
+                .ok();
+                let mut payload = serde_json::to_value(&r)
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+                insight_api::attach_analysis_receipt(&mut payload, &req.question, &gate.p);
+                ask_persist(&st, req.conv_id, &req.question, &payload).await;
+                return Ok(Json(payload).into_response());
+            }
             // `Principal` → `Viewer` 与同步分支同一个映射（`kb_answer` 内部也是它）
             let v = dms_agent::answerers::knowledge::viewer(&gate.p);
             let mut extra = serde_json::Map::new();
@@ -2768,25 +2811,10 @@ async fn api_ask_stream(
             Ok(kb_api::sse_response(rx, extra).into_response())
         }
         IntentRoute::Hybrid | IntentRoute::Unknown => {
-            // 与 `/api/ask` 同一条兜底：两端行为必须一致（流式与非流式对同一句话
-            // 给出不同答案，是本仓反复付过账的那类分叉）
-            let payload = match unknown_route_kb_fallback(
-                &st,
-                &gate.p,
-                req.space_id.as_deref(),
-                &prepared.question.effective_question,
-            )
-            .await
-            {
-                Some(a) => {
-                    let mut payload = serde_json::to_value(&a)
-                        .expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
-                    payload["intent_summary"] = knowledge_summary_value(&prepared, &a);
-                    payload
-                }
-                None => serde_json::to_value(prepared.question.clarification_result())
-                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
-            };
+            // 与同步分支同一条：两臂并行，`route` 只决定问数臂开不开自由 SQL。
+            // 此前这里是 `unknown_route_kb_fallback` —— 只问知识库，查到就顶替澄清卡，
+            // 查不到就出澄清卡；确定性问数成员（实体卡、单据点查）一个都没跑过。
+            let payload = ask_arms_payload(&st, &req, &gate, &prepared).await?;
             ask_persist(&st, req.conv_id, &req.question, &payload).await;
             Ok(Json(payload).into_response())
         }
@@ -4100,8 +4128,12 @@ mod tests {
                     // 按**字符**取窗口：`&src[at..at+window]` 会切在中文注释的 UTF-8 中间
                     // 直接 panic（第一版就是这么红的，且报的是切片越界不是判据不满足）。
                     let body: String = src[at..].chars().take(window).collect();
+                    // 两个合格出口：`unknown_route_kb_fallback(` 只问知识库；
+                    // `ask_arms_payload(` 走两臂并行（问数 + 知识库），更强的同一条不变量。
+                    // 2026-08-14 起 `/api/ask` 与 `/api/ask/stream` 的 Data/Knowledge/Unknown
+                    // 三档统一走后者 —— 那正是「浏阳品元商贸」在 web 上拿不到客户卡的修法。
                     assert!(
-                        body.contains("unknown_route_kb_fallback("),
+                        body.contains("unknown_route_kb_fallback(") || body.contains("ask_arms_payload("),
                         "{name} 有一条出卡路径没问过知识库就出卡了（形状 `{shape}`）：{body}"
                     );
                 }

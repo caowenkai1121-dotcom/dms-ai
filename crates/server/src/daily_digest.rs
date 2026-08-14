@@ -286,7 +286,7 @@ async fn generate(st: &AppState, today: NaiveDate) -> anyhow::Result<()> {
             row("昨日毛利率", percent_opt(kpis_y.gross_margin)),
             row("昨日毛利率环比", change(kpis_y.gross_margin, kpis_prev_day.gross_margin, true)),
             row("昨日毛利率同比", change(kpis_y.gross_margin, kpis_yoy_day.gross_margin, true)),
-            row("昨日订单数", crate::chart_svg::display_number("订单数", oy)),
+            row("昨日订单数", crate::chart_svg::display_number_semantic(&COUNT, "", oy)),
             row("昨日订单数环比", change(Some(oy), Some(opd), false)),
             row("昨日订单数同比", change(Some(oy), Some(oyd), false)),
             row("当月累计销售额（报告日所在月）", money_opt(kpis_mtd.sales_amount)),
@@ -405,8 +405,14 @@ async fn top(
     Ok(st.mysql.raw_dates_all(sql, &[a, b]).await?)
 }
 
+/// 日报的口径是**服务端自己定的**，不必让 `chart_svg` 去猜列名：直接声明语义。
+/// （原先传的是假标签 `display_number("金额", v)` —— 那是拿一个不存在的列名去操纵词表，
+/// 调用点一旦跟着真列名走就会静默变格式。声明式没有这个坑。）
+const MONEY: dms_kernel::present::Semantic = dms_kernel::present::Semantic::Money;
+const COUNT: dms_kernel::present::Semantic = dms_kernel::present::Semantic::Count;
+
 fn money(v: f64) -> String {
-    crate::chart_svg::display_number("金额", v)
+    crate::chart_svg::display_number_semantic(&MONEY, "", v)
 }
 
 fn money_opt(v: Option<f64>) -> String {
@@ -414,7 +420,7 @@ fn money_opt(v: Option<f64>) -> String {
 }
 
 fn number_opt(v: Option<f64>) -> String {
-    v.map(|n| crate::chart_svg::display_number("销量", n))
+    v.map(|n| crate::chart_svg::display_number_semantic(&COUNT, "", n))
         .unwrap_or_else(|| "暂无".to_string())
 }
 
@@ -494,7 +500,7 @@ fn report_md(d: &Digest<'_>) -> String {
         gm = percent_opt(d.kpis_y.gross_margin),
         gm_mom = change(d.kpis_y.gross_margin, d.kpis_prev_day.gross_margin, true),
         gm_yoy = change(d.kpis_y.gross_margin, d.kpis_yoy_day.gross_margin, true),
-        od = crate::chart_svg::display_number("订单数", oy),
+        od = crate::chart_svg::display_number_semantic(&COUNT, "", oy),
         od_mom = change(Some(oy), Some(opd), false),
         od_yoy = change(Some(oy), Some(oyd), false),
         mtd = money_opt(d.kpis_mtd.sales_amount),
@@ -565,7 +571,7 @@ fn charts(d: &Digest<'_>) -> Vec<String> {
         to_rows(d.top_region),
         to_rows(d.top_customer),
     ];
-    specs.iter().zip(&data).map(|(sp, rows)| crate::chart_svg::chart_svg(sp, &cols(), rows)).collect()
+    specs.iter().zip(&data).map(|(sp, rows)| crate::chart_svg::chart_svg(sp, &cols(), rows, dms_kernel::present::Semantic::None)).collect()
 }
 
 #[cfg(test)]
