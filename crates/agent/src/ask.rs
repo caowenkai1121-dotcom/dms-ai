@@ -301,10 +301,18 @@ fn plan(
 /// 🔴 实体（`entity_mentions`）与地区（`regions`）**刻意不算**：政策类问句天生带它们
 /// （「线下设备申请政策」「湖南的报销制度」），拿它们判 Data 就是把资料问句误伤成问数 ——
 /// 这正是「线下设备申请政策」被要求「补充明确的对象、指标和时间」的成因之一。
+/// 🔴 **根级的时间槽单独不算「可度量」**（2026-08-15 生产实测）：
+/// 「市场费用的报销政策是什么」→ 资料答案（对）；
+/// 「**今年**市场费用的报销政策是什么」→ direct-agg 一行金额、资料半整个没上（错）。
+/// 差别只有一个「今年」—— 根级的时间词往往只是在说**哪一版**政策，不是数据诉求；
+/// 真正的数据诉求是指标 / 分组 / 比较。
+///
+/// 子任务里**照旧算**：那一档模型已经明确把这半标成 `mode: data`
+/// （「查一下最近的设备订单，并且最近的线下设备政策」的数据半只有一个「最近」），
+/// 时间槽是它「这半是数据」的声明的一部分，剥掉就等于把真混合问句压成单路、丢掉数据半。
 fn has_measurable_slots(attempt: &crate::intent::IntentAttempt) -> bool {
     attempt.ready().is_some_and(|i| {
         let root = !i.metrics.is_empty()
-            || i.time.is_some()
             || !i.breakdowns.is_empty()
             || !i.comparisons.is_empty();
         root || i.subgoals.iter().any(|g| {
@@ -3474,6 +3482,28 @@ mod tests {
         assert_eq!(plan.route, crate::intent::IntentRoute::Data);
         assert!(!plan.deterministic);
         assert_eq!(plan.reason, "contract");
+
+        // 🔴 根级只有时间槽 → 仍是资料问句（2026-08-15 生产实测：加一个「今年」
+        // 就把政策问句翻成 direct-agg 一行金额，资料半整个没上）。
+        // 合同刻意写 `mode=data`：那正是当时生产给出的形状，也让这条断言有区分度 ——
+        // 时间槽若算「可度量」，R2 就被跳过、R3 听合同判 Data。
+        let q = "今年市场费用的报销政策是什么";
+        let with_time = crate::intent::IntentAttempt::validated(
+            crate::intent::IntentV1 {
+                version: 2,
+                mode: crate::intent::IntentMode::Data,
+                time: Some(crate::intent::TimeSlot {
+                    surface: "今年".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            q,
+        );
+        assert!(with_time.is_ready(), "合同本身要成立，否则这条断言测的是别的东西");
+        let plan = decide(q, &with_time, None);
+        assert_eq!(plan.route, crate::intent::IntentRoute::Knowledge, "时间词不是数据诉求");
+        assert_eq!(plan.reason, "doc-topic");
     }
 
     /// R2 不许压掉 Hybrid：模型明确说「这句里有两件事」时，把它压成单路就是丢掉数据半。
