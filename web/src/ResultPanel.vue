@@ -264,7 +264,8 @@ function deltaDetail(kpi: Kpi): string {
 
 function chartTitle(block: Block, view = props.result.view): string {
   // 模型编排的标题优先：它是看着真实数据起的，比「指标按维度对比」这种拼装句贴题。
-  // 后端 `view_compose::safe_title` 已经保证它不含数字（标题里的数字＝未经核验的断言）。
+  // 后端 `view_compose::safe_title` 保证**模型写的**那半不含数字（标题里的数字＝未经核验的断言）；
+  // 唯一带数字的是代码自己补的「（前 N 行）」截断后缀（`honest_under_truncation`），N 由行数算出。
   const composed = block.title?.trim()
   if (composed) return composed
   const x = (block.x === undefined ? undefined : view?.columns[block.x]?.name) ?? '维度'
