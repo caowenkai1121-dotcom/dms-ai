@@ -315,7 +315,11 @@ fn has_measurable_slots(attempt: &crate::intent::IntentAttempt) -> bool {
         let root = !i.metrics.is_empty()
             || !i.breakdowns.is_empty()
             || !i.comparisons.is_empty();
-        root || i.subgoals.iter().any(|g| {
+        // 只看**模型标成 data 的**子任务：时间槽在这里算数，靠的正是那个 `mode: data`
+        // 声明。知识类子任务上的时间槽（「今年…的报销政策」被劈成两个 knowledge 子任务、
+        // 其中一个带「今年」）不是数据诉求 —— 不过滤就等于根级那条判据白改
+        // （2026-08-15 生产实测：改完根级仍走 direct-agg，日志 budget=8s 说明 R2 没触发）。
+        root || i.subgoals.iter().filter(|g| g.mode == crate::intent::IntentMode::Data).any(|g| {
             !g.metrics.is_empty()
                 || g.time.is_some()
                 || !g.breakdowns.is_empty()
@@ -3504,6 +3508,38 @@ mod tests {
         let plan = decide(q, &with_time, None);
         assert_eq!(plan.route, crate::intent::IntentRoute::Knowledge, "时间词不是数据诉求");
         assert_eq!(plan.reason, "doc-topic");
+
+        // 同一句被劈成两个 **knowledge** 子任务、其中一个带时间槽：仍是资料问句。
+        // （生产实测形状：合同 mode=knowledge、slots 只有 entity+time，而改完根级判据
+        //   仍走 direct-agg —— 因为子任务分支不分 mode，把知识半的时间槽也算了。）
+        let kb_subgoals = crate::intent::IntentAttempt::validated(
+            crate::intent::IntentV1 {
+                version: 2,
+                mode: crate::intent::IntentMode::Knowledge,
+                subgoals: vec![
+                    crate::intent::IntentSubgoal {
+                        mode: crate::intent::IntentMode::Knowledge,
+                        surface: "今年市场费用".into(),
+                        time: Some(crate::intent::TimeSlot {
+                            surface: "今年".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    crate::intent::IntentSubgoal {
+                        mode: crate::intent::IntentMode::Knowledge,
+                        surface: "报销政策是什么".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            q,
+        );
+        assert!(kb_subgoals.is_ready(), "合同本身要成立");
+        let plan = decide(q, &kb_subgoals, None);
+        assert_eq!(plan.route, crate::intent::IntentRoute::Knowledge);
+        assert_eq!(plan.reason, "doc-topic", "知识类子任务上的时间槽不是数据诉求");
     }
 
     /// R2 不许压掉 Hybrid：模型明确说「这句里有两件事」时，把它压成单路就是丢掉数据半。
