@@ -544,6 +544,10 @@ pub(crate) async fn ask_data_arm(
                 r = nt;
             }
             crate::localize::localize_result(&cx, &mut r).await;
+            // 呈现编排：确定性决策树**退成裸表格**时，让模型按真实数据决定该出什么块。
+            // 放在 localize 之后 —— 模型看到的列名与码值就是用户看到的那一份。
+            // 数值一律在 `view_compose` 里由 Rust 从原始行算，模型只选列与聚合。
+            crate::view_compose::refine(&cx, &mut r).await;
             // ── 【AI 重新理解层】「不可计算」卡与「反问」卡触发；合同能答的问句一行行为不变 ──
             // 反问卡纳入触发（2026-08-12 业主裁决：意图不明先归一再重试，不许上来就反问）——
             // 破坏性问句（红线）除外：它的反问是刻意拦截，放行改写等于帮它换皮。

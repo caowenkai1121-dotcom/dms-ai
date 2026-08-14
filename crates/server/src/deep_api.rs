@@ -4980,7 +4980,7 @@ async fn compose_inner(
     attach_report_checks(&execution_question, &mut primary, &sections);
     // 主结果图（视图 Chart 块回声 → SVG，放在 KPI 卡行下方）
     let kpi_chart: Option<crate::chart_svg::ChartSpec> = primary.view.blocks.iter().find_map(|b| {
-        if let dms_kernel::present::Block::Chart { kind, x, y, top, series } = b {
+        if let dms_kernel::present::Block::Chart { kind, x, y, top, series, .. } = b {
             let kind = match kind {
                 dms_kernel::present::ChartKind::Bar => "bar",
                 dms_kernel::present::ChartKind::Line => "line",

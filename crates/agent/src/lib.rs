@@ -38,6 +38,7 @@ pub mod review;
 pub mod run;
 pub mod source;
 pub mod triage;
+pub mod view_compose;
 
 // 路径一次性钉死（同 kernel/connector/policy 的做法）：同一个符号只有一条 use 路径。
 pub use answerers::{Answerer, ROUTER_ORDER, ROUTE_LABELS};

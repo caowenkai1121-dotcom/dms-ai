@@ -24,6 +24,9 @@ interface Block {
   /** 多序列切分列下标（后端 `skip_serializing_if`，单序列时整键不上线 → 可选）。
    *  不往下传 = 「时间 + 1 类别 + 1 指标」继续被画成一条混轴折线。 */
   series?: number | null
+  /** 模型编排层给的图表标题（后端 `skip_serializing_if`，确定性决策树恒不上线）。
+   *  有就用它，没有才落回 `chartTitle` 按列名拼出来的那句。 */
+  title?: string | null
 }
 interface ViewSpec { columns: ColSpec[]; blocks: Block[]; interact?: { drill?: string[] }; insight?: string }
 interface SupplementalResult {
@@ -260,6 +263,10 @@ function deltaDetail(kpi: Kpi): string {
 }
 
 function chartTitle(block: Block, view = props.result.view): string {
+  // 模型编排的标题优先：它是看着真实数据起的，比「指标按维度对比」这种拼装句贴题。
+  // 后端 `view_compose::safe_title` 已经保证它不含数字（标题里的数字＝未经核验的断言）。
+  const composed = block.title?.trim()
+  if (composed) return composed
   const x = (block.x === undefined ? undefined : view?.columns[block.x]?.name) ?? '维度'
   const metrics = (block.y ?? []).map((i) => view?.columns[i]?.name).filter(Boolean).join('、') || '指标'
   if (block.kind === 'line') return `${metrics}趋势`

@@ -450,7 +450,7 @@ fn trend(rows: &[Vec<Value>], ix: &RoleIdx) -> Option<Vec<Block>> {
     // 那要 类别×指标 的双层序列 + 双值轴，等它真出现在回归里再做。
     let series = (ix.cat.len() == 1 && ix.metric.len() == 1).then(|| ix.cat[0]);
     Some(vec![
-        Block::Chart { kind: ChartKind::Line, x: ix.time[0], y: ix.metric.clone(), top: None, series },
+        Block::Chart { kind: ChartKind::Line, x: ix.time[0], y: ix.metric.clone(), top: None, series, title: None },
         Block::Table,
     ])
 }
@@ -470,9 +470,9 @@ fn one_cat_one_metric(specs: &[ColumnSpec], rows: &[Vec<Value>], ix: &RoleIdx) -
     let all_nonneg = rows.iter().all(|r| cell_f64(&r[y]).map(|v| v >= 0.0).unwrap_or(true));
     let is_pct = matches!(specs[y].semantic, Semantic::Percent);
     let chart = if rows.len() <= PIE_MAX && all_nonneg && !is_pct {
-        Block::Chart { kind: ChartKind::Pie, x, y: vec![y], top: None, series: None }
+        Block::Chart { kind: ChartKind::Pie, x, y: vec![y], top: None, series: None, title: None }
     } else {
-        Block::Chart { kind: ChartKind::Bar, x, y: vec![y], top: bar_top(rows.len()), series: None }
+        Block::Chart { kind: ChartKind::Bar, x, y: vec![y], top: bar_top(rows.len()), series: None, title: None }
     };
     Some(vec![chart, Block::Table])
 }
@@ -485,7 +485,7 @@ fn grouped_bar(rows: &[Vec<Value>], ix: &RoleIdx) -> Option<Vec<Block>> {
     }
     Some(vec![
         // 多指标本身就是多序列（`y` 有几列就几根柱），不需要 `series` 再切一层
-        Block::Chart { kind: ChartKind::Bar, x: ix.cat[0], y: ix.metric.clone(), top: bar_top(rows.len()), series: None },
+        Block::Chart { kind: ChartKind::Bar, x: ix.cat[0], y: ix.metric.clone(), top: bar_top(rows.len()), series: None, title: None },
         Block::Table,
     ])
 }

@@ -70,6 +70,12 @@ pub enum Block {
         /// （serde 形状是前端 + `tools/regression.py` 的契约，只许加 `Option`）。
         #[serde(skip_serializing_if = "Option::is_none")]
         series: Option<usize>,
+        /// 图表标题（模型编排层给；确定性决策树恒 `None`）。
+        ///
+        /// `None` ⇒ 整键不上线，旧 JSON 逐字节不变 —— serde 形状是前端与
+        /// `tools/regression.py` 的契约，只许加 `Option`。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     /// 表格（默认兜底）
     Table,
@@ -136,8 +142,11 @@ mod tests {
         let v = ViewSpec {
             columns: vec![ColumnSpec { name: "c".into(), role: Role::Metric, semantic: Semantic::None }],
             blocks: vec![
-                Block::Chart { kind: ChartKind::Pie, x: 0, y: vec![1], top: None, series: None },
-                Block::Chart { kind: ChartKind::Line, x: 0, y: vec![2], top: None, series: Some(1) },
+                Block::Chart { kind: ChartKind::Pie, x: 0, y: vec![1], top: None, series: None, title: None },
+                Block::Chart {
+                    kind: ChartKind::Line, x: 0, y: vec![2], top: None, series: Some(1),
+                    title: Some("月度趋势".into()),
+                },
                 Block::Table,
             ],
             interact: Interact::default(),
@@ -151,7 +160,9 @@ mod tests {
         assert!(j["blocks"][0].get("top").is_none(), "top=None 不上线");
         // series=None 整键不上线（旧 JSON 逐字节不变）；Some 时是**列下标**，不是列名
         assert!(j["blocks"][0].get("series").is_none(), "series=None 不上线");
+        assert!(j["blocks"][0].get("title").is_none(), "title=None 不上线（旧 JSON 逐字节不变）");
         assert_eq!(j["blocks"][1]["series"], 1);
+        assert_eq!(j["blocks"][1]["title"], "月度趋势");
         assert_eq!(j["blocks"][2]["type"], "table");
         assert!(j.get("interact").is_none(), "空下钻不上线");
         assert!(j.get("insight").is_none());
