@@ -203,7 +203,7 @@ impl ResolvedIntent {
         if !route_is_owned {
             return None;
         }
-        let projected = self.0.project(question, route).ground(question)?;
+        let projected = self.0.project(question, route)?.ground(question)?;
         (projected.route() == route).then_some(projected)
     }
 }
@@ -356,7 +356,19 @@ impl IntentV1 {
     /// 只有已 grounding 的 typed subgoal，或可执行槽位，才能成为路由证据。
     /// 单独的模型 `mode` 不足以把一个无槽位问句强行分到 Data。
     pub fn route(&self) -> IntentRoute {
-        if self.mode == IntentMode::Unknown || !self.ambiguities.is_empty() {
+        // 🔴 `ambiguities` **不参与**选路（2026-08-14 生产直打定位）：
+        // 「现在库存量是多少」的回包是完美的（mode=data、metrics=["库存量"]、time.surface="现在"），
+        // 只多了一句诚实的 `未指定具体的商品、仓库或组织范围` —— 而这一句曾把整份合同打成
+        // `Unknown` → grounding 判 `mode-unknown` → `Invalid`：自由 SQL 关、语义缓存关、
+        // 知识库路由拿不到、混合问句拆不开。提示词第 4 条明写「拿不准写入 ambiguities」，
+        // 系统却因此判它废票 —— 惩罚诚实，且模型是否说这一句本身就带采样抖动，
+        // 于是同一句话不同轮给出不同路由（业主反复报的「同题不同答」的一个来源）。
+        //
+        // 歧义是**信息**，不是无效：选路只看证据（mode + 槽位），
+        // 「模型说它不确定」写进收据（`summary` 的 `intent:model-flagged-ambiguity`），
+        // 而 fail-closed 的那一半原样保留在 `IntentAttempt::is_data_executable`
+        // —— 有歧义就不开自由 SQL / 语义缓存，与本次改动前逐字一致。
+        if self.mode == IntentMode::Unknown {
             return IntentRoute::Unknown;
         }
         let routed = route_from_subgoals(&self.subgoals);
@@ -578,7 +590,14 @@ impl IntentV1 {
         }
     }
 
-    fn project(&self, question: &str, route: IntentRoute) -> Self {
+    /// 投影：把父合同裁到某个子问 + 某条路上。`None` = **投影不成立**
+    /// （找不到对应子任务 / 归属不唯一 / 把父级已 grounding 的槽位弄丢了）。
+    ///
+    /// 🔴 这三档此前是往 `child.ambiguities` 里塞一句话、靠 `ground()` 见歧义即返 None
+    /// 来处决的。歧义字段从此只表示「模型说它不确定」（见 `route()` 上那段），
+    /// 内部的 fail-closed 就必须自己有个返回值 —— 一个字段两种含义，
+    /// 改任何一个含义都会悄悄改掉另一个。
+    fn project(&self, question: &str, route: IntentRoute) -> Option<Self> {
         let mut child = self.clone();
         let had_subgoals = !self.subgoals.is_empty();
         child.mode = match route {
@@ -601,12 +620,10 @@ impl IntentV1 {
         });
         if self.version >= 2 && had_subgoals {
             let Some(goal) = child.subgoals.first().cloned() else {
-                child.ambiguities.push("未找到匹配的结构化子任务".into());
-                return child;
+                return None; // 未找到匹配的结构化子任务
             };
             if child.subgoals.len() != 1 {
-                child.ambiguities.push("结构化子任务归属不唯一".into());
-                return child;
+                return None; // 结构化子任务归属不唯一
             }
             child.goals = goal.goals;
             child.metrics = goal.metrics;
@@ -619,7 +636,7 @@ impl IntentV1 {
             child.requested_detail = goal.requested_detail;
             child.subgoals.clear();
             child.version = 0;
-            return child;
+            return Some(child);
         }
         if had_subgoals {
             child.goals = child
@@ -701,9 +718,9 @@ impl IntentV1 {
                 || lost_comparison
                 || lost_detail)
         {
-            child.ambiguities.push("复合子问未保留父级范围槽位".into());
+            return None; // 复合子问未保留父级范围槽位
         }
-        child
+        Some(child)
     }
 
     /// 模型只负责抽取用户写过的表面槽位。实体、地区、筛选值与时间原文若不是问句子串，
@@ -759,9 +776,8 @@ impl IntentV1 {
         if self.route() == IntentRoute::Unknown {
             return Some("mode-unknown");
         }
-        if !self.ambiguities.is_empty() {
-            return Some("model-flagged-ambiguity");
-        }
+        // 模型自报的歧义**不再判废票**：它照旧进收据（`summary`），但合同留着用。
+        // 理由与 `route()` 上那段同一件事，只写一处。
         None
     }
 
@@ -845,7 +861,11 @@ impl IntentV1 {
         // goals 只用于解释，不参与路由或执行。模型常把“保修期多久”改写成
         // “查询保修期”；这种未落在原文的概括不得进入已验证合同。
         self.goals.retain(|goal| grounded(goal));
-        if self.route() == IntentRoute::Unknown || !self.ambiguities.is_empty() {
+        // 歧义**不作废合同**（判据与理由写在 `IntentV1::route` 上那段）：
+        // 这里曾是它真正的处决点 —— 模型如实说一句「指代不明」，`ground` 返 None，
+        // 整轮退成 `IntentAttempt::Invalid`。现在它只进覆盖收据（`unverifiable`）与
+        // `is_data_executable`（自由 SQL 仍然一票否决）。
+        if self.route() == IntentRoute::Unknown {
             return None;
         }
         Some(ResolvedIntent(self))
@@ -1466,8 +1486,12 @@ impl IntentAttempt {
         matches!(self.0, IntentAttemptState::Invalid)
     }
 
+    /// 自由 SQL / 语义缓存的开关。**歧义仍然一票否决** —— 合同不再因此作废
+    /// （见 `IntentV1::route`），但「模型说它不确定」时绝不放开自由查询：
+    /// 这一半 fail-closed 与改动前逐字一致，改的只是「确定性路径还能不能读到合同」。
     pub fn is_data_executable(&self) -> bool {
         self.route() == IntentRoute::Data
+            && self.ready().is_some_and(|intent| intent.ambiguities.is_empty())
     }
 
     pub fn route(&self) -> IntentRoute {
@@ -1519,6 +1543,12 @@ impl IntentAttempt {
         let evaluated = coverage.is_some();
         if !evaluated && self.route() == IntentRoute::Data {
             push_unique(&mut issues, "coverage:not-evaluated".into());
+        }
+        // 模型自报的歧义不再作废合同（见 `IntentV1::route`），但必须留在收据里，
+        // 且要**在 `complete` 之前**入列：覆盖判据据此保持 blocked ＝
+        // 答案照出、可信级降 review、理由写明是谁说的不确定。
+        for ambiguity in self.ready().iter().flat_map(|intent| &intent.ambiguities) {
+            push_unique(&mut issues, format!("ambiguity:{ambiguity}"));
         }
         let complete = self.route() != IntentRoute::Unknown && evaluated && issues.is_empty();
         let (status, coverage_status) = match self.0 {
@@ -1770,8 +1800,12 @@ fn coverage_with_evidence(
     {
         push_unique(&mut report.unverifiable, "detail:result-shape".into());
     }
+    // 🔴 归 `unverifiable` 而不是 `conflicts`（2026-08-14）：`conflicts` 会让
+    // `blocking()` 为真 —— 那是「有证据表明限定被删」才配的处置，会把一条**答对的**
+    // 确定性模板整份丢掉（E10：库存量答对了，只因模型附了一句「指代不明」）。
+    // 「模型说它不确定」是**无法证明**，不是证明为错：答案照出、收据降 review。
     for ambiguity in &intent.ambiguities {
-        push_unique(&mut report.conflicts, format!("ambiguity:{ambiguity}"));
+        push_unique(&mut report.unverifiable, format!("ambiguity:{ambiguity}"));
     }
 
     for region in &intent.regions {
@@ -2714,7 +2748,11 @@ mod tests {
             r#"{"mode":"data","goals":["查金额"],"metrics":["销售额"],"entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":["金额口径不明确"]}"#,
             "销售额，金额口径不明确",
         );
-        assert_eq!(ambiguous.route(), IntentRoute::Unknown);
+        // 歧义**不再作废合同**：选路照旧看证据（这里有 metrics → Data），
+        // fail-closed 落在自由 SQL 那一道 —— 模型说不确定就不开自由查询。
+        // （2026-08-14：作废整份合同曾让「现在库存量是多少」这种答对的题
+        //   连合同都读不到，且模型说不说这一句本身带采样抖动 → 同题不同答。）
+        assert_eq!(ambiguous.route(), IntentRoute::Data);
         assert!(!ambiguous.is_data_executable());
 
         let empty = parse_intent_strict(
@@ -3439,13 +3477,18 @@ mod tests {
             "SELECT SUM(amount) AS `销售额` FROM sales",
             &dialect,
         );
+        // 归 unverifiable 而不是 conflicts：`conflicts` 会 `blocking()`，
+        // 那会把一条答对的确定性模板整份丢掉。「模型说它不确定」= 无法证明，
+        // 不是证明为错 —— 答案照出、收据降 review。
         assert!(
             report
-                .conflicts
+                .unverifiable
                 .iter()
                 .any(|slot| slot.starts_with("ambiguity:")),
             "{report:?}"
         );
+        assert!(!report.blocking(), "歧义不该拦掉答案：{report:?}");
+        assert!(report.needs_review(), "但必须降 review：{report:?}");
     }
 
     #[test]
@@ -3552,3 +3595,4 @@ mod tests {
         );
     }
 }
+

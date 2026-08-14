@@ -283,13 +283,16 @@
       "route": "direct-agg",
       "sql_contains": [
         "sales_dw.dws_off_offline_sale_dfn",
-        "董会琴",
-        "INSTR"
+        "SUM(sf.amount)",
+        "'180135'"
       ],
       "sql_not_contains": [
-        "t_winc"
+        "t_winc",
+        "不可计算",
+        "未确认限定"
       ],
-      "note": "领头类别词「客户」不是名称一部分：剥掉后探针才探得到「线下-董会琴」（2026-08-11 实测整词探库必空 → 错走 ODS 推导）。"
+      "min_rows": 1,
+      "note": "领头类别词「客户」不是名称一部分：剥掉后 customer_name_fragment 给出「董会琴」，主档模糊探针唯一命中「线下-董会琴」（customer_code=180135），事实表按 storecode 精确过滤 —— 这比按名称 INSTR 模糊匹配更准，原期望（INSTR）是修好之前写的。编码写死是有意的：这份题集本就对着生产真数据跑，客户换编码时这条该红（2026-08-14 生产直打实测 72028）。"
     },
     {
       "name": "B02-本月不含税收入",
