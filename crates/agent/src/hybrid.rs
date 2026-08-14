@@ -254,6 +254,8 @@ const KB_PRIMARY_BUDGET: std::time::Duration = std::time::Duration::from_secs(45
 async fn race_arms<K>(
     data: impl std::future::Future<Output = anyhow::Result<AskResult>>,
     kb: K,
+    // 裁决判 Knowledge ＝ 资料臂是**主答者**，不是加分项：预算按主答者给。
+    kb_is_primary: bool,
 ) -> (anyhow::Result<AskResult>, Option<Answer>)
 where
     K: std::future::Future<Output = Option<Answer>>,
@@ -273,8 +275,13 @@ where
     if let Some(answer) = kb_done {
         return (data_out, answer);
     }
+    // 🔴 只看「问数臂有没有行」是不够的（2026-08-14 生产实测）：
+    // 「市场费用的报销政策是什么」裁决判 Knowledge，而「市场费用」恰好是**已登记指标**，
+    // 于是问数臂 1 秒出一份费用合计 → 资料臂被降成 8 秒加分项 → 检索+生成超时 →
+    // 用户问报销政策，拿到一个金额。库里明明有《市场费用项适用场景及核销标准说明》。
+    // 预算必须跟着**裁决**走：判 Knowledge 时资料臂就是答案本身。
     let budget = match &data_out {
-        Ok(r) if data_has_substance(r) => KB_BONUS_BUDGET,
+        Ok(r) if data_has_substance(r) && !kb_is_primary => KB_BONUS_BUDGET,
         _ => KB_PRIMARY_BUDGET,
     };
     let answer = match tokio::time::timeout(budget, kb).await {
@@ -331,7 +338,9 @@ pub async fn dual_outcome(
     // 两路**并行**，但资料臂**带预算**：它是加分项，不该让一个已经答完的问数结果干等。
     // 生产实测（2026-08-14）：裸客户名的实体卡本身 1 秒出，改造后整轮 39 秒 ——
     // 全花在等知识库那一路上（检索 + 一次生成，30 秒级很正常）。
-    let (data_r, knowledge) = race_arms(data_fut, kb_fut).await;
+    // 裁决判 Knowledge（R1 要文件 / R2 纯资料问句）＝ 资料臂是主答者。
+    let kb_is_primary = prepared.route() == crate::intent::IntentRoute::Knowledge;
+    let (data_r, knowledge) = race_arms(data_fut, kb_fut, kb_is_primary).await;
     let knowledge = knowledge.filter(kb_has_substance);
 
     let only_kb = |a| HybridOutcome {
@@ -392,6 +401,12 @@ pub async fn dual_outcome(
             (data.route == crate::ask::NEED_INTENT).then(|| "数据侧未能确定查询口径，以上只是资料侧的回答。".to_string())
         });
         return Ok(out);
+    }
+    // 🔴 判 Knowledge 时资料半是**主体**，不是挂件（与上面那条「Data 路由不让位」对称）。
+    // 否则「市场费用的报销政策是什么」端上来的顶层答案是一份费用合计，政策躲在 `kb` 里 ——
+    // 形状上像答了，实质上换了个问题回答（2026-08-14 生产实测）。
+    if kb_is_primary {
+        return Ok(only_kb(a));
     }
     let summary =
         crate::compound::hybrid_summary(&**d.llm, &prepared.effective_question, &data, &a).await;

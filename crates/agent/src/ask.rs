@@ -2402,7 +2402,13 @@ mod tests {
             "两臂合成必须走 fuse（主体保留 + kb 挂附加字段）：{dual}"
         );
         let outcome = src.split("pub async fn dual_outcome(").nth(1).expect("dual_outcome 改名了");
-        assert!(outcome.contains("race_arms(data_fut, kb_fut)"), "两臂必须并行：{outcome}");
+        assert!(outcome.contains("race_arms(data_fut, kb_fut,"), "两臂必须并行：{outcome}");
+        // 预算跟着裁决走：判 Knowledge 时资料臂是主答者，不是 8 秒加分项
+        // （否则「市场费用的报销政策是什么」会因为「市场费用」是已登记指标而被一份合计顶掉）
+        assert!(
+            outcome.contains("kb_is_primary = prepared.route() == crate::intent::IntentRoute::Knowledge"),
+            "资料臂的主/次身份必须由裁决定：{outcome}"
+        );
         // 资料臂是加分项：问数臂已经答出实质内容时不许让它继续干等
         let race = src.split("async fn race_arms<K>(").nth(1).expect("race_arms 改名了");
         assert!(
