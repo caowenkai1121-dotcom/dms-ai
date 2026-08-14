@@ -1933,7 +1933,19 @@ async fn rewrite_followup(
             // 判据与上面「上一轮素材是不是一条 SQL」**共用 `looks_like_sql`**，
             // 两处各写一份的话改一处忘另一处不会红。
             let explicit_slots = crate::intent::reinterpret_coverage(question, &rewritten, None);
-            if rewritten.is_empty() || looks_like_sql(&rewritten) || !explicit_slots.complete() {
+            // 🔴 单号必须**逐字**活下来（2026-08-14 生产实测）。改写模型会把
+            // 「订单 HJXH-DXO2026081300138」顺手整理成别的形状，而 `resolve_code` 是
+            // 形状判据：差一个字符就从 `direct-doc` 掉进自由 SQL 返 0 行，
+            // 且同一句两次结果不同（采样抖动）。槽位覆盖判据看不见单号 —— 它不是槽位。
+            let codes_kept = {
+                let before = crate::triage::code_tokens(question);
+                let after = crate::triage::code_tokens(&rewritten);
+                before.iter().all(|code| after.contains(code))
+            };
+            if !codes_kept {
+                tracing::warn!(original = question, candidate = rewritten, "追问改写动了单号 → 原样放行");
+            }
+            if rewritten.is_empty() || looks_like_sql(&rewritten) || !explicit_slots.complete() || !codes_kept {
                 if !explicit_slots.complete() {
                     tracing::warn!(original = question, candidate = rewritten, coverage = ?explicit_slots,
                         "追问改写丢失本轮显式槽位 → 原样放行");
@@ -2218,6 +2230,34 @@ mod tests {
     ///    确定性成员照跑，自由 SQL 仍然关死。
     /// ③ Hybrid 合同只能由 `hybrid::run` 出手，不许落进两臂档。
     /// ④ 兜底档摘掉 `llm` 成员。
+    /// 🔴 单号在追问改写前后必须**逐字**活下来。
+    ///
+    /// 生产实测（2026-08-14）：「订单 HJXH-DXO2026081300138」两次得到两个不同结果
+    /// （`llm+repair` 0 行 / 纯资料卡），而「查 HJXH-DXO…」「HJXH-DXO… 明细」都稳稳
+    /// 命中 `direct-doc` —— 差别就是改写模型把单号「顺手整理」了。
+    /// `resolve_code` 是形状判据，差一个字符就整条路走不到。
+    #[test]
+    fn followup_rewrite_must_not_touch_document_codes() {
+        let src = include_str!("ask.rs");
+        let body = src.split("async fn rewrite_followup(").nth(1).expect("rewrite_followup 改名了");
+        assert!(
+            body.contains("let codes_kept = {") && body.contains("|| !codes_kept {"),
+            "改写守卫不看单号了 —— 一句带单号的追问会随采样掉进自由 SQL：{body}"
+        );
+        // 判据本体（纯函数）：大小写不敏感，缺一个就是没保住
+        let before = crate::triage::code_tokens("订单 HJXH-DXO2026081300138");
+        assert_eq!(before, vec!["HJXH-DXO2026081300138".to_string()]);
+        let kept = |after: &str| {
+            let after = crate::triage::code_tokens(after);
+            before.iter().all(|c| after.contains(c))
+        };
+        assert!(kept("HJXH-DXO2026081300138 这张销售订单的明细"));
+        assert!(kept("hjxh-dxo2026081300138 的明细"), "大小写不同不算动过单号");
+        assert!(!kept("HJXH-DXO 2026081300138 的明细"), "插空格就是动过了");
+        assert!(!kept("HJXH-DXO202608130013 的明细"), "少一位就是动过了");
+        assert!(!kept("这张销售订单的明细"), "整个丢掉当然不算保住");
+    }
+
     #[test]
     fn dual_arm_dispatch_keeps_the_four_invariants() {
         let src = include_str!("ask.rs");

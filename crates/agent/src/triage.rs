@@ -367,11 +367,24 @@ pub(crate) fn doc_code_hit(q: &str) -> bool {
 /// 把它判成点查就是又一次误路由。`doc_code_hit` 那侧维持原判据一字不变（它只用于
 /// 「要不要多走一次问数」，判宽的代价是快路径不命中后回落，不对称地便宜）。
 pub(crate) fn code_token_hit(q: &str) -> bool {
-    q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).any(|t| {
-        t.len() >= 6
-            && t.chars().any(|c| c.is_ascii_digit())
-            && t.chars().any(|c| c.is_ascii_alphabetic())
-    })
+    !code_tokens(q).is_empty()
+}
+
+/// 问句里的**单据号形 token**（字母数字混排、≥6 位）。大写归一后返回。
+///
+/// 除了路由判据，它还是**改写守卫**的输入：追问改写模型偶尔会把单号「顺手整理」
+/// （加空格、改大小写、丢一位），而单号一旦不逐字相同，`resolve_code` 的形状判据当场失配，
+/// 一句「订单 HJXH-DXO2026081300138」就从 `direct-doc` 掉进自由 SQL 返 0 行 ——
+/// 而且**同一句话两次结果不同**（模型采样抖动），生产实测。
+pub(crate) fn code_tokens(q: &str) -> Vec<String> {
+    q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|t| {
+            t.len() >= 6
+                && t.chars().any(|c| c.is_ascii_digit())
+                && t.chars().any(|c| c.is_ascii_alphabetic())
+        })
+        .map(str::to_ascii_uppercase)
+        .collect()
 }
 
 /// fast LLM 二分类。答非所问/超时/挂掉 → `None`，调用方兜底 Data。

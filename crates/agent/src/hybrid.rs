@@ -299,7 +299,15 @@ pub fn data_has_substance(r: &AskResult) -> bool {
     {
         return false;
     }
-    r.row_count > 0 || !r.subs.is_empty() || !r.view.blocks.is_empty()
+    // 🔴 「有块」不等于「有内容」：确定性视图对空结果同样兜底成 `[Table]`，
+    // 于是一个 0 行的失败查询会被判成「有实质」，把真正答出东西的资料半挤成侧栏
+    // （2026-08-14 生产实测：`route=llm+repair, rows=0` 却当了主答案）。
+    // 只有**自带内容**的块（实体卡 / KPI 卡）才算数，表格必须有行。
+    r.row_count > 0
+        || !r.subs.is_empty()
+        || r.view.blocks.iter().any(|block| {
+            matches!(block, dms_kernel::present::Block::Entity { .. } | dms_kernel::present::Block::Kpis { .. })
+        })
 }
 
 /// 资料臂**答出东西了**吗。判据只有一条：模型给不出任何带角标的结论时，

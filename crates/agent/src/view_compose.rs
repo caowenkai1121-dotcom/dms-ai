@@ -65,10 +65,16 @@ pub(crate) async fn refine(cx: &AskCtx<'_>, r: &mut AskResult) {
     if !worth_composing(r) {
         return;
     }
-    let Some(view) = compose(cx.llm, cx.question, &r.columns, &r.rows, &r.view).await else {
+    let Some(composed) = compose(cx.llm, cx.question, &r.columns, &r.rows, &r.view).await else {
         return;
     };
-    r.view.blocks = view;
+    // 单据/实体头卡**原样留在最前**：它是「这是哪张单」的身份，不是可编排的展示形态。
+    // 编排只接管它后面那一段（此前那段就是一张裸表格）。
+    let header: Vec<Block> = std::mem::take(&mut r.view.blocks)
+        .into_iter()
+        .take_while(|block| matches!(block, Block::Entity { .. }))
+        .collect();
+    r.view.blocks = header.into_iter().chain(composed).collect();
 }
 
 /// 值不值得多烧一次 fast 调用。
@@ -84,7 +90,17 @@ fn worth_composing(r: &AskResult) -> bool {
     }
     // 确定性树已经给出图表时不抢：那些形态（趋势线、单类别柱/饼）它判得比模型稳。
     // 只在它**退成裸表格**时接手 —— 那正是「规则没意见」的那一档。
-    matches!(r.view.blocks.as_slice(), [Block::Table])
+    //
+    // 🔴 「实体卡 + 裸表格」同样算这一档（2026-08-14 生产实测补）：业主抱怨的那张
+    // 单号卡就是这个形状 —— 头卡下面挂 6 行订单明细，一张裸表，没有合计也没有构成图。
+    // 第一版只认 `[Table]`，恰好把要治的那张卡漏在门外。
+    let tail: Vec<&Block> = r
+        .view
+        .blocks
+        .iter()
+        .skip_while(|block| matches!(block, Block::Entity { .. }))
+        .collect();
+    matches!(tail.as_slice(), [Block::Table])
 }
 
 async fn compose(
@@ -488,9 +504,42 @@ mod tests {
         r.view.blocks =
             vec![Block::Chart { kind: ChartKind::Bar, x: 0, y: vec![1], top: None, series: None, title: None }];
         assert!(!worth_composing(&r), "确定性树已经出图就不抢");
+        // 🔴 单据/实体卡（头卡 + 裸表格）同样接手：业主抱怨的那张单号卡就是这个形状。
+        r.view.blocks = vec![
+            Block::Entity { pairs: vec![("单据类型".into(), Value::from("销售订单"))] },
+            Block::Table,
+        ];
+        assert!(worth_composing(&r), "头卡 + 裸表格必须接手（那正是要治的那张卡）");
+        // 头卡后面已经有图了就不抢
+        r.view.blocks = vec![
+            Block::Entity { pairs: vec![("单据类型".into(), Value::from("销售订单"))] },
+            Block::Chart { kind: ChartKind::Bar, x: 0, y: vec![1], top: None, series: None, title: None },
+            Block::Table,
+        ];
+        assert!(!worth_composing(&r), "确定性树已经出图就不抢");
         r.view.blocks = vec![Block::Table];
         r.rows.truncate(1);
         assert!(!worth_composing(&r), "单行结果没有可编排的余地");
+    }
+
+    /// 头卡**原样留在最前**：它是「这是哪张单」的身份，编排只接管它后面那一段。
+    #[test]
+    fn document_header_survives_composition() {
+        let v = view(&[("商品名称", Role::Category, Semantic::Goods), ("明细金额", Role::Metric, Semantic::Money)]);
+        let rows = vec![
+            vec![Value::from("烤肠"), Value::from(10.0)],
+            vec![Value::from("烧麦"), Value::from(20.0)],
+        ];
+        let composed = build_blocks(
+            &plan(r#"{"blocks":[{"type":"stat","col":1,"agg":"sum","label":"合计金额"}]}"#),
+            &v,
+            &rows,
+        );
+        let header = Block::Entity { pairs: vec![("单号".into(), Value::from("HJXH-DXO1"))] };
+        let merged: Vec<Block> = std::iter::once(header).chain(composed).collect();
+        assert!(matches!(merged[0], Block::Entity { .. }), "头卡必须还在最前：{merged:?}");
+        assert!(matches!(merged[1], Block::Kpis { .. }), "{merged:?}");
+        assert!(matches!(merged.last(), Some(Block::Table)), "{merged:?}");
     }
 
     /// 造一个字段全空的 `AskResult`（本模块只读 sql/columns/rows/subs/view）。
