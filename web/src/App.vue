@@ -192,6 +192,8 @@ interface DeepPage {
   kind?: 'metric' | 'breakdown' | 'trend' | 'comparison' | 'attribution' | 'document' | 'entity' | 'detail' | 'general'
   label?: string
   understanding?: string | null
+  /** 规划了却没跑出来的板块标题（后端 `missing_sections`）。老服务端没有这个键。 */
+  missing_sections?: string[]
   /** 【D8】验收断言透出区（报告页顶部小字区；老服务端不带此键 = 不渲染） */
   assertions?: DeepAssertion[]
   kpi?: { label: string; value: string } | null
@@ -3061,6 +3063,13 @@ function exportSupplementalCsv(t: Turn) {
                    <span>分析目标</span>
                    <p>{{ t.page.understanding }}</p>
                  </div>
+                 <!-- 规划了却没跑出来的板块**必须点名**：此前它们被静默丢掉，页面只是少一块，
+                      用户既不知道少了什么、也不知道剩下的数是不是完整的。
+                      老服务端不带 missing_sections 键 = 整区不渲染（降级同 assertions）。 -->
+                 <div v-if="t.page.missing_sections?.length" class="deep-objective deep-gap">
+                   <span>本次未取到的板块</span>
+                   <p>{{ t.page.missing_sections.join('、') }}。以上结论只覆盖已取到的部分。</p>
+                 </div>
                  <!-- 【D8】验收断言透出区：规划时定的「每板块要证明什么」+ 末次自评。
                       老服务端不带 assertions 键 = 整区不渲染（降级同后端纪律） -->
                  <div v-if="t.page.assertions?.length" class="daccept">
@@ -3954,6 +3963,7 @@ function exportSupplementalCsv(t: Turn) {
   .deep-page-head { align-items: flex-start; flex-direction: column; gap: 5px; }
   .deep-page-meta { flex-wrap: wrap; }
   .deep-objective { grid-template-columns: 1fr; gap: 4px; }
+.deep-gap { border-left-color: var(--warning-text); background: var(--warning-bg); }
   .bi-focus { padding: 8px; }
   .bi-focus-card { width: 100%; height: 96vh; }
   .bi-focus-body { padding: 12px; }
