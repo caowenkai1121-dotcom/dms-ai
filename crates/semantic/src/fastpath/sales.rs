@@ -286,6 +286,13 @@ pub fn intent_time_surface(question: &str) -> Option<String> {
         .windows(10)
         .enumerate()
         .filter_map(|(at, bytes)| {
+            // 🔴 两头必须是数字（2026-08-14 实测）：chrono 的 `%Y` 会**跳过前导空白**，
+            // 于是 `" 2026-08-1"` 也解析成功 —— 窗口整体左移一位，取出来的跨度少一个字符。
+            // 「2026-08-10 至 2026-08-11」被截成「2026-08-10 至 2026-08-1」，
+            // 带前缀时更是只剩「 2026-08-10」（B01W 的时间槽因此永远兑现不了）。
+            if !bytes[0].is_ascii_digit() || !bytes[9].is_ascii_digit() {
+                return None;
+            }
             let value = std::str::from_utf8(bytes).ok()?;
             chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
                 .ok()
@@ -393,3 +400,31 @@ pub fn sales_fact_province_filter(
 
 
 
+
+
+
+#[cfg(test)]
+mod range_surface_tests {
+    use super::*;
+
+    /// 两个 ISO 日期的区间：跨度必须**整段**取出来。
+    /// chrono 的 `%Y` 跳过前导空白 → `" 2026-08-1"` 也解析成功，窗口左移一位，
+    /// 此前把「2026-08-10 至 2026-08-11」截成「…至 2026-08-1」，带中文前缀时
+    /// 更是只剩「 2026-08-10」—— 时间槽因此永远兑现不了（生产回归 B01W）。
+    #[test]
+    fn an_explicit_date_range_surface_covers_both_ends() {
+        for q in [
+            "2026-08-10 至 2026-08-11 销售额",
+            "山东省 2026-08-10 至 2026-08-11 销售额",
+        ] {
+            assert_eq!(
+                intent_time_surface(q).as_deref(),
+                Some("2026-08-10 至 2026-08-11"),
+                "{q}"
+            );
+        }
+        // 单个日期不走这一支（交给相对词/年月/整句兜底），不许被这条改动带偏
+        assert_eq!(intent_time_surface("本月销售额").as_deref(), Some("本月"));
+        assert_eq!(intent_time_surface("2026年6月销售额").as_deref(), Some("2026年6月"));
+    }
+}
