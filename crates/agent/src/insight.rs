@@ -219,7 +219,7 @@ impl Reading<'_> {
             _ => SYSTEM_DEEP,
         };
         let user = format!(
-            "{}\n原问题：{}\n分析合同：{}\n\n请按指定结构输出：",
+            "{}\n原问题：{}\n分析合同：{}\n\n请按要求输出：",
             wrap_untrusted(&hits),
             self.question,
             kind.label(),
