@@ -65,9 +65,14 @@ pub(crate) async fn refine(cx: &AskCtx<'_>, r: &mut AskResult) {
     if !worth_composing(r) {
         return;
     }
-    let Some(composed) = compose(cx.llm, cx.question, &r.columns, &r.rows, &r.view).await else {
-        return;
+    // 模型那半失败也要有确定性摘要：合计与行数是代码算得出的确定事实，不该跟着一起没有。
+    let composed = match compose(cx.llm, cx.question, &r.columns, &r.rows, &r.view).await {
+        Some(blocks) => blocks,
+        None => deterministic_summary(&r.view, &r.rows),
     };
+    if composed.is_empty() {
+        return;
+    }
     // 单据/实体头卡**原样留在最前**：它是「这是哪张单」的身份，不是可编排的展示形态。
     // 编排只接管它后面那一段（此前那段就是一张裸表格）。
     let header: Vec<Block> = std::mem::take(&mut r.view.blocks)
@@ -127,8 +132,51 @@ async fn compose(
         .map_err(|e| tracing::warn!(err = %e, reply = %clip(&reply), "呈现编排 JSON 不合约 → 保留确定性视图"))
         .ok()?;
     let blocks = build_blocks(&plan, view, rows);
+    if blocks.is_empty() {
+        // 🔴 一个**不留痕**的层没法诊断（生产实测：编排跑了、什么都没出、日志一个字没有）。
+        tracing::info!(reply = %clip(&reply), "呈现编排未产出可用块 → 走确定性兜底");
+    }
     (!blocks.is_empty()).then_some(blocks)
 }
+
+/// 零模型的确定性摘要：明细表至少要有「合计金额 / 记录数」。
+///
+/// 🔴 为什么不全交给模型：这一层的价值有两半 —— **选什么图、起什么标题**只有模型判得出，
+/// 而「这张明细表的金额合计是多少」是代码算得出的确定事实。模型那半失败（超时、
+/// JSON 不合约、选的块全被判据拒掉）时，不该连这半也一起没有。
+/// 业主抱怨的那张单据卡就是这一档：6 行订单明细，一张裸表，没有合计。
+fn deterministic_summary(view: &ViewSpec, rows: &[Vec<Value>]) -> Vec<Block> {
+    let mut items: Vec<Kpi> = Vec::new();
+    for (index, spec) in view.columns.iter().enumerate() {
+        if items.len() >= MAX_STATS || spec.role != Role::Metric {
+            continue;
+        }
+        // 只对**金额**求和：数量类列相加常常没有业务含义（箱数 + 袋数），
+        // 占比类相加恒等于 100%（`aggregate` 已经拒了）。
+        if spec.semantic != Semantic::Money {
+            continue;
+        }
+        let Some((value, semantic)) = aggregate(rows, index, "sum", spec.semantic) else { continue };
+        let Some(label) = default_stat_label("sum", &spec.name) else { continue };
+        if items.iter().any(|k| k.label == label) {
+            continue;
+        }
+        items.push(Kpi { label, value, semantic, delta: None });
+    }
+    if items.is_empty() {
+        return vec![];
+    }
+    items.push(Kpi {
+        label: "记录数".into(),
+        value: Value::from(rows.len()),
+        semantic: Semantic::Count,
+        delta: None,
+    });
+    vec![Block::Kpis { items }, Block::Table]
+}
+
+/// 确定性摘要最多几张 KPI（再多一屏塞不下，且金额列本来就不该有很多）。
+const MAX_STATS: usize = 3;
 
 #[derive(serde::Deserialize)]
 struct Plan {
@@ -531,6 +579,39 @@ mod tests {
         r.view.blocks = vec![Block::Table];
         r.rows.truncate(1);
         assert!(!worth_composing(&r), "单行结果没有可编排的余地");
+    }
+
+    /// 模型那半失败时仍要有确定性摘要：合计与行数是代码算得出的确定事实。
+    ///
+    /// 生产实测（2026-08-14）：单据卡的编排跑了、什么都没出、日志一个字没有 ——
+    /// 用户看到的还是那张没有合计的裸表。
+    #[test]
+    fn deterministic_summary_survives_a_useless_model() {
+        let v = view(&[
+            ("商品名称", Role::Category, Semantic::Goods),
+            ("数量", Role::Metric, Semantic::Count),
+            ("明细金额", Role::Metric, Semantic::Money),
+        ]);
+        let rows = vec![
+            vec![Value::from("烤肠"), Value::from(2.0), Value::from("100.50")],
+            vec![Value::from("烧麦"), Value::from(3.0), Value::from("200.25")],
+        ];
+        let blocks = deterministic_summary(&v, &rows);
+        match &blocks[0] {
+            Block::Kpis { items } => {
+                assert_eq!(items[0].label, "合计明细金额");
+                assert_eq!(items[0].value, serde_json::json!(300.75), "合计由代码算");
+                assert_eq!(items.last().unwrap().label, "记录数");
+                assert_eq!(items.last().unwrap().value, Value::from(2));
+                // 数量类不求和：箱数 + 袋数相加没有业务含义
+                assert!(!items.iter().any(|k| k.label.contains("数量")), "{items:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(blocks.last(), Some(Block::Table)), "逐行核对能力保底");
+        // 没有金额列时不硬凑一张卡
+        let no_money = view(&[("商品名称", Role::Category, Semantic::Goods), ("数量", Role::Metric, Semantic::Count)]);
+        assert!(deterministic_summary(&no_money, &rows).is_empty());
     }
 
     /// 头卡**原样留在最前**：它是「这是哪张单」的身份，编排只接管它后面那一段。
