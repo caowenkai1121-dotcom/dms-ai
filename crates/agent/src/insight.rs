@@ -57,7 +57,7 @@ const SYSTEM: &str = "你把一次数据查询的结果解读成人话。\
 fn with_contract(system: &str) -> String {
     format!(
         "{system}\n{}\n本次解读的事实域固定为：MAIN=主结果，DETAIL=补充明细，\
-         COMPARE=结构化比较，CONTEXT=同窗经营补充。只能引用当前断言所属事实域，禁止跨域借数。",
+         COMPARE=结构化比较，CONTEXT=同窗经营补充，CALIBER=口径说明（来源表/过滤/时间窗/去重）。         只能引用当前断言所属事实域，禁止跨域借数 —— 尤其不许拿 CALIBER 的 ID 去支撑一个数值。",
         AnswerContract::instruction()
     )
 }
@@ -257,6 +257,13 @@ impl Reading<'_> {
     fn answer_contract(&self, n: usize) -> AnswerContract {
         let mut contract = AnswerContract::new();
         contract.push_table("MAIN", "主结果", self.columns, self.rows, n);
+        // 🔴 口径也必须是**可引用事实**（2026-08-15 生产实测）：
+        // 提示词要求「再用一句说清这个数是怎么算出来的（照口径说明里的来源表/过滤/去重/
+        // 时间窗说）」，而口径此前只在素材里、不在合同里 —— 合同又规定「没有对应事实
+        // 就省略该断言」。两条规矩夹在一起，模型只能把数字复述一遍：
+        // 「本月销售额」的解读实测就是一句「本月销售额为 106793453.2900。」，
+        // 而 KPI 卡上那个数用户已经看见了，这句话等于没说。
+        contract.push_text("CALIBER", "口径说明", &self.caliber());
         if let Some(table) = self.supplemental {
             contract.push_table("DETAIL", "补充明细", table.columns, table.rows, EXTRA_ROWS);
         }
