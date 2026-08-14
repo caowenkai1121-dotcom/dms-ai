@@ -3299,6 +3299,19 @@ pub fn ");
         );
         // 剥完是类别词的照旧拒（分类问句不许错配成名称探库）
         assert_eq!(customer_name_fragment("线下客户本月销售额"), None);
+        // 🔴 大区名不是客户名（2026-08-15 生产直打）：DWS 的 region 里没有「华东」，
+        // 而客户表里有个 `线下-福建云通供应链有限公司(华东区）`——名字括号里带着地域标注。
+        // 不拒的话「本月华东区销售额」会变成「那一家客户本月销售额」，答 0，
+        // 用户读到的是「华东区本月没销售」。
+        assert_eq!(customer_name_fragment("本月华东区销售额"), None);
+        assert_eq!(customer_name_fragment("华南区本月销售额"), None);
+        assert_eq!(customer_name_fragment("本月西北大区销售额"), None);
+        // 正常客户名一个都不许被这条误伤
+        assert_eq!(
+            customer_name_fragment("华东实业本月销售额").as_deref(),
+            Some("华东实业"),
+            "带地域字样的**公司名**照旧是客户名"
+        );
         // 渠道词黏在实体名头尾是限定不是名字（2026-08-12 生产实测归一重试两连不中）
         assert_eq!(
             customer_name_fragment("潍坊程祥商贸有限公司本月线下销售额是多少？"),
