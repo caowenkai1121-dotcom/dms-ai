@@ -564,8 +564,12 @@ impl PresentCn {
         if view.columns.len() == raw.len()
             && view.columns.iter().zip(raw.iter()).all(|(c, r)| c.name == *r)
         {
-            for (spec, name) in view.columns.iter_mut().zip(finals.iter()) {
-                spec.name = name.clone();
+            for (i, (spec, name)) in view.columns.iter_mut().zip(finals.iter()).enumerate() {
+                // 🔴 改名后**重算规格**：role/semantic 是按列名推的，中文化恰恰改列名。
+                // 不重算的后果（2026-08-14 生产实测）：`goods_amount` 译成「商品金额」之后
+                // 规格还停在英文名推出来的 `category/None` —— 前端不右对齐、不按 ¥ 格式化，
+                // 呈现编排也拿不到一个「金额列」。原名已经是中文时重算等于原样。
+                *spec = crate::present::col_spec(name, rows, i);
             }
         }
         *columns = finals.clone();
@@ -762,6 +766,40 @@ mod tests {
     }
 
     // ─────────── 任务 2：码值翻译 ───────────
+
+    /// 🔴 改名之后**规格要跟着重算**。
+    ///
+    /// 生产实测（2026-08-14）：数仓明细的 `goods_amount` 被译成「商品金额」，
+    /// 而 `ColumnSpec` 还停在英文名推出来的 `category/None` —— 前端不右对齐、
+    /// 不按 ¥ 格式化，呈现编排也拿不到一个「金额列」，单据卡因此永远没有合计。
+    #[test]
+    fn renaming_a_column_recomputes_its_spec() {
+        use dms_kernel::present::{Block, ColumnSpec, Interact, Role, Semantic};
+        // 走 `column_doc` 注释这条路改名（生产上 `goods_amount` 就是这么变成「商品金额」的）
+        let cn = PresentCn::from_parts(
+            &["t_sales_order_detail"],
+            vec![("t_sales_order_detail", "goods_amount", "商品金额")],
+            vec![],
+        );
+        let mut columns = vec!["goods_amount".to_string()];
+        let mut rows = vec![vec![Value::from("240.0000")], vec![Value::from("120.5")]];
+        let mut view = ViewSpec {
+            columns: vec![ColumnSpec {
+                name: "goods_amount".into(),
+                role: Role::Category,
+                semantic: Semantic::None,
+            }],
+            blocks: vec![Block::Table],
+            interact: Interact::default(),
+            insight: None,
+        };
+        let mut redacted = vec![];
+        cn.apply(&mut columns, &mut rows, &mut view, &mut redacted);
+        assert_eq!(columns[0], "商品金额");
+        assert_eq!(view.columns[0].name, "商品金额");
+        assert_eq!(view.columns[0].role, Role::Metric, "改名后规格没重算：{:?}", view.columns[0]);
+        assert_eq!(view.columns[0].semantic, Semantic::Money);
+    }
 
     #[test]
     fn value_map_translation_eq_like_and_numeric() {

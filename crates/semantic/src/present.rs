@@ -44,6 +44,16 @@ fn infer_drill(specs: &[ColumnSpec], has_metric: bool) -> Vec<String> {
 }
 
 /// 列名 → 语义
+/// 单列规格推断（列名 + 该列的值）。
+///
+/// `pub`：`present_cn` 改完列名要**重算**它 —— 规格是按列名推的，而中文化恰恰改列名。
+/// 不重算的后果实测过：数仓明细的 `goods_amount` 被译成「商品金额」之后，
+/// 规格还停在英文名推出来的 `category/None`，于是前端不右对齐、不按 ¥ 格式化，
+/// 呈现编排也拿不到一个「金额列」（2026-08-14 生产实测）。
+pub fn col_spec(name: &str, rows: &[Vec<Value>], i: usize) -> ColumnSpec {
+    ColumnSpec { name: name.to_string(), role: infer_role(name, rows, i), semantic: infer_semantic(name) }
+}
+
 fn infer_semantic(name: &str) -> Semantic {
     if name.contains('率') || name.contains("占比") || name.contains('%') {
         Semantic::Percent
