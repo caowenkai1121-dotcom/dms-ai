@@ -362,42 +362,67 @@ pub async fn ask(
 
 /// 执行一份已经准备好的问句。调用方不得重新抽取意图；选源、compound 与所有
 /// Answerer 都复用 `prepared.intent_attempt`。
+/// ★ 一次问答的**裁决与编排**：决定两臂各自怎么跑，然后把产物合成一份答案。
+///
+/// 🔴 2026-08-14 架构改造：路由从「五选一，选中谁就只跑谁」改成「**两臂并行 + 一次合成**」。
+///
+/// 旧形态的病在业主的四张截图里都能看到同一个影子：一句「线下-浏阳品元商贸有限公司」
+/// 被判成资料问句，于是**只**问知识库，知识库如实答「没有这家公司的规定」——
+/// 而这家公司在业务库里明明有客户卡。分类器判错一次，用户就整轮拿不到本来存在的答案。
+///
+/// 现在分类器的产物只决定两件事：① 问数臂开不开自由 SQL（`deterministic_fallback`）；
+/// ② 两臂都有话说时谁排在前面。**它不再决定谁不许跑**。
 pub async fn ask_prepared(
     d: &AskDeps<'_>,
     p: &Principal,
     prepared: &PreparedQuestion,
     explicit_ds: Option<&str>,
 ) -> anyhow::Result<AskResult> {
-    let t0 = prepared.started_at;
+    use crate::intent::IntentRoute as R;
+    // Hybrid 合同自带 typed 拆分（问数半 N 条 + 资料半 1 条），有自己的编排器，不进两臂。
+    if prepared.route() == R::Hybrid {
+        let outcome = crate::hybrid::run(d, p, prepared, explicit_ds).await?;
+        return Ok(crate::hybrid::into_ask_result(outcome, prepared));
+    }
     // 🔴 意图不可用 ≠ 不能回答。`AGENT-ARCHITECTURE §3.1` 的原话是「已有确定性路径仍可尝试，
-    // 但只能标记为 review」—— 此前这里直接出反问卡，于是 fast 模型一次抖动（偶发
-    // `mode=unknown`）就把一道确定性模板答得出的题变成反问：**同一句问三次，一次反问两次出卡**
-    // （2026-08-13 实测）。同题不同答比答错更伤信任。
+    // 但只能标记为 review」—— 此前 `Unknown` 直接出反问卡，于是 fast 模型一次抖动就把一道
+    // 确定性模板答得出的题变成反问：**同一句问三次，一次反问两次出卡**（2026-08-13 实测）。
     //
-    // 分档：Knowledge/Hybrid 仍然直接澄清（数据成员回答不了文档问题，硬答就是编）；
-    // 只有 `Unknown`（＝合同没拿到，不是用户真的问了别的）才走确定性兜底 ——
-    // 自由 SQL 那一路仍由 `cx.intent == None` 时的既有闸门挡着，兜底只可能命中
-    // graph/装配器/模板/实体卡这些**代码写死**的路径，收据照常按 review 出。
-    let deterministic_fallback = match prepared.route() {
-        crate::intent::IntentRoute::Data => false,
-        crate::intent::IntentRoute::Unknown => true,
-        // Hybrid 收进 agent（T8 之后的第二套编排器清理）：两路并行 + 一次合成，
-        // CLI/判官与 HTTP 从此走同一条 —— 此前判官问混合问句永远得到澄清卡。
-        crate::intent::IntentRoute::Hybrid => {
-            let outcome = crate::hybrid::run(d, p, prepared, explicit_ds).await?;
-            return Ok(crate::hybrid::into_ask_result(outcome, prepared));
-        }
-        // 与 Hybrid 同一条收口：**能答就答，不能答才澄清**。此前这里无条件出澄清卡，
-        // 于是纯资料问句在 CLI/判官链路永远得不到答案 —— 而 HTTP 侧早就把它接到知识库了，
-        // 又是一处「两条链路对同一问句行为相反」（Hybrid 那次收口只修了一半）。
-        // `d.kb` 缺席（深度报告子问、定时任务）才澄清：那是调用方的能力边界，不是用户问错了。
-        crate::intent::IntentRoute::Knowledge => {
-            return match crate::hybrid::knowledge_only(d, p, prepared).await {
-                Some(r) => Ok(r),
-                None => Ok(prepared.clarification_result()),
-            };
-        }
-    };
+    // `Knowledge` 同样进兜底档：资料问句的问数臂**不许开自由 SQL**（硬答就是编），
+    // 但实体卡、单据点查这些代码写死的确定性成员该跑就跑 —— 那正是「浏阳品元商贸」
+    // 这类问句本该拿到的东西。
+    let deterministic_fallback = prepared.route() != R::Data;
+    crate::hybrid::dual(d, p, prepared, explicit_ds, deterministic_fallback).await
+}
+
+/// **只跑问数臂**的入口。给「产物形状必须是一份取数结果」的调用方用 ——
+/// 深度 BI 报告拿它当主结果去拼板块（`primary.columns` / `primary.rows` /
+/// `document_evidence(&primary)`），套一层 compound 壳整份报告就散了。
+///
+/// 资料臂对深度报告不是丢掉而是**还没接**：报告要的是「资料如何解释这组数」，
+/// 那是板块级的合成，不是把两份答案并排 —— 归 P2。
+pub async fn ask_prepared_data_only(
+    d: &AskDeps<'_>,
+    p: &Principal,
+    prepared: &PreparedQuestion,
+    explicit_ds: Option<&str>,
+) -> anyhow::Result<AskResult> {
+    let deterministic_fallback = prepared.route() != crate::intent::IntentRoute::Data;
+    ask_data_arm(d, p, prepared, explicit_ds, deterministic_fallback).await
+}
+
+/// 问数臂本体（原 `ask_prepared` 的全部内容，去掉顶上那段分派）。
+///
+/// `deterministic_fallback = true` ⇒ 本轮**不许自由生成 SQL**，只留代码写死的确定性成员
+/// （graph / 装配器 / 模板 / 实体卡 / 语义缓存）。
+pub(crate) async fn ask_data_arm(
+    d: &AskDeps<'_>,
+    p: &Principal,
+    prepared: &PreparedQuestion,
+    explicit_ds: Option<&str>,
+    deterministic_fallback: bool,
+) -> anyhow::Result<AskResult> {
+    let t0 = prepared.started_at;
     // 兜底档没有合同，自然也没有 typed 子问；这条只管有合同那一档。
     //
     // 🔴 **确定性车道也没有 typed 子问**（2026-08-14 业主实测裸单号）。
@@ -651,7 +676,7 @@ pub async fn ask_prepared(
 /// 漂移双端锁：direct.rs 侧测试断言产出的卡能被它自己的 `is_unavailable_card` 认出；
 /// 本文件测试用 `include_str!` 直扫 direct.rs，投影头改一个字那边当场红
 /// （跨 crate 扫源有先例：server/main.rs 扫 agent/ctx.rs、direct.rs 扫 semantic/ods.rs）。
-fn is_unavailable_card_result(r: &AskResult) -> bool {
+pub(crate) fn is_unavailable_card_result(r: &AskResult) -> bool {
     r.sql.contains("'不可计算' AS `数据状态`")
 }
 
@@ -1056,6 +1081,7 @@ fn empty_reply(route: &str, elapsed_ms: u128, note: String) -> AskResult {
         value_labels: vec![],
         sales_context: None,
         intent_summary: None,
+        kb: None,
     }
 }
 
@@ -1431,19 +1457,10 @@ fn attach_document_identity(
     let Some(document) = document else {
         return;
     };
-    let Some(source) = document.family.source(warehouse) else {
-        return;
-    };
-    let metadata = [
-        ("单据类型", serde_json::Value::String(document.family.name.into())),
-        ("主表", serde_json::Value::String(source.header_table.into())),
-        (
-            "明细表",
-            serde_json::Value::String(
-                source.details.iter().map(|detail| detail.table).collect::<Vec<_>>().join("、"),
-            ),
-        ),
-    ];
+    // 物理表名不进用户可见 pairs（同 `business_lookup::document_identity_pairs` 的理由）：
+    // 表名是实现细节，占着头卡最前排把真正的业务字段挤掉。审计走「查看 SQL」。
+    let _ = warehouse;
+    let metadata = [("单据类型", serde_json::Value::String(document.family.name.into()))];
     if let Some(dms_kernel::present::Block::Entity { pairs }) = result
         .view
         .blocks
@@ -2186,41 +2203,91 @@ mod tests {
         assert!(vague.view.interact.drill.is_empty(), "{:?}", vague.view.interact.drill);
     }
 
-    /// 🔴 意图合同拿不到时走**确定性兜底**，不是直接反问（`AGENT-ARCHITECTURE §3.1` 原话：
-    /// 「已有确定性路径仍可尝试，但只能标记为 review」）。
+    /// 🔴 双臂裁决的四条不变量（2026-08-14 架构改造后重写；守的性质一条没少）。
     ///
-    /// 由来：fast 模型偶发吐 `mode=unknown`，同一句「潍坊程祥商贸有限公司，本月的数据」
-    /// 问三次得到 反问 / 实体卡 / 实体卡（2026-08-13 实测）。同题不同答比答错更伤信任。
-    /// 分档必须保住：Knowledge/Hybrid 仍直接澄清（数据成员回答不了文档问题，硬答就是编）。
+    /// ① 合同拿不到（`Unknown`）时走**确定性兜底**而不是直接反问 —— fast 模型偶发吐
+    ///    `mode=unknown`，同一句「潍坊程祥商贸有限公司，本月的数据」问三次得到
+    ///    反问/实体卡/实体卡（2026-08-13 实测）。同题不同答比答错更伤信任。
+    /// ② 资料问句的问数臂**不许开自由 SQL**（数据成员回答不了文档问题，硬答就是编）。
+    ///    改造前这条靠「Knowledge 直接出澄清卡」实现，代价是「浏阳品元商贸」这类
+    ///    库里有客户卡的问句整轮拿不到答案；现在靠 `deterministic_fallback` 实现 ——
+    ///    确定性成员照跑，自由 SQL 仍然关死。
+    /// ③ Hybrid 合同只能由 `hybrid::run` 出手，不许落进两臂档。
+    /// ④ 兜底档摘掉 `llm` 成员。
     #[test]
-    fn unknown_intent_falls_back_to_deterministic_members_not_a_question_card() {
+    fn dual_arm_dispatch_keeps_the_four_invariants() {
         let src = include_str!("ask.rs");
-        let body = src
+        let dispatch = src
             .split("pub async fn ask_prepared(")
             .nth(1)
             .expect("ask_prepared 改名了")
-            .split("
-async fn ")
+            .split("pub(crate) async fn ask_data_arm(")
             .next()
-            .unwrap();
+            .expect("ask_data_arm 改名了");
+        // ①②：Data 之外（Unknown / Knowledge）一律进兜底档
         assert!(
-            body.contains("IntentRoute::Unknown => true"),
-            "Unknown 不再走确定性兜底 —— 模型一次抖动就把答得出的题变反问：{body}"
+            dispatch.contains("let deterministic_fallback = prepared.route() != R::Data;"),
+            "Unknown/Knowledge 的自由 SQL 闸门没了：{dispatch}"
+        );
+        // ③
+        assert!(
+            dispatch.contains("crate::hybrid::run(d, p, prepared, explicit_ds)"),
+            "Hybrid 没有走 agent 的编排：CLI/判官与 HTTP 又会行为相反：{dispatch}"
+        );
+        // 两臂并行是本函数的全部产出；不许再出现「选中谁就只跑谁」的早返回
+        assert!(
+            dispatch.contains("crate::hybrid::dual(d, p, prepared, explicit_ds, deterministic_fallback)"),
+            "裁决没有交给两臂编排：{dispatch}"
         );
         assert!(
-            body.contains("IntentRoute::Knowledge => {"),
-            "Knowledge 必须仍走澄清，不许被数据成员硬答：{body}"
+            !dispatch.contains("knowledge_only("),
+            "资料问句又被单臂化了 —— 那正是「浏阳品元商贸」拿不到客户卡的成因：{dispatch}"
         );
-        // Hybrid 已收进 agent 执行（`hybrid::run` 两路并行），不再与 Knowledge 同走澄清 ——
-        // 但它**只能**由 hybrid 编排出手，不许落进下面的确定性兜底档。
+        // ④：兜底档摘自由 SQL 成员，判据留在问数臂里
+        let arm = src.split("pub(crate) async fn ask_data_arm(").nth(1).expect("ask_data_arm 改名了");
         assert!(
-            body.contains("crate::hybrid::run(d, p, prepared, explicit_ds)"),
-            "Hybrid 没有走 agent 的编排：CLI/判官与 HTTP 又会行为相反：{body}"
+            arm.contains(r#"m.route() != "llm""#),
+            "兜底档必须摘掉自由 SQL 成员（没有合同不许生成新 SQL 形态）：{arm}"
         );
+    }
+
+    /// 两臂合成的保守边界：**只有问数臂有实质时原样返回**，与改造前逐字节一致。
+    /// 这条不是风格洁癖 —— 79 条回归判据与前端渲染都按「普通问数结果 subs 为空」写的。
+    #[test]
+    fn dual_only_wraps_when_both_arms_have_substance() {
+        let src = include_str!("hybrid.rs");
+        let dual = src.split("pub async fn dual(").nth(1).expect("dual 改名了");
         assert!(
-            body.contains(r#"m.route() != "llm""#),
-            "兜底档必须摘掉自由 SQL 成员（没有合同不许生成新 SQL 形态）：{body}"
+            dual.contains("Ok(fuse(outcome, prepared))"),
+            "两臂合成必须走 fuse（主体保留 + kb 挂附加字段）：{dual}"
         );
+        let outcome = src.split("pub async fn dual_outcome(").nth(1).expect("dual_outcome 改名了");
+        assert!(outcome.contains("tokio::join!(data_fut, kb_fut)"), "两臂必须并行：{outcome}");
+        // 主体不许被 compound 壳吃掉：那会让 row_count 归零、导出/解读按钮消失、收据变空
+        let fuse = src
+            .split("fn fuse(outcome: HybridOutcome")
+            .nth(1)
+            .expect("fuse 改名了")
+            .split("
+}
+")
+            .next()
+            .expect("fuse 函数体没有闭合");
+        assert!(fuse.contains("r.kb = knowledge;"), "资料半必须挂在 kb 附加字段上：{fuse}");
+        assert!(
+            !fuse.contains("AskResult::compound"),
+            "问数主体又被套进 compound 容器了 —— 79 题回归会红 68 题：{fuse}"
+        );
+        // 反问/出界/不可计算/空结果都不算「答出东西了」
+        let substance = src.split("fn data_has_substance(").nth(1).expect("data_has_substance 改名了");
+        for marker in ["NEED_INTENT", "NO_TOPIC", "is_unavailable_card_result"] {
+            assert!(substance.contains(marker), "「答不了」的说法漏了 {marker}：{substance}");
+        }
+    }
+
+    #[test]
+    fn ask_single_falls_back_to_a_clarification_card_when_no_member_accepts() {
+        let src = include_str!("ask.rs");
         // 一个成员都没接住时回澄清卡而不是 bail 成 500
         let single = src.split("async fn ask_single(").nth(1).expect("ask_single 改名了");
         assert!(

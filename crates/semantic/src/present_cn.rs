@@ -78,6 +78,65 @@ const GENERIC_COL_NAMES: &[(&str, &str)] = &[
     ("mobile", "手机号"),
 ];
 
+/// 销售订单状态码表 —— **全仓唯一事实源**，形状对齐 `seed_defs` 的 `(中文名, 码)`。
+///
+/// 此前它有两份且都不完整：`fastpath::template::sales_status_sql` 里一段 16 臂 `CASE`
+/// （只有「SQL 自己翻译」的那条路能出中文），`meta.value_map` 种子里只播了 3 档
+/// （0/108/199）。生产轻点查按物理列取数、不经过那段 SQL，命中「已登记但无此码」
+/// 直接原样输出 —— 业主截图里单据卡上那个裸 `101` 就是这么来的。
+///
+/// 这 16 档不是臆造：它们是生产 SQL 里跑了很久的那段 `CASE` 的逐字搬运。
+/// 播进 `meta.value_map` 后**两个方向**同时通了 —— 展示侧码→名，问句侧名→码
+/// （「待备货的订单」这类问法此前换不出码）。
+pub const SALES_ORDER_STATUS: &[(&str, &str)] = &[
+    ("暂存", "0"),
+    ("未支付", "100"),
+    ("待备货", "101"),
+    ("备货中", "102"),
+    ("等待配送", "103"),
+    ("交易完成", "104"),
+    ("待核销", "105"),
+    ("售后中", "106"),
+    ("已退款", "107"),
+    ("已取消", "108"),
+    ("部分收货", "109"),
+    ("待收货", "110"),
+    ("部分发货", "111"),
+    ("取消中", "150"),
+    ("取消失败-退款失败", "151"),
+    ("已删除", "199"),
+];
+
+/// 客户分类码表（`t_customer.customer_class`）。形状同 [`SALES_ORDER_STATUS`]：`(中文名, 码)`。
+///
+/// 与 order_status 修前完全同型 —— 此前这 7 档在 `agent::answerers::entity` 与
+/// `semantic::seed_defs` 各嵌一份 SQL `CASE`，于是点查路以外的展示、以及问句侧
+/// 「货架店铺的客户」名→码，全都拿不到。
+pub const CUSTOMER_CLASS: &[(&str, &str)] = &[
+    ("货架店铺", "01"),
+    ("新媒体店铺", "02"),
+    ("社团店铺", "03"),
+    ("线下客户", "04"),
+    ("内部客户", "05"),
+    ("其他财务专用", "06"),
+    ("外部客户的店铺", "99"),
+];
+
+/// 客户类型码表（`t_customer.customer_type`）。
+pub const CUSTOMER_TYPE: &[(&str, &str)] = &[
+    ("一般销售客户", "Z001"),
+    ("财务专用客户", "Z002"),
+    ("关联方客户", "Z003"),
+    ("货架店铺", "Z004"),
+    ("客户终端仓", "Z005"),
+];
+
+/// 商品上架状态（`t_goods.on_sale`）。
+pub const GOODS_ON_SALE: &[(&str, &str)] = &[("已上架", "1"), ("未上架", "0")];
+
+/// 商品冻结状态（`t_goods.frozen_state`）。
+pub const GOODS_FROZEN: &[(&str, &str)] = &[("已冻结", "1"), ("正常", "0")];
+
 /// snake_case 词元 → 中文。**全部词元命中才拼接**（见文件头 ③）。
 const TOKEN_DICT: &[(&str, &str)] = &[
     ("order", "订单"),
@@ -604,6 +663,8 @@ fn translate_like(s: &str, entries: &[CodeEntry]) -> Option<String> {
     flush(&mut token, &mut out, &mut hit);
     hit.then_some(out)
 }
+
+
 
 /// 省份区划码列的列名判据（值那半是 34 省码精确命中，两道闸一起才翻）。
 fn looks_like_province_col(col: &str) -> bool {

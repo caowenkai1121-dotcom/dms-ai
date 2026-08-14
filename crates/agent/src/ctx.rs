@@ -165,6 +165,19 @@ pub struct AskResult {
     /// 面向回归和用户诊断的非敏感意图收据；不含 prompt、SQL AST 或内部实体 ID。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent_summary: Option<IntentSummary>,
+    /// **知识库半**（两臂并行的产物）。`None` = 本轮资料侧没有实质内容，整键不上线，
+    /// 老消费者逐字节不变。
+    ///
+    /// 🔴 为什么是一个附加字段而不是把两半折成 `compound`：`compound` 容器把顶层
+    /// `sql`/`columns`/`rows`/`row_count`/`view` 全部清空（`row_count` 恒 0），于是
+    /// 「导出 CSV」「AI 解读」两个按钮消失、收据变空、`tools/regression.py` 的 15 个断言里
+    /// 有 13 个读的正是这几个顶层字段（实测 79 题会红 68 题）。
+    ///
+    /// 键名 `kb` 是**既有协议**：混合问句的 `hybrid_payload` 早就手工塞
+    /// `v["kb"]`，前端 `App.vue` 的 `t.result?.kb` 分支已经在渲染它（含引用角标与
+    /// 「下载原件」按钮）—— 所以这条改动前端零改。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kb: Option<dms_kernel::Answer>,
 }
 
 /// 反问候选（need-intent）：`label` 是短标签（≤6 字预期），`question` 是可直接重发的完整问句。
@@ -279,6 +292,7 @@ impl AskResult {
             value_labels: vec![],
             sales_context: None,
             intent_summary: None,
+            kb: None,
         }
     }
 }
@@ -337,6 +351,7 @@ pub fn table_answer(
         value_labels: vec![],
         sales_context: None,
         intent_summary: None,
+        kb: None,
     }
 }
 
@@ -1198,6 +1213,7 @@ mod tests {
             value_labels: vec![],
             sales_context: None,
             intent_summary: None,
+            kb: None,
         };
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("caliber_note").is_none(), "{j}");
@@ -1306,6 +1322,7 @@ mod tests {
             value_labels: vec![ValueLabel { column: "状态".into(), code: "100".into(), label: "待审核".into() }],
             sales_context: None,
             intent_summary: None,
+            kb: None,
         };
         let j = serde_json::to_value(&r).unwrap();
         assert_eq!(j["clarify_options"], serde_json::json!([{"label": "销售表现", "question": "本月销售额是多少"}]));

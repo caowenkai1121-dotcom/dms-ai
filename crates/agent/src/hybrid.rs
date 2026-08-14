@@ -16,7 +16,7 @@
 use dms_kernel::Answer;
 use dms_policy::principal::Principal;
 
-use crate::ask::{ask_prepared, AskDeps, PreparedQuestion};
+use crate::ask::{ask_data_arm, AskDeps, PreparedQuestion};
 use crate::ctx::AskResult;
 use crate::intent::{IntentRoute, RoutedQuestion};
 
@@ -104,8 +104,10 @@ pub async fn run(
     // 多条问数子问**彼此也并行**：它们各自打一次库，串行等于白等（与 compound 同一条）。
     let data_fut = async {
         let mut out = Vec::with_capacity(data_prepared.len());
+        // 走**问数臂**而不是 `ask_prepared`：后者现在自己会并行点一次知识库，
+        // typed 子问再各点一次就是 N+1 次检索 + N+1 次生成（合同已经把资料半单独拆出来了）。
         for r in futures::future::join_all(
-            data_prepared.iter().map(|q| Box::pin(ask_prepared(d, p, q, explicit_ds))),
+            data_prepared.iter().map(|q| Box::pin(ask_data_arm(d, p, q, explicit_ds, false))),
         )
         .await
         {
@@ -157,6 +159,160 @@ pub async fn run(
     Ok(HybridOutcome { data, knowledge, summary, clarification: None })
 }
 
+
+/// ★ **两臂并行**：一句问句同时走问数与知识库，两边都有实质内容时合成一份答案。
+///
+/// ## 它替换了什么
+///
+/// 此前 `ask_prepared` 顶上是一段五选一的分派：判 `Knowledge` 就**只**问知识库，
+/// 判 `Data` 就**只**问数。分类器错一次，用户整轮拿不到本来存在的答案 ——
+/// 业主 2026-08-14 实测「线下-浏阳品元商贸有限公司」被判资料问句，知识库如实答
+/// 「知识库里没有这家公司的规定」，而这家公司在业务库里有客户卡，一个字没提。
+///
+/// ## 合成纪律（保守，不改既有形状）
+///
+/// | 两臂状态 | 产物 |
+/// |---|---|
+/// | 都有实质 | `compound` 容器（问数半 + 资料半）+ AI 综合落 `view.insight` |
+/// | 只有问数 | **问数结果原样返回** —— 与改造前逐字节相同 |
+/// | 只有资料 | 资料结果（route = `knowledge`） |
+/// | 都没有 | 问数臂那张卡（它至少解释了为什么答不了）；问数臂报错才澄清 |
+///
+/// 「只有问数时原样返回」是刻意的：绝大多数问数题知识库里本来就没有对应资料，
+/// 这一档必须与改造前逐字节一致，否则 79 条回归判据和前端渲染要跟着一起改。
+///
+/// ## 代价
+///
+/// 每一问多一次知识库检索。知识库那边模型给不出带角标的结论时会返回
+/// [`dms_knowledge::answer::NO_HIT`]，这一档**不进合成**、也不影响主答案。
+pub async fn dual(
+    d: &AskDeps<'_>,
+    p: &Principal,
+    prepared: &PreparedQuestion,
+    explicit_ds: Option<&str>,
+    deterministic_fallback: bool,
+) -> anyhow::Result<AskResult> {
+    let outcome = dual_outcome(d, p, prepared, explicit_ds, deterministic_fallback).await?;
+    Ok(fuse(outcome, prepared))
+}
+
+/// 两臂产物 → 一份 `AskResult`。**问数半在就以它为主体**，资料半挂 [`AskResult::kb`]。
+///
+/// 🔴 不套 `compound` 壳（2026-08-14 实测过代价）：容器会把顶层
+/// `sql`/`columns`/`rows`/`row_count`/`view` 全清空，于是「导出 CSV」「AI 解读」消失、
+/// 收据变空，`tools/regression.py` 79 题里 68 题当场红。
+/// 真正的复合问句（Hybrid 合同 typed 拆出多条问数子问）仍走 [`into_ask_result`] ——
+/// 那一档本来就有多个子结果，容器是它的正确载体。
+fn fuse(outcome: HybridOutcome, prepared: &PreparedQuestion) -> AskResult {
+    if let Some(card) = outcome.clarification {
+        return card;
+    }
+    let HybridOutcome { data, knowledge, summary, .. } = outcome;
+    let Some(mut r) = data else {
+        return into_ask_result(
+            HybridOutcome { data: None, knowledge, summary, clarification: None },
+            prepared,
+        );
+    };
+    if knowledge.is_some() {
+        r.kb = knowledge;
+        // AI 综合落 `view.insight`，与混合问句同一个键位。已有洞察（SuperSonic textSummary）
+        // 不覆盖：那是对**数据**的解读，综合是对两侧的解读，覆盖掉等于丢一条。
+        if r.view.insight.is_none() {
+            r.view.insight = summary;
+        }
+    }
+    r
+}
+
+/// [`dual`] 的**类型化**出口：wire 形状归协议层。
+///
+/// HTTP 面把资料半塞进 `v["kb"]`（引用角标要能点开，`Answer` 必须整份过去），
+/// CLI/判官那条路只需要「资料半答了什么」。两条路必须来自**同一次执行** ——
+/// 这正是 `hybrid::run` 当初收口的理由，`dual` 不许再破一次。
+pub async fn dual_outcome(
+    d: &AskDeps<'_>,
+    p: &Principal,
+    prepared: &PreparedQuestion,
+    explicit_ds: Option<&str>,
+    deterministic_fallback: bool,
+) -> anyhow::Result<HybridOutcome> {
+    let data_fut = ask_data_arm(d, p, prepared, explicit_ds, deterministic_fallback);
+    let kb_fut = async {
+        let kb = d.kb.as_ref()?;
+        crate::answerers::knowledge::answer(
+            kb.owned,
+            d.embed,
+            &**d.llm,
+            p,
+            kb.space,
+            &prepared.effective_question,
+            kb.weights,
+        )
+        .await
+        // 一路挂了不拖死另一路（与 `run` 同族纪律）
+        .map_err(|e| tracing::warn!(err = %e, "两臂并行：知识库路失败 → 只用问数半"))
+        .ok()
+    };
+    // 两路**并行**：总耗时 = 较大者，不是相加
+    let (data_r, knowledge) = tokio::join!(data_fut, kb_fut);
+    let knowledge = knowledge.filter(kb_has_substance);
+
+    let only_kb = |a| HybridOutcome {
+        data: None,
+        knowledge: Some(a),
+        summary: None,
+        clarification: None,
+    };
+    let data = match data_r {
+        Ok(r) => r,
+        Err(e) => {
+            // 两路皆挂才上抛（fail-closed，不伪造半个答案）
+            let Some(a) = knowledge else { return Err(e) };
+            tracing::warn!(err = %e, "两臂并行：问数路失败 → 只用资料半");
+            return Ok(only_kb(a));
+        }
+    };
+    let Some(a) = knowledge else {
+        return Ok(HybridOutcome {
+            data: Some(data),
+            knowledge: None,
+            summary: None,
+            clarification: None,
+        });
+    };
+    // 问数臂只会说「我答不了」时不并排展示：一张反问卡配一份真资料，
+    // 合成出来的「综合结论」会让用户以为数据侧也确认了什么。
+    if !data_has_substance(&data) {
+        return Ok(only_kb(a));
+    }
+    let summary =
+        crate::compound::hybrid_summary(&**d.llm, &prepared.effective_question, &data, &a).await;
+    Ok(HybridOutcome { data: Some(data), knowledge: Some(a), summary, clarification: None })
+}
+
+/// 问数臂**答出东西了**吗。反问卡、出界卡、不可计算卡与空结果都不算 ——
+/// 它们是「我答不了」的四种说法，不该和一份真资料并排展示成「综合结论」。
+fn data_has_substance(r: &AskResult) -> bool {
+    if matches!(r.route.as_str(), crate::ask::NEED_INTENT | crate::ask::NO_TOPIC)
+        || crate::ask::is_unavailable_card_result(r)
+    {
+        return false;
+    }
+    r.row_count > 0 || !r.subs.is_empty() || !r.view.blocks.is_empty()
+}
+
+/// 资料臂**答出东西了**吗。判据只有一条：模型给不出任何带角标的结论时，
+/// `finalize_markdown` 会把整份答案换成 [`dms_knowledge::answer::NO_HIT`]。
+/// 拿它当界比任何相关度阈值都可靠 —— RRF 融合分不是标定过的相关度，阈值切不准。
+fn kb_has_substance(a: &Answer) -> bool {
+    match &a.body {
+        dms_kernel::AnswerBody::Text { markdown, citations } => {
+            !citations.is_empty() && !markdown.trim().starts_with(dms_knowledge::answer::NO_HIT)
+        }
+        _ => true,
+    }
+}
 
 /// 纯资料问句（`IntentRoute::Knowledge`）：直接走知识库半。
 ///

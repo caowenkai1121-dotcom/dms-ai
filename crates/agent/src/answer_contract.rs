@@ -55,6 +55,9 @@ struct QualitativeClaim {
 #[derive(Clone, Debug)]
 struct ChineseNumberClaim {
     raw: String,
+    /// 中文数字**本体**的字节区间（不含单位）。归一只改这一段，单位原样留着，
+    /// 数字与单位仍然紧邻 —— 单位识别照旧走 `extract_numeric_claims` 那一份。
+    digits: std::ops::Range<usize>,
 }
 
 /// 一条只能在其自身作用域内使用的已验证事实。表格事实按“单元格”原子化，避免同一行的
@@ -319,15 +322,18 @@ impl AnswerContract {
         }
 
         let masked = mask_references(text, &references);
+        // 🔴 中文数字先归一成阿拉伯数字，与阿拉伯数字走**同一条**核验路（2026-08-14）。
+        // 此前任何中文数字都被判「暂不能精确核验」→ validate 失败 → 重试 → 再失败 →
+        // 整篇 AI 文案丢掉，而 `dms_kernel::nl::time::cn_num` 一直躺在仓里能精确换算。
+        // 换算不出的（「数十」「几」「三百」）仍然落到下面的 error，安全性一分没减。
+        let (masked, unparsed_chinese) = normalize_chinese_numerals(&masked);
         let all_claims = extract_numeric_claims(&masked);
         let all_qualitative = extract_qualitative_claims(&masked);
-        let chinese_numbers = extract_chinese_number_claims(&masked);
         let mut associated = Vec::<(usize, usize)>::new();
         let mut associated_qualitative = Vec::<(usize, usize)>::new();
-        for claim in chinese_numbers {
+        for raw in unparsed_chinese {
             errors.push(format!(
-                "中文数字 {} 暂不能精确核验，请改用阿拉伯数字并引用事实",
-                claim.raw
+                "中文数字 {raw} 暂不能精确核验，请改用阿拉伯数字并引用事实"
             ));
         }
         let groups = reference_groups(&references, text);
@@ -701,6 +707,43 @@ fn fact_qualitative_kinds(fact: &VerifiedFact) -> Vec<QualitativeKind> {
         .map(|claim| claim.kind)
         .collect()
 }
+/// 中文数字 → 阿拉伯数字的**等字节长度**归一（`三个月` → `  3个月`）。
+///
+/// 只改 [`extract_chinese_number_claims`] 已经认定的片段 —— 那道抽取本来就带上下文闸
+/// （前后必须是边界字符、后面必须紧跟已登记单位）。无差别替换会把「占了**一**半」
+/// 「**一**致」「第**一**」里的汉字也当成数字，把一句好好的解读改成含假数字的句子。
+///
+/// 等字节长是硬要求：`validate` 里 `groups` 的下标来自**原文** `text`，而 `clause_start`
+/// 吃的是归一后的串，两者必须逐字节对齐（`mask_references` 也是等长替换）。
+/// 汉字 3 字节、目标数字最多 2 位，永远填得下；补位补在**前面**
+/// —— 补在后面会把数字与单位隔开（`3  个月`），单位识别当场失效。
+///
+/// 返回 `(归一后的文本, 换算不出的片段)`。换算能力就是
+/// [`dms_kernel::nl::time::cn_num`] 的能力（1~99）；`一百万`/`数十` 这类原样留下，
+/// 由调用方照旧判「不能精确核验」——安全性一分没减。
+fn normalize_chinese_numerals(masked: &str) -> (String, Vec<String>) {
+    let mut out = masked.to_string();
+    let mut unparsed = Vec::new();
+    // 从后往前替换：前面的字节区间不会被后面的替换挪位（等长其实也不会挪，
+    // 但倒序是这类原地改写的既定纪律，别让后来者去证明「等长所以顺序无关」）
+    let mut claims = extract_chinese_number_claims(masked);
+    claims.sort_by_key(|claim| std::cmp::Reverse(claim.digits.start));
+    for claim in claims {
+        let run = &masked[claim.digits.clone()];
+        // `〇` 不在 `cn_num` 的表里，先归一成 `零`（同一个零的两种写法）
+        let Some(n) = dms_kernel::nl::time::cn_num(&run.replace('〇', "零")) else {
+            unparsed.push(claim.raw);
+            continue;
+        };
+        let digits = n.to_string();
+        debug_assert!(run.len() >= digits.len(), "中文数字段必然不短于阿拉伯写法");
+        let mut replacement = " ".repeat(run.len() - digits.len());
+        replacement.push_str(&digits);
+        out.replace_range(claim.digits, &replacement);
+    }
+    debug_assert_eq!(out.len(), masked.len(), "中文数字归一必须等字节长");
+    (out, unparsed)
+}
 
 fn extract_chinese_number_claims(text: &str) -> Vec<ChineseNumberClaim> {
     const DIGITS: &str = "零〇一二两三四五六七八九十百千";
@@ -740,6 +783,7 @@ fn extract_chinese_number_claims(text: &str) -> Vec<ChineseNumberClaim> {
         }
         out.push(ChineseNumberClaim {
             raw: text[start..end].to_string(),
+            digits: start..digit_end,
         });
     }
     out
@@ -1345,16 +1389,38 @@ mod tests {
         assert!(multiple.validate("会员返利为2倍。").is_err());
     }
 
+    /// 中文数字**能换算就走与阿拉伯数字同一条核验路**，换不出才判不可核验。
+    ///
+    /// 🔴 2026-08-14 之前这里是「见到中文数字一律判死」：模型写一句「保修期为三个月」，
+    /// 哪怕原文白纸黑字写着 3 个月，validate 也失败 → 重试 → 再失败 → **整篇 AI 文案丢**。
+    /// 而 `dms_kernel::nl::time::cn_num` 一直躺在仓里能精确换算 1~99。
     #[test]
-    fn chinese_numbers_are_rejected_until_they_can_be_exactly_parsed() {
+    fn chinese_numbers_go_through_the_same_check_once_they_parse() {
         let mut contract = AnswerContract::new();
         contract.push_table("Q", "销售额", &["销售额".into()], &[vec![Value::from(1_000_000)]], 5);
+        // 「一百万」超出 cn_num 的 1~99 → 仍判不可核验（安全性一分没减）
         assert!(contract.validate("销售额为一百万元[Q:F001]。").is_err());
 
         let mut duration = AnswerContract::new();
         duration.push_text("KB", "保修规定", "整机保修期为1年，易损件保修期为3个月。");
-        assert!(duration.validate("整机保修期为一年[KB:F001]。").is_err());
-        assert!(duration.validate("易损件保修期为三个月[KB:F002]。").is_err());
+        assert!(
+            duration.validate("整机保修期为一年[KB:F001]。").is_ok(),
+            "原文写着 1 年，模型用中文写「一年」不该被判死"
+        );
+        assert!(
+            duration.validate("易损件保修期为三个月[KB:F002]。").is_ok(),
+            "原文写着 3 个月，模型用中文写「三个月」不该被判死"
+        );
+        // 换算得出但原文不支持 → 照旧判错（这才是这道闸真正该拦的）
+        assert!(
+            duration.validate("整机保修期为五年[KB:F001]。").is_err(),
+            "换算出来的数字对不上事实必须拦住"
+        );
+        // 「一半」「第一」这类不是数字，归一不许碰（碰了会把好句子改成含假数字的句子）
+        assert!(
+            duration.validate("整机与易损件的规定不一致，需核实。").is_ok(),
+            "普通汉字里的「一」不是数字"
+        );
         assert!(
             duration.validate("这是一个可以核验的结论。").is_err(),
             "普通汉字不应被误判为中文数字，但‘可以’属于受控定性业务断言"

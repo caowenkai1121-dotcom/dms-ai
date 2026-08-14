@@ -283,25 +283,25 @@ impl Reading<'_> {
 const DEVICE_STORY_TERMS: &[&str] = &[
     "免押", "授信", "铺货", "合同押金", "风险阈值", "客服支持", "物流响应", "强烈设备需求", "合规性",
 ];
-/// 无证据的经营风险断言
-const UNSUPPORTED_RISK_TERMS: &[&str] = &["依赖单一", "单一品类风险", "经营风险", "流失风险", "履约风险"];
-/// 无证据的策略建议
-const UNSUPPORTED_STRATEGY_TERMS: &[&str] = &[
-    "资源倾斜", "资源向", "加大投入", "扩大投入", "收缩品类", "巩固优势",
-    "重点投放", "调整策略", "是否可持续", "增长驱动因素", "增长驱动",
-];
-/// 把不同时间窗板块误判成口径冲突
-const CROSS_WINDOW_CONFLICT_TERMS: &[&str] = &["口径差异", "数值量级不一致", "统计口径差异"];
-
 /// 设备订单数据只证明单号、时间、客户、押金金额与状态；不能证明合同/授信/履约安排。
 /// 首次命中会重试一次，重试仍命中则丢弃 AI 文本，确定性 BI 数据照常返回。
+///
+/// 🔴 2026-08-14 删掉了三张**无条件**子串黑名单（`UNSUPPORTED_RISK_TERMS` /
+/// `UNSUPPORTED_STRATEGY_TERMS` / `CROSS_WINDOW_CONFLICT_TERMS`）。它们和本函数保留的
+/// 这条不是一回事：
+///
+/// - 它们没有 `question` 门，命中即整段丢弃深度解读；
+/// - 词表里的词**正是本文件 prompt 要求模型产出的词** —— `SYSTEM_DEEP` 的约束是
+///   *有条件* 的（「只有占比/排行而没有利润、增长和产能证据时，禁止建议资源倾斜…」），
+///   而黑名单是无条件的。模型拿着利润与增长证据合规地写「资源倾斜」，照样被杀；
+/// - 「有没有证据」已经由 [`AnswerContract::validate`] 按「主体/指标/值三元组必须有事实
+///   支撑」真校验过了 —— 词表是它的劣化重复，且是**假阴性方向**的劣化。
+///
+/// 保留 `device_story` 是因为它有 `question` 门、语义窄，且它挡的是**语料里根本没有的
+/// 事实类别**（合同、授信、免押），不是措辞。
 fn has_unsupported_business_inference(question: &str, text: &str) -> bool {
-    let device_story = (question.contains("设备订单") || question.contains("设备销售单"))
-        && DEVICE_STORY_TERMS.iter().any(|w| text.contains(w));
-    let unsupported_risk = UNSUPPORTED_RISK_TERMS.iter().any(|w| text.contains(w));
-    let unsupported_strategy = UNSUPPORTED_STRATEGY_TERMS.iter().any(|w| text.contains(w));
-    let cross_window_conflict = CROSS_WINDOW_CONFLICT_TERMS.iter().any(|w| text.contains(w));
-    device_story || unsupported_risk || unsupported_strategy || cross_window_conflict
+    (question.contains("设备订单") || question.contains("设备销售单"))
+        && DEVICE_STORY_TERMS.iter().any(|w| text.contains(w))
 }
 
 /// 一次 fast 调用 + 三条降级（调用失败 / 空串 / 含网址 → `None`）。
@@ -767,17 +767,29 @@ mod tests {
         assert!(!SYSTEM_DEEP.contains("## 口径与可信度"), "口径已有独立板块，不应在 AI 分析里重复");
     }
 
+    /// 只剩设备订单那一条**带语境门**的判据。
+    ///
+    /// 🔴 后半段是回归方向的判据：三张无条件中文词黑名单删掉后，普通经营问句下模型
+    /// 合规写出的措辞**不许**再被整段丢弃 —— 它们是 `SYSTEM_DEEP` 自己要求模型产出的词，
+    /// 有没有证据由 `AnswerContract::validate` 按事实三元组判，不由词表判。
     #[test]
     fn device_order_insight_rejects_unproven_business_story() {
         assert!(has_unsupported_business_inference("昨天设备订单", "需核实是否适用特殊免押政策"));
         assert!(has_unsupported_business_inference("设备销售单", "建议检查授信余额"));
         assert!(!has_unsupported_business_inference("昨天设备订单", "押金金额为 0，具体原因需核实"));
         assert!(!has_unsupported_business_inference("销售额", "建议检查授信余额"), "授信词只约束设备订单语境");
-        assert!(has_unsupported_business_inference("本月销售额", "品类集中，存在单一品类风险"));
-        assert!(has_unsupported_business_inference("本月销售额", "主查询与月度趋势数值量级不一致，需确认统计口径差异"));
-        assert!(has_unsupported_business_inference("本月销售额", "建议资源进一步向头部品类倾斜以巩固优势"));
-        assert!(has_unsupported_business_inference("本月销售额", "复盘增长驱动因素，确认是否可持续"));
-        assert!(!has_unsupported_business_inference("本月销售额", "烤肠类占比 46%，建议下钻客户明细核实构成"));
+        for text in [
+            "品类集中，存在单一品类风险",
+            "主查询与月度趋势数值量级不一致，需确认统计口径差异",
+            "建议资源进一步向头部品类倾斜以巩固优势",
+            "复盘增长驱动因素，确认是否可持续",
+            "烤肠类占比 46%，建议下钻客户明细核实构成",
+        ] {
+            assert!(
+                !has_unsupported_business_inference("本月销售额", text),
+                "词表又回来了，模型合规产出被整段丢弃：{text}",
+            );
+        }
     }
 
     /// 降级与精简版同一条路：调用失败 / 含网址 → None（「没有解读」≠「取数失败」）

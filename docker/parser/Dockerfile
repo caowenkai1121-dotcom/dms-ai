@@ -64,7 +64,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #  供应链哈希校验，那要钉全传递依赖的哈希，暂无生成条件。）
 RUN pip install --no-cache-dir \
         pymupdf4llm==0.0.17 pypdf==5.1.0 \
-        python-docx==1.1.2 python-pptx==1.0.2 openpyxl==3.1.5 pillow==11.0.0 \
+        python-docx==1.2.0 python-pptx==1.0.2 openpyxl==3.1.5 pillow==11.0.0 \
         pytesseract==0.3.13
 
 # OCR：tesseract 二进制 + chi_sim 语言包 + pytesseract 包装器（已并入上面 apt/pip 两个合层）。

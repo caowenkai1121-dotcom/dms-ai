@@ -441,7 +441,17 @@ def _p_docx(path):
                 _push(stack, lvl, t)
             out.append(_blk(t, None, stack))
         elif tag == 'tbl':
-            rows = [' | '.join(c.text.strip() for c in r.cells) for r in Table(child, doc).rows]
+            # 按 tblGrid 的**列位**拼，不是按「这行有几个 tc」拼：Word 允许某行晚起步/早收尾
+            # （gridBefore/gridAfter），`_Row.cells` 只给实际存在的单元格 —— 不补空位的话该行整体
+            # 左移一列，「标签」就跟邻行的「值」配上对（实测：开户银行 ↔ 银行账号 两行的值互换）。
+            # 空单元格也**保留占位**（拼成 ` | `）：join 吞掉空串同样会毁掉列位对应关系。
+            # gridSpan/vMerge 由 `_Row.cells` 自己摊平（跨列重复、竖并取上格），这里不用管。
+            # getattr 取值：grid_cols_* 是 python-docx 1.2.0 才有的 API，老版本上退化成旧行为
+            # 而不是 AttributeError（容器镜像的钉版见 docker/parser/Dockerfile，两边须一致）。
+            rows = [' | '.join([''] * getattr(r, 'grid_cols_before', 0)
+                               + [c.text.strip() for c in r.cells]
+                               + [''] * getattr(r, 'grid_cols_after', 0))
+                    for r in Table(child, doc).rows]
             if rows:
                 out.append(_blk('\n'.join(rows), None, stack))
     return out, 0, []

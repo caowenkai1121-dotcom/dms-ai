@@ -946,6 +946,7 @@ fn candidate_card(cx: &AskCtx<'_>, query: &str, candidates: Vec<Candidate>) -> A
         value_labels: vec![],
         sales_context: None,
         intent_summary: None,
+        kb: None,
     }
 }
 
@@ -1175,15 +1176,23 @@ async fn customer_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result
     } else {
         ("", "")
     };
+    // 码表折 SQL：本体在 `present_cn`（点查展示与问句侧名→码共用同一份，见 `SALES_ORDER_STATUS` 那条的由来）
+    let type_case = dms_semantic::fastpath::template::code_case_sql(
+        "c.customer_type",
+        dms_semantic::present_cn::CUSTOMER_TYPE,
+        "NULL",
+    );
+    let class_case = dms_semantic::fastpath::template::code_case_sql(
+        "c.customer_class",
+        dms_semantic::present_cn::CUSTOMER_CLASS,
+        "NULL",
+    );
     let profile_sql = format!(
         "SELECT c.customer_code AS `客户编码`, c.customer_name AS `客户名称`, \
                 COALESCE(c.customer_short_name,'') AS `客户简称`, \
-                COALESCE(CASE c.customer_type WHEN 'Z001' THEN '一般销售客户' WHEN 'Z002' THEN '财务专用客户' \
-                  WHEN 'Z003' THEN '关联方客户' WHEN 'Z004' THEN '货架店铺' WHEN 'Z005' THEN '客户终端仓' END, c.customer_type, '未分类') AS `客户类型`, \
+                COALESCE({type_case}, c.customer_type, '未分类') AS `客户类型`, \
                 COALESCE(NULLIF(c.customer_level,''),'未设置') AS `客户等级`, \
-                COALESCE(CASE c.customer_class WHEN '01' THEN '货架店铺' WHEN '02' THEN '新媒体店铺' \
-                  WHEN '03' THEN '社团店铺' WHEN '04' THEN '线下客户' WHEN '05' THEN '内部客户' \
-                  WHEN '06' THEN '其他财务专用' WHEN '99' THEN '外部客户的店铺' END, c.customer_class, '未分类') AS `客户分类`, \
+                COALESCE({class_case}, c.customer_class, '未分类') AS `客户分类`, \
                 COALESCE(rp.region_name,c.province,'') AS `省份`, COALESCE(rc.region_name,c.city,'') AS `城市`{select_extra}, \
                 COALESCE(c.contacts_name,'') AS `联系人`, \
                 CASE c.is_enable WHEN 1 THEN '启用' WHEN 0 THEN '停用' ELSE COALESCE(c.customer_status,'未设置') END AS `主档状态` \
@@ -1353,6 +1362,17 @@ async fn goods_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Op
     let code = candidate.code.clone();
     let gname = candidate.name.clone();
     let safe_code = esc(&code);
+    // 码表折 SQL：本体在 `present_cn`（同 `SALES_ORDER_STATUS` 那条的由来）
+    let on_sale_case = dms_semantic::fastpath::template::code_case_sql(
+        "g.on_sale",
+        dms_semantic::present_cn::GOODS_ON_SALE,
+        "'未设置'",
+    );
+    let frozen_case = dms_semantic::fastpath::template::code_case_sql(
+        "g.frozen_state",
+        dms_semantic::present_cn::GOODS_FROZEN,
+        "'未设置'",
+    );
     let profile_sql = if cx.source.is_warehouse() {
         format!(
             "SELECT g.goods_code AS `商品编码`, g.goods_name AS `商品名称`, COALESCE(g.brand_name,'') AS `品牌`, \
@@ -1360,8 +1380,8 @@ async fn goods_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Op
                     COALESCE(NULLIF(TRIM(s.class2),''),NULLIF(g.goods_category_name,''),'未分类') AS `商品分类`, \
                     COALESCE(NULLIF(TRIM(s.classfinal),''),'') AS `末级分类`, COALESCE(NULLIF(TRIM(s.product_channel),''),'') AS `产品渠道`, \
                     COALESCE(NULLIF(TRIM(s.materialtype),''),'') AS `物料类型`, \
-                    CASE g.on_sale WHEN 1 THEN '已上架' WHEN 0 THEN '未上架' ELSE '未设置' END AS `销售状态`, \
-                    CASE g.frozen_state WHEN 1 THEN '已冻结' WHEN 0 THEN '正常' ELSE '未设置' END AS `冻结状态`, \
+                    {on_sale_case} AS `销售状态`, \
+                    {frozen_case} AS `冻结状态`, \
                     COALESCE(g.group_number,'') AS `存货组` \
              FROM t_goods g LEFT JOIN DW.dim_sku s ON s.sku_code = g.goods_code \
              WHERE g.deleted_flag = 0 AND g.goods_code = '{safe_code}' LIMIT 1"
@@ -1370,8 +1390,8 @@ async fn goods_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Op
         format!(
             "SELECT g.goods_code AS `商品编码`, g.goods_name AS `商品名称`, COALESCE(g.brand_name,'') AS `品牌`, \
                     COALESCE(g.goods_short_name,'') AS `商品简称`, COALESCE(NULLIF(g.goods_category_name,''),'未分类') AS `商品分类`, \
-                    CASE g.on_sale WHEN 1 THEN '已上架' WHEN 0 THEN '未上架' ELSE '未设置' END AS `销售状态`, \
-                    CASE g.frozen_state WHEN 1 THEN '已冻结' WHEN 0 THEN '正常' ELSE '未设置' END AS `冻结状态`, \
+                    {on_sale_case} AS `销售状态`, \
+                    {frozen_case} AS `冻结状态`, \
                     COALESCE(g.group_number,'') AS `存货组` \
              FROM t_goods g WHERE g.deleted_flag = 0 AND g.goods_code = '{safe_code}' LIMIT 1"
         )
@@ -1663,6 +1683,7 @@ fn build_card(
         value_labels: vec![],
         sales_context: None,
         intent_summary: None,
+        kb: None,
     }
 }
 

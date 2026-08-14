@@ -677,6 +677,7 @@ async fn ask_data_payload(
         None, // ds：小程序侧不提供选源，后端选源（可见源只有一个时直通主源）
         Some(&conv_id_str),
         st.sc_samples,
+        true,
     )
     .await;
     let r = r.map_err(|e| {

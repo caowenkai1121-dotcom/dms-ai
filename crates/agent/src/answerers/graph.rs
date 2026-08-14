@@ -233,6 +233,7 @@ pub async fn try_graph(pg: &PgPool, rel: &Relation, t0: Instant) -> Option<AskRe
         value_labels: vec![],
         sales_context: None,
         intent_summary: None,
+        kb: None,
     })
 }
 

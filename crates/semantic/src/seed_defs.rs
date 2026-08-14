@@ -394,6 +394,9 @@ pub(crate) async fn seed_dimensions(pg: &PgPool) -> anyhow::Result<()> {
          "品牌在商品主档 t_goods.brand_name（明细行无品牌列），连接键 d.sku_code = g.goods_code；空串归'未归属'"),
         ("customer_class", "订单客户分类", &["下单客户分类"],
          "t_sales_order o LEFT JOIN t_customer cus ON cus.customer_code = o.customer_code AND cus.deleted_flag = 0",
+         // 码表本体在 `present_cn::CUSTOMER_CLASS`（与 entity 卡共用一份）。这里是**注册表
+         // 的 agg_expr**，必须是 `&'static str` —— 不能运行时折 SQL，故保留字面量，
+         // 由 `customer_class_case_is_in_sync` 钉住两者一字不差。
          "COALESCE(CASE cus.customer_class WHEN '01' THEN '货架店铺' WHEN '02' THEN '新媒体店铺' WHEN '03' THEN '社团店铺' WHEN '04' THEN '线下客户' WHEN '05' THEN '内部客户' WHEN '06' THEN '其他财务专用' WHEN '99' THEN '外部客户的店铺' END,'未分类')",
          "客户分类=t_customer.customer_class 编码列（字典 key=CustClassif 已坐实：真库 04线下客户占 96%），CASE 翻名免字典 JOIN；NULL 归'未分类'"),
         // 【回归 B06】「各区域经理业绩」原本回落 LLM，LLM 拿 t_customer_online_balance
@@ -574,13 +577,9 @@ pub(crate) async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
         ("t_sales_order", "receiver_province", PROVINCE_CODES, "eq"),
         // 客户分类（字典 CustClassif，与 meta.dimension customer_class 的 CASE 同源）：
         // 「线下客户」这类问法必须换成 '04'，否则 LLM 会去猜别的列（实测猜到了 customer_channel）
-        ("t_customer", "customer_class",
-         &[("货架店铺", "01"), ("新媒体店铺", "02"), ("社团店铺", "03"), ("线下客户", "04"),
-           ("内部客户", "05"), ("其他财务专用", "06"), ("外部客户的店铺", "99")], "eq"),
+        ("t_customer", "customer_class", crate::present_cn::CUSTOMER_CLASS, "eq"),
         // 客户类型（字典 CUST_TYPE）
-        ("t_customer", "customer_type",
-         &[("一般销售客户", "Z001"), ("财务专用客户", "Z002"), ("关联方客户", "Z003"),
-           ("货架店铺", "Z004"), ("客户终端仓", "Z005")], "eq"),
+        ("t_customer", "customer_type", crate::present_cn::CUSTOMER_TYPE, "eq"),
         // 售后类型（SystemConsant.java L148-149 / AfterSalesServiceImpl L1218-1222；Java 无枚举类）
         ("t_after_sales_order_header", "after_sales_type",
          &[("退货", "1"), ("退款", "2"), ("中台售后", "3")], "eq"),
@@ -598,8 +597,13 @@ pub(crate) async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
         // 108=已取消、199=已删除 —— 旧名「无效/作废」由 seed_value_maps 开头的 DELETE 收敛
         // （upsert 键含 name，不删旧行就是两名一码）。Java 侧共 17 档，其余 14 档码名
         // 待源码清单导出后补齐（不臆造）。
-        ("t_sales_order", "order_status",
-         &[("暂存", "0"), ("已取消", "108"), ("已删除", "199")], "eq"),
+        // 🔴 16 档全播（原先只有 3 档）。码表见 `present_cn::SALES_ORDER_STATUS` ——
+        // 生产 SQL 那段 `CASE` 用了很久的同一份，不是臆造。少播的那 13 档正是业主截图里
+        // 单据卡印出裸 `101` 的原因：`translate_cell` 对「已登记但无此码」返回原样。
+        ("t_sales_order", "order_status", crate::present_cn::SALES_ORDER_STATUS, "eq"),
+        // 与 order_status 同一条：码表本体在 `present_cn`，展示侧码→名与问句侧名→码共用。
+        ("t_goods", "on_sale", crate::present_cn::GOODS_ON_SALE, "eq"),
+        ("t_goods", "frozen_state", crate::present_cn::GOODS_FROZEN, "eq"),
         // PayWayEnum：真库有逗号组合值——ZX01 纯值可等值，余额类必须 LIKE 含组合（pitfall 坐实）
         ("t_sales_order", "paid_way", &[("在线支付", "ZX01")], "eq"),
         ("t_sales_order", "paid_way",
@@ -1162,7 +1166,7 @@ mod tests {
             .split("];").next().expect("MAPS 结束锚点不见了")
             .split_whitespace().collect::<String>();
         for frag in [
-            "(\"t_sales_order\",\"order_status\",&[(\"暂存\",\"0\"),(\"已取消\",\"108\"),(\"已删除\",\"199\")]",
+            "(\"t_sales_order\",\"order_status\",crate::present_cn::SALES_ORDER_STATUS",
             "(\"线下销售\",\"SO01\")", "(\"设备\",\"SO04\")", "(\"样品\",\"SO10\")",
             "(\"样品领用\",\"SO12\")", "(\"营销物料\",\"SO15\")", "(\"积分兑换\",\"SO16\")",
             "(\"t_sales_order\",\"paid_status\",&[(\"未支付\",\"0\"),(\"已支付\",\"1\"),(\"支付中\",\"2\")]",
@@ -1174,6 +1178,26 @@ mod tests {
         // 旧名不许留在 MAPS 里（否则与正名两名一码）；DELETE 收敛清单必须在
         assert!(!maps.contains("(\"无效\",\"108\")") && !maps.contains("(\"作废\",\"199\")")
             && !maps.contains("(\"商品行\",\"1\")"), "旧名还在 MAPS 里");
+        // 码表本体改由常量承载：这里断言它的完整性（原先只播 3 档，裸 `101` 就是这么漏的）
+        let book = crate::present_cn::SALES_ORDER_STATUS;
+        assert_eq!(book.len(), 16, "订单状态 16 档少了：{book:?}");
+        for (name, code) in [("暂存", "0"), ("待备货", "101"), ("已取消", "108"), ("已删除", "199")] {
+            assert!(book.contains(&(name, code)), "订单状态缺 {name}({code})");
+        }
+        assert!(!book.iter().any(|(n, _)| *n == "无效" || *n == "作废"), "旧名不许回到码表");
+
+        // 客户分类码表：`seed_defs` 的 agg_expr 必须是 `&'static str`，折不出来，
+        // 只能保留一份字面量 —— 那就用判据钉住它与码表逐档一致（漂了当场红）。
+        let expr = src
+            .split("(\"customer_class\", \"订单客户分类\"")
+            .nth(1)
+            .expect("订单客户分类维度没了");
+        for (name, code) in crate::present_cn::CUSTOMER_CLASS {
+            assert!(
+                expr.contains(&format!("WHEN '{code}' THEN '{name}'")),
+                "customer_class 的 SQL CASE 与 present_cn::CUSTOMER_CLASS 漂了：缺 {name}({code})",
+            );
+        }
         for old in ["(\"t_sales_order\", \"order_status\", \"无效\")",
                     "(\"t_sales_order\", \"order_status\", \"作废\")",
                     "(\"t_sales_order_detail\", \"item_type\", \"商品行\")"] {

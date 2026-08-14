@@ -1112,8 +1112,8 @@ fn validate_evidence_insight_with_facts(
             return None;
         }
     }
-    if contains_chinese_numeric_claim(text) {
-        tracing::warn!("ANALYSIS_CHINESE_NUMBER_UNVERIFIED：中文数字当前不能可靠归一 → 整段分析判失败");
+    if let Some(raw) = unparsable_chinese_number(text) {
+        tracing::warn!(raw = %raw, "ANALYSIS_CHINESE_NUMBER_UNVERIFIED：中文数字不能精确归一 → 整段分析判失败");
         return None;
     }
     if !facts.is_empty() {
@@ -1291,19 +1291,31 @@ fn metric_phrase_matches(phrase: &str, terms: &[String]) -> bool {
         })
 }
 
-/// 可靠中文数值换算尚未进入权威合同前，宁可回退确定性摘要，也不让“一百万元/三个月”
-/// 绕过只识别 ASCII 数字的数值闸。普通“第一/二级”等非量化序号不在这条最小判据内。
-fn contains_chinese_numeric_claim(text: &str) -> bool {
+/// 换算不出的中文数值（`一百万元` / `数十家`）→ 回退确定性摘要，不让它绕过只识别
+/// ASCII 数字的数值闸。
+///
+/// 🔴 换算**得出**的（`三个月` / `一年`，1~99）不再一票否决：`dms_kernel::nl::time::cn_num`
+/// 精确转得出，`agent::answer_contract` 已经把它们归一后送进与阿拉伯数字同一条核验路。
+/// 这里此前是仓里第三份中文数字探测器（`DIGITS`/`UNITS` 与另外两份逐字不同），
+/// 于是「模型写中文数字」这件事在三个地方有三种判法。现在只剩「能不能换算」一个判据。
+fn unparsable_chinese_number(text: &str) -> Option<String> {
     const DIGITS: &str = "零〇一二两三四五六七八九十百千万亿点半";
     const UNITS: [&str; 19] = [
         "元", "万元", "亿元", "个", "件", "家", "单", "笔", "次", "台", "箱", "天", "日", "周", "月", "年", "倍", "成", "百分之",
     ];
     text.split(|c: char| c.is_whitespace() || "，。；：、|()（）[]【】".contains(c))
-        .any(|part| {
-            part.chars().any(|c| DIGITS.contains(c))
-                && UNITS.iter().any(|unit| part.contains(unit))
-                && !part.chars().any(|c| c.is_ascii_digit())
+        .find(|part| {
+            if part.chars().any(|c| c.is_ascii_digit())
+                || !UNITS.iter().any(|unit| part.contains(unit))
+            {
+                return false;
+            }
+            // 片段里**任意一段**连续中文数字换算不出，就算不可核验
+            // （`销售额为一百万元` 的数字段是「一百万」，不在片段开头）
+            let mut runs = part.split(|c: char| !DIGITS.contains(c)).filter(|run| !run.is_empty());
+            runs.any(|run| dms_kernel::nl::time::cn_num(&run.replace('〇', "零")).is_none())
         })
+        .map(str::to_string)
 }
 
 /// 提取数值 token：连续数字（含千分位/小数/百分号），尾部 万/亿 压缩单位一并保留，
@@ -2141,9 +2153,10 @@ async fn execute_plan_sections(
     rid: &str,
     run: Option<&RunCtx>,
     restored: Option<&[Option<RestoredSection>]>,
-) -> Vec<Section> {
+) -> SectionRun {
     note_sections_planned(rid, sections);
-    ordered_bounded(
+    let titles: Vec<&str> = sections.iter().map(|section| section.title.as_str()).collect();
+    let done = ordered_bounded(
         sections
             .iter()
             .enumerate()
@@ -2171,10 +2184,29 @@ async fn execute_plan_sections(
             })
             .collect(),
     )
-    .await
-    .into_iter()
-    .flatten()
-    .collect()
+    .await;
+    // 🔴 失败板块**点名**，不再 `.flatten()` 静默丢掉（2026-08-14）。
+    //
+    // 业主实测「今年退款额是多少」：3 个板块挂了 2 个，报告里既没有那两块、也没有
+    // 一句话说明它们去哪了 —— 页面只剩一个孤零零的 KPI 和三条红色「未满足」标签。
+    // 用户看到的是「系统给了我一个数，但它自己说没验证过」，而**为什么**没验证过
+    // 只存在于服务端日志里。
+    let failed = titles
+        .iter()
+        .zip(&done)
+        .filter(|(_, out)| out.is_none())
+        .map(|(title, _)| (*title).to_string())
+        .collect();
+    SectionRun { sections: done.into_iter().flatten().collect(), failed }
+}
+
+/// 板块执行结果：跑出来的板块 + **没跑出来**的板块标题。
+///
+/// 两者必须一起走：只带成功的那一半，调用方就没有任何办法把「这块没数据」
+/// 说给用户听，只能让页面静静少一块。
+struct SectionRun {
+    sections: Vec<Section>,
+    failed: Vec<String>,
 }
 
 async fn sub_ask(
@@ -2499,8 +2531,38 @@ fn fmt_metric(label: &str, v: &serde_json::Value) -> String {
         .unwrap_or_else(|| crate::chart_svg::display_value(label, v))
 }
 
+/// 毛利率列判定 —— 与前端 `web/src/format.ts::isGrossMarginLabel` **逐字同源**。
+///
+/// 🔴 2026-08-14：此前后端是窄判据（精确等于「毛利率」/「销售毛利率」），前端是宽判据
+/// （去空白后 `includes('毛利率')`）。列名一旦是变体（品类毛利率 / 平均毛利率），
+/// **同一屏能出两个数**：服务端渲染的分享页 SVG 画 0.2，前端表格画 20%；
+/// 更糟的是喂给 LLM 的证据文本走的是后端这份，模型据此写「毛利率 0.2」，
+/// 与同页表格的 20% 直接打架，而 SQL、行数、口径全对，没有任何判据会红。
+///
+/// 取**宽**的那份（与前端一致）：窄判据漏掉的都是真毛利率列；而「汇率/频率/功率/
+/// 倍率/速率」不含「毛利率」，本来就不会命中。`sales_fact` 登记的别名「毛利占比」
+/// 两份判据原本都漏，这里一并收进来。
 fn is_gross_margin_value_label(label: &str) -> bool {
-    matches!(label.trim(), "毛利率" | "销售毛利率")
+    gross_margin_core(label).is_some()
+}
+
+/// 归一到「这个列名是不是**就是**毛利率」：去空白 → 去尾部括注（`（%）`/`(%)`）→ 去尾部百分号。
+/// 命中条件是**词尾**而不是包含 —— `毛利率可计算覆盖率` 含「毛利率」但它是覆盖率，
+/// 已经是 0~100 的百分数，再 ×100 就是错数（`chart_margin_conversion_...` 钉着这条）。
+fn gross_margin_core(label: &str) -> Option<()> {
+    let mut clean: String = label.chars().filter(|ch| !ch.is_whitespace()).collect();
+    while clean.ends_with('%') || clean.ends_with('％') {
+        clean.pop();
+    }
+    if clean.ends_with('）') || clean.ends_with(')') {
+        if let Some(at) = clean.rfind(['（', '(']) {
+            clean.truncate(at);
+        }
+    }
+    while clean.ends_with('%') || clean.ends_with('％') {
+        clean.pop();
+    }
+    (clean.ends_with("毛利率") || clean.ends_with("毛利占比")).then_some(())
 }
 
 /// 单据头字段 / 实体字段 / 明细列三处投影共用同一展示预算（页面阅读密度合同）。
@@ -2551,8 +2613,13 @@ fn document_evidence(r: &dms_agent::AskResult) -> bool {
         })
 }
 
-/// 单据头卡在附加明细后仍保存在 `view.blocks`；把其中可核查字段提升到 ReportSpec，
-/// 避免深度页只展示明细表而把“是什么单、主表/明细表、客户与状态”藏掉。
+/// 单据/实体头卡在附加明细后仍保存在 `view.blocks`；把它原样提升到 ReportSpec，
+/// 避免深度页只展示明细表而把「是什么单、客户、状态、金额」藏掉。
+///
+/// 🔴 Document 分支**曾经**另有一张 26 条别名表，按写死的标签去捞字段。它与
+/// `semantic::present_cn` 的列名中文化不是同一套词（`present_cn` 出「客户名称」，
+/// 别名表找「客户」），对不上的字段被静默丢弃 —— 业主截图里那张只剩表名的销售订单卡
+/// 就是这么来的。两个分支现在共用同一条：**头卡有什么就展示什么**。
 fn primary_facts(r: &dms_agent::AskResult, kind: dms_agent::AnalysisKind) -> Vec<Fact> {
     if !matches!(kind, dms_agent::AnalysisKind::Document | dms_agent::AnalysisKind::Entity) {
         return vec![];
@@ -2566,46 +2633,6 @@ fn primary_facts(r: &dms_agent::AskResult, kind: dms_agent::AnalysisKind) -> Vec
         })
         .cloned()
         .unwrap_or_default();
-    if kind == dms_agent::AnalysisKind::Document {
-        const FIELDS: &[(&str, &[&str])] = &[
-            ("单据类型", &["单据类型"]),
-            ("主表", &["主表", "应查主表"]),
-            ("明细表", &["明细表", "应查明细表"]),
-            ("数据状态", &["数据状态"]),
-            ("售后单号", &["售后单号", "after_sales_code"]),
-            ("销售单号", &["销售单号", "sales_order_code"]),
-            ("需求单号", &["需求单号", "requisition_code"]),
-            ("中台单号", &["中台单号"]),
-            ("基础系统单号", &["基础系统单号"]),
-            ("DMS销售单号", &["DMS销售单号"]),
-            ("客户", &["客户", "customer_name"]),
-            ("门店", &["门店", "shop_name", "store_name"]),
-            ("单据状态", &["单据状态", "订单状态", "after_sales_status", "doc_status"]),
-            ("订单金额", &["订单金额", "total_amount"]),
-            ("实付金额", &["实付金额", "actual_paid_amount"]),
-            ("退款金额", &["退款金额", "refund_amount", "actual_refund_amount"]),
-            ("数量", &["总数量", "total_quantity"]),
-            ("退货原因", &["退货原因", "return_reason", "customer_return_reason"]),
-            ("下单时间", &["下单时间", "order_time"]),
-            ("申请时间", &["申请时间", "after_sales_time", "申请日期"]),
-            ("发货时间", &["发货日期", "ship_at"]),
-            ("设备类型", &["设备类型", "device_type"]),
-            ("投放方式", &["投放方式", "delivery_type"]),
-            ("购置金额", &["购置金额", "purchase_amount"]),
-            ("押金", &["押金", "deposit_amount"]),
-            ("识别依据", &["识别依据"]),
-        ];
-        return FIELDS
-            .iter()
-            .filter_map(|(label, aliases)| {
-                pairs.iter().find(|(key, _)| aliases.contains(&key.as_str())).and_then(|(_, value)| {
-                    let value = fmt_metric(label, value);
-                    (!value.trim().is_empty()).then(|| Fact { label: (*label).into(), value })
-                })
-            })
-            .take(MAX_PRIMARY_FIELDS)
-            .collect();
-    }
     pairs
         .into_iter()
         .filter_map(|(label, value)| {
@@ -2616,54 +2643,57 @@ fn primary_facts(r: &dms_agent::AskResult, kind: dms_agent::AnalysisKind) -> Vec
         .collect()
 }
 
-/// 单据明细在底层保留完整列用于 CSV/SQL 核查，ReportSpec 只投影业务阅读列。
+/// 运维/审计列：任何结果表里它们对业务读者都是噪音。判据按**原始英文列名**与
+/// `present_cn` 可能给出的中文名两套写 —— 中文化发生在这一步之前。
+const HOUSEKEEPING_COLUMNS: &[&str] = &[
+    "id", "version", "revision", "tenant_id",
+    "created_by", "create_by", "creator", "updated_by", "update_by", "modifier",
+    "deleted_flag", "del_flag", "is_deleted",
+    "删除标志", "版本", "租户", "创建人", "更新人",
+];
+
+/// 结果表投影：只摘掉运维列，其余原样带出。
+///
+/// 🔴 这里**曾经**是一张 23 条的白名单，只展示它认识的列。它与 `semantic::present_cn`
+/// 的中文化不是同一套词（`present_cn` 出「客户名称」，白名单找「客户」），对不上的字段
+/// 被整列丢弃 —— 业主截图里那张只剩表名的销售订单卡就是这么来的。
+///
+/// 白名单与黑名单的区别不是风格：白名单默认丢弃**未知**字段，于是每加一个业务列都要
+/// 有人记得来这里补一条，漏补就是静默丢数据；黑名单默认展示，只摘明确无意义的那几个。
+/// CSV 导出与「查看 SQL」不受影响（那两条要的是完整列，核查用）。
 fn primary_display(
     r: &dms_agent::AskResult,
     kind: dms_agent::AnalysisKind,
 ) -> (Vec<String>, Vec<Vec<serde_json::Value>>) {
-    if kind != dms_agent::AnalysisKind::Document {
-        return (r.columns.clone(), r.rows.clone());
-    }
-    const FIELDS: &[(&str, &[&str])] = &[
-        ("明细类型", &["明细类型"]),
-        ("售后单号", &["after_sales_code"]),
-        ("关联销售单", &["sales_order_code", "关联销售单"]),
-        ("商品编码", &["商品编码", "item_code"]),
-        ("SKU编码", &["SKU编码", "sku_code", "设备编码"]),
-        ("商品/设备名称", &["商品名称", "sku_name", "设备名称"]),
-        ("箱规", &["箱规", "box_gauge"]),
-        ("箱数", &["箱数", "box_quantity"]),
-        ("袋数", &["袋数", "bag_quantity"]),
-        ("申请退货箱数", &["applied_return_qty_box", "requested_return_qty_box"]),
-        ("申请退货袋数", &["applied_return_qty_bag", "requested_return_qty_bag"]),
-        ("实际退货箱数", &["returned_qty_box"]),
-        ("实际退货袋数", &["returned_qty_bag"]),
-        ("数量", &["数量", "quantity"]),
-        ("单价", &["单价", "price"]),
-        ("明细金额", &["明细金额", "amount", "金额"]),
-        ("退款金额", &["refund_amount"]),
-        ("实发数量", &["实发数量", "actual_delivery_quantity"]),
-        ("实收数量", &["实收数量", "actual_receive_quantity"]),
-        ("去向", &["去向"]),
-        ("联系人", &["联系人"]),
-        ("地址", &["地址"]),
-        ("备注", &["备注", "remark"]),
-    ];
-    let selected = FIELDS
+    let _ = kind;
+    let keep: Vec<usize> = r
+        .columns
         .iter()
-        .filter_map(|(label, aliases)| {
-            r.columns.iter().position(|column| aliases.contains(&column.as_str())).map(|index| ((*label).to_string(), index))
-        })
-        .take(MAX_PRIMARY_FIELDS)
-        .collect::<Vec<_>>();
-    if selected.is_empty() {
+        .enumerate()
+        .filter(|(_, name)| !is_housekeeping(name))
+        .map(|(index, _)| index)
+        .collect();
+    if keep.len() == r.columns.len() {
         return (r.columns.clone(), r.rows.clone());
     }
-    let columns = selected.iter().map(|(label, _)| label.clone()).collect();
-    let rows = r.rows.iter().map(|row| {
-        selected.iter().map(|(_, index)| row.get(*index).cloned().unwrap_or(serde_json::Value::Null)).collect()
-    }).collect();
+    // 全是运维列（不该发生）时不做空投影：宁可原样展示也不给一张空表
+    if keep.is_empty() {
+        return (r.columns.clone(), r.rows.clone());
+    }
+    let columns = keep.iter().map(|i| r.columns[*i].clone()).collect();
+    let rows = r
+        .rows
+        .iter()
+        .map(|row| {
+            keep.iter().map(|i| row.get(*i).cloned().unwrap_or(serde_json::Value::Null)).collect()
+        })
+        .collect();
     (columns, rows)
+}
+
+fn is_housekeeping(name: &str) -> bool {
+    let name = name.trim();
+    HOUSEKEEPING_COLUMNS.iter().any(|k| k.eq_ignore_ascii_case(name))
 }
 
 fn default_understanding(kind: dms_agent::AnalysisKind, question: &str) -> String {
@@ -4117,6 +4147,8 @@ fn bi_page(
     detail: Option<&DetailSection>,
     sqls: &[String],
     _trust: Option<&dms_agent::TrustEnvelope>,
+    // 规划了但**没跑出来**的板块标题。空 = 计划全部兑现。
+    failed_sections: &[String],
 ) -> String {
     use std::fmt::Write as _;
 
@@ -4131,6 +4163,16 @@ fn bi_page(
     // 问题理解只保留一行导航，不与图表争夺阅读注意力。
     if let Some(u) = understanding.filter(|u| !u.trim().is_empty()) {
         s.push_str(&format!("<section class=\"bi-brief\"><div class=\"eyebrow\">分析目标</div><p>{}</p></section>", esc(u.trim())));
+    }
+    // 🔴 规划了却没跑出来的板块**必须点名**（2026-08-14 业主实测）。
+    // 此前这些板块被 `.flatten()` 静默丢掉，页面只是少一块 —— 用户既不知道少了什么，
+    // 也不知道剩下的数是不是完整的。少一块数据不可怕，不说才可怕。
+    if !failed_sections.is_empty() {
+        let _ = write!(
+            s,
+            "<section class=\"bi-brief bi-gap\"><div class=\"eyebrow\">本次未取到的板块</div>             <p>{}。这些板块的数据本次没有取到，上方结论只覆盖已取到的部分。</p></section>",
+            esc(&failed_sections.join("、")),
+        );
     }
     if let Some((label, val)) = kpi {
         s.push_str("<div class=\"kpi-grid\">");
@@ -4663,6 +4705,8 @@ async fn compose_inner(
         req.ds.as_deref(),
         conv_id.as_deref(),
         sc,
+        // 深度报告只要问数臂：主结果要拿去拼板块，compound 壳会让整份报告散架
+        false,
     );
     tokio::pin!(primary_future);
     let mut prefetched_plan = None;
@@ -4751,7 +4795,7 @@ async fn compose_inner(
     let mut requested_sections = Vec::new();
     // 【D4】本轮的落账句柄（Some = 计划定稿、板块执行逐条落 PG）；guard 存活 = 执行器活着
     let mut run_tracking: Option<(RunCtx, Option<RunGuard>)> = None;
-    let (mut sections, mut detail) = match planned {
+    let (run_out, mut detail) = match planned {
         Some((u, plan_secs)) => {
             if u.is_some() {
                 understanding = u;
@@ -4904,10 +4948,11 @@ async fn compose_inner(
                 .await;
                 (sections, None)
             } else {
-                (vec![], None)
+                (SectionRun { sections: vec![], failed: vec![] }, None)
             }
         }
     };
+    let SectionRun { sections: mut sections, failed: failed_sections } = run_out;
     if report_allows_analysis && sales_measure.is_some() {
         note(&rid, ProgressStage::Detail);
         detail = sales_operating_detail(&st, &p, &primary.sql).await;
@@ -5165,6 +5210,7 @@ async fn compose_inner(
         detail.as_ref(),
         &sqls,
         primary.trust.as_ref(),
+        &failed_sections,
     );
     let title: String = display_question.chars().take(40).collect();
     let html = crate::artifact_api::page_shell(&title, &html_body);
@@ -5218,6 +5264,8 @@ async fn compose_inner(
             "columns": detail.columns,
             "rows": detail.rows,
         })),
+        // 聊天内嵌页同样要说清缺口（HTML 报告页与聊天页不许一个说一个不说）
+        "missing_sections": failed_sections,
         "sqls": sql_entries.into_iter()
             .map(|(title, sql)| serde_json::json!({ "title": title, "sql": sql }))
             .collect::<Vec<_>>(),
@@ -5407,6 +5455,7 @@ mod tests {
             value_labels: vec![],
             sales_context: None,
             intent_summary: None,
+            kb: None,
         }
     }
 
@@ -5841,6 +5890,44 @@ mod tests {
 
     /// 页面骨架（v2 bi_page）：段序（头部→KPI→板块→明细→折叠 SQL→AI 收尾）+
     /// 单元格转义 + 空段不出 + SVG 直接内嵌（不走占位符）。
+    /// 规划了却没跑出来的板块必须在页面上**点名**。
+    ///
+    /// 由来：业主实测「今年退款额是多少」，3 个板块挂了 2 个，报告里既没有那两块、
+    /// 也没有一句说明 —— 页面只剩一个孤零零的 KPI 和三条红色「未满足」标签。
+    #[test]
+    fn missing_sections_are_named_on_the_page() {
+        let html = bi_page(
+            "今年退款额是多少",
+            dms_agent::AnalysisPlan {
+                kind: dms_agent::AnalysisKind::Metric,
+                dws_sales_metric: true,
+                allow_model_sections: true,
+            }
+            .report_spec(),
+            Some("分析今年退款额"),
+            Some(("退款额", "¥6794.37万")),
+            &[], &[], &[], &[], &[], None, &[], &[], None, &[], None,
+            &["月度退款额趋势".to_string(), "战区退款额排行".to_string()],
+        );
+        assert!(html.contains("本次未取到的板块"), "{html}");
+        assert!(html.contains("月度退款额趋势、战区退款额排行"), "{html}");
+        // 计划全部兑现时不许平白多一条噪音
+        let clean = bi_page(
+            "今年退款额是多少",
+            dms_agent::AnalysisPlan {
+                kind: dms_agent::AnalysisKind::Metric,
+                dws_sales_metric: true,
+                allow_model_sections: true,
+            }
+            .report_spec(),
+            Some("分析今年退款额"),
+            Some(("退款额", "¥6794.37万")),
+            &[], &[], &[], &[], &[], None, &[], &[], None, &[], None,
+            &[],
+        );
+        assert!(!clean.contains("本次未取到的板块"), "{clean}");
+    }
+
     #[test]
     fn bi_page_shape() {
         let sec = Section {
@@ -5902,6 +5989,7 @@ mod tests {
             Some(&detail),
             &["SELECT 1".into(), "SELECT 2".into()],
             Some(&trust),
+            &[],
         );
         let order = ["bi-head", "kpi-grid", "头部贡献与集中度", "省份拆解", "经营明细", "执行 SQL", "AI 分析摘要"];
         let mut last = 0;
@@ -5948,6 +6036,7 @@ mod tests {
             None,
             &[],
             None,
+            &[],
         );
         assert!(!h2.contains("bi-ai"), "没有模型分析时不留空板块：{h2}");
         assert!(!h2.contains("kpi-grid"), "{h2}");
@@ -5982,6 +6071,7 @@ mod tests {
             None,
             &["SELECT header".into(), "SELECT detail".into()],
             None,
+            &[],
         );
         let facts = html.find("业务对象").unwrap();
         let detail = html.find("单据明细").unwrap();
@@ -5991,7 +6081,7 @@ mod tests {
     }
 
     #[test]
-    fn document_display_projects_business_columns_but_keeps_rows() {
+    fn display_drops_housekeeping_columns_and_keeps_every_business_column() {
         let mut result = kpi_result();
         result.columns = vec![
             "id".into(), "after_sales_code".into(), "sales_order_code".into(), "sku_code".into(),
@@ -6006,11 +6096,17 @@ mod tests {
         ]];
         let (columns, rows) = primary_display(&result, dms_agent::AnalysisKind::Document);
         assert_eq!(rows.len(), 1);
-        assert_eq!(columns, vec![
-            "售后单号", "关联销售单", "SKU编码", "商品/设备名称", "箱规",
-            "申请退货袋数", "实际退货袋数", "退款金额",
-        ]);
-        assert!(!columns.iter().any(|c| c == "id" || c == "updated_by" || c == "version"));
+        // 运维列摘掉；业务列**一个都不许丢** —— 白名单时代 `sku_name`/`box_gauge` 这类
+        // 没登记在册的列会被静默丢弃，业主截图里的空壳单据卡就是那么来的。
+        assert!(!columns.iter().any(|c| c == "id" || c == "updated_by" || c == "version"), "{columns:?}");
+        for business in [
+            "after_sales_code", "sales_order_code", "sku_code", "sku_name",
+            "box_gauge", "applied_return_qty_bag", "returned_qty_bag", "refund_amount",
+        ] {
+            assert!(columns.iter().any(|c| c == business), "业务列 {business} 被丢了：{columns:?}");
+        }
+        assert_eq!(columns.len(), 8, "{columns:?}");
+        assert_eq!(rows[0].len(), 8, "行宽必须跟着列走：{rows:?}");
     }
 
     #[test]
@@ -6434,6 +6530,19 @@ mod tests {
         assert!(!compact_sql(primary).contains("avg("), "汇总毛利率禁止平均行毛利率");
         let src = include_str!("deep_api.rs");
         assert!(!src.contains(concat!("事实行数", "（非订单数）")), "深度报告不得追加行数型订单估计或技术扫描");
+    }
+
+    /// 毛利率列判定与前端 `format.ts::isGrossMarginLabel` 逐字同源；判据是**词尾**。
+    /// 由来：后端窄（精确等于）+ 前端宽（包含）→ 「品类毛利率」在同一屏出两个数
+    /// （SVG 0.2 / 表格 20%），而喂给 LLM 的证据走后端那份，模型据此写「毛利率 0.2」。
+    #[test]
+    fn gross_margin_label_matches_by_suffix_not_substring() {
+        for yes in ["毛利率", "销售毛利率", "品类毛利率", "平均 毛利率", "毛利率（%）", "毛利占比"] {
+            assert!(is_gross_margin_value_label(yes), "{yes} 该判成毛利率列");
+        }
+        for no in ["毛利率可计算覆盖率", "毛利额", "汇率", "覆盖率", "毛利率缺失行数"] {
+            assert!(!is_gross_margin_value_label(no), "{no} 不该判成毛利率列");
+        }
     }
 
     #[test]
@@ -7009,7 +7118,9 @@ mod tests {
         let evidence = vec![EvidenceItem {
             id: "KPI-01".into(), kind: "kpi", label: "销售额".into(), body: "销售额=100万".into(),
         }];
-        assert!(contains_chinese_numeric_claim("销售额为一百万元"));
+        assert!(unparsable_chinese_number("销售额为一百万元").is_some());
+        // 能精确换算的不再一票否决 —— 由 `answer_contract` 归一后走同一条数值核验
+        assert!(unparsable_chinese_number("易损件保修期为三个月").is_none());
         assert!(validate_evidence_insight("## 经营结论\n销售额为一百万元。[KPI-01]", &evidence).is_none());
     }
 

@@ -40,7 +40,16 @@ export function toNum(v: unknown): number | null {
  *  取宽的那份：窄判据漏的都是真毛利率列；而「汇率/频率/功率/倍率/速率」不含「毛利率」，
  *  本来就不会命中。 */
 export function isGrossMarginLabel(label: string): boolean {
-  return label.replace(/\s+/g, '').includes('毛利率')
+  // 判据是**词尾**不是包含：`毛利率可计算覆盖率` 含「毛利率」但它是覆盖率，
+  // 已经是 0~100 的百分数，再 ×100 就是错数。
+  // 「毛利占比」是 sales_fact 登记的别名，两份判据原本都漏。
+  // 后端 `deep_api::is_gross_margin_value_label` 与本函数逐字同源，改一处必须改两处。
+  const clean = label
+    .replace(/\s+/g, '')
+    .replace(/[%％]+$/, '')
+    .replace(/[（(][^（()）]*[)）]$/, '')
+    .replace(/[%％]+$/, '')
+  return clean.endsWith('毛利率') || clean.endsWith('毛利占比')
 }
 
 export function semanticForLabel(label: string): Semantic {

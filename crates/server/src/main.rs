@@ -2115,6 +2115,7 @@ async fn ask_data_run(
         // 「query_log 当年没有 conv_id，从它拿不回本会话上一轮」
         conv_id,
         sc_samples,
+        true,
     )
     .await;
     // 服务侧 fire-and-forget：`_log` 句柄直接丢弃，HTTP 主链路一个 `.await` 都不多
@@ -2900,6 +2901,10 @@ async fn ask_prepared(
     explicit_ds: Option<&str>,
     conv_id: Option<&str>,
     sc_samples: usize,
+    // `dual_arms=false` = **只跑问数臂**。深度 BI 报告拿主结果去拼板块
+    // （`primary.columns` / `primary.rows` / `document_evidence`），
+    // 两臂合成出来的 compound 壳会让整份报告散架。
+    dual_arms: bool,
 ) -> (
     anyhow::Result<dms_agent::AskResult>,
     tokio::task::JoinHandle<()>,
@@ -2950,7 +2955,11 @@ async fn ask_prepared(
         conv_id,
         sc_samples,
     };
-    let out = dms_agent::ask::ask_prepared(&deps, p, &prepared.question, explicit_ds).await;
+    let out = if dual_arms {
+        dms_agent::ask::ask_prepared(&deps, p, &prepared.question, explicit_ds).await
+    } else {
+        dms_agent::ask::ask_prepared_data_only(&deps, p, &prepared.question, explicit_ds).await
+    };
     let log = query_log::finish(
         pg,
         &trace,

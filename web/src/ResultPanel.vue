@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, ref } from 'vue'
 import { fmt, isGrossMarginLabel, semanticForLabel, toNum, type Semantic } from './format'
-import { intentIssueText, type IntentSlot, type IntentSummary } from './result-receipt'
+import { intentIssueText, type IntentSummary } from './result-receipt'
+import { buildInsightCards, sanitizeInsight } from './insight-cards'
 
 // 弱网 / chunk 加载失败时图表区不能长期空白无反馈：loading 占位 + error 兜底
 const BiChart = defineAsyncComponent({
@@ -165,8 +166,6 @@ const supplementalHasWideTable = computed(() => (supplemental.value?.columns.len
 /** 窄屏表格提示（≤720px 才显示，见样式）：窄屏多是触屏没有悬停，文案说「点击」不说「悬停」。 */
 const TABLE_SCROLL_HINT = '左右滑动可查看完整字段，点击单元格可查看完整内容'
 
-type InsightKind = 'conclusion' | 'risk' | 'action'
-interface InsightCard { kind: InsightKind; title: string; items: string[] }
 
 const insightText = computed(() => sanitizeInsight(props.result.view?.insight ?? ''))
 const displaySql = computed(() => {
@@ -193,17 +192,17 @@ const hasFoundation = computed(() => !!(
   auditCaliberNote.value || props.result.scope_note || auditTrust.value
   || reinterpretNote.value || resolvedQuestion.value || intentSummary.value
 ))
-const INTENT_MODE_LABEL: Record<IntentSummary['mode'], string> = {
+const INTENT_MODE_LABEL: Record<string, string> = {
   data: '问数', knowledge: '知识检索', hybrid: '数据 + 知识', unknown: '待确认',
 }
-const INTENT_SLOT_LABEL: Record<IntentSlot['kind'], string> = {
+const INTENT_SLOT_LABEL: Record<string, string> = {
   metric: '指标', entity: '对象', region: '地区', time: '时间', filter: '筛选',
   breakdown: '拆分', comparison: '比较', detail: '明细',
 }
 const intentStatusText = computed(() => {
   const summary = intentSummary.value
   if (!summary) return ''
-  if (summary.coverage.status === 'complete') return `${INTENT_MODE_LABEL[summary.mode]}意图已完整覆盖`
+  if (summary.coverage.status === 'complete') return `${INTENT_MODE_LABEL[summary.mode] ?? summary.mode}意图已完整覆盖`
   return summary.status === 'clarification' ? '需要补充问题限定' : '意图覆盖未通过'
 })
 const TRUST_LEVEL_LABEL: Record<string, string> = {
@@ -216,106 +215,8 @@ const TRUST_LEVEL_NOTE: Record<string, string> = {
   high: '模型查询已通过安全、权限与执行校验',
   review: '存在明确风险，使用前请核对',
 }
-const insightCards = computed<InsightCard[]>(() => {
-  if (isEntityCandidate.value) return []
-  if (!insightText.value) return []
-
-  const buckets: Record<InsightKind, string[]> = { conclusion: [], risk: [], action: [] }
-  let current: InsightKind = 'conclusion'
-  // insightText 已经过 sanitizeInsight（那边去过 \r），这里不再重复洗
-  for (const rawLine of insightText.value.split('\n')) {
-    const line = cleanInsight(rawLine)
-    if (!line) continue
-    const heading = line.replace(/[：:]$/, '')
-    if (/^(?:经营结论|结论|摘要|概览|总体结论|核心结论)$/.test(heading)) { current = 'conclusion'; continue }
-    if (/^(?:关键变化|模块分析|异常|风险|关键发现|异常与关注|问题|预警)$/.test(heading)) { current = 'risk'; continue }
-    if (/^(?:建议|行动建议|下周行动建议|下一步|措施|优化建议)$/.test(heading)) { current = 'action'; continue }
-
-    const cells = markdownTableCells(rawLine)
-    if (cells?.length === 0) continue
-    const fragments = cells
-      ? [cells.join('；')]
-      : (line.match(/[^。！？；]+[。！？；]?/g) ?? [line])
-    for (const sentence of fragments) {
-      const text = cleanInsight(sentence)
-      if (!text) continue
-      const kind = cells
-        ? current
-        : /建议|应当|可以|优先|下一步|行动|跟进|排查|优化|关注/.test(text)
-          ? 'action'
-          : /异常|风险|问题|预警|下降|波动|偏低|偏高|集中|缺失|失衡/.test(text)
-            ? 'risk'
-            : current
-      const clipped = clipInsight(text)
-      if (buckets[kind].length < 3 && !buckets[kind].includes(clipped)) buckets[kind].push(clipped)
-    }
-  }
-
-  const meta: Record<InsightKind, string> = {
-    conclusion: '结论',
-    risk: '异常与关注',
-    action: '建议',
-  }
-  return (['conclusion', 'risk', 'action'] as InsightKind[])
-    .filter((kind) => buckets[kind].length)
-    .map((kind) => ({ kind, title: meta[kind], items: buckets[kind] }))
-})
-
-function sanitizeInsight(text: string): string {
-  const visible: string[] = []
-  let hidingInternalSection = false
-  for (const rawLine of text.replace(/\r/g, '').split('\n')) {
-    const plainLine = rawLine.trim().replace(/^[-*>\d.、\s]+/, '').replace(/\*\*|__/g, '')
-    const heading = /^(#{1,6})\s*(.*)$/.exec(rawLine.trim())
-    const strongHeading = /^(?:\*\*([^*]+)\*\*|__([^_]+)__)$/.exec(rawLine.trim())
-    const headingText = heading?.[2] ?? strongHeading?.[1] ?? strongHeading?.[2]
-    if (headingText !== undefined) {
-      hidingInternalSection = /^(?:证据|证据与边界|数据边界|可信度|技术诊断|口径与可信度|内部校验)/.test(headingText.trim())
-      if (hidingInternalSection) continue
-    } else if (hidingInternalSection) {
-      continue
-    }
-    if (/^(?:证据(?:编号|与边界)?|数据边界|可信度|技术诊断|口径与可信度|内部校验)\s*[:：|]/.test(plainLine)) continue
-    if (rawLine.includes('|') && /\b(?:KPI|SEC|CON)-\d+\b/i.test(rawLine)) continue
-    if (!/^\s*\|?\s*(?:证据|证据编号|可信度|技术诊断)\s*\|/.test(rawLine)) visible.push(rawLine)
-  }
-  return visible.join('\n')
-    .replace(/\[(?:KPI|SEC|CON)-\d+\]/gi, '')
-    .replace(/\b(?:KPI|SEC|CON)-\d+\b/gi, '')
-    .replace(/(?:证据编号|KPI引用|SEC引用)\s*[:：]?\s*/gi, '')
-    .replace(/证据不足/g, '数据不足')
-    .replace(/\s+([，。；：])/g, '$1')
-    .trim()
-}
-
-function markdownTableCells(rawLine: string): string[] | null {
-  const line = rawLine.trim()
-  if (!line.includes('|')) return null
-  const cells = line
-    .replace(/^\|/, '')
-    .replace(/\|$/, '')
-    .split('|')
-    .map(cleanInsight)
-    .filter(Boolean)
-  if (cells.length < 2) return null
-  if (cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return []
-  const header = /^(?:结论|业务影响|关键变化|原因判断|改进建议|模块|异常|影响|建议|行动|优先级|跟进事项|判断|变化|指标|说明|证据)$/
-  return cells.every((cell) => header.test(cell)) ? [] : cells
-}
-
-function cleanInsight(text: string): string {
-  return text
-    .replace(/^#{1,6}\s*/, '')
-    .replace(/^[-*•]\s*/, '')
-    .replace(/\*\*|__/g, '')
-    .replace(/`/g, '')
-    .trim()
-}
-
-function clipInsight(text: string): string {
-  // Array.from 按码点切：slice 会在 emoji/代理对中间砍出乱码
-  return text.length > 76 ? `${Array.from(text).slice(0, 75).join('').trim()}…` : text
-}
+/** 分桶/表头/截断判据都在 insight-cards.ts（有单测）：这里只负责渲染。 */
+const insightCards = computed(() => (isEntityCandidate.value ? [] : buildInsightCards(insightText.value)))
 
 const deltaNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 })
 
@@ -616,9 +517,9 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
         <div v-if="intentSummary" class="foundation-row intent-row">
           <span>识别条件</span>
           <div class="intent-slots">
-            <span class="intent-mode">{{ INTENT_MODE_LABEL[intentSummary.mode] }}</span>
+            <span class="intent-mode">{{ INTENT_MODE_LABEL[intentSummary.mode] ?? intentSummary.mode }}</span>
             <span v-for="(slot, si) in intentSummary.slots" :key="`${slot.kind}-${slot.surface}-${si}`" class="intent-slot">
-              <i>{{ INTENT_SLOT_LABEL[slot.kind] }}</i>{{ slot.surface }}
+              <i>{{ INTENT_SLOT_LABEL[slot.kind] ?? slot.kind }}</i>{{ slot.surface }}
             </span>
             <span v-if="!intentSummary.slots.length" class="intent-empty">尚未识别到可执行限定</span>
           </div>
@@ -1115,11 +1016,14 @@ const supplementalKpiCards = computed(() => supplementalKpis.value.map(kpiCardOf
 .insight-card.conclusion { border-left-color: var(--primary); }
 .insight-card.risk { border-left-color: var(--warning-text); }
 .insight-card.action { border-left-color: var(--success-text); }
+/* other = prompt 之外的标题落的通用桶：必须看得见（此前这类内容被并进上一个桶乱分） */
+.insight-card.other { border-left-color: var(--text-faint); }
 .insight-card-head { display: flex; align-items: center; gap: 7px; color: var(--text-primary); font-size: 12px; font-weight: 750; }
 .insight-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .insight-card.conclusion .insight-dot { color: var(--primary); }
 .insight-card.risk .insight-dot { color: var(--warning-text); }
 .insight-card.action .insight-dot { color: var(--success-text); }
+.insight-card.other .insight-dot { color: var(--text-faint); }
 .insight-card ul { display: grid; gap: 7px; margin: 9px 0 0; padding: 0; list-style: none; }
 .insight-card li { position: relative; padding-left: 11px; color: var(--text-regular); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
 .insight-card li::before { content: ""; position: absolute; top: .72em; left: 0; width: 3px; height: 3px; border-radius: 50%; background: var(--text-faint); }

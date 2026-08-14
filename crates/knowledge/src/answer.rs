@@ -27,7 +27,7 @@ const ANSWER_TEMPERATURE: f32 = 0.0;
 /// 「没有」的基干文案。两条路都落它：检索零命中（**不调 LLM**，此时经 `no_hit_text`
 /// 带上检索范围与建议），以及模型一句带角标的话都没给出（无引用即无结论，
 /// 不许把它的自由发挥当答案 —— 那条路有命中但给不出结论，不是「空结果」，保持基干文案）。
-const NO_HIT: &str = "知识库里没有相关内容。";
+pub const NO_HIT: &str = "知识库里没有相关内容。";
 
 /// 空结果兜底文案（KB 审查⑥）：说清检索范围（哪个空间、几篇文档）并给下一步建议，
 /// 不再是一句孤零零的「没有」。`searched_docs = None` = 本次没真正检索
@@ -708,6 +708,10 @@ fn keep_supported_only(md: &str, hits: &[Hit]) -> String {
     let cited = keep_cited_only(md, hits.len());
     // 源数字表按 hit 预计算一次：一句引多篇、多句引同篇都不重扫（hit.text 可上千字）
     let sources: Vec<Vec<String>> = hits.iter().map(source_numbers_of).collect();
+    // 标识符（统一社会信用代码 / SKU 编码 / 单号 / 版本号）单独一条通道：它们不是「数值」，
+    // 拿数值判据切碎了比对必然对不上，而它们又恰恰最不能编。判据换成**整串出现在原文里**。
+    let identifiers: Vec<Vec<String>> =
+        hits.iter().map(|hit| identifier_tokens(&hit.text)).collect();
     let mut out = Vec::new();
     let lines = cited.lines().collect::<Vec<_>>();
     for (index, line) in lines.iter().enumerate() {
@@ -721,7 +725,10 @@ fn keep_supported_only(md: &str, hits: &[Hit]) -> String {
         }
         let kept: String = sentences(line)
             .into_iter()
-            .filter(|sentence| numbers_supported(sentence, &sources))
+            .filter(|sentence| {
+                numbers_supported(sentence, &sources)
+                    && identifiers_supported(sentence, &identifiers)
+            })
             .collect();
         if !kept.trim().is_empty() {
             out.push(kept);
@@ -734,13 +741,17 @@ fn keep_supported_only(md: &str, hits: &[Hit]) -> String {
 /// 治理元数据（版本号/生效期）的数字一并算合法源是刻意的：允许模型复述这些元数据
 /// **本身**（SYSTEM 段约束的是「不能拿它们替代正文支撑业务数值」，复述日期/版本号不在其列）。
 fn source_numbers_of(hit: &Hit) -> Vec<String> {
-    let mut source = numbers(&hit.text);
+    // 🔴 与 `hit_numeric_claims` 同源用 `business_values`（2026-08-14）：`numbers` 会把
+    // `91430104MA7AMADH81` 切成 91430104/7/81、把 18 位银行账号当成一个「数值」。
+    // 在这条路上的后果比版本冲突那条更重 —— 比对不上就**整句从答案里删掉**，
+    // 用户看到的是一段莫名其妙缺了半句的回答。标识符改由 `identifiers_supported` 守。
+    let mut source = business_values(&hit.text);
     for governed in
         [hit.document_revision.as_deref(), hit.effective_from.as_deref(), hit.effective_to.as_deref()]
             .into_iter()
             .flatten()
     {
-        source.extend(numbers(governed));
+        source.extend(business_values(governed));
     }
     source
 }
@@ -805,9 +816,41 @@ fn has_supported_content(md: &str) -> bool {
             && !is_partial_coverage_disclaimer(line)
     })
 }
+/// 标识符 token：字母数字混排（编码、型号、合同模板名）或 ≥12 位纯数字（账号、税号、单号）。
+/// 这两类恰恰是 [`business_values`] 刻意排除在「数值」之外的，所以要有自己的判据 ——
+/// 否则模型可以凭空写一个银行账号而无人核对。
+fn identifier_tokens(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| {
+            let long_number = token.len() >= 12 && token.bytes().all(|b| b.is_ascii_digit());
+            let mixed = token.len() >= 4
+                && token.bytes().any(|b| b.is_ascii_alphabetic())
+                && token.bytes().any(|b| b.is_ascii_digit());
+            long_number || mixed
+        })
+        .map(|token| token.to_ascii_uppercase())
+        .collect()
+}
+
+/// 句子里出现的标识符必须**整串**出现在它引用的原文里。大小写不敏感 ——
+/// 模型把 `xs2026a1.1` 写成 `XS2026A1.1` 是排版差异，不是编造。
+fn identifiers_supported(sentence: &str, sources: &[Vec<String>]) -> bool {
+    let claimed = identifier_tokens(&without_refs(sentence));
+    if claimed.is_empty() {
+        return true;
+    }
+    let mut source: Vec<&str> = Vec::new();
+    for (_, _, n) in refs(sentence) {
+        if let Some(s) = n.checked_sub(1).and_then(|i| sources.get(i)) {
+            source.extend(s.iter().map(String::as_str));
+        }
+    }
+    claimed.iter().all(|token| source.contains(&token.as_str()))
+}
+
 
 fn numbers_supported(sentence: &str, sources: &[Vec<String>]) -> bool {
-    let claimed = numbers(&without_refs(sentence));
+    let claimed = business_values(&without_refs(sentence));
     if claimed.is_empty() {
         return true;
     }
@@ -1091,15 +1134,13 @@ fn disclose_conflicting_numeric_claims(md: &str, hits: &[Hit]) -> String {
     );
     for n in conflict_refs {
         let hit = &hits[n - 1];
-        let values = source_numbers_of(hit).join("、");
+        // 🔴 表格里的数值走 `business_values` 而不是 `source_numbers_of`：后者把统一社会信用
+        // 代码、银行账号、合同模板文件名里的数字碎片一并印出来（业主截图里那一长串就是它）。
+        let values = business_values(&hit.text).join("、");
         notice.push_str(&format!(
             "| {} | {} | 适用对象与口径需查看原文确认[^{n}] |\n",
             table_cell(&hit.doc_name),
-            table_cell(if values.is_empty() {
-                "未可靠提取"
-            } else {
-                &values
-            }),
+            table_cell(if values.is_empty() { "未可靠提取" } else { &values }),
         ));
     }
     if has_supported_content(&complementary) {
@@ -1115,12 +1156,56 @@ struct NumericClaim {
     numbers: Vec<String>,
     terms: Vec<String>,
 }
+/// 冲突检测专用的「业务数值」抽取。`numbers` 本身要给数字对账用（模型说的数字必须在
+/// 原文出现），那里宁可多收；判**版本冲突**时多收就是灾难：
+///
+/// - `91430104MA7AMADH81`（统一社会信用代码）被切成 `91430104` / `7` / `81` 三段；
+/// - `销售协议书XS2026A1.1` 切出 `2026` / `1.1`；
+/// - `810000297001000001`（银行账号）整段是数字。
+///
+/// 于是两份**互补**的开户信息（各说各家公司）被判成「同一问题的不同数值」，
+/// 模型本来答对的内容被整段换成「资料给出了不同数值，请人工核对」+ 一串碎数字
+/// —— 业主截图里问「中国农业银行重庆荣昌昌州支行」得到的就是这个。
+///
+/// 判据：① 字母数字混排的整块（编码、型号、文件名）整块屏蔽；② 12 位及以上的纯整数
+/// 是标识符不是金额/数量（账号、单号、税号），不参与冲突比较。
+fn business_values(text: &str) -> Vec<String> {
+    let mut masked = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        let mixed = token.chars().any(|c| c.is_ascii_alphabetic())
+            && token.chars().any(|c| c.is_ascii_digit());
+        if mixed {
+            out.extend(std::iter::repeat(' ').take(token.chars().count()));
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' {
+            token.push(ch);
+        } else {
+            flush(&mut token, &mut masked);
+            masked.push(ch);
+        }
+    }
+    flush(&mut token, &mut masked);
+    numbers(&masked)
+        .into_iter()
+        .filter(|n| {
+            let digits = n.trim_start_matches('-');
+            !(digits.len() >= 12 && digits.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect()
+}
+
 
 fn hit_numeric_claims(hits: &[Hit]) -> Vec<NumericClaim> {
     let mut claims = Vec::new();
     for (i, hit) in hits.iter().enumerate() {
         for sentence in hit.text.lines().flat_map(sentences) {
-            let mut claim_numbers = numbers(sentence);
+            let mut claim_numbers = business_values(sentence);
             claim_numbers.sort();
             claim_numbers.dedup();
             if claim_numbers.is_empty() {
@@ -1884,6 +1969,72 @@ mod tests {
             "不得保留模型的单边裁决: {md}"
         );
         assert_eq!(n, 2, "模型未引用的冲突证据也必须进入引用列表");
+    }
+
+    /// 编码类事实走**整串比对**而不是数值比对：切碎了必然对不上，而对不上的代价是
+    /// 「整句从答案里删掉」—— 用户看到一段莫名其妙缺半句的回答。
+    /// 同时不能因此放开编造：原文没有的账号仍要拦住。
+    #[test]
+    fn identifiers_are_checked_whole_not_sliced_into_numbers() {
+        let hit = hit(
+            "重庆虎腾食品销售有限公司
+统一社会信用代码：91500153MAK1DP8D04
+             开户银行：中国农业银行股份有限公司重庆荣昌昌州支行
+银行账号：31171701040019537",
+        );
+        let hits = [hit];
+        // ① 原文里有的编码：整句必须留下（此前会被数值判据切碎后整句删掉）
+        let good = "重庆虎腾的统一社会信用代码是 91500153MAK1DP8D04，账号 31171701040019537[^1]。";
+        assert_eq!(keep_supported_only(good, &hits).trim(), good, "有据的编码句被删了");
+        // ② 编造的账号必须拦住
+        let fake = "重庆虎腾的账号是 62220000000000001[^1]。";
+        assert!(
+            !keep_supported_only(fake, &hits).contains("62220000000000001"),
+            "编造的账号没拦住"
+        );
+        // ③ 大小写差异是排版不是编造
+        assert!(identifier_tokens("xs2026a1").contains(&"XS2026A1".to_string()));
+    }
+
+    /// 业主 2026-08-14 实测：问「中国农业银行股份有限公司重庆荣昌昌州支行」，
+    /// 两份**互补**的销售主体资料被判成「同一问题的不同数值」，模型答案被整段换成
+    /// 一句推诿 + 一张碎数字表（`91430104`、`7`、`81` —— 统一社会信用代码被切三段）。
+    /// 语料是截图里的原文逐字。
+    #[test]
+    fn company_registration_blocks_are_complementary_not_conflicting() {
+        let a = hit(
+            "4.2 长沙虎家商贸有限公司
+经销商合同模版：销售协议书XS2026A1.1(虎家商贸).docx
+             纳税人识别号/统一社会信用代码：91430104MA7AMADH81
+开户名称：长沙虎家商贸有限公司
+             开户银行：长沙银行股份有限公司硅谷支行
+银行账号：810000297001000001",
+        );
+        let mut b = hit(
+            "重庆虎腾食品销售有限公司
+合同模版：销售协议书XS2025A1.1（重庆）.doc
+             纳税人识别号/统一社会信用代码：91500153MAK1DP8D04
+             开户银行：中国农业银行股份有限公司重庆荣昌昌州支行
+银行账号：31171701040019537",
+        );
+        b.doc_id = "d2".into();
+        b.doc_name = "线下销售支持流程.docx".into();
+        b.chunk_id = 43;
+
+        // ① 编码不是数值：混排块与 12 位以上纯数字都不参与冲突比较
+        for token in ["91430104", "7", "81", "810000297001000001", "31171701040019537", "169"] {
+            assert!(
+                !business_values(&a.text).contains(&token.to_string())
+                    && !business_values(&b.text).contains(&token.to_string()),
+                "编码碎片 {token} 不该当成业务数值",
+            );
+        }
+
+        // ② 因此不该触发版本冲突改写 —— 模型的答案原样留下
+        let md = "## 直接结论
+
+重庆虎腾食品销售有限公司的开户行为中国农业银行股份有限公司重庆荣昌昌州支行[^2]。";
+        assert_eq!(disclose_conflicting_numeric_claims(md, &[a, b]), md);
     }
 
     #[test]

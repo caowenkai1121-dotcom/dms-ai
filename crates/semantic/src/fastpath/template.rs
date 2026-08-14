@@ -51,21 +51,27 @@ pub fn residual_text(question: &str, consumed: &[&str]) -> String {
 
 
 
-/// 16 臂 order_status 中文状态映射。形参是**列引用**（`o.order_status` / 裸 `order_status`），
-/// 订单明细、单据卡、设备订单三处共用 —— 各抄一份，两处状态文案必漂。
+/// 码表 → SQL `CASE` 的**通用**生成器。码表本体一律住在 [`crate::present_cn`]
+/// （点查路的展示与问句侧的名→码都要读它），这里只负责折成 SQL。
+///
+/// `unknown` = 一个都没命中时的兜底表达式（SQL 片段，调用方给字面量或列引用）。
+pub fn code_case_sql(col: &str, book: &[(&str, &str)], unknown: &str) -> String {
+    let arms = book
+        .iter()
+        .map(|(name, code)| format!("WHEN '{code}' THEN '{name}' "))
+        .collect::<String>();
+    format!("CASE {col} {arms}ELSE {unknown} END")
+}
+
+/// order_status → 中文状态的 SQL 形态。码表本身住在 [`crate::present_cn::SALES_ORDER_STATUS`]
+/// （点查路的单据卡也要翻它，两边共用一份）；这里只负责折成 `CASE`。
+/// 形参是**列引用**（`o.order_status` / 裸 `order_status`），订单明细、单据卡、设备订单三处共用。
 pub fn sales_status_sql(col: &str) -> String {
-    format!(
-        "CASE {col} \
-         WHEN '0' THEN '暂存 (0)' WHEN '100' THEN '未支付 (100)' \
-         WHEN '101' THEN '待备货 (101)' WHEN '102' THEN '备货中 (102)' \
-         WHEN '103' THEN '等待配送 (103)' WHEN '104' THEN '交易完成 (104)' \
-         WHEN '105' THEN '待核销 (105)' WHEN '106' THEN '售后中 (106)' \
-         WHEN '107' THEN '已退款 (107)' WHEN '108' THEN '已取消 (108)' \
-         WHEN '109' THEN '部分收货 (109)' WHEN '110' THEN '待收货 (110)' \
-         WHEN '111' THEN '部分发货 (111)' WHEN '150' THEN '取消中 (150)' \
-         WHEN '151' THEN '取消失败-退款失败 (151)' WHEN '199' THEN '已删除 (199)' \
-         ELSE CONCAT('未知状态 (', {col}, ')') END"
-    )
+    let arms = crate::present_cn::SALES_ORDER_STATUS
+        .iter()
+        .map(|(name, code)| format!("WHEN '{code}' THEN '{name} ({code})' "))
+        .collect::<String>();
+    format!("CASE {col} {arms}ELSE CONCAT('未知状态 (', {col}, ')') END")
 }
 
 
@@ -208,3 +214,22 @@ pub fn time_window(q: &str) -> Option<String> {
 
 
 
+
+#[cfg(test)]
+mod status_tests {
+    /// 状态文案只有一份：SQL 侧折出来的 `CASE`，与点查路查表得到的中文必须同源。
+    /// 这条钉住的是那个真实故障 —— SQL 路印「待备货 (101)」而单据卡印裸 `101`。
+    #[test]
+    fn sql_case_and_card_lookup_share_one_code_book() {
+        let sql = super::sales_status_sql("o.order_status");
+        for (name, code) in crate::present_cn::SALES_ORDER_STATUS {
+            assert!(sql.contains(&format!("WHEN '{code}' THEN '{name} ({code})'")), "{sql}");
+        }
+        assert!(sql.starts_with("CASE o.order_status WHEN '0' THEN '暂存 (0)' "), "{sql}");
+        assert!(sql.ends_with("ELSE CONCAT('未知状态 (', o.order_status, ')') END"), "{sql}");
+        assert_eq!(
+            crate::present_cn::SALES_ORDER_STATUS.iter().find(|(_, c)| *c == "101").map(|(n, _)| *n),
+            Some("待备货"),
+        );
+    }
+}

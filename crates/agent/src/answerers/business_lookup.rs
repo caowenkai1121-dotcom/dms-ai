@@ -658,18 +658,13 @@ fn document_identity_pairs(
     family: &DocumentFamily,
     code: &str,
 ) -> Vec<(String, serde_json::Value)> {
+    // 🔴 只留业务身份。物理表名（主表/明细表）**不进用户可见 pairs**：
+    // 它们是实现细节，却因为 `insert(0, ..)` 占着头卡最前两格，把客户、金额、数量挤出
+    // 展示窗口（业主截图：一张销售订单卡只剩「单据类型/主表/明细表/单号/状态/时间」）。
+    // 审计需求由「查看 SQL」面板满足 —— 表名本来就在 SQL 里，不必再复述一遍。
     vec![
         ("单据类型".into(), serde_json::Value::String(family.name.into())),
         ("单号".into(), serde_json::Value::String(code.into())),
-        ("主表".into(), serde_json::Value::String(family.header_table.into())),
-        (
-            "明细表".into(),
-            serde_json::Value::String(if family.details.is_empty() {
-                "（无）".to_string() // 空清单不拼出空串（头卡「明细表：（空）」是坏展示）
-            } else {
-                family.details.iter().map(|(table, _)| *table).collect::<Vec<_>>().join("、")
-            }),
-        ),
     ]
 }
 
@@ -747,6 +742,7 @@ fn result(
         value_labels: vec![],
         sales_context: None,
         intent_summary: None,
+        kb: None,
     }
 }
 
@@ -842,17 +838,22 @@ mod tests {
 
     #[test]
     fn recognized_but_unverified_documents_still_return_exact_registry_identity() {
-        for (code, kind, header, details) in [
-            ("CG2603090123", DocumentKind::PurchaseTransfer, "t_winc_purchase_transfer", "（无）"),
-            ("SHOP_PH20260805100005", DocumentKind::ShopShipment, "t_shop_shipment_order", "t_shop_order_header、t_shop_order_detail"),
-            ("PZ20260805100003", DocumentKind::Voucher, "t_voucher_header", "t_voucher_detail"),
+        for (code, kind, name) in [
+            ("CG2603090123", DocumentKind::PurchaseTransfer, "采购调拨单"),
+            ("SHOP_PH20260805100005", DocumentKind::ShopShipment, "门店配送单"),
+            ("PZ20260805100003", DocumentKind::Voucher, "库存凭证单"),
         ] {
             let resolved = resolve_document(code, false).expect(code);
             assert_eq!(resolved.family.kind, kind, "{code}");
             assert!(resolved.family.production.is_none(), "{code} 不得误开生产查询");
             let pairs = document_identity_pairs(resolved.family, code);
-            assert!(pairs.iter().any(|(label, value)| label == "主表" && value.as_str() == Some(header)), "{code}: {pairs:?}");
-            assert!(pairs.iter().any(|(label, value)| label == "明细表" && value.as_str() == Some(details)), "{code}: {pairs:?}");
+            assert!(pairs.iter().any(|(l, v)| l == "单据类型" && v.as_str() == Some(name)), "{code}: {pairs:?}");
+            assert!(pairs.iter().any(|(l, v)| l == "单号" && v.as_str() == Some(code)), "{code}: {pairs:?}");
+            // 物理表名不进用户可见头卡：它们占着最前排把客户、金额、数量挤出展示窗口
+            assert!(
+                !pairs.iter().any(|(l, _)| l == "主表" || l == "明细表"),
+                "{code}: 表名不该出现在头卡 {pairs:?}",
+            );
         }
     }
 

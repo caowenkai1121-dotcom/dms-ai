@@ -307,6 +307,7 @@ mod tests {
             value_labels: vec![],
             sales_context: None,
             intent_summary: None,
+            kb: None,
         }
     }
 
