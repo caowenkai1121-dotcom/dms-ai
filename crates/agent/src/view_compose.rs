@@ -127,7 +127,18 @@ fn worth_composing(r: &AskResult) -> bool {
     if r.rows.len() < MIN_ROWS || r.columns.len() < 2 || !r.subs.is_empty() {
         return false;
     }
-    // 截断的结果**照样编排**，但产出要说实话（`honest_under_truncation`）。
+    // 🔴 截断 + **明细清单**（有 id 角色列）= 不编排（2026-08-15 回归 E03 抓到）。
+    //
+    // 「前 200 行」对这两族的含义完全不同：
+    // - 聚合行（「本月销售额按客户」1 类别 + 1 指标 × 200 组）：前 200 组通常就是按指标
+    //   排下来的**头部**，画构成图是对的，也正是这一档此前一张裸表的原因；
+    // - 明细行（「昨天订单明细」带订单号）：前 200 行只是被行上限切出来的一截，
+    //   拿它画「各状态金额分布」，用户读到的是一张**不representative 的分布图** ——
+    //   标题写「（前 200 行）」也救不回来，因为它看起来就是那张图。
+    if r.truncated && r.view.columns.iter().any(|spec| spec.role == Role::Id) {
+        return false;
+    }
+    // 其余截断结果**照样编排**，但产出要说实话（`honest_under_truncation`）。
     //
     // 🔴 上一版是整条拒（怕「合计」其实是小计）。代价实测出来了（2026-08-15 生产直打）：
     // 「本月销售额按客户」200 行、「昨天销售订单明细」200 行 —— 恰恰是最该给构成图与
@@ -617,6 +628,45 @@ mod tests {
         r.view.blocks = vec![Block::Table];
         r.rows.truncate(1);
         assert!(!worth_composing(&r), "单行结果没有可编排的余地");
+    }
+
+    /// 截断的**明细清单**（有 id 列）一个块都不编排：前 200 行只是被行上限切出来的一截，
+    /// 拿它画分布图，标题写「（前 200 行）」也救不回来 —— 用户读到的就是那张图。
+    /// 聚合行（无 id 列）不受影响：那一档的前 200 组就是头部（回归 E03）。
+    #[test]
+    fn a_truncated_detail_listing_is_never_composed() {
+        let detail = view(&[
+            ("订单号", Role::Id, Semantic::Order),
+            ("订单状态", Role::Category, Semantic::None),
+            ("订单金额", Role::Metric, Semantic::Money),
+        ]);
+        let mut r = crate::ctx::AskResult {
+            sql: "SELECT 订单号, 订单状态, 订单金额 FROM t".into(),
+            columns: vec!["订单号".into(), "订单状态".into(), "订单金额".into()],
+            rows: vec![vec![Value::from("A"), Value::from("已完成"), Value::from(1.0)]; 200],
+            row_count: 200,
+            truncated: true,
+            view: detail,
+            ..empty_result()
+        };
+        assert!(!worth_composing(&r), "明细清单截断时不许编排");
+        r.truncated = false;
+        assert!(worth_composing(&r), "不截断时明细照旧可编排（单号卡那一档）");
+
+        let agg = view(&[
+            ("客户", Role::Category, Semantic::Customer),
+            ("销售额", Role::Metric, Semantic::Money),
+        ]);
+        let r2 = crate::ctx::AskResult {
+            sql: "SELECT 客户, 销售额 FROM t".into(),
+            columns: vec!["客户".into(), "销售额".into()],
+            rows: vec![vec![Value::from("甲"), Value::from(1.0)]; 200],
+            row_count: 200,
+            truncated: true,
+            view: agg,
+            ..empty_result()
+        };
+        assert!(worth_composing(&r2), "聚合行截断时照样编排（前 200 组就是头部）");
     }
 
     /// 截断结果照样编排，但代码不许它说谎：KPI 去掉（合计其实是小计），
