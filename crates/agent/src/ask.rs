@@ -2406,8 +2406,8 @@ mod tests {
         // 预算跟着裁决走：判 Knowledge 时资料臂是主答者，不是 8 秒加分项
         // （否则「市场费用的报销政策是什么」会因为「市场费用」是已登记指标而被一份合计顶掉）
         assert!(
-            outcome.contains("kb_is_primary = prepared.route() == crate::intent::IntentRoute::Knowledge"),
-            "资料臂的主/次身份必须由裁决定：{outcome}"
+            outcome.contains("plan.route == crate::intent::IntentRoute::Knowledge && plan.deterministic"),
+            "资料臂的主/次身份必须由**确定性**裁决定（合同判 knowledge 不算，那会把实体卡单臂化）：{outcome}"
         );
         // 资料臂是加分项：问数臂已经答出实质内容时不许让它继续干等
         let race = src.split("async fn race_arms<K>(").nth(1).expect("race_arms 改名了");

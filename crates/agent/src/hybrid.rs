@@ -338,8 +338,15 @@ pub async fn dual_outcome(
     // 两路**并行**，但资料臂**带预算**：它是加分项，不该让一个已经答完的问数结果干等。
     // 生产实测（2026-08-14）：裸客户名的实体卡本身 1 秒出，改造后整轮 39 秒 ——
     // 全花在等知识库那一路上（检索 + 一次生成，30 秒级很正常）。
-    // 裁决判 Knowledge（R1 要文件 / R2 纯资料问句）＝ 资料臂是主答者。
-    let kb_is_primary = prepared.route() == crate::intent::IntentRoute::Knowledge;
+    // 资料臂是不是主答者：只认**确定性规则**判的 Knowledge（R1 要文件 / R2 纯资料问句）。
+    //
+    // 🔴 不能只看 `route()`：合同（R3）判 knowledge 是一次 fast 采样的结果，而裸客户名
+    // 被判成 knowledge 是常事 —— 那一档若也把资料半当主体，实体卡就又被单臂化了
+    // （`浏阳品元商贸` 拿不到客户卡的老账，本轮刚在 `entity::self_evident` 修完）。
+    // `deterministic` ＝ 由问句词法信号定的路，同一句永远同一条路。
+    let plan = prepared.plan();
+    let kb_is_primary =
+        plan.route == crate::intent::IntentRoute::Knowledge && plan.deterministic;
     let (data_r, knowledge) = race_arms(data_fut, kb_fut, kb_is_primary).await;
     let knowledge = knowledge.filter(kb_has_substance);
 
