@@ -375,9 +375,17 @@ pub async fn dual_outcome(
 /// 问数臂**答出东西了**吗。反问卡、出界卡、不可计算卡与空结果都不算 ——
 /// 它们是「我答不了」的四种说法，不该和一份真资料并排展示成「综合结论」。
 pub fn data_has_substance(r: &AskResult) -> bool {
-    if matches!(r.route.as_str(), crate::ask::NEED_INTENT | crate::ask::NO_TOPIC)
-        || crate::ask::is_unavailable_card_result(r)
-    {
+    // 🔴 「不可计算」卡**是答案，不是「答不了」**（2026-08-14 生产回归 E05/E08）。
+    //
+    // 它明确地说「这个事实数仓里没有」，`land()` 专门为它开了一条不过覆盖闸的豁免。
+    // 把它判成没实质 → 资料臂一有带角标的命中就顶替 → 用户拿到一段**名字像**的资料
+    // 当答案。那正是这张卡当初要拦的那件事，只不过换成知识库来做替代。
+    if crate::ask::is_unavailable_card_result(r) {
+        return true;
+    }
+    // 反问卡（「我需要你补充限定」）与出界卡才让位：那两档资料臂若答得出来就是更好的答案
+    // —— 业主实测「中国农业银行…昌州支行」正是这一档。
+    if matches!(r.route.as_str(), crate::ask::NEED_INTENT | crate::ask::NO_TOPIC) {
         return false;
     }
     // 🔴 「有块」不等于「有内容」：确定性视图对空结果同样兜底成 `[Table]`，
@@ -514,8 +522,9 @@ mod tests {
         for route in [crate::ask::NEED_INTENT, crate::ask::NO_TOPIC] {
             assert!(!data_has_substance(&card(route, "", vec![Block::Table], 0)), "{route}");
         }
+        // 「不可计算」卡是**明确结论**，不许被资料臂顶替（生产回归 E05/E08）
         let unavailable = card("direct-agg", "SELECT '不可计算' AS `数据状态`", vec![Block::Table], 1);
-        assert!(!data_has_substance(&unavailable), "不可计算卡不算答出东西");
+        assert!(data_has_substance(&unavailable), "不可计算卡是答案，不是「答不了」");
     }
 
     /// 资料臂的实质判据：模型给不出带角标的结论时 `finalize_markdown` 会整份换成 `NO_HIT`。

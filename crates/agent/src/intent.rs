@@ -385,6 +385,32 @@ impl IntentV1 {
 
     /// 主数据实体卡只能证明一个实体表面词；它不支持指标、时间、
     /// 地区、业务筛选、分组或比较。此门在 IO 之前拒绝部分回答。
+    /// 裸实体名（问句去掉实体表面词后没有剩下任何内容）—— 这一档**不看 mode**。
+    ///
+    /// 🔴 由来（2026-08-14 生产回归 C06/C08）：`entity_card_compatible` 要求
+    /// 合同 `route() == Data`，而 fast 模型把一个裸公司名判成 `knowledge` 是常事
+    /// （同一句两次采样两种 mode）。判据读**合同**、裁决读 `decide()` 的 plan，
+    /// 两者在 AX147 之后就分叉了 —— 这是同一个分叉的第三次现形。
+    /// 一个裸实体名该出实体卡，与模型这次把它归成哪一类无关。
+    pub fn bare_entity_mention(&self, question: &str) -> bool {
+        self.entity_mentions.len() == 1
+            && self.metrics.is_empty()
+            && self.filters.is_empty()
+            && self.regions.is_empty()
+            && self.breakdowns.is_empty()
+            && self.comparisons.is_empty()
+            && self.time.is_none()
+            && {
+                let surface = self.entity_mentions[0].surface.trim();
+                !surface.is_empty()
+                    && question
+                        .trim()
+                        .replace(surface, "")
+                        .chars()
+                        .all(|c| c.is_whitespace() || "，,。.、？?！!的".contains(c))
+            }
+    }
+
     pub fn entity_card_compatible(&self) -> bool {
         // 🔴 刻意**不**要求 `time.is_none()`：实体卡本身就渲染时间窗
         // （`answerers/entity.rs:538-582` 读 `time_predicate`/`time_phrase_of`），
@@ -2525,6 +2551,28 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 裸实体名不看 mode：fast 模型把一个裸公司名判成 knowledge 是常事，
+    /// 而它该出实体卡（2026-08-14 生产回归 C06/C08）。
+    #[test]
+    fn a_bare_entity_mention_ignores_the_mode() {
+        let bare = IntentV1 {
+            mode: IntentMode::Knowledge,
+            entity_mentions: vec![EntityMention {
+                surface: "线下-广东横琴雨燕供应链管理有限公司".into(),
+                kind: EntityKind::Organization,
+            }],
+            ..IntentV1::default()
+        };
+        assert!(!bare.entity_card_compatible(), "常规判据要求 mode=data，这里刻意不是");
+        assert!(bare.bare_entity_mention("线下-广东横琴雨燕供应链管理有限公司"));
+        assert!(bare.bare_entity_mention("线下-广东横琴雨燕供应链管理有限公司？"), "句末标点不算内容");
+        // 问句里还有别的内容就不是裸实体名
+        assert!(!bare.bare_entity_mention("线下-广东横琴雨燕供应链管理有限公司的合同模板"));
+        // 带可度量槽位的一律不是
+        let with_metric = IntentV1 { metrics: vec!["销售额".into()], ..bare };
+        assert!(!with_metric.bare_entity_mention("线下-广东横琴雨燕供应链管理有限公司"));
+    }
     use std::sync::Mutex;
 
     use dms_kernel::{BoxFut, ChatReply, LlmError};

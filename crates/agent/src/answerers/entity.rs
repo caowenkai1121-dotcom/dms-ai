@@ -613,6 +613,15 @@ fn dws_relation_sql(
     ))
 }
 
+/// 合同放不放行实体卡：常规判据 **或** 这是个裸实体名。
+///
+/// 后半条不看 `mode` —— fast 模型把裸公司名判成 `knowledge` 是常事（同一句两次两种 mode），
+/// 而一个裸实体名该出实体卡，与它这次被归成哪一类无关（2026-08-14 生产回归 C06/C08）。
+/// 两臂并行之后资料半照样挂在 `kb` 上，不会因此丢掉资料答案。
+fn contract_allows(intent: &crate::intent::IntentV1, question: &str) -> bool {
+    intent.entity_card_compatible() || intent.bare_entity_mention(question)
+}
+
 impl Answerer for EntityAnswerer {
     fn route(&self) -> &'static str {
         "entity-card"
@@ -627,17 +636,13 @@ impl Answerer for EntityAnswerer {
     // 一次抖动整轮掉进反问卡（同题不同答，2026-08-13 实测）。收据侧无需另加判据：
     // `attach_trust` 的 `intent_unverified` 已经把这一档钉成 review。
     fn accept(&self, cx: &AskCtx<'_>) -> bool {
-        cx.intent
-            .map_or(true, crate::intent::IntentV1::entity_card_compatible)
+        cx.intent.map_or(true, |i| contract_allows(i, cx.question))
             && parse_entity(cx.question).is_some()
     }
 
     fn answer<'a>(&'a self, cx: &'a AskCtx<'a>) -> dms_kernel::BoxFut<'a, anyhow::Result<Option<AskResult>>> {
         Box::pin(async move {
-            if !cx
-                .intent
-                .map_or(true, crate::intent::IntentV1::entity_card_compatible)
-            {
+            if !cx.intent.map_or(true, |i| contract_allows(i, cx.question)) {
                 return Ok(None);
             }
             let Some(parsed) = parse_entity(cx.question) else {

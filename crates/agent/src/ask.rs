@@ -2413,9 +2413,15 @@ mod tests {
         );
         // 反问/出界/不可计算/空结果都不算「答出东西了」
         let substance = src.split("fn data_has_substance(").nth(1).expect("data_has_substance 改名了");
-        for marker in ["NEED_INTENT", "NO_TOPIC", "is_unavailable_card_result"] {
+        for marker in ["NEED_INTENT", "NO_TOPIC"] {
             assert!(substance.contains(marker), "「答不了」的说法漏了 {marker}：{substance}");
         }
+        // 「不可计算」卡是**明确结论**，必须算实质 —— 否则资料臂一有命中就顶掉它
+        assert!(
+            substance.contains("if crate::ask::is_unavailable_card_result(r) {
+        return true;"),
+            "不可计算卡又被判成「答不了」了（生产回归 E05/E08）：{substance}"
+        );
     }
 
     #[test]
