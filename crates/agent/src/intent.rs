@@ -2572,6 +2572,16 @@ mod tests {
         // 带可度量槽位的一律不是
         let with_metric = IntentV1 { metrics: vec!["销售额".into()], ..bare };
         assert!(!with_metric.bare_entity_mention("线下-广东横琴雨燕供应链管理有限公司"));
+
+        // 「前缀 + 名字」形（生产回归 C06「商品分类烤肠类」）：前缀由 `entity` 侧剥掉后
+        // 再进来判，本函数只负责「剩下的是不是就是那个实体名」。
+        let cat = IntentV1 {
+            mode: IntentMode::Knowledge,
+            entity_mentions: vec![EntityMention { surface: "烤肠类".into(), kind: EntityKind::Other }],
+            ..IntentV1::default()
+        };
+        assert!(cat.bare_entity_mention("烤肠类"));
+        assert!(!cat.bare_entity_mention("商品分类烤肠类"), "前缀没剥掉时不算裸实体名");
     }
     use std::sync::Mutex;
 

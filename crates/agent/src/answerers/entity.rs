@@ -619,7 +619,19 @@ fn dws_relation_sql(
 /// 而一个裸实体名该出实体卡，与它这次被归成哪一类无关（2026-08-14 生产回归 C06/C08）。
 /// 两臂并行之后资料半照样挂在 `kb` 上，不会因此丢掉资料答案。
 fn contract_allows(intent: &crate::intent::IntentV1, question: &str) -> bool {
-    intent.entity_card_compatible() || intent.bare_entity_mention(question)
+    if intent.entity_card_compatible() {
+        return true;
+    }
+    // 实体前缀（`商品分类` / `客户名称` / `商品编码`…）是**在说哪一类实体**，
+    // 与领头类别词同理，不是名字的一部分。剥掉它再判裸实体名 ——
+    // 否则「商品分类烤肠类」这种「前缀 + 名字」的形永远不算裸实体名（生产回归 C06）。
+    let body = trim_edge(question);
+    let stripped = ENTITY_PREFIXES
+        .iter()
+        .find_map(|(prefix, _, _)| body.strip_prefix(prefix))
+        .map(trim_edge)
+        .unwrap_or(body);
+    intent.bare_entity_mention(stripped)
 }
 
 impl Answerer for EntityAnswerer {
