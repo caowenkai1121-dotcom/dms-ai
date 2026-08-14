@@ -1863,6 +1863,21 @@ impl CoverageReport {
         !self.missing.is_empty() || !self.extra.is_empty() || !self.conflicts.is_empty()
     }
 
+    /// 唯一的「冲突」是**闸门读不懂这条 SQL**（`sql:coverage-unverifiable`），
+    /// 而不是任何证据表明限定被删。
+    ///
+    /// 对 **LLM 生成**的 SQL，读不懂就该硬拦（不可信）。对**代码写死的模板**恰恰相反：
+    /// 那是解析器的局限，把一条正确的模板丢掉、回落自由 SQL 是**放宽**不是收紧。
+    /// 生产实测（2026-08-14）：`本月订单数` 的模板 SQL 里
+    /// `DATE_ADD(…, INTERVAL 1 MONTH)` 让 sqlparser 读不懂，于是 `direct-agg` 被丢，
+    /// 整题掉进自由 SQL 并最终出反问卡。判据留在这里，用不用由调用方按 SQL 来源定。
+    pub fn only_unreadable(&self) -> bool {
+        self.missing.is_empty()
+            && self.extra.is_empty()
+            && self.conflicts.iter().all(|c| c == "sql:coverage-unverifiable")
+            && !self.conflicts.is_empty()
+    }
+
     /// 软降级：证不出来，但也没有证据表明模型删了用户的限定。放行执行，收据降 review，
     /// 缺口逐条写进 `IntentSummary.coverage.issues`（前端「问题理解与结果依据」直接读它）。
     pub fn needs_review(&self) -> bool {

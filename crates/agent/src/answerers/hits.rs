@@ -118,9 +118,17 @@ pub async fn land(
     // 确定性模板：硬阻断才回落下一成员。软降级（证不出来但没删槽）继续执行 ——
     // 模板 SQL 是代码写死的，它「证不出来」通常是闸门读不懂而不是模板错了；
     // 收据仍会因 `unverifiable` 降到 review（`attach_intent_summary` 重算同一份）。
-    if !unavailable && coverage.blocking() {
+    // 🔴 「闸门读不懂这条 SQL」对**代码写死的模板**不是硬阻断（2026-08-14 生产实测）：
+    // `本月订单数` 的模板里 `DATE_ADD(…, INTERVAL 1 MONTH)` 让 sqlparser 读不懂，
+    // 覆盖闸把它记进 `conflicts` → 硬阻断 → 一条正确的 direct-agg 被丢掉、整题回落自由 SQL，
+    // 最后出了张反问卡。丢模板换自由 SQL 是**放宽**不是收紧，与本函数上面那段注释也矛盾。
+    // 对 LLM SQL 仍然硬拦 —— 那条路的覆盖闸在 `run.rs`，不经过这里。
+    if !unavailable && coverage.blocking() && !coverage.only_unreadable() {
         tracing::warn!(route = %hit.route, ?coverage, "确定性路径未证明结构化意图覆盖 → 回落下一成员");
         return Ok(None);
+    }
+    if coverage.only_unreadable() {
+        tracing::warn!(route = %hit.route, sql = %hit.sql, "覆盖闸读不懂模板 SQL → 照常执行，收据标 review");
     }
     if !unavailable && coverage.needs_review() {
         tracing::warn!(route = %hit.route, ?coverage, "确定性路径部分槽位证不出来 → 执行但收据标 review");
@@ -663,5 +671,36 @@ mod unavailable_card_tests {
         );
         // 其它模板仍必须过闸（这条豁免只给「明确说没有」的那一张）
         assert!(body.contains("coverage.blocking()"), "覆盖闸整条没了 —— 那是另一个方向的错");
+        // 「读不懂」不是硬阻断：丢模板换自由 SQL 是放宽不是收紧
+        assert!(
+            body.contains("!coverage.only_unreadable()"),
+            "闸门读不懂模板 SQL 时又去回落自由 SQL 了：{body}"
+        );
+    }
+
+    /// 🔴 生产实测（2026-08-14）：`本月订单数` 的模板 SQL 里
+    /// `DATE_ADD(…, INTERVAL 1 MONTH)` 让 sqlparser 读不懂 → 覆盖闸记进 `conflicts`
+    /// → 硬阻断 → 一条正确的 `direct-agg` 被丢掉、整题回落自由 SQL，最后出反问卡。
+    #[test]
+    fn unreadable_sql_is_not_a_conflict_for_code_written_templates() {
+        use crate::intent::CoverageReport;
+        let unreadable = CoverageReport {
+            conflicts: vec!["sql:coverage-unverifiable".into()],
+            ..CoverageReport::default()
+        };
+        assert!(unreadable.blocking(), "它仍然是「没证明」——只是不该由模板路径硬拦");
+        assert!(unreadable.only_unreadable());
+
+        // 真冲突（删了用户的限定）照旧硬拦
+        let real = CoverageReport {
+            conflicts: vec!["sql:coverage-unverifiable".into()],
+            missing: vec!["time:本月".into()],
+            ..CoverageReport::default()
+        };
+        assert!(!real.only_unreadable(), "丢了槽位就不是「只是读不懂」");
+        let other = CoverageReport { conflicts: vec!["region:湖南≠广东".into()], ..CoverageReport::default() };
+        assert!(!other.only_unreadable());
+        // 没有冲突时不误命中
+        assert!(!CoverageReport::default().only_unreadable());
     }
 }
