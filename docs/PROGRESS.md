@@ -3725,3 +3725,31 @@ sql=SELECT … FROM t_sales_order WHERE sales_order_code = 'HJXH-DXO202608130013
   `activating (auto-restart)` 失败刷屏 —— 与本轮无关，但该收拾。
 
 回归：`cargo test --workspace` 1950 绿；web 60 绿；`npm run build` 通过。
+
+### AX149 续：最后一层 —— 金额列一直没被当成金额列
+
+单据卡在两臂、别名表、码表全修好之后**仍然没有合计**。呈现编排的日志说
+「未产出可用块 → 走确定性兜底」，而确定性兜底也返回空。把生产的 `view.columns`
+原样打出来才看见：
+
+```text
+商品金额  role=category  sem=None
+金额      role=category  sem=None
+实发数量  role=category  sem=None
+```
+
+`ColumnSpec` 的 role/semantic 是**按列名推**的（`present::infer_*`），而
+`present_cn::apply` 只改列名、**不重算规格**。数仓明细的 `goods_amount` 被译成
+「商品金额」之后，规格还停在英文名推出来的那一份 —— 英文名里没有「金额」二字。
+
+后果不止编排这一处：前端按 `role=metric` 决定右对齐、按 `semantic=money` 决定 ¥ 与
+万/亿压缩，这两件事对**所有原名是英文的金额列一直是坏的**（列名本来就是中文的那些碰巧对）。
+这条在业主的截图里看不出来 —— 截图上那张卡的字段恰好都有中文别名。
+
+修法一行：`present::col_spec` 提 pub，`apply` 同步列名时一并重算。原名已是中文时重算等于原样。
+
+**教训**：把一份数据的「名字」和「按名字推出来的属性」放在两个地方维护，
+改了名字不改属性，就是本轮反复在拆的那类缺陷 —— 只不过这次它藏在我自己刚建的
+呈现编排后面，直到把生产的中间态原样打出来才现形。
+
+回归：`cargo test --workspace` 1951 绿。
