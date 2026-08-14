@@ -482,9 +482,19 @@ pub(crate) async fn ask_data_arm(
     // 向量选到主源，同一张单就查得出来 —— 同一个单号，多两个字就查不到。
     //
     // 用户显式选了源（`explicit_ds`）时不夺权：那是他自己的选择。
-    let has_document_code = explicit_ds.is_none()
-        && dms_semantic::document::resolve_document(&rewritten, d.dms.is_warehouse()).is_some();
-    let picked = if has_document_code {
+    //
+    // 🔴 **同一条更一般的形态**（2026-08-14 生产实测 A07/A11）：确定性模板命中时同样锁主源。
+    // 「本月订单数」被向量最近邻路由到某个用户上传的数据源（PostgreSQL），于是模板 SQL 里
+    // 反引号别名 `` AS `订单数` `` 解析不了 → 红线闸门**静默**拒（那条只打 debug）→
+    // 回落自由 SQL → 反问卡。用户看到的是「请补充明确的对象、指标和时间」，
+    // 而这道题有一份代码写死的模板本来就答得出来。
+    //
+    // 模板是**按主源写的**（表名、方言、别名都是），让最近邻把它改投到别人上传的表格上，
+    // 从定义上就不成立。用户想查自己上传的数据时显式选源即可（`explicit_ds`）。
+    let deterministic_answerable = explicit_ds.is_none()
+        && (dms_semantic::document::resolve_document(&rewritten, d.dms.is_warehouse()).is_some()
+            || crate::answerers::fastpath_intent::try_direct_for(&rewritten, d.dms.is_warehouse()).is_some());
+    let picked = if deterministic_answerable {
         ds_reg::DMS_DS_ID.to_string()
     } else {
         source::select_source(&**d.llm, d.pg, d.embed, p, &rewritten, explicit_ds).await?
@@ -2288,19 +2298,22 @@ mod tests {
         assert!(loc < compose, "呈现编排跑在中文化之前了：它会拿英文列名与裸码值编排");
     }
 
-    /// 🔴 单号锁主源：源由单据族注册表**证明**，不交给向量最近邻猜。
+    /// 🔴 确定性可答的问句锁主源：源由注册表/模板**证明**，不交给向量最近邻猜。
     ///
-    /// 生产实测（2026-08-14）：「订单 HJXH-DXO2026081300138」里的「订单」二字把选源
-    /// 推到某个用户上传的数据源，单据 SQL 打进别人的上传 schema 当场失败、回落自由 SQL
-    /// 返 0 行；而**裸单号**同一张单查得出来 —— 同一个单号，多两个字就查不到。
+    /// 生产实测（2026-08-14）两条：
+    /// ① 「订单 HJXH-DXO2026081300138」里的「订单」二字把选源推到某个用户上传的数据源，
+    ///    单据 SQL 打进别人的上传 schema 当场失败；裸单号同一张单却查得出来。
+    /// ② 「本月订单数」同样被推到上传源（PostgreSQL），模板 SQL 的反引号别名解析不了 →
+    ///    红线闸门**静默**拒 → 回落自由 SQL → 反问卡。
     #[test]
     fn a_document_code_pins_the_main_source() {
         let src = include_str!("ask.rs");
         let arm = src.split("pub(crate) async fn ask_data_arm(").nth(1).expect("ask_data_arm 改名了");
         assert!(
-            arm.contains("let has_document_code = explicit_ds.is_none()")
-                && arm.contains("dms_semantic::document::resolve_document(&rewritten"),
-            "单号又回去参与向量选源了：{arm}"
+            arm.contains("let deterministic_answerable = explicit_ds.is_none()")
+                && arm.contains("dms_semantic::document::resolve_document(&rewritten")
+                && arm.contains("fastpath_intent::try_direct_for(&rewritten"),
+            "确定性可答的问句又回去参与向量选源了：{arm}"
         );
         // 用户显式选了源就不夺权
         assert!(arm.contains("explicit_ds.is_none()"), "显式选源必须优先：{arm}");
