@@ -301,7 +301,18 @@ pub async fn dual_outcome(
     deterministic_fallback: bool,
 ) -> anyhow::Result<HybridOutcome> {
     let data_fut = ask_data_arm(d, p, prepared, explicit_ds, deterministic_fallback);
+    // 🔴 破坏性问句（删除/清空/drop）**不跑资料臂**（2026-08-14 生产回归 H01/H02/H03）。
+    //
+    // 那一档问数臂出的是红线拦截卡（`route=need-intent`），而拦截卡按判据「没有实质内容」，
+    // 于是资料臂一有带角标的命中就顶替 —— 用户问「清空订单表」，系统端上一段知识库内容。
+    // 拦截在日志里仍然成立，但用户看到的是**一个答案**，不是一次拒绝。
+    // 这一档连问都不该问知识库：破坏性意图不是检索意图。
+    let destructive = crate::ask::destructive_hit(&prepared.effective_question);
     let kb_fut = async {
+        if destructive {
+            tracing::info!("破坏性问句：不跑资料臂（红线拦截卡不许被顶替）");
+            return None;
+        }
         let kb = d.kb.as_ref()?;
         crate::answerers::knowledge::answer(
             kb.owned,

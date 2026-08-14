@@ -991,7 +991,7 @@ const DESTRUCTIVE: &[&str] = &[
 
 /// 破坏性词命中（纯函数）：中文词 plain contains；ASCII 词加**词边界**（前后邻字符是
 /// ASCII 字母/数字/下划线 = 词内）——「dropdown」「waterdrop」这类英文词混入问句不得误判红线反问。
-fn destructive_hit(question: &str) -> bool {
+pub(crate) fn destructive_hit(question: &str) -> bool {
     let lower = question.to_ascii_lowercase();
     let wordy = |c: char| c.is_ascii_alphanumeric() || c == '_';
     DESTRUCTIVE.iter().any(|w| {
@@ -2410,6 +2410,11 @@ mod tests {
         assert!(
             !fuse.contains("AskResult::compound"),
             "问数主体又被套进 compound 容器了 —— 79 题回归会红 68 题：{fuse}"
+        );
+        // 破坏性问句根本不跑资料臂：红线拦截卡不许被知识库答案顶替（生产回归 H01/H02/H03）
+        assert!(
+            outcome.contains("crate::ask::destructive_hit(&prepared.effective_question)"),
+            "破坏性问句又去问知识库了 —— 拦截卡会被顶掉：{outcome}"
         );
         // 反问/出界/不可计算/空结果都不算「答出东西了」
         let substance = src.split("fn data_has_substance(").nth(1).expect("data_has_substance 改名了");
