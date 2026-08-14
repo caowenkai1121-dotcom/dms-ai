@@ -402,12 +402,19 @@ impl IntentV1 {
             && self.time.is_none()
             && {
                 let surface = self.entity_mentions[0].surface.trim();
-                !surface.is_empty()
-                    && question
-                        .trim()
-                        .replace(surface, "")
-                        .chars()
-                        .all(|c| c.is_whitespace() || "，,。.、？?！!的".contains(c))
+                if surface.is_empty() {
+                    return false;
+                }
+                // 剩余里允许留**渠道/类别限定词**与标点：模型抽表面词时常把库内名称的
+                // 前缀切掉（`线下-广东横琴雨燕供应链管理有限公司` 抽成
+                // `广东横琴雨燕供应链管理有限公司`），剩下一个「线下-」——
+                // 它不是「另一个问题」，只是同一个名字的前缀（生产回归 C08）。
+                const QUALIFIERS: &[&str] = &["线下", "线上", "客户", "门店", "商品", "品牌", "员工"];
+                let mut rest = question.trim().replace(surface, "");
+                for word in QUALIFIERS {
+                    rest = rest.replace(word, "");
+                }
+                rest.chars().all(|c| c.is_whitespace() || "，,。.、？?！!的-_—".contains(c))
             }
     }
 
@@ -2581,7 +2588,23 @@ mod tests {
             ..IntentV1::default()
         };
         assert!(cat.bare_entity_mention("烤肠类"));
-        assert!(!cat.bare_entity_mention("商品分类烤肠类"), "前缀没剥掉时不算裸实体名");
+        // 完整类别前缀（`商品分类`）由 `entity::contract_allows` 剥掉后再进来 ——
+        // 这里只认单词级限定词（`商品`/`客户`/`线下`…），不认「分类」这种半截
+        assert!(!cat.bare_entity_mention("商品分类烤肠类"), "完整前缀该由调用方剥");
+
+        // 模型常把库内名称的渠道前缀切掉：表面词是「广东横琴…公司」而问句带「线下-」
+        // （生产回归 C08）。剩下的「线下-」不是另一个问题，只是同一个名字的前缀。
+        let with_channel = IntentV1 {
+            mode: IntentMode::Knowledge,
+            entity_mentions: vec![EntityMention {
+                surface: "广东横琴雨燕供应链管理有限公司".into(),
+                kind: EntityKind::Organization,
+            }],
+            ..IntentV1::default()
+        };
+        assert!(with_channel.bare_entity_mention("线下-广东横琴雨燕供应链管理有限公司"));
+        // 剩余里有真内容仍然不算
+        assert!(!with_channel.bare_entity_mention("广东横琴雨燕供应链管理有限公司的合同模板"));
     }
     use std::sync::Mutex;
 

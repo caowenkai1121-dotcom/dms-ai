@@ -371,6 +371,21 @@ pub async fn dual_outcome(
     //
     // 🔴 但那张卡上的**解释**不许跟着丢（2026-08-14 自审）：用户问的是数据，
     // 「为什么算不出来」正是他要的信息之一；只把资料答案端上去，他会以为数据侧没意见。
+    // 🔴 **Data 路由的问句不让位**（2026-08-14 生产回归 D03）。
+    //
+    // 反问卡让位给资料答案，是为了业主那句「中国农业银行…昌州支行」—— 那一档裁决判的是
+    // `Knowledge`/`Unknown`，问数臂本来就答不了。而「本月销售额按省区」裁决判的是 `Data`：
+    // 问数臂答不出时，用户要的是**为什么答不出**，不是一段讲制度的资料。
+    // 拿资料答案去顶一个数据问题，形状上像答了，实质上换了个问题回答。
+    if !data_has_substance(&data) && prepared.route() == crate::intent::IntentRoute::Data {
+        return Ok(HybridOutcome {
+            data: Some(data),
+            knowledge: Some(a),
+            summary: None,
+            clarification: None,
+            data_note: None,
+        });
+    }
     if !data_has_substance(&data) {
         let mut out = only_kb(a);
         out.data_note = data.caliber_note.clone().or_else(|| {
