@@ -405,15 +405,11 @@ impl IntentV1 {
                 if surface.is_empty() {
                     return false;
                 }
-                // 剩余里允许留**渠道/类别限定词**与标点：模型抽表面词时常把库内名称的
-                // 前缀切掉（`线下-广东横琴雨燕供应链管理有限公司` 抽成
-                // `广东横琴雨燕供应链管理有限公司`），剩下一个「线下-」——
-                // 它不是「另一个问题」，只是同一个名字的前缀（生产回归 C08）。
-                const QUALIFIERS: &[&str] = &["线下", "线上", "客户", "门店", "商品", "品牌", "员工"];
-                let mut rest = question.trim().replace(surface, "");
-                for word in QUALIFIERS {
-                    rest = rest.replace(word, "");
-                }
+                // 表面词以外只许剩标点：这道门判的是「问句是不是只有这一个名字」。
+                // 模型把库内名称的渠道前缀切掉（`线下-XX有限公司` 抽成 `XX有限公司`）
+                // 这一档**不在这里救** —— 名字自带公司形态时实体卡根本不看合同
+                //（`answerers/entity.rs::self_evident`），在这里再放宽等于同一件事修两遍。
+                let rest = question.trim().replace(surface, "");
                 rest.chars().all(|c| c.is_whitespace() || "，,。.、？?！!的-_—".contains(c))
             }
     }
@@ -2580,31 +2576,18 @@ mod tests {
         let with_metric = IntentV1 { metrics: vec!["销售额".into()], ..bare };
         assert!(!with_metric.bare_entity_mention("线下-广东横琴雨燕供应链管理有限公司"));
 
-        // 「前缀 + 名字」形（生产回归 C06「商品分类烤肠类」）：前缀由 `entity` 侧剥掉后
-        // 再进来判，本函数只负责「剩下的是不是就是那个实体名」。
+        // 表面词与问句对不齐的两族 —— 模型抽成「烤肠类」而问句是「商品分类烤肠类」，
+        // 或抽成「广东横琴…公司」而问句带「线下-」—— 本函数一律判否，**这是对的**：
+        // 它只答「问句是不是只有这一个表面词」。那两族由形态证据在
+        // `answerers::entity::self_evident` 接住（显式实体前缀 / 公司形态），
+        // 与模型这轮抽成什么无关；在这里再放宽等于同一件事修两遍。
         let cat = IntentV1 {
             mode: IntentMode::Knowledge,
             entity_mentions: vec![EntityMention { surface: "烤肠类".into(), kind: EntityKind::Other }],
             ..IntentV1::default()
         };
         assert!(cat.bare_entity_mention("烤肠类"));
-        // 完整类别前缀（`商品分类`）由 `entity::contract_allows` 剥掉后再进来 ——
-        // 这里只认单词级限定词（`商品`/`客户`/`线下`…），不认「分类」这种半截
-        assert!(!cat.bare_entity_mention("商品分类烤肠类"), "完整前缀该由调用方剥");
-
-        // 模型常把库内名称的渠道前缀切掉：表面词是「广东横琴…公司」而问句带「线下-」
-        // （生产回归 C08）。剩下的「线下-」不是另一个问题，只是同一个名字的前缀。
-        let with_channel = IntentV1 {
-            mode: IntentMode::Knowledge,
-            entity_mentions: vec![EntityMention {
-                surface: "广东横琴雨燕供应链管理有限公司".into(),
-                kind: EntityKind::Organization,
-            }],
-            ..IntentV1::default()
-        };
-        assert!(with_channel.bare_entity_mention("线下-广东横琴雨燕供应链管理有限公司"));
-        // 剩余里有真内容仍然不算
-        assert!(!with_channel.bare_entity_mention("广东横琴雨燕供应链管理有限公司的合同模板"));
+        assert!(!cat.bare_entity_mention("商品分类烤肠类"), "前缀不在表面词里 → 交给形态证据");
     }
     use std::sync::Mutex;
 

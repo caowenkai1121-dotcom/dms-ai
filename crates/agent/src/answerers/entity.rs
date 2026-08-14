@@ -613,27 +613,35 @@ fn dws_relation_sql(
     ))
 }
 
-/// 合同放不放行实体卡：常规判据 **或** 这是个裸实体名。
+/// 形态自证的实体名：`kind` 已定（显式实体前缀「商品分类…」或裸型号形态），
+/// 或名称本身带公司形态（渠道前缀 `线下-` / 公司类后缀）。这一档**不看合同**。
 ///
-/// 后半条不看 `mode` —— fast 模型把裸公司名判成 `knowledge` 是常事（同一句两次两种 mode），
-/// 而一个裸实体名该出实体卡，与它这次被归成哪一类无关（2026-08-14 生产回归 C06/C08）。
-/// 两臂并行之后资料半照样挂在 `kb` 上，不会因此丢掉资料答案。
+/// 🔴 由来（2026-08-14 生产直打，同句连打三次）：
+///   `线下-广东横琴雨燕供应链管理有限公司` → entity-card / entity-card / llm+repair
+///   `商品分类烤肠类`                     → no-topic / no-topic / entity-card
+/// 同一句同一份代码两种答案 —— 差别只在 fast 那一轮抽没抽出实体表面词。
+/// 「这句是不是一个实体名」是问句的**形态属性**，不是模型的采样结果；
+/// 有形态证据时就不该让合同一票否决。
+///
+/// 反过来仍要合同点头的是**没有形态证据**的短句：`parse_entity` 也放行
+/// 「退货政策」「报销流程」「会员积分规则」（实测），那些一旦不看合同，
+/// 每条知识库问句都要白付五路主档探针。
+fn self_evident(parsed: &ParsedEntity) -> bool {
+    parsed.kind.is_some() || looks_like_company(&parsed.value)
+}
+
+/// 合同放不放行实体卡：常规判据 **或** 这是个裸实体名（后半条不看 `mode`——
+/// fast 把裸公司名判成 `knowledge` 是常事，而它该出实体卡）。
 fn contract_allows(intent: &crate::intent::IntentV1, question: &str) -> bool {
-    if intent.entity_card_compatible() {
-        return true;
-    }
-    // 实体前缀（`商品分类` / `客户名称` / `商品编码`…）是**在说哪一类实体**，
-    // 与领头类别词同理，不是名字的一部分。剥掉它再判裸实体名 ——
-    // 否则「商品分类烤肠类」这种「前缀 + 名字」的形永远不算裸实体名（生产回归 C06）。
-    // 两种都试：模型可能把表面词抽成**整句**（`商品分类烤肠类`），也可能只抽**名字**
-    // （`烤肠类`）。前者用原句比，后者用剥掉前缀的句子比 —— 只比一种必然漏一半。
-    let body = trim_edge(question);
-    let stripped = ENTITY_PREFIXES
-        .iter()
-        .find_map(|(prefix, _, _)| body.strip_prefix(prefix))
-        .map(trim_edge)
-        .unwrap_or(body);
-    intent.bare_entity_mention(body) || intent.bare_entity_mention(stripped)
+    intent.entity_card_compatible() || intent.bare_entity_mention(trim_edge(question))
+}
+
+/// 词法门 + 合同门的合成判据（`accept` 与 `answer` 同一份，不许分叉）。
+fn gate(cx: &AskCtx<'_>) -> Option<ParsedEntity> {
+    let parsed = parse_entity(cx.question)?;
+    let allowed =
+        self_evident(&parsed) || cx.intent.map_or(true, |i| contract_allows(i, cx.question));
+    allowed.then_some(parsed)
 }
 
 impl Answerer for EntityAnswerer {
@@ -642,24 +650,20 @@ impl Answerer for EntityAnswerer {
     }
 
     /// 词法门（同步无 IO）：只解析“实体本身/实体资料”问法；带指标或关系的长问句交给分析链。
-    /// （`answer` 会复跑一次完整 `parse_entity` —— Router 形状要求 accept/answer 分离，
-    ///   同 graph.rs 的「第二次识别」注释；词法门本就为省 IO，重复 CPU 解析是有意付的。）
+    /// （`answer` 复跑同一个 `gate` —— Router 形状要求 accept/answer 分离，同 graph.rs 的
+    ///   「第二次识别」注释；词法门本就为省 IO，重复 CPU 解析是有意付的。）
     // 🔴 合同缺席（`Unknown`/`Invalid`/`Unavailable`）时按**词法门**放行，不是拒绝：
     // `AGENT-ARCHITECTURE §3.1` 写的是「已有确定性路径仍可尝试，但只能标记为 review」。
     // `is_some_and` 在 None 时恒 false ＝ 无合同就一个确定性成员都不出手，于是 fast 模型
     // 一次抖动整轮掉进反问卡（同题不同答，2026-08-13 实测）。收据侧无需另加判据：
     // `attach_trust` 的 `intent_unverified` 已经把这一档钉成 review。
     fn accept(&self, cx: &AskCtx<'_>) -> bool {
-        cx.intent.map_or(true, |i| contract_allows(i, cx.question))
-            && parse_entity(cx.question).is_some()
+        gate(cx).is_some()
     }
 
     fn answer<'a>(&'a self, cx: &'a AskCtx<'a>) -> dms_kernel::BoxFut<'a, anyhow::Result<Option<AskResult>>> {
         Box::pin(async move {
-            if !cx.intent.map_or(true, |i| contract_allows(i, cx.question)) {
-                return Ok(None);
-            }
-            let Some(parsed) = parse_entity(cx.question) else {
+            let Some(parsed) = gate(cx) else {
                 return Ok(None);
             };
             if parsed.kind == Some(Kind::Category) {
@@ -1710,6 +1714,27 @@ fn build_card(
 mod tests {
     use super::*;
 
+    /// 形态自证的实体名不看合同：同一句连打三次给出两种 route（2026-08-14 生产直打）——
+    /// 差别只在 fast 那一轮抽没抽出实体表面词，而「是不是实体名」是问句的形态属性。
+    /// 反面同样钉住：没有形态证据的短句（知识库问法）仍要合同点头，否则每条都要白付探针。
+    #[test]
+    fn entity_shaped_names_do_not_need_the_contract() {
+        for q in [
+            "线下-广东横琴雨燕供应链管理有限公司", // 渠道前缀（C08）
+            "商品分类烤肠类",                     // 显式实体前缀（C06）
+            "潍坊程祥商贸有限公司",               // 公司类后缀
+            "DHT150-6",                           // 裸型号
+        ] {
+            let parsed = parse_entity(q).unwrap_or_else(|| panic!("{q} 该过词法门"));
+            assert!(self_evident(&parsed), "{q} 该形态自证");
+        }
+        // 这些也过 `parse_entity`（实测），但没有形态证据 —— 必须留给合同裁决
+        for q in ["退货政策", "报销流程", "会员积分规则", "公司考勤制度"] {
+            let parsed = parse_entity(q).unwrap_or_else(|| panic!("{q} 仍过词法门（本用例的前提）"));
+            assert!(!self_evident(&parsed), "{q} 不该绕过合同");
+        }
+    }
+
     #[test]
     fn exact_match_precedes_fuzzy_and_ambiguity_never_picks_first() {
         let src = include_str!("entity.rs");
@@ -2212,3 +2237,4 @@ mod tests {
         assert!(merge_distribution(Some(mk(0)), None).is_none());
     }
 }
+
