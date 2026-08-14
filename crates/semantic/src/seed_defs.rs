@@ -226,8 +226,16 @@ pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
         ("buyer_count", "2-order", ORDER_DIMS),
         ("avg_order_value", "2-order", ORDER_DIMS),
         ("market_expense", "2026.08.07-sales-ads-v1", &[]),
-        ("aftersales_count", "1", &[]),
-        ("refund_amount", "1", &[]),
+        // 售后两个流量指标可按**月份**拆：`月份` 声明绑在销售事实上，但装配器对
+        // 「指标自绑时间维度」早有专门支路（`metric_bound_time_dim` → `bind_time_dimension`），
+        // 会把它重绑到指标自己的 `after_sales_time` 上，不需要跨表 JOIN。
+        // 🔴 只加时间粒度，**不加 `战区`**：战区取自 `dws_off_offline_sale_dfn.war_zone`，
+        // ODS 售后单头上没有这一列、也没有到销售事实的已验收 join —— 那一档写进白名单
+        // 只是把「装配不出来」换个地方失败，业主看到的仍是空板块。
+        // 由来：业主截图「今年退款额是多少」的深度报告 板块 1/3（2 失败），
+        // 三条断言里「月度退款额趋势」是唯一现在就能诚实兑现的（2026-08-15）。
+        ("aftersales_count", "1", &["月份"]),
+        ("refund_amount", "1", &["月份"]),
         ("refund_ratio", sales_fact::VERSION, &[]),
         ("stock_qty", "1", &[]),
         ("stock_amount", "1", &[]),
