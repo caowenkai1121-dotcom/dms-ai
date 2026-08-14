@@ -144,6 +144,10 @@ const TOKEN_DICT: &[(&str, &str)] = &[
     ("sales", "销售"),
     ("time", "时间"),
     ("date", "日期"),
+    // 生产实测补的（2026-08-14 账余充值单卡上 `receipt_date` 仍是英文，
+    // 而 `t_customer_balance` 那几列在 `meta.column_doc` 里没有中文注释）
+    ("receipt", "收款"),
+    ("pay", "支付"),
     ("month", "月份"),
     ("year", "年份"),
     ("day", "日"),
