@@ -625,13 +625,15 @@ fn contract_allows(intent: &crate::intent::IntentV1, question: &str) -> bool {
     // 实体前缀（`商品分类` / `客户名称` / `商品编码`…）是**在说哪一类实体**，
     // 与领头类别词同理，不是名字的一部分。剥掉它再判裸实体名 ——
     // 否则「商品分类烤肠类」这种「前缀 + 名字」的形永远不算裸实体名（生产回归 C06）。
+    // 两种都试：模型可能把表面词抽成**整句**（`商品分类烤肠类`），也可能只抽**名字**
+    // （`烤肠类`）。前者用原句比，后者用剥掉前缀的句子比 —— 只比一种必然漏一半。
     let body = trim_edge(question);
     let stripped = ENTITY_PREFIXES
         .iter()
         .find_map(|(prefix, _, _)| body.strip_prefix(prefix))
         .map(trim_edge)
         .unwrap_or(body);
-    intent.bare_entity_mention(stripped)
+    intent.bare_entity_mention(body) || intent.bare_entity_mention(stripped)
 }
 
 impl Answerer for EntityAnswerer {
