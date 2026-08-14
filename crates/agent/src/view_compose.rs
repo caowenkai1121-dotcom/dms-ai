@@ -70,6 +70,7 @@ pub(crate) async fn refine(cx: &AskCtx<'_>, r: &mut AskResult) {
         Some(blocks) => blocks,
         None => deterministic_summary(&r.view, &r.rows),
     };
+    let composed = if r.truncated { honest_under_truncation(composed, r.rows.len()) } else { composed };
     if composed.is_empty() {
         return;
     }
@@ -82,6 +83,43 @@ pub(crate) async fn refine(cx: &AskCtx<'_>, r: &mut AskResult) {
     r.view.blocks = header.into_iter().chain(composed).collect();
 }
 
+/// 截断结果的产出整形：**代码保证不说谎**，不指望模型自觉。
+///
+/// - KPI 一律去掉：`aggregate` 只看回传的这几行，「合计」其实是小计。
+///   一个悄悄少算的数比少一张卡坏得多（这条判据本来就是拒整条编排的理由）。
+/// - 图表标题补「（前 N 行）」：前 N 行的构成本来就只是前 N 行的构成，说清楚就不骗人。
+///   模型给的标题一律加后缀；它没给标题时也补一个。
+/// - 表格原样留。
+///
+/// 去完 KPI 只剩表格时返回空 —— 那等于没编排，让调用方按「不编排」走（少一次无意义重排）。
+fn honest_under_truncation(blocks: Vec<Block>, rows: usize) -> Vec<Block> {
+    let suffix = format!("（前 {rows} 行）");
+    let kept: Vec<Block> = blocks
+        .into_iter()
+        .filter(|block| !matches!(block, Block::Kpis { .. }))
+        .map(|block| match block {
+            Block::Chart { kind, x, y, top, series, title } => Block::Chart {
+                kind,
+                x,
+                y,
+                top,
+                series,
+                title: Some(match title {
+                    Some(t) if t.ends_with(&suffix) => t,
+                    Some(t) => format!("{t}{suffix}"),
+                    None => format!("构成{suffix}"),
+                }),
+            },
+            other => other,
+        })
+        .collect();
+    if kept.iter().any(|b| matches!(b, Block::Chart { .. })) {
+        kept
+    } else {
+        vec![]
+    }
+}
+
 /// 值不值得多烧一次 fast 调用。
 ///
 /// 判据只看**结果形状**，不看路由：确定性快路与 LLM SQL 出来的表格是一样的表格。
@@ -89,11 +127,13 @@ fn worth_composing(r: &AskResult) -> bool {
     if r.rows.len() < MIN_ROWS || r.columns.len() < 2 || !r.subs.is_empty() {
         return false;
     }
-    // 🔴 结果被截断时不编排：`aggregate` 只看回传的这几行，算出来的「合计」是**小计**，
-    // 而卡上写着「合计」。宁可少一张 KPI 卡，不给一个悄悄少算的数（2026-08-14 自审）。
-    if r.truncated {
-        return false;
-    }
+    // 截断的结果**照样编排**，但产出要说实话（`honest_under_truncation`）。
+    //
+    // 🔴 上一版是整条拒（怕「合计」其实是小计）。代价实测出来了（2026-08-15 生产直打）：
+    // 「本月销售额按客户」200 行、「昨天销售订单明细」200 行 —— 恰恰是最该给构成图与
+    // 排序的那一档，因为撞上行上限而**一个块都没编排**，用户看到一张 200 行裸表。
+    // 拒的理由只对「合计」成立，不对图表成立：前 200 行的构成图本来就只是前 200 行的构成，
+    // 标题里写清楚就不骗人。
     // 反问卡/出界卡没有数据可编排（它们的 blocks 是文案载体）
     if r.sql.trim().is_empty() {
         return false;
@@ -577,6 +617,42 @@ mod tests {
         r.view.blocks = vec![Block::Table];
         r.rows.truncate(1);
         assert!(!worth_composing(&r), "单行结果没有可编排的余地");
+    }
+
+    /// 截断结果照样编排，但代码不许它说谎：KPI 去掉（合计其实是小计），
+    /// 图表标题补「（前 N 行）」。生产实测这一档是「本月销售额按客户」200 行那种，
+    /// 此前整条拒编排 → 用户看到一张 200 行裸表。
+    #[test]
+    fn truncated_results_get_charts_but_never_a_fake_total() {
+        let blocks = vec![
+            Block::Kpis { items: vec![Kpi { label: "合计金额".into(), value: Value::from(1), semantic: Semantic::Money, delta: None }] },
+            Block::Chart { kind: dms_kernel::present::ChartKind::Bar, x: 0, y: vec![1], top: Some(10), series: None, title: Some("各客户销售额".into()) },
+            Block::Table,
+        ];
+        let out = honest_under_truncation(blocks, 200);
+        assert!(!out.iter().any(|b| matches!(b, Block::Kpis { .. })), "截断时不许出合计：{out:?}");
+        let Some(Block::Chart { title, .. }) = out.iter().find(|b| matches!(b, Block::Chart { .. })) else {
+            panic!("图表该留下：{out:?}")
+        };
+        assert_eq!(title.as_deref(), Some("各客户销售额（前 200 行）"));
+        assert!(matches!(out.last(), Some(Block::Table)));
+    }
+
+    /// 后缀只加一次（重排/重试不许叠成「（前 200 行）（前 200 行）」）
+    #[test]
+    fn the_truncation_suffix_is_not_appended_twice() {
+        let once = honest_under_truncation(
+            vec![Block::Chart { kind: dms_kernel::present::ChartKind::Bar, x: 0, y: vec![1], top: None, series: None, title: Some("构成（前 200 行）".into()) }],
+            200,
+        );
+        let Some(Block::Chart { title, .. }) = once.first() else { panic!("{once:?}") };
+        assert_eq!(title.as_deref(), Some("构成（前 200 行）"));
+    }
+
+    /// 去完 KPI 只剩表格 = 没编排：返回空，让调用方按「不编排」走
+    #[test]
+    fn truncation_without_a_chart_is_not_a_composition() {
+        assert!(honest_under_truncation(vec![Block::Kpis { items: vec![] }, Block::Table], 200).is_empty());
     }
 
     /// 模型那半失败时仍要有确定性摘要：合计与行数是代码算得出的确定事实。
