@@ -1116,6 +1116,17 @@ fn validate_evidence_insight_with_facts(
         tracing::warn!(raw = %raw, "ANALYSIS_CHINESE_NUMBER_UNVERIFIED：中文数字不能精确归一 → 整段分析判失败");
         return None;
     }
+    // 🔴 能换算的中文数字**也要过数值闸**（2026-08-14 自审）：放行它们的前提是
+    // 「归一后走与阿拉伯数字同一条核验路」，而这条路上的 `number_tokens` 只认 ASCII 数字。
+    // 不归一就等于给 1~99 的中文数字开了一条免检通道 —— 模型写「毛利率下降三个百分点」
+    // 无人对账。归一只用于**核验**，展示文本一个字不动。
+    let normalized = normalize_cjk_digits(text);
+    if facts.is_empty() && normalized != text {
+        if let Some(claim) = first_scoped_unbound_claim_value(&normalized, evidence) {
+            tracing::warn!(claim = %claim, "ANALYSIS_CLAIM_VALUE_MISMATCH：中文数字归一后绑不上任何证据 → 整段分析判失败");
+            return None;
+        }
+    }
     if !facts.is_empty() {
         let Some(validated) = validate_evidence_facts(text, facts) else {
             tracing::warn!("ANALYSIS_FACT_SCOPE_MISMATCH：分析事实未按主体/指标/比较字段/单元格原子绑定");
@@ -1316,6 +1327,32 @@ fn unparsable_chinese_number(text: &str) -> Option<String> {
             runs.any(|run| dms_kernel::nl::time::cn_num(&run.replace('〇', "零")).is_none())
         })
         .map(str::to_string)
+}
+
+/// 中文数字 → 阿拉伯数字（**只为核验**，不改展示文本）。换不出的原样留下 ——
+/// 那一类已经由 `unparsable_chinese_number` 一票否决。
+fn normalize_cjk_digits(text: &str) -> String {
+    const CN_DIGITS: &str = "零〇一二两三四五六七八九十";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(|c| CN_DIGITS.contains(c)) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let run_len = rest
+            .char_indices()
+            .take_while(|(_, c)| CN_DIGITS.contains(*c))
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        let (run, tail) = rest.split_at(run_len);
+        match dms_kernel::nl::time::cn_num(&run.replace('〇', "零")) {
+            Some(n) => out.push_str(&n.to_string()),
+            None => out.push_str(run),
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 提取数值 token：连续数字（含千分位/小数/百分号），尾部 万/亿 压缩单位一并保留，

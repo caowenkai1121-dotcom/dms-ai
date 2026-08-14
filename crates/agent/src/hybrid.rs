@@ -38,6 +38,9 @@ pub struct HybridOutcome {
     pub summary: Option<String>,
     /// 归属不唯一等无法执行的原因；非空时 `data`/`knowledge` 都为 `None`。
     pub clarification: Option<AskResult>,
+    /// 问数臂**答不了的原因**（它出了卡但没实质内容时）。资料半单独上屏时把这句带上，
+    /// 否则用户会以为数据侧没意见 —— 而他问的本来就是数据。
+    pub data_note: Option<String>,
 }
 
 /// typed subgoal → (问数半 N 条, 知识库半 1 条)。
@@ -96,6 +99,7 @@ pub async fn run(
             knowledge: None,
             summary: None,
             clarification: Some(card),
+            data_note: None,
         });
     };
     let data_prepared: Vec<_> = data_qs.iter().map(|q| prepared.project(q)).collect();
@@ -156,7 +160,7 @@ pub async fn run(
         }
         _ => None,
     };
-    Ok(HybridOutcome { data, knowledge, summary, clarification: None })
+    Ok(HybridOutcome { data, knowledge, summary, clarification: None, data_note: None })
 }
 
 
@@ -207,12 +211,22 @@ fn fuse(outcome: HybridOutcome, prepared: &PreparedQuestion) -> AskResult {
     if let Some(card) = outcome.clarification {
         return card;
     }
-    let HybridOutcome { data, knowledge, summary, .. } = outcome;
+    let HybridOutcome { data, knowledge, summary, data_note, .. } = outcome;
     let Some(mut r) = data else {
-        return into_ask_result(
-            HybridOutcome { data: None, knowledge, summary, clarification: None },
+        let mut out = into_ask_result(
+            HybridOutcome { data: None, knowledge, summary, clarification: None, data_note: None },
             prepared,
         );
+        // 问数臂答不了的**原因**跟着上屏：用户问的是数据，只端一份资料答案会让他以为
+        // 数据侧没意见。`into_ask_result` 已经把资料摘要写进 caliber_note，这里接在前面。
+        if let Some(note) = data_note {
+            out.caliber_note = Some(match out.caliber_note.take() {
+                Some(kb) => format!("{note}
+{kb}"),
+                None => note,
+            });
+        }
+        return out;
     };
     if knowledge.is_some() {
         r.kb = knowledge;
@@ -263,6 +277,7 @@ pub async fn dual_outcome(
         knowledge: Some(a),
         summary: None,
         clarification: None,
+        data_note: None,
     };
     let data = match data_r {
         Ok(r) => r,
@@ -286,16 +301,24 @@ pub async fn dual_outcome(
             knowledge: None,
             summary: None,
             clarification: None,
+            data_note: None,
         });
     };
     // 问数臂只会说「我答不了」时不并排展示：一张反问卡配一份真资料，
     // 合成出来的「综合结论」会让用户以为数据侧也确认了什么。
+    //
+    // 🔴 但那张卡上的**解释**不许跟着丢（2026-08-14 自审）：用户问的是数据，
+    // 「为什么算不出来」正是他要的信息之一；只把资料答案端上去，他会以为数据侧没意见。
     if !data_has_substance(&data) {
-        return Ok(only_kb(a));
+        let mut out = only_kb(a);
+        out.data_note = data.caliber_note.clone().or_else(|| {
+            (data.route == crate::ask::NEED_INTENT).then(|| "数据侧未能确定查询口径，以上只是资料侧的回答。".to_string())
+        });
+        return Ok(out);
     }
     let summary =
         crate::compound::hybrid_summary(&**d.llm, &prepared.effective_question, &data, &a).await;
-    Ok(HybridOutcome { data: Some(data), knowledge: Some(a), summary, clarification: None })
+    Ok(HybridOutcome { data: Some(data), knowledge: Some(a), summary, clarification: None, data_note: None })
 }
 
 /// 问数臂**答出东西了**吗。反问卡、出界卡、不可计算卡与空结果都不算 ——
@@ -468,7 +491,7 @@ mod tests {
 
         // ① 两边都有 → 问数主体 + kb 挂件 + 综合落 insight
         let both = fuse(
-            HybridOutcome { data: Some(data()), knowledge: Some(answer()), summary: Some("综合".into()), clarification: None },
+            HybridOutcome { data: Some(data()), knowledge: Some(answer()), summary: Some("综合".into()), clarification: None, data_note: None },
             &prepared,
         );
         assert_eq!(both.route, "direct-agg", "主体必须还是问数结果");
@@ -478,7 +501,7 @@ mod tests {
 
         // ② 只有问数 → 逐字原样（wire 与改造前一致）
         let only_data = fuse(
-            HybridOutcome { data: Some(data()), knowledge: None, summary: None, clarification: None },
+            HybridOutcome { data: Some(data()), knowledge: None, summary: None, clarification: None, data_note: None },
             &prepared,
         );
         assert_eq!(only_data.route, "direct-agg");
@@ -486,7 +509,7 @@ mod tests {
 
         // ③ 只有资料 → route=knowledge，且**整份 Answer 带出去**（HTTP 要靠它重塑形状）
         let only_kb = fuse(
-            HybridOutcome { data: None, knowledge: Some(answer()), summary: None, clarification: None },
+            HybridOutcome { data: None, knowledge: Some(answer()), summary: None, clarification: None, data_note: None },
             &prepared,
         );
         assert_eq!(only_kb.route, "knowledge");
@@ -496,7 +519,7 @@ mod tests {
         let mut clar = card(crate::ask::NEED_INTENT, "", vec![], 0);
         clar.caliber_note = Some("请补充".into());
         let out = fuse(
-            HybridOutcome { data: None, knowledge: None, summary: None, clarification: Some(clar) },
+            HybridOutcome { data: None, knowledge: None, summary: None, clarification: Some(clar), data_note: None },
             &prepared,
         );
         assert_eq!(out.route, crate::ask::NEED_INTENT);

@@ -2276,6 +2276,18 @@ mod tests {
     ///    确定性成员照跑，自由 SQL 仍然关死。
     /// ③ Hybrid 合同只能由 `hybrid::run` 出手，不许落进两臂档。
     /// ④ 兜底档摘掉 `llm` 成员。
+    /// 呈现编排必须**接在中文化之后**：模型看到的列名与码值就是用户看到的那一份。
+    /// 接反了它会拿英文列名与裸码值去编排，标题与聚合都跟着偏。
+    /// 模块内部单测很全，但「有没有被接上、接在哪」此前全仓一条判据都没有（自审发现）。
+    #[test]
+    fn view_compose_is_wired_after_localize() {
+        let src = include_str!("ask.rs");
+        let one = src.split("let one = |q: String|").nth(1).expect("单问闭包改名了");
+        let loc = one.find("localize_result(&cx").expect("localize 收口没了");
+        let compose = one.find("view_compose::refine(&cx").expect("呈现编排没接上");
+        assert!(loc < compose, "呈现编排跑在中文化之前了：它会拿英文列名与裸码值编排");
+    }
+
     /// 🔴 单号锁主源：源由单据族注册表**证明**，不交给向量最近邻猜。
     ///
     /// 生产实测（2026-08-14）：「订单 HJXH-DXO2026081300138」里的「订单」二字把选源

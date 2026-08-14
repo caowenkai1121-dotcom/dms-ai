@@ -2743,6 +2743,8 @@ async fn api_ask_stream(
             if let Some(mut r) = probe {
                 // 这一档已经不是纯资料问句了，流式意义不大：资料半同步取一次挂 `kb` 键，
                 // wire 与混合问句同形（前端 `t.result?.kb` 分支现成）。
+                // 与 agent 侧**同一条**实质判据：模型给不出带角标的结论时会整份换成
+                // `NO_HIT`，那种「答案」挂上去只是给用户一句「知识库里没有」的噪音。
                 r.kb = kb_answer(
                     &st,
                     &gate.p,
@@ -2750,7 +2752,8 @@ async fn api_ask_stream(
                     &prepared.question.effective_question,
                 )
                 .await
-                .ok();
+                .ok()
+                .filter(dms_agent::hybrid::kb_has_substance);
                 let mut payload = serde_json::to_value(&r)
                     .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
                 insight_api::attach_analysis_receipt(&mut payload, &req.question, &gate.p);
@@ -4139,6 +4142,36 @@ mod tests {
     /// 判据也在那里。这里只钉一件本层的事：server 不许再长出第二份配对逻辑 ——
     /// 2026-08-14 删掉的 `hybrid_pair`/`hybrid_cardinality_clarification` 就是这么留下的
     /// （编排搬走后没人删，规则还与 agent 侧不一致：它连「2 数 1 知」都拒）。
+    /// 🔴 `/api/ask` 与 `/api/ask/stream` 的 Data/Knowledge/Unknown 三档**必须走同一个出口**。
+    ///
+    /// 由来：此前两个端点各有一套 `match route`，`Knowledge` 直接调 `kb_answer`、
+    /// `Unknown` 调 `unknown_route_kb_fallback`，完全绕过 agent 的两臂编排 ——
+    /// 「线下-浏阳品元商贸有限公司」在 web 上照旧只答「知识库里没有这家公司的规定」，
+    /// 而这家公司在业务库里有客户卡。整块改动此前可以原地回退而全绿。
+    #[test]
+    fn both_ask_endpoints_share_one_arms_exit() {
+        let src = include_str!("main.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            production.matches("ask_arms_payload(&st, &req, &gate, &prepared)").count(),
+            3,
+            "两个端点的 Data/Knowledge/Unknown 三档没有全部走 ask_arms_payload"
+        );
+        // 老出口不许再长回来（`unknown_route_kb_fallback` 本体仍被 deep_api 用着，
+        // 这里只禁 `/api/ask` 两个 handler 里的 `match route` 分支形态）
+        assert!(
+            !production.contains("IntentRoute::Knowledge => {
+            let a = kb_answer("),
+            "Knowledge 又绕过两臂直连 kb_answer 了"
+        );
+        // 分档判据：`route == "knowledge"` ⇒ `kb` 必然在（`hybrid::fuse` 的约定）
+        let arms = production.split("async fn ask_arms_payload(").nth(1).expect("ask_arms_payload 改名了");
+        assert!(
+            arms.contains(r#"if r.route == "knowledge" {"#) && arms.contains("if let Some(a) = &r.kb {"),
+            "纯资料档没有按整份 Answer 重塑形状（角标会点不开）：{arms}"
+        );
+    }
+
     #[test]
     fn server_keeps_no_second_hybrid_pairing() {
         let src = include_str!("main.rs");
