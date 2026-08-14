@@ -216,6 +216,33 @@ async fn summarize(
 }
 
 
+/// KPI 卡里的环比/同比 → 事实合同能吃的表。
+///
+/// 列名与 `insight::Reading::answer_contract` 的 COMPARE 域同一套中文（本期/基期/变化额/增幅）：
+/// 两处用同一批词，模型才不会因为换了说法而重新学一遍。
+fn delta_facts(data: &AskResult) -> Vec<Vec<serde_json::Value>> {
+    data.view
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            dms_kernel::present::Block::Kpis { items } => Some(items),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|kpi| {
+            let d = kpi.delta.as_ref()?;
+            Some(vec![
+                serde_json::Value::from(kpi.label.clone()),
+                serde_json::Value::from(d.label.clone()),
+                kpi.value.clone(),
+                serde_json::Value::from(d.baseline),
+                serde_json::Value::from(d.change),
+                serde_json::Value::from(d.pct),
+            ])
+        })
+        .collect()
+}
+
 /// 【混合查询】「问数 + 知识库」两路结果的 AI 综合（fast LLM）。与 `summarize` 同一份纪律：
 /// 两路正文都过 `wrap_untrusted`（I5 同一信任边界，单元格/文档正文都是用户打的字）；
 /// 失败一律 `None` —— 两路结果都在，综合缺席不塌答案（降级路与单问解读同一份
@@ -243,6 +270,21 @@ pub async fn hybrid_summary(
     };
     let mut contract = AnswerContract::new();
     contract.push_table("DATA", "取数结果", &data.columns, &data.rows, 5);
+    // 🔴 KPI 卡上的环比/同比也要进合同（2026-08-15 生产实测）：
+    // 「本月销售额」的 KPI 卡明明带着 `delta{pct:13.4, label:"较上月"}`，
+    // 而它只活在 `view.blocks` 里 —— 对每一层 LLM 都不可见。于是综合只能写
+    // 「本月销售额为 106793453.2900。」：把用户已经看见的数字复述一遍，等于没说。
+    // 最有信息量的那件事（涨了还是跌了、涨了多少）就在手边，只是没人递给模型。
+    let deltas = delta_facts(data);
+    if !deltas.is_empty() {
+        contract.push_table(
+            "DELTA",
+            "同比环比",
+            &["指标".into(), "比较类型".into(), "本期".into(), "基期".into(), "变化额".into(), "增幅".into()],
+            &deltas,
+            deltas.len(),
+        );
+    }
     contract.push_text("KB", "知识库资料", &kb_text);
     let hits = vec![
         insight::hit(1, "取数结果", &insight::brief(&data.columns, &data.rows, data.row_count)),
@@ -258,6 +300,33 @@ pub async fn hybrid_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KPI 卡上的环比必须能进合同：它是「涨了还是跌了」的唯一证据，
+    /// 而此前只活在 `view.blocks` 里，对每一层 LLM 都不可见 ——
+    /// 综合于是只能把用户已经看见的数字复述一遍（2026-08-15 生产实测）。
+    #[test]
+    fn kpi_deltas_become_citable_facts() {
+        use dms_kernel::present::{Block, Delta, Kpi, Semantic};
+        let mut r = crate::ask::prepared_for_test_result();
+        r.view.blocks = vec![Block::Kpis {
+            items: vec![
+                Kpi {
+                    label: "销售额".into(),
+                    value: serde_json::Value::from(120.0),
+                    semantic: Semantic::Money,
+                    delta: Some(Delta { pct: 13.4, dir: "up", label: "较上月".into(), baseline: 100.0, change: 20.0 }),
+                },
+                // 没有 delta 的 KPI 不产事实（不许凭空造一个基期）
+                Kpi { label: "订单数".into(), value: serde_json::Value::from(7.0), semantic: Semantic::Count, delta: None },
+            ],
+        }];
+        let facts = delta_facts(&r);
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert_eq!(facts[0][0], serde_json::Value::from("销售额"));
+        assert_eq!(facts[0][1], serde_json::Value::from("较上月"));
+        assert_eq!(facts[0][5], serde_json::Value::from(13.4));
+        assert!(delta_facts(&crate::ask::prepared_for_test_result()).is_empty());
+    }
 
     use dms_kernel::{BoxFut, ChatReply, LlmError};
 

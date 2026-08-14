@@ -328,6 +328,13 @@ fn has_measurable_slots(attempt: &crate::intent::IntentAttempt) -> bool {
     })
 }
 
+/// 测试用的最小 `AskResult`（空取数、空视图）。与 `prepared_for_test` 同一个理由放在
+/// 生产代码里：测试段里的项只对本模块可见，而用它的测试在 `compound` 模块。
+#[doc(hidden)]
+pub fn prepared_for_test_result() -> AskResult {
+    empty_reply("test", 0, String::new())
+}
+
 /// 测试用的最小 `PreparedQuestion`（不调模型、合同为空）。
 ///
 /// 放在生产代码里而不是测试段：测试段里的项只对本模块的测试可见，
