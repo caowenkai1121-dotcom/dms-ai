@@ -253,7 +253,9 @@ fn build_blocks(plan: &Plan, view: &ViewSpec, rows: &[Vec<Value>]) -> Vec<Block>
                     kind,
                     x: *x,
                     y,
-                    top: (rows.len() > TOP_FROM).then_some(TOP_KEEP),
+                    // 收纳阈值与确定性决策树**共用一份**（`present::bar_top`）：
+                    // 「类别轴挤爆看不清」在两处是同一件事，各写一个数字就是两个阈值。
+                    top: dms_semantic::present::bar_top(rows.len()),
                     series: None,
                     title: safe_title(title),
                 });
@@ -276,10 +278,6 @@ fn build_blocks(plan: &Plan, view: &ViewSpec, rows: &[Vec<Value>]) -> Vec<Block>
     }
     out
 }
-
-/// 超过这个行数的柱图收纳 TOP N（与 `present::bar_top` 同一个理由：类别轴挤爆看不清）。
-const TOP_FROM: usize = 18;
-const TOP_KEEP: usize = 18;
 
 /// 饼图只在类别少且数值全正时成立（负值切不出扇形，类别多了看不清）。
 fn pie_ok(rows: &[Vec<Value>], x: usize, y: usize) -> bool {

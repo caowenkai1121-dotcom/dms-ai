@@ -2711,6 +2711,11 @@ fn primary_facts(r: &dms_agent::AskResult, kind: dms_agent::AnalysisKind) -> Vec
 
 /// 运维/审计列：任何结果表里它们对业务读者都是噪音。判据按**原始英文列名**与
 /// `present_cn` 可能给出的中文名两套写 —— 中文化发生在这一步之前。
+///
+/// 与 `semantic::lineage::STOP_COLS` 成员有重叠但**不是同一份知识**，别去合并：
+/// 那张表答的是「这列进不进表间重叠判据」（`remark`/`created_time` 在里面，
+/// 因为它们在任意两表间都同名、只注水），这张答的是「业务读者要不要看」
+/// （`备注`/`创建时间` 恰恰是要看的，业主截图里的单据卡就靠它们）。
 const HOUSEKEEPING_COLUMNS: &[&str] = &[
     "id", "version", "revision", "tenant_id",
     "created_by", "create_by", "creator", "updated_by", "update_by", "modifier",

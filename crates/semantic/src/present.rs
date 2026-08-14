@@ -490,7 +490,9 @@ fn grouped_bar(rows: &[Vec<Value>], ix: &RoleIdx) -> Option<Vec<Block>> {
     ])
 }
 
-fn bar_top(nrows: usize) -> Option<usize> {
+/// 柱图 TOP 收纳阈值。`pub`：`agent::view_compose` 的模型编排层也要它 ——
+/// 「类别轴挤爆看不清」在两处是同一件事，各写一个数字就是两个阈值。
+pub fn bar_top(nrows: usize) -> Option<usize> {
     (nrows > BAR_TOP).then_some(BAR_TOP)
 }
 
