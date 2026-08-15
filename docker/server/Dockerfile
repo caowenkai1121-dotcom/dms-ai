@@ -17,6 +17,11 @@ COPY crates ./crates
 # "requires BuildKit"（2026-08-11 事故：加 cache mount 后服务器构建即炸）——RUN 保持单行无 mount。
 # 另：服务器构建脚本用行首锚定的 sed 给下面 RUN 行前插 rsproxy 镜像配置（纯净 Dockerfile 不内嵌
 # 镜像源）——本 RUN 行首保持原样、别拆行，注释里也绝不能再写一遍同款行首字面量（sed 自匹配事故）。
+# 🔴 debug 构建的代价（2026-08-15 生产实测踩到）：`debug_assert!` 在生产**是活的** ——
+# 一条断言失败 = 整个请求 panic。C08 那次是「中文数字归一必须等字节长」被一句模型产物打破，
+# CLI 直接非 0 退出、回归判执行错误。纪律：**模型产物驱动的不变量一律不许用 debug_assert**，
+# 要判就判成可降级的分支（`answer_contract::normalize_chinese_numerals` 已按此改）。
+# 内部结构不变量（调用方自觉那类）仍可用 debug_assert。
 # debug 是有意取舍：本机/CI 迭代优先构建快；要切 --release 必须同步改下面 COPY 的源路径
 # （target/release/），两处没有对账机制，改一处忘另一处就是构建失败。
 RUN cargo build --locked && cp /ws/target/debug/dms-ai-server /usr/local/bin/dms-ai-server

@@ -749,12 +749,26 @@ fn normalize_chinese_numerals(masked: &str) -> (String, Vec<String>) {
             continue;
         };
         let digits = n.to_string();
-        debug_assert!(run.len() >= digits.len(), "中文数字段必然不短于阿拉伯写法");
-        let mut replacement = " ".repeat(run.len() - digits.len());
+        // 🔴 判据不许 panic（2026-08-15 生产 C08 实测崩过一次）：这道归一吃的是**模型产物**，
+        // 而生产跑的是 debug 构建 —— `debug_assert` 在这里等于「某句话能让整个请求崩掉」。
+        // 塞不下就当它没换算（进 `unparsed`，调用方照旧判「不能精确核验」）：
+        // 安全方向是**少归一**，不是崩。
+        let Some(pad) = run.len().checked_sub(digits.len()) else {
+            unparsed.push(claim.raw);
+            continue;
+        };
+        let mut replacement = " ".repeat(pad);
         replacement.push_str(&digits);
         out.replace_range(claim.digits, &replacement);
     }
-    debug_assert_eq!(out.len(), masked.len(), "中文数字归一必须等字节长");
+    if out.len() != masked.len() {
+        // 同上：等字节长是下游按原文下标取数的前提，对不上就整份退回未归一的原串
+        tracing::warn!(
+            before = masked.len(), after = out.len(),
+            "中文数字归一没保住等字节长 → 整份退回原串（宁可少归一，不给下游一个错位的串）"
+        );
+        return (masked.to_string(), unparsed);
+    }
     (out, unparsed)
 }
 
