@@ -2487,6 +2487,13 @@ mod tests {
             outcome.contains("plan.route == crate::intent::IntentRoute::Knowledge && plan.deterministic"),
             "资料臂的主/次身份必须由**确定性**裁决定（合同判 knowledge 不算，那会把实体卡单臂化）：{outcome}"
         );
+        // 资料半得配得上那块面板：综合没引用到它、问句又没有资料诉求词 → 不挂
+        // （2026-08-15 生产：纯数据问句下面挂「知识库里没有关于…」+ 无关手册引用；
+        //   人名实体卡上挂优步 CEO 言论）
+        assert!(
+            outcome.contains("summary.is_none() && !doc_asked"),
+            "检索残渣必须挡在面板之外：{outcome}"
+        );
         // 资料臂是加分项：问数臂已经答出实质内容时不许让它继续干等
         let race = src.split("async fn race_arms<K>(").nth(1).expect("race_arms 改名了");
         assert!(

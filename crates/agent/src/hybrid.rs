@@ -417,6 +417,31 @@ pub async fn dual_outcome(
     }
     let summary =
         crate::compound::hybrid_summary(&**d.llm, &prepared.effective_question, &data, &a).await;
+    // 🔴 资料半是**加分项**，它得配得上那块面板（2026-08-15 生产直打逮到）：
+    //
+    //   浏阳品元本月买了多少 → 数答对了（151668），下面挂一段
+    //     「知识库里没有关于浏阳品元本月购买数量的规定」+ 一份费用报销操作手册的引用；
+    //   董会琴（人名实体卡）   → 面板里是优步前 CEO 贬低女性司机、影石创新发红包。
+    //
+    // 判据用现成的：`hybrid_summary` 已经要求综合**必须引用到 KB 事实域**，否则返 None。
+    // 综合都出不来 = 模型在两侧之间找不到任何可说的关系。此时若问句里连一个资料诉求词
+    // 都没有（`doc::signals().noun`），这份资料就是与问题无关的检索残渣 —— 不挂。
+    // 反过来，问句带资料诉求词的（「…的政策/流程/标准」）即使综合失败也照挂：
+    // 那一档用户要的就是资料，综合只是锦上添花。
+    let doc_asked = dms_kernel::nl::doc::signals(&prepared.effective_question).noun;
+    if summary.is_none() && !doc_asked {
+        tracing::info!(
+            question = %prepared.effective_question,
+            "资料半没被综合引用、问句也没有资料诉求词 → 不挂资料面板（检索残渣不上屏）"
+        );
+        return Ok(HybridOutcome {
+            data: Some(data),
+            knowledge: None,
+            summary: None,
+            clarification: None,
+            data_note: None,
+        });
+    }
     Ok(HybridOutcome { data: Some(data), knowledge: Some(a), summary, clarification: None, data_note: None })
 }
 
