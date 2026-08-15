@@ -404,9 +404,19 @@ pub async fn dual_outcome(
     }
     if !data_has_substance(&data) {
         let mut out = only_kb(a);
-        out.data_note = data.caliber_note.clone().or_else(|| {
-            (data.route == crate::ask::NEED_INTENT).then(|| "数据侧未能确定查询口径，以上只是资料侧的回答。".to_string())
-        });
+        // 🔴 只有**用户确实在问数据**时才解释「数据侧为什么答不出」（2026-08-15 生产直打）：
+        // 「市场费用核销需要哪些材料」的资料半答得完整（带 3-6 条角标），
+        // 却在正上方挂一句「我没能完全确定…要查的具体数据，可以点一个最接近的问法」——
+        // 与下方内容直接矛盾，用户第一眼读到的是「没查到」。
+        // 裁决判 Knowledge 时数据臂本来就不该有意见，它的 need-intent 不是「失败」而是「不适用」。
+        // 判 Data 的那一档在上面已经原样返回两半（D03 规则）；这里只剩 Knowledge / Unknown，
+        // Unknown 仍然挂 —— 那一档用户可能真在问数，得说清数据侧没接住。
+        if prepared.route() != crate::intent::IntentRoute::Knowledge {
+            out.data_note = data.caliber_note.clone().or_else(|| {
+                (data.route == crate::ask::NEED_INTENT)
+                    .then(|| "数据侧未能确定查询口径，以上只是资料侧的回答。".to_string())
+            });
+        }
         return Ok(out);
     }
     // 🔴 判 Knowledge 时资料半是**主体**，不是挂件（与上面那条「Data 路由不让位」对称）。
