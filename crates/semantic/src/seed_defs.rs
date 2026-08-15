@@ -9,6 +9,18 @@ use crate::registry::datasource::DMS_DS_ID;
 use crate::sales_fact::{self, Metric as SalesMetric};
 use sqlx::PgPool;
 
+/// 客单价的说法 —— **三张表共用一份**。
+///
+/// 🔴 此前这串在本文件里抄了三遍（指标表 / 指标卡 / 同义词表）：加一个说法要改三处，
+/// 漏一处就是「同一个词在这条路认得、那条路不认得」。2026-08-15 生产直打
+/// 「本月每单平均金额」落 need-intent，就是这一族说法一个都没登记。
+///
+/// 刻意不收「平均订单金额」：它整段包含另一个已登记指标的名字（订单金额 → 订单额），
+/// 子串匹配会让一句话同时命中两个指标。
+const AVG_ORDER_VALUE_ALIASES: &[&str] =
+    &["客单价", "订单单均", "平均客单", "每单平均金额", "单均金额", "平均每单金额"];
+
+
 /// 指标注册：默认销售只认 `sales_fact`；其余指标仅在等价资产已验收后迁移。
 pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
     // (code, name, aliases, source_table, agg_expr, scope_filter, time_col, dedup_keys, description, unit)
@@ -42,7 +54,7 @@ pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
          "order_time",
          "",
          "【ODS 订单口径】下过有效订单的去重客户数（按 customer_code 去重），物理来源 dms_ods.t_sales_order。默认销售 DWS 只能证明存在销售事实，不能无损还原有效下单事件；禁止按销售事实客户数替代", ""),
-        ("avg_order_value", "订单客单价", &["客单价", "订单单均", "平均客单"],
+        ("avg_order_value", "订单客单价", AVG_ORDER_VALUE_ALIASES,
          "t_sales_order", "SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)",
          "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
          "order_time",
@@ -688,7 +700,7 @@ pub(crate) async fn seed_terms(pg: &PgPool) -> anyhow::Result<()> {
         ("动销", "dms_ods 有效订单在统计期内的正品 item_type='1' 去重商品数；必须关联订单头过滤有效状态和 order_time，禁止按默认销售 DWS SKU 去重替代", &["在售", "有销量"]),
         ("成交客户数", "dms_ods.t_sales_order 中下过有效订单的去重客户数 COUNT(DISTINCT customer_code)；默认销售 DWS 不替代订单事件口径", &["下单客户数", "成交客户"]),
         ("复购", "dms_ods.t_sales_order 中同一客户在统计期内有效订单数≥2(COUNT DISTINCT sales_order_code GROUP BY customer_code HAVING>=2)", &["复购客户", "二次购买"]),
-        ("订单客单价", "订单客单价＝订单额÷订单数＝SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)；不使用默认 Doris DWS 销售额", &["客单价", "订单单均", "平均客单"]),
+        ("订单客单价", "订单客单价＝订单额÷订单数＝SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)；不使用默认 Doris DWS 销售额", AVG_ORDER_VALUE_ALIASES),
     ];
     // 旧术语把订单额写成销售额，保留会与 DWS 默认销售额同时召回。
     sqlx::query("DELETE FROM meta.term WHERE ds_id=$1 AND term='客单价'")
@@ -909,11 +921,14 @@ mod tests {
     /// 上面 `METRICS` 里既有指标的 名+别名。const 在函数体内、测试够不到，
     /// 只能抄一份 —— 与 `recall/metric.rs::refund_ratio_aliases_do_not_shadow_refund_amount`
     /// 同一处置：**改那边的别名必须改这里**（改漏了下面两条行为断言会红）。
+    ///
+    /// 例外：客单价那族已经收成模块级的 `AVG_ORDER_VALUE_ALIASES`（三处共用一份），
+    /// 这里直接引它 —— 抄不了就漂不了。其余几条哪天也提到模块级，同样直接引。
     const OTHERS: &[(&str, &[&str])] = &[
         // 「订单额」曾漏抄（与 buyer_count 同族事故）——下方的覆盖断言就是抓这种漏抄的
         ("订单额", &["订单金额", "下单金额", "订单总额"]),
         ("订单数", &["订单量", "单量", "成交订单数", "多少单", "多少个订单", "多少订单", "几个订单", "几单", "订单笔数", "下了多少"]),
-        ("订单客单价", &["客单价", "订单单均", "平均客单"]),
+        ("订单客单价", super::AVG_ORDER_VALUE_ALIASES),
         ("市场费用", &["营销费用", "费用总额", "推广费"]),
         ("售后单数", &["退货数", "售后量", "退货单数", "售后单有多少", "多少售后", "几个售后单"]),
         ("退款额", &["售后退款金额", "售后退款", "退款金额", "售后金额"]),

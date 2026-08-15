@@ -69,7 +69,16 @@ fn seed_clears_legacy_sales_time_cap_and_disables_untrusted_manager() {
     assert!(seed.contains(disables_manager), "历史经理维度必须在播种时禁用");
 
     assert!(seed.contains("(\"order_amount\", \"订单额\", &[\"订单金额\", \"下单金额\", \"订单总额\"]"));
-    assert!(seed.contains("(\"avg_order_value\", \"订单客单价\", &[\"客单价\", \"订单单均\", \"平均客单\"]"));
+    // 客单价的说法收成了模块级 `AVG_ORDER_VALUE_ALIASES`（三处共用一份，2026-08-15）——
+    // 判据跟着改成「指标行引的是那份常量」+「常量里那几个说法都在」，
+    // 逐字钉别名数组等于禁止再加说法。
+    assert!(seed.contains("(\"avg_order_value\", \"订单客单价\", AVG_ORDER_VALUE_ALIASES"));
+    for saying in ["客单价", "订单单均", "平均客单", "每单平均金额"] {
+        assert!(
+            seed.contains(&format!("\"{saying}\"")),
+            "客单价别名少了 {saying}"
+        );
+    }
     for ambiguous in [
         "下单口径销售额",
         "订单口径销售额",
