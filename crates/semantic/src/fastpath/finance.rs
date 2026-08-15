@@ -124,7 +124,14 @@ pub fn warehouse_finance(question: &str) -> Option<DirectHit> {
     if question.contains("对账单") || (question.contains("对账") && question.contains("待确认")) {
         return Some(warehouse_account_bill_unavailable());
     }
-    if ["市场费用", "营销费用", "销售费用"].iter().any(|w| question.contains(w)) {
+    // 🔴 十个分类名也是触发词（2026-08-15 生产直打 + 复验）：
+    // 「6月营销物料费用」「本月客户返利费用」此前全落 need-intent —— 而这些分类名
+    // 正是本模板自己拼明细时用的那十个（`MARKET_COST_GROUPS`）。
+    // 模板既然算得出「营销物料」这一类的合计，就不该在用户点名它时装作不认识。
+    let named_group = market_cost_group(question);
+    if named_group.is_some()
+        || ["市场费用", "营销费用", "销售费用"].iter().any(|w| question.contains(w))
+    {
         // 🔴 残留守卫（2026-08-15 生产直打逮到，两条都很重）：
         //
         //   湖南省区市场费用       → 地域限定**一个字都没进 SQL**（`WHERE 1 = 1`），
@@ -137,7 +144,10 @@ pub fn warehouse_finance(question: &str) -> Option<DirectHit> {
         if !market_cost_residue(question).is_empty() {
             return None;
         }
-        return Some(warehouse_market_cost(question));
+        return Some(match named_group {
+            Some((name, cols)) => warehouse_market_cost_group(question, name, cols),
+            None => warehouse_market_cost(question),
+        });
     }
     None
 }
@@ -157,10 +167,60 @@ pub fn market_cost_residue(question: &str) -> String {
         // 「花/花了/花费/支出」是费用问句的口语动词，不是限定（「本月市场费用花了多少」）
         "花费", "花了", "花", "支出",
     ];
+    // 时间：相对词用 `time_phrase_of`，显式年月（「6月」「2026年6月」）用 `intent_time_surface`。
+    // 后者带**整句兜底**（`time_predicate(q).map(|_| q)`），拿整句当消化词会把真限定一起吞掉 ——
+    // 所以只在它 != 整句时才用（与 `ops_caliber` 那处同一条守卫）。
+    // `owned` 持有显式年月那一支的表面词（`intent_time_surface` 返 String）——
+    // 借用它的 `&str` 进 `consumed`，不用 `Box::leak`（那是每次调用泄一次）。
+    let owned_time = crate::fastpath::intent_time_surface(question)
+        .filter(|surface| surface != question);
     if let Some(phrase) = dms_kernel::nl::time::time_phrase_of(question) {
         consumed.push(phrase);
+    } else if let Some(surface) = owned_time.as_deref() {
+        consumed.push(surface);
+    }
+    // 分类名是模板真的兑现得了的（它就是按这十个分类拼明细的）——点名哪一类就消化哪一类。
+    // 「费用」本身也随之消化：「营销物料费用」= 分类名 + 通用尾词，不是两个限定。
+    if let Some((name, _)) = market_cost_group(question) {
+        consumed.push(name);
+        consumed.push("费用");
     }
     crate::fastpath::residual_text(question, &consumed)
+}
+
+/// 问句点名了哪一个市场费用分类。`None` = 没点名（走全量口径）。
+///
+/// 只认**唯一**一个：点了两类（「营销物料和客户返利费用」）本模板一条 SQL 表达不了，
+/// 按残留守卫的同一条纪律 fail-closed，不许挑一个答。
+pub fn market_cost_group(question: &str) -> Option<(&'static str, &'static [&'static str])> {
+    let mut hit: Option<(&'static str, &'static [&'static str])> = None;
+    for (name, cols) in MARKET_COST_GROUPS {
+        // 「其他」太泛，不做触发词（「其他费用」不是一个业务分类问法）
+        if *name == "其他" || !question.contains(name) {
+            continue;
+        }
+        if hit.is_some() {
+            return None;
+        }
+        hit = Some((name, cols));
+    }
+    hit
+}
+
+/// 点名某一个分类时的合计（与全量口径同一张表、同一个时间窗，只换求和列）。
+pub fn warehouse_market_cost_group(
+    question: &str,
+    name: &'static str,
+    cols: &'static [&'static str],
+) -> DirectHit {
+    let pred = market_cost_where(question);
+    hit(
+        format!(
+            "SELECT COALESCE(SUM({}),0) AS `{name}费用`              FROM sales_ads.ads_off_sales_cost_customer_dnf f WHERE {pred}",
+            market_cost_expr("f", cols),
+        ),
+        "direct-agg",
+    )
 }
 
 
@@ -223,6 +283,22 @@ mod market_cost_guard_tests {
             assert_eq!(market_cost_residue(q), "", "{q} 该被模板全兑现");
             assert!(warehouse_finance(q).is_some(), "{q} 该接");
         }
+        // 点名分类的照旧接，且只求该类的列（2026-08-15：这十个分类名此前既不是触发词、
+        // 也不在消化词里，「6月营销物料费用」「本月客户返利费用」全落 need-intent）
+        for (q, name, col) in [
+            ("6月营销物料费用", "营销物料", "mat_costume"),
+            ("本月客户返利费用", "客户返利", "rebate_key_cust"),
+            ("本月终端费用", "终端费用", "term_adv_fee"),
+        ] {
+            let h = warehouse_finance(q).unwrap_or_else(|| panic!("{q} 该接"));
+            assert!(h.sql.contains(col), "{q} 该只求 {name} 那几列：{}", h.sql);
+            assert!(h.sql.contains(&format!("`{name}费用`")), "{q} 列名该点明分类：{}", h.sql);
+            // 全量口径的列不许混进来
+            assert!(!h.sql.contains("sup_staff_cost + ") || name == "长促督导", "{q} 混进了全量列：{}", h.sql);
+        }
+        // 点了两类一条 SQL 表达不了 → 不接（与残留守卫同一条纪律）
+        assert!(warehouse_finance("本月营销物料和客户返利费用").is_none());
+
         for (q, why) in [
             ("湖南省区市场费用", "地域限定模板表达不了"),
             ("山东省区本月市场费用", "同上"),
