@@ -269,8 +269,16 @@ pub fn warehouse_sales_fact_predicated(
     let has_categorical_dimension = dimensions
         .iter()
         .any(|dimension| !matches!(dimension, Dimension::Month | Dimension::OrderDate));
+    // 🔴 「最高/最多」是一个**取值限定**（N=1），不是「给我整张榜」（2026-08-15 生产直打）：
+    // 「本月销售额最高的客户」此前返回 200 行全榜，确定性摘要还把第一名标成「榜首」推给用户 ——
+    // 同一个引擎对「前十」严格落 LIMIT 10、对「最高」一个 LIMIT 都不落，是分支缺失不是取舍。
+    // 只认**极值词**，不认「排行/排名」——后者用户要的就是一张榜。
+    const SUPERLATIVES: &[&str] =
+        &["最高", "最多", "最大", "最少", "最小", "最低", "最好", "最差"];
+    let singular_superlative =
+        explicit_limit.is_none() && SUPERLATIVES.iter().any(|word| question.contains(word));
     let limit = if has_categorical_dimension {
-        Some(explicit_limit.unwrap_or(200))
+        Some(explicit_limit.or(singular_superlative.then_some(1)).unwrap_or(200))
     } else {
         explicit_limit
     };

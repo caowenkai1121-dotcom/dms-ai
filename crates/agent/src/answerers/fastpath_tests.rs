@@ -716,6 +716,23 @@ mod tests {
         assert!(try_direct("昨天有哪些设备").is_none(), "泛设备名词不能误认成设备订单");
     }
 
+    /// 「最高/最多」是 N=1 的取值限定，不是「给我整张榜」。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打 + 复验 2/2）：「本月销售额最高的客户」返回 200 行全榜，
+    /// 确定性摘要还把第一名标成「榜首」推给用户。同一个引擎对「前十」严格落 LIMIT 10。
+    #[test]
+    fn a_superlative_means_one_row_not_the_whole_board() {
+        for q in ["本月销售额最高的客户", "哪个客户本月销售额最高", "本月销量最低的商品"] {
+            let sql = warehouse_sales_fact(q).unwrap_or_else(|| panic!("{q} 该命中")).sql;
+            assert!(sql.contains("LIMIT 1"), "{q} 该只要一行：{sql}");
+        }
+        // 显式 N 照旧；「排行/排名」用户要的就是一张榜，不许被这条改成 1 行
+        let five = warehouse_sales_fact("本月销量最低的5个商品").expect("该命中").sql;
+        assert!(five.contains("LIMIT 5"), "{five}");
+        let board = warehouse_sales_fact("本月各客户销售额排行").expect("该命中").sql;
+        assert!(board.contains("LIMIT 200"), "{board}");
+    }
+
     /// 纯数字客户编码抽到了就必须落进 WHERE。
     ///
     /// 🔴 由来（2026-08-15 生产直打 + 对抗复验 4/4）：
