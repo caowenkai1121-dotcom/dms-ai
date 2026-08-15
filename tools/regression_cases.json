@@ -304,11 +304,11 @@
         "西北大区"
       ],
       "sql_not_contains": [
-        "不可计算",
-        "storecode"
+        "不可计算"
       ],
       "min_rows": 1,
-      "note": "「西北大区」是 region/war_zone 的真实成员值（非省名派生）。dimension_value_hit 探库确认后装配 —— 它此前 intent_evidence 恒空，覆盖闸判 missing:time + unverifiable:region 把这条正确结果整份丢掉、回落 llm+repair（2026-08-15 生产直打）。本族题此前回归里一条都没有，所以那个洞活了很久。"
+      "coverage_status": "complete",
+      "note": "「西北大区」是 region/war_zone 的真实成员值（非省名派生）。dimension_value_hit 探库确认后装配 —— 它此前 intent_evidence 恒空，覆盖闸判 missing:time + unverifiable:region 把这条正确结果整份丢掉、回落 llm+repair（2026-08-15 生产直打）。本族题此前回归里一条都没有，所以那个洞活了很久。`coverage_status=complete` 是这一刀真正的判据：探针把成员值同时按 Region 与 Filter 报证据之后，收据才从 review 回到 verified（模型未必把地域词归成地域，「直营」被归成 `渠道类型` 筛选）。不钉 storecode：明细 SQL 里 `storecode` 是合法列，那条禁词只对 R02 那种退化形态成立。"
     },
     {
       "name": "R02-未登记大区诚实拒答",
