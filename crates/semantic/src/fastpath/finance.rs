@@ -124,8 +124,43 @@ pub fn warehouse_finance(question: &str) -> Option<DirectHit> {
     if question.contains("对账单") || (question.contains("对账") && question.contains("待确认")) {
         return Some(warehouse_account_bill_unavailable());
     }
-    (["市场费用", "营销费用", "销售费用"].iter().any(|w| question.contains(w)))
-        .then(|| warehouse_market_cost(question))
+    if ["市场费用", "营销费用", "销售费用"].iter().any(|w| question.contains(w)) {
+        // 🔴 残留守卫（2026-08-15 生产直打逮到，两条都很重）：
+        //
+        //   湖南省区市场费用       → 地域限定**一个字都没进 SQL**（`WHERE 1 = 1`），
+        //                            照样出数：真值 111 万，答 1.04 亿，约 94 倍；
+        //   市场费用核销需要哪些材料 → 政策问句被答成一个 1.04 亿的合计（换了个问题回答）。
+        //
+        // 本模板只兑现「时间窗 + 费用分类」两样东西，此前却是个裸 `contains("市场费用")`：
+        // 剩下的限定一个都表达不了、也一个都不检查。与销售事实那条路同一条纪律 ——
+        // **识别到却兑现不了的限定，不许静默丢**：有残留就不接，让它去走资料臂/自由 SQL。
+        if !market_cost_residue(question).is_empty() {
+            return None;
+        }
+        return Some(warehouse_market_cost(question));
+    }
+    None
+}
+
+/// 市场费用模板消化不掉的残留。空 = 这条问句它全兑现得了。
+///
+/// 消化词只列**模板真的兑现了的**：指标本名、时间窗（`market_cost_where` 真的填进 WHERE）、
+/// 排行词与分类词（`warehouse_market_cost` 的 rank 分支与 `MARKET_COST_GROUPS` 明细）。
+/// 地域、客户、材料、核销、流程这些一个都不在里面 —— 它们出现就是残留。
+pub fn market_cost_residue(question: &str) -> String {
+    let mut consumed: Vec<&str> = vec![
+        "市场费用", "营销费用", "销售费用", "费用总额", "推广费",
+        // 排行分支真的落 ORDER BY + LIMIT
+        "最多", "最高", "排行", "排名", "top", "Top", "TOP",
+        // 明细分支真的按 `MARKET_COST_GROUPS` 出分类
+        "分类", "构成", "明细", "各项", "分项", "项",
+        // 「花/花了/花费/支出」是费用问句的口语动词，不是限定（「本月市场费用花了多少」）
+        "花费", "花了", "花", "支出",
+    ];
+    if let Some(phrase) = dms_kernel::nl::time::time_phrase_of(question) {
+        consumed.push(phrase);
+    }
+    crate::fastpath::residual_text(question, &consumed)
 }
 
 
@@ -169,3 +204,34 @@ pub fn balance_ranking(question: &str) -> Option<DirectHit> {
     ))
 }
 
+
+#[cfg(test)]
+mod market_cost_guard_tests {
+    use super::*;
+
+    /// 模板兑现得了的照旧接；兑现不了的一律不接（不许静默丢限定）。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打）：
+    ///   湖南省区市场费用        → 地域一个字没进 SQL（`WHERE 1 = 1`），真值 111 万答成 1.04 亿；
+    ///   市场费用核销需要哪些材料 → 政策问句被答成一个 1.04 亿的合计。
+    #[test]
+    fn market_cost_only_answers_what_it_can_actually_honour() {
+        for q in [
+            "本月市场费用", "本月市场费用是多少", "市场费用排行",
+            "本月市场费用各分类构成", "本月市场费用花了多少", "本月市场费用最高的5项",
+        ] {
+            assert_eq!(market_cost_residue(q), "", "{q} 该被模板全兑现");
+            assert!(warehouse_finance(q).is_some(), "{q} 该接");
+        }
+        for (q, why) in [
+            ("湖南省区市场费用", "地域限定模板表达不了"),
+            ("山东省区本月市场费用", "同上"),
+            ("市场费用核销需要哪些材料", "这是政策问句，不是金额问句"),
+            ("市场费用报销流程是什么", "同上"),
+            ("恒众餐饮本月市场费用", "客户限定模板表达不了"),
+        ] {
+            assert!(!market_cost_residue(q).is_empty(), "{q}：{why}（残留不该为空）");
+            assert!(warehouse_finance(q).is_none(), "{q}：{why}（不该接）");
+        }
+    }
+}
