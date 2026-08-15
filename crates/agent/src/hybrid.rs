@@ -347,6 +347,8 @@ pub async fn dual_outcome(
     let plan = prepared.plan();
     let kb_is_primary =
         plan.route == crate::intent::IntentRoute::Knowledge && plan.deterministic;
+    // 问句里有没有资料诉求词（政策/流程/标准/规定…）。两处相关性闸共用一份，不许各判各的。
+    let doc_asked = dms_kernel::nl::doc::signals(&prepared.effective_question).noun;
     let (data_r, knowledge) = race_arms(data_fut, kb_fut, kb_is_primary).await;
     let knowledge = knowledge.filter(kb_has_substance);
 
@@ -394,9 +396,15 @@ pub async fn dual_outcome(
     // 问数臂答不出时，用户要的是**为什么答不出**，不是一段讲制度的资料。
     // 拿资料答案去顶一个数据问题，形状上像答了，实质上换了个问题回答。
     if !data_has_substance(&data) && prepared.route() == crate::intent::IntentRoute::Data {
+        // 🔴 这条分支也要过相关性闸（2026-08-15 猎捕复验）：D03 当初只修了
+        // 「不让 kb 顶替拒答」，没修「不让**无关的** kb 附加到拒答上」。
+        // 实测「6月营销物料费用」「本月客户返利费用」→ need-intent（问数臂拒答），
+        // 却挂着一整段核销材料清单 —— 问句里连一个资料诉求词都没有。
+        // 判据与下面那道逐字同一条：没有资料诉求词的，检索残渣不上屏。
+        let knowledge = doc_asked.then_some(a);
         return Ok(HybridOutcome {
             data: Some(data),
-            knowledge: Some(a),
+            knowledge,
             summary: None,
             clarification: None,
             data_note: None,
@@ -422,7 +430,16 @@ pub async fn dual_outcome(
     // 🔴 判 Knowledge 时资料半是**主体**，不是挂件（与上面那条「Data 路由不让位」对称）。
     // 否则「市场费用的报销政策是什么」端上来的顶层答案是一份费用合计，政策躲在 `kb` 里 ——
     // 形状上像答了，实质上换了个问题回答（2026-08-14 生产实测）。
-    if kb_is_primary {
+    //
+    // 🔴 但**数据半有实质内容时不许单臂化**（2026-08-15 猎捕复验，这是上一刀的连带）：
+    // 「上周设备订单有多少单，设备押金政策是什么」是一句真混合问句，
+    // R2 却因为「上周」这个根级时间槽不算可度量而判它纯资料 → deterministic → 整个数据半
+    // 被无声吃掉（顶层 rows=[]、sql=`[复合问题拆解]`、连 trust 键都没有），
+    // 用户问的两件事只答了一件，且没有任何提示说另一件被丢了。
+    // 「要文件」那一档（R1，deliverable=Document）例外：那时用户要的就是一份文件，
+    // 数据半再有实质也是噪声。
+    let wants_a_file = plan.deliverable == crate::ask::Deliverable::Document;
+    if kb_is_primary && (wants_a_file || !data_has_substance(&data)) {
         return Ok(only_kb(a));
     }
     let summary =
@@ -438,7 +455,6 @@ pub async fn dual_outcome(
     // 都没有（`doc::signals().noun`），这份资料就是与问题无关的检索残渣 —— 不挂。
     // 反过来，问句带资料诉求词的（「…的政策/流程/标准」）即使综合失败也照挂：
     // 那一档用户要的就是资料，综合只是锦上添花。
-    let doc_asked = dms_kernel::nl::doc::signals(&prepared.effective_question).noun;
     if summary.is_none() && !doc_asked {
         tracing::info!(
             question = %prepared.effective_question,
