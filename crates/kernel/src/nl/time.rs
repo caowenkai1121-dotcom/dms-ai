@@ -491,11 +491,25 @@ fn rule_month(q: &str) -> Option<String> {
         return None;
     }
     let pos = q.find('月')?;
-    let head: String = q[..pos].chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
-    let num: String = head
-        .chars()
-        .filter(|c| c.is_ascii_digit() || CN_DIGITS.contains(*c))
-        .collect();
+    // 🔴 数字必须**紧贴**「月」：中间隔着别的字就不是「N月」（2026-08-15 生产直打）。
+    //
+    // 旧写法取「月」前两个字符再 `filter` 掉非数字 —— 于是「180135本月销售额」里的
+    // 「5本」被滤成「5」，整句被读成**5 月**；「客户180157本月销售额」读成 7 月
+    // （N ＝ 客户编码的最后一位）。用户问本月，拿到的是今年 N 月至今的累计数，
+    // 答案里没有任何提示。这是纯数字客户编码那族错答的根因之一。
+    //
+    // 改成从「月」往前**连续**取数字，遇到非数字立刻停：
+    //   「6月」「2026年6月」「十二月」照旧命中；「…5本月」不再命中，交给相对词兜底（本月）。
+    let mut digits: Vec<char> = Vec::new();
+    for c in q[..pos].chars().rev().take(2) {
+        if c.is_ascii_digit() || CN_DIGITS.contains(c) {
+            digits.push(c);
+        } else {
+            break;
+        }
+    }
+    digits.reverse();
+    let num: String = digits.into_iter().collect();
     let m = cn_num(&num).filter(|m| (1..=12).contains(m))?;
     // 同 `rule_quarter`：显式年份/去年走字面日期，今年那一支字节不变
     if let YearBase::Explicit(_) | YearBase::LastYear = year_base(q) {
@@ -619,6 +633,27 @@ mod tests {
         for q in ["近三个月", "上个月", "上周", "本周", "上月", "本月", "去年", "今年", "昨天", "上半年"] {
             assert!(time_predicate(q).is_some(), "{q} 在表面词表里却没有谓词");
         }
+    }
+
+    /// 数字必须紧贴「月」才算 `N月`。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打）：旧写法取「月」前两字符再滤掉非数字，
+    /// 「180135本月销售额」的「5本」被滤成「5」→ 整句读成**5 月**；
+    /// 「客户180157本月销售额」→ 7 月（N ＝ 客户编码末位）。
+    /// 用户问本月，拿到今年 N 月至今的累计数，且答案里没有任何提示。
+    #[test]
+    fn digits_must_touch_the_month_character() {
+        for (q, want) in [
+            ("180135本月销售额", "DATE_FORMAT(CURDATE(),'%Y-%m-01')"),
+            ("客户180157本月销售额", "DATE_FORMAT(CURDATE(),'%Y-%m-01')"),
+            ("客户编码180135的本月销售额", "DATE_FORMAT(CURDATE(),'%Y-%m-01')"),
+        ] {
+            assert!(tp(q).contains(want), "{q} 该按本月算：{}", tp(q));
+        }
+        // 真的写了 N月 的照旧命中
+        assert!(tp("6月销售额").contains("'-06-01'"), "{}", tp("6月销售额"));
+        assert_eq!(tp("2025年6月"), "{} >= '2025-06-01' AND {} < '2025-07-01'");
+        assert!(tp("十二月销售额").contains("'-12-01'"), "{}", tp("十二月销售额"));
     }
 
     /// 🔴 显式年份必须被尊重。缺陷现场：`上半年/第N季度/N月` 三条规则都写死 `CURDATE()` 的年份，
