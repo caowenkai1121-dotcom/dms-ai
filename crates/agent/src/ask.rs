@@ -1813,6 +1813,14 @@ fn build_dimension_value_hit(
     // 将来这张表加了非地域维度，这里必须跟着分档（不许把商品分类值报成 Region）。
     debug_assert!(PROBE_DIMS.contains(&dim), "探针维度表变了，证据分档要跟着改");
     intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Region, member);
+    // 🔴 同一个值再按 `Filter` 报一次：模型未必把它归成地域。实测「本月直营销售额」
+    // 的合同写的是 `filters:[{name:"渠道类型", value:"直营"}]`，而 `filter_columns("渠道类型")`
+    // 认不出这个名字 → 恒判 `unverifiable` → 一条 verified 的确定性答案被降成 review。
+    // 证据的语义本就是「**这个表面词已兑现进 SQL**」，不是「列名判对了」——
+    // 而它确实兑现了（`Predicate::eq(dim, member)` 就在上面）。
+    // 代价面：合同里若另有一个同值、不同列的筛选（「客户类型=直营」），会被这条一并算证明。
+    // 那一族极罕见，且今天的行为是「凡是认不出名字的筛选一律 review」，本就把真问题淹了。
+    intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Filter, member);
     if let Some(surface) = dms_semantic::fastpath::intent_time_surface(question) {
         intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Time, surface);
     }
@@ -1851,6 +1859,8 @@ mod dimension_hit_evidence_tests {
         assert!(ev.proves(crate::intent::IntentSlotKind::Metric, Metric::SalesAmount.name()), "{ev:?}");
         assert!(ev.proves(crate::intent::IntentSlotKind::Region, "西北大区"), "{ev:?}");
         assert!(ev.proves(crate::intent::IntentSlotKind::Time, "本月"), "{ev:?}");
+        // 模型未必把它归成地域（实测「直营」被归成 `渠道类型` 筛选），同值再报一次 Filter
+        assert!(ev.proves(crate::intent::IntentSlotKind::Filter, "西北大区"), "{ev:?}");
         // 证据来自这次真的建进 SQL 的东西，不是照抄问句
         assert!(hit.sql.contains("西北大区"), "{}", hit.sql);
     }
