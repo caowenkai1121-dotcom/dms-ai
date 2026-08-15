@@ -226,6 +226,20 @@ mod tests {
         assert!(!provinces.sql.contains("province IN"), "{}", provinces.sql);
         assert!(provinces.detail.is_none(), "分组结果本身就是明细，不应再附另一张表");
 
+        // 🔴 库存**量**掉到门店快照表时，口径必须写在列名上（2026-08-15 生产直打）：
+        // 「福建库存量」这类带省份的问法会从中台 WMS 掉到门店/经销商进销存快照 ——
+        // 那是另一个口径，而此前答案里没有任何提示。中台表无省份列，掉落本身是有意的，
+        // 缺的只是说清楚。金额不加后缀：它本来就只有这一张表，加了是噪声。
+        let by_province = stock_snapshot("福建库存量").expect("省份库存走门店快照");
+        assert!(
+            by_province.sql.contains("AS `库存量（门店进销存口径）`"),
+            "省份库存量必须披露口径：{}",
+            by_province.sql
+        );
+        // （「用户自己点名 WinC/门店」那一档不在这里钉：`stock_snapshot` 对
+        //   「福建门店库存量」「福建营销通库存量」都返 None —— 那是省份+渠道词的
+        //   另一条既有拒答路径，与本条无关。分支本身在 stock.rs 里带注释。）
+
         let warehouses = stock_snapshot("库存金额最高的10个仓库").expect("仓库排行应走快照分组");
         assert!(warehouses.sql.contains("AS `仓库`"), "{}", warehouses.sql);
         assert!(warehouses.sql.contains("GROUP BY COALESCE(NULLIF(warehouse_name,''),'未知')"), "{}", warehouses.sql);

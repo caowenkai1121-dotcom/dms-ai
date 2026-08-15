@@ -294,11 +294,28 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
     }
 
     // ── 营销通门店进销存快照路径（金额/省份限定专用；库存量的默认源已是中台表）──
+    //
+    // 🔴 口径要写在**列名**上（2026-08-15 生产直打 + 复验 4/4）：
+    // 「福建库存量」这类带省份的问法会从中台 WMS 掉到这张门店/经销商进销存快照表 ——
+    // 那是**另一个口径**（门店/经销商在库，不是公司仓库存），而此前答案里没有任何提示，
+    // 用户拿到 200048 会以为那是「福建的公司库存」。
+    // 中台表无省份列，这条掉落本身是有意的（注释在上面那段）；缺的只是**说清楚**。
+    // 写进列别名是零管道成本的披露：`DirectHit` 没有备注字段，而列名一定会上屏。
+    // 用户自己点名 WinC/营销通/门店时不加后缀 —— 那时他知道自己在问什么。
+    // 只有**库存量**需要这个后缀：它的默认源是中台 WMS，掉到这里是口径被换掉了。
+    // 库存金额本来就只有这一张表（中台无金额列），加后缀是纯噪声。
+    // 用户自己点名 WinC/营销通/门店/进销存时也不加 —— 那时他知道自己在问什么。
+    let names_winc = ["winc", "WinC", "WINC", "营销通", "经销商", "门店", "进销存"]
+        .iter()
+        .any(|word| question.contains(word));
     let (column, label) = if wants_amount {
-        ("stock_amount", "库存金额")
+        ("stock_amount", "库存金额".to_string())
+    } else if names_winc {
+        ("stock_quantity", "库存量".to_string())
     } else {
-        ("stock_quantity", "库存量")
+        ("stock_quantity", "库存量（门店进销存口径）".to_string())
     };
+    let label = label.as_str();
     let latest = "product_stock_date = (SELECT MAX(product_stock_date) \
                   FROM t_winc_stock_report WHERE deleted_flag = 0)";
     let where_sql = match province {
