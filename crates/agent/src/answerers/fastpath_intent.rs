@@ -158,6 +158,30 @@ pub fn recover_sales_intent(
 
 /// `customer`：共享实体解析器唯一确认的客户绑定。执行谓词落 canonical customer_code，
 /// 意图证据仍绑定用户原文 surface；不再用模糊名称当事实谓词。
+/// 问句里**唯一**的一段 6 位数字 = 客户编码（`t_customer.customer_code` 全部 6 位）。
+///
+/// 只认「恰好一段、且长度恰好 6」：多段或长度不符一律 `None`，宁可不认也不猜。
+/// 单据号（`HJXH-DSO2026080300838`）的数字段是 17 位，不会误中；
+/// 「2026年6月」两段分别是 4 位与 1 位，也不会。
+pub(crate) fn lone_customer_code(question: &str) -> Option<String> {
+    let mut runs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in question.chars() {
+        if ch.is_ascii_digit() {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            runs.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    match runs.as_slice() {
+        [only] if only.len() == 6 => Some(only.clone()),
+        _ => None,
+    }
+}
+
 pub fn warehouse_sales_fact_predicated(
     question: &str,
     customer: Option<&crate::entity_resolver::CustomerBinding>,
@@ -197,6 +221,24 @@ pub fn warehouse_sales_fact_predicated(
             Dimension::CustomerCode,
             &binding.canonical_code,
         ));
+    }
+    // 🔴 纯数字客户编码：抽到了就必须用上（2026-08-15 生产直打 + 对抗复验 4/4）。
+    //
+    //   180135本月销售额          → 客户限定**一个字都没进 WHERE**，答全公司 6.34 亿，
+    //                              真值 7.2 万，放大约 8800 倍（单值 KPI，用户无从察觉）；
+    //   客户编码180135的本月销售额 → 收据里明写 `filter:客户编码=180135`，
+    //                              SQL 里一个 storecode 条件都没有，直接按客户分组出 200 行。
+    // 抽到了、没用上、也没拦 —— 这是本仓最不能有的那一类。
+    //
+    // 判据窄：t_customer 的 customer_code **全部是 6 位数字**（4041 行无例外，2026-08-15 实测），
+    // 且问句里只有一段 6 位数字时才认。不探库：探不到就是 0 行，走既有的「该条件下没有数据」
+    // 出口，比悄悄答成全公司总额诚实得多。
+    if customer.is_none() {
+        if let Some(code) = lone_customer_code(question) {
+            predicates.push(dms_semantic::sales_fact::Predicate::eq(Dimension::CustomerCode, &code));
+            consumed.push(code);
+            consumed.extend(["客户编码".into(), "客户代码".into(), "客户编号".into(), "客户".into()]);
+        }
     }
     if has_residue(question, &consumed) {
         return None;

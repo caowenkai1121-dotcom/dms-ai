@@ -716,6 +716,26 @@ mod tests {
         assert!(try_direct("昨天有哪些设备").is_none(), "泛设备名词不能误认成设备订单");
     }
 
+    /// 纯数字客户编码抽到了就必须落进 WHERE。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打 + 对抗复验 4/4）：
+    ///   「180135本月销售额」客户限定一个字都没进 SQL，答全公司 6.34 亿（真值 7.2 万，约 8800 倍）；
+    ///   「客户编码180135的本月销售额」收据里明写 `filter:客户编码=180135`，SQL 里却没有 storecode。
+    #[test]
+    fn a_lone_six_digit_code_becomes_a_customer_filter() {
+        for q in ["180135本月销售额", "客户180135本月销售额", "客户编码180135的本月销售额"] {
+            let sql = warehouse_sales_fact(q).unwrap_or_else(|| panic!("{q} 该命中")).sql;
+            assert!(sql.contains("'180135'"), "{q} 的客户编码没进 SQL：{sql}");
+            // 时间也不许被编码末位劫持（同一族的另一半，判据在 kernel/nl/time.rs）
+            assert!(sql.contains("DATE_FORMAT(CURDATE(),'%Y-%m-01')"), "{q} 的本月被换掉了：{sql}");
+        }
+        // 不是「恰好一段 6 位」的一律不认：宁可不认也不猜
+        assert!(crate::answerers::fastpath_intent::lone_customer_code("2026年6月销售额").is_none());
+        assert!(crate::answerers::fastpath_intent::lone_customer_code("查 HJXH-DSO2026080300838").is_none());
+        assert!(crate::answerers::fastpath_intent::lone_customer_code("180135 和 180157 本月销售额").is_none());
+        assert_eq!(crate::answerers::fastpath_intent::lone_customer_code("客户180135本月销售额").as_deref(), Some("180135"));
+    }
+
     #[test]
     fn warehouse_finance_uses_available_facts_and_never_invents_invoice_tables() {
         let cost = try_direct_for("本月市场费用花了多少", true).expect("数仓费用快路径");
