@@ -302,7 +302,9 @@ pub async fn hybrid_summary(
     let user = format!("{}
 原问题：{question}
 请综合成结论：", wrap_untrusted(&hits));
-    insight::fast_guarded_checked(llm, &system, &user, &contract, "混合查询综合").await
+    // `Some("KB")`：综合必须真的引用到资料侧，否则它只是把 KPI 卡上的数字复述一遍
+    // 再加一句「资料里没有」—— 那不是综合，是噪声（2026-08-15 实测「本月订单数」）。
+    insight::fast_guarded_checked_citing(llm, &system, &user, &contract, "混合查询综合", Some("KB")).await
 }
 
 #[cfg(test)]

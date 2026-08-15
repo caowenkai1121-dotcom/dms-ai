@@ -543,6 +543,19 @@ struct ReferenceGroup {
     end: usize,
 }
 
+/// 这段文本有没有引用某个事实域（`"KB"` / `"DATA"` / `"CALIBER"`…）。
+///
+/// 用在「两臂综合」上：综合的**全部意义**就是把两侧对起来。一条 `KB:` 引用都没有 =
+/// 模型只就数据侧说了话，那段话与单侧解读重复，端上去就是噪声
+/// （实测「本月订单数」的综合是「本月订单数为 10500，知识库资料中未包含关于本月订单数的
+/// 具体规定或标准。」—— 前半句 KPI 卡上有，后半句等于没说）。
+///
+/// 判**未剥引用的原文**：`validate` 成功后会把 `[ID]` 全部移除，剥完就判不出来了。
+pub(crate) fn cites_namespace(text: &str, namespace: &str) -> bool {
+    let prefix = format!("{namespace}:");
+    reference_tokens(text).iter().any(|token| token.id.starts_with(&prefix))
+}
+
 fn reference_tokens(text: &str) -> Vec<ReferenceToken> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
@@ -1482,4 +1495,22 @@ mod tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod cites_tests {
+    /// 引用判据只认「域前缀」，且必须判**未剥引用的原文**。
+    #[test]
+    fn a_namespace_citation_is_detected_before_stripping() {
+        let raw = "本月销售额 120 万元[DATA:F001]，超出单省季度上限[KB:F003]。";
+        assert!(super::cites_namespace(raw, "KB"));
+        assert!(super::cites_namespace(raw, "DATA"));
+        assert!(!super::cites_namespace(raw, "CALIBER"));
+        // 只说数据侧 = 没把两侧对起来
+        assert!(!super::cites_namespace("本月订单数为 10500[DATA:F001]。", "KB"));
+        // 剥完引用就判不出来了 —— 这正是判据必须放在 validate 之前的理由
+        assert!(!super::cites_namespace("本月销售额 120 万元，超出单省季度上限。", "KB"));
+        // 前缀要整段匹配，不许 `KB2:` 冒充 `KB:`
+        assert!(!super::cites_namespace("x[KB2:F001]", "KB"));
+    }
 }

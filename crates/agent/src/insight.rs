@@ -387,14 +387,42 @@ pub(crate) async fn fast_guarded_checked(
     contract: &AnswerContract,
     what: &str,
 ) -> Option<String> {
+    fast_guarded_checked_citing(llm, system, user, contract, what, None).await
+}
+
+/// 同上，外加一条**必须引用到某个事实域**的门。
+///
+/// `must_cite = Some("KB")` 给两臂综合用：综合的全部意义就是把两侧对起来，
+/// 一条 `KB:` 引用都没有 ＝ 它只就数据侧说了话，那段话与单侧解读重复，端上去是噪声
+/// （2026-08-15 实测「本月订单数」的综合：「本月订单数为 10500，知识库资料中未包含
+/// 关于本月订单数的具体规定或标准。」—— 前半句 KPI 卡上有，后半句等于没说）。
+///
+/// 判据落在**未剥引用的原文**上：`validate` 成功后 `[ID]` 已被移除，剥完就判不出来了。
+pub(crate) async fn fast_guarded_checked_citing(
+    llm: &dyn ChatModel,
+    system: &str,
+    user: &str,
+    contract: &AnswerContract,
+    what: &str,
+    must_cite: Option<&str>,
+) -> Option<String> {
+    let accept = |raw: &str, display: String| match must_cite {
+        Some(ns) if !crate::answer_contract::cites_namespace(raw, ns) => {
+            tracing::info!(namespace = ns, "{what}一条该域引用都没有 → 不出这段（没把两侧对起来）");
+            None
+        }
+        _ => Some(display),
+    };
     let first = fast_guarded(llm, system, user, what).await?;
     match contract.validate(&first) {
-        Ok(display) => Some(display),
+        Ok(display) => accept(&first, display),
         Err(bad) => {
             tracing::warn!(claims = ?bad, "{what}未通过事实合同 → 精确重试一次");
-            let retry = format!("{user}\n{}", AnswerContract::retry_note(&bad));
+            let retry = format!("{user}
+{}", AnswerContract::retry_note(&bad));
             let second = fast_guarded(llm, system, &retry, what).await?;
-            contract.validate(&second).ok()
+            let display = contract.validate(&second).ok()?;
+            accept(&second, display)
         }
     }
 }
