@@ -248,7 +248,7 @@ pub fn warehouse_sales_fact_predicated(
     // 「最低 N 个」走带补丁的入口：`detect_top_n` 的极值词表不含「最低」，`ranking_limit` 有
     let requested_top_n = ranking_limit(question);
     let explicit_limit = (requested_top_n < 200).then_some(requested_top_n as u32);
-    let ranking = ["排行", "排名", "最高", "最多", "最大", "最少", "最小", "最低", "最好"]
+    let ranking = ["排行", "排名", "最高", "最多", "最大", "最少", "最小", "最低", "最好", "倒数"]
         .iter()
         .any(|word| question.contains(word))
         || explicit_limit.is_some();

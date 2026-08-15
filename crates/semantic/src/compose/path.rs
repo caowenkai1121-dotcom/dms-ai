@@ -42,7 +42,9 @@ pub fn is_time_expr(expr: &str) -> bool {
 pub fn rank_direction(question: &str) -> &'static str {
     // 🔴「最差」必须在这里：认不出来就返回 DESC ——「卖得最差的 3 个商品」会**确定性地**
     // 给出卖得最好的三个。飘着的失败还能被用户发现，确定的答反不会（2026-08-13 审计）。
-    if ["最少", "最小", "最低", "最差"].iter().any(|word| question.contains(word)) {
+    // 「倒数」同族（2026-08-15）：认不出来它就落 DESC ——「倒数三名的省区」会确定性地
+    // 给出最高的三个，与上面那条「最差」的账一模一样。
+    if ["最少", "最小", "最低", "最差", "倒数"].iter().any(|word| question.contains(word)) {
         "ASC"
     } else {
         "DESC"
