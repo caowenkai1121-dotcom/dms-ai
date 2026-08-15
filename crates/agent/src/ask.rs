@@ -1707,9 +1707,16 @@ fn dimension_probe_values(dim: dms_semantic::sales_fact::Dimension, word: &str) 
         Dimension::WarZone | Dimension::Region | Dimension::State | Dimension::City
     ));
     let stem = DIMENSION_NOUN_TAILS.iter().find_map(|t| word.strip_suffix(t)).unwrap_or(word);
+    // 🔴 空候选一个都不许产（2026-08-15 生产 panic）：问句「本月销售额按省区」的残留就是
+    // 「省区」本身，剥掉维度词尾之后 stem 是**空串** —— 它会被拼进 `IN ('省区','')`，
+    // 探到一行 `city = ''` 就把空串当成员值返回，最终 `Predicate::eq(dim, "")` 触发
+    // 「eq 空串谓词恒假」的断言。生产是 debug 构建，这条断言 = 整个请求崩掉。
+    // （City 进探针表之后才现形：city 列有空值，region/war_zone 没有。）
     let mut out: Vec<String> = vec![word.to_string()];
     if stem != word {
-        out.push(stem.to_string());
+        if !stem.is_empty() {
+            out.push(stem.to_string());
+        }
         return out;
     }
     let suffixed = match dim {
@@ -1768,7 +1775,15 @@ async fn probe_dimension_member(
             return None;
         }
     };
-    rs.rows.first()?.first()?.as_str().map(str::to_string)
+    // 空成员值不算命中：`COALESCE` 之前的裸列有空串行，把 '' 当成员值会一路走到
+    // `Predicate::eq(dim, "")`（恒假谓词），而那条断言在 debug 构建里是整请求 panic。
+    rs.rows
+        .first()?
+        .first()?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// 维度值过滤的合同装配（纯函数，故有单测）：形状与 direct.rs `warehouse_sales_fact_predicated`
@@ -1781,7 +1796,8 @@ fn build_dimension_value_hit(
     metrics: &[dms_semantic::sales_fact::Metric],
 ) -> Option<DirectHit> {
     use dms_semantic::sales_fact::{self, Predicate, QueryOptions};
-    if metrics.is_empty() {
+    if metrics.is_empty() || member.trim().is_empty() {
+        // 空成员值＝没探到；`Predicate::eq` 对空串是恒假谓词（且断言会在 debug 构建里 panic）
         return None;
     }
     let (begin, end) = sales_fact::question_time_bounds(question)?;
@@ -1858,6 +1874,36 @@ fn build_dimension_value_hit(
 
 #[cfg(test)]
 mod dimension_hit_evidence_tests {
+    /// 探针候选里**一个空串都不许有**。
+    ///
+    /// 🔴 由来（2026-08-15 生产 panic，回归 B01R 报「进程非 0 退出」）：
+    /// 问句「本月销售额按省区」的残留就是「省区」本身，剥掉维度词尾后 stem 是空串，
+    /// 被拼进 `IN ('省区','')`；探到一行 `city = ''` 就把空串当成员值返回，
+    /// 最终 `Predicate::eq(dim, "")` 触发「eq 空串谓词恒假」断言 —— 生产是 debug 构建，
+    /// 这条断言就是整个请求崩掉。City 进探针表之后才现形（city 列有空值，region/war_zone 没有）。
+    #[test]
+    fn probe_candidates_are_never_empty() {
+        use dms_semantic::sales_fact::Dimension;
+        for (dim, word) in [
+            (Dimension::Region, "省区"),
+            (Dimension::WarZone, "战区"),
+            (Dimension::Region, "区域"),
+            (Dimension::City, "市"),
+        ] {
+            let values = super::dimension_probe_values(dim, word);
+            assert!(!values.is_empty(), "{word} 该有候选");
+            assert!(values.iter().all(|v| !v.trim().is_empty()), "{word} 产出了空候选：{values:?}");
+        }
+        // 空成员值不许装配成谓词
+        assert!(super::build_dimension_value_hit(
+            "本月销售额",
+            Dimension::Region,
+            "",
+            &[dms_semantic::sales_fact::Metric::SalesAmount],
+        )
+        .is_none());
+    }
+
     /// 维度成员值命中必须**自报**它兑现了哪些槽位。
     ///
     /// 🔴 由来（2026-08-15 生产直打）：这条路把 SQL 建对了（`region = '西北大区'` +
