@@ -98,6 +98,25 @@ pub fn warehouse_sales_metrics(
     // word 上游（`longest_sales_fact_word`）已按 `contains` 筛过，`find` 恒 Some；
     // 兜底 MAX 是防御写法（上游筛法若改，未知位置排最后），不会真取到
     selected.sort_by_key(|(_, word)| question.find(*word).unwrap_or(usize::MAX));
+    // 🔴 「多少 + 数量单位」问的是**件数**，不是钱（2026-08-15 生产直打 + 复验 4/4）：
+    // 「浏阳品元本月买了多少箱」里的「买了多少」是销售额的别名、「箱」被当虚词剥掉，
+    // 于是系统把**销售额 151668 元**当成箱数答了回去 —— 收据里 `metric:箱` 明写未解析，
+    // 却既不拒也不提示。而 qty 列就在同一张表上（真值 27370）。
+    //
+    // 判据刻意窄：单位必须**紧跟在「多少/几」后面**。只判 `contains(单位)` 会被商品名误伤
+    // （「薄皮包子」含「包」、「油条」含「条」），而「多少箱」这种形只可能是在问件数。
+    const QTY_UNITS: &[&str] =
+        &["箱", "件", "袋", "包", "盒", "吨", "支", "瓶", "条", "斤", "公斤", "提", "桶"];
+    let asks_quantity = QTY_UNITS.iter().any(|unit| {
+        question.contains(&format!("多少{unit}")) || question.contains(&format!("几{unit}"))
+    });
+    if asks_quantity {
+        for entry in selected.iter_mut() {
+            if entry.0 == crate::sales_fact::Metric::SalesAmount {
+                entry.0 = crate::sales_fact::Metric::SalesQuantity;
+            }
+        }
+    }
     selected
 }
 
@@ -446,6 +465,34 @@ pub fn sales_fact_province_filter(
 #[cfg(test)]
 mod range_surface_tests {
     use super::*;
+
+    /// 「多少 + 数量单位」问的是件数，不是钱。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打 + 复验 4/4）：「浏阳品元本月买了多少箱」里的
+    /// 「买了多少」是销售额别名、「箱」被当虚词剥掉，于是把销售额 151668 元当箱数答了回去
+    /// （收据里 `metric:箱` 明写未解析，却既不拒也不提示）。qty 列就在同一张表上。
+    #[test]
+    fn a_quantity_unit_after_how_many_means_the_quantity_metric() {
+        use crate::sales_fact::Metric;
+        // 「本月几箱」这类**没有任何指标词**的问句不在本条范围内（它连指标都没抽到），
+        // 本条只治「已经抽成销售额、但用户问的是件数」那一档。
+        for q in ["本月买了多少箱", "浏阳品元本月买了多少箱", "本月卖了多少件"] {
+            let m = warehouse_sales_metrics(q);
+            assert!(
+                m.iter().any(|(metric, _)| *metric == Metric::SalesQuantity),
+                "{q} 该问销量：{m:?}"
+            );
+            assert!(
+                !m.iter().any(|(metric, _)| *metric == Metric::SalesAmount),
+                "{q} 不该答销售额：{m:?}"
+            );
+        }
+        // 判据必须窄：商品名里带单位字的不许被误伤（「薄皮包子」含「包」、「油条」含「条」）
+        let amount = warehouse_sales_metrics("小虎青菜香菇薄皮包子420g本月销售额");
+        assert!(amount.iter().any(|(metric, _)| *metric == Metric::SalesAmount), "{amount:?}");
+        let plain = warehouse_sales_metrics("本月销售额是多少");
+        assert!(plain.iter().any(|(metric, _)| *metric == Metric::SalesAmount), "{plain:?}");
+    }
 
     /// 用户直接说出 region 的取值本身：确定性路必须接住，不许掉进自由 SQL。
     /// 「川渝藏大区」含「川」这类省名字样，判据必须在省名扫描**之前**。
