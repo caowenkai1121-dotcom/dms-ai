@@ -1256,9 +1256,21 @@ fn no_topic_reply(question: &str, topic: &str, t0: Instant, clarify_options: Vec
 const OUT_OF_SCOPE_ROUTES: &[&str] = &["direct-derive", "llm", "llm+repair", "llm+schema-fix"];
 
 /// 成员值探针覆盖的维度清单（`topic_covered` 与 `dimension_value_hit` 共用 —— 加维度只许改这一处）。
-const PROBE_DIMS: [dms_semantic::sales_fact::Dimension; 2] = [
+/// 成员值探针要试的列。**顺序即优先级**（同名值撞车时取先命中的那一列）。
+///
+/// 🔴 加进 `State`/`City`（2026-08-15 生产直打）：事实表另有 `state`（38 个行政省全称）
+/// 与 `city`（318 个市）两列，此前探针只试销售组织口径的两列，于是
+///   粤东本月销售额     → 「粤东」是 state 的真实取值（2129 行），却被当成客户名去探主档，
+///                        探成一个零命中的 storecode，答 0；
+///   郑州市本月销售额   → city='郑州市' 本月 182 万，判「合同没有该维度」；
+///   各城市本月销售额   → 同上，拒答理由是「库里没有」，其实是没登记。
+/// 探针读的是**真数据**，新增取值自动跟上 —— 比再维护一张词表可靠。
+/// 组织口径排在行政口径前：老问法（省区/战区）不受影响。
+const PROBE_DIMS: [dms_semantic::sales_fact::Dimension; 4] = [
     dms_semantic::sales_fact::Dimension::WarZone,
     dms_semantic::sales_fact::Dimension::Region,
+    dms_semantic::sales_fact::Dimension::State,
+    dms_semantic::sales_fact::Dimension::City,
 ];
 
 /// 换文案判据（纯函数，故有单测）：空结果 + route 在圈内 + 无既有风险标注
@@ -1689,8 +1701,11 @@ const DETAIL_ROWS: u32 = 100;
 /// 去重保序。
 fn dimension_probe_values(dim: dms_semantic::sales_fact::Dimension, word: &str) -> Vec<String> {
     use dms_semantic::sales_fact::Dimension;
-    // 调用点只传 WarZone/Region（PROBE_DIMS）；给 Dimension 加变体时这里必须同步，不许静默产空串
-    debug_assert!(matches!(dim, Dimension::WarZone | Dimension::Region));
+    // 调用点只传 `PROBE_DIMS` 里的四个；给 Dimension 加变体时这里必须同步，不许静默产空串
+    debug_assert!(matches!(
+        dim,
+        Dimension::WarZone | Dimension::Region | Dimension::State | Dimension::City
+    ));
     let stem = DIMENSION_NOUN_TAILS.iter().find_map(|t| word.strip_suffix(t)).unwrap_or(word);
     let mut out: Vec<String> = vec![word.to_string()];
     if stem != word {
@@ -1700,6 +1715,10 @@ fn dimension_probe_values(dim: dms_semantic::sales_fact::Dimension, word: &str) 
     let suffixed = match dim {
         Dimension::WarZone => format!("{stem}战区"),
         Dimension::Region => format!("{stem}省区"),
+        // 行政省存官方全称（海南 → 海南省 / 新疆 → 新疆维吾尔自治区）：只补最常见的「省」，
+        // 自治区那几个由 `sales_fact_province_filter` 的 INSTR 那条路接住，这里不重复造词。
+        Dimension::State => format!("{stem}省"),
+        Dimension::City => format!("{stem}市"),
         _ => String::new(),
     };
     // 到这步词干就是原词：suffixed 恒 ≠ out 里已有的原词，只挡空串（未来新变体的占位）

@@ -275,6 +275,9 @@ pub enum Dimension {
     /// 只给「某个行政省的过滤」用 —— 省区（region）是销售组织口径，与行政省多对一，
     /// 拿它当行政省的过滤会把邻省算进来（2026-08-15 实测：海南 46 万被答成广东省区 540 万）。
     State,
+    /// 市（`city` 列，318 个取值）。与 `State` 同一处置：**不进 `DIMENSIONS`**，
+    /// 只给成员值探针与过滤用。
+    City,
     Month,
 }
 
@@ -300,6 +303,7 @@ impl Dimension {
             Self::WarZone => "war_zone",
             Self::Region => "sales_region",
             Self::State => "state",
+            Self::City => "city",
             Self::Month => "month",
         }
     }
@@ -314,6 +318,7 @@ impl Dimension {
             Self::WarZone => "战区",
             Self::Region => "省区",
             Self::State => "行政省",
+            Self::City => "城市",
             Self::Month => "月份",
         }
     }
@@ -331,6 +336,7 @@ impl Dimension {
             Self::Region => &["销售省区", "区域", "销售区域", "片区", "省份", "销售省份"],
             // 刻意为空：行政省不参与自然语言维度匹配（「省份」按 2026-08-11 裁决归 region）
             Self::State => &[],
+            Self::City => &[],
             Self::Month => &["按月", "每月", "每个月", "按月份", "各月", "月度"],
         }
     }
@@ -345,6 +351,7 @@ impl Dimension {
             Self::WarZone => "war_zone",
             Self::Region => "region",
             Self::State => "state",
+            Self::City => "city",
         }
     }
 
@@ -360,6 +367,7 @@ impl Dimension {
             Self::WarZone => "COALESCE(NULLIF(sf.war_zone,''),'未归属')",
             Self::Region => "COALESCE(NULLIF(sf.region,''),'未归属')",
             Self::State => "COALESCE(NULLIF(sf.state,''),'未知')",
+            Self::City => "COALESCE(NULLIF(sf.city,''),'未知')",
             Self::Month => "DATE_FORMAT(sf.order_date,'%Y-%m')",
         }
     }
@@ -374,6 +382,7 @@ impl Dimension {
             Self::WarZone => "战区取 war_zone，空值归未归属",
             Self::Region => "省区只取业务确认字段 region，空值归未归属；不得改用 state",
             Self::State => "行政省取 state（38 个取值，官方全称如「海南省」「新疆维吾尔自治区」）。它**不是**省区：region 是销售组织口径，与行政省多对一（广东省区含海南、浙江省区含上海、川渝藏大区含川渝藏）。只用于行政省过滤，不用于分组",
+            Self::City => "城市取 city（318 个取值）。与行政省同一处置：只用于过滤与成员值探针，不参与自然语言维度匹配",
             Self::Month => "月份由 order_date 截取到 YYYY-MM",
         }
     }
