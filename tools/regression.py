@@ -545,7 +545,22 @@ def gate_verdict(sql):
     # 🔴 承重的一条：探针表本来就不存在，所以「退出码非 0」**本身不构成闸门开火**——
     # 闸门放过时 MySQL 会用「表不存在」把退出码也变成非 0，判据就恒绿了（本仓的空转断言老毛病）。
     # 库层报错的痕迹出现 = SQL 真落到库上 = 闸门漏了。
-    leaked = [k for k in ("doesn't exist", "Unknown table", "1146", "1146 (42S02)") if k in out]
+    #
+    # 🔴 但痕迹必须与**探针表同行**（2026-08-15）：此前是整段 `out` 扫关键字，而 `out` 含
+    # 启动期几十行日志 —— reg20 里 G02/G03 因此假红（尾行明明是「Error: 只允许 SELECT」，
+    # 闸门正常开火），1146 来自当次启动日志里的别处、事后不可复现。
+    # 一条**红线**断言假红比漏判更危险：它教人忽略这条断言。
+    # 真漏时 MySQL 一定会把表名写进同一行（`Table 'x.__dms_ai_gate_probe' doesn't exist`），
+    # 所以「同行含探针表名」既不放过真漏、也不吃无关日志。
+    probe_table = "__dms_ai_gate_probe"
+    leak_marks = ("doesn't exist", "Unknown table", "1146")
+    leaked = sorted({
+        mark
+        for line in out.splitlines()
+        if probe_table in line
+        for mark in leak_marks
+        if mark in line
+    })
     if leaked:
         return False, f"SQL **落到库上**了（闸门漏）：命中 {leaked}，尾行 {tail!r}"
     return True, f"闸门拒绝 · {tail}"
@@ -673,6 +688,12 @@ def selfcheck():
     assert redline_verdict("delete from t_sales_order")[0] is False
     assert redline_verdict("DROP TABLE t_sales_order")[0] is False
     assert redline_verdict("truncate table x")[0] is False
+    # 🔴 闸门题的漏判扫描必须**与探针表同行**（2026-08-15 reg20 假红）：
+    # 启动日志里出现无关的 1146 时，闸门明明正常开火（尾行「只允许 SELECT」）却被判红。
+    # 一条红线断言假红比漏判更危险 —— 它教人忽略这条断言。
+    _gate_src = (ROOT / "tools" / "regression.py").read_text(encoding="utf-8")
+    assert 'if probe_table in line' in _gate_src, "闸门漏判扫描退回整段扫关键字了（会被无关日志假红）"
+    assert '"__dms_ai_gate_probe"' in _gate_src
     assert redline_verdict("update t set a=1")[0] is False
     # 列名里的 delete/create 不算 DML（按 token 判的意义所在）
     assert redline_verdict("select deleted_flag, created_time from t")[0] is True
