@@ -326,12 +326,23 @@ fn valid_iso_date(b: &[u8]) -> Option<(u16, u8, u8)> {
 /// 规则①：近 N 天/周/月/年（含中文数字）
 fn rule_recent_n(q: &str) -> Option<String> {
     let (n, unit) = recent_n(q)?;
-    // 🔴 「近 N 天」含今天：起点只回推 N-1 天，窗口才恰好 N 个自然日
-    //（修前回推 N 天，「近7天」实测覆盖 8 个自然日）；周/月/年是滚动周期单位，不折算。
+    // 🔴 上界含今天（`< 明天`），所以下界必须**多回推一天再往前挪一天**，窗口才恰好 N 个单位。
+    //
+    // 「近 N 天」早就这么修了（回推 N-1 天）。周/月/年当时按「滚动周期单位，不折算」放过，
+    // 于是同一个用户意图两个窗口（2026-08-15 并行猎捕实测）：
+    //   近7天   → 2026-08-09..08-15 共 7 天  ✅
+    //   近一周  → 2026-08-08..08-15 共 8 天  ❌（多算一天）
+    // 「近一周」和「近7天」是同一句话的两种说法，不该给两个数。
+    // 周/月/年改成「先回推 N 个单位、再 +1 天」——日历算术自己处理月末长度，
+    // 不用把月折算成天（那会在 1/31 → 2/28 上出错）。
     debug_assert!(n >= 1, "recent_n 的 1..=60 过滤保证 n-1 不下溢");
-    let back = if unit == "DAY" { n - 1 } else { n };
+    let lower = if unit == "DAY" {
+        format!("DATE_SUB(CURDATE(), INTERVAL {} DAY)", n - 1)
+    } else {
+        format!("DATE_ADD(DATE_SUB(CURDATE(), INTERVAL {n} {unit}), INTERVAL 1 DAY)")
+    };
     Some(format!(
-        "{{}} >= DATE_SUB(CURDATE(), INTERVAL {back} {unit}) AND {{}} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
+        "{{}} >= {lower} AND {{}} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
     ))
 }
 
@@ -856,6 +867,22 @@ mod tests {
             );
             assert_eq!(prev_window(q), prev_window("本月销售额"), "{q} 缺环比");
             assert_eq!(yoy_window(q), yoy_window("本月销售额"), "{q} 缺同比");
+        }
+    }
+
+    /// 「近一周」与「近7天」必须是同一个窗口。
+    ///
+    /// 🔴 由来（2026-08-15 并行猎捕实测）：上界含今天，而周/月/年的下界只回推整 N 个单位，
+    /// 于是「近一周」覆盖 8 个自然日、「近7天」覆盖 7 个 —— 同一句话两种说法两个数。
+    #[test]
+    fn a_rolling_window_is_the_same_length_however_you_say_it() {
+        let week = tp("近一周销售额");
+        assert!(week.contains("INTERVAL 1 WEEK"), "{week}");
+        assert!(week.contains("INTERVAL 1 DAY)"), "周窗必须补回一天才是 7 天：{week}");
+        // 天那一支照旧回推 N-1（不是 +1 天的写法），别被这条改动带偏
+        assert!(tp("近7天销售额").contains("INTERVAL 6 DAY"), "{}", tp("近7天销售额"));
+        for q in ["近三个月销售额", "近2年销售额"] {
+            assert!(tp(q).contains("INTERVAL 1 DAY)"), "{q} 的下界也要补回一天：{}", tp(q));
         }
     }
 
