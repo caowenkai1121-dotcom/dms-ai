@@ -124,7 +124,16 @@ pub async fn land(
     // 最后出了张反问卡。丢模板换自由 SQL 是**放宽**不是收紧，与本函数上面那段注释也矛盾。
     // 对 LLM SQL 仍然硬拦 —— 那条路的覆盖闸在 `run.rs`，不经过这里。
     if !unavailable && coverage.blocking() && !coverage.only_unreadable() {
-        tracing::warn!(route = %hit.route, ?coverage, "确定性路径未证明结构化意图覆盖 → 回落下一成员");
+        // 🔴 证据要一起打（2026-08-15）：只打 coverage 时看到的是「哪个槽位没证明」，
+        // 看不到「模板自己声称兑现了什么」——两者对不上才是真因（模板没登记证据 /
+        // 登记的表面词与合同的表面词不同形）。为这条少打的日志追了一整轮。
+        tracing::warn!(
+            route = %hit.route, ?coverage, evidence = ?planned_evidence,
+            intent_regions = ?cx.intent.map(|i| i.regions.clone()),
+            intent_time = ?cx.intent.and_then(|i| i.time.as_ref().map(|t| t.surface.clone())),
+            sql = %hit.sql.chars().take(200).collect::<String>(),
+            "确定性路径未证明结构化意图覆盖 → 回落下一成员"
+        );
         return Ok(None);
     }
     if coverage.only_unreadable() {
