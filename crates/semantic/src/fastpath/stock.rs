@@ -241,8 +241,12 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
         .any(|word| question.contains(word));
     // 裸「前」不是触发词（「目前的库存」会误中）：「前+N/前十」由 `detect_top_n`
     // 带时间单位黑名单判；「top」归一小写后判一次
+    // 🔴 「各仓库/按仓库/每个仓库」也是分组诉求（2026-08-15 生产直打 + 复验 3/3）：
+    // 此前触发词只有排行词，于是「各仓库库存量」「按仓库看库存量」全落 need-intent ——
+    // 而它要的正是这条分支已经会写的那句 GROUP BY。
     let grouped_warehouse = question.contains("仓库")
-        && (["哪个", "最高", "最多", "最大", "最少", "最小", "最低", "排行", "排名"]
+        && (["哪个", "最高", "最多", "最大", "最少", "最小", "最低", "排行", "排名",
+             "各仓库", "按仓库", "每个仓库", "各个仓库", "分仓库"]
             .iter()
             .any(|word| question.contains(word))
             || question.to_lowercase().contains("top")
@@ -256,10 +260,10 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
         const ZT_FROM: &str = "ywzt_ods.scm_warehous_manage";
         // 只计正品在库；残损/临期等其余 inventory_status 须点名才计（合同卡同口径）
         const ZT_WHERE: &str = "inventory_status = 'ZP'";
-        // 带商品残留的库存题必须走 `stock_product_filtered` 实表探针；同步模板只接通用总量/仓库排行。
-        if stock_product_fragment(question).is_some() {
-            return None;
-        }
+        // 🔴 仓库分组的判断**排在商品残留守卫之前**（2026-08-15）：
+        // 「各仓库库存量」里的「各仓库」会被 `stock_product_fragment` 当成商品名残留，
+        // 于是整条被那道守卫拒掉 —— 而它要的正是下面这句 GROUP BY，与商品无关。
+        // 顺序即行为：先判「这是不是按仓库分组」，再判「有没有商品限定」。
         if grouped_warehouse {
             // 仓库码表（t_warehouse）未镜像进数仓，按码与库位出（名称接入后再换名）
             return Some(hit(
@@ -274,6 +278,11 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
                 ),
                 "direct-agg",
             ));
+        }
+        // 带商品残留的库存题必须走 `stock_product_filtered` 实表探针；
+        // 同步模板只接通用总量（仓库分组已在上面接走）。
+        if stock_product_fragment(question).is_some() {
+            return None;
         }
         return Some(DirectHit {
             detail: Some(format!(
@@ -399,3 +408,27 @@ pub fn stock_product_snapshot(sku_predicate: &str, surface: &str) -> DirectHit {
 
 
 
+
+#[cfg(test)]
+mod warehouse_group_tests {
+    use super::*;
+
+    /// 「各仓库/按仓库」是分组诉求，不是排行诉求。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打 + 复验 3/3）：触发词此前只有排行词
+    /// （哪个/最多/最高/排行/top/前N），于是「各仓库库存量」「按仓库看库存量」
+    /// 全落 need-intent —— 而它要的正是这条分支已经会写的那句 GROUP BY。
+    #[test]
+    fn grouping_by_warehouse_is_a_grouping_ask_not_only_a_ranking_one() {
+        for q in ["各仓库库存量", "按仓库看库存量", "每个仓库的库存量", "分仓库库存量"] {
+            let hit = stock_snapshot(q).unwrap_or_else(|| panic!("{q} 该命中"));
+            assert!(hit.sql.contains("GROUP BY wms_code, location"), "{q}：{}", hit.sql);
+        }
+        // 排行诉求照旧（不许被这条改动带偏）
+        let rank = stock_snapshot("库存量最多的仓库").expect("排行照旧");
+        assert!(rank.sql.contains("ORDER BY"), "{}", rank.sql);
+        // 不含「仓库」的通用总量照旧走单值
+        let total = stock_snapshot("现在库存量是多少").expect("总量照旧");
+        assert!(!total.sql.contains("GROUP BY"), "{}", total.sql);
+    }
+}
