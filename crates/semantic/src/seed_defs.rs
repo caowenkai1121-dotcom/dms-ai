@@ -600,6 +600,12 @@ pub(crate) async fn seed_value_maps(pg: &PgPool) -> anyhow::Result<()> {
         // 接着错（码列 LIKE 名称照样 0 行）。同一批值（`PROVINCE_CODES` 单一份事实源），
         // 两个落点，判据与换码卡都得看得见。
         ("t_sales_order", "receiver_province", PROVINCE_CODES, "eq"),
+        // 🔴 第三张落点：售后单头（2026-08-15 生产直打 + 复验 4/4）。
+        // 「湖南退款额」走 llm+schema-fix 答 227.94，SQL 里是
+        // `receiver_province LIKE '%湖南%'` —— 而这张表的 `receiver_province` 与上面两张
+        // 同样存 6 位行政区划码（只有极少数脏数据行是中文省名），码列 LIKE 名称必然近乎 0 行。
+        // 同一本字典的第三个落点：不登记，模型就只能靠猜，而且会**确定性地**猜错。
+        ("t_after_sales_order_header", "receiver_province", PROVINCE_CODES, "eq"),
         // 客户分类（字典 CustClassif，与 meta.dimension customer_class 的 CASE 同源）：
         // 「线下客户」这类问法必须换成 '04'，否则 LLM 会去猜别的列（实测猜到了 customer_channel）
         ("t_customer", "customer_class", crate::present_cn::CUSTOMER_CLASS, "eq"),
