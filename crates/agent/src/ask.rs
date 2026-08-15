@@ -1794,6 +1794,28 @@ fn build_dimension_value_hit(
         .collect();
     let detail = scalar.then(|| sales_fact::detail_sql(&begin, &end, &predicates, DETAIL_ROWS));
     let sales_context = scalar.then(|| with(&begin, &end, sales_fact::CONTEXT_METRICS));
+    // 🔴 兑现了什么就自报什么（2026-08-15 生产直打逮到）：这里原先是
+    // `intent_evidence: Default::default()` —— SQL 建对了（`region = '西北大区'` +
+    // 时间窗 + 指标），却一个槽位都不声明。于是覆盖闸判 `missing: time:本月` +
+    // `unverifiable: region:西北大区` → **把这条正确结果整份丢掉**、回落自由 SQL
+    // （实测「本月西北大区销售额」因此走 llm+repair）。
+    //
+    // 与库存模板那条（`stock_snapshot` 自报指标）同一个病：**模板不自报，闸门就当它没做**。
+    // 三个槽位都是这里已经算出来的确定事实，不是猜的：
+    // - Metric：`metrics` 就是命中的指标本身；
+    // - Region：`member` 是**探库探到的成员值**，也正是用户写的那个词；
+    // - Time：与其它模板同一份 `intent_time_surface`（口径也同一份）。
+    let mut intent_evidence = dms_semantic::ExecutionEvidence::default();
+    for metric in metrics {
+        intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Metric, metric.name());
+    }
+    // `PROBE_DIMS` 恒是 WarZone/Region 两个地域列 —— 两者都归 Region 槽位。
+    // 将来这张表加了非地域维度，这里必须跟着分档（不许把商品分类值报成 Region）。
+    debug_assert!(PROBE_DIMS.contains(&dim), "探针维度表变了，证据分档要跟着改");
+    intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Region, member);
+    if let Some(surface) = dms_semantic::fastpath::intent_time_surface(question) {
+        intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Time, surface);
+    }
     // route 与合同装配器同款：direct-agg（`land` 按它走 verified 信任级）
     Some(DirectHit {
         outcome: DirectOutcome::Data,
@@ -1803,8 +1825,35 @@ fn build_dimension_value_hit(
         comparisons,
         detail,
         sales_context,
-        intent_evidence: Default::default(),
+        intent_evidence,
     })
+}
+
+#[cfg(test)]
+mod dimension_hit_evidence_tests {
+    /// 维度成员值命中必须**自报**它兑现了哪些槽位。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打）：这条路把 SQL 建对了（`region = '西北大区'` +
+    /// 时间窗 + 指标），却 `intent_evidence: Default::default()` —— 覆盖闸于是判
+    /// `missing: time:本月` + `unverifiable: region:西北大区`，把一条正确结果整份丢掉、
+    /// 回落自由 SQL。判据钉的是「三个槽位都在证据里」，不是 SQL 长什么样。
+    #[test]
+    fn a_dimension_member_hit_declares_what_it_resolved() {
+        use dms_semantic::sales_fact::{Dimension, Metric};
+        let hit = super::build_dimension_value_hit(
+            "本月西北大区销售额",
+            Dimension::Region,
+            "西北大区",
+            &[Metric::SalesAmount],
+        )
+        .expect("该命中");
+        let ev = &hit.intent_evidence;
+        assert!(ev.proves(crate::intent::IntentSlotKind::Metric, Metric::SalesAmount.name()), "{ev:?}");
+        assert!(ev.proves(crate::intent::IntentSlotKind::Region, "西北大区"), "{ev:?}");
+        assert!(ev.proves(crate::intent::IntentSlotKind::Time, "本月"), "{ev:?}");
+        // 证据来自这次真的建进 SQL 的东西，不是照抄问句
+        assert!(hit.sql.contains("西北大区"), "{}", hit.sql);
+    }
 }
 
 /// Router 有序表 = `ROUTER_ORDER` **七位齐全**，一位都不许换：
