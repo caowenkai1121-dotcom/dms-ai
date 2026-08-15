@@ -10,7 +10,9 @@
 const MAX_TOP_N: usize = 200;
 
 /// 中文数字字符集（detect_top_n / recent_n / rule_month 四处共用）
-const CN_DIGITS: &str = "零一两二三四五六七八九十";
+/// 中文数字字符集（`cn_num` 的输入域）。`pub` 是给 agent 侧的序数识别用 ——
+/// 抄第二份必漂（本仓为「抄了两份」付过多次账）。
+pub const CN_DIGITS: &str = "零一两二三四五六七八九十";
 
 /// 「今天/昨天」词组（prev_window / yoy_window / rule_relative 三处共用，不抄第三份）
 const TODAY_WORDS: &[&str] = &["今天", "今日"];

@@ -730,6 +730,25 @@ mod tests {
         assert!(try_direct("昨天有哪些设备").is_none(), "泛设备名词不能误认成设备订单");
     }
 
+    /// 序数排名表达不了就**不接**，不许返回一张答非所问的榜。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打 + 复验 2/2）：「本月销售额排名第二的客户」返回
+    /// 200 行全榜，确定性摘要还把**第一名**标成「榜首」——用户问第二，拿到的是第一。
+    /// `QueryOptions` 只有 limit 没有 offset，加它要动全部调用点；按纪律先 fail-closed。
+    #[test]
+    fn an_ordinal_rank_is_refused_not_silently_widened() {
+        for q in ["本月销售额排名第二的客户", "本月销售额第3名的省区", "本月销量第一名的商品"] {
+            assert!(warehouse_sales_fact(q).is_none(), "{q} 该 fail-closed");
+        }
+        // 时间里的序数不许被误判成名次（「第一季度」「第3个月」）
+        assert!(
+            warehouse_sales_fact("今年第一季度销售额").is_some(),
+            "季度序数不是名次"
+        );
+        // 普通 TopN 照旧
+        assert!(warehouse_sales_fact("本月销售额前十的客户").is_some());
+    }
+
     /// 「最高/最多」是 N=1 的取值限定，不是「给我整张榜」。
     ///
     /// 🔴 由来（2026-08-15 生产直打 + 复验 2/2）：「本月销售额最高的客户」返回 200 行全榜，

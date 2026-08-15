@@ -185,6 +185,44 @@ pub(crate) fn lone_customer_code(question: &str) -> Option<String> {
     }
 }
 
+/// 问句里的**序数排名**（「排名第二的客户」「销售额第3名的省区」）。
+///
+/// 🔴 本模板表达不了它（2026-08-15 生产直打 + 复验 2/2）：`QueryOptions` 只有 `limit`、
+/// 没有 `offset`，于是「第二名」此前被静默丢掉、回落默认 LIMIT 200 —— 返回整张 200 行榜，
+/// 确定性摘要还把**第一名**标成「榜首」推给用户。用户问第二，拿到的是第一。
+///
+/// 加 OFFSET 要改 `QueryOptions` 的全部调用点，不是这一刀的范围；
+/// 按本仓纪律（识别到却兑现不了的限定，不许静默丢）先 fail-closed ——
+/// 让它去出「不可计算·未确认限定」，而不是继续返回一张答非所问的榜。
+fn ordinal_rank(question: &str) -> Option<u32> {
+    for marker in ["排名第", "第"] {
+        for (pos, _) in question.match_indices(marker) {
+            let rest = &question[pos + marker.len()..];
+            let digits: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || dms_kernel::nl::time::CN_DIGITS.contains(*c))
+                .collect();
+            if digits.is_empty() {
+                continue;
+            }
+            let tail = &rest[digits.len()..];
+            // 「排名第N」本身已经点明是名次，不必再要量词（实测「排名第二的客户」就没有）；
+            // 裸「第N」必须跟名次量词，否则「第一季度」「第3个月」这类时间词会被误判。
+            let is_rank = marker == "排名第"
+                || ["名", "位", "大"].iter().any(|unit| tail.starts_with(unit));
+            if !is_rank {
+                continue;
+            }
+            if let Some(n) = dms_kernel::nl::time::cn_num(&digits) {
+                if (1..=200).contains(&n) {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn warehouse_sales_fact_predicated(
     question: &str,
     customer: Option<&crate::entity_resolver::CustomerBinding>,
@@ -193,6 +231,12 @@ pub fn warehouse_sales_fact_predicated(
 
     let metric_hits = warehouse_sales_metrics(question);
     if metric_hits.is_empty() || warehouse_sales_has_unsupported_semantics(question) {
+        return None;
+    }
+    // 序数排名（「第二名」）本模板表达不了：没有 OFFSET。不接，让它去出「不可计算」——
+    // 继续跑的话会返回整张 200 行榜，还把第一名当「榜首」推给问第二的人。
+    if let Some(n) = ordinal_rank(question) {
+        tracing::debug!(question = %question, n, "序数排名无 OFFSET 可表达 → 不接（fail-closed）");
         return None;
     }
     let dimension_hits = warehouse_sales_dimensions(question);
