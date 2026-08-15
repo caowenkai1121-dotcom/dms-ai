@@ -30,6 +30,14 @@ pub fn sales_fact_metric_extra_words(metric: crate::sales_fact::Metric) -> &'sta
         Metric::SalesAmount => &["销售金额"],
         Metric::RevenueExcludingTax => &["收入"],
         Metric::GrossProfit => &["毛利"],
+        // 🔴 数量单位与「买了/卖了多少」都要能被**消化**（2026-08-15）：
+        // 「买了多少」本是销售额的别名，`warehouse_sales_metrics` 见到「多少+单位」会把指标
+        // 改判成销量；若这些词不在销量的消化词里，残留守卫就会看到「浏阳品元买了」并整条拒 ——
+        // 指标改对了、问句反而答不出来。
+        Metric::SalesQuantity => &[
+            "买了多少", "卖了多少", "进了多少",
+            "箱", "件", "袋", "包", "盒", "吨", "支", "瓶", "条", "斤", "公斤", "提", "桶",
+        ],
         _ => &[],
     }
 }
@@ -136,6 +144,9 @@ pub fn warehouse_sales_dimensions(
         sales_fact::Dimension::Goods,
         sales_fact::Dimension::WarZone,
         sales_fact::Dimension::Region,
+        // 城市 2026-08-15 加入：city 是事实表实有列（318 个取值）。
+        // `State` 仍不在 —— 2026-08-11 裁决「省份 ≡ 省区 ≡ region」管的正是分组口径。
+        sales_fact::Dimension::City,
         sales_fact::Dimension::Month,
     ];
     let mut candidates = RELIABLE

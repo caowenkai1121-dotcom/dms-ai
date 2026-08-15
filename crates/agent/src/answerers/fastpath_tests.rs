@@ -1536,11 +1536,17 @@ pub fn ");
             "本月销售额按商品类型",
             "本月销售额按二级分类",
             "本月销售额按末级分类",
-            "本月销售额按城市",
+            // 「按城市」2026-08-15 移出本清单：city 是 dws_off_offline_sale_dfn 的实有列
+            // （318 个取值），此前被写死在 WAREHOUSE_SALES_UNSUPPORTED 里，
+            // 「本月销售额最高的城市」被判「合同没有该维度」—— 把「没登记」讲成「库里没有」。
             "本月销售额按价格组",
             "本月销售额按来源订单类型",
         ] {
             assert!(sales_breakdown(question).is_none(), "未经事实验证的维度必须回落：{question}");
+        }
+        // 反面：已验证的维度必须接得住（否则这条判据会变成「什么都别加」）
+        for question in ["本月销售额按城市", "本月销售额按省区", "本月销售额按战区"] {
+            assert!(sales_breakdown(question).is_some(), "已验证维度该接：{question}");
         }
     }
 
