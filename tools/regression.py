@@ -242,13 +242,43 @@ def service_up(port):
         return False
 
 def graph_up():
+    """图**已同步**才算 up —— 只判「容器在跑」会把一整族题判成假红。
+
+    🔴 由来（2026-08-15）：容器重启后图要几分钟才同步完，而本函数只看 `docker ps`
+    有没有 dms-ai-pg。于是回归在重启后立刻开跑 → F01/F02/F03/F05/F06 五道全判
+    `route=direct-doc≠graph`，而代码一个字没错（同一批题手工重打全是 route=graph）。
+    一次假红 = 一轮 20 分钟白跑，还得人去分辨「是我改坏了还是没同步完」。
+
+    判据换成健康检查里的 `graph_sync`：`never` = 没同步过 → 依赖缺席 → 那些题**跳过**
+    （⏭️），不是失败。健康检查够不到时回落旧判据（拿不准就别比原来更严）。
+    """
     # docker 未装/守护进程卡死时不得让判官崩或挂住：记 graph=DOWN（依赖缺席语义），不是 traceback
     try:
         r = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
                            capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return "dms-ai-pg" in r.stdout
+    if "dms-ai-pg" not in r.stdout:
+        return False
+    synced = _graph_synced()
+    if synced is None:
+        return True  # 健康检查够不到：维持旧行为，不比原来更严
+    if not synced:
+        print("graph_sync=never（容器刚重启、图还没同步完）→ 图题按依赖缺席跳过", flush=True)
+    return synced
+
+
+def _graph_synced():
+    """健康检查里的 `graph_sync`：True/False，够不到返回 None。"""
+    import urllib.request
+    base = os.environ.get("DMSAI_BASE", "http://172.17.0.1:8100")
+    try:
+        with urllib.request.urlopen(f"{base}/api/health", timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    value = str(data.get("graph_sync", "")).strip()
+    return bool(value) and value != "never"
 
 def ask_argv(c):
     """题 → CLI argv（**纯函数**，selfcheck 直接验它）。
