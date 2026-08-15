@@ -402,16 +402,34 @@ pub fn sales_fact_province_filter(
     let business_region = crate::warehouse_catalog::shop_business_region_for_province(name)
         .ok_or(())?;
     let conventional_region = format!("{name}省区");
-    let values = if business_region == conventional_region {
-        vec![
-            format!("{name}省区"),
-            format!("{name}战区"),
-            format!("{name}大区"),
-            name.to_string(),
-        ]
-    } else {
-        vec![business_region.to_string()]
-    };
+    if business_region != conventional_region {
+        // 🔴 省区与行政省**不是一回事**（2026-08-15 生产直打逮到的一整族倍数级错答）：
+        //   海南省 → region='广东省区'（含广东 494.8 万 + 海南 46.1 万）→ 高估 11.7 倍
+        //   上海市 → region='浙江省区'                                  → 高估 3.8 倍
+        //   西藏   → region='川渝藏大区'（真值 0）                      → 凭空 419 万
+        //   新疆   → region='西北大区'                                  → 高估 4.3 倍
+        // 而且全都 trust=verified、caliber_note 为空 —— 用户没有任何途径察觉。
+        //
+        // 映射**不是 1:1** 的那一档，region 是行政省的**超集**，拿它当过滤必然多算。
+        // 这一档改用 `state`（38 个官方全称取值）精确过滤。
+        //
+        // 1:1 的那一档（山东省 → 山东省区）**照旧走 region 四形候选**：
+        // 那是 2026-08-11 业务裁决的口径（「省份」≡「省区」≡ region），实测两侧同值
+        // （山东省本月 7,126,980.40 = 山东省区本月），B01W 钉的也是那个形态。
+        // 本改动只治「超集冒充精确值」，不动分组口径。
+        //
+        // `contains` 而不是 `eq`：`PROVINCE_LABELS` 给的是短名（海南/新疆/内蒙古），
+        // 而 state 存官方全称（海南省/新疆维吾尔自治区/内蒙古自治区）。短名是全称的
+        // 唯一前缀，省名之间互不为子串（河南≠海南≠湖南、山西≠陕西），INSTR 不会误中。
+        let predicate = Predicate::contains(Dimension::State, name);
+        return Ok(Some((consumed, predicate)));
+    }
+    let values = vec![
+        format!("{name}省区"),
+        format!("{name}战区"),
+        format!("{name}大区"),
+        name.to_string(),
+    ];
     let refs = values.iter().map(String::as_str).collect::<Vec<_>>();
     let predicate = Predicate::one_of(Dimension::Region, &refs).expect("省区候选固定非空");
     Ok(Some((consumed, predicate)))

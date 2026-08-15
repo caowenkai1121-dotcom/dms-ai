@@ -1221,21 +1221,39 @@ pub fn ");
             shandong.sql
         );
 
+        // 🔴 映射**不是 1:1** 的省份改走 `state` 精确过滤（2026-08-15 生产直打逮到一族倍数级错答）：
+        //   海南省 → region='广东省区'（含广东 494.8 万 + 海南 46.1 万）→ 高估 11.7 倍
+        //   上海市 → region='浙江省区'                                  → 高估 3.8 倍
+        //   西藏   → region='川渝藏大区'（真值 0）                      → 凭空 419 万
+        // 全都 trust=verified、caliber_note 为空，用户没有任何途径察觉。
+        // region 是**销售组织**口径、与行政省多对一，拿它当行政省的过滤必然多算。
+        // 「不许拼出不存在的 'X省区'」这条判据原样保留 —— 它防的是另一件事。
         let shanghai = warehouse_sales_fact("上海市本月销售额").expect("上海销售额应命中 DWS");
         assert!(
-            shanghai.sql.contains("COALESCE(NULLIF(sf.region,''),'未归属') IN ('浙江省区')"),
+            shanghai.sql.contains("INSTR(COALESCE(NULLIF(sf.state,''),'未知'), '上海') > 0"),
             "{}",
             shanghai.sql
         );
         assert!(!shanghai.sql.contains("'上海省区'"), "{}", shanghai.sql);
+        assert!(!shanghai.sql.contains("'浙江省区'"), "上海不许被算成整个浙江省区：{}", shanghai.sql);
 
         let hainan = warehouse_sales_fact("海南省本月销售额").expect("海南销售额应命中 DWS");
         assert!(
-            hainan.sql.contains("COALESCE(NULLIF(sf.region,''),'未归属') IN ('广东省区')"),
+            hainan.sql.contains("INSTR(COALESCE(NULLIF(sf.state,''),'未知'), '海南') > 0"),
             "{}",
             hainan.sql
         );
         assert!(!hainan.sql.contains("'海南省区'"), "{}", hainan.sql);
+        assert!(!hainan.sql.contains("'广东省区'"), "海南不许被算成整个广东省区：{}", hainan.sql);
+
+        // 1:1 的那一档照旧走 region 四形候选（2026-08-11 业务裁决，实测两侧同值）——
+        // 上面 `shandong` 已经钉住；这里再钉一条同族的，防止「顺手全改成 state」。
+        let henan = warehouse_sales_fact("河南省本月销售额").expect("河南销售额应命中 DWS");
+        assert!(
+            henan.sql.contains("COALESCE(NULLIF(sf.region,''),'未归属') IN ('河南省区'"),
+            "{}",
+            henan.sql
+        );
 
         let mini = mini_program_order_agg("海南省区本月小程序下单金额")
             .expect("小程序销售也必须复用同一业务省区例外");
