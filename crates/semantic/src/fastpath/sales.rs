@@ -350,6 +350,26 @@ pub fn sales_fact_province_filter(
 ) -> Result<Option<(String, crate::sales_fact::Predicate)>, ()> {
     use crate::sales_fact::{Dimension, Predicate};
 
+    // 用户直接说出 region 的取值本身（「西北大区」「线下私域」…）：这一支在省名扫描
+    // **之前**，因为「川渝藏大区」里含「川」这类省名字样，先扫省名会把它拆错。
+    // 出现两个不同取值 = 多区域比较，与多省同一纪律：不猜、不静默放宽成全国。
+    {
+        let mut direct: Option<&'static str> = None;
+        for value in crate::warehouse_catalog::DIRECT_REGION_VALUES {
+            if !question.contains(*value) {
+                continue;
+            }
+            if direct.is_some_and(|existing| existing != *value) {
+                return Err(());
+            }
+            direct = Some(value);
+        }
+        if let Some(value) = direct {
+            let predicate = Predicate::one_of(Dimension::Region, &[value]).expect("固定非空");
+            return Ok(Some((value.to_string(), predicate)));
+        }
+    }
+
     let mut hit: Option<(&'static str, String)> = None;
     for &(_code, name) in crate::present::PROVINCE_LABELS {
         if !question.contains(name) || customer.is_some_and(|entity| entity.contains(name)) {
@@ -406,6 +426,32 @@ pub fn sales_fact_province_filter(
 #[cfg(test)]
 mod range_surface_tests {
     use super::*;
+
+    /// 用户直接说出 region 的取值本身：确定性路必须接住，不许掉进自由 SQL。
+    /// 「川渝藏大区」含「川」这类省名字样，判据必须在省名扫描**之前**。
+    #[test]
+    fn a_region_value_spoken_verbatim_is_a_region_filter() {
+        for (q, want) in [
+            ("本月西北大区销售额", "西北大区"),
+            ("川渝藏大区本月销售额", "川渝藏大区"),
+            ("线下私域本月销售额", "线下私域"),
+            ("海外事业部本月销售额", "海外事业部"),
+        ] {
+            let (consumed, predicate) =
+                sales_fact_province_filter(q, None).expect("不该 Err").expect("该认出来");
+            assert_eq!(consumed, want, "{q}");
+            let sql = format!("{predicate:?}");
+            assert!(sql.contains(want), "{q} → {sql}");
+        }
+        // 省名照旧走四形候选（不许被这条改动带偏）
+        let (_, p) = sales_fact_province_filter("山东省本月销售额", None).unwrap().unwrap();
+        let sql = format!("{p:?}");
+        assert!(sql.contains("山东省区") && sql.contains("山东战区"), "{sql}");
+        // 两个不同大区 = 多区域比较，不猜
+        assert!(sales_fact_province_filter("西北大区和线下私域本月销售额", None).is_err());
+        // 未登记的大区名照旧不认（让它去走「未确认限定」）
+        assert!(sales_fact_province_filter("华东区本月销售额", None).unwrap().is_none());
+    }
 
     /// 两个 ISO 日期的区间：跨度必须**整段**取出来。
     /// chrono 的 `%Y` 跳过前导空白 → `" 2026-08-1"` 也解析成功，窗口左移一位，

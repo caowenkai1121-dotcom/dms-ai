@@ -42,6 +42,22 @@ pub fn province_region_qualifier(question: &str) -> Result<Option<(&'static str,
             }
         }
     }
+    // 直接说出 region 取值本身的那几个（西北大区/川渝藏大区/海外事业部/线下私域）
+    if hit.is_none() {
+        let mut direct: Option<&'static str> = None;
+        for value in crate::warehouse_catalog::DIRECT_REGION_VALUES {
+            if !question.contains(*value) {
+                continue;
+            }
+            if direct.is_some_and(|existing| existing != *value) {
+                return Err(()); // 多个区域限定值，等值谓词表达不了
+            }
+            direct = Some(value);
+        }
+        if let Some(value) = direct {
+            return Ok(Some((value, value.to_string())));
+        }
+    }
     if hit.is_none() && ["战区", "省区", "大区"].iter().any(|w| question.contains(w)) {
         return Err(());
     }

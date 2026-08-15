@@ -393,7 +393,26 @@ pub const ASSETS: &[Asset] = &[
 /// 生产表的 463 个省市行仍是唯一明细事实源；初始化脚本已强校验“同一省份只能对应一个
 /// 业务省区”，所以运行时只投影 32 个省级结果，不复制城市配置。未进入生产映射的台湾、
 /// 港澳返回 `None`，调用方必须 fail closed，不能拼出不存在的“台湾省区”等值。
+/// 生产 `region` 列里**不是省名派生**的取值 —— 用户会直接说出口的那几个。
+///
+/// 🔴 由来（2026-08-15 生产直打）：`region` 的真实取值里有 西北大区 / 川渝藏大区 /
+/// 海外事业部 / 线下私域，而 `province_region_qualifier` 只认「省名 + 省区/战区」，
+/// 非省名一律 `Err` → 整题掉进自由 SQL。实测「本月西北大区销售额」走 llm+repair
+/// （答案碰巧对：`war_zone` 与 `region` 同值），但慢、且收据降 review。
+///
+/// 刻意**不收**的两个：
+/// - `直营`：太短，「直营店/直营渠道/直营客户」都会误中，裸 `contains` 判不住；
+/// - `零食很忙地配`：用户嘴里说的是「零食很忙」，那是客户名，归实体路。
+/// 这两个仍旧走 fail-closed（识别到却兑现不了 → 不接），不静默丢限定。
+pub const DIRECT_REGION_VALUES: &[&str] =
+    &["西北大区", "川渝藏大区", "海外事业部", "线下私域"];
+
 pub fn shop_business_region_for_province(province: &str) -> Option<&'static str> {
+    // 用户直接说出 region 的取值本身时按原值返回（恒等映射）：下游按
+    // 「映射结果 != {词干}省区」判为「非字面映射」，于是写成单值等值谓词，正是要的形态。
+    if let Some(value) = DIRECT_REGION_VALUES.iter().find(|v| **v == province) {
+        return Some(value);
+    }
     match province.trim() {
         "北京" | "北京市" => Some("北京省区"),
         "天津" | "天津市" => Some("天津省区"),
