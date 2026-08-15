@@ -580,8 +580,14 @@ pub fn time_phrase_of(q: &str) -> Option<&'static str> {
     if q.contains("20") {
         return None;
     }
+    // 🔴 季度族必须在这里（2026-08-15 生产直打）：`time_predicate` 早就认得
+    // 「上个季度/本季度」，而本函数返 None → `intent_time_surface` 拿不到表面词 →
+    // 残留守卫看到一个孤零零的「上」就把整条拒掉，用户收到
+    // 「问句含未能识别的限定「上」」。谓词认得、消化词不认得 = 白拒一族常见问法。
+    // 顺序：长形态在前（`find` 取第一个命中），`上个季度` 必须先于 `上季度`。
     const PHRASES: &[&str] = &[
-        "近三个月", "上个月", "上周", "本周", "这周", "上月", "本月", "这个月", "当月",
+        "近三个月", "上个季度", "这个季度", "上季度", "本季度",
+        "上个月", "上周", "本周", "这周", "上月", "本月", "这个月", "当月",
         "去年", "前年", "今年", "本年", "昨天", "今日", "今天", "前天", "上半年", "下半年",
     ];
     PHRASES.iter().find(|w| q.contains(**w)).copied()
@@ -593,6 +599,26 @@ mod tests {
 
     fn tp(q: &str) -> String {
         time_predicate(q).unwrap_or_else(|| panic!("未解析: {q}"))
+    }
+
+    /// 季度族必须**同时**有表面词与谓词。
+    ///
+    /// 🔴 两条都要（2026-08-15 生产直打）：
+    /// - 只有谓词没表面词 → `intent_time_surface` 拿不到词 → 残留守卫看到孤零零的「上」
+    ///   把整条拒掉（用户收到「问句含未能识别的限定「上」」）；
+    /// - 只有表面词没谓词 → 那个词被「消化」掉却没兑现成时间窗，等于**静默丢限定**
+    ///   （`当季度` 就是这一档，故意不收）。
+    #[test]
+    fn quarter_phrases_have_both_a_surface_and_a_predicate() {
+        for q in ["上个季度销售额", "上季度销售额", "本季度销售额", "这个季度销售额"] {
+            let phrase = time_phrase_of(q).unwrap_or_else(|| panic!("{q} 缺表面词"));
+            assert!(q.contains(phrase), "{q} 的表面词 {phrase} 不在原句里");
+            assert!(time_predicate(phrase).is_some(), "{q} 的表面词 {phrase} 没有谓词 → 会静默丢限定");
+        }
+        // 表面词表里的每一条都必须有谓词（新增时这条会红）
+        for q in ["近三个月", "上个月", "上周", "本周", "上月", "本月", "去年", "今年", "昨天", "上半年"] {
+            assert!(time_predicate(q).is_some(), "{q} 在表面词表里却没有谓词");
+        }
     }
 
     /// 🔴 显式年份必须被尊重。缺陷现场：`上半年/第N季度/N月` 三条规则都写死 `CURDATE()` 的年份，
