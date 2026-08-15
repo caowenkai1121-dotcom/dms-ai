@@ -54,12 +54,17 @@ pub(crate) async fn seed_metrics(pg: &PgPool) -> anyhow::Result<()> {
          "order_time",
          "",
          "【ODS 订单口径】下过有效订单的去重客户数（按 customer_code 去重），物理来源 dms_ods.t_sales_order。默认销售 DWS 只能证明存在销售事实，不能无损还原有效下单事件；禁止按销售事实客户数替代", ""),
+        // 🔴 `ROUND(…, 2)` 与硬编码模板逐字对齐（2026-08-15）：此前声明不 ROUND、模板 ROUND，
+        // 同一个「客单价」两条路给两个数（生产实测 11318.33052890 vs 11317.72）。
+        // 用户一天里问两次拿到两个答案，是这套系统最不该有的毛病。
+        // 口径本身没变（÷ 的两侧一字未动），只是把展示精度统一到业务已经在用的那一份。
+        // `compose/metric.rs` 的让路门注释 ④ 写的就是这件事（「撤门前要先把 ROUND 补进声明」）。
         ("avg_order_value", "订单客单价", AVG_ORDER_VALUE_ALIASES,
-         "t_sales_order", "SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)",
+         "t_sales_order", "ROUND(SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0), 2)",
          "deleted_flag = 0 AND order_status NOT IN ('0','108','199')",
          "order_time",
          "",
-         "【ODS 订单口径，非默认销售指标】订单客单价＝订单额÷订单数＝SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)，物理来源 dms_ods.t_sales_order。默认销售 DWS 没有订单号与订单额，无法无损迁移；不得拿 Doris DWS 默认销售额作分子", ""),
+         "【ODS 订单口径，非默认销售指标】订单客单价＝订单额÷订单数＝ROUND(SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0), 2)，物理来源 dms_ods.t_sales_order。默认销售 DWS 没有订单号与订单额，无法无损迁移；不得拿 Doris DWS 默认销售额作分子", ""),
         ("market_expense", "市场费用", &["营销费用", "费用总额", "推广费"],
          "sales_ads.ads_off_sales_cost_customer_dnf",
          "SUM(COALESCE(sup_staff_cost,0)+COALESCE(comp_pkg,0)+COALESCE(comp_cust_complaint,0)+COALESCE(comp_logistics,0)+COALESCE(comp_out_stock,0)+COALESCE(comp_other,0)+COALESCE(mat_costume,0)+COALESCE(mat_card_sign,0)+COALESCE(mat_freight_install,0)+COALESCE(mat_ip_goods,0)+COALESCE(mat_sticker,0)+COALESCE(mat_tasting_table,0)+COALESCE(mat_stand_banner,0)+COALESCE(mat_kt_board,0)+COALESCE(mat_lightbox,0)+COALESCE(mat_other,0)+COALESCE(mat_insulated_bag,0)+COALESCE(mat_tent,0)+COALESCE(eq_baking,0)+COALESCE(eq_other,0)+COALESCE(eq_freight,0)+COALESCE(eq_fridge,0)+COALESCE(eq_sausage,0)+COALESCE(term_adv_fee,0)+COALESCE(term_other,0)+COALESCE(term_entry_barcode,0)+COALESCE(term_display,0)+COALESCE(term_display_material,0)+COALESCE(offline_adv,0)+COALESCE(brand_adv,0)+COALESCE(act_other,0)+COALESCE(act_outsource,0)+COALESCE(act_tasting_sample,0)+COALESCE(act_logistics,0)+COALESCE(act_venue,0)+COALESCE(act_material_build,0)+COALESCE(rebate_key_cust,0)+COALESCE(rebate_fresh_food,0)+COALESCE(rebate_other,0)+COALESCE(not_act_tasting_sample,0)+COALESCE(other,0))",
@@ -700,7 +705,7 @@ pub(crate) async fn seed_terms(pg: &PgPool) -> anyhow::Result<()> {
         ("动销", "dms_ods 有效订单在统计期内的正品 item_type='1' 去重商品数；必须关联订单头过滤有效状态和 order_time，禁止按默认销售 DWS SKU 去重替代", &["在售", "有销量"]),
         ("成交客户数", "dms_ods.t_sales_order 中下过有效订单的去重客户数 COUNT(DISTINCT customer_code)；默认销售 DWS 不替代订单事件口径", &["下单客户数", "成交客户"]),
         ("复购", "dms_ods.t_sales_order 中同一客户在统计期内有效订单数≥2(COUNT DISTINCT sales_order_code GROUP BY customer_code HAVING>=2)", &["复购客户", "二次购买"]),
-        ("订单客单价", "订单客单价＝订单额÷订单数＝SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0)；不使用默认 Doris DWS 销售额", AVG_ORDER_VALUE_ALIASES),
+        ("订单客单价", "订单客单价＝订单额÷订单数＝ROUND(SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0), 2)；不使用默认 Doris DWS 销售额", AVG_ORDER_VALUE_ALIASES),
     ];
     // 旧术语把订单额写成销售额，保留会与 DWS 默认销售额同时召回。
     sqlx::query("DELETE FROM meta.term WHERE ds_id=$1 AND term='客单价'")

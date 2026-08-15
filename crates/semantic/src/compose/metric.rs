@@ -123,14 +123,15 @@ pub async fn metric_only(pg: &sqlx::PgPool, ds: &str, question: &str, agg_templa
     //    那正是 item_type 那件未裁决的事」。实查 `seed_defs.rs:19-48`：
     //    `order_count` / `buyer_count` / `avg_order_value` 三条声明的
     //    `source_table` 是 `t_sales_order`，`agg_expr` 与 `scope_filter` 与模板逐字相同。
-    //    唯一真差异是**客单价**：模板 `ROUND(…, 2)`，声明不 ROUND（`10222.77` vs `10222.77212139`）。
+    //    ~~唯一真差异是客单价的 ROUND~~ —— **已消（2026-08-15）**：声明补上了 `ROUND(…, 2)`，
+    //    两条路逐字同形。此前生产实测同一句「客单价」两条路给 11317.72 与 11318.33052890。
     //    默认销售额已迁出本模板，由 `sales_fact` 单独负责。
     // ② ~~本函数不出上期查询~~ —— 已消（二·AC：装配器出 KPI 环比，与模板同形）。
     // ③ **伪维度命中**：撤门实测「本月成交客户数」首格从 `1625` 变成一个客户名
     //    （200 行每行 1，route 仍 `direct-agg`、无报错）。二·AS1 已在 `pick_excluding` 里根治，
     //    但那是**装配器这一侧**的修法；门撤掉还要逐题对拍数字才算安全（二·AR）。
-    // ④ **客单价丢 ROUND**：见 ① 末句。撤门前要先把 ROUND 补进声明。
-    // 撤门的前置是③的逐题对拍与④的精度统一。
+    // ④ ~~客单价丢 ROUND~~ —— **已消（2026-08-15，声明补上 ROUND）**。
+    // 撤门的前置现在只剩 ③ 的逐题对拍。
     // 命中结果由调用方传入（`compose_hit` 的让路门对同一问句刚算过同一函数，别重扫一遍）
     if agg_template_hit {
         return MetricOnly::YieldToTemplate;
