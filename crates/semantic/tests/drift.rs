@@ -147,6 +147,10 @@ const ALLOW: &[(&str, &str)] = &[
     ("probe.rs", "where_del"),
     // ops_caliber 的公式构造器只接收本文件私有函数中的硬编码别名/列/聚合片段，
     // 用来避免把同一段23省区CASE和有效记录过滤复制十几次；没有外部输入入口。
+    // stock.rs 的冻结/锁定分支：`col` 与 `label` 都取自本文件里那张 &'static 二元组表
+    // （freeze_quantity / lock_quantity），没有任何外部输入入口。
+    ("stock.rs", "col"),
+    ("stock.rs", "label"),
     ("ops_caliber.rs", "col"),
     ("ops_caliber.rs", "alias"),
     ("ops_caliber.rs", "fallback"),

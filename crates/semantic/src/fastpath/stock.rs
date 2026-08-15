@@ -260,6 +260,27 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
         const ZT_FROM: &str = "ywzt_ods.scm_warehous_manage";
         // 只计正品在库；残损/临期等其余 inventory_status 须点名才计（合同卡同口径）
         const ZT_WHERE: &str = "inventory_status = 'ZP'";
+        // 🔴 冻结/锁定是**同一张表上的另外两列**，不是商品名（2026-08-15 生产直打 + 复验 4/4）：
+        // 「冻结库存量」此前落 need-intent，卡面说「商品限定「冻结」还不能唯一匹配到一个
+        // 库存商品」—— 而 `freeze_quantity`（97.6 万）与 `lock_quantity`（3.3 万）就在这张表上。
+        // 把度量词落进「商品限定」槽位，唯一匹配必然失败。
+        if let Some((col, label)) = [
+            ("freeze_quantity", "冻结库存量", ["冻结"].as_slice()),
+            ("lock_quantity", "锁定库存量", ["锁定", "锁库"].as_slice()),
+        ]
+        .iter()
+        .find_map(|(col, label, words)| {
+            words.iter().any(|w| question.contains(w)).then_some((*col, *label))
+        }) {
+            let mut freeze = hit(
+                format!("SELECT COALESCE(SUM({col}),0) AS `{label}` FROM {ZT_FROM} WHERE {ZT_WHERE}"),
+                "direct-agg",
+            );
+            // 模板自报兑现了哪个指标（与外层出口同一条纪律）
+            freeze.intent_evidence = std::mem::take(&mut freeze.intent_evidence)
+                .resolve(IntentSlotKind::Metric, label);
+            return Some(freeze);
+        }
         // 🔴 仓库分组的判断**排在商品残留守卫之前**（2026-08-15）：
         // 「各仓库库存量」里的「各仓库」会被 `stock_product_fragment` 当成商品名残留，
         // 于是整条被那道守卫拒掉 —— 而它要的正是下面这句 GROUP BY，与商品无关。
@@ -418,6 +439,23 @@ mod warehouse_group_tests {
     /// 🔴 由来（2026-08-15 生产直打 + 复验 3/3）：触发词此前只有排行词
     /// （哪个/最多/最高/排行/top/前N），于是「各仓库库存量」「按仓库看库存量」
     /// 全落 need-intent —— 而它要的正是这条分支已经会写的那句 GROUP BY。
+    /// 冻结/锁定是同一张表上的另外两列，不是商品名。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打 + 复验 4/4）：「冻结库存量」落 need-intent，
+    /// 卡面说「商品限定「冻结」还不能唯一匹配到一个库存商品」——
+    /// 而 `freeze_quantity`（97.6 万）与 `lock_quantity`（3.3 万）就在这张表上。
+    #[test]
+    fn frozen_and_locked_are_columns_not_product_names() {
+        let frozen = stock_snapshot("冻结库存量").expect("冻结库存量该命中");
+        assert!(frozen.sql.contains("SUM(freeze_quantity)"), "{}", frozen.sql);
+        assert!(frozen.sql.contains("`冻结库存量`"), "{}", frozen.sql);
+        let locked = stock_snapshot("锁定库存量是多少").expect("锁定库存量该命中");
+        assert!(locked.sql.contains("SUM(lock_quantity)"), "{}", locked.sql);
+        // 通用总量照旧走在库数量，不许被这条带偏
+        let total = stock_snapshot("现在库存量是多少").expect("总量照旧");
+        assert!(total.sql.contains("SUM(in_stock_quantity)"), "{}", total.sql);
+    }
+
     #[test]
     fn grouping_by_warehouse_is_a_grouping_ask_not_only_a_ranking_one() {
         for q in ["各仓库库存量", "按仓库看库存量", "每个仓库的库存量", "分仓库库存量"] {
