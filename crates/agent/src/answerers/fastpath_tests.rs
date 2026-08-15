@@ -3378,3 +3378,24 @@ pub fn ");
 }
 
 
+
+/// 已识别的时间表面词天然是被消化的；没兑现的限定照旧要被抓住。
+///
+/// 🔴 由来（2026-08-15 生产直打）：「上个季度销售额」落
+/// 「不可计算 · 未能识别的限定「上」」—— 残留守卫从不剥时间词，
+/// 靠的是虚词表里恰好有「本」「今」；「上」不在表里，一个孤字把整条问句拒掉。
+#[test]
+fn a_recognized_time_phrase_is_consumed_but_a_real_qualifier_is_not() {
+    for q in ["上个季度销售额", "本季度销售额", "上个月销售额", "上周销售额", "去年销售额"] {
+        assert_eq!(
+            crate::answerers::fastpath_intent::unrecognized_residue(q),
+            "",
+            "{q} 的时间词该被当成已消化"
+        );
+    }
+    // 没兑现的限定一个都不许被顺手吞掉（那是静默丢限定）
+    assert_eq!(
+        crate::answerers::fastpath_intent::unrecognized_residue("长沙本月销售额"),
+        "长沙"
+    );
+}

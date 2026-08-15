@@ -70,6 +70,18 @@ pub fn sales_fact_consumed(
     // 与 `has_entity_residue` 手工补的那颗对齐 —— 否则「本月销售额最低的客户」残留「最低」，
     // 落「未确认限定」卡，而下面的 ASC 排序分支本来就为它写着。
     consumed.push("最低".to_string());
+    // 🔴 已识别的时间表面词天然是被消化的：模板会把它编译进时间窗。
+    //
+    // 由来（2026-08-15 生产直打）：「上个季度销售额」落「不可计算 · 未能识别的限定「上」」——
+    // 残留守卫从不剥时间词，靠的是虚词表里恰好有「本」「今」；「上」不在表里，
+    // 于是一个孤字把整条问句拒掉。谓词认得、时间表面词也认得，只有这里不认。
+    //
+    // 只能用**词级**的 `time_phrase_of`：`intent_time_surface` 带整句兜底
+    //（`time_predicate(question).map(|_| question.to_string())`），拿它当消化词会把
+    // 「长沙」这类没兑现的限定一起吞掉 —— 那正是静默丢限定。
+    if let Some(phrase) = dms_kernel::nl::time::time_phrase_of(question) {
+        consumed.push(phrase.to_string());
+    }
     if let Some(binding) = customer {
         consumed.push(binding.surface.clone());
     }
