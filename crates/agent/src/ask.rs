@@ -1812,7 +1812,7 @@ async fn dimension_value_hit(cx: &AskCtx<'_>) -> Option<DirectHit> {
                 "过滤值命中维度成员值 → 走维度过滤（不再错配客户名）"
             );
             let metrics: Vec<_> = hits.iter().map(|(m, _)| *m).collect();
-            return build_dimension_value_hit(cx.question, dim, &member, &metrics);
+            return build_dimension_value_hit(cx.question, dim, &member, &word, &metrics);
         }
     }
     None
@@ -1977,6 +1977,11 @@ fn build_dimension_value_hit(
     question: &str,
     dim: dms_semantic::sales_fact::Dimension,
     member: &str,
+    // 用户原话里的那个残留词。与 `member` **常常不同形**：探针按
+    // `dimension_probe_values` 合成候选（City 会补「市」、WarZone 会补「战区」），
+    // 命中的是**库里的存储值**；而合同里的表面词必须逐字出自问句（intent.rs 强制），
+    // 于是「郑州」与「郑州市」永远对不上 —— 证据只登记 member 时 proves 恒假。
+    word: &str,
     metrics: &[dms_semantic::sales_fact::Metric],
 ) -> Option<DirectHit> {
     use dms_semantic::sales_fact::{self, Predicate, QueryOptions};
@@ -2053,6 +2058,28 @@ fn build_dimension_value_hit(
     // 代价面：合同里若另有一个同值、不同列的筛选（「客户类型=直营」），会被这条一并算证明。
     // 那一族极罕见，且今天的行为是「凡是认不出名字的筛选一律 review」，本就把真问题淹了。
     intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Filter, member);
+    // 🔴 **用户原话那个词也要登记一次**（2026-08-17 审计逮到）。
+    //
+    // `member` 是探针探到的**库里存储值**，而合同里的表面词必须逐字出自问句
+    // （`intent.rs` 的 grounding 强制）。两者天然不同形 —— `dimension_probe_values`
+    // 存在的唯一理由就是「用户说裸词、库里存带后缀值」（City 补「市」、WarZone 补「战区」）。
+    // 而 `ExecutionEvidence::proves` 是**精确等值**（`direct_types.rs`），
+    // 于是「郑州本月销售额」探中了、SQL 建对了、数也算对了，
+    // 却因为证据登记的是「郑州市」而合同写的是「郑州」，判 `region:郑州` 未认领 → 硬拦 → 回落自由 SQL。
+    //
+    // 一处收口：`word` 与 `member` 各登记一次，九个 `PROBE_DIMS` 全覆盖，
+    // Region 与 Entity 两支同时治。语义上完全成立 —— 「这个表面词已兑现进 SQL」
+    // 对 `word` 是字面真的（`Predicate::eq(dim, member)` 就是因它而建）。
+    // 不动 `proves` 的精确语义（那会让「烤肠」证明「小虎黑椒味烤肠500G」，是 fail-open）。
+    if !word.trim().is_empty() && word != member {
+        for kind in [
+            crate::intent::IntentSlotKind::Region,
+            crate::intent::IntentSlotKind::Entity,
+            crate::intent::IntentSlotKind::Filter,
+        ] {
+            intent_evidence = intent_evidence.resolve(kind, word.to_string());
+        }
+    }
     if let Some(surface) = dms_semantic::fastpath::intent_time_surface(question) {
         intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Time, surface);
     }
@@ -2125,6 +2152,7 @@ mod dimension_hit_evidence_tests {
             "本月销售额",
             Dimension::Region,
             "",
+            "",
             &[dms_semantic::sales_fact::Metric::SalesAmount],
         )
         .is_none());
@@ -2142,6 +2170,7 @@ mod dimension_hit_evidence_tests {
         let hit = super::build_dimension_value_hit(
             "本月西北大区销售额",
             Dimension::Region,
+            "西北大区",
             "西北大区",
             &[Metric::SalesAmount],
         )
@@ -2162,6 +2191,7 @@ mod dimension_hit_evidence_tests {
         let category = super::build_dimension_value_hit(
             "本月烤肠系列销售额",
             Dimension::Category,
+            "烤肠系列",
             "烤肠系列",
             &[Metric::SalesAmount],
         )
@@ -2456,6 +2486,45 @@ fn looks_like_sql(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 探针探到的是**库里的存储值**，而合同里的表面词是**用户原话** —— 两者天然不同形
+    /// （`dimension_probe_values` 存在的唯一理由就是这个：City 补「市」、WarZone 补「战区」）。
+    /// 证据只登记存储值时 `proves` 恒假（它是精确等值），于是「郑州本月销售额」
+    /// 探中了、SQL 建对了、数也算对了，却判 `region:郑州` 未认领 → 硬拦 → 回落自由 SQL。
+    /// 2026-08-17 审计逮到，收口在 `build_dimension_value_hit`：两个词各登记一次。
+    #[test]
+    fn the_users_own_word_is_registered_as_evidence_not_just_the_stored_member() {
+        use crate::intent::IntentSlotKind;
+        use dms_semantic::sales_fact::{Dimension, Metric};
+        let hit = super::build_dimension_value_hit(
+            "郑州本月销售额",
+            Dimension::City,
+            "郑州市", // 库里的存储值
+            "郑州",   // 用户原话
+            &[Metric::SalesAmount],
+        )
+        .expect("该命中");
+        assert!(
+            hit.intent_evidence.proves(IntentSlotKind::Region, "郑州"),
+            "用户原话没登记 ⇒ 合同里的 region:郑州 永远证不出来 ⇒ 硬拦"
+        );
+        assert!(
+            hit.intent_evidence.proves(IntentSlotKind::Region, "郑州市"),
+            "存储值那一份不许丢（模型有时确实写全称）"
+        );
+        // 实体侧同治：模型把地名归进 entity_mentions 时走的是 Entity 那一档
+        assert!(hit.intent_evidence.proves(IntentSlotKind::Entity, "郑州"));
+        // 两者同形时不重复登记，也不该出问题
+        let same = super::build_dimension_value_hit(
+            "本月西北大区销售额",
+            Dimension::Region,
+            "西北大区",
+            "西北大区",
+            &[Metric::SalesAmount],
+        )
+        .expect("该命中");
+        assert!(same.intent_evidence.proves(IntentSlotKind::Region, "西北大区"));
+    }
     use super::*;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3400,7 +3469,7 @@ mod tests {
     #[test]
     fn dimension_value_hit_builds_the_contract_answer() {
         use dms_semantic::sales_fact::{Dimension, Metric};
-        let hit = build_dimension_value_hit("直营上月销售额", Dimension::WarZone, "直营", &[Metric::SalesAmount])
+        let hit = build_dimension_value_hit("直营上月销售额", Dimension::WarZone, "直营", "直营", &[Metric::SalesAmount])
             .expect("标量装配必须成立");
         assert!(hit.sql.contains("FROM sales_dw.dws_off_offline_sale_dfn sf"), "{}", hit.sql);
         assert!(hit.sql.contains("sf.war_zone") && hit.sql.contains("= '直营'"), "谓词必须落在战区列：{}", hit.sql);
@@ -3415,12 +3484,13 @@ mod tests {
             "直营上月销售额和毛利",
             Dimension::WarZone,
             "直营",
+            "直营",
             &[Metric::SalesAmount, Metric::GrossProfit],
         )
         .unwrap();
         assert!(multi.prev.is_none() && multi.detail.is_none() && multi.sales_context.is_none());
         // 反向（防恒真）：空指标集不许装出答案
-        assert!(build_dimension_value_hit("直营上月销售额", Dimension::WarZone, "直营", &[]).is_none());
+        assert!(build_dimension_value_hit("直营上月销售额", Dimension::WarZone, "直营", "直营", &[]).is_none());
     }
 
     /// 【问题 2】接线判据：router 的 direct-doc 成员被优先门包住、表标签不变；
