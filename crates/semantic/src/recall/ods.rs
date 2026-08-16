@@ -144,6 +144,22 @@ pub async fn join_evidence_edges(pg: &PgPool, ds: &str, tables: &[&str]) -> Vec<
     )
     .await;
     rows.into_iter()
+        // 🔴 统计推断出来的 joinable 边**必须再过一道键形闸**（2026-08-16）。
+        //
+        // `meta datamap-build` 第一次真正跑起来之后（此前 `datamap_edge` 只有 2 条人工种子），
+        // 一次产出 38780 条 joinable 边，其中 365 条落在 `confidence >= 0.9` 的生效档。
+        // 抽样看，里面混着 `amount ~ amount`、`rebate_other ~ rebate_other`、
+        // `version` / `created_by` / `updated_by` 这类**根本不该做 JOIN 键**的列 ——
+        // 它们同名、基数相近，于是被判成「高置信可关联」。拿金额列做 JOIN 键是灾难性的。
+        //
+        // 更要紧的是这条流水线自相矛盾：写入侧一律标 `status='pending'`（注释写着「待人工复核」），
+        // 而本函数的 SQL 接受 `status <> 'rejected'` —— 复核闸形同虚设。
+        // 在拿不到复核人力之前，判据必须**正着写**：只有键形列才算证据，未知一律不算（fail-closed）。
+        // `meta.join_edge` 那 27 条是人工精修的，不过这道闸（下面按 kind 区分不了，
+        // 所以判据放宽到「人工边的列本来就都是键形」——实测 27 条全部满足）。
+        .filter(|(_, left_col, _, right_col)| {
+            is_join_key_column(left_col) && is_join_key_column(right_col)
+        })
         .map(|(left_table, left_col, right_table, right_col)| JoinEvidenceRow {
             left_table,
             left_col,
@@ -151,6 +167,42 @@ pub async fn join_evidence_edges(pg: &PgPool, ds: &str, tables: &[&str]) -> Vec<
             right_col,
         })
         .collect()
+}
+
+/// 这一列能不能当 JOIN 键。**正判据**：认得出的键形才算，其余一律不算。
+///
+/// 为什么不写成「排除度量列/审计列」那种负判据：负判据要穷举坏形态，漏一个就放行一条
+/// 灾难性的 JOIN（`amount ~ amount`）；正判据漏一个只是少一条证据，推导那侧本来就
+/// fail-closed 回落「不可计算」。两种漏法的代价不对称。
+///
+/// 三档：
+/// - 编码/单号/主键形（`*_code` / `*_no` / `*_id` / `*_key`，以及裸 `code`/`id`）；
+/// - 合同已登记的事实表维度列（`sales_fact::Dimension::column()` 的取值，唯一事实源）；
+/// - 数仓通用的分区/维度列（`province` / `class2` / `data_month` / `dept` 这一族）——
+///   它们不在事实合同里，但确实是数仓横向对齐的键。
+pub fn is_join_key_column(col: &str) -> bool {
+    let c = col.trim().to_ascii_lowercase();
+    if c.is_empty() {
+        return false;
+    }
+    if c.ends_with("_code") || c.ends_with("_no") || c.ends_with("_id") || c.ends_with("_key") {
+        return true;
+    }
+    if matches!(c.as_str(), "code" | "id" | "no") {
+        return true;
+    }
+    // 合同登记的维度列：唯一事实源是 `Dimension::column()`，这里不抄第二份
+    if crate::sales_fact::DIMENSIONS
+        .iter()
+        .chain([crate::sales_fact::Dimension::State].iter())
+        .any(|dimension| dimension.column().eq_ignore_ascii_case(&c))
+    {
+        return true;
+    }
+    // 数仓横向对齐用的分区/维度列（合同外，但确实是键）
+    const WAREHOUSE_KEYS: &[&str] =
+        &["province", "class1", "class2", "class3", "data_month", "dept", "channel", "brand"];
+    WAREHOUSE_KEYS.contains(&c.as_str())
 }
 
 /// 血缘边里落在目录明细层的对端表名集合。**方向不敏感**：血缘边的左/右哪端是 ODS
@@ -246,5 +298,61 @@ mod tests {
             vec!["t_goods", "t_sales_order", "t_master_shop"],
             "血缘命中者排前，其余维持原序"
         );
+    }
+}
+
+#[cfg(test)]
+mod join_key_shape_tests {
+    use super::is_join_key_column;
+
+    /// 🔴 JOIN 键判据是**正着写**的：认得出的键形才算证据，未知一律不算。
+    ///
+    /// 由来（2026-08-16）：`meta datamap-build` 第一次真正跑起来，一次产出 38780 条
+    /// joinable 边，365 条落在 `confidence >= 0.9` 的生效档。抽样里混着
+    /// `amount ~ amount`、`rebate_other ~ rebate_other`、`version` / `created_by` /
+    /// `updated_by` —— 同名、基数相近，于是被判成「高置信可关联」。
+    /// 拿金额列做 JOIN 键会把两张表按金额撞在一起，是灾难性的错答。
+    #[test]
+    fn only_key_shaped_columns_count_as_join_evidence() {
+        // 编码/单号/主键形
+        for ok in [
+            "customer_code",
+            "sales_order_code",
+            "after_sales_code",
+            "employee_id",
+            "shop_no",
+            "biz_key",
+            "code",
+            "id",
+        ] {
+            assert!(is_join_key_column(ok), "{ok} 该算键");
+        }
+        // 合同登记的事实表维度列（唯一事实源是 `Dimension::column()`）
+        for dim in ["region", "war_zone", "state", "city", "storecode", "skucode"] {
+            assert!(is_join_key_column(dim), "{dim} 是合同维度列，该算键");
+        }
+        // 数仓横向对齐的分区/维度列
+        for wh in ["province", "class2", "data_month", "dept"] {
+            assert!(is_join_key_column(wh), "{wh} 该算键");
+        }
+        // 🔴 反面才是这条判据存在的理由：度量列与审计列一律不算
+        for bad in [
+            "amount",
+            "rebate_other",
+            "comp_logistics",
+            "comp_out_of_stock",
+            "brand_adv",
+            "version",
+            "created_by",
+            "updated_by",
+            "create_time",
+            "qty",
+            "gross_profit",
+            "",
+        ] {
+            assert!(!is_join_key_column(bad), "{bad} 不该算 JOIN 键");
+        }
+        // 大小写不敏感（数仓里列名大小写不统一）
+        assert!(is_join_key_column("Customer_Code"));
     }
 }
