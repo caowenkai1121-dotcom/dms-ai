@@ -308,7 +308,15 @@ pub fn decide(
     // 这条判据此前修过四次，每次都在回答「**哪一类**槽位不该算」（根级时间、
     // 子任务时间、hybrid 豁免…），从没人问「**未经证实的**槽位凭什么有否决权」。
     // 现在否决要**双条件**：有可度量槽位，**且**合同真的认领了那个文档名词。
-    if sig.noun && !(has_measurable_slots(attempt) && doc_noun_claimed(attempt)) {
+    // 🔴 第三条判据是**确定性指标匹配器**（复核逮到的回归面）：
+    // 「标准价销售额」的「标准」是文档名词，而 `metrics=["销售额"]` 剥完仍留「标准价」——
+    // 只按「认领」判会把它抢去知识库，而它今天是对的问数。
+    // `warehouse_sales_metrics` 是纯函数、与合同同一份词表：**注册表认得的指标**在场，
+    // 就不是资料诉求，无论模型把表面词写成什么。
+    let registry_metric = !dms_semantic::fastpath::warehouse_sales_metrics(question).is_empty();
+    if sig.noun
+        && !(has_measurable_slots(attempt) && (registry_metric || doc_noun_claimed(question, attempt)))
+    {
         return plan(R::Knowledge, Deliverable::Answer, true, "doc-topic");
     }
     // R3：确定性信号没意见时，听合同的。
@@ -362,54 +370,77 @@ fn has_measurable_slots(attempt: &crate::intent::IntentAttempt) -> bool {
     })
 }
 
-/// 合同有没有**认领**那个文档名词。判据只有一句：某个槽位的表面词自己就带着文档名词。
+/// 触发 R2 的那个**文档名词**有没有被认领。
 ///
-/// - 「本月**合同**金额多少」→ `metrics=["合同金额"]`，「合同」是限定词不是资料诉求 → 认领成立，
-///   否决有效，照旧走问数；
-/// - 「客户退出申请**流程**」→ `metrics=["退出申请"]`、`breakdowns=["客户"]`，
-///   「流程」谁都没提 —— 模型压根没解释问句里的这个词，否决不成立，R2 接走。
+/// 判据是「剥掉合同声称兑现的全部表面词之后，问句里还剩不剩一个文档名词」——
+/// 与 `residual_text` / `sales_fact_consumed` 那一族同一条纪律（本仓的残留守卫原语），
+/// 不是「某个槽位里含某个文档名词」。
 ///
-/// 🔴 扫描面刻意只收**执行槽位**与 knowledge 子任务的 `surface`：
-/// - data 子任务的 `surface`/`goals` 是自由叙述，可以整句吞掉问句（连「流程」一起），
-///   拿它当认领证据就是把这条判据当场作废；
-/// - knowledge 子任务的 `surface` 必须收 —— 真混合问句「查最近的设备订单，并且最近的
-///   线下设备政策」里的「政策」正是被资料半认领的，不收它会把 Hybrid 压成单路、丢掉数据半。
+/// 🔴 两种写法差在哪（复核逮到的洞，2026-08-16）：
+/// 「本月**合同金额**的审批**流程**是什么」的 `metrics=["合同金额"]` 自带一个「合同」，
+/// 「某槽位含某文档名词」当场成立 → 否决有效 → 判 Data，而用户问的是「审批流程」。
+/// 剥法不会：剥掉「合同金额」「本月」之后残留「的审批流程是什么」，「流程」还在 → 未认领。
 ///
-/// 词表仍是 `nl::doc` 那唯一一份：这里只是**再问它一次**，不新造第二份判据。
-fn doc_noun_claimed(attempt: &crate::intent::IntentAttempt) -> bool {
-    let claimed = |surface: &str| dms_kernel::nl::doc::signals(surface).noun;
-    attempt.ready().is_some_and(|intent| {
-        let slots_claim = |metrics: &[String],
-                           breakdowns: &[String],
-                           comparisons: &[String],
-                           filters: &[crate::intent::FilterSlot],
-                           entities: &[crate::intent::EntityMention]| {
-            metrics.iter().any(|m| claimed(m))
-                || breakdowns.iter().any(|b| claimed(b))
-                || comparisons.iter().any(|c| claimed(c))
-                || filters.iter().any(|f| claimed(&f.value_surface) || claimed(&f.name))
-                || entities.iter().any(|e| claimed(&e.surface))
-        };
-        slots_claim(
-            &intent.metrics,
-            &intent.breakdowns,
-            &intent.comparisons,
-            &intent.filters,
-            &intent.entity_mentions,
-        ) || intent.subgoals.iter().any(|goal| {
-            (goal.mode == crate::intent::IntentMode::Knowledge && claimed(&goal.surface))
-                || slots_claim(
-                    &goal.metrics,
-                    &goal.breakdowns,
-                    &goal.comparisons,
-                    &goal.filters,
-                    &goal.entity_mentions,
-                )
-        })
-    })
+/// 扫描面只收**执行槽位**与 knowledge 子任务的 `surface`：data 子任务的
+/// `surface`/`goals` 是自由叙述，能整句吞掉问句（连「流程」一起剥光），
+/// 拿它当认领证据就是把这条判据当场作废。
+fn doc_noun_claimed(question: &str, attempt: &crate::intent::IntentAttempt) -> bool {
+    let Some(intent) = attempt.ready() else {
+        return false;
+    };
+    let mut consumed: Vec<String> = Vec::new();
+    let mut collect = |metrics: &[String],
+                       breakdowns: &[String],
+                       comparisons: &[String],
+                       regions: &[String],
+                       filters: &[crate::intent::FilterSlot],
+                       entities: &[crate::intent::EntityMention],
+                       time: Option<&crate::intent::TimeSlot>,
+                       out: &mut Vec<String>| {
+        out.extend(metrics.iter().cloned());
+        out.extend(breakdowns.iter().cloned());
+        out.extend(comparisons.iter().cloned());
+        out.extend(regions.iter().cloned());
+        out.extend(filters.iter().flat_map(|f| [f.name.clone(), f.value_surface.clone()]));
+        out.extend(entities.iter().map(|e| e.surface.clone()));
+        out.extend(time.map(|t| t.surface.clone()));
+    };
+    collect(
+        &intent.metrics,
+        &intent.breakdowns,
+        &intent.comparisons,
+        &intent.regions,
+        &intent.filters,
+        &intent.entity_mentions,
+        intent.time.as_ref(),
+        &mut consumed,
+    );
+    for goal in &intent.subgoals {
+        if goal.mode == crate::intent::IntentMode::Knowledge {
+            consumed.push(goal.surface.clone());
+        }
+        collect(
+            &goal.metrics,
+            &goal.breakdowns,
+            &goal.comparisons,
+            &goal.regions,
+            &goal.filters,
+            &goal.entity_mentions,
+            goal.time.as_ref(),
+            &mut consumed,
+        );
+    }
+    consumed.retain(|word| !word.trim().is_empty());
+    // 长词优先（与 kernel `has_residue_with` 同一剥法）：「合同金额」必须先于「合同」
+    consumed.sort_by_key(|word| std::cmp::Reverse(word.chars().count()));
+    let mut residue = question.to_string();
+    for word in &consumed {
+        residue = residue.replace(word.as_str(), "");
+    }
+    !dms_kernel::nl::doc::signals(&residue).noun
 }
 
-/// 测试用的最小 `AskResult`（空取数、空视图）。与 `prepared_for_test` 同一个理由放在
+/// 测试用的最小 `AskResult`（空取数、空视图）。与 `prepared_for_test` 同一个理由放在/// 测试用的最小 `AskResult`（空取数、空视图）。与 `prepared_for_test` 同一个理由放在
 /// 生产代码里：测试段里的项只对本模块可见，而用它的测试在 `compound` 模块。
 #[doc(hidden)]
 pub fn prepared_for_test_result() -> AskResult {
@@ -3841,7 +3872,7 @@ mod tests {
         );
         assert!(fabricated.is_ready(), "前提：这种合同今天确实能过 grounding");
         assert!(has_measurable_slots(&fabricated), "前提：旧判据会被它否决");
-        assert!(!doc_noun_claimed(&fabricated), "没有任何槽位提到「流程」");
+        assert!(!doc_noun_claimed(q, &fabricated), "剥掉两个槽位表面词后「流程」还在 = 没人认领");
         let plan = decide(q, &fabricated, None);
         assert_eq!(plan.route, IntentRoute::Knowledge, "{plan:?}");
         assert_eq!(plan.reason, "doc-topic");
@@ -3856,10 +3887,44 @@ mod tests {
             },
             "本月合同金额是多少",
         );
-        assert!(doc_noun_claimed(&contract_amount));
+        assert!(doc_noun_claimed("本月合同金额是多少", &contract_amount));
         assert_eq!(
             decide("本月合同金额是多少", &contract_amount, None).route,
             IntentRoute::Data
+        );
+
+        // 🔴 复核逮到的洞：「某槽位含某文档名词」不等于「**那个**文档名词被认领」。
+        // 「本月合同金额的审批流程是什么」的 metrics=["合同金额"] 自带一个「合同」，
+        // 旧写法当场成立 → 判 Data，而用户问的是「审批流程」。
+        let approval_q = "本月合同金额的审批流程是什么";
+        let approval = IntentAttempt::validated(
+            IntentV1 {
+                mode: IntentMode::Data,
+                metrics: vec!["合同金额".into()],
+                ..Default::default()
+            },
+            approval_q,
+        );
+        assert!(!doc_noun_claimed(approval_q, &approval), "剥完仍留「流程」= 没人认领");
+        assert_eq!(decide(approval_q, &approval, None).reason, "doc-topic");
+
+        // 🔴 反面②（复核逮到的回归面）：注册表认得的指标在场就不是资料诉求。
+        // 「标准价销售额」的「标准」是文档名词，剥掉 metrics=["销售额"] 后仍留「标准价」——
+        // 只按「认领」判会把一道今天正确的问数题抢去知识库。
+        let standard_q = "本月标准价销售额";
+        let standard = IntentAttempt::validated(
+            IntentV1 {
+                mode: IntentMode::Data,
+                metrics: vec!["销售额".into()],
+                ..Default::default()
+            },
+            standard_q,
+        );
+        assert!(!doc_noun_claimed(standard_q, &standard), "「标准」确实没人认领");
+        assert_eq!(
+            decide(standard_q, &standard, None).route,
+            IntentRoute::Data,
+            "注册表认得「销售额」，不许被抢去知识库"
         );
 
         // 反面②：真混合问句不许被压成单路 —— 资料半的 surface 认领了「政策」
@@ -3890,7 +3955,7 @@ mod tests {
             mixed_q,
         );
         assert!(mixed.is_ready(), "前提：混合合同能过 grounding");
-        assert!(doc_noun_claimed(&mixed), "资料子任务的 surface 认领了「政策」");
+        assert!(doc_noun_claimed(mixed_q, &mixed), "资料子任务的 surface 剥掉了「政策」");
         assert_ne!(decide(mixed_q, &mixed, None).reason, "doc-topic", "混合问句被压成单路了");
     }
 
