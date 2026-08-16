@@ -4666,9 +4666,9 @@ async fn compose_inner(
         None => prepared,
     };
     let route = prepared.question.route();
-    if route == dms_agent::intent::IntentRoute::Data
-        && !prepared.question.intent_attempt.is_data_executable()
-    {
+    // 判据收在 agent 一处（`PreparedQuestion::needs_clarification`）：此前这里是
+    // `route == Data && !is_data_executable()`，缺确定性豁免 —— 裸单号在深度模式同样吃反问卡。
+    if prepared.question.needs_clarification() {
         let result = serde_json::to_value(prepared.question.clarification_result())
             .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
         if let Some(cid) = req.conv_id {

@@ -149,6 +149,29 @@ impl PreparedQuestion {
         self.plan().route
     }
 
+    /// 本轮该不该**直接**出澄清卡（不进 Router）。★ 唯一判据 —— HTTP / 流式 / 深度
+    /// 三个入口都调它，不许在 server 侧再演化出第二种写法（守卫见 `only_one_contract_gate`）。
+    ///
+    /// 🔴 三个判据来自两个时代，`&&` 的顺序就是纪律：
+    /// ① `plan.route` 是**新裁决**（`decide`）；② `plan.deterministic` 是「这条路由问句
+    /// 词法定，与本次 LLM 采样无关」；③ `is_data_executable()` 是**旧合同**视角。
+    ///
+    /// 漏掉 ② 就是让确定性车道被自己判出来的 `Data` 反噬：裸单号
+    /// `HJXH-DSO2026081500390` 的合同必然作废（模型对一个裸号正确地答 `mode=unknown`），
+    /// 而它恰恰是**全系统最不含糊的问数信号**（R1.5 `code-lookup`）。
+    /// 2026-08-16 业主实测：web 上吃「先问清再查 · 尚未确定应使用问数还是知识检索」，
+    /// CLI 同一句出 18 行单据明细 —— 差别就是这一条豁免。判官走 CLI，
+    /// 结构上看不见 HTTP 那三份闸，所以这一族「改过多次还回潮」。
+    ///
+    /// fail-closed 一个字没松：自由 SQL 的真闸是 `LlmAnswerer::accept == is_data_executable()`，
+    /// 与 route 判成什么无关；确定性成员（实体卡 / 单据点查 / business-lookup）本就该接。
+    pub fn needs_clarification(&self) -> bool {
+        let plan = self.plan();
+        plan.route == crate::intent::IntentRoute::Data
+            && !plan.deterministic
+            && !self.intent_attempt.is_data_executable()
+    }
+
     pub fn routed_questions(&self) -> Vec<crate::intent::RoutedQuestion> {
         self.intent_attempt
             .routed_questions(&self.effective_question)
@@ -3675,6 +3698,52 @@ mod tests {
         // 「单号」这个**词**不算：口径问句不许被判成点查
         let q = "账余记录单号是什么意思";
         assert_ne!(decide(q, &crate::intent::IntentAttempt::Unavailable, None).reason, "code-lookup");
+    }
+
+    /// 🔴 裸单号的合同必然作废（一个裸号抽不出任何槽位），但它**不许出澄清卡**。
+    ///
+    /// 生产实测（2026-08-16 业主截图）：`HJXH-DSO2026081500390` 在 web 上吃
+    /// 「先问清再查 · 尚未确定应使用问数还是知识检索」，同一句走 CLI 出 18 行单据明细。
+    /// 差别是 HTTP 那条路上的合同闸写的是 `route == Data && !is_data_executable()`，
+    /// 缺了确定性车道的豁免 —— 而 R1.5 判的正是 `Data` + `deterministic`。
+    /// 判官走 CLI，结构上看不见那三道闸，所以这一族反复回潮。
+    #[test]
+    fn a_bare_document_code_never_gets_a_clarification_card() {
+        let prep = |q: &str, attempt: crate::intent::IntentAttempt| PreparedQuestion {
+            original_question: q.into(),
+            effective_question: q.into(),
+            intent_attempt: attempt,
+            started_at: Instant::now(),
+        };
+        for q in ["HJXH-DSO2026081500390", "HJXH-DXO2026081300138", "CZ202608131914"] {
+            for attempt in
+                [crate::intent::IntentAttempt::Invalid, crate::intent::IntentAttempt::Unavailable]
+            {
+                assert!(
+                    !prep(q, attempt).needs_clarification(),
+                    "「{q}」又被合同闸拦在 Router 之前了"
+                );
+            }
+        }
+        // 反面（防恒假）：合同说 Data、却自报歧义 → 不可执行且非确定性车道，照旧出卡。
+        // 这一档才是这道闸原本要拦的东西（自由 SQL 的前置闸），一个字都不许松。
+        let plain = "本月销售额是多少";
+        let ambiguous = crate::intent::IntentV1 {
+            mode: crate::intent::IntentMode::Data,
+            metrics: vec!["销售额".into()],
+            ambiguities: vec!["未指定商品范围".into()],
+            ..Default::default()
+        };
+        let attempt = crate::intent::IntentAttempt::validated(ambiguous, plain);
+        assert_eq!(decide(plain, &attempt, None).route, crate::intent::IntentRoute::Data);
+        assert!(!decide(plain, &attempt, None).deterministic);
+        assert!(
+            prep(plain, attempt).needs_clarification(),
+            "带歧义的 Data 合同被放行了 —— 自由 SQL 的前置闸松了"
+        );
+        // Knowledge 那条路本来就不过这道闸（判据只管 Data 半）
+        let doc = "把 押金转货款申请书 发我";
+        assert!(!prep(doc, crate::intent::IntentAttempt::Invalid).needs_clarification());
     }
 
     /// R2：资料/政策问句不再吃澄清卡；带指标的问句一条都不许被抢走。
