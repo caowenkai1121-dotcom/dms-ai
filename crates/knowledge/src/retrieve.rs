@@ -510,15 +510,28 @@ pub async fn search_report(
     );
     let related = related?;
     lists.push(related.iter().map(|r| r.chunk_id).collect());
-    lists.push(kg);
+    // 🔴 图谱是加分项，不是承重路（2026-08-16）：一条正文直接命中都没有时，
+    // 它的 PPR top-10 就是无锚噪声 —— `kg_top_chunks` 没有任何相关度下限，
+    // 只按图上的邻近度取前 K。与上面关系路的锚**逐字同一条**。
+    //
+    // 由来：纯数据问句下面挂一段「知识库里没有关于…」外加一篇无关手册。
+    // 五条正文路（向量/全文/标题/元数据/词级）全空 ⇒ 按定义没有任何正文证据，
+    // 而这两路仍往 `ids` 里塞候选，于是零命中早退（本函数下方那条不变量）走不到。
+    lists.push(if direct_ids.is_empty() { Vec::new() } else { kg });
     // 第 8 路（Yuxi B9）：远程文本块没有本地 chunk 行，合成**负 id** 进 RRF
     // （本地 chunk_id 是 bigserial 恒正，负数永不撞；id 序即路内名次）。
     // 记录留在旁表 `ext_kb_map`，加载阶段按它构造只读 Hit。
-    let ext_kb_map: Vec<(i64, ExtKbRecord)> = ext_kb
-        .into_iter()
-        .enumerate()
-        .map(|(i, record)| (ext_kb_synthetic_id(i), record))
-        .collect();
+    // 同上：合成负 id 永远进不了任何正文路，结构上不受直接命中约束 ——
+    // 没有正文锚时这一路等于「拿远程库的 top-k 当答案」，正是本次要治的噪声源。
+    let ext_kb_map: Vec<(i64, ExtKbRecord)> = if direct_ids.is_empty() {
+        Vec::new()
+    } else {
+        ext_kb
+            .into_iter()
+            .enumerate()
+            .map(|(i, record)| (ext_kb_synthetic_id(i), record))
+            .collect()
+    };
     lists.push(ext_kb_map.iter().map(|(id, _)| *id).collect());
     // 第 9 路词级召回：槽位**钉死在末尾**（前八槽的通道名被既有测试逐字钉住）。
     lists.push(terms);
@@ -1905,6 +1918,43 @@ fn opposite_version_sections(left: &Hit, right: &Hit) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 图谱路与外部 KB 路必须与关系路共用同一条锚：**没有正文直接命中就不出候选**。
+    ///
+    /// 由来（2026-08-16）：纯数据问句下面挂一段「知识库里没有关于…」外加一篇无关手册。
+    /// 五条正文路（向量/全文/标题/元数据/词级）全空 ⇒ 按定义没有任何正文证据，
+    /// 而这两路仍往 `ids` 里塞候选 —— `kg_top_chunks` 没有相关度下限（只按图上邻近度取前 K），
+    /// 外部 KB 用的是合成负 id、结构上进不了任何正文路。于是本函数下方那条
+    /// 「零命中早退」的不变量在注释里写着、实际却是假的，top-k 无关文档照样进 prompt。
+    ///
+    /// 这里只能扫源码：`search_report` 要 PgPool + 向量服务，单测跑不起来。
+    /// 判据钉的是三路锚**逐字同形**，谁把其中一条改回无条件 push 就当场红。
+    #[test]
+    fn kg_and_ext_kb_routes_need_a_body_anchor() {
+        let src = include_str!("retrieve.rs");
+        let body = src
+            .split("async fn search_report")
+            .nth(1)
+            .expect("search_report 没了");
+        assert!(
+            body.contains("lists.push(if direct_ids.is_empty() { Vec::new() } else { kg });"),
+            "图谱路丢了正文锚 —— 无锚 PPR top-10 就是噪声"
+        );
+        assert!(
+            body.contains("let ext_kb_map: Vec<(i64, ExtKbRecord)> = if direct_ids.is_empty() {"),
+            "外部 KB 路丢了正文锚 —— 合成负 id 结构上不受直接命中约束"
+        );
+        // 关系路那条锚是这两条的原型，一起钉住（它先在，别被顺手改掉）
+        assert!(
+            body.contains("if direct_ids.is_empty() {
+                Ok(Vec::new())"),
+            "关系路的锚是这两条的原型"
+        );
+        // 五道已标定的相关度下限一个都没碰：本次是结构闸，不是数值闸
+        for gate in ["VEC_MAX_DIST", "TRGM_MIN", "TITLE_MIN", "METADATA_MIN", "TERMS_MIN_HITS"] {
+            assert!(src.contains(gate), "{gate} 不该在这一刀里消失");
+        }
+    }
     use super::*;
 
     fn hit(chunk_id: i64, doc: &str, ord: i32, score: f32) -> Hit {
