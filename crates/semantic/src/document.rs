@@ -378,6 +378,41 @@ mod tests {
     }
 
     #[test]
+    fn every_declared_prefix_is_actually_resolvable() {
+        // `DocumentFamily::prefixes` 此前是**只写字段**：seed 落库、无人读，而
+        // `resolve_code` 把同一份前缀知识又硬编码了一遍（"HJXH-DRO"/"IO"/"SQ"/…）。
+        // 两份真相源里有一份没人对，漂了也不会红 —— 这条判据把它们绑在一起：
+        // 每个声明的前缀，都必须能被 `resolve_code` 认回**声明它的那个家族**。
+        // （DSO/DXO/SO/XO 被数仓发货与销售订单共享，靠 warehouse 位分流，所以判据是
+        //   「认回一个 prefixes 里含这个前缀的家族」，不是「认回同一个 kind」。）
+        for family in DOCUMENT_FAMILIES {
+            for prefix in family.prefixes {
+                // 形状按家族各异（带日期 / 纯数字 / 本地流水），逐个试到一个成
+                let samples = [
+                    format!("{prefix}2026081500390"),
+                    format!("{prefix}20260815001"),
+                    format!("{prefix}123456"),
+                    format!("{prefix}1234567890"),
+                    format!("{prefix}100"),
+                    format!("{prefix}20260815-00390"),   // SPC- 那族是 前缀+日期+`-`+流水
+                ];
+                let hit = samples.iter().find_map(|c| {
+                    resolve_code(c, false).or_else(|| resolve_code(c, true))
+                });
+                let hit = hit.unwrap_or_else(|| {
+                    panic!("家族 {} 声明的前缀 {prefix} 造不出任何能被 resolve_code 认出的号：{samples:?}",
+                           family.code)
+                });
+                assert!(
+                    hit.family.prefixes.contains(prefix),
+                    "前缀 {prefix} 由 {} 声明，却被认成 {}（两份前缀真相源漂了）",
+                    family.code, hit.family.code
+                );
+            }
+        }
+    }
+
+    #[test]
     fn malformed_known_prefixes_are_rejected() {
         for code in ["SPC-", "SPC-20261301-1", "HJXH-DXO202602300001", "DEV_XQ_IDEM_001",
                      "SHOP_YH20261301100001", "PZ202608051234"] {
