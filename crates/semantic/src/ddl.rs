@@ -16,6 +16,18 @@ use sqlx::PgPool;
 /// 🔴 `seed` 是 `ADD COLUMN` 的**默认值，且必须是三者里最保守的那个**：`seed_defs` 手写的码表
 /// 只播了会用到的那几个取值（不是完整枚举），既有行全部落它 —— 默认成 `dict` 就等于对手写那批
 /// 开火，那是假红，而误伤一条会连带把本来对的答案回炉改错（裁决 二·G）。
+/// 🔴 **向量维度的唯一事实源**（2026-08-17 从 512 升到 1024）。
+///
+/// 512 是上一版为「零 schema 迁移」压出来的：千问 `text-embedding-v4` 的默认维度是
+/// **1024**（实测支持 64/128/256/512/768/1024/1536/2048，且**按 token 计费、与维度无关**），
+/// 而当时库里六列都是 512 维。换模型那一轮的首要目标是把本地 bge 换掉、不动数据面。
+/// （这里刻意写「512 维」而不是那个 `vector(…)` 形——判据扫全文，注释里写旧值也会判红。）
+///
+/// 改这个常量必须同时改三处，`the_vector_dimension_is_declared_once` 那条判据会逐一核对：
+/// 本文件的 DDL 字面量、`semantic/migrations/0020_kb_init.sql` 的 `kb.chunk`、
+/// 以及 `tools/embed_service.py` 的 `DIM`。下面 DDL 末尾的幂等改型块负责把**已有库**拉齐。
+pub const EMBED_DIM: u32 = 1024;
+
 pub const VALUE_ORIGIN_SEED: &str = "seed";
 
 /// autodiscover **字典对码**那批写这个（写入点 `ingest::autodiscover::register::register_match`）：
@@ -57,7 +69,7 @@ CREATE INDEX IF NOT EXISTS idx_table_doc_trgm ON meta.table_doc USING gin (searc
 -- 每次都 42703 `column "embedding" does not exist`，被 `.unwrap_or_default()` 吞成空集、零日志，
 -- 而 trgm 兜底总能把 6 个额度填满 ⇒ 三路召回只剩两路，外面一点看不出来。
 -- 服务侧必须自己声明：DDL 是**启动**路径，build 是离线路径，不能拿离线脚本当建表工具。
-ALTER TABLE meta.table_doc ADD COLUMN IF NOT EXISTS embedding vector(512);
+ALTER TABLE meta.table_doc ADD COLUMN IF NOT EXISTS embedding vector(1024);
 -- 索引名与 `embed_service.py build` 逐字同名（idx_doc_hnsw + vector_cosine_ops）：
 -- 换个名字就是两边各建一棵 HNSW，同一列上两份索引各占一份内存还都得维护。
 CREATE INDEX IF NOT EXISTS idx_doc_hnsw ON meta.table_doc USING hnsw (embedding vector_cosine_ops);
@@ -145,7 +157,7 @@ CREATE TABLE IF NOT EXISTS meta.memory(
   kind text NOT NULL DEFAULT 'review',
   question text NOT NULL DEFAULT '',
   content text NOT NULL,
-  embedding vector(512),
+  embedding vector(1024),
   hit_count int NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -193,7 +205,7 @@ CREATE TABLE IF NOT EXISTS meta.sql_exemplar(
   id bigserial PRIMARY KEY,
   question text NOT NULL,
   sql text NOT NULL,
-  embedding vector(512),
+  embedding vector(1024),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 -- 复核态（移植 SuperSonic MemoryReviewTask）：pending 未复核 / enabled 复核通过 / disabled 判错剔除
@@ -309,7 +321,7 @@ CREATE TABLE IF NOT EXISTS meta.element(
   search_text text NOT NULL DEFAULT '', -- 名+别名+描述（向量化文本）
   status text NOT NULL DEFAULT 'active'
 );
-ALTER TABLE meta.element ADD COLUMN IF NOT EXISTS embedding vector(512);
+ALTER TABLE meta.element ADD COLUMN IF NOT EXISTS embedding vector(1024);
 -- 纠错反哺日志（自进化引擎B+）：确定性校正器每次出手都记录，同错累计→升格 pitfall 教训
 CREATE TABLE IF NOT EXISTS meta.correction_log(
   id bigserial PRIMARY KEY,
@@ -421,7 +433,7 @@ CREATE TABLE IF NOT EXISTS meta.datasource(
   description text NOT NULL DEFAULT '',
   workspace   text NOT NULL DEFAULT 'default',
   status      text NOT NULL DEFAULT 'active',
-  embedding vector(512),
+  embedding vector(1024),
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 -- ── 【K3-B ①】注册表 ds_id 化：只加列，本步不改任何查询 ──
@@ -449,6 +461,7 @@ ALTER TABLE meta.sql_exemplar  ADD COLUMN IF NOT EXISTS ds_id text NOT NULL DEFA
 -- 指标级时间窗上限（'' = 无；'yesterday' = 仅适用于事实合同明确要求的延迟确认指标）。
 -- 默认 DWS 销售事实按 order_date 聚合，必须保持空值，不继承旧发货口径上限。
 ALTER TABLE meta.metric        ADD COLUMN IF NOT EXISTS time_cap text NOT NULL DEFAULT '';
+
 "#;
 
 pub async fn migrate(pg: &PgPool) -> anyhow::Result<()> {
@@ -503,8 +516,46 @@ pub async fn migrate(pg: &PgPool) -> anyhow::Result<()> {
             }
         }
     }
+    retype_embedding_columns(pg).await?;
     rekey_ds_pk(pg).await?;
     tracing::info!(statements = n, "meta DDL 迁移完成");
+    Ok(())
+}
+
+/// 🔴 **向量维度的幂等改型**（2026-08-17，512 → 1024）。
+///
+/// DDL 里那几句 `ADD COLUMN IF NOT EXISTS embedding vector(1024)` 只对**新库**成立：
+/// 列已经在的库，`IF NOT EXISTS` 直接跳过，维度还停在旧值。而维度对不上不是「慢一点」——
+/// 写入当场报 `expected 512 dimensions, not 1024`、读侧 `<=>` 同样报，
+/// 而三个调用点都是 `.unwrap_or_default()`，于是三条向量路一起**静默**哑掉。
+///
+/// 改型顺带把值清成 NULL：**维度变了旧向量本来就作废**（不同维度的向量不可比，
+/// 留着比丢掉更危险——它让检索悄悄变差而不报错）。补回来靠
+/// `tools/embed_service.py build` / `revec`，与换模型那一轮同一条路。
+///
+/// 为什么不写成 DDL 里的 `DO $$ … $$`：本文件的执行器是 `DDL.split(';')`（上面第 507 行），
+/// 裸分号切分会把 PL/pgSQL 函数体切碎。knowledge 侧的切分器认 `$$`，那边就直接写在迁移里。
+async fn retype_embedding_columns(pg: &PgPool) -> anyhow::Result<()> {
+    for table in ["meta.table_doc", "meta.element", "meta.sql_exemplar", "meta.datasource", "meta.memory"] {
+        // pgvector 把维度直接存进 atttypmod；列/表不存在时 `to_regclass` 返 NULL ⇒ 无行 ⇒ 跳过
+        let current: Option<i32> = sqlx::query_scalar(
+            "SELECT a.atttypmod FROM pg_attribute a              WHERE a.attrelid = to_regclass($1) AND a.attname = 'embedding' AND NOT a.attisdropped",
+        )
+        .bind(table)
+        .fetch_optional(pg)
+        .await?
+        .flatten();
+        let Some(current) = current else { continue };
+        if current == EMBED_DIM as i32 {
+            continue;
+        }
+        tracing::warn!(table, from = current, to = EMBED_DIM, "向量维度改型：旧向量作废置 NULL");
+        sqlx::query(&format!(
+            "ALTER TABLE {table} ALTER COLUMN embedding TYPE vector({EMBED_DIM}) USING NULL"
+        ))
+        .execute(pg)
+        .await?;
+    }
     Ok(())
 }
 
@@ -606,7 +657,7 @@ const VECTOR_READY_SQL: &str = "SELECT EXISTS(SELECT 1 FROM meta.table_doc WHERE
 /// 冷启 311 ms、热身后 14~19 ms。所以省的是 **~7 倍（热）/ ~100 倍（冷）**，
 /// 外加单线程 :8077 被占时那条 3s 超时的长尾 —— 不是三个数量级，别把上限当日常。
 ///
-/// 为什么落在 ddl.rs：这三列就是本文件声明的（各一句 `embedding vector(512)`），而
+/// 为什么落在 ddl.rs：这三列就是本文件声明的（各一句 `embedding vector(1024)`），而
 /// **「列建好了」≠「向量灌了」**——数据靠 `python tools/embed_service.py build` 离线算。
 /// 2026-07-28 查库：`meta.table_doc` 连列都没有（本轮补的就是它）、`meta.element` 1033 行
 /// embedding 全 NULL、`meta.datasource` 4 行 active / 0 行有向量、HNSW 索引 0 个 ——
@@ -627,6 +678,50 @@ pub async fn vector_ready(pg: &PgPool) -> anyhow::Result<VectorReady> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 向量维度只许声明一次。四处必须逐字一致：本文件的 DDL 字面量、
+    /// `retype_embedding_columns` 的改型目标、`0020_kb_init.sql` 的 `kb.chunk`、
+    /// 以及 `tools/embed_service.py` 的 `DIM`。
+    ///
+    /// 漂了不是「慢一点」：写入当场报 `expected N dimensions`、读侧 `<=>` 同样报，
+    /// 而三个调用点都是 `.unwrap_or_default()` ⇒ 三条向量路一起**静默**哑掉。
+    /// 2026-08-17 从 512 升 1024 时，光 ddl.rs 里就有 5 处字面量要跟着改。
+    #[test]
+    fn the_vector_dimension_is_declared_once() {
+        let want = format!("vector({EMBED_DIM})");
+        let sources: [(&str, &str); 3] = [
+            ("semantic/src/ddl.rs", include_str!("ddl.rs")),
+            ("semantic/migrations/0020_kb_init.sql", include_str!("../migrations/0020_kb_init.sql")),
+            ("knowledge/src/store.rs", include_str!("../../knowledge/src/store.rs")),
+        ];
+        let mut seen = 0;
+        for (name, src) in sources {
+            for (idx, _) in src.match_indices("vector(") {
+                let tail = &src[idx + "vector(".len()..];
+                let Some(close) = tail.find(')') else { continue };
+                let inner = &tail[..close];
+                // 只管 `vector(<纯数字>)` 这一形；`vector_cosine_ops`、`::vector` 不在内
+                if inner.is_empty() || !inner.bytes().all(|b| b.is_ascii_digit()) {
+                    continue;
+                }
+                seen += 1;
+                assert_eq!(
+                    format!("vector({inner})"),
+                    want,
+                    "{name} 里有一处 vector({inner})，与 EMBED_DIM={EMBED_DIM} 不符"
+                );
+            }
+        }
+        assert!(seen >= 6, "只扫到 {seen} 处 vector(N)，判据可能已经扫空（文件改名/路径漂了）");
+
+        // Python 侧那一行也要对上 —— 它是**另一个进程**里的同一个常量
+        let py = include_str!("../../../tools/embed_service.py");
+        let line = py
+            .lines()
+            .find(|l| l.starts_with("DIM = "))
+            .expect("tools/embed_service.py 里找不到 `DIM = ` 那一行");
+        assert_eq!(line.trim(), format!("DIM = {EMBED_DIM}"), "Python 侧维度与 EMBED_DIM 不符");
+    }
     use super::*;
 
     /// 🔴 `value_map.origin` 的默认值必须是**最保守**的那个（`seed`）。
@@ -660,7 +755,7 @@ mod tests {
     /// 顺序那条不是洁癖：`migrate` 按分号逐句执行，索引跑在加列之前就是当场 42703 启动失败。
     #[test]
     fn table_doc_has_the_vector_column_before_its_index() {
-        let col = "ALTER TABLE meta.table_doc ADD COLUMN IF NOT EXISTS embedding vector(512)";
+        let col = "ALTER TABLE meta.table_doc ADD COLUMN IF NOT EXISTS embedding vector(1024)";
         // 索引名必须与 embed_service.py 的 build 同名，否则同一列上两棵 HNSW
         let idx = "CREATE INDEX IF NOT EXISTS idx_doc_hnsw ON meta.table_doc \
                    USING hnsw (embedding vector_cosine_ops)";

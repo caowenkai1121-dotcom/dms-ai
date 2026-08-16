@@ -117,6 +117,24 @@ ALTER TABLE kb.chunk ADD COLUMN IF NOT EXISTS start_char_pos int;
 ALTER TABLE kb.chunk ADD COLUMN IF NOT EXISTS end_char_pos int;
 ALTER TABLE kb.doc ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
 ALTER TABLE kb.doc ADD COLUMN IF NOT EXISTS last_ingest_error text NOT NULL DEFAULT '';
+-- 🔴 向量维度幂等改型（2026-08-17，512 → 1024）。与 `semantic::ddl` 里 meta 那五张表
+-- 同一段逻辑：`0020_kb_init.sql` 的 `vector(1024)` 只对新库成立，已有库的列还停在旧维度，
+-- 而维度对不上是**当场报错**（写 `expected 512 dimensions`、读 `<=>` 同样报），
+-- 三条向量路一起被 `.unwrap_or_default()` 吞成空集。
+-- 改型顺带清 NULL（不同维度的向量不可比，留着只会让检索悄悄变差），
+-- 并把受影响文档退回 `chunked` —— 否则 `revec` 的 `KB_SEL` 只扫 chunked，会扫到 0 行还退 0。
+DO $$
+DECLARE current_dim int;
+BEGIN
+  SELECT a.atttypmod INTO current_dim
+    FROM pg_attribute a
+   WHERE a.attrelid = to_regclass('kb.chunk') AND a.attname = 'embedding' AND NOT a.attisdropped;
+  IF current_dim IS NOT NULL AND current_dim <> 1024 THEN
+    RAISE NOTICE '向量维度改型：kb.chunk 从 % → 1024（旧向量作废置 NULL，文档退回 chunked）', current_dim;
+    EXECUTE 'ALTER TABLE kb.chunk ALTER COLUMN embedding TYPE vector(1024) USING NULL';
+    UPDATE kb.doc SET status = 'chunked' WHERE status = 'embedded';
+  END IF;
+END $$;
 ";
 
 /// `DocRow` 的列清单。`created_at` 取 `::text`——为一个纯展示字段给 knowledge 引 chrono 不值当。
@@ -2707,7 +2725,8 @@ mod tests {
     #[test]
     fn chunk_char_pos_migration_is_idempotent_and_wired() {
         let stmts: Vec<&str> = statements(KB_DDL_DELTA).collect();
-        assert_eq!(stmts.len(), 4);
+        // 条数写死是「不许悄悄多一条」的钉。2026-08-17 从 4 → 5：第五条是向量维度的幂等改型。
+        assert_eq!(stmts.len(), 5, "KB_DDL_DELTA 条数变了，确认是有意加的再改这个数");
         assert!(stmts[..2]
             .iter()
             .all(|s| s.starts_with("ALTER TABLE kb.chunk ADD COLUMN IF NOT EXISTS")));
@@ -2719,6 +2738,13 @@ mod tests {
         ));
         // 影子入库失败不能改线上 status：独立字段保留旧版可检索性。
         assert!(stmts[3].starts_with("ALTER TABLE kb.doc ADD COLUMN IF NOT EXISTS last_ingest_error text NOT NULL DEFAULT ''"));
+        // 第五条：向量维度幂等改型。三件事缺一不可 —— 读 atttypmod 判当前维度（不是无条件 ALTER，
+        // 那会每次启动重建一次索引）、改型时清 NULL（不同维度的向量不可比）、
+        // 把受影响文档退回 chunked（否则 revec 的 KB_SEL 只扫 chunked，会扫到 0 行还退 0）。
+        let retype = stmts[4];
+        assert!(retype.contains("atttypmod"), "改型必须先读当前维度：{retype}");
+        assert!(retype.contains("ALTER COLUMN embedding TYPE vector(1024) USING NULL"), "{retype}");
+        assert!(retype.contains("UPDATE kb.doc SET status = 'chunked'"), "改型必须把文档退回 chunked：{retype}");
         let src = include_str!("store.rs");
         let migrate = src.split("pub async fn migrate").nth(1).unwrap();
         let migrate = migrate.split("pub async fn ").next().unwrap();

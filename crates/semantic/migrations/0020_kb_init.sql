@@ -332,7 +332,7 @@ CREATE TABLE IF NOT EXISTS kb.chunk(
   tokens       int NOT NULL DEFAULT 0,
   embedding_text text NOT NULL DEFAULT '',       -- 配方输入快照；正文仍以 text 为引用真相
   embedding_recipe smallint NOT NULL DEFAULT 0, -- 配方版本，升级后旧向量自动失效
-  embedding    vector(512),                      -- 复用现有 bge-small-zh-v1.5，不引第二模型
+  embedding    vector(1024),                     -- 维度唯一事实源 = ddl.rs::EMBED_DIM（千问 v4 默认 1024）
   ts           tsvector GENERATED ALWAYS AS (to_tsvector('simple', text)) STORED,
   UNIQUE(doc_id, ord)
 );

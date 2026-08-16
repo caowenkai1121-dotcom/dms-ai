@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""向量层 + 精排 + 文档服务：**千问（DashScope）适配层**，512 维。
+"""向量层 + 精排 + 文档服务：**千问（DashScope）适配层**，1024 维（千问 v4 默认维度）。
   本地模型（fastembed / bge-small-zh-v1.5）已按业主裁决废除（2026-08-16）。
   Rust 侧的 wire 契约一个字没动：`/embed` 收 `{"texts":[...],"query":bool}`，
   `/rerank` 收 Cohere/Jina 形状 —— 这里当适配层，Rust 不认识 DashScope。
@@ -40,12 +40,17 @@ for _s in (sys.stdout, sys.stderr):
 # （`{"texts":[...],"query":bool}` / Cohere 形状的 `/rerank`）一个字不动，本文件当适配层。
 # 一个进程一份适配，Rust 侧不认识 DashScope，也就不会长出第二套 provider 分支。
 #
-# 维度**必须留在 512**：`kb.chunk.embedding` / `meta.table_doc.embedding` 等列都是
-# `vector(512)`，换维度要迁全部向量列。千问 v3/v4 都支持 `dimensions` 参数，512 在其中 ——
-# 所以这次换模型**零 schema 改动**。
+# 维度 = 1024（千问 v4 的默认值，实测支持 64/128/256/512/768/1024/1536/2048，
+# 且**按 token 计费、与维度无关**）。2026-08-16 换模型那一轮先用 512 是为了零 schema 迁移；
+# 2026-08-17 业主裁决升到 1024，六列一起改型（`semantic::ddl::retype_embedding_columns`
+# 与 knowledge 侧迁移里的 DO 块各管一半，都是幂等的）。
 # ⚠️ 但向量空间变了：bge 与千问的向量不可比，**全量语料必须重新向量化**（`revec` 那条路）。
 MODEL = os.environ.get('DMS_EMBED_MODEL', 'text-embedding-v4')
-DIM = 512
+# 维度的唯一事实源在 Rust 侧 `semantic::ddl::EMBED_DIM`（库里六列就是按它建的）。
+# 两边对不上不是「慢一点」：写入当场报 `expected N dimensions`，读侧 `<=>` 同样报，
+# 而三个调用点都是 `.unwrap_or_default()` ⇒ 三条向量路一起静默哑掉。
+# `the_vector_dimension_is_declared_once` 那条判据逐字核对这一行。
+DIM = 1024
 # 千问兼容端点的单批上限实测 = 10（12 起报 `batch size is invalid`）。
 # 这个数**不是**语料侧的批大小（`KB_BATCH=64`）：那一层按 64 组批，本层再切成 10 一组发。
 QWEN_EMBED_BATCH = 10
