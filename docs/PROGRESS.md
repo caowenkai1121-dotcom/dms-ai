@@ -4763,3 +4763,86 @@ b.score.total_cmp(&a.score).then(a.chunk_id.cmp(&b.chunk_id))   // 入库顺序�
 - 闸门漏判扫描改成「痕迹必须与探针表 `__dms_ai_gate_probe` 同行」，
   并在 `--selfcheck` 里加了自证 —— 防止哪天又退回整段扫关键字。
 - 回归题集 81 → 82 题（新增 R01 大区成员值直查 / R02 未登记大区诚实拒答）。
+
+## AX149-AX156 千问向量/精排全面切换 + 意图层「光杆维度词」根因（2026-08-16）
+
+### 一、向量与精排全部换成千问（业主裁决：废除本地模型）
+
+`tools/embed_service.py` 变成 DashScope 适配层，**Rust 侧 wire 契约一个字没动**：
+- `text-embedding-v4` @ `dimensions=512` —— 与库里 `vector(512)` 同形，**零 schema 迁移**
+- `gte-rerank-v2`（`gte-rerank` 已 AccessDenied）走原生 text-rerank 端点，出参转 Cohere 形状
+- 单批上限 **10**（实测 12 条即 `batch size is invalid`），按 `index` 归位不信返回顺序
+- 不留「有 key 走千问、没 key 回落本地」的双档：双档 = 两套向量空间，混了不报错只变差
+
+换空间要重算的是**六张**表，不是四张：`kb.chunk`(1102) / `meta.table_doc`(123) /
+`meta.element`(1310) / `meta.sql_exemplar`(75 enabled) / `meta.datasource`(6) / `meta.memory`(91)。
+`kb.chunk` 另有一坑：`revec` 的 `KB_SEL` 只扫 `kb.doc.status='chunked'`，
+向量置 NULL 但状态还是 `embedded` 时它**扫到 0 行还退出码 0** —— 必须先把状态退回 chunked。
+
+### 二、精排第一次真正接线（此前生产从未跑过）
+
+`DMS_RERANK_BASE_URL` 默认取 `settings.service_url`、`DMS_RERANK_MODEL` 默认 `gte-rerank-v2`，
+两条都进了 `scripts/test-deploy-contract.sh` 的合同清单（反向验证过会红）。
+正面证据不是「没有『未接线』日志」（那句是 debug 级，生产日志级别根本不打），
+而是 embed 服务每次调用打一行 stderr：`journalctl -u dms-ai-embed | grep rerank`
+实测 `rerank 11 篇 → 11 分（gte-rerank-v2）`。
+
+### 三、根因：光杆维度词被当成实体，确定性那条臂整条哑掉
+
+`--http` 回归 87 题 9 红，其中**四题同一个根因**（E04 客户销量排行 / E17 客户毛利额排行 /
+SALE17 省区毛利率 / C07 昨日下单客户）。生产直打 E04 的 `intent_summary` 是证据：
+
+    slots: metric:销量(grounded) / entity:客户(grounded) / breakdown:客户(grounded)
+    coverage: {status: blocked, issues: ["entity:客户"]}
+
+大模型把分组维度「客户」同时报进 `breakdowns` 和 `entity_mentions`。后者一进去就永远
+证不出来（SQL 里是 `GROUP BY 客户`，不是 `WHERE 客户='客户'`）→ `entity_proved` 恒 false
+→ `unclaimed_scope()` 硬拦 → fastpath 拒答 → LLM 臂兜底。
+
+**这条降级不报错也不难看**：答案往往还是对的（E04 那 5 行就是对的），所以没人会去看。
+代价是口径/时间窗/权限过滤全走了非确定性那条路，每题多花 10 秒。
+
+修在源头：`IntentV1::normalize` 剔掉表面词整词等于类别词的 entity_mention，
+词表提成 `derive::DIMENSION_CLASS_WORDS` 与 `customer_name_fragment` 共用。
+第二版补了量词前缀（「各省区」——第一版让 SALE17 时绿时红，取决于模型这次吐哪个词）。
+`regions` 走同一条硬闸，同样剔。
+
+### 四、并列问句只答一半
+
+「分别查本月销售额和本月订单数」→ 1 行「不可计算」；
+「分别统计各省区销售额和各商品销量」→ 只按省区分组，各商品销量**静默消失**。
+拆分的唯一合同是意图的 subgoals（`routed.len() > 1` 才进复合），模型没吐就没有复合。
+规则 3 只有抽象表述，补了 3.1 与两个逐字例子。
+
+### 五、顺手修掉的三处同族「哑掉的降级」
+
+1. `_qwen_key` 不再无条件读 `llm_api_key` —— 本机 `llm_provider=deepseek`，
+   早一版拿 deepseek 的 key 打 DashScope（404）。对话 LLM 与向量层是两笔账。
+2. `server/src/embed.rs` 那个写死 `127.0.0.1:8077` 的单例删了：生产 embed 服务在 **:8078**，
+   写死那份在容器里无人监听，`retrieve` 冒烟因此**恒静默跳过向量路**却照样打印结果。
+3. `_EMBED_LOCK` 删了。它唯一的理由是 onnxruntime session 非线程安全；本地模型没了理由也没了，
+   而留着会重造一个修过的故障：一趟 revec（110 次 HTTP 往返）把每个问句的 /embed 堵在锁后面
+   → 超 Rust 侧 3s → 进程级熔断 300s → 之后 5 分钟三条向量路全降级且零报错。
+
+### 六、判据（都反向验证过会红）
+
+- `_selftest_qwen_embed`：切片按 10 / 按 index 归位 / 条数不符抛 / 维度不符抛 / rerank 形状
+- `_selftest_post_retry`：429 退避重试一次、400 不重试
+- `the_offline_builder_covers_every_meta_vector_target`：真去读 `tools/embed_service.py`，
+  遍历 `MetaVecTarget::ALL` 比对写入点与配方。原来那条只把 Rust 侧钉在字面量上，
+  读不到离线脚本，所以「离线少覆盖一张表」它一个字都不会红 —— `meta.memory` 就是这么漏的
+- `every_declared_prefix_is_actually_resolvable`：`DocumentFamily::prefixes` 此前是只写字段，
+  而 `resolve_code` 把同一份前缀知识又硬编码了一遍。写这条时 `SPC-` 当场红了一次
+- `bare_dimension_words_are_not_entities`：entity 与 region 两侧，真名字不许被误伤
+
+### 七、未结（下一手接着查）
+
+1. **C03 `HJXH-DSO2026080300838*2`**：`docker exec … ask admin` 下 direct-doc 9 行；
+   走 `/api/ask` 与 `/api/mcp` 恒 need-intent（direct-doc miss）。只把 `*` 换成 `_`
+   两条路都 hit。二进制同一个、源同一份、显式 `ds=dms` 也一样，连打三次结果稳定 ——
+   不是抖动，也不是选源（`meta.datasource` 最近邻两者都是同一张 upload 表）。
+   黑盒能问的都问完了；`direct_hit` 里留了一行 `tracing::debug!`，
+   开法 `--env RUST_LOG=dms_agent=debug`，下一手先读它。
+2. **E10 的口径披露**：`coverage_status: blocked` 是过期期望（同日 64c37e7 裁决 ambiguity 不再硬闸），
+   已改成 complete。但原本要钉的事**没了出口**：库存有多口径，而 coverage 不提、
+   caliber_note 空、正文也不提。要治是给库存族补一条口径披露。
