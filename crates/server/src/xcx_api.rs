@@ -504,8 +504,24 @@ pub async fn ask_stream(
             None,
         )
         .await;
-        if probe.is_none() {
-            return xcx_stream_knowledge(&st, &gate, &prepared);
+        // 🔴 探针结果要**接住**（2026-08-16 对抗复核逮到）：只判 `is_none()` 会把
+        // 问数臂整个跑第二遍 —— 一次提问打两遍库、两份 query_log、两倍 LLM 开销，
+        // 两次结果还可能不一致。`/api/ask/stream` 那侧一直是复用 `r` 再补一次 `r.kb`。
+        match probe {
+            None => return xcx_stream_knowledge(&st, &gate, &prepared),
+            Some(mut r) => {
+                // 这一档已经不是纯资料问句了：资料半同步取一次挂 `kb` 键，
+                // 与混合问句同形（判据与 agent 侧同一条 `kb_has_substance`）。
+                r.kb = crate::kb_answer(&st, &gate.p, None, &prepared.question.effective_question)
+                    .await
+                    .ok()
+                    .filter(dms_agent::hybrid::kb_has_substance);
+                let payload = serde_json::to_value(&r).unwrap_or_else(|e| {
+                    tracing::warn!(conv_id = gate.conv_id, reason = %e, "AskResult 序列化失败，回空对象");
+                    json!({})
+                });
+                return Ok(ask_finish(&st, &gate, payload).await.into_response());
+            }
         }
     }
     // 其余全部走与非流式**同一个出口**（Data / Unknown / 探到数的 Knowledge）。

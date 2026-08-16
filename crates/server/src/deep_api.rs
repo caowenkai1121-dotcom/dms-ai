@@ -4641,9 +4641,79 @@ async fn compose_inner(
         None => prepared,
     };
     let route = prepared.question.route();
+    // 🔴 `Unknown` 必须走**两臂**（2026-08-16 对抗复核逮到我自己砸的洞）。
+    //
+    // 下面的深度报告主查询写死 `dual_arms = false`（「深度报告只要问数臂」），
+    // 而 `Unknown` 不匹配 Knowledge/Hybrid 任何一臂 → fall-through 到那里 →
+    // 知识库一次都不问。这一档的成因恰恰是「fast 吐坏 JSON / 资料问句抽不出槽位」，
+    // 拿它去拼深度板块没有意义，更不该把资料半整个丢掉。
+    // 给一张正常的两臂答案卡：合同都没就绪，拼板块本来就无从谈起。
+    if route == dms_agent::intent::IntentRoute::Unknown {
+        let (answered, _log) = crate::ask_prepared(
+            &st.llm,
+            &st.auth_mysql,
+            &st.mysql,
+            &st.sources,
+            st.owned.pool(),
+            &st.embed,
+            &p,
+            &prepared,
+            req.ds.as_deref(),
+            req.conv_id.map(|c| c.to_string()).as_deref(),
+            st.sc_samples,
+            req.space_id.as_deref(),
+            true, // 两臂：资料半照旧跑，只是不再是唯一一条
+        )
+        .await;
+        let result = match answered {
+            Ok(r) => match crate::knowledge_arm_payload(&r, &prepared, &requested_execution_question)
+            {
+                Some(payload) => payload,
+                None => serde_json::to_value(&r)
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "深度模式 Unknown 档的两臂编排失败 → 出澄清卡");
+                serde_json::to_value(prepared.question.clarification_result())
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败")
+            }
+        };
+        if let Some(cid) = req.conv_id {
+            save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
+            let payload = serde_json::json!({ "result": result });
+            save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+        }
+        note(&rid, ProgressStage::Done);
+        return Ok(Json(serde_json::json!({ "result": result })));
+    }
     let execution_question = prepared.question.effective_question.clone();
     if route == dms_agent::intent::IntentRoute::Knowledge {
         note(&rid, ProgressStage::Knowledge);
+        // 🔴 开资料臂之前先探一次**确定性问数车道**（与 `/api/ask/stream`、小程序流式
+        // 同一个 `deterministic_data_probe`）。此前这里直接调 `knowledge::answer` ——
+        // 正是 2026-08-14 在 `/api/ask` 上修掉的那个缺陷（「线下-浏阳品元商贸有限公司」），
+        // 深度模式是它最后一个没收的入口。探到实质就按问数结果出卡。
+        if let Some(r) = crate::deterministic_data_probe(
+            &st,
+            &p,
+            req.ds.as_deref(),
+            req.conv_id.map(|c| c.to_string()).as_deref(),
+            st.sc_samples,
+            &prepared,
+            req.space_id.as_deref(),
+        )
+        .await
+        {
+            let result = serde_json::to_value(&r)
+                .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+            if let Some(cid) = req.conv_id {
+                save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
+                let payload = serde_json::json!({ "result": result });
+                save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
+            }
+            note(&rid, ProgressStage::Done);
+            return Ok(Json(serde_json::json!({ "result": result })));
+        }
         let answer = dms_agent::answerers::knowledge::answer(
             &st.owned,
             &st.embed,

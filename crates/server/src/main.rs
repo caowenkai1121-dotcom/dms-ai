@@ -3366,6 +3366,36 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     }))
 }
 
+/// 源码扫描类判据的公共前处理：剥掉 `#[cfg(test)]` 标注的**条目**（mod / fn / impl…）。
+///
+/// 🔴 不许再写 `src.split("#[cfg(test)]").next()`（2026-08-16 对抗复核逮到）：
+/// `deep_api.rs` 在**第 1058 行**就有一个函数上的局部 `#[cfg(test)]`，于是所有按那种写法
+/// 取「生产段」的判据只扫到全文件的 **13.7%** —— 深度模式的整条问答路径
+/// （`compose` / `compose_inner`）全在扫描面之外。谁在那里重新加一道合同闸、
+/// 或者重新长出一条只问知识库的出口，四条守卫全绿。
+///
+/// 「护栏自己会哑」在本仓是有前科的一族；这一份是它的公共修法，新写源码判据一律用它。
+#[cfg(test)]
+pub(crate) fn production_only(src: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in src.lines() {
+        // 只认**列 0** 的标注：条目内部缩进的 `#[cfg(test)]` 不是顶层条目
+        if !skipping && line.starts_with("#[cfg(test)]") {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            // 列 0 的单个右大括号 = 该条目收尾（内部大括号都有缩进）
+            skipping = line != "}";
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4001,41 +4031,122 @@ mod tests {
     /// 除 `main.rs`（它是定义处，且两臂编排内部的资料半要用它）外，
     /// 任何入口文件出现它就是又一次绕过 Router。
     /// 形状可以随便重构，这条判据不受影响 —— 这正是上一版缺的性质。
+    /// 🔴 守卫的守卫：`production_only` 自己必须真的剥干净。
+    ///
+    /// 由来：全仓源码判据一直写 `src.split("#[cfg(test)]").next()`，而 `deep_api.rs`
+    /// 在第 1058 行就有一个函数上的局部标注 —— 那些判据只扫到全文件的 13.7%，
+    /// 深度模式整条问答路径在扫描面之外。这条测试把「扫描面覆盖率」本身钉住。
+    #[test]
+    fn production_only_strips_every_test_item_not_just_the_first() {
+        let nl = char::from(10); // 不写转义：本文件里带转义的字面量被工具链毁过两次
+        let src = [
+            "fn keep_one() {}",
+            "#[cfg(test)]",
+            "fn helper() {",
+            "    let x = 1;",
+            "}",
+            "fn keep_two() {}",
+            "#[cfg(test)]",
+            "mod tests {",
+            "    fn inner() {",
+            "        drop(0);",
+            "    }",
+            "}",
+            "fn keep_three() {}",
+        ]
+        .join(&nl.to_string());
+        let src = src.as_str();
+        let out = super::production_only(src);
+        for kept in ["keep_one", "keep_two", "keep_three"] {
+            assert!(out.contains(kept), "剥掉了生产代码：{out}");
+        }
+        for dropped in ["helper", "mod tests", "inner"] {
+            assert!(!out.contains(dropped), "没剥干净（`{dropped}` 还在）：{out}");
+        }
+        // 真文件上的覆盖率：deep_api 的生产段必须远超「第一个 cfg(test) 之前」那 13.7%
+        let deep = include_str!("deep_api.rs");
+        let naive = deep.split("#[cfg(test)]").next().unwrap().lines().count();
+        let real = super::production_only(deep).lines().count();
+        assert!(
+            real > naive * 3,
+            "deep_api 的扫描面又缩回去了：朴素写法 {naive} 行 / production_only {real} 行"
+        );
+    }
+
     #[test]
     fn no_entry_calls_the_kb_directly() {
         // needle 运行时拼：写成字面量的话本测试自己会被自己命中
-        let banned = [
+        // 判据不是「不许出现 kb_answer」而是「**探过确定性问数车道才允许**」——
+        // 资料臂本来就该跑，错的是没探就跑。每个调用点往回看一个窗口，
+        // 必须先出现 `deterministic_data_probe`（那是全仓唯一那份探针）。
+        // 🔴 三个名字缺一不可：小程序走的是 `spawn_kb_worker`（流式工人），不叫 `kb_answer` ——
+        // 复核逮到守卫对它是瞎的。判据要覆盖**所有**打知识库的入口名，不是最眼熟的那一个。
+        let kb_calls = [
             ["kb_", "answer("].concat(),
-            ["unknown_route_kb", "_fallback("].concat(),
+            ["knowledge::", "answer("].concat(),
+            ["spawn_kb", "_worker("].concat(),
+            // 资料出口被抽成独立函数时，**它的调用点**才是被判的对象（见 KB_EXIT_HELPERS）
+            ["xcx_stream", "_knowledge("].concat(),
         ];
+        // 🔴 这些辅助函数**本身就是**资料出口，函数体内出现打知识库的调用是它的本分；
+        // 判据要判的是「谁在调它」。所以先把它们的函数体整块摘掉，再让它们的名字
+        // 以调用点的身份进 `kb_calls` —— 少了这一步，判据要么误红（函数体里必然有 KB 调用）、
+        // 要么只能给它开豁免（那就等于对整条路瞎）。
+        // 列 0 的右大括号 + 换行：顶层条目之间的分界（与 `production_only` 同一条约定）
+        let item_boundary = [char::from(10), '}'].iter().collect::<String>();
+        let item_boundary = item_boundary.as_str();
+        const KB_EXIT_HELPERS: [&str; 2] =
+            ["fn xcx_stream_knowledge(", "async fn kb_answer("];
+        let probe = ["deterministic_data", "_probe("].concat();
+        // 「只问知识库」那条老路无条件禁止：它连探针都没有的概念
+        let never = ["unknown_route_kb", "_fallback("].concat();
+        // main.rs 也在表里：它是 `kb_answer` 的**定义处**，但定义之外的每一次调用
+        // 同样必须先探过确定性问数车道（定义行由下面的 `fn ` 判据跳过）。
         for (name, src) in [
+            ("main.rs", include_str!("main.rs")),
             ("xcx_api.rs", include_str!("xcx_api.rs")),
             ("mcp_api.rs", include_str!("mcp_api.rs")),
             ("deep_api.rs", include_str!("deep_api.rs")),
         ] {
-            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
-            for needle in &banned {
-                let offender = production.lines().enumerate().find(|(_, line)| {
-                    !line.trim_start().starts_with("//") && line.contains(needle)
-                });
-                assert!(
-                    offender.is_none(),
-                    "{name}:{} 又直连知识库（`{needle}`）—— 确定性问数成员一个都不跑，                     「线下-浏阳品元商贸有限公司」那一族当场复活",
-                    offender.map_or(0, |(i, _)| i + 1)
-                );
+            let production = super::production_only(src);
+            // 摘掉资料出口辅助函数的函数体（它们的名字改以调用点身份受判）
+            let mut production = production;
+            for helper in KB_EXIT_HELPERS {
+                if let Some(at) = production.find(helper) {
+                    let end = production[at..]
+                        .find("
+}")
+                        .map_or(production.len(), |off| at + off + 2);
+                    production.replace_range(at..end, "");
+                }
             }
-        }
-        // main.rs 里 `kb_answer` 只许出现在**定义**与两臂编排内部（流式那条探针之后），
-        // 不许成为某个 route 臂的直接出口。
-        let production = include_str!("main.rs").split("#[cfg(test)]").next().unwrap();
-        let arm_exit = [
-            "IntentRoute::Knowledge => {
-            let a = kb_",
-            "IntentRoute::Unknown => {
-            let a = kb_",
-        ];
-        for shape in arm_exit {
-            assert!(!production.contains(shape), "main.rs 的 route 臂又直连知识库了");
+            let production = production.as_str();
+            let code = |line: &&str| !line.trim_start().starts_with("//");
+            assert!(
+                !production.lines().filter(code).any(|line| line.contains(&never)),
+                "{name} 又长出「只问知识库」那条路"
+            );
+            for needle in &kb_calls {
+                for (at, _) in production.match_indices(needle.as_str()) {
+                    // 注释里复述调用名是允许的（要写清楚为什么），只判代码行
+                    let line_start = production[..at].rfind('\n').map_or(0, |i| i + 1);
+                    let head = production[line_start..at].trim_start();
+                    // 注释与**定义行**都不是调用点
+                    if head.starts_with("//") || head.contains("fn ") {
+                        continue;
+                    }
+                    // 🔴 回溯范围按**顶层条目**定，不用字符数魔数（第一版写 2000 字符，
+                    // 中间几段中文注释就把探针挤出了窗口 —— 判据自己会哑的又一种形态）。
+                    // 列 0 的右大括号 = 上一个顶层条目的收尾，其后就是当前这一个。
+                    let item_start = production[..at].rfind(item_boundary).map_or(0, |i| i + 2);
+                    let window = &production[item_start..at];
+                    assert!(
+                        window.contains(&probe),
+                        "{name} 的知识库调用（第 {} 行附近）没先探确定性问数车道 ——                         「线下-浏阳品元商贸有限公司」那一族当场复活",
+                        production[..at].lines().count()
+                    );
+                }
+            }
         }
         // 🔴 深度模式的**臂序**：知识臂必须在「转问数」之前。它是 fall-through 结构，
         // 一旦有人把知识臂挪到问数之后，「下载 押金转货款申请书」又会掉回 38 行账余表。
@@ -4067,7 +4178,8 @@ mod tests {
             ("mcp_api.rs", include_str!("mcp_api.rs")),
             ("deep_api.rs", include_str!("deep_api.rs")),
         ] {
-            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let production = super::production_only(src);
+            let production = production.as_str();
             // main.rs 里还留着**定义**（两臂编排内部的资料半仍要用它）：只禁调用点。
             let call_sites = production
                 .lines()
@@ -4119,7 +4231,8 @@ mod tests {
             ("mcp_api.rs", include_str!("mcp_api.rs")),
         ] {
             // 只扫**代码行**：注释里要写清楚判据去哪了、为什么，扫进去等于禁止解释
-            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let production = super::production_only(src);
+            let production = production.as_str();
             for needle in &needles {
                 let offender = production
                     .lines()
@@ -4156,7 +4269,8 @@ mod tests {
     #[test]
     fn both_ask_endpoints_share_one_arms_exit() {
         let src = include_str!("main.rs");
-        let production = src.split("#[cfg(test)]").next().unwrap();
+        let production = super::production_only(src);
+        let production = production.as_str();
         // 🔴 **不用计数判据**（本仓明确记过这笔账：上一版写成「出现 5 次」，
         // 一重构就得跟着改数字，而改数字的人不会去想为什么）。改成按 handler 判形状：
         // 两个 handler 各自必须有 `ask_arms_payload` 出口，且**都不许**有第二个出口形态。
@@ -4201,7 +4315,8 @@ mod tests {
             ("xcx_api.rs", include_str!("xcx_api.rs")),
             ("mcp_api.rs", include_str!("mcp_api.rs")),
         ] {
-            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let prod = super::production_only(src);
+            let prod = prod.as_str();
             assert!(
                 prod.contains("knowledge_arm_payload("),
                 "{name} 没用共享的纯资料分档 —— 又要各写各的了"

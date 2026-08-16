@@ -636,6 +636,19 @@ pub(crate) async fn ask_data_arm(
     let (trace_id, conv_id) = (&trace_id, &conv_id);
     // Router 一次问答只组一次：成员只持依赖引用、无 per-call 状态，复合拆解的每个子问
     // 共用同一表（原来每个子问都重建 7 个 Box）。
+    // 🔴 **破坏性红线在成员表之外判**（2026-08-16 对抗复核逮到）。
+    //
+    // 它此前只长在 `llm` 成员体内（`run.rs` 的 `prepared_data_safety_reply`），
+    // 而下面这行 `retain` 恰恰在合同不可执行时把那个成员摘掉 ——
+    // 于是「删除今天的订单」在合同 Invalid / 自报歧义 / mode=unknown 三档下
+    // **一次都不过红线**，只能指望六个确定性成员碰巧都不接、再落到本函数尾部的澄清卡。
+    // 「碰巧不接」不是安全保证：红线的成立与否不许取决于这一轮 fast 给了什么合同。
+    //
+    // 资料臂那侧本来就在编排层判（`hybrid` 的 destructive 判据），两处从此同源同层。
+    if let Some(reply) = prepared_data_safety_reply(&prepared.effective_question, prepared.started_at)
+    {
+        return Ok(reply);
+    }
     let mut members =
         router(d.embed, d.detect, d.compose_hit, d.direct_hit, d.sc_samples);
     if deterministic_fallback {
