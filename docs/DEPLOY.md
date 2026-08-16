@@ -7,7 +7,7 @@
 | 组件 | 形态 | 说明 |
 |---|---|---|
 | 元数据 PG | `docker/age`（postgres16 + Apache AGE + pgvector + pg_trgm） | 唯一可写库（注册表/知识库/会话/日志） |
-| 解析+向量服务 | `tools/embed_service.py`（Python 3.10+） | 文档解析（含扫描件 OCR 档）与 bge 向量化 |
+| 解析+向量+精排服务 | `tools/embed_service.py`（Python 3.10+） | 文档解析（含扫描件 OCR 档）+ 千问 `text-embedding-v4`(512维) 向量化 + `gte-rerank-v2` 精排 |
 | Rust API | `dms-ai-server`（容器或裸机 exe） | 问数/知识库/数据地图全部 API |
 | Web | `web/`（Vue3 构建产物，nginx 托管） | `docker/web` 有现成 nginx 配置 |
 | 业务源 | Doris（warehouse）/ DMS 生产 MySQL（production_lookup，仅只读点查） | 部署方提供只读账号 |
@@ -36,7 +36,7 @@ cp settings.example.json "$DMS_RUNTIME_ROOT/settings.docker.json"   # 容器部�
 .\scripts\run.ps1
 ```
 
-裸机 Linux（PG 仍走容器）：`docker compose -f docker/age/docker-compose.yml up -d`；embed 服务 `python3 tools/embed_service.py serve 8077`（模型自动下载，离线环境先备 `BAAI/bge-small-zh-v1.5`）。生产脚本显式使用 `python3`，不兼容仍把 `python` 指向 Python 2 的旧系统。
+裸机 Linux（PG 仍走容器）：`docker compose -f docker/age/docker-compose.yml up -d`；embed 服务 `python3 tools/embed_service.py serve <port> <bind>`（**生产是 systemd 单元 `dms-ai-embed`，绑 172.17.0.1:8078**，端口以 `settings.docker.json` 的 `service_url` 为准）。它现在是千问适配层，没有本地模型可下载，但**必须能读到千问 key**：单元里带 `DMSAI_SETTINGS=/opt/dms-ai/settings.docker.json`，并由 `sh -c` 现读 `.secret_key` 注入 `DMS_SECRET_KEY`。生产脚本显式使用 `python3`，不兼容仍把 `python` 指向 Python 2 的旧系统。
 
 知识库解析接口接收的是 `/kbdata/<doc_id>.<ext>` **路径，不是文件字节**，所以 Rust 容器和解析服务必须读取同一宿主目录：
 

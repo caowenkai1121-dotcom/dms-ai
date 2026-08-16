@@ -145,7 +145,7 @@ kernel ──► connector ──► policy ──┐
 | `ddl.rs` | 200 | **全仓唯一**的上传建表安全面：`SafeIdent` 白名单 + `ColType` 推断 + DDL 渲染 + `quote_literal`（knowledge 不得再有第二份） | 新增 |
 | `http.rs` | 70 | 出站 HTTP 共享底座：进程级 `reqwest::Client` + 最小熔断器（不放任何策略） | 新增 |
 | `llm.rs` | 205 | OpenAI 兼容 `ChatModel` 实现；参数全部请求级（升温重试不写回共享配置） | `llm.rs` 全文 |
-| `embed.rs` | 150 | bge 客户端：批量 + query/passage 双模式 + 3s 超时 + 300s 熔断；**实例而非全局单例** | `embed.rs` 全文 |
+| `embed.rs` | 150 | 向量客户端：批量 + query/passage 双模式 + 3s 超时 + 300s 熔断；**实例而非全局单例**。它不认识任何供应商 —— 模型在 `tools/embed_service.py` 那一层（2026-08-16 起是千问 `text-embedding-v4`@512） | `embed.rs` 全文 |
 | `doc.rs` | 190 | Python 文档服务客户端 `/parse`（返 `blocks` + **`sheets`**）`/chunk` `/health`；大文件 120s | 新增（K1） |
 | `graph.rs` | 200 | AGE 协议面：cypher 通道 + `esc/unquote` + 三个图查询 + `rebuild(nodes,edges)`；**查询要求 `&UnrestrictedProof`**（F2 同源） | `graph.rs:1-160` |
 
@@ -309,7 +309,7 @@ seeds/*.sql (11 个)                330   9 组 const 种子 + 32 表权限档�
 | knowledge 入口 | knowledge | `answer::answer(&KbCtx, question) -> Result<Answer>`；`Answerer` 适配器在 agent（反向边） |
 | `OwnedStore::pool()` | connector | 开放访问器，semantic 的 30+ 个 `&PgPool` 签名不动（`ponytail:` 标注这条靠 grep 而非类型守） |
 | 迁移 | 单 migrator | `0020_kb_init.sql` 放 `crates/semantic/migrations/`（两个 migrator 同表会 `VersionMissing` 启动失败；靠 `set_ignore_missing(true)` 绕开等于关掉「迁移被删」检测） |
-| chunk 尺寸 | knowledge | **400 token / 重叠 60**（bge-small-zh-v1.5 窗口 512；700 会让块尾被静默截断 → 症状是「检索时好时坏」而非报错，最难查） |
+| chunk 尺寸 | knowledge | **400 token / 重叠 60**（原因曾是 bge 的 512 窗口；2026-08-16 换千问后窗口远大于此，**这个数不跟着放大** —— 块大小是检索粒度，放大块会让引用定位变粗，要改另开一票并重算全部向量） |
 
 ---
 
