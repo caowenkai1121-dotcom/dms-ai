@@ -308,6 +308,10 @@ async fn generate(st: &AppState, today: NaiveDate) -> anyhow::Result<()> {
             supplemental: None,
             comparisons: None,
             sales_context: None,
+            // 🔴 21 行**每一行都是一个不同的指标**（昨日/当月累计 × 销售额/销量/收入/
+            // 成本/毛利额/毛利率…），不是排行榜的前几名。用默认的 5 行会把毛利、订单数、
+            // 当月累计整段静默蒸发，然后还让模型「总结…毛利、结构」——它只能就着剩下的编。
+            brief_rows: Some(rows.len()),
         };
         r.insight(&st.llm).await
     } else {

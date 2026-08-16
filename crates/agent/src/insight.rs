@@ -137,6 +137,14 @@ pub struct Reading<'a> {
     pub comparisons: Option<ReadingTable<'a>>,
     /// 与主指标同时间窗的成本、收入、毛利等经营补充，使用独立 CONTEXT 事实域。
     pub sales_context: Option<ReadingTable<'a>>,
+    /// 进 prompt 的数据行数上限。`None` = 用默认的 [`BRIEF_ROWS`]（5 行）。
+    ///
+    /// 🔴 存在的理由（2026-08-17 审计逮到）：默认的 5 行是给**排行/明细**这类
+    /// 「看头部就够」的结果定的。而经营日报递进来的 21 行**每一行都是一个不同的指标**
+    /// （昨日/当月累计 × 销售额/销量/收入/成本/毛利额/毛利率…），截到 5 行等于把
+    /// 毛利、订单数、当月累计整段**静默蒸发** —— 然后还让模型「总结…毛利、结构」，
+    /// 它只能就着剩下的 5 行编。行数不是「越多越好」，是**这张表是不是排行**。
+    pub brief_rows: Option<usize>,
 }
 
 impl Reading<'_> {
@@ -190,8 +198,9 @@ impl Reading<'_> {
         // 口径说明也进不可信段：它由 `self.sql` 派生，而按需端点上那条 SQL 是调用方回传的。
         // 代价是 `<`/`>` 会被 `esc` 转成 `&lt;`（`order_time < '…'` 读起来别扭），
         // 换来的是「回传的串永远进不了 prompt 的可信段」这条不用讨论的边界。
-        let mut hits = self.briefing_hits(BRIEF_ROWS);
-        let contract = self.answer_contract(BRIEF_ROWS);
+        let rows = self.brief_rows.unwrap_or(BRIEF_ROWS);
+        let mut hits = self.briefing_hits(rows);
+        let contract = self.answer_contract(rows);
         hits.push(hit(hits.len() + 1, "可引用事实合同", &contract.render()));
         let user = format!("{}\n原问题：{}\n\n请按要求解读：", wrap_untrusted(&hits), self.question);
         fast_guarded_checked(llm, &with_contract(SYSTEM), &user, &contract, "结果解读").await
@@ -675,6 +684,44 @@ fn clip(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 行数上限是「这张表是不是排行」的函数，不是一个常数（2026-08-17 审计）。
+    ///
+    /// 经营日报递进来 21 行，**每一行都是一个不同的指标**。默认的 5 行会把毛利、
+    /// 订单数、当月累计整段静默蒸发，然后还让模型「总结…毛利、结构」——
+    /// 它只能就着剩下的 5 行编。
+    #[test]
+    fn a_kpi_table_can_ask_for_all_of_its_rows_in_the_prompt() {
+        let columns = vec!["指标".to_string(), "值".to_string()];
+        let rows: Vec<Vec<Value>> = (0..21)
+            .map(|i| vec![Value::from(format!("指标{i}")), Value::from(i)])
+            .collect();
+        let base = Reading {
+            question: "经营日报",
+            sql: "SELECT 1",
+            columns: &columns,
+            rows: &rows,
+            row_count: rows.len(),
+            caliber_note: None,
+            supplemental: None,
+            comparisons: None,
+            sales_context: None,
+            brief_rows: None,
+        };
+        // 默认：只有前 BRIEF_ROWS 行进 prompt
+        let default_hits = base.briefing_hits(base.brief_rows.unwrap_or(BRIEF_ROWS));
+        let default_text = default_hits.iter().map(|h| h.text.clone()).collect::<String>();
+        assert!(default_text.contains("指标4"), "默认该有前 5 行");
+        assert!(!default_text.contains("指标20"), "默认不该有第 21 行：{default_text}");
+        // 显式要全量：21 行全进
+        let all = Reading { brief_rows: Some(rows.len()), ..base };
+        let all_text = all
+            .briefing_hits(all.brief_rows.unwrap_or(BRIEF_ROWS))
+            .iter()
+            .map(|h| h.text.clone())
+            .collect::<String>();
+        assert!(all_text.contains("指标20"), "要了全量就必须全进：{all_text}");
+    }
     use super::*;
 
     use dms_kernel::{BoxFut, ChatReply, LlmError};
@@ -737,6 +784,7 @@ mod tests {
             supplemental: None,
             comparisons: None,
             sales_context: None,
+            brief_rows: None,
         }
     }
 
@@ -1088,6 +1136,7 @@ mod tests {
             supplemental: None,
             comparisons: None,
             sales_context: None,
+            brief_rows: None,
         };
 
         assert!(
@@ -1132,6 +1181,7 @@ mod tests {
             supplemental: None,
             comparisons: None,
             sales_context: None,
+            brief_rows: None,
         };
         let llm = Sequence { calls: std::sync::atomic::AtomicUsize::new(0) };
         assert_eq!(reading.insight(&llm).await.as_deref(), Some("实际销售额为80万元。"));
@@ -1170,6 +1220,7 @@ mod tests {
             sales_context: Some(ReadingTable {
                 columns: &context_columns, rows: &context_rows, row_count: 1,
             }),
+            brief_rows: None,
         };
         let contract = reading.answer_contract(DEEP_ROWS);
 

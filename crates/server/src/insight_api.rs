@@ -88,6 +88,8 @@ fn reading_of<'a>(
         supplemental: extras.supplemental,
         comparisons: extras.comparisons,
         sales_context: extras.sales_context,
+        // 通用解读入口：结果多半是排行/明细，看头部就够，用默认行数
+        brief_rows: None,
     }
 }
 
