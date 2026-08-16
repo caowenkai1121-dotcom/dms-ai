@@ -1377,7 +1377,7 @@ const OUT_OF_SCOPE_ROUTES: &[&str] = &["direct-derive", "llm", "llm+repair", "ll
 ///   各城市本月销售额   → 同上，拒答理由是「库里没有」，其实是没登记。
 /// 探针读的是**真数据**，新增取值自动跟上 —— 比再维护一张词表可靠。
 /// 组织口径排在行政口径前：老问法（省区/战区）不受影响。
-const PROBE_DIMS: [dms_semantic::sales_fact::Dimension; 5] = [
+const PROBE_DIMS: [dms_semantic::sales_fact::Dimension; 9] = [
     dms_semantic::sales_fact::Dimension::WarZone,
     dms_semantic::sales_fact::Dimension::Region,
     dms_semantic::sales_fact::Dimension::State,
@@ -1388,6 +1388,23 @@ const PROBE_DIMS: [dms_semantic::sales_fact::Dimension; 5] = [
     // `sf.class2` 那 39 个「…系列」取值在 Rust 侧一个落点都没有，
     // 而分组口径（「各商品分类销量」）仍旧 fail-closed：Category 不进 `DIMENSIONS`。
     dms_semantic::sales_fact::Dimension::Category,
+    // 🔴 商品/客户四维（2026-08-16 生产度量逼出来的）：
+    //
+    //   QY-HJXHPSDTP600G          → need-intent 白拒（事实表里明明有这个 skucode）
+    //   牛油蛋挞皮600g本月销量      → 「不可计算·未能识别的限定「牛油蛋挞皮g」」
+    //
+    // 实体卡查的是 `t_goods`（2883 行），而事实表用的是**另一套编码空间**
+    //（`QY-HJXHPSDTP600G` 这种业务码），`DW.dim_sku` 又是第三套（5325 行，14 位数字）。
+    // 与其登记「哪一套才算商品编码」，不如让**事实表自己当成员值的事实源** ——
+    // 与地域四维、商品分类同一个机制：读真数据，新增取值自动跟上。
+    //
+    // 排在最后：地域/分类先探，撞名时它们优先（与「战区先于省区」同一纪律）。
+    // 安全面：本探针只在问句**带指标**时才跑（`sales_contract_metrics` 非空），
+    // 所以裸客户名/裸商品名照旧走实体卡，不会被这四维抢走。
+    dms_semantic::sales_fact::Dimension::SkuCode,
+    dms_semantic::sales_fact::Dimension::Goods,
+    dms_semantic::sales_fact::Dimension::CustomerCode,
+    dms_semantic::sales_fact::Dimension::Customer,
 ];
 
 /// 换文案判据（纯函数，故有单测）：空结果 + route 在圈内 + 无既有风险标注
@@ -1418,6 +1435,23 @@ fn hanzi_count(s: &str) -> usize {
 /// 滤数字/空白/标点」的公共残渣流水线：`out_of_scope_topic` 与 `value_word_residue` 共用，
 /// 剥法两份必漂。「够不够一个词」（汉字 ≥2）留给调用方判 —— 出界主题在判定前还要剥方位词尾。
 fn residue_after_strip(question: &str, consumed: &[&'static str]) -> String {
+    residue_after_strip_with(question, consumed, false)
+}
+
+/// 🔴 `keep_digits`（2026-08-16 生产度量逼出来的）：**值探针必须保留数字**。
+///
+/// 「牛油蛋挞皮600g本月销量」剥完指标与时间后残留 `牛油蛋挞皮600g`，
+/// 数字过滤器把它削成 `牛油蛋挞皮g` —— 拿这个串去探 `sf.skuname` 必不中，
+/// 于是一件事实表里明明有的商品被答成「不可计算·未能识别的限定「牛油蛋挞皮g」」。
+/// 规格数字是商品名的一部分，编码更是整串数字/字母混编。
+///
+/// 出界主题那一侧照旧滤掉数字（`residue_after_strip`）：那条判据要的是
+/// 「还剩不剩一个**主题词**」，纯数字不算残留是它刻意的。
+fn residue_after_strip_with(
+    question: &str,
+    consumed: &[&'static str],
+    keep_digits: bool,
+) -> String {
     let mut s = question.to_string();
     // 词长先算好再排（`sort_by_key` 的比较器会按比较次数重算 key）
     let mut consumed: Vec<(usize, &'static str)> =
@@ -1430,7 +1464,9 @@ fn residue_after_strip(question: &str, consumed: &[&'static str]) -> String {
         s = s.replace(w, "");
     }
     s.chars()
-        .filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && !PUNCT_CHARS.contains(*c))
+        .filter(|c| {
+            (keep_digits || !c.is_ascii_digit()) && !c.is_whitespace() && !PUNCT_CHARS.contains(*c)
+        })
         .collect()
 }
 
@@ -1799,8 +1835,15 @@ fn value_word_residue(
         consumed.extend(m.aliases().iter().copied());
         consumed.extend(crate::run::sales_metric_extra_words(*m).iter().copied());
     }
-    let s = residue_after_strip(question, &consumed);
-    if hanzi_count(&s) < 2 {
+    let s = residue_after_strip_with(question, &consumed, true);
+    // 🔴 两档都要放行（2026-08-16 生产度量）：
+    // ① 「够一个词」的中文值（≥2 汉字）—— 原判据；
+    // ② **标识符形**：≥6 位的字母数字混编（`QY-HJXHPSDTP600G` 这类事实表商品编码）。
+    //    只按汉字数判会把整个编码族挡在探针之外 —— 而编码恰恰是最不含糊的过滤值。
+    let identifier_like = s.chars().count() >= 6
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && s.chars().any(|c| c.is_ascii_digit());
+    if hanzi_count(&s) < 2 && !identifier_like {
         return None;
     }
     Some(s)
@@ -1826,6 +1869,10 @@ fn dimension_probe_values(dim: dms_semantic::sales_fact::Dimension, word: &str) 
             | Dimension::State
             | Dimension::City
             | Dimension::Category
+            | Dimension::SkuCode
+            | Dimension::Goods
+            | Dimension::CustomerCode
+            | Dimension::Customer
     ));
     // 分类值的维度词在**前缀**位（「商品分类烤肠系列」），与地域值的词尾位相反。
     // 🔴 词表直接借 `ENTITY_PREFIXES` 里 `Kind::Category` 那四条（`category_noun_heads()`）——
@@ -1983,6 +2030,7 @@ fn build_dimension_value_hit(
     }
     // 🔴 证据要按维度分档（2026-08-16 加 Category 时兑现）：不许把商品分类值报成 Region。
     debug_assert!(PROBE_DIMS.contains(&dim), "探针维度表变了，证据分档要跟着改");
+    // 地域四维报 Region，其余（商品分类 / 商品 / 客户）报 Entity —— 见下面 else 支的红字
     if matches!(
         dim,
         dms_semantic::sales_fact::Dimension::WarZone
@@ -2057,6 +2105,21 @@ mod dimension_hit_evidence_tests {
             super::dimension_probe_values(Dimension::Region, "商品分类烤肠系列"),
             vec!["商品分类烤肠系列".to_string(), "商品分类烤肠系列省区".to_string()],
         );
+        // 🔴 商品/客户四维：值原样进探针，不补任何后缀（2026-08-16）。
+        // 事实表的商品编码是 `QY-HJXHPSDTP600G` 这种业务码，规格数字是名字的一部分 ——
+        // 补后缀或削数字都会让探针必不中。
+        for (dim, word) in [
+            (Dimension::SkuCode, "QY-HJXHPSDTP600G"),
+            (Dimension::Goods, "牛油蛋挞皮600g"),
+            (Dimension::CustomerCode, "180524"),
+            (Dimension::Customer, "线下-东莞市常平正一冷冻食品销售行"),
+        ] {
+            assert_eq!(
+                super::dimension_probe_values(dim, word),
+                vec![word.to_string()],
+                "{word} 的探针候选被改写了"
+            );
+        }
         // 空成员值不许装配成谓词
         assert!(super::build_dimension_value_hit(
             "本月销售额",
@@ -3285,6 +3348,25 @@ mod tests {
 
     /// 【问题 2】值词残留提取：剥指标词/虚词后剩下的整串才是候选过滤值。
     /// 判官原案「直营上月销售额」→ 候选「直营」；客户名族原样保留（委托内层探主档）。
+    #[test]
+    fn residue_keeps_digits_for_value_probes() {
+        // 🔴 生产度量（2026-08-16）：「牛油蛋挞皮600g本月销量」剥完指标与时间后
+        // 残留 `牛油蛋挞皮600g`，数字过滤器把它削成 `牛油蛋挞皮g` ——
+        // 拿它去探 `sf.skuname` 必不中，于是事实表里明明有的商品被答成
+        // 「不可计算·未能识别的限定「牛油蛋挞皮g」」。
+        let q = "牛油蛋挞皮600g本月销量";
+        let residue = super::value_word_residue(q, &crate::run::sales_contract_metrics(q))
+            .expect("带规格的商品名必须能进探针");
+        assert!(residue.contains("600"), "规格数字被削掉了：{residue}");
+        // 标识符形（纯 ASCII、零汉字）也要放行 —— 编码是最不含糊的过滤值
+        let code_q = "QY-HJXHPSDTP600G本月销量";
+        let code = super::value_word_residue(code_q, &crate::run::sales_contract_metrics(code_q))
+            .expect("商品编码必须能进探针");
+        assert!(code.contains("QY-HJXHPSDTP600G"), "{code}");
+        // 出界主题那一侧照旧滤数字（两条判据要的东西不同，不许合并）
+        assert!(!super::residue_after_strip("本月销售额600g", &[]).contains("600"));
+    }
+
     #[test]
     fn value_word_residue_extracts_the_filter_candidate() {
         let residue =
