@@ -172,7 +172,23 @@ fn parse_subs(r: &str) -> Vec<String> {
 /// 所以它只经 `wrap_untrusted` 进 prompt，简报装配与包裹都用 `insight` 那一份。
 fn sub_hit(i: usize, sub: &SubResult) -> Hit {
     let r = &sub.result;
-    insight::hit(i, &sub.question, &insight::brief(&r.columns, &r.rows, r.row_count))
+    let mut body = insight::brief(&r.columns, &r.rows, r.row_count);
+    // 🔴 **子结果的口径警示要跟着数一起进 prompt**（2026-08-17 审计逮到）。
+    //
+    // 面板上那条「这个数不可信 / 口径复核未通过」挂在 `caliber_note` 与 `trust.level`
+    // 上，而汇总步只喂了 `brief`（列名 + 行）。于是页面一边挂着警示、
+    // 下面那段 AI 综合一边拿它当结论下判断 —— 两个出口自相矛盾，
+    // 而用户更可能读那段流畅的中文，不是那行小字。
+    if let Some(note) = r.caliber_note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        body.push_str("
+⚠️ 口径提示：");
+        body.push_str(note);
+    }
+    if r.trust.as_ref().is_some_and(|t| t.level == "review") {
+        body.push_str("
+⚠️ 本子结果未通过完整性/值级核验，下结论时必须说明它需要复核。");
+    }
+    insight::hit(i, &sub.question, &body)
 }
 
 /// 汇总步（fast LLM）。**失败一律 `None`**：拿不到结论不能连子结果一起丢
@@ -335,6 +351,31 @@ pub async fn hybrid_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 子结果的口径警示必须跟着数一起进汇总 prompt（2026-08-17 审计）。
+    ///
+    /// 面板上挂着「这个数不可信」，下面那段 AI 综合照样拿它下结论 ——
+    /// 两个出口自相矛盾，而用户更可能读那段流畅的中文，不是那行小字。
+    #[test]
+    fn a_sub_results_caliber_warning_travels_with_its_numbers() {
+        let mut flagged = AskResult::compound(vec![], 0);
+        flagged.route = "llm+repair".into();
+        flagged.columns = vec!["销售额".into()];
+        flagged.rows = vec![vec![serde_json::Value::from("1")]];
+        flagged.row_count = 1;
+        flagged.caliber_note = Some("口径复核未通过：指标声明与取数列不符".into());
+        let sub = SubResult { question: "本月销售额".into(), result: flagged };
+        let hit = sub_hit(1, &sub);
+        assert!(hit.text.contains("口径复核未通过"), "口径警示没跟着数走：{}", hit.text);
+
+        // 反面（防恒真）：干净的子结果不许平白多一行警示
+        let mut clean = AskResult::compound(vec![], 0);
+        clean.columns = vec!["销售额".into()];
+        clean.rows = vec![vec![serde_json::Value::from("1")]];
+        clean.row_count = 1;
+        let ok = SubResult { question: "本月销售额".into(), result: clean };
+        assert!(!sub_hit(1, &ok).text.contains("口径提示"), "干净结果不该多话");
+    }
 
     /// 复合容器自己没有行、没有 comparisons —— 数都在子结果里。
     /// 不下沉的后果是生产实测过的那句：综合写「取数结果未提供任何数据」，
