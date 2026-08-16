@@ -343,6 +343,41 @@ pub fn warehouse_sales_fact_predicated(
         Some(_) => return None,
         None => (limit, None),
     };
+    // 🔴 合成兜底桶不占名次，但必须被说出来（2026-08-16）。
+    // 「本月销售额最高的城市」此前答「未知」—— 那一桶本月 4618 万，是排行榜第一名。
+    // 它不是一个地方，是「这些行没登记城市」。
+    //
+    // 口径裁决：**排行/极值**问句的名次只发给真实成员；无限定的「各城市销售额」是分布问题，
+    // 那一桶照旧留在表里（用户看得见全貌，不会把它误当榜首）。
+    // 只排不说 = 静默隐藏数据缺口，本仓不许 —— 所以同时装一条说明行走 `detail` 通道。
+    // ponytail: 只处理**唯一**类别维度；多维排行「哪一桶」说不清楚，原样放过（已知天花板）。
+    let bucket_dimension = ranking
+        .then(|| {
+            let categorical = dimensions
+                .iter()
+                .copied()
+                .filter(|dimension| !matches!(dimension, Dimension::Month | Dimension::OrderDate))
+                .collect::<Vec<_>>();
+            match categorical.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            }
+        })
+        .flatten()
+        .filter(|dimension| dimension.unregistered_bucket().is_some());
+    // 说明行：与主查询同一时间窗、同一批既有谓词，只把维度换成「只取这一桶」。
+    // **必须在 push 排除谓词之前**克隆 —— 靠 `pop()` 还原是依赖顺序的写法，改一行就漂。
+    let bucket_note = bucket_dimension.map(|dimension| {
+        let mut with_bucket = predicates.clone();
+        with_bucket.push(dms_semantic::sales_fact::Predicate::eq(
+            dimension,
+            dimension.unregistered_bucket().expect("已 filter 过"),
+        ));
+        sales_fact_sql(&metrics, &[dimension], &begin, &end, &with_bucket, None, Some(1), None)
+    });
+    if let Some(dimension) = bucket_dimension {
+        predicates.extend(dms_semantic::sales_fact::Predicate::excluding_unregistered(dimension));
+    }
     let sql = sales_fact_sql(
         &metrics,
         &dimensions,
@@ -380,7 +415,11 @@ pub fn warehouse_sales_fact_predicated(
         })
         .into_iter()
         .collect();
-    let detail = scalar.then(|| dms_semantic::sales_fact::detail_sql(&begin, &end, &predicates, 100));
+    // 排行的说明行与标量的明细走同一条 `detail` 通道（前端「补充数据」区已经在渲染，
+    // 零新增字段、零协议改动）。两者互斥：`scalar` ⇒ 无维度 ⇒ `bucket_dimension` 恒 None。
+    let detail = scalar
+        .then(|| dms_semantic::sales_fact::detail_sql(&begin, &end, &predicates, 100))
+        .or(bucket_note);
     // 同窗补充（裁决：销售类单指标 KPI 顺带成本/收入/毛利额/毛利率）：与主查询**同一时间窗、
     // 同一批谓词**，一条 SQL 取齐五值。仅标量命中挂它 —— 维度拆解/多指标的主结果自带这些列。
     let sales_context = scalar.then(|| {

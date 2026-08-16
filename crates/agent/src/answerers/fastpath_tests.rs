@@ -761,6 +761,36 @@ mod tests {
         assert!(try_direct("昨天有哪些设备").is_none(), "泛设备名词不能误认成设备订单");
     }
 
+    /// 排行的名次只发给真实成员；被排掉的那一桶必须在同一个答案里说出来。
+    ///
+    /// 🔴 由来（2026-08-15 生产直打）：「本月销售额最高的城市」答「未知」——
+    /// `COALESCE(NULLIF(sf.city,''),…)` 造出来的兜底桶本月 4618 万，排行第一。
+    /// 它不是一个地方，是「这些行没登记城市」。只排不说 = 静默隐藏数据缺口，本仓不许。
+    #[test]
+    fn ranking_excludes_the_synthetic_bucket_and_still_reports_it() {
+        let hit = warehouse_sales_fact("本月销售额最高的城市").expect("必须命中");
+        assert!(
+            hit.sql.contains("COALESCE(NULLIF(sf.city,''),'未登记城市') <> '未登记城市'"),
+            "{}",
+            hit.sql
+        );
+        assert!(hit.sql.contains("LIMIT 1"), "{}", hit.sql);
+        let note = hit.detail.expect("被排除的那一桶必须单独说出来");
+        assert!(
+            note.contains("COALESCE(NULLIF(sf.city,''),'未登记城市') = '未登记城市'"),
+            "{note}"
+        );
+        // 说明行与主查询同一时间窗、同一批既有谓词，两者恰好互补 = 全量，不重不漏
+        assert!(note.contains("sf.order_date >= DATE_FORMAT(CURDATE(),'%Y-%m-01')"), "{note}");
+        // 反向：分布问句不排除，桶留在表里（那是分布问题，用户看得见全貌），也不挂说明行
+        let all = warehouse_sales_fact("各城市本月销售额").expect("必须命中");
+        assert!(!all.sql.contains("<>") && all.detail.is_none(), "{}", all.sql);
+        // 标量（无维度）不受影响：明细通道仍是明细
+        let scalar = warehouse_sales_fact("本月销售额是多少").expect("必须命中");
+        assert!(!scalar.sql.contains("<>"), "{}", scalar.sql);
+        assert!(scalar.detail.is_some_and(|d| !d.contains("未登记")), "标量明细不该变成说明行");
+    }
+
     /// 序数排名要**真答**：第 N 名 = `LIMIT 1 OFFSET N-1`，不是一张 200 行的榜。
     ///
     /// 🔴 由来（2026-08-15 生产直打 + 复验 2/2）：「本月销售额排名第二的客户」返回

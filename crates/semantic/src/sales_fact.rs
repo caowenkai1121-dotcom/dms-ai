@@ -377,8 +377,27 @@ impl Dimension {
             Self::WarZone => "COALESCE(NULLIF(sf.war_zone,''),'未归属')",
             Self::Region => "COALESCE(NULLIF(sf.region,''),'未归属')",
             Self::State => "COALESCE(NULLIF(sf.state,''),'未知')",
-            Self::City => "COALESCE(NULLIF(sf.city,''),'未知')",
+            // 🔴 「未登记城市」不是「未知」（2026-08-16）：兜底桶要自解释。
+            // 「未知」既能读成「有个城市叫未知」也能读成「系统不知道」，
+            // 而这一桶本月 4618 万、排行第一 —— 用户看到「销售额最高的城市：未知」
+            // 只会以为系统坏了。只改 City 一处，其余维度这次不动。
+            Self::City => "COALESCE(NULLIF(sf.city,''),'未登记城市')",
             Self::Month => "DATE_FORMAT(sf.order_date,'%Y-%m')",
+        }
+    }
+
+    /// `expression()` 的 COALESCE 兜底字面量 —— 也就是「这些行没登记该维度」被合成出来的
+    /// 那个**假成员**。`None` = 该维度没有兜底（日期/月份）。
+    /// 🔴 与 `expression()` 逐字耦合，由 `unregistered_bucket_is_the_expression_fallback` 钉住。
+    /// 穷举 match 不写 `_`：将来加维度时编译期强制表态。
+    pub const fn unregistered_bucket(self) -> Option<&'static str> {
+        match self {
+            Self::OrderDate | Self::Month => None,
+            Self::WarZone | Self::Region => Some("未归属"),
+            Self::CustomerCode | Self::Customer | Self::SkuCode | Self::Goods | Self::State => {
+                Some("未知")
+            }
+            Self::City => Some("未登记城市"),
         }
     }
 
@@ -416,6 +435,20 @@ impl Predicate {
         // INSTR 而不是 LIKE ESCAPE：Doris 不支持 ESCAPE 子句（实测 1105 语法错误），
         // 且子串语义本就是字面的（%/_ 不再特殊），两种方言同形。
         Self(format!("INSTR({}, {}) > 0", dimension.expression(), quote(value)))
+    }
+
+    /// 排除合成兜底桶。排行榜的名次只发给真实成员：`COALESCE(…,'未登记城市')` 造出来的
+    /// 那一桶是「这些行没登记该维度」，让它占第一名 = 把「没登记」答成一个地方
+    /// （实测「本月销售额最高的城市」答「未知」，那一桶 4618 万）。
+    /// 🔴 调用方必须同时把这一桶**单独说出来**，否则就成了静默隐藏数据缺口 ——
+    /// 本仓不许把「没登记」讲成「库里没有」。
+    /// 反向的「只取这一桶」直接用 `eq(dim, dim.unregistered_bucket()?)`，不另造构造器。
+    pub fn excluding_unregistered(dimension: Dimension) -> Option<Self> {
+        Some(Self(format!(
+            "{} <> {}",
+            dimension.expression(),
+            quote(dimension.unregistered_bucket()?)
+        )))
     }
 
     /// 多值谓词。调用方保证 values 非空、无重复、无空串元素（`IN ('')` 恒不命中，
@@ -766,6 +799,36 @@ pub fn detail_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 兜底桶登记表与 `expression()` 必须逐字对齐 —— 对不上就会拼出一条永假的排除谓词
+    /// （排行榜照旧被合成桶占第一名，而且看不出哪里错了）。
+    #[test]
+    fn unregistered_bucket_is_the_expression_fallback() {
+        for &dimension in DIMENSIONS
+            .iter()
+            .chain([Dimension::State].iter())
+        {
+            match dimension.unregistered_bucket() {
+                Some(bucket) => assert!(
+                    dimension.expression().ends_with(&format!(",'{bucket}')")),
+                    "{} 的兜底桶与表达式对不上：{}",
+                    dimension.name(),
+                    dimension.expression()
+                ),
+                None => assert!(
+                    !dimension.expression().contains("COALESCE"),
+                    "{} 有兜底却没登记",
+                    dimension.name()
+                ),
+            }
+        }
+        // 排除谓词与「只取这一桶」恰好互补：主查询 + 说明行 = 全量，不重不漏
+        let excluded = Predicate::excluding_unregistered(Dimension::City).unwrap();
+        let only = Predicate::eq(Dimension::City, Dimension::City.unregistered_bucket().unwrap());
+        assert_eq!(excluded.0, only.0.replace(" = ", " <> "));
+        // 日期/月份没有兜底，构造不出排除谓词
+        assert!(Predicate::excluding_unregistered(Dimension::Month).is_none());
+    }
 
     #[test]
     fn cross_database_schema_enrichment_is_complete_and_idempotent() {
