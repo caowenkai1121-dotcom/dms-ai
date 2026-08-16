@@ -378,45 +378,54 @@ fn year_month_surface(question: &str) -> Option<String> {
 ///
 /// 只认唯一省名；省名若只是已探明客户名的一部分则不解释为区域。无法唯一解释时返回 Err，
 /// 调用方必须 fail closed，不能把省份限定丢掉后查询全国数据。
+/// 问句里的地域限定 → `(已消化的表面词, region/state 谓词)`。
+///
+/// 返回 `Vec<String>` 而不是一个 `String`：多值枚举（「山东省区和河南省区本月销售额」）
+/// 要把**每一个**值的表面词都交回去当消化词。取「首尾命中之间的整段子串」那种免改签名的
+/// 写法不行 —— 那会把中间没兑现的限定（「长沙」之类）一起吞掉，正是静默丢限定。
 pub fn sales_fact_province_filter(
     question: &str,
     customer: Option<&str>,
-) -> Result<Option<(String, crate::sales_fact::Predicate)>, ()> {
+) -> Result<Option<(Vec<String>, crate::sales_fact::Predicate)>, ()> {
     use crate::sales_fact::{Dimension, Predicate};
 
     // 用户直接说出 region 的取值本身（「西北大区」「线下私域」…）：这一支在省名扫描
     // **之前**，因为「川渝藏大区」里含「川」这类省名字样，先扫省名会把它拆错。
     // 出现两个不同取值 = 多区域比较，与多省同一纪律：不猜、不静默放宽成全国。
     {
-        let mut direct: Option<&'static str> = None;
+        let mut direct: Vec<&'static str> = Vec::new();
         for value in crate::warehouse_catalog::DIRECT_REGION_VALUES {
-            if !question.contains(*value) {
-                continue;
+            if question.contains(*value) && !direct.contains(value) {
+                direct.push(value);
             }
-            if direct.is_some_and(|existing| existing != *value) {
-                return Err(());
-            }
-            direct = Some(value);
         }
-        if let Some(value) = direct {
-            let predicate = Predicate::one_of(Dimension::Region, &[value]).expect("固定非空");
-            return Ok(Some((value.to_string(), predicate)));
+        if !direct.is_empty() {
+            let mut consumed: Vec<String> = direct.iter().map(|v| (*v).to_string()).collect();
+            consumed.extend(enumeration_separators(question, direct.len()));
+            let predicate = Predicate::one_of(Dimension::Region, &direct).expect("固定非空");
+            return Ok(Some((consumed, predicate)));
         }
     }
 
-    let mut hit: Option<(&'static str, String)> = None;
+    let mut hits: Vec<(&'static str, String)> = Vec::new();
     for &(_code, name) in crate::present::PROVINCE_LABELS {
         if !question.contains(name) || customer.is_some_and(|entity| entity.contains(name)) {
             continue;
         }
         // 长形态在前，确保「广西壮族自治区」不会只消化成「广西」。同时容忍用户常见的
         // “省/市/自治区”写法；裸省名仅在残留守卫确认其余限定都已兑现后才会放行。
+        // 🔴 「{name}省区」「{name}战区」必须排在「{name}省」**之前**（长形态优先，这张表既有的纪律）：
+        // 否则「山东省区和河南省区…」只消化掉「山东省」「河南省」，剩两个孤字「区」被残留守卫
+        // 判成实义残留、整条拒答 —— 而「省区」这个词已经被维度词消化过一次，补不回来。
         let phrases = [
             format!("{name}壮族自治区"),
             format!("{name}回族自治区"),
             format!("{name}维吾尔自治区"),
             format!("{name}特别行政区"),
             format!("{name}自治区"),
+            format!("{name}省区"),
+            format!("{name}战区"),
+            format!("{name}大区"),
             format!("{name}省"),
             format!("{name}市"),
             name.to_string(),
@@ -424,19 +433,27 @@ pub fn sales_fact_province_filter(
         let Some(phrase) = phrases.into_iter().find(|phrase| question.contains(phrase)) else {
             continue;
         };
-        if hit.as_ref().is_some_and(|(existing, _)| *existing != name) {
-            return Err(()); // 多省比较不是单省过滤；不猜、不静默放宽成全国。
-        }
-        hit = Some((name, phrase));
+        hits.push((name, phrase));
     }
 
-    let Some((name, consumed)) = hit else {
+    if hits.is_empty() {
         return Ok(None);
-    };
+    }
+    // 单值时保持原样；多值枚举（「山东省区和河南省区」）拼一条 region IN。
+    let multi = hits.len() > 1;
+    let mut values: Vec<String> = Vec::new();
+    let mut consumed: Vec<String> = Vec::new();
+    for (name, phrase) in &hits {
+        let name = *name;
     let business_region = crate::warehouse_catalog::shop_business_region_for_province(name)
         .ok_or(())?;
     let conventional_region = format!("{name}省区");
     if business_region != conventional_region {
+        // 非 1:1 那一档走 state 的 INSTR 子串，混不进一条 region IN；
+        // 和 1:1 的省混着枚举就是两种口径拼一个 WHERE，不猜。
+        if multi {
+            return Err(());
+        }
         // 🔴 省区与行政省**不是一回事**（2026-08-15 生产直打逮到的一整族倍数级错答）：
         //   海南省 → region='广东省区'（含广东 494.8 万 + 海南 46.1 万）→ 高估 11.7 倍
         //   上海市 → region='浙江省区'                                  → 高估 3.8 倍
@@ -456,17 +473,34 @@ pub fn sales_fact_province_filter(
         // 而 state 存官方全称（海南省/新疆维吾尔自治区/内蒙古自治区）。短名是全称的
         // 唯一前缀，省名之间互不为子串（河南≠海南≠湖南、山西≠陕西），INSTR 不会误中。
         let predicate = Predicate::contains(Dimension::State, name);
-        return Ok(Some((consumed, predicate)));
+        return Ok(Some((vec![phrase.clone()], predicate)));
     }
-    let values = vec![
-        format!("{name}省区"),
-        format!("{name}战区"),
-        format!("{name}大区"),
-        name.to_string(),
-    ];
+        values.extend([
+            format!("{name}省区"),
+            format!("{name}战区"),
+            format!("{name}大区"),
+            name.to_string(),
+        ]);
+        consumed.push(phrase.clone());
+    }
+    consumed.extend(enumeration_separators(question, hits.len()));
     let refs = values.iter().map(String::as_str).collect::<Vec<_>>();
     let predicate = Predicate::one_of(Dimension::Region, &refs).expect("省区候选固定非空");
     Ok(Some((consumed, predicate)))
+}
+
+/// 多值枚举的分隔符也要进消化词表：「和」「与」在 `STRIP_WORDS` 里、「、」被标点过滤器吃掉，
+/// 但「跟」两处都没有 —— 不并进来，「山东省区跟河南省区…」照旧被残留守卫整条拒。
+/// 单值时返回空（一个字的消化面都不扩）。
+fn enumeration_separators(question: &str, hits: usize) -> Vec<String> {
+    if hits < 2 {
+        return Vec::new();
+    }
+    ["和", "与", "跟", "、", "以及", "还有"]
+        .iter()
+        .filter(|word| question.contains(**word))
+        .map(|word| (*word).to_string())
+        .collect()
 }
 
 
@@ -519,7 +553,7 @@ mod range_surface_tests {
         ] {
             let (consumed, predicate) =
                 sales_fact_province_filter(q, None).expect("不该 Err").expect("该认出来");
-            assert_eq!(consumed, want, "{q}");
+            assert_eq!(consumed, vec![want.to_string()], "{q}");
             let sql = format!("{predicate:?}");
             assert!(sql.contains(want), "{q} → {sql}");
         }
@@ -527,10 +561,42 @@ mod range_surface_tests {
         let (_, p) = sales_fact_province_filter("山东省本月销售额", None).unwrap().unwrap();
         let sql = format!("{p:?}");
         assert!(sql.contains("山东省区") && sql.contains("山东战区"), "{sql}");
-        // 两个不同大区 = 多区域比较，不猜
-        assert!(sales_fact_province_filter("西北大区和线下私域本月销售额", None).is_err());
+        // 🔴 两个大区不再是「不猜」而是**枚举**（2026-08-16）：单值路径本来就走 `Predicate::one_of`，
+        // 拒答只是因为扫描器命中第二个值时直接 Err。分隔符要一起消化，否则残留守卫照旧拒。
+        let (consumed, p) =
+            sales_fact_province_filter("西北大区和线下私域本月销售额", None).unwrap().unwrap();
+        let sql = format!("{p:?}");
+        assert!(sql.contains("西北大区") && sql.contains("线下私域") && sql.contains(" IN ("), "{sql}");
+        assert!(consumed.contains(&"和".to_string()), "分隔符要进消化词表：{consumed:?}");
         // 未登记的大区名照旧不认（让它去走「未确认限定」）
         assert!(sales_fact_province_filter("华东区本月销售额", None).unwrap().is_none());
+    }
+
+    /// 多省枚举：单值路径本来就支持 IN 列表，拒答只是扫描器命中第二个省就 Err。
+    ///
+    /// 🔴 三处承重（少一处就整条白拒）：省区/战区长形态要排在「{name}省」之前
+    /// （否则「山东省区」只消化掉「山东省」，剩一个孤字「区」）；分隔符要进消化词表
+    /// （「跟」既不在 STRIP_WORDS 也不是标点）；1:1 与非 1:1 两种口径不许混着枚举。
+    #[test]
+    fn provinces_enumerated_become_one_in_list() {
+        let (consumed, p) =
+            sales_fact_province_filter("山东省区和河南省区本月销售额", None).unwrap().unwrap();
+        let sql = format!("{p:?}");
+        assert!(sql.contains("'山东省区'") && sql.contains("'河南省区'") && sql.contains(" IN ("), "{sql}");
+        for want in ["山东省区", "河南省区", "和"] {
+            assert!(consumed.contains(&want.to_string()), "{want} 该被消化：{consumed:?}");
+        }
+        // 「跟」不在 STRIP_WORDS 也不是标点，只有这里能消化它
+        let (consumed, _) =
+            sales_fact_province_filter("山东省区跟河南省区本月销售额", None).unwrap().unwrap();
+        assert!(consumed.contains(&"跟".to_string()), "{consumed:?}");
+        // 🔴 1:1（山东省→山东省区）与非 1:1（海南省→广东省区，region 是行政省的超集）
+        // 两种口径混着枚举 = 一个 WHERE 里两套口径，仍旧不猜。
+        assert!(sales_fact_province_filter("山东省和海南省本月销售额", None).is_err());
+        // 单值仍走 state 精确过滤那一档，不许被多值改动带偏
+        let (consumed, p) = sales_fact_province_filter("海南省本月销售额", None).unwrap().unwrap();
+        assert!(format!("{p:?}").contains("INSTR"), "{p:?}");
+        assert_eq!(consumed, vec!["海南省".to_string()]);
     }
 
     /// 两个 ISO 日期的区间：跨度必须**整段**取出来。

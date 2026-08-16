@@ -1200,8 +1200,10 @@ pub fn ");
                 .unwrap_or_else(|| panic!("明确销售事实问句应恢复：{question}"));
             assert_eq!(attempt.route(), crate::intent::IntentRoute::Data);
         }
+        // 多省枚举 2026-08-16 起是**可恢复**的（regions 两项），不再是 fail-closed 那一档
+        let two = recover_sales_intent("山东省和江苏省本月销售额", true).expect("多省枚举应恢复");
+        assert_eq!(two.route(), crate::intent::IntentRoute::Data);
         for ambiguous in [
-            "山东省和江苏省本月销售额",
             "嗨肉本月销售额",
             "本月退货销售额",
             "销售额按门店",
@@ -1292,9 +1294,15 @@ pub fn ");
             relative.sales_context
         );
 
+        // 🔴 2026-08-16 改口径：多省不再 fail-closed，而是拼一条 region IN。
+        // 「不能静默查全国或只取一个省」这条纪律没变 —— 现在由「两个省的候选值都必须在
+        // IN 列表里」来钉，比原来的 is_none() 钉得更紧（漏掉一个省当场红）。
+        let two = warehouse_sales_fact("山东省和江苏省 2026-08-10 至 2026-08-11 销售额")
+            .expect("多省枚举应命中");
         assert!(
-            warehouse_sales_fact("山东省和江苏省 2026-08-10 至 2026-08-11 销售额").is_none(),
-            "多省问法必须 fail closed，不能静默查全国或只取一个省"
+            two.sql.contains("'山东省区'") && two.sql.contains("'江苏省区'") && two.sql.contains(" IN ("),
+            "两个省的候选值都要在 IN 列表里：{}",
+            two.sql
         );
     }
 

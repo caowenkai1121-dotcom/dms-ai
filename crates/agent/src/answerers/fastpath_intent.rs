@@ -123,7 +123,7 @@ pub fn recover_sales_intent(
         .collect();
     let regions = sales_fact_province_filter(question, None)
         .ok()?
-        .map(|(surface, _)| vec![surface])
+        .map(|(surfaces, _)| surfaces)
         .unwrap_or_default();
     let time = intent_time_surface(question).map(|surface| crate::intent::TimeSlot {
         surface,
@@ -256,8 +256,8 @@ pub fn warehouse_sales_fact_predicated(
     )
     .ok()?;
     let mut predicates = vec![];
-    if let Some((province_name, predicate)) = province {
-        consumed.push(province_name);
+    if let Some((province_surfaces, predicate)) = province {
+        consumed.extend(province_surfaces);
         predicates.push(predicate);
     }
     if let Some(binding) = customer {
@@ -411,17 +411,21 @@ pub fn warehouse_sales_fact_predicated(
             *surface,
         );
     }
-    if let Some((surface, _)) = sales_fact_province_filter(
+    if let Some((surfaces, _)) = sales_fact_province_filter(
         question,
         customer.map(|binding| binding.canonical_name.as_str()),
     )
     .ok()
     .flatten()
     {
-        intent_evidence = intent_evidence.resolve(
-            crate::intent::IntentSlotKind::Region,
-            surface,
-        );
+        // 🔴 逐个 resolve：多值枚举下只登记第一个表面词，第二个会落进 `report.unverifiable`，
+        // 把一条答对的收据降成 review（覆盖闸认的是「每个槽位各自被证明」）。
+        for surface in surfaces {
+            intent_evidence = intent_evidence.resolve(
+                crate::intent::IntentSlotKind::Region,
+                surface,
+            );
+        }
     }
     if let Some(surface) = intent_time_surface(question) {
         intent_evidence = intent_evidence.resolve(
