@@ -4222,7 +4222,12 @@ fn bi_page(
     svgs: &[String],
     detail: Option<&DetailSection>,
     sqls: &[String],
-    _trust: Option<&dms_agent::TrustEnvelope>,
+    // 🔴 **收据必须上屏**（2026-08-17 审计逮到）：这个形参此前叫 `_trust`，
+    // 在整个函数体里零引用 —— 而 `attach_report_checks` 刚刚把对账结论写进它
+    // （`level="review"` + 「合计与分项对不上」这类 checks）。
+    // 于是页面自己算出了「这份报告需复核」，然后把结论扔了，两个出口都不显示。
+    // 用户拿着一份看起来干净的报表去开会，而系统其实知道它对不上。
+    trust: Option<&dms_agent::TrustEnvelope>,
     // 规划了但**没跑出来**的板块标题。空 = 计划全部兑现。
     failed_sections: &[String],
 ) -> String {
@@ -4248,6 +4253,34 @@ fn bi_page(
             s,
             "<section class=\"bi-brief bi-gap\"><div class=\"eyebrow\">本次未取到的板块</div>             <p>{}。这些板块的数据本次没有取到，上方结论只覆盖已取到的部分。</p></section>",
             esc(&failed_sections.join("、")),
+        );
+    }
+    // 🔴 收据判「需复核」时必须上屏（2026-08-17）。放在 KPI **之前**：
+    // 先说「这份数要复核」，再给数 —— 反过来放等于让用户先读完再告诉他别信。
+    if let Some(trust) = trust.filter(|t| t.level == "review") {
+        // 只挑真正说明问题的那几条：checks 里另有「只读执行通道」这类恒真项，
+        // 全列出来会把关键的一条淹掉。
+        let flagged: Vec<&str> = trust
+            .checks
+            .iter()
+            .filter(|c| {
+                c.contains("对不上")
+                    || c.contains("未通过")
+                    || c.contains("复核")
+                    || c.contains("不可信")
+                    || c.contains("冲突")
+            })
+            .map(String::as_str)
+            .collect();
+        let body = if flagged.is_empty() {
+            "本次执行未通过完整性或值级核验，数字请人工复核后再使用。".to_string()
+        } else {
+            format!("{}。数字请人工复核后再使用。", flagged.join("；"))
+        };
+        let _ = write!(
+            s,
+            "<section class=\"bi-brief bi-gap\"><div class=\"eyebrow\">需人工复核</div><p>{}</p></section>",
+            esc(&body),
         );
     }
     if let Some((label, val)) = kpi {
@@ -6013,6 +6046,59 @@ mod tests {
 
     /// 页面骨架（v2 bi_page）：段序（头部→KPI→板块→明细→折叠 SQL→AI 收尾）+
     /// 单元格转义 + 空段不出 + SVG 直接内嵌（不走占位符）。
+    /// 🔴 收据判「需复核」时必须上屏（2026-08-17 审计逮到）。
+    ///
+    /// `attach_report_checks` 把对账结论写进 `trust`（level=review + 「合计与分项对不上」），
+    /// 而 `bi_page` 此前把这个形参命名成 `_trust` 后整个函数体零引用 ——
+    /// 页面自己算出了「这份报告需复核」，然后把结论扔了。
+    /// 用户拿着一份看起来干净的报表去开会，而系统其实知道它对不上。
+    #[test]
+    fn a_review_verdict_is_shown_on_the_report_page() {
+        let spec = dms_agent::AnalysisPlan {
+            kind: dms_agent::AnalysisKind::Metric,
+            dws_sales_metric: true,
+            allow_model_sections: true,
+        }
+        .report_spec();
+        let review = dms_agent::TrustEnvelope {
+            level: "review",
+            trace_id: "t".into(),
+            source: "dms".into(),
+            route: "direct-agg".into(),
+            access: "全量".into(),
+            execution: "实时执行",
+            fingerprint: "f".into(),
+            checks: vec![
+                "只读执行通道".into(),
+                "合计与分项对不上：差 12.3%".into(),
+            ],
+        };
+        let html = bi_page(
+            "本月销售额",
+            spec.clone(),
+            None,
+            Some(("销售额", "¥1")),
+            &[], &[], &[], &[], &[], None, &[], &[], None, &[],
+            Some(&review),
+            &[],
+        );
+        assert!(html.contains("需人工复核"), "复核结论没上屏：{html}");
+        assert!(html.contains("合计与分项对不上"), "该点名的那条没上屏：{html}");
+        assert!(!html.contains("只读执行通道"), "恒真项不许一起倒出来把关键那条淹了");
+        // 反面（防恒真）：verified 的报告不许平白多一条吓人的横幅
+        let verified = dms_agent::TrustEnvelope { level: "verified", ..review };
+        let clean = bi_page(
+            "本月销售额",
+            spec,
+            None,
+            Some(("销售额", "¥1")),
+            &[], &[], &[], &[], &[], None, &[], &[], None, &[],
+            Some(&verified),
+            &[],
+        );
+        assert!(!clean.contains("需人工复核"), "verified 不该出复核横幅：{clean}");
+    }
+
     /// 规划了却没跑出来的板块必须在页面上**点名**。
     ///
     /// 由来：业主实测「今年退款额是多少」，3 个板块挂了 2 个，报告里既没有那两块、
