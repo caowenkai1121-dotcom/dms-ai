@@ -5014,6 +5014,17 @@ DO 块里；两处都先读 `atttypmod` 再决定改不改，无条件 ALTER 会
 
 ### 七、未结（下一手接着查）
 
+0.5 **部署路上的两条运维坑（今天各踩一次）**：
+   ① sshd 被打满（一天几百条短连接）后 `deploy_update.sh` 的上传/切换会间歇断线，
+   表现是 `Error reading SSH protocol banner` / `Socket is closed` / bput 校验和不符。
+   构建往往已经成功，只是切换那步没跑到 —— **先看 `build-*.log` 有没有 BUILD_OK**，
+   有就手工切（`ln -sfn <release> app.next && mv -Tf app.next app` 再跑
+   `DMS_RUNTIME_ROOT=/opt/dms-ai DMS_SERVER_HOST=172.17.0.1 bash app/scripts/server-restart.sh`）。
+   ② 断线会留下 `dms-ai-server-rollback` 残骸容器，而 `server-restart.sh` 的预检
+   **会因此拒绝切换**（`发现上次部署遗留容器…请先核对并人工处理`）。预检是对的
+   —— 带着残骸切等于把回滚位弄丢 —— 但没人清它就会一直卡着。核对无误后
+   `docker rm -f dms-ai-server-rollback` 再切。
+
 0. ~~生产当前跑的是手工补丁 release~~ —— 已在 AX158 那一轮用完整 `deploy_update.sh` 拉回正路。
    下面这段留作记录（SSH 不稳时的应急路子）：**生产曾跑过手工补丁 release**（`20260816T150000Z-hotfix2`）：今晚 sshd 连接
    连续掉线（`Error reading SSH protocol banner` / `Socket is closed`，一天几百条短连接
