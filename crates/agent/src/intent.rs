@@ -27,6 +27,7 @@ const INTENT_SYSTEM: &str = r#"你是企业 AI Agent 的意图解析器。只提
    例：「分别查本月销售额和本月订单数」→ subgoals 两个：{"mode":"data","surface":"本月销售额","metrics":["销售额"],"time":{"surface":"本月"}} 与 {"mode":"data","surface":"本月订单数","metrics":["订单数"],"time":{"surface":"本月"}}。
    例：「分别统计各省区销售额和各商品销量」→ subgoals 两个：{"mode":"data","surface":"各省区销售额","metrics":["销售额"],"breakdowns":["省区"]} 与 {"mode":"data","surface":"各商品销量","metrics":["销量"],"breakdowns":["商品"]}。
    不拆的后果是**只答一半**：系统只会按第一个指标和第一个分组取数，另一半静默消失。
+   ⚠️ 反过来也要守住：**没有并列标记**的问句一律不拆。「2026年6月湖南运营活动场次是多少」是一个指标（运营活动场次）+ 一个地区（湖南）+ 一个时间，整句一个 subgoal 都不写；把「运营活动」拆成实体、「场次」拆成指标是错的 —— 指标名要按原文完整取，不许从中间切开。
 4. 没提到的槽位用空数组、null 或 false；拿不准写入 ambiguities，不得猜。
 5. 只输出 JSON，不要 Markdown、解释或额外文本。"#;
 
