@@ -19,8 +19,20 @@ use crate::warehouse_catalog::{self, detail_layer};
 /// 血缘边以它们为端点找 ODS 对端；锚点取得越多，加权越接近「全目录平推」，失去意义。
 const LINEAGE_ANCHORS: usize = 3;
 
-/// datamap 推断边进 JOIN 证据的置信下限：低于它只信人工确认（status='accepted'）。
-/// （两处 `status <> 'rejected'` 依赖两张边表的 status 均为 NOT NULL —— DDL 钉着，无 NULL 漏网。）
+/// 🔴 **自动推断出来的边是「提案」，不是「证据」**（2026-08-16）。
+///
+/// 写入侧（`datamap.rs` / `lineage.rs`）一律落 `status='pending'`，注释写着「待人工复核」；
+/// 而消费侧此前收 `status <> 'rejected'` + `confidence >= 0.9` —— **复核闸形同虚设**。
+/// 当天两次都踩到了：
+/// - `meta datamap-build` 第一次真正跑起来，38780 条 joinable 里 365 条落进生效档，
+///   混着 `amount ~ amount`、`rebate_other ~ rebate_other`、`version`/`created_by`
+///   —— 同名、基数相近就被判「高置信可关联」。拿金额列做 JOIN 键是灾难性错答。
+/// - `meta lineage-build` 的 80 条 pending 边**立即**参与 `direct-derive` 候选加权，
+///   而锚点只取 3 张、池子只留 6 张 —— 足以把加权摊平成随机序（已撤回成 rejected）。
+///
+/// 现在两个消费者都只认 `status='accepted'`。**行为面为零**：改动前库里 accepted 的
+/// joinable 是 0 条、lineage 只有 2 条人工种子。变的是将来 —— 谁再跑一次自动构建，
+/// 产物进复核队列，不会自己变成证据。阈值常量留着给复核界面排序，不再单独构成放行条件。
 const JOIN_MIN_CONFIDENCE: f64 = 0.9;
 
 /// 推导候选表（裸表名，目录内唯一），按「血缘命中优先、问句相关性次之」排序，最多 `limit` 张。
@@ -133,8 +145,7 @@ pub async fn join_evidence_edges(pg: &PgPool, ds: &str, tables: &[&str]) -> Vec<
              WHERE status = 'active' AND left_table = ANY($1) AND right_table = ANY($1){ds_pred} \
              UNION ALL \
              SELECT left_table, left_col, right_table, right_col FROM meta.datamap_edge \
-             WHERE kind = 'joinable' AND status <> 'rejected' \
-               AND (confidence >= {JOIN_MIN_CONFIDENCE} OR status = 'accepted') \
+             WHERE kind = 'joinable' AND status = 'accepted' \
                AND left_table = ANY($1) AND right_table = ANY($1){ds_pred}",
             ds_pred = ds_pred(2)
         ))
@@ -215,7 +226,7 @@ async fn lineage_boost(pg: &PgPool, ds: &str, anchors: &[String]) -> HashSet<Str
         pg,
         sqlx::query_as(&format!(
             "SELECT left_table, right_table FROM meta.datamap_edge \
-             WHERE kind = 'lineage' AND status <> 'rejected' \
+             WHERE kind = 'lineage' AND status = 'accepted' \
                AND (left_table = ANY($1) OR right_table = ANY($1)){ds_pred}",
             ds_pred = ds_pred(2)
         ))

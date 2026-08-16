@@ -3262,11 +3262,27 @@ pub fn ");
         assert!(body.contains("UNION ALL"), "两源必须合并成一条查询：{body}");
         assert!(body.contains("status = 'active'"), "合同边只认 active：{body}");
         assert!(body.contains("kind = 'joinable'"), "{body}");
-        // 置信下限提成具名常量：钉常量名的引用（两档缺一不可）+ 钉字面值不许暗降
-        assert!(body.contains("JOIN_MIN_CONFIDENCE") && body.contains("OR status = 'accepted'"),
-                "高置信/人工确认两档缺一不可：{body}");
-        assert!(src.contains("const JOIN_MIN_CONFIDENCE: f64 = 0.9;"), "置信下限 0.9 不许暗降");
-        assert!(body.contains("status <> 'rejected'"), "rejected 永远不算证据：{body}");
+        // 🔴 **自动推断边只认 `accepted`**（2026-08-16 改口径，这条断言此前钉的是旧行为）。
+        //
+        // 旧判据是「高置信(≥0.9) **或** 人工确认」两档。当天 `meta datamap-build` 第一次
+        // 真正跑起来，38780 条 joinable 里 365 条落进高置信档，混着 `amount ~ amount`、
+        // `rebate_other ~ rebate_other`、`version`/`created_by` —— 同名 + 基数相近就被判
+        // 「高置信可关联」。拿金额列做 JOIN 键是灾难性错答。
+        //
+        // 写入侧一律落 `pending` 并注明「待人工复核」，读取侧却收 pending ——
+        // 复核闸形同虚设。现在两侧对齐：推断产物是**提案**，`accepted` 才是证据。
+        // 行为面为零（改动前 accepted 的 joinable 就是 0 条），变的是将来。
+        assert!(
+            body.contains("kind = 'joinable' AND status = 'accepted'"),
+            "自动推断边又能不经复核当证据了：{body}"
+        );
+        assert!(
+            !body.contains("JOIN_MIN_CONFIDENCE"),
+            "置信下限不许再单独构成放行条件：{body}"
+        );
+        assert!(src.contains("const JOIN_MIN_CONFIDENCE: f64 = 0.9;"), "常量留给复核界面排序，不许删");
+        // 第二道闸：键形。度量列/审计列同名也不算 JOIN 键（判据在 `is_join_key_column`）
+        assert!(body.contains("is_join_key_column("), "键形闸没了：{body}");
         assert!(body.contains("ANY($1)"), "证据边必须限定在候选表集合内：{body}");
     }
 
