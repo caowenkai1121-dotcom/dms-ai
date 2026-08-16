@@ -159,9 +159,15 @@ const KG_PPR_TOL: f64 = 1e-6;
 const TOP_K: usize = 6;
 /// 先多取候选再去重/多样化；直接在 RRF 后截 6 条会让同一文档的相邻块挤掉其他来源。
 const CANDIDATE_K: usize = TOP_K * 4;
-/// rerank 精排的窗口：合并去重后的头部约 2×`TOP_K` 条送精排，排完仍截回 `TOP_K`
+/// rerank 精排的窗口：合并去重后的头部送精排，排完仍截回 `TOP_K`
 /// （`docs/research/yuxi.json` B5：recall_top_k → 精排 → final_top_k）。窗口外候选保持 RRF 原序。
-const RERANK_WINDOW: usize = TOP_K * 2;
+///
+/// 🔴 = `CANDIDATE_K`，**不是 `TOP_K * 2`**（2026-08-16）。旧值 12 够不到候选集的
+/// 第 13-24 名，而生产度量是 `recall@6 = 0.95` / `recall@1 = 0.15` —— 精排要救的正是
+/// 「召回到了但排在后面」。拿一个够不到后半段的窗口去测「精排有没有收益」，
+/// 测出来必然是「没收益」，然后有人会把这个能力删掉。
+/// 代价：一次 rerank 多 12 条文本，上游 `MAX_DOCS = 500`，富余。
+const RERANK_WINDOW: usize = CANDIDATE_K;
 /// 多文档时先保证来源覆盖；候选不足时第二轮仍会用同文档结果补满。
 const DOC_FIRST_PASS: usize = 2;
 /// `span()` 的硬上限也是 16，合并超过它会让引用无法完整回查。
@@ -298,6 +304,24 @@ pub struct Hit {
     /// 本条命中由多少个连续块合并而成（`merge_adjacent` 填；SQL 取出来时恒 1）。
     /// 引用要靠它才能被忠实回查 —— 见 `dms_kernel::Citation::span`。
     pub merged: u32,
+    /// 与问句的向量距离（`embedding <=> query`，越小越近）。**只做并列时的次序键**，
+    /// 不参与任何阈值判定、不进 RRF 主分、不出现在 wire 上。
+    ///
+    /// 🔴 为什么需要它（2026-08-16 度量）：`recall@6 = 0.95` 而 `recall@1 = 0.15` ——
+    /// 对的块召回得到、就是排不到第一。0.80 的缺口 100% 在排序层。
+    /// 而 `merge_adjacent` 的收尾排序此前是 `score desc → chunk_id asc`：
+    /// RRF 同分时**由入库顺序决胜**，用户看到的第一条引用与相关性无关。
+    /// 典型同分形态：A 只被向量路 rank1 命中、B 只被词级路 rank1 命中，两者都是 `w/61`。
+    ///
+    /// 为什么用向量距离而不是「每路各自归一分取最大」：后者是**跨路比较**，
+    /// 而各路分的量纲完全不同（元数据路命中标签时 sim 恒等于 1.0、向量强命中只有 0.45），
+    /// 得出的偏好序会与本文件用字面量钉死的权重序**相反** —— 那是「同一件事两份口径
+    /// 各自演化」的同构体。向量距离是**单一量纲、零标定**：对每个候选块都可算，
+    /// 而且候选集加载时那张表就在手上。
+    ///
+    /// `None` = 这块没有向量（外部 KB 的合成块、或 embed 服务降级）：排在有距离的之后，
+    /// 再按 `chunk_id` 兜底 —— 可复现性一个字没松。
+    pub vec_dist: Option<f32>,
 }
 
 /// 一次检索的可观测数据。数值直接来自六路内容召回、一路结构扩展、一路图谱召回和一路外部 KB 召回，不参与阈值判定。
@@ -357,6 +381,8 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for Hit {
             relations: Vec::new(),
             score: 0.0,
             merged: 1,
+            // SQL 不取向量距离：候选集定下来之后统一回填一次（见 `fill_vec_dist`）
+            vec_dist: None,
         })
     }
 }
@@ -450,14 +476,20 @@ pub async fn search_report(
     // 五路彼此独立：向量 HTTP 与四条 PG 查询并行，保持原阈值/排序不变，只去掉固定串行等待。
     let vector = async {
         match embed.embed_query(&query).await {
-            Some(qv) => Ok((vector_ids(store, &docs, &to_pgvector(&qv), scan).await?, false)),
+            // 🔴 问句向量要**留下来**（2026-08-16）：候选集定下来之后拿它回填每块的语义距离，
+            // 当 RRF 同分时的次序键（见 `Hit::vec_dist`）。此前它算完就丢，
+            // 于是 rank-1 并列只能按 `chunk_id`（入库顺序）决胜。
+            Some(qv) => {
+                let pg = to_pgvector(&qv);
+                Ok((vector_ids(store, &docs, &pg, scan).await?, false, Some(pg)))
+            }
             // 🔴 静默跳过这一路是本文件最贵的一处沉默。剩下路线仍可答，但必须显式降级。
             None => {
                 tracing::warn!(
                     space = space.unwrap_or("<all>"),
                     "向量检索不可用（embed 服务挂或熔断中）→ 本次只剩精确匹配/正文相似/标题/元数据路，可能漏检"
                 );
-                Ok::<_, KbError>((Vec::new(), true))
+                Ok::<_, KbError>((Vec::new(), true, None))
             }
         }
     };
@@ -473,7 +505,7 @@ pub async fn search_report(
         terms_ids(store, &docs, &query, terms_route_enabled()),
         ext_kb_route(ext_client.as_ref(), &query),
     );
-    let (vec_ids, vec_down) = vector?;
+    let (vec_ids, vec_down, query_vector) = vector?;
     let terms = terms?;
     // 固定五个槽位，向量降级时也保留空 vec：诊断日志不会把精确路数量误记成向量数量。
     let mut lists = vec![vec_ids, exact?, trgm?, title?, metadata?];
@@ -621,8 +653,15 @@ pub async fn search_report(
             channel_map.entry(*id).or_default().push(name);
         }
     }
+    // RRF 同分时的次序键：一条 SQL、只打本次候选集（向量降级时整步跳过，行为回到旧的
+    // 「按 chunk_id 兜底」，不额外报错）。
+    let dist_of = match &query_vector {
+        Some(pg) => chunk_distances(store, pg, &ids).await,
+        None => HashMap::new(),
+    };
     for h in &mut hits {
         h.score = score_of.get(&h.chunk_id).copied().unwrap_or(0.0);
+        h.vec_dist = dist_of.get(&h.chunk_id).copied();
         h.channels = channel_map
             .get(&h.chunk_id)
             .map(|names| names.iter().map(|n| n.to_string()).collect())
@@ -636,7 +675,17 @@ pub async fn search_report(
     // rerank（B5）只在 `DMS_RERANK_*` 配齐时插入；未配置时走原来的 `finalize_hits`，一字不差。
     // 每次检索读一次 env：本函数签名被 server 各调用点冻结，配置只能走环境变量（3 次 getenv 可忽略）。
     let hits = match RerankClient::from_env() {
-        None => finalize_hits(hits),
+        None => {
+            // 🔴 关着必须留痕（2026-08-16）：精排是唯一专治「召回到了但排不到第一」的组件，
+            // 而它在生产上**一次都没跑过**（`DMS_RERANK_BASE_URL` / `DMS_RERANK_MODEL`
+            // 从未进过 docker run 的 --env，全仓也没有任何 rerank 服务）。
+            // 不留痕的后果不是少一点效果，是**结论被污染**：任何「精排有没有收益」的
+            // 实验测出来必然是「没收益」，然后这条链会被当成无用能力删掉。
+            tracing::debug!(
+                "rerank 未接线（DMS_RERANK_BASE_URL / DMS_RERANK_MODEL 未配）→ 本次只有 RRF 排序；                 recall@1 的头寸全在这条链上，别拿本次结果去判「精排无收益」"
+            );
+            finalize_hits(hits)
+        }
         Some(client) => finalize_ranked(rerank_candidates(&client, &query, rank_hits(hits)).await),
     };
     Ok(SearchReport {
@@ -1478,6 +1527,8 @@ fn ext_kb_hit(chunk_id: i64, ord: i32, record: &ExtKbRecord) -> Hit {
         channels: Vec::new(),
         relations: Vec::new(),
         score: 0.0,
+        // 远程块没有本地向量：并列时排在有距离的之后（与它「宁少勿滥」的定位一致）
+        vec_dist: None,
         merged: 1,
     }
 }
@@ -1521,6 +1572,35 @@ fn load_hits_sql() -> &'static str {
         crate::acl::visible_docs!(),
         ") AND ($4::text IS NULL OR d.space_id=$4)"
     )
+}
+
+/// 候选块与问句的向量距离（`embedding <=> $1`）。**只做并列次序键**，不是阈值。
+///
+/// 一切失败 = 空表（次序退回 `chunk_id` 兜底）：它是排序的锦上添花，
+/// 不许因为它让一次本来能答的检索失败。
+async fn chunk_distances(
+    store: &OwnedStore,
+    query_vector: &str,
+    chunk_ids: &[i64],
+) -> HashMap<i64, f32> {
+    if chunk_ids.is_empty() {
+        return HashMap::new();
+    }
+    let rows: Result<Vec<(i64, f64)>, _> = store
+        .fixed(
+            "SELECT chunk_id, (embedding <=> $1::vector) AS dist FROM kb.chunk              WHERE chunk_id = ANY($2::bigint[]) AND embedding IS NOT NULL",
+        )
+        .bind(query_vector)
+        .bind(chunk_ids)
+        .fetch_all()
+        .await;
+    match rows {
+        Ok(rows) => rows.into_iter().map(|(id, d)| (id, d as f32)).collect(),
+        Err(e) => {
+            tracing::warn!(err = %e, "候选块向量距离读取失败 → 并列次序退回 chunk_id 兜底");
+            HashMap::new()
+        }
+    }
 }
 
 async fn load_hits(
@@ -1892,8 +1972,19 @@ fn merge_adjacent(mut hits: Vec<Hit>) -> Vec<Hit> {
             _ => out.push(h),
         }
     }
-    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.chunk_id.cmp(&b.chunk_id)));
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            // 🔴 RRF 同分时按**与问句的向量距离**决胜，不再按入库顺序（见 `Hit::vec_dist`）
+            .then(dist_key(a).total_cmp(&dist_key(b)))
+            .then(a.chunk_id.cmp(&b.chunk_id))
+    });
     out
+}
+
+/// 并列次序键：没有向量的块（外部 KB 合成块 / embed 降级）排在有距离的之后。
+fn dist_key(hit: &Hit) -> f32 {
+    hit.vec_dist.unwrap_or(f32::INFINITY)
 }
 
 fn opposite_version_sections(left: &Hit, right: &Hit) -> bool {
@@ -1950,10 +2041,20 @@ mod tests {
                 Ok(Vec::new())"),
             "关系路的锚是这两条的原型"
         );
-        // 五道已标定的相关度下限一个都没碰：本次是结构闸，不是数值闸
-        for gate in ["VEC_MAX_DIST", "TRGM_MIN", "TITLE_MIN", "METADATA_MIN", "TERMS_MIN_HITS"] {
-            assert!(src.contains(gate), "{gate} 不该在这一刀里消失");
-        }
+        // 🔴 五道已标定的相关度下限**钉值，不钉名字**（2026-08-16 复核逮到）。
+        //
+        // 上一版写的是 `for gate in [...] { assert!(src.contains(gate)) }`，而
+        // `src = include_str!("retrieve.rs")` 是整份文件 —— **包含这个数组字面量本身**。
+        // 五条断言恒真：把五个常量全删了它照样绿。这是本轮反复猎的「护栏自己会哑」，
+        // 而它守的恰好是「不许调松阈值」这条纪律（调松会让 nohit 题变坏，
+        // 而五个自动指标会一起假涨，没有任何判据会红）。
+        //
+        // 值闸不会哑：谁想调松，先来改这行数字，改的时候就得读上面那段。
+        assert_eq!(VEC_MAX_DIST, 0.55, "向量距离上限被动了");
+        assert_eq!(TRGM_MIN, 0.2, "正文相似下限被动了");
+        assert_eq!(TITLE_MIN, 0.35, "标题相似下限被动了");
+        assert_eq!(METADATA_MIN, 0.35, "元数据相似下限被动了");
+        assert_eq!(TERMS_MIN_HITS, 2, "词级最少命中数被动了");
     }
     use super::*;
 
@@ -1981,6 +2082,8 @@ mod tests {
             relations: Vec::new(),
             score,
             merged: 1,
+            // SQL 不取向量距离：候选集定下来之后统一回填一次（见 `fill_vec_dist`）
+            vec_dist: None,
         }
     }
 
@@ -2379,6 +2482,51 @@ mod tests {
         assert!((out[1].1 - 1.0 / 61.0).abs() < 1e-6);
         assert_eq!(out[2].0, 8);
         assert!((out[2].1 - 1.0 / 62.0).abs() < 1e-6);
+    }
+
+    /// 🔴 **RRF 同分时按语义距离决胜，不再按入库顺序**（2026-08-16 生产度量逼出来的）。
+    ///
+    /// 基线（20 题）：`recall@6 = 0.95` 而 `recall@1 = 0.15` —— 对的块召回得到、
+    /// 就是排不到第一。0.80 的缺口 100% 落在排序层，不在召回层。
+    /// 而 `merge_adjacent` 的收尾排序此前是 `score desc → chunk_id asc`：
+    /// RRF 同分时**由入库顺序决胜**，用户看到的第一条引用与相关性无关。
+    ///
+    /// 典型同分形态（本测试构造的就是它）：A 只被向量路 rank1 命中、B 只被词级路 rank1
+    /// 命中，两路权重都是 1.0 ⇒ 两块都是 `w/61`，完全同分。
+    ///
+    /// 次序键选**向量距离**而不是「每路各自归一分取最大」：后者是跨路比较，
+    /// 而各路量纲完全不同（元数据路命中标签时 sim 恒 1.0、向量强命中只有 0.45），
+    /// 得出的偏好序会与本文件字面量钉死的权重序**相反**。向量距离单一量纲、零标定。
+    #[test]
+    fn equal_rrf_scores_break_by_semantic_distance_not_insertion_order() {
+        let mut near = hit(9, "d1", 0, 0.5);
+        near.vec_dist = Some(0.20); // 语义更近，但 chunk_id 更大
+        let mut far = hit(2, "d2", 0, 0.5);
+        far.vec_dist = Some(0.50);
+        let out = merge_adjacent(vec![far.clone(), near.clone()]);
+        assert_eq!(out[0].chunk_id, 9, "同分时该由语义距离决胜，不是入库顺序");
+
+        // 没有向量的块（外部 KB 合成块 / embed 降级）排在有距离的之后
+        let mut blind = hit(1, "d3", 0, 0.5);
+        blind.vec_dist = None;
+        let out = merge_adjacent(vec![blind, near.clone()]);
+        assert_eq!(out[0].chunk_id, 9, "无向量的块不许靠 chunk_id 小抢到第一");
+
+        // 距离全等时仍按 chunk_id 升序 —— 可复现性一个字没松
+        let mut a = hit(7, "d4", 0, 0.5);
+        a.vec_dist = Some(0.30);
+        let mut b = hit(3, "d5", 0, 0.5);
+        b.vec_dist = Some(0.30);
+        let out = merge_adjacent(vec![a, b]);
+        assert_eq!(out[0].chunk_id, 3);
+
+        // 🔴 距离**严格次级**：RRF 主分不同时，距离再近也不许翻越
+        let mut low_but_near = hit(4, "d6", 0, 0.1);
+        low_but_near.vec_dist = Some(0.01);
+        let mut high_but_far = hit(6, "d7", 0, 0.9);
+        high_but_far.vec_dist = Some(0.54);
+        let out = merge_adjacent(vec![low_but_near, high_but_far]);
+        assert_eq!(out[0].chunk_id, 6, "次序键不许翻越 RRF 主分");
     }
 
     /// 并列必须稳定（同分按 chunk_id 升序）：同一问句两次不同顺序无法排查

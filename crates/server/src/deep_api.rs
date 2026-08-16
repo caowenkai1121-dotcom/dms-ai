@@ -1568,6 +1568,7 @@ async fn evidence_insight(
             relations: Vec::new(),
             score: 0.0,
             merged: 1,
+            vec_dist: None,
         })
         .collect::<Vec<_>>();
     let ids = evidence.iter().map(|item| item.id.as_str()).collect::<Vec<_>>().join("、");

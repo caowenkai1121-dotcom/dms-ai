@@ -183,9 +183,19 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 DMS_SECRET_KEY="$(< "$SECRET_FILE")"
+# 🔴 rerank（B5 精排）的三个变量随 docker run 透传：接一个 Cohere/Jina 形状的端点即生效，
+# 不改代码。它是唯一专治「块召回到了但排不到第一」的组件 —— 生产度量
+# recall@6=0.95 / recall@1=0.15，0.80 的头寸全在这条链上。变量未设时
+# `RerankClient::from_env` 返 None，检索退回纯 RRF 排序（与接线前逐字一致）并留一句日志。
+#
+# ⚠️ 注释**只能写在 docker run 之外**：行继续符后面接 `#` 会把命令的剩余参数
+# 整段吃成注释，而 `bash -n` 查不出来（语法仍合法）—— 第一版就是这么写的。
 if ! docker run -d --name dms-ai-server --restart unless-stopped \
   --add-host host.docker.internal:host-gateway \
   --env DMS_SECRET_KEY="$DMS_SECRET_KEY" \
+  --env DMS_RERANK_BASE_URL="${DMS_RERANK_BASE_URL:-}" \
+  --env DMS_RERANK_API_KEY="${DMS_RERANK_API_KEY:-}" \
+  --env DMS_RERANK_MODEL="${DMS_RERANK_MODEL:-}" \
   --mount "type=bind,source=$SETTINGS_FILE,target=/app/settings.json" \
   --mount "type=bind,source=$KBDATA_REAL,target=/kbdata" \
   --mount "type=bind,source=$TOOLS_DIR,target=/app/tools" \

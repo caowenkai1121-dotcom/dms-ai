@@ -1648,6 +1648,7 @@ mod tests {
             relations: Vec::new(),
             score: 0.5,
             merged: 1,
+        vec_dist: None,
         }
     }
 

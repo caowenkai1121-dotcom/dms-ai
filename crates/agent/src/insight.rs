@@ -499,6 +499,7 @@ pub(crate) fn hit(i: usize, source: &str, text: &str) -> Hit {
         score: 0.0,
         // 不是检索命中，没有合并跨度
         merged: 1,
+        vec_dist: None,
     }
 }
 
