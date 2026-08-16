@@ -519,6 +519,11 @@ mod tests {
     #[test]
     fn account_balance_ranking_uses_latest_customer_snapshot_without_order_join() {
         let hit = balance_ranking("账户余额最高的10个客户").expect("余额排行应走确定性快照模板");
+        // 改动前逐字快照（排行档 SQL 一个字节都不许变，否则 evaluation.py 的结果集对拍失去意义）
+        assert_eq!(
+            hit.sql,
+            "SELECT c.customer_name AS `客户`, SUM(t.balance) AS `账户余额`              FROM (SELECT customer_code, balance_type, balance,                           ROW_NUMBER() OVER (PARTITION BY customer_code, balance_type                                              ORDER BY created_time DESC, id DESC) AS rn                    FROM t_customer_balance                    WHERE deleted_flag = 0 AND balance_status = '4' AND balance_type IN ('8','9')) t              JOIN t_customer c ON c.customer_code = t.customer_code AND c.deleted_flag = 0              WHERE t.rn = 1              GROUP BY t.customer_code, c.customer_name              ORDER BY `账户余额` DESC LIMIT 10"
+        );
         assert!(hit.sql.contains("PARTITION BY customer_code, balance_type"), "{}", hit.sql);
         assert!(hit.sql.contains("ORDER BY created_time DESC, id DESC"), "{}", hit.sql);
         assert!(hit.sql.contains("WHERE t.rn = 1"), "{}", hit.sql);
@@ -528,11 +533,37 @@ mod tests {
         for q in [
             "湖南省账户余额最高的10个客户",
             "430000账户余额最高的10个客户",
-            "本月账户余额最高的10个客户",
             "VIP客户账户余额最高的10个客户",
         ] {
             assert!(balance_ranking(q).is_none(), "未实现限定不得被静默丢弃：{q}");
         }
+        // 🔴 三句各靠不同的机制拒，别一起放宽：「湖南省」靠残留、「430000」靠
+        // `has_province_code`（`residual_text` 把数字全过滤掉，指望不上它）、「VIP」靠残留。
+
+        // 当期时间词 2026-08-16 起**消化**：余额是时点量，最新快照就是截至今天的余额，
+        // 而当期窗口的右端也是今天 —— 限定没有被静默丢，它按口径恒等地满足了，
+        // 并且在 `intent_evidence` 里标了 Time 槽（否则覆盖闸判 missing:time 回落 LLM）。
+        let current = balance_ranking("本月账户余额最高的10个客户").expect("当期时间词该消化");
+        assert!(current.sql.contains("LIMIT 10"), "{}", current.sql);
+        // 过去期仍拒：它要的是截至该期末的余额，得把 created_time <= 期末下推进
+        // ROW_NUMBER 子查询，本模板表达不了；静默给当前余额是确定性答错。
+        for past in ["上月账户余额是多少", "去年账户余额最高的10个客户", "6月账户余额是多少"] {
+            assert!(balance_ranking(past).is_none(), "过去期快照兑现不了：{past}");
+        }
+
+        // 总额档（此前门禁要求「账户余额」+ 排行词 +「客户」三样同现，这一族整族白拒）
+        for q in ["本月账户余额是多少", "账户余额合计", "客户账户余额总额是多少"] {
+            let total = balance_ranking(q).unwrap_or_else(|| panic!("总额问法该接住：{q}"));
+            assert!(total.sql.starts_with("SELECT SUM(t.balance) AS `账户余额`"), "{q} → {}", total.sql);
+            assert!(!total.sql.contains("GROUP BY") && !total.sql.contains("LIMIT"), "{q} → {}", total.sql);
+            assert!(total.sql.contains("WHERE t.rn = 1"), "总额也必须先取最新快照：{}", total.sql);
+        }
+        // 分组诉求不许被总额档抢走（今天走组合器，按声明包 ROW_NUMBER，答得对）
+        for grouped in ["各客户账户余额", "按客户看账户余额", "哪些客户账户余额高"] {
+            assert!(balance_ranking(grouped).is_none(), "分组诉求要让路给组合器：{grouped}");
+        }
+        // 「还有多少账户余额」隐含 balance > 0，本模板不加那个条件 —— 残留守卫拦下
+        assert!(balance_ranking("还有多少账户余额").is_none());
 
         let src = DETERMINISTIC_SRC;
         let compose = body_between(src, "pub fn compose_hit", "pub fn direct_hit");

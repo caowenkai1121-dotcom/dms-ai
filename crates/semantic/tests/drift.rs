@@ -151,6 +151,10 @@ const ALLOW: &[(&str, &str)] = &[
     // （freeze_quantity / lock_quantity），没有任何外部输入入口。
     ("stock.rs", "col"),
     ("stock.rs", "label"),
+    // finance.rs 的 SNAP_FROM 是本函数私有的 &'static str：账户余额两档（排行/总额）
+    // 共用同一个快照 FROM 子句。抄第二份必漂 —— 排行档的 SQL 是钉着逐字快照的，
+    // 而总额档要与它同一张表同一批过滤，否则两个数对不上。无任何外部输入入口。
+    ("finance.rs", "SNAP_FROM"),
     ("ops_caliber.rs", "col"),
     ("ops_caliber.rs", "alias"),
     ("ops_caliber.rs", "fallback"),

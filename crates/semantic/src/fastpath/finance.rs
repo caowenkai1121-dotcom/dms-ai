@@ -224,44 +224,78 @@ pub fn warehouse_market_cost_group(
 }
 
 
-/// 账户余额排行是滚动快照，必须先按 (客户,余额类型) 取最新再聚合。
+/// 账户余额是滚动快照：必须先按 (客户,余额类型) 取最新再聚合，裸 SUM 是 10 倍级虚增。
+///
+/// 两档：**排行**（「账户余额最高的10个客户」）与**总额**（「本月账户余额是多少」）。
+/// 总额档 2026-08-16 补：此前门禁同时要求「账户余额」+ 排行词 +「客户」三样，
+/// 求总额的问法完全没有承接，整族白拒。
+///
+/// 🔴 时间怎么处置是本函数的设计前提，不是补充说明。余额是**时点**量
+///（`t_customer_balance` 每笔变动写一行，`balance` 是那一刻的滚动余额，
+/// `meta.metric.account_balance` 的 time_col 刻意留空），所以：
+///   - 窗口含今天（本月/今天/本周/今年/最近）→ **消化**并照常出数。不是「忽略限定」，
+///     是「限定与口径同义」：最新快照就是截至今天的余额，当期窗口的右端也是今天。
+///   - 过去期（上月/去年/6月/显式区间）→ **仍拒**。它要的是截至该期末的余额，
+///     得把 `created_time <= 期末` 下推进 ROW_NUMBER 子查询，本模板表达不了；
+///     静默给当前余额是确定性答错。
+///
 /// 该问法的“客户”维度属于客户主档，不允许经销售订单表绕路造成扇出。
 pub fn balance_ranking(question: &str) -> Option<DirectHit> {
+    if !question.contains("账户余额") {
+        return None;
+    }
     // 裸「前」不是触发词（「之前的账户余额」会误中）：「前+N/前十」由 `detect_top_n`
     // 带时间单位黑名单判；「top」归一小写后判一次
     let top_n = detect_top_n(question);
-    if !question.contains("账户余额")
-        || !(["最高", "最多", "排行", "排名"].iter().any(|word| question.contains(word))
-            || question.to_lowercase().contains("top")
-            || top_n < 200)
-        || !question.contains("客户")
-    {
+    let rank = ["最高", "最多", "排行", "排名"].iter().any(|word| question.contains(word))
+        || question.to_lowercase().contains("top")
+        || top_n < 200;
+    // 排行档门禁逐字不动：没点名「客户」的排行问法照旧不接
+    if rank && !question.contains("客户") {
         return None;
     }
+    // 🔴 总额档的让路门：这些词 `STRIP_WORDS` 剥得掉，但一个 SUM 单值兑现不了。
+    // 「各客户账户余额」今天走组合器（按声明包 ROW_NUMBER，答得对），被总额档抢走
+    // 就是拿一个总额去答一份名单。
+    const NOT_A_TOTAL: &[&str] = &[
+        "各", "按", "明细", "清单", "名单", "占比", "对比", "趋势", "哪些", "哪个", "谁", "分别",
+    ];
+    if !rank && NOT_A_TOTAL.iter().any(|word| question.contains(word)) {
+        return None;
+    }
+    let past_window = time_predicate(question).is_some()
+        && !dms_kernel::nl::time::window_includes_today(question);
     let has_province_code = crate::present::PROVINCE_LABELS
         .iter()
         .any(|(code, _)| question.contains(code));
-    if time_predicate(question).is_some()
-        || has_province_code
-        || !residual_text(question, &["账户余额", "客户"]).is_empty()
-    {
+    // 消化词只列模板真的兑现了的。裸尾词「余额」可以剥：触发词已经钉死是账户余额那一桶，
+    // 「账户余额和信控余额分别多少」剥完仍残留「信控」→ 照旧拒。
+    // 🔴 「还」「剩」刻意不进这张表（lexicon.rs 同一条纪律）：「还有多少账户余额」隐含
+    // `balance > 0`，而本模板不加那个条件 —— 残留守卫替我们把它拦下来。
+    const CONSUMED: &[&str] =
+        &["账户余额", "余额", "客户", "合计", "总额", "总计", "总共", "所有", "全部"];
+    if past_window || has_province_code || !residual_text(question, CONSUMED).is_empty() {
         return None;
     }
-    Some(hit(
+    // 两档共用同一个 FROM：排行档产出的 SQL 必须与本次改动前**逐字相同**，
+    // 否则 `evaluation.py` 的逐题结果集对拍失去意义。
+    const SNAP_FROM: &str = "FROM (SELECT customer_code, balance_type, balance,                           ROW_NUMBER() OVER (PARTITION BY customer_code, balance_type                                              ORDER BY created_time DESC, id DESC) AS rn                    FROM t_customer_balance                    WHERE deleted_flag = 0 AND balance_status = '4' AND balance_type IN ('8','9')) t              JOIN t_customer c ON c.customer_code = t.customer_code AND c.deleted_flag = 0              WHERE t.rn = 1";
+    // 总额档保留 JOIN t_customer 不是装饰：它带 `c.deleted_flag = 0`，
+    // 去掉的话总额 ≠ 排行档那张表的求和，权限注入的路径也与排行档不同形。
+    let sql = if rank {
         format!(
-            "SELECT c.customer_name AS `客户`, SUM(t.balance) AS `账户余额` \
-             FROM (SELECT customer_code, balance_type, balance, \
-                          ROW_NUMBER() OVER (PARTITION BY customer_code, balance_type \
-                                             ORDER BY created_time DESC, id DESC) AS rn \
-                   FROM t_customer_balance \
-                   WHERE deleted_flag = 0 AND balance_status = '4' AND balance_type IN ('8','9')) t \
-             JOIN t_customer c ON c.customer_code = t.customer_code AND c.deleted_flag = 0 \
-             WHERE t.rn = 1 \
-             GROUP BY t.customer_code, c.customer_name \
-             ORDER BY `账户余额` DESC LIMIT {top_n}"
-        ),
-        "direct-agg",
-    ))
+            "SELECT c.customer_name AS `客户`, SUM(t.balance) AS `账户余额`              {SNAP_FROM}              GROUP BY t.customer_code, c.customer_name              ORDER BY `账户余额` DESC LIMIT {top_n}"
+        )
+    } else {
+        format!("SELECT SUM(t.balance) AS `账户余额` {SNAP_FROM}")
+    };
+    let mut hit = hit(sql, "direct-agg");
+    // 🔴 当期时间词消化了就必须**标成已兑现**：SQL 里没有时间谓词，覆盖闸会判
+    // `missing:time:本月` → blocking → 回落下一成员 → 又掉进 LLM。
+    if let Some(surface) = crate::fastpath::intent_time_surface(question) {
+        hit.intent_evidence = hit.intent_evidence.resolve(IntentSlotKind::Time, surface);
+    }
+    Some(hit)
 }
 
 
