@@ -636,15 +636,31 @@ fn evidence_items(
     sections: &[Section],
     contributions: &[Vec<serde_json::Value>],
     include_contributions: bool,
+    // 执行问句：用来判本期是不是**未完整周期**。传展示问句会判错（模板短标题被改写过）。
+    period_question: &str,
 ) -> Vec<EvidenceItem> {
     let mut out = Vec::new();
     let metric_label = kpi.map(|(label, _)| label).unwrap_or("指标");
     if let Some((label, value)) = kpi {
+        // 🔴 **「本月还没过完」要写进证据本身**（2026-08-17 审计逮到）。
+        //
+        // 这条事实此前只印在 KPI 卡的小字上（`bi_page` 里那句 `current_period_note`），
+        // 而写结论的模型看到的是**证据目录**，目录里没有它。于是模型会拿一个
+        // 「截至今日」的残月，去和一个完整的上月直接比，得出「本月大幅下滑」这种结论 ——
+        // 数字都对，结论是错的，而且读起来毫无破绽。
+        // 只在**未完整**时加这一句：完整周期是常态，写进去只是噪音，
+        // 而噪音会稀释证据目录里真正要模型看见的那几条。
+        let period = current_period_note(period_question);
+        let body = if period.contains("未完整") {
+            format!("{label}={value}（**{period}**：本期尚未结束，与完整周期直接比较会低估本期）")
+        } else {
+            format!("{label}={value}")
+        };
         out.push(EvidenceItem {
             id: "KPI-01".into(),
             kind: "kpi",
             label: label.into(),
-            body: format!("{label}={value}"),
+            body,
         });
     }
     for (index, cmp) in comparisons.iter().enumerate() {
@@ -5305,6 +5321,7 @@ async fn compose_inner(
         &sections,
         &contributions,
         report_spec.show_contribution,
+        &execution_question,
     );
     let mut evidence = if is_weekly_report(&req.question) {
         weekly_evidence_items(evidence, &requested_sections, &sections)
@@ -5988,6 +6005,7 @@ mod tests {
             &sections,
             &contributions,
             true,
+            "上月销售额",
         );
         assert_eq!(
             evidence.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
@@ -6046,6 +6064,24 @@ mod tests {
 
     /// 页面骨架（v2 bi_page）：段序（头部→KPI→板块→明细→折叠 SQL→AI 收尾）+
     /// 单元格转义 + 空段不出 + SVG 直接内嵌（不走占位符）。
+    /// 🔴 「本期还没过完」必须写进**证据目录**，不能只印在 KPI 卡的小字上（2026-08-17 审计）。
+    ///
+    /// 写结论的模型看到的是证据目录。目录里没有这条，它就会拿一个「截至今日」的残月
+    /// 去和一个完整的上月直接比，得出「本月大幅下滑」—— 数字都对，结论是错的，
+    /// 而且读起来毫无破绽。
+    #[test]
+    fn an_incomplete_period_is_written_into_the_evidence_not_just_the_card() {
+        let open = evidence_items(Some(("销售额", "120")), &[], &[], &[], false, "本月销售额");
+        assert!(
+            open[0].body.contains("未完整周期") && open[0].body.contains("低估本期"),
+            "未完整周期必须进证据：{}",
+            open[0].body
+        );
+        // 完整周期是常态，不许平白加一句噪音（噪音会稀释真正要模型看见的那几条）
+        let closed = evidence_items(Some(("销售额", "120")), &[], &[], &[], false, "上月销售额");
+        assert_eq!(closed[0].body, "销售额=120", "完整周期不该多话");
+    }
+
     /// 🔴 收据判「需复核」时必须上屏（2026-08-17 审计逮到）。
     ///
     /// `attach_report_checks` 把对账结论写进 `trust`（level=review + 「合计与分项对不上」），
@@ -6955,7 +6991,7 @@ mod tests {
         assert!(html.contains("4,321.5"), "{html}");
         assert!(html.contains("19.0%"), "{html}");
         assert!(html.contains("-1.0%"), "毛利率变化值必须按百分点展示：{html}");
-        let evidence = evidence_items(None, &[], &[section], &[], false);
+        let evidence = evidence_items(None, &[], &[section], &[], false, "上月销售额");
         let body = &evidence[0].body;
         assert!(body.contains("¥12.35万"), "{body}");
         assert!(body.contains("¥2.35万"), "{body}");
@@ -7043,7 +7079,7 @@ mod tests {
             rows: vec![vec![serde_json::json!("A"), serde_json::json!(1)]],
             sql: "SELECT stock".into(),
         }];
-        let evidence = weekly_evidence_items(evidence_items(None, &[], &actual, &[], false), &requested, &actual);
+        let evidence = weekly_evidence_items(evidence_items(None, &[], &actual, &[], false, "上周销售额"), &requested, &actual);
         let gap = evidence.iter().find(|item| item.label == "营销费用").expect("缺模块必须有证据缺口");
         assert!(gap.body.contains("禁止用全量数据或相似指标代替"));
         assert!(evidence.iter().any(|item| item.label == "库存与缺货风险" && !item.body.contains("数据状态=")));
@@ -7222,7 +7258,7 @@ mod tests {
             IntentSlotSummary, IntentSummary,
         };
 
-        let mut evidence = evidence_items(Some(("销售额", "120")), &[], &[], &[], false);
+        let mut evidence = evidence_items(Some(("销售额", "120")), &[], &[], &[], false, "上月销售额");
         bind_intent_scope_to_kpis(
             &mut evidence,
             &IntentSummary {
@@ -7273,7 +7309,7 @@ mod tests {
             pct: Some(20.0),
             dir: "up",
         }];
-        let evidence = evidence_items(Some(("销售额", "120")), &comparisons, &[], &[], false);
+        let evidence = evidence_items(Some(("销售额", "120")), &comparisons, &[], &[], false, "上月销售额");
         let facts = evidence_facts(
             Some(("销售额", "120")),
             &comparisons,
@@ -7341,7 +7377,7 @@ mod tests {
             subjects: vec!["小虎黑椒味烤肠500G".into()],
             qualifiers: vec![],
         };
-        let sku_evidence = evidence_items(Some(("库存量", "20件")), &[], &[], &[], false);
+        let sku_evidence = evidence_items(Some(("库存量", "20件")), &[], &[], &[], false, "上月销售额");
         let sku_facts = evidence_facts(
             Some(("库存量", "20件")),
             &[],
