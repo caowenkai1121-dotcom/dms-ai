@@ -15,6 +15,9 @@ restart="$(cat scripts/server-restart.sh)"
 deploy="$(cat tools/deploy_update.sh)"
 web_update="$(cat scripts/web-update.sh)"
 
+# 🔴 精排两条也在合同里：它默认接本机 embed 服务（同进程同端口的千问适配层）。
+# 掉回「未设即关」不会报错 —— 检索只是排不到第一（生产实测 recall@6=0.95 / recall@1=0.15），
+# 而那种回退在任何健康检查上都是绿的。
 for required in \
   'APP_ROOT=' \
   'RUNTIME_ROOT="${DMS_RUNTIME_ROOT:-/opt/dms-ai}"' \
@@ -37,7 +40,9 @@ for required in \
   '解析服务响应未包含知识库探针 token' \
   'caps.get("text") is not True' \
   'curl -fsS' \
-  'data.get("ok") is True'; do
+  'data.get("ok") is True' \
+  'DMS_RERANK_BASE_URL+set' \
+  'DMS_RERANK_MODEL:-gte-rerank-v2'; do
   grep -Fq "$required" <<<"$restart" || {
     echo "server-restart 缺部署合同：$required" >&2
     exit 1

@@ -2110,7 +2110,21 @@ fn clean_strings(values: &mut Vec<String>) {
 /// 「潍坊程祥商贸」这种真名字一个都不许被误伤。
 fn is_bare_dimension_word(surface: &str) -> bool {
     let s = surface.trim();
-    dms_semantic::fastpath::derive::DIMENSION_CLASS_WORDS.contains(&s)
+    if dms_semantic::fastpath::derive::DIMENSION_CLASS_WORDS.contains(&s) {
+        return true;
+    }
+    // 🔴 量词前缀也要剥（2026-08-16 第二次实测）：「本月各省区毛利率」里模型报的是
+    // `entity:各省区`，整词不等于「省区」，第一版的判据放过了它，于是同一题时绿时红 ——
+    // 模型报「省区」就绿、报「各省区」就红。这类分组量词恰恰证明它**不是**某一个实体。
+    // 只剥这几个确定的量词：不做通用前缀剥离，那会伤到真名字。
+    for prefix in ["各", "每", "所有", "全部", "全", "各个", "每个"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            if dms_semantic::fastpath::derive::DIMENSION_CLASS_WORDS.contains(&rest) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn clean(value: &str) -> String {
@@ -2638,6 +2652,8 @@ mod tests {
             breakdowns: vec!["客户".into()],
             entity_mentions: vec![
                 EntityMention { surface: "客户".into(), kind: EntityKind::Customer },
+                EntityMention { surface: "各省区".into(), kind: EntityKind::Organization },
+                EntityMention { surface: "所有门店".into(), kind: EntityKind::Other },
                 EntityMention { surface: "省区".into(), kind: EntityKind::Organization },
                 EntityMention { surface: " 门店 ".into(), kind: EntityKind::Other },
                 // 真名字一个都不许被误伤
