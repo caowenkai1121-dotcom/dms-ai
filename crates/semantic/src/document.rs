@@ -263,9 +263,31 @@ fn resolved(code: String, kind: DocumentKind) -> Option<ResolvedDocument> {
         .map(|family| ResolvedDocument { code, family })
 }
 
-fn ascii_candidates(question: &str) -> impl Iterator<Item = &str> {
-    question.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '*')))
+/// 单号形 token 的**唯一切分口径**：ASCII 字母数字 + `-` / `_` / `*` 连成一段。
+///
+/// 🔴 `pub` 的理由（2026-08-16 全量清点逮到）：`triage::code_tokens` 曾经自己写了一份，
+/// 分隔符集少了 `_` 和 `*`，于是同一串号在两处被切成不同的东西：
+///
+/// | 号 | `document`（本函数） | 旧 `triage::code_tokens` |
+/// |---|---|---|
+/// | `DEV_XQ100` | 一个 token | 切成 `DEV`(无数字) + `XQ100`(5 位) ⇒ **空** |
+/// | `HJXH-DSO2026080400071_2` | 整串 | `HJXH-DSO2026080400071`（**丢 `_2`**） |
+/// | `HJXH_XQ20260804100` | 整串 | `XQ20260804100`（丢 `HJXH_`） |
+///
+/// 三处伤：① `DEV_XQ`+3 位流水（注册表明写允许）在 `decide` 的 R1.5 里**不触发**，
+/// 一个真单号可能被判成资料问句掉进知识库兜底；② 追问改写守卫只保护被切出来的片段，
+/// 改写模型丢掉 `_2` 也算「单号活着」—— 而拆单号丢了后缀会从 `WarehouseShipment`
+/// **静默变成 `SalesOrder`**，查错表返错数，没有任何提示；③ 同理丢 `HJXH_` 前缀。
+///
+/// 一个口径一份实现：`triage::code_tokens` 现在转调本函数。
+pub fn ascii_code_candidates(question: &str) -> impl Iterator<Item = &str> {
+    question
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '*')))
         .filter(|candidate| !candidate.is_empty())
+}
+
+fn ascii_candidates(question: &str) -> impl Iterator<Item = &str> {
+    ascii_code_candidates(question)
 }
 
 fn valid_code_byte(byte: u8) -> bool {

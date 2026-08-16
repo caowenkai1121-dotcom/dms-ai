@@ -377,7 +377,12 @@ pub(crate) fn code_token_hit(q: &str) -> bool {
 /// 一句「订单 HJXH-DXO2026081300138」就从 `direct-doc` 掉进自由 SQL 返 0 行 ——
 /// 而且**同一句话两次结果不同**（模型采样抖动），生产实测。
 pub(crate) fn code_tokens(q: &str) -> Vec<String> {
-    q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+    // 🔴 切分口径**转调唯一事实源**（2026-08-16）：这里曾经自己写一份，分隔符集少了
+    // `_` 和 `*`，于是 `DEV_XQ100` 被切成 `DEV`+`XQ100` 双双落选（R1.5 不触发），
+    // 而拆单号 `HJXH-DSO...071_2` 被切成 base、`_2` 丢掉 —— 改写守卫据此判「单号还在」，
+    // 放行之后 `resolve_code` 从 WarehouseShipment 静默变成 SalesOrder，查错表返错数。
+    // 判据只保留「够长 + 混编」这一半，切分交给 `document::ascii_code_candidates`。
+    dms_semantic::document::ascii_code_candidates(q)
         .filter(|t| {
             t.len() >= 6
                 && t.chars().any(|c| c.is_ascii_digit())
@@ -434,6 +439,43 @@ fn parse_intent(s: &str) -> Option<Intent> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 单号切分只有**一个口径**（2026-08-16 全量清点逮到的一条静默错答）。
+    ///
+    /// `triage::code_tokens` 曾经自己写一份分隔符集，少了 `_` 和 `*`：
+    /// - `DEV_XQ100` 被切成 `DEV`(无数字) + `XQ100`(5 位) ⇒ 空 ⇒ `decide` 的 R1.5
+    ///   **不触发**，一个注册表明写允许的真单号可能被判成资料问句掉进知识库兜底；
+    /// - 拆单号 `HJXH-DSO2026080400071_2` 被切成 base、`_2` 丢掉 ⇒ 追问改写守卫
+    ///   （ask.rs 的 `codes_kept`）据此判「单号还在」并放行，而 `resolve_code` 拿到
+    ///   base 之后从 `WarehouseShipment` **静默变成 `SalesOrder`** —— 查错表、返错数、
+    ///   没有任何提示。这是这一族里唯一一条会**答错**而不是白拒的。
+    #[test]
+    fn code_tokens_share_one_split_rule_with_the_document_registry() {
+        // 下划线不再是分隔符：整串活着
+        assert_eq!(code_tokens("DEV_XQ100"), vec!["DEV_XQ100"]);
+        assert_eq!(
+            code_tokens("HJXH-DSO2026080400071_2 这单什么状态"),
+            vec!["HJXH-DSO2026080400071_2"]
+        );
+        assert_eq!(code_tokens("HJXH_XQ20260804100"), vec!["HJXH_XQ20260804100"]);
+        assert_eq!(code_tokens("SHOP_YH2026080510000"), vec!["SHOP_YH2026080510000"]);
+        // 与单据注册表的切分逐字同源（两处不许再各写一份）
+        for q in ["DEV_XQ100", "HJXH-DSO2026080400071_2", "SHOP_TZ2026080512345"] {
+            let from_registry: Vec<&str> =
+                dms_semantic::document::ascii_code_candidates(q).collect();
+            assert_eq!(from_registry, vec![q], "{q} 两处切分不一致");
+        }
+        // 原有判据一个字没松：够长 + 含数字 + 含字母
+        assert!(code_tokens("账余记录单号是什么意思").is_empty());
+        assert!(code_tokens("ABC").is_empty(), "太短不算");
+        assert!(code_tokens("20250101").is_empty(), "纯数字是日期不是单号");
+        assert!(code_tokens("ABCDEFGH").is_empty(), "纯字母不算");
+        // 🔴 拆单号与主单号必须切成**不同**的 token —— 这正是静默错答的分界
+        assert_ne!(
+            code_tokens("HJXH-DSO2026080400071_2"),
+            code_tokens("HJXH-DSO2026080400071")
+        );
+    }
     use super::*;
 
     /// 切出 `triage()` 的函数体（到 `/// 规则判据` 注释为止）—— 两个源码扫描判据共用，
