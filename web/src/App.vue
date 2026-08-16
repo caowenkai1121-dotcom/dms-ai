@@ -2610,7 +2610,7 @@ function exportSupplementalCsv(t: Turn) {
     <!-- 侧栏 -->
     <aside class="side" :class="{ open: sideOpen }">
       <div class="side-hd">
-        <span class="logo">🐯 皇家小虎</span>
+        <span class="logo"><img src="/logo.png" alt="" width="22" height="22" />皇家小虎</span>
         <button class="btn-icon" @click="toggleTheme" title="明暗切换">{{ theme === 'dark' ? '☀️' : '🌙' }}</button>
       </div>
       <div class="sec">
@@ -2704,7 +2704,7 @@ function exportSupplementalCsv(t: Turn) {
     <div class="main">
       <div class="topbar">
         <button type="button" class="btn-icon mobile-menu" title="会话列表与导航" aria-label="会话列表与导航" @click="sideOpen = true">☰</button>
-        <div class="brand">数据智能<span class="sub">DMS · 自然语言取数</span></div>
+        <div class="brand"><img src="/logo.png" alt="" width="24" height="24" class="brand-mark" />数据智能<span class="sub">DMS · 自然语言取数</span></div>
         <div class="sp"></div>
         <span v-if="sessionToken" class="dms-user">已登录 <b>{{ loginName || '认证中…' }}</b><template v-if="roleCode"> · {{ roleCode }}</template></span>
         <button v-if="kbManager" class="btn-sm mobile-kb" title="企业知识库" @click="openKnowledge">知识库</button>
@@ -2954,6 +2954,7 @@ function exportSupplementalCsv(t: Turn) {
         <!-- 欢迎语 -->
         <div v-if="!turns.length" class="turn">
           <div class="bubble ai">
+            <img src="/logo.png" alt="" width="40" height="40" class="hello-mark" />
             嗷呜~ 我是 <b>皇家小虎 · 数据智能</b>。用自然语言查询任意数据——订单、客户、商品、库存、财务、活动、售后，<b>数据权限与你的 DMS 账号完全一致</b>。<br /><br />
             试试：<i>本月销售额</i> · <i>销售额按省区</i> · <i>买过烤肠的客户</i> · <i>昨天的订单明细</i>
           </div>
@@ -3816,6 +3817,12 @@ function exportSupplementalCsv(t: Turn) {
 .login-box { position: relative; width: min(400px, 100%); background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 24px 70px rgba(60, 40, 0, .28); padding: 34px 36px 36px; }
 .login-brand { display: flex; align-items: center; gap: 9px; color: var(--primary); font-size: 15px; font-weight: 700; margin-bottom: 18px; }
 .login-brand img { border-radius: 8px; }
+/* 品牌标：三处共用一套（侧栏 / 顶栏 / 欢迎语）。图本身是圆形主体，只补一点圆角防锯齿。 */
+.side-hd .logo img, .topbar .brand-mark, .bubble.ai .hello-mark { border-radius: 50%; vertical-align: middle; }
+.side-hd .logo { display: flex; align-items: center; gap: 7px; }
+.topbar .brand-mark { margin-right: 8px; align-self: center; }
+/* 欢迎语里的头像浮在左上，正文绕排 —— 不改气泡的既有排版 */
+.bubble.ai .hello-mark { float: left; margin: 1px 10px 4px 0; }
 @media (max-width: 900px) {
   .login-mask { place-items: center; padding: 20px; background-position: center center; }
   .login-mask::before { background: rgba(20, 14, 0, .34); }

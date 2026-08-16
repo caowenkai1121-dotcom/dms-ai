@@ -418,12 +418,25 @@ pub fn is_measure_col(col: &str, cmt: &str) -> bool {
 /// ① 别名在取数表的列名/列注释里有出处（防虚构的基本面）；
 /// ② 别名是注册指标且其登记源表就是取数表（`meta.metric` 的同源映射 —— 运营指标回自己的表）；
 /// ③ 别名是核心销售口径词且取数表有度量列（合同覆盖外的 ODS 推导映射，结果标注未经合同验证）。
+///
+/// 🔴 **合同拥有这个指标名时，①③一律不算数，只认②**（2026-08-16）。理由见函数体内红字。
 pub fn derive_labels_ungrounded(
     shape: &DeriveShape,
     corpus: &[(String, Vec<(String, String)>)],
     metrics: &[(String, String)],
 ) -> Option<String> {
     for (label, tables) in &shape.labeled {
+        // 🔴 **合同已覆盖的指标名：只有它自己的登记源表算有出处**（2026-08-16 业主实测）。
+        //
+        // 「销售额按省份」在一次多轮改写之后 fastpath 没命中，落「不可计算」→ ODS 推导用
+        // `dms_ods.t_master_shop` 的 `monthly_sales` SUM 出 **¥151 亿**（真值 7.6 亿），
+        // 河北省占 99.9%，还带着可信徽标上了屏。放行它的是下面通道③
+        //（核心销售口径词 + 该表有任意度量列）—— 而那个判据的方向是反的：
+        // 核心销售词恰恰是合同**已经验证过**的那几个，最不该允许推导另起炉灶。
+        //
+        // 降级的语义是「合同**没覆盖**这个问题」，不是「合同覆盖了但这一轮 fastpath 没命中」。
+        // 后者是 fastpath 的问题，用推导编一个数顶上，是把一次白拒换成一次倍数级错答。
+        let contract_owns = metrics.iter().any(|(name, _)| name == label);
         let grounded = tables.iter().any(|table| {
             let cols_of = || {
                 corpus
@@ -446,7 +459,13 @@ pub fn derive_labels_ungrounded(
                         .split(|c: char| c.is_whitespace() || c == '/')
                         .any(|seg| seg.rsplit('.').next() == Some(table.as_str()))
             });
-            // ③ 核心销售口径词 + 该表有度量列
+            // 合同拥有这个指标名时，判据收紧成「必须是它自己的登记源表」——
+            // 通道①（列注释里有这三个字）与通道③（核心词 + 任意度量列）都不算数：
+            // `t_master_shop.monthly_sales` 的注释里就有「销售额」，通道①一样会放行。
+            if contract_owns {
+                return by_metric;
+            }
+            // ③ 核心销售口径词 + 该表有度量列（只对**合同没覆盖**的标签开）
             let by_core = CORE_SALES_METRIC_WORDS.contains(&label.as_str())
                 && cols_of().iter().any(|(col, cmt)| is_measure_col(col, cmt));
             by_comment || by_metric || by_core
@@ -655,3 +674,79 @@ pub fn customer_name_fragment(question: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+#[cfg(test)]
+mod contract_owned_label_tests {
+    use super::*;
+
+    fn shape(label: &str, table: &str) -> DeriveShape {
+        DeriveShape {
+            labeled: vec![(label.to_string(), vec![table.to_string()])],
+            ..Default::default()
+        }
+    }
+
+    /// 🔴 合同已覆盖的指标名，推导路只许用它自己的登记源表。
+    ///
+    /// 由来（2026-08-16 业主实测）：「销售额按省份」在一次多轮改写后 fastpath 没命中，
+    /// 落「不可计算」→ ODS 推导用 `dms_ods.t_master_shop` 的 `monthly_sales` SUM 出
+    /// **¥151 亿**（真值 7.6 亿），河北省占 99.9%，还带着可信徽标上了屏。
+    /// 放行它的是通道③（核心销售口径词 + 该表有任意度量列）——
+    /// 而那个判据方向是反的：核心销售词恰恰是合同验证过的那几个。
+    /// 通道①同样拦不住：`monthly_sales` 的列注释里就有「销售额」三个字。
+    #[test]
+    fn a_contract_owned_metric_may_only_come_from_its_registered_source() {
+        // 合同：销售额 登记在 sales_dw.dws_off_offline_sale_dfn
+        let metrics = vec![(
+            "销售额".to_string(),
+            "sales_dw.dws_off_offline_sale_dfn".to_string(),
+        )];
+        // ODS 门店主档：有度量列，注释里还带着「销售额」三个字（通道①③都会放行）
+        let corpus = vec![(
+            "t_master_shop".to_string(),
+            vec![("monthly_sales".to_string(), "月销售额".to_string())],
+        )];
+        assert_eq!(
+            derive_labels_ungrounded(&shape("销售额", "t_master_shop"), &corpus, &metrics),
+            Some("销售额".to_string()),
+            "合同拥有「销售额」，ODS 门店主档不许冒充它的出处"
+        );
+        // 登记源表本身照旧放行（通道②）
+        let own = vec![(
+            "dws_off_offline_sale_dfn".to_string(),
+            vec![("amount".to_string(), "销售额".to_string())],
+        )];
+        assert_eq!(
+            derive_labels_ungrounded(
+                &shape("销售额", "dws_off_offline_sale_dfn"),
+                &own,
+                &metrics
+            ),
+            None
+        );
+        // 反面（防恒拒）：合同**没覆盖**的标签，通道①③照旧管用 —— 这条路的存在意义没被砍掉
+        let uncovered = vec![(
+            "t_master_shop".to_string(),
+            vec![
+                ("monthly_sales".to_string(), "门店月销".to_string()),
+                // 通道③要的是**度量列**：`is_measure_col` 认 qty/amount/price/cost 那一族，
+                // `monthly_sales` 的 "sales" 不在表里（这条 fixture 第一版就写错了）
+                ("sale_qty".to_string(), "月销数量".to_string()),
+            ],
+        )];
+        assert_eq!(
+            derive_labels_ungrounded(&shape("门店月销", "t_master_shop"), &uncovered, &[]),
+            None,
+            "合同没覆盖的标签仍按列注释找出处"
+        );
+        assert_eq!(
+            derive_labels_ungrounded(&shape("销量", "t_master_shop"), &uncovered, &[]),
+            None,
+            "核心销售词在合同没登记时仍走通道③"
+        );
+        // 无出处的虚构标签照旧拒
+        assert_eq!(
+            derive_labels_ungrounded(&shape("神秘指标", "t_master_shop"), &uncovered, &[]),
+            Some("神秘指标".to_string())
+        );
+    }
+}
