@@ -117,6 +117,13 @@ def req(method, path, body=None, ctype=None, timeout=120, token=None):
         r.add_header("Content-Type", ctype)
     if token:
         r.add_header("Authorization", "Bearer " + token)
+    # 🔴 第三种身份：`X-API-Key`（settings.docker.json 的 mcp_keys 明文键名 → login）。
+    # 2026-08-16 加：生产的 `insecure_login_fallback` 是关的，裸 login 一律 401；
+    # 而基线要在**生产语料**上冻结才有意义（本地夹具 15 篇量不出九路 RRF 的排序病）。
+    # 与 `tools/regression.py --http/--entries` 用同一把 key，不再多造一套身份。
+    api_key = os.environ.get("DMSAI_API_KEY", "").strip()
+    if api_key:
+        r.add_header("X-API-Key", api_key)
     try:
         with urllib.request.urlopen(r, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
