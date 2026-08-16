@@ -221,6 +221,11 @@ async fn summarize(
 /// 列名与 `insight::Reading::answer_contract` 的 COMPARE 域同一套中文（本期/基期/变化额/增幅）：
 /// 两处用同一批词，模型才不会因为换了说法而重新学一遍。
 fn delta_facts(data: &AskResult) -> Vec<Vec<serde_json::Value>> {
+    // 复合容器自己没有 comparisons（同 columns/rows：数在子结果里）。
+    // 不下沉的话「涨了还是跌了」这条最有信息量的事，在复合答案上恒缺席。
+    if !data.subs.is_empty() {
+        return data.subs.iter().flat_map(|sub| delta_facts(&sub.result)).collect();
+    }
     // 读 `comparisons` 而不是 `view.blocks[..].delta`：两者由同一个 `apply_prev` 同时落，
     // 但前者带**完整原值**（`view` 里的 delta 只保留第一项，是给老前端的兼容位）。
     data.comparisons
@@ -277,7 +282,24 @@ pub async fn hybrid_summary(
         _ => String::new(),
     };
     let mut contract = AnswerContract::new();
-    contract.push_table("DATA", "取数结果", &data.columns, &data.rows, 5);
+    // 🔴 复合容器没有自己的行（2026-08-16 生产实测）：`AskResult::compound` 的
+    // `columns/rows` 是空的，数在**每个子结果**里。照旧只喂容器，综合就会写出
+    // 「取数结果未提供任何数据，故无法判断本月销售额和订单数的具体数值」——
+    // 而屏幕上两张子卡各自摆着数。用户读到的是系统自己跟自己对不上口径。
+    if !data.subs.is_empty() {
+        for (i, sub) in data.subs.iter().enumerate() {
+            let r = &sub.result;
+            contract.push_table(
+                &format!("DATA{}", i + 1),
+                &sub.question,
+                &r.columns,
+                &r.rows,
+                5,
+            );
+        }
+    } else {
+        contract.push_table("DATA", "取数结果", &data.columns, &data.rows, 5);
+    }
     // 🔴 KPI 卡上的环比/同比也要进合同（2026-08-15 生产实测）：
     // 「本月销售额」的 KPI 卡明明带着 `delta{pct:13.4, label:"较上月"}`，
     // 而它只活在 `view.blocks` 里 —— 对每一层 LLM 都不可见。于是综合只能写
@@ -294,11 +316,14 @@ pub async fn hybrid_summary(
         );
     }
     contract.push_text("KB", "知识库资料", &kb_text);
-    let hits = vec![
-        insight::hit(1, "取数结果", &insight::brief(&data.columns, &data.rows, data.row_count)),
-        insight::hit(2, "知识库资料", &kb_text),
-        insight::hit(3, "可引用事实合同", &contract.render()),
-    ];
+    // 简报侧同理：复合容器要逐个子结果给，否则模型看到的仍是「0 行」
+    let mut hits: Vec<Hit> = if data.subs.is_empty() {
+        vec![insight::hit(1, "取数结果", &insight::brief(&data.columns, &data.rows, data.row_count))]
+    } else {
+        data.subs.iter().enumerate().map(|(i, sub)| sub_hit(i + 1, sub)).collect()
+    };
+    hits.push(insight::hit(hits.len() + 1, "知识库资料", &kb_text));
+    hits.push(insight::hit(hits.len() + 1, "可引用事实合同", &contract.render()));
     let user = format!("{}
 原问题：{question}
 请综合成结论：", wrap_untrusted(&hits));
@@ -310,6 +335,31 @@ pub async fn hybrid_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 复合容器自己没有行、没有 comparisons —— 数都在子结果里。
+    /// 不下沉的后果是生产实测过的那句：综合写「取数结果未提供任何数据」，
+    /// 而屏幕上两张子卡各自摆着数（2026-08-16「分别查本月销售额和本月订单数」）。
+    #[test]
+    fn compound_container_lends_its_subs_to_the_summary() {
+        use crate::ctx::KpiComparison;
+        let mut sub = AskResult::compound(vec![], 0);
+        sub.route = "direct-agg".into();
+        sub.columns = vec!["销售额".into()];
+        sub.rows = vec![vec![serde_json::Value::from("118651278.68")]];
+        sub.row_count = 1;
+        sub.comparisons = vec![KpiComparison {
+            label: "较上月".into(), current: 118651278.68, baseline: 99807612.669,
+            change: 18843666.011, pct: 18.9, dir: "up",
+        }];
+        let container = AskResult::compound(
+            vec![SubResult { question: "本月销售额".into(), result: sub }],
+            1,
+        );
+        assert_eq!(container.row_count, 0, "容器本身没有行 —— 判据的前提");
+        let deltas = delta_facts(&container);
+        assert_eq!(deltas.len(), 1, "环比必须从子结果里捞上来：{deltas:?}");
+        assert_eq!(deltas[0][1], serde_json::Value::from("较上月"));
+    }
 
     /// KPI 卡上的环比必须能进合同：它是「涨了还是跌了」的唯一证据，
     /// 而此前只活在 `view.blocks` 里，对每一层 LLM 都不可见 ——
