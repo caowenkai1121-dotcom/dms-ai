@@ -1147,18 +1147,22 @@ pub(crate) fn sales_metric_extra_words(
     dms_semantic::fastpath::sales_fact_metric_extra_words(metric)
 }
 
-/// 与已验证销售合同（`sales_fact` DWS 日事实）**主题重叠**的 ODS 表：同一批线下销售业务的
-/// 原始层。LLM 兜底路径引了它们、又没引合同表 = 绕开合同口径（2.29 亿 vs 2.03 亿那一案）。
-/// `t_sales_order_logistics` 是物流批次，刻意不在列 —— 匹配按**最后一段表名精确等值**，不做前缀。
-const CONTRACT_OVERLAP_TABLES: &[&str] = &["t_sales_order", "t_sales_order_detail", "t_winc_sale_report"];
-
-/// 合同绕开判据（**纯函数**，故有单测）。三要件缺一不可：
+/// 合同绕开判据（**纯函数**，故有单测）。两要件缺一不可：
 /// ① 问句点了合同指标（`sales_contract_metrics` 非空 —— 订单数/库存/售后不是合同指标，
 ///    那些问题走 ODS 是正当口径，不许标注）；
-/// ② 最终 SQL 引了主题重叠的 ODS 表（大小写不敏感、按最后一段表名精确等值）；
-/// ③ 最终 SQL 没引合同事实表（引了 —— 哪怕混用 —— 都不算绕开）。
-/// 产出 = 给用户看的口径说明，落到 `st.note`：trust 经 `ctx::attach_trust` 既有机制
-/// 降 review（caliber_note 非空 = risk），同时 `worth_learning` 否决语料沉淀。
+/// ② 最终 SQL **没引**合同事实表（引了 —— 哪怕混用 —— 都不算绕开）。
+///
+/// 🔴 **第三个要件删掉了**（2026-08-17 审计逮到）。它原来是一张手写名单
+/// `CONTRACT_OVERLAP_TABLES = [t_sales_order, t_sales_order_detail, t_winc_sale_report]`：
+/// 只有名字在这三张里才标注。而 2026-08-16 那条 ¥151 亿走的是
+/// `dms_ods.t_master_shop.monthly_sales` —— **不在名单里**，于是答案带着 verified 徽标、
+/// caliber_note 为空上屏，还会被 `worth_learning` 当成正确范例沉淀进 few-shot。
+/// 当天只补了 derive 那条路的闸，LLM 这条出口一个字没动。
+///
+/// 负判据（名单）永远会有下一个漏项。合同覆盖的指标只应该从合同事实表出，
+/// 换成正判据「没引合同表就必须说明」，一次收口。
+/// 代价是别名宽泛的问句（「本月各活动的成本」）会多挂一句口径说明 ——
+/// 那是 loud 的一侧，且 `attach_trust` 只降到 review、答案照出。
 fn contract_bypass_note(question: &str, tables: &[String]) -> Option<String> {
     if sales_contract_metrics(question).is_empty() {
         return None;
@@ -1167,15 +1171,17 @@ fn contract_bypass_note(question: &str, tables: &[String]) -> Option<String> {
     if hit(dms_semantic::sales_fact::TABLE_NAME) {
         return None;
     }
-    let overlap: Vec<&str> =
-        CONTRACT_OVERLAP_TABLES.iter().copied().filter(|t| hit(t)).collect();
-    if overlap.is_empty() {
+    // 一张表都没解析出来时不标注：那多半是 AST 没读懂，
+    // 而「读不懂」不该反过来把一次成功取数标成可疑（与 `contract_overlap_note` 同一条纪律）。
+    if tables.is_empty() {
         return None;
     }
+    let mut used: Vec<&str> = tables.iter().map(String::as_str).collect();
+    used.sort_unstable();
+    used.dedup();
     Some(format!(
-        "本答案由 LLM 路径从 ODS 原始表（{}）计算，未使用已验证的销售合同口径（{}）：\
-         有效单过滤、时间列与退换货冲减可能不同，数字与合同口径可能有差，仅供排查参考。",
-        overlap.join("、"),
+        "本答案由 LLM 路径从 {} 计算，未使用已验证的销售合同口径（{}）：         有效单过滤、时间列与退换货冲减可能不同，数字与合同口径可能有差，仅供排查参考。",
+        used.join("、"),
         dms_semantic::sales_fact::TABLE
     ))
 }
@@ -2064,12 +2070,18 @@ mod contract_bypass_tests {
             contract_bypass_note("上月有多少订单", &["t_sales_order".into()]).is_none(),
             "订单数不是合同指标 —— 走 ODS 是正当口径"
         );
-        assert!(
-            contract_bypass_note("上月销售额", &["t_activity_main".into()]).is_none(),
-            "不在重叠集的表不归这条管"
-        );
-        // 精确匹配最后一段表名：物流批次表不许被 t_sales_order 前缀吞掉
-        assert!(contract_bypass_note("上月销售额", &["t_sales_order_logistics".into()]).is_none());
+        // 🔴 2026-08-17 反转：原来这里断言「不在重叠集的表不归这条管」——
+        // 那正是那张手写名单的漏。¥151 亿走的 `t_master_shop` 就不在名单里，
+        // 于是答案带 verified 徽标上屏、还被沉淀进 few-shot。
+        // 合同覆盖的指标只应该从合同事实表出，换成正判据一次收口。
+        for table in ["t_activity_main", "t_master_shop", "t_sales_order_logistics"] {
+            let note = contract_bypass_note("上月销售额", &[table.into()])
+                .unwrap_or_else(|| panic!("{table}：合同指标没走合同表就必须标注"));
+            assert!(note.contains(table), "标注要点名实际用了哪张表：{note}");
+        }
+        // 一张表都没解析出来时不标注：那多半是 AST 没读懂，
+        // 而「读不懂」不该反过来把一次成功取数标成可疑。
+        assert!(contract_bypass_note("上月销售额", &[]).is_none());
     }
 
     /// 接线判据（源码扫描 —— execute 要走库，无库测不了。锚点 `concat!` 拼，自匹配家族）：
