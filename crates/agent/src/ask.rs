@@ -149,29 +149,6 @@ impl PreparedQuestion {
         self.plan().route
     }
 
-    /// 本轮该不该**直接**出澄清卡（不进 Router）。★ 唯一判据 —— HTTP / 流式 / 深度
-    /// 三个入口都调它，不许在 server 侧再演化出第二种写法（守卫见 `only_one_contract_gate`）。
-    ///
-    /// 🔴 三个判据来自两个时代，`&&` 的顺序就是纪律：
-    /// ① `plan.route` 是**新裁决**（`decide`）；② `plan.deterministic` 是「这条路由问句
-    /// 词法定，与本次 LLM 采样无关」；③ `is_data_executable()` 是**旧合同**视角。
-    ///
-    /// 漏掉 ② 就是让确定性车道被自己判出来的 `Data` 反噬：裸单号
-    /// `HJXH-DSO2026081500390` 的合同必然作废（模型对一个裸号正确地答 `mode=unknown`），
-    /// 而它恰恰是**全系统最不含糊的问数信号**（R1.5 `code-lookup`）。
-    /// 2026-08-16 业主实测：web 上吃「先问清再查 · 尚未确定应使用问数还是知识检索」，
-    /// CLI 同一句出 18 行单据明细 —— 差别就是这一条豁免。判官走 CLI，
-    /// 结构上看不见 HTTP 那三份闸，所以这一族「改过多次还回潮」。
-    ///
-    /// fail-closed 一个字没松：自由 SQL 的真闸是 `LlmAnswerer::accept == is_data_executable()`，
-    /// 与 route 判成什么无关；确定性成员（实体卡 / 单据点查 / business-lookup）本就该接。
-    pub fn needs_clarification(&self) -> bool {
-        let plan = self.plan();
-        plan.route == crate::intent::IntentRoute::Data
-            && !plan.deterministic
-            && !self.intent_attempt.is_data_executable()
-    }
-
     pub fn routed_questions(&self) -> Vec<crate::intent::RoutedQuestion> {
         self.intent_attempt
             .routed_questions(&self.effective_question)
@@ -3808,155 +3785,44 @@ mod tests {
     ///
     /// 生产实测（2026-08-16 业主截图）：`HJXH-DSO2026081500390` 在 web 上吃
     /// 「先问清再查 · 尚未确定应使用问数还是知识检索」，同一句走 CLI 出 18 行单据明细。
-    /// 差别是 HTTP 那条路上的合同闸写的是 `route == Data && !is_data_executable()`，
-    /// 缺了确定性车道的豁免 —— 而 R1.5 判的正是 `Data` + `deterministic`。
-    /// 判官走 CLI，结构上看不见那三道闸，所以这一族反复回潮。
+    /// 差别是 HTTP 那条路上有三道**只长在 server 层**的合同闸，判据是
+    /// `route == Data && !is_data_executable()` —— 缺确定性车道的豁免。
+    ///
+    /// 那三道闸 2026-08-16 **整体删除**（不是加豁免）：它们在确定性成员跑之前就拒答，
+    /// 而 agent 侧本来就有正确的兜底 —— 摘掉接不了单的 `llm` 成员、跑完全部确定性成员、
+    /// 一个都不接才出澄清卡。这条测试守的是那条兜底链的两端。
     #[test]
-    fn a_bare_document_code_never_gets_a_clarification_card() {
-        let prep = |q: &str, attempt: crate::intent::IntentAttempt| PreparedQuestion {
-            original_question: q.into(),
-            effective_question: q.into(),
-            intent_attempt: attempt,
-            started_at: Instant::now(),
-        };
+    fn a_bare_document_code_reaches_the_deterministic_lane() {
+        // ① 路由判据：裸单号是确定性问数（R1.5），与本次采样无关
         for q in ["HJXH-DSO2026081500390", "HJXH-DXO2026081300138", "CZ202608131914"] {
             for attempt in
                 [crate::intent::IntentAttempt::Invalid, crate::intent::IntentAttempt::Unavailable]
             {
-                assert!(
-                    !prep(q, attempt).needs_clarification(),
-                    "「{q}」又被合同闸拦在 Router 之前了"
-                );
+                let plan = decide(q, &attempt, None);
+                assert_eq!(plan.route, crate::intent::IntentRoute::Data, "{q}");
+                assert!(plan.deterministic, "{q} 必须是确定性车道");
+                assert_eq!(plan.reason, "code-lookup", "{q}");
             }
         }
-        // 反面（防恒假）：合同说 Data、却自报歧义 → 不可执行且非确定性车道，照旧出卡。
-        // 这一档才是这道闸原本要拦的东西（自由 SQL 的前置闸），一个字都不许松。
-        let plain = "本月销售额是多少";
-        let ambiguous = crate::intent::IntentV1 {
-            mode: crate::intent::IntentMode::Data,
-            metrics: vec!["销售额".into()],
-            ambiguities: vec!["未指定商品范围".into()],
-            ..Default::default()
-        };
-        let attempt = crate::intent::IntentAttempt::validated(ambiguous, plain);
-        assert_eq!(decide(plain, &attempt, None).route, crate::intent::IntentRoute::Data);
-        assert!(!decide(plain, &attempt, None).deterministic);
+        // ② 兜底链：合同不可执行时 `llm` 成员被摘掉（自由 SQL 那条路结构上不接单），
+        //    而确定性成员照跑 —— 这两句话是同一行代码承担的
+        let dispatch = include_str!("ask.rs")
+            .split("pub async fn ask_prepared(")
+            .nth(1)
+            .expect("ask_prepared 改名了")
+            .split("pub(crate) async fn ask_data_arm(")
+            .next()
+            .unwrap();
         assert!(
-            prep(plain, attempt).needs_clarification(),
-            "带歧义的 Data 合同被放行了 —— 自由 SQL 的前置闸松了"
+            dispatch.contains("!prepared.intent_attempt.is_data_executable()"),
+            "接不了单的 llm 成员又留在表里了：{dispatch}"
         );
-        // Knowledge 那条路本来就不过这道闸（判据只管 Data 半）
-        let doc = "把 押金转货款申请书 发我";
-        assert!(!prep(doc, crate::intent::IntentAttempt::Invalid).needs_clarification());
-    }
-
-    /// 🔴 合同从没解释过的文档名词 = 资料诉求（2026-08-16 业主实测）。
-    ///
-    /// 「客户退出申请流程」返回 200 行「退出申请金额」排行 + 深度 BI，三条验收断言全「未满足」，
-    /// 而库里就有《客户退出申请流程填写详细指引》。成因不在词表（「流程」在 `DOC_NOUNS` 里）：
-    /// 合同把这个名词短语的**碎片**当成了槽位（grounding 的兜底只要求子串），
-    /// R2 于是被自己要救的那句话否决掉。
-    #[test]
-    fn a_document_noun_no_slot_ever_claimed_is_a_document_question() {
-        use crate::intent::{IntentAttempt, IntentMode, IntentRoute, IntentV1};
-        let q = "客户退出申请流程";
-        // 模型把标题碎片当槽位：两个都能过 grounding（都是问句子串），但都没提「流程」
-        let fabricated = IntentAttempt::validated(
-            IntentV1 {
-                mode: IntentMode::Data,
-                metrics: vec!["退出申请".into()],
-                breakdowns: vec!["客户".into()],
-                ..Default::default()
-            },
-            q,
+        // ③ 一个成员都不接时出澄清卡，不是 500
+        let tail = include_str!("ask.rs");
+        assert!(
+            tail.contains("if !members.iter().any(|m| m.route() == \"llm\") {"),
+            "确定性兜底档的澄清出口没了"
         );
-        assert!(fabricated.is_ready(), "前提：这种合同今天确实能过 grounding");
-        assert!(has_measurable_slots(&fabricated), "前提：旧判据会被它否决");
-        assert!(!doc_noun_claimed(q, &fabricated), "剥掉两个槽位表面词后「流程」还在 = 没人认领");
-        let plan = decide(q, &fabricated, None);
-        assert_eq!(plan.route, IntentRoute::Knowledge, "{plan:?}");
-        assert_eq!(plan.reason, "doc-topic");
-        assert!(plan.deterministic);
-
-        // 反面①（防恒真）：文档名词被槽位**认领**时，否决照旧成立 —— 问数不许被抢走
-        let contract_amount = IntentAttempt::validated(
-            IntentV1 {
-                mode: IntentMode::Data,
-                metrics: vec!["合同金额".into()],
-                ..Default::default()
-            },
-            "本月合同金额是多少",
-        );
-        assert!(doc_noun_claimed("本月合同金额是多少", &contract_amount));
-        assert_eq!(
-            decide("本月合同金额是多少", &contract_amount, None).route,
-            IntentRoute::Data
-        );
-
-        // 🔴 复核逮到的洞：「某槽位含某文档名词」不等于「**那个**文档名词被认领」。
-        // 「本月合同金额的审批流程是什么」的 metrics=["合同金额"] 自带一个「合同」，
-        // 旧写法当场成立 → 判 Data，而用户问的是「审批流程」。
-        let approval_q = "本月合同金额的审批流程是什么";
-        let approval = IntentAttempt::validated(
-            IntentV1 {
-                mode: IntentMode::Data,
-                metrics: vec!["合同金额".into()],
-                ..Default::default()
-            },
-            approval_q,
-        );
-        assert!(!doc_noun_claimed(approval_q, &approval), "剥完仍留「流程」= 没人认领");
-        assert_eq!(decide(approval_q, &approval, None).reason, "doc-topic");
-
-        // 🔴 反面②（复核逮到的回归面）：注册表认得的指标在场就不是资料诉求。
-        // 「标准价销售额」的「标准」是文档名词，剥掉 metrics=["销售额"] 后仍留「标准价」——
-        // 只按「认领」判会把一道今天正确的问数题抢去知识库。
-        let standard_q = "本月标准价销售额";
-        let standard = IntentAttempt::validated(
-            IntentV1 {
-                mode: IntentMode::Data,
-                metrics: vec!["销售额".into()],
-                ..Default::default()
-            },
-            standard_q,
-        );
-        assert!(!doc_noun_claimed(standard_q, &standard), "「标准」确实没人认领");
-        assert_eq!(
-            decide(standard_q, &standard, None).route,
-            IntentRoute::Data,
-            "注册表认得「销售额」，不许被抢去知识库"
-        );
-
-        // 反面②：真混合问句不许被压成单路 —— 资料半的 surface 认领了「政策」
-        let mixed_q = "查最近的设备订单，并且最近的线下设备政策";
-        let mixed = IntentAttempt::validated(
-            IntentV1 {
-                version: 2,
-                mode: IntentMode::Hybrid,
-                subgoals: vec![
-                    crate::intent::IntentSubgoal {
-                        mode: IntentMode::Data,
-                        surface: "查最近的设备订单".into(),
-                        metrics: vec!["设备订单".into()],
-                        time: Some(crate::intent::TimeSlot {
-                            surface: "最近".into(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    crate::intent::IntentSubgoal {
-                        mode: IntentMode::Knowledge,
-                        surface: "最近的线下设备政策".into(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            },
-            mixed_q,
-        );
-        assert!(mixed.is_ready(), "前提：混合合同能过 grounding");
-        assert!(doc_noun_claimed(mixed_q, &mixed), "资料子任务的 surface 剥掉了「政策」");
-        assert_ne!(decide(mixed_q, &mixed, None).reason, "doc-topic", "混合问句被压成单路了");
     }
 
     /// R2：资料/政策问句不再吃澄清卡；带指标的问句一条都不许被抢走。

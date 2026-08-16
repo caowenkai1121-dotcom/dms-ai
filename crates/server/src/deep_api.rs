@@ -4623,47 +4623,6 @@ async fn compose_inner(
     // 属主登记抢在第一个 note 前：前端发起 POST 即开始轮询，早一拍是一拍。
     let rid = req.rid.clone().unwrap_or_default();
     note_owner(&rid, &login_name);
-    // 🔴 合同不可用 ≠ 知识库不能答（与 `main.rs` 两个端点同一个函数，不写第二份）。
-    // 深度模式此前是唯一没接兜底的入口 —— 业主从这里进来，同一句「下载 押金转货款申请书」
-    // 拿到的是 38 行账余表，而 CLI 拿到的是知识库回答。同题不同答的成因就在这里。
-    if !crate::prepared_contract_ready(&prepared) {
-        // 🔴 **两臂编排，不是只问知识库**（2026-08-16 与另外四个入口一起收）。
-        // 上一版只做检索，确定性问数成员（实体卡 / 单据点查 / business-lookup）一个都没跑过：
-        // 整句就是一个客户名时用户拿到「知识库里没有关于…」，而那家客户有客户卡。
-        // 这一档不出深度报告是对的 —— 合同都没就绪，拼板块没有意义；给一张正常答案卡。
-        let (answered, _log) = crate::ask_prepared(
-            &st.llm,
-            &st.auth_mysql,
-            &st.mysql,
-            &st.sources,
-            st.owned.pool(),
-            &st.embed,
-            &p,
-            &prepared,
-            req.ds.as_deref(),
-            req.conv_id.map(|c| c.to_string()).as_deref(),
-            st.sc_samples,
-            req.space_id.as_deref(),
-            true, // 两臂：资料半照旧跑，只是不再是唯一一条
-        )
-        .await;
-        let result = match answered {
-            Ok(r) => serde_json::to_value(&r)
-                .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
-            Err(e) => {
-                tracing::warn!(error = %e, "深度模式合同未就绪的两臂兜底失败 → 出澄清卡");
-                serde_json::to_value(prepared.question.clarification_result())
-                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败")
-            }
-        };
-        if let Some(cid) = req.conv_id {
-            save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
-            let payload = serde_json::json!({ "result": result });
-            save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
-        }
-        note(&rid, ProgressStage::Done);
-        return Ok(Json(serde_json::json!({ "result": result })));
-    }
     let prepared = match forced {
         Some(route) => match crate::projected_forced(&prepared, route) {
             Some(projected) => projected,
@@ -4682,19 +4641,6 @@ async fn compose_inner(
         None => prepared,
     };
     let route = prepared.question.route();
-    // 判据收在 agent 一处（`PreparedQuestion::needs_clarification`）：此前这里是
-    // `route == Data && !is_data_executable()`，缺确定性豁免 —— 裸单号在深度模式同样吃反问卡。
-    if prepared.question.needs_clarification() {
-        let result = serde_json::to_value(prepared.question.clarification_result())
-            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
-        if let Some(cid) = req.conv_id {
-            save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;
-            let payload = serde_json::json!({ "result": result });
-            save_chat_msg(st.owned.pool(), cid, "ai", "", Some(&payload)).await;
-        }
-        note(&rid, ProgressStage::Done);
-        return Ok(Json(serde_json::json!({ "result": result })));
-    }
     let execution_question = prepared.question.effective_question.clone();
     if route == dms_agent::intent::IntentRoute::Knowledge {
         note(&rid, ProgressStage::Knowledge);

@@ -399,45 +399,14 @@ async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, 
     let question = req_str(args, "question")?;
     let ds = opt_str(args, "ds");
     let prepared = crate::prepare_ask(st, &question, None).await;
+    // 🔴 Data / Knowledge / Unknown **同一个出口**（2026-08-16）。
+    // 此前 `Knowledge` 臂直连 `kb_answer` —— 与 `/api/ask` 2026-08-14 修掉的缺陷一字不差：
+    // 「线下-浏阳品元商贸有限公司」在 web 上修好了，从 MCP 进来照旧只答
+    // 「知识库里没有这家公司的规定」，而这家公司在业务库里有客户卡。
+    // `ask_prepared` 内部按 route 决定问数臂开不开自由 SQL（Knowledge/Unknown 档本就不开），
+    // 纯资料答案由 `knowledge_arm_payload` 还原成整份 `Answer`，wire 形状一字不变。
+    // 只剩 Hybrid 单列 —— 它的 wire 形状（两路并排 + AI 综合）确实不同。
     let out: Value = match prepared.question.route() {
-        // 🔴 合同不可用 → **两臂编排**，不是只问知识库（2026-08-16 与 `/api/ask` 一起收）。
-        // 只做检索那一版把确定性问数成员（实体卡 / 单据点查 / business-lookup）整块跳过：
-        // 整句就是一个客户名时，用户拿到「知识库里没有关于…的任何信息」，
-        // 而那家客户在业务库里有客户卡。走 Data 同一条出口即可 ——
-        // `ask_prepared` 内部按 route 决定问数臂开不开自由 SQL，Unknown 档本就不开。
-        IntentRoute::Unknown | IntentRoute::Data => {
-            let (r, _log) = crate::ask_prepared(
-                &st.llm,
-                &st.auth_mysql,
-                &st.mysql,
-                &st.sources,
-                st.owned.pool(),
-                &st.embed,
-                p,
-                &prepared,
-                ds.as_deref(),
-                None, // conv_id：MCP 无会话概念（`chat.msg.conv_id` 只存在于 HTTP 聊天）
-                st.sc_samples,
-                None, // space_id：MCP 无空间选择面
-                true,
-            )
-            .await;
-            // 长驻进程，写入句柄直接丢弃（fire-and-forget，同 `/api/ask`）
-            let r = r.map_err(|e| internal_fail("问数执行", &e))?;
-            serde_json::to_value(&r).map_err(|e| internal_fail("问数结果序列化", &e))?
-        }
-        IntentRoute::Knowledge => {
-            let a = crate::kb_answer(st, p, None, &prepared.question.effective_question)
-                .await
-                .map_err(|e| internal_fail("知识问答", &e))?;
-            let mut payload =
-                serde_json::to_value(&a).map_err(|e| internal_fail("知识结果序列化", &e))?;
-            payload["intent_summary"] = crate::knowledge_summary_value(&prepared, &a);
-            if prepared.question.effective_question != question {
-                payload["resolved_question"] = json!(prepared.question.effective_question);
-            }
-            payload
-        }
         IntentRoute::Hybrid => {
             let h = crate::HybridAsk {
                 question: &question,
@@ -458,6 +427,31 @@ async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, 
                         .to_string();
                     (EXEC_FAILED, msg)
                 })?
+        }
+        _ => {
+            let (r, _log) = crate::ask_prepared(
+                &st.llm,
+                &st.auth_mysql,
+                &st.mysql,
+                &st.sources,
+                st.owned.pool(),
+                &st.embed,
+                p,
+                &prepared,
+                ds.as_deref(),
+                None, // conv_id：MCP 无会话概念（`chat.msg.conv_id` 只存在于 HTTP 聊天）
+                st.sc_samples,
+                None, // space_id：MCP 无空间选择面
+                true,
+            )
+            .await;
+            // 长驻进程，写入句柄直接丢弃（fire-and-forget，同 `/api/ask`）
+            let r = r.map_err(|e| internal_fail("问数执行", &e))?;
+            match crate::knowledge_arm_payload(&r, &prepared, &question) {
+                Some(payload) => payload,
+                None => serde_json::to_value(&r)
+                    .map_err(|e| internal_fail("问数结果序列化", &e))?,
+            }
         }
     };
     Ok(json_text(&out))

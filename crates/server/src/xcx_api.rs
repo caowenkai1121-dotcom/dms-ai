@@ -458,35 +458,15 @@ pub async fn ask(
         .as_ref()
         .map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
     let prepared = crate::prepare_ask(&st, &gate.question, prev).await;
+    // 🔴 Data / Knowledge / Unknown **同一个出口**（2026-08-16）。
+    // 此前这里是四臂 `match`，`Knowledge` 直连 `kb_answer` —— 与 `/api/ask` 2026-08-14
+    // 修掉的那个缺陷一字不差：「线下-浏阳品元商贸有限公司」在 web 上修好了，
+    // 在小程序上照旧只答「知识库里没有这家公司的规定」，而这家公司在业务库里有客户卡。
+    // 同一个缺陷在不同入口上各活各的，正是本仓反复付账的那个形状。
+    // 现在只剩 Hybrid 一档单列 —— 它的 wire 形状（两路并排 + AI 综合）确实不同。
     let payload = match prepared.question.route() {
-        // 🔴 合同不可用 → **两臂编排**，不是只问知识库（2026-08-16 与 `/api/ask` 一起收）。
-        // 上一版只做检索，确定性问数成员（实体卡 / 单据点查 / business-lookup）一个都没跑过：
-        // 整句就是一个客户名时，用户拿到「知识库里没有关于…的任何信息」，
-        // 而那家客户在业务库里有客户卡。fail-closed 没松 —— 合同不可执行时
-        // `LlmAnswerer::accept` 结构上不接单，自由 SQL 那条路照旧关着。
-        IntentRoute::Unknown => ask_data_payload(&st, &gate, &prepared).await?,
         IntentRoute::Hybrid => xcx_hybrid_payload(&st, &gate, &prepared).await?,
-        IntentRoute::Data => ask_data_payload(&st, &gate, &prepared).await?,
-        IntentRoute::Knowledge => {
-            let a = crate::kb_answer(&st, &gate.p, None, &prepared.question.effective_question)
-                .await
-                .map_err(|_| {
-                    fail(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        422,
-                        "暂时无法完成知识检索，请稍后重试",
-                    )
-                })?;
-            let mut payload = serde_json::to_value(&a).unwrap_or_else(|e| {
-                tracing::warn!(conv_id = gate.conv_id, reason = %e, "知识检索结果序列化失败，回空对象");
-                json!({})
-            });
-            payload["intent_summary"] = crate::knowledge_summary_value(&prepared, &a);
-            if prepared.question.effective_question != gate.question {
-                payload["resolved_question"] = json!(prepared.question.effective_question);
-            }
-            payload
-        }
+        _ => ask_data_payload(&st, &gate, &prepared).await?,
     };
     Ok(ask_finish(&st, &gate, payload).await)
 }
@@ -508,51 +488,69 @@ pub async fn ask_stream(
         .as_ref()
         .map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
     let prepared = crate::prepare_ask(&st, &gate.question, prev).await;
-    match prepared.question.route() {
-        // 与同文件非流式版逐字同义（两臂编排）。少了这一处，同一个人在小程序里
-        // 换个开关（流式/非流式）就得到两种答案。
-        IntentRoute::Unknown => {
-            let payload = ask_data_payload(&st, &gate, &prepared).await?;
-            Ok(ask_finish(&st, &gate, payload).await.into_response())
-        }
-        IntentRoute::Hybrid => {
-            let payload = xcx_hybrid_payload(&st, &gate, &prepared).await?;
-            Ok(ask_finish(&st, &gate, payload).await.into_response())
-        }
-        IntentRoute::Data => {
-            let payload = ask_data_payload(&st, &gate, &prepared).await?;
-            Ok(ask_finish(&st, &gate, payload).await.into_response())
-        }
-        IntentRoute::Knowledge => {
-            // `Principal` → `Viewer` 与同步分支同一个映射（`kb_answer` 内部也是它）
-            let v = dms_agent::answerers::knowledge::viewer(&gate.p);
-            let mut extra = serde_json::Map::new();
-            extra.insert("conv_id".into(), json!(gate.conv_id));
-            extra.insert(
-                "intent_summary".into(),
-                serde_json::to_value(prepared.question.intent_summary())
-                    .expect("IntentSummary 是纯数据 struct，派生 Serialize 不会失败"),
-            );
-            if prepared.question.effective_question != gate.question {
-                extra.insert(
-                    "resolved_question".into(),
-                    json!(prepared.question.effective_question),
-                );
-            }
-            // 持久化在工人里做（答案落定后存 user/ai 两条）；错误文案与同步分支的 422 同一句
-            let rx = crate::kb_api::spawn_kb_worker(
-                &st,
-                v,
-                None,
-                &prepared.question.effective_question,
-                Some(&gate.question),
-                Some(extra.clone()),
-                Some(gate.conv_id),
-                |_| "暂时无法完成知识检索，请稍后重试".to_string(),
-            );
-            Ok(crate::kb_api::sse_response(rx, extra).into_response())
+    // 🔴 `Knowledge` 开流**之前先探一次确定性问数车道**（2026-08-16，与 `/api/ask/stream`
+    // 同一个 `deterministic_data_probe`）。此前这里直接开 SSE —— 与 `/api/ask` 2026-08-14
+    // 修掉的缺陷一字不差：「线下-浏阳品元商贸有限公司」在 web 上修好了，
+    // 在小程序上照旧只答「知识库里没有这家公司的规定」，而这家公司在业务库里有客户卡。
+    // 探到实质就走同步双臂答案；探不到才开流 —— 纯资料问句的流式体验一点没变。
+    if prepared.question.route() == IntentRoute::Knowledge {
+        let probe = crate::deterministic_data_probe(
+            &st,
+            &gate.p,
+            None,
+            Some(gate.conv_id.to_string().as_str()),
+            st.sc_samples,
+            &prepared,
+            None,
+        )
+        .await;
+        if probe.is_none() {
+            return xcx_stream_knowledge(&st, &gate, &prepared);
         }
     }
+    // 其余全部走与非流式**同一个出口**（Data / Unknown / 探到数的 Knowledge）。
+    // 少了这一条，同一个人在小程序里换个开关（流式/非流式）就得到两种答案。
+    let payload = match prepared.question.route() {
+        IntentRoute::Hybrid => xcx_hybrid_payload(&st, &gate, &prepared).await?,
+        _ => ask_data_payload(&st, &gate, &prepared).await?,
+    };
+    Ok(ask_finish(&st, &gate, payload).await.into_response())
+}
+
+/// 纯资料问句的 SSE 出口（从 `ask_stream` 的 `Knowledge` 臂原样搬出，一个字节没改）。
+fn xcx_stream_knowledge(
+    st: &Arc<AppState>,
+    gate: &XcxAskGate,
+    prepared: &crate::PreparedAsk,
+) -> Result<axum::response::Response, ApiErr> {
+    use axum::response::IntoResponse;
+    // `Principal` → `Viewer` 与同步分支同一个映射（`kb_answer` 内部也是它）
+    let v = dms_agent::answerers::knowledge::viewer(&gate.p);
+    let mut extra = serde_json::Map::new();
+    extra.insert("conv_id".into(), json!(gate.conv_id));
+    extra.insert(
+        "intent_summary".into(),
+        serde_json::to_value(prepared.question.intent_summary())
+            .expect("IntentSummary 是纯数据 struct，派生 Serialize 不会失败"),
+    );
+    if prepared.question.effective_question != gate.question {
+        extra.insert(
+            "resolved_question".into(),
+            json!(prepared.question.effective_question),
+        );
+    }
+    // 持久化在工人里做（答案落定后存 user/ai 两条）；错误文案与同步分支的 422 同一句
+    let rx = crate::kb_api::spawn_kb_worker(
+        st,
+        v,
+        None,
+        &prepared.question.effective_question,
+        Some(&gate.question),
+        Some(extra.clone()),
+        Some(gate.conv_id),
+        |_| "暂时无法完成知识检索，请稍后重试".to_string(),
+    );
+    Ok(crate::kb_api::sse_response(rx, extra).into_response())
 }
 
 /// `ask` / `ask_stream` 共用的前段：require_identity → 入参校验 → Principal → 会话
@@ -672,6 +670,11 @@ async fn ask_data_payload(
             )
         }
     })?;
+    // 纯资料答案走**与 `/api/ask` 同一份分档**：整份 `Answer`（角标要点得开），
+    // 不是 AskResult 壳。抄第二份必漂 —— 那正是这一族缺陷的形状。
+    if let Some(payload) = crate::knowledge_arm_payload(&r, prepared, &gate.question) {
+        return Ok(payload);
+    }
     Ok(serde_json::to_value(&r).unwrap_or_else(|e| {
         tracing::warn!(conv_id = gate.conv_id, reason = %e, "AskResult 序列化失败，回空对象（客户端会看到空白答案）");
         json!({})

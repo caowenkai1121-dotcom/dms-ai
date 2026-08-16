@@ -2063,6 +2063,62 @@ async fn ask_gate(
     let refs: Vec<String> = req.refs.clone().unwrap_or_default();
     Ok(AskGate { p, prev, refs, history })
 }
+/// 资料问句开流之前先探一次**确定性问数车道**（`dual_arms=false` ⇒ Knowledge 档不开自由 SQL，
+/// 只有实体卡 / 单据点查 / business-lookup 这些代码写死的成员会接单）。
+///
+/// 🔴 抽出来是为了让 web 与小程序的流式入口用**同一份**判据（2026-08-16）：
+/// 此前只有 `/api/ask/stream` 会先探一次，小程序的流式 `Knowledge` 臂直接开 SSE ——
+/// 「线下-浏阳品元商贸有限公司」在 web 上修好了，在小程序上照旧只答
+/// 「知识库里没有这家公司的规定」。探到实质就走同步双臂答案，探不到才把知识库流式推给前端，
+/// 纯资料问句的流式体验一点没变。
+/// 一切失败 = `None`（探针挂了就照旧开流，不许把一次本来能走的问答拖死）。
+pub(crate) async fn deterministic_data_probe(
+    st: &AppState,
+    p: &principal::Principal,
+    ds: Option<&str>,
+    conv_id: Option<&str>,
+    sc_samples: usize,
+    prepared: &PreparedAsk,
+    space_id: Option<&str>,
+) -> Option<dms_agent::AskResult> {
+    ask_data_run(st, p, ds, conv_id, sc_samples, prepared, space_id, false)
+        .await
+        .ok()
+        .filter(dms_agent::hybrid::data_has_substance)
+}
+
+/// 两臂产物里**纯资料**那一档 → wire 形状（`Some` = 这一轮是资料答案，已经成形）。
+///
+/// 🔴 抽出来是为了让 `/api/ask`、小程序、MCP 用**同一份**分档（2026-08-16）：
+/// 此前只有 `/api/ask` 会先探一次确定性问数车道再决定要不要出资料卡，
+/// 小程序与 MCP 的 `Knowledge` 臂直连 `kb_answer` —— 于是
+/// 「线下-浏阳品元商贸有限公司」在 web 上修好了，在小程序上照旧只答
+/// 「知识库里没有这家公司的规定」，而这家公司在业务库里有客户卡。
+/// 同一个缺陷在不同入口上各活各的，正是本仓反复付账的那个形状。
+pub(crate) fn knowledge_arm_payload(
+    r: &dms_agent::AskResult,
+    prepared: &PreparedAsk,
+    original_question: &str,
+) -> Option<serde_json::Value> {
+    if r.route != "knowledge" {
+        return None;
+    }
+    let Some(a) = &r.kb else {
+        // 两臂都空：澄清卡（`hybrid::fuse` 只在两边都没实质时走到这里）
+        return Some(
+            serde_json::to_value(prepared.question.clarification_result())
+                .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+        );
+    };
+    let mut payload =
+        serde_json::to_value(a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+    payload["intent_summary"] = knowledge_summary_value(prepared, a);
+    if prepared.question.effective_question != original_question {
+        payload["resolved_question"] = serde_json::json!(prepared.question.effective_question);
+    }
+    Some(payload)
+}
+
 /// 两臂产物 → wire 形状。**`/api/ask` 与 `/api/ask/stream` 唯一的 Data/Knowledge/Unknown 出口。**
 ///
 /// 🔴 2026-08-14：此前这里是 `match route` 的三个分支，`Knowledge` 直接调 `kb_answer`、
@@ -2093,21 +2149,8 @@ async fn ask_arms_payload(
         true,
     )
     .await?;
-    // 纯资料答案：`route == "knowledge"` 时问数半没有实质内容，`kb` 里是原件
-    if r.route == "knowledge" {
-        if let Some(a) = &r.kb {
-            let mut payload =
-                serde_json::to_value(a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
-            payload["intent_summary"] = knowledge_summary_value(prepared, a);
-            if prepared.question.effective_question != req.question {
-                payload["resolved_question"] =
-                    serde_json::json!(prepared.question.effective_question);
-            }
-            return Ok(payload);
-        }
-        // 两臂都空：澄清卡（`hybrid::fuse` 只在两边都没实质时走到这里）
-        return Ok(serde_json::to_value(prepared.question.clarification_result())
-            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"));
+    if let Some(payload) = knowledge_arm_payload(&r, prepared, &req.question) {
+        return Ok(payload);
     }
     let mut payload =
         serde_json::to_value(&r).expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
@@ -2529,34 +2572,6 @@ fn hybrid_summary_value(
         .expect("IntentSummary 是纯数据 struct，派生 Serialize 不会失败")
 }
 
-/// forced chip 只能覆盖一个已就绪、无歧义且本身可路由的合同；不能把 Unknown/解析失败
-/// “洗”成可执行请求。Data 投影后还会再校验 `is_data_executable`。
-fn prepared_contract_ready(prepared: &PreparedAsk) -> bool {
-    // 🔴 **确定性车道不需要合同**（2026-08-14 架构级体检）。
-    //
-    // 这道早退是知识库/文件类问句的主出卡口：fast 模型一次抖动（`Unavailable`/`Invalid`），
-    // 或者资料问句天生没有指标/时间（`Unknown`），都会让「线下设备申请政策」变成
-    // 一张「请补充明确的对象、指标和时间」——而那张卡的措辞本身就是合同结构的镜像，
-    // 合同只有那三样可问。
-    //
-    // fail-closed 一个字没松：R1/R2 产 Knowledge，**R1.5（单号点查）产 Data** ——
-    // 后者结构上也到不了自由 SQL（闸是 `LlmAnswerer::accept == is_data_executable()`）。
-    // 🔴 这句话此前写的是「确定性规则**只产** Knowledge」，而 R1.5 是后加的：
-    // 那句过期注释正是下游三处合同闸漏加确定性豁免的心理依据（2026-08-16 业主实测，
-    // 裸单号在 web 上吃反问卡）。判据现在收在 `PreparedQuestion::needs_clarification` 一处。
-    if prepared.question.plan().deterministic {
-        return true;
-    }
-    intent_contract_ready(&prepared.question.intent_attempt)
-}
-
-fn intent_contract_ready(attempt: &dms_agent::intent::IntentAttempt) -> bool {
-    attempt
-        .ready()
-        .is_some_and(|intent| intent.ambiguities.is_empty())
-        && attempt.route() != IntentRoute::Unknown
-}
-
 async fn api_ask(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -2583,23 +2598,6 @@ async fn api_ask(
     // ①fast 模型间歇吐坏 JSON（`Invalid`）②知识库问句天生没有指标/时间/实体（`Unknown`），
     // 两种都**不代表**用户问了一个答不了的问题。
     //
-    // 🔴 **两臂编排，不是只问知识库**（2026-08-16 业主实测）。
-    //
-    // 上一版这里是 `unknown_route_kb_fallback` —— 只做检索，确定性问数成员
-    //（实体卡 / 单据点查 / business-lookup）一个都没跑过。后果：整句就是一个客户名
-    // 「长沙鸣望供应链管理有限公司」时，合同判 Unknown（一个裸名抽不出任何槽位）→
-    // 走到这里 → 用户拿到「知识库里没有关于「长沙鸣望供应链管理有限公司」的任何信息」，
-    // 而这家客户在业务库里有客户卡、事实表里本月还有 67 单。
-    // 同一族缺陷在下面 `IntentRoute::Knowledge` 那条臂上已经治过一次（「线下-浏阳品元」），
-    // 这条早退是它漏掉的另一半。
-    //
-    // fail-closed 一个字没松：`route` 只决定问数臂开不开自由 SQL，
-    // 而合同没就绪时 `LlmAnswerer::accept == is_data_executable()` 结构上不接单。
-    if !prepared_contract_ready(&prepared) {
-        let payload = ask_arms_payload(&st, &req, &gate, &prepared).await?;
-        ask_persist(&st, req.conv_id, &req.question, &payload).await;
-        return Ok(Json(payload));
-    }
     if let Some(payload) = hybrid_branch(&st, &req, &gate, &prepared).await {
         let payload = payload?;
         ask_persist(&st, req.conv_id, &req.question, &payload).await;
@@ -2617,12 +2615,6 @@ async fn api_ask(
         },
         None => prepared,
     };
-    if prepared.question.needs_clarification() {
-        let payload = serde_json::to_value(prepared.question.clarification_result())
-            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
-        ask_persist(&st, req.conv_id, &req.question, &payload).await;
-        return Ok(Json(payload));
-    }
     // Data / Knowledge / Unknown 三档共用两臂编排：`route` 只决定问数臂开不开自由 SQL
     // 与谁排前面，不再决定「谁不许跑」（见 `ask_arms_payload` 的红字）。
     let payload = ask_arms_payload(&st, &req, &gate, &prepared).await?;
@@ -2662,23 +2654,6 @@ async fn api_ask_stream(
     // ①fast 模型间歇吐坏 JSON（`Invalid`）②知识库问句天生没有指标/时间/实体（`Unknown`），
     // 两种都**不代表**用户问了一个答不了的问题。
     //
-    // 🔴 **两臂编排，不是只问知识库**（2026-08-16 业主实测）。
-    //
-    // 上一版这里是 `unknown_route_kb_fallback` —— 只做检索，确定性问数成员
-    //（实体卡 / 单据点查 / business-lookup）一个都没跑过。后果：整句就是一个客户名
-    // 「长沙鸣望供应链管理有限公司」时，合同判 Unknown（一个裸名抽不出任何槽位）→
-    // 走到这里 → 用户拿到「知识库里没有关于「长沙鸣望供应链管理有限公司」的任何信息」，
-    // 而这家客户在业务库里有客户卡、事实表里本月还有 67 单。
-    // 同一族缺陷在下面 `IntentRoute::Knowledge` 那条臂上已经治过一次（「线下-浏阳品元」），
-    // 这条早退是它漏掉的另一半。
-    //
-    // fail-closed 一个字没松：`route` 只决定问数臂开不开自由 SQL，
-    // 而合同没就绪时 `LlmAnswerer::accept == is_data_executable()` 结构上不接单。
-    if !prepared_contract_ready(&prepared) {
-        let payload = ask_arms_payload(&st, &req, &gate, &prepared).await?;
-        ask_persist(&st, req.conv_id, &req.question, &payload).await;
-        return Ok(Json(payload).into_response());
-    }
     if let Some(payload) = hybrid_branch(&st, &req, &gate, &prepared).await {
         let payload = payload?;
         ask_persist(&st, req.conv_id, &req.question, &payload).await;
@@ -2697,12 +2672,6 @@ async fn api_ask_stream(
         None => prepared,
     };
     let route = prepared.question.route();
-    if prepared.question.needs_clarification() {
-        let payload = serde_json::to_value(prepared.question.clarification_result())
-            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
-        ask_persist(&st, req.conv_id, &req.question, &payload).await;
-        return Ok(Json(payload).into_response());
-    }
     match route {
         IntentRoute::Data => {
             let payload = ask_arms_payload(&st, &req, &gate, &prepared).await?;
@@ -2717,7 +2686,7 @@ async fn api_ask_stream(
             // 探的是**确定性车道**（Knowledge 档不开自由 SQL，只有实体卡/单据点查这些
             // 代码写死的成员会接单），探到实质就整轮走同步双臂答案；探不到才把知识库
             // 流式推给前端 —— 纯资料问句的流式体验一点没变。
-            let probe = ask_data_run(
+            let probe = deterministic_data_probe(
                 &st,
                 &gate.p,
                 req.ds.as_deref(),
@@ -2725,11 +2694,8 @@ async fn api_ask_stream(
                 st.sc_samples,
                 &prepared,
                 req.space_id.as_deref(),
-                false,
             )
-            .await
-            .ok()
-            .filter(dms_agent::hybrid::data_has_substance);
+            .await;
             if let Some(mut r) = probe {
                 // 这一档已经不是纯资料问句了，流式意义不大：资料半同步取一次挂 `kb` 键，
                 // wire 与混合问句同形（前端 `t.result?.kb` 分支现成）。
@@ -3019,49 +2985,6 @@ struct ConvQuery {
 ///
 /// 合同不可用 ≠ 知识库不能答：检索本身是 fail-safe 的（查不到就说「知识库里没有相关内容」），
 /// 拿它兜底严格优于一张答非所问的卡。**问数侧一个字不变**：这条路不生成任何 SQL。
-/// 只有真的检索到带引用的内容才顶替澄清卡；没查到就照旧出卡（数据问句的体验不变）。
-pub(crate) async fn unknown_route_kb_fallback(
-    st: &AppState,
-    p: &principal::Principal,
-    space: Option<&str>,
-    question: &str,
-) -> Option<dms_kernel::Answer> {
-    match kb_answer(st, p, space, question).await {
-        // 有引用 = 真的在库里找到了依据。没有引用的那两种（NO_HIT / 模型没给带角标的结论）
-        // 都不顶替澄清卡：那时卡片至少还给了下一步怎么问。
-        Ok(a) => match &a.body {
-            dms_kernel::AnswerBody::Text { citations, markdown, .. }
-                if !citations.is_empty() && !reads_as_not_found(markdown) =>
-            {
-                Some(a)
-            }
-            _ => None,
-        },
-        Err(e) => {
-            // 兜底路失败不许影响主结论：照旧出澄清卡，但要留痕（否则这条路哑了没人知道）
-            tracing::warn!(err = %e, "Unknown 合同的知识库兜底失败 → 回澄清卡");
-            None
-        }
-    }
-}
-
-
-/// 「答了，但答的是『查不到』」—— **带引用的非答案**。
-///
-/// 🔴 业主 2026-08-14 实测：发一个单号 `HJXH-DXO2026081300138`，知识库兜底把
-/// 「该订单号未出现在任何资料中，无法查询其订单状态、商品明细或金额」连同 **2 条引用**
-/// 返回，顶掉了本该走问数的路。模型一边说查不到、一边照样打了角标 ——
-/// **有引用 ≠ 有答案**，上一版只判 `citations.is_empty()` 拦不住这种。
-///
-/// 只扫开头 160 字（「直接结论」那一段）：正文后段出现「未提及」是正常的行文，
-/// 拿它判非答案会把大量真答案误杀。
-fn reads_as_not_found(markdown: &str) -> bool {
-    // 判据搬到了 `dms_knowledge::answer`（与生成那些措辞的 SYSTEM 段同一个文件）：
-    // 此前这份副本的 7 条 MARKERS 里没有「知识库里没有关于」，而那正是 SYSTEM 亲手
-    // 规定模型必须写的开头 —— 一句「知识库里没有关于「长沙鸣望…」的任何信息」
-    // 带着 5 篇无关文档的角标当答案上了屏（2026-08-16 业主实测）。
-    dms_knowledge::answer::reads_as_not_found(markdown)
-}
 
 /// 可选角色列表：多角色账号必须显式选角色（1:1 对齐 DMS「请选择登录角色」，
 /// 不替用户默认选——不同角色数据权限档差异巨大）
@@ -3956,7 +3879,6 @@ mod tests {
         )
         .expect("合法知识意图");
         let knowledge = IntentAttempt::validated(knowledge, "美的烤箱保修期多久");
-        assert!(super::intent_contract_ready(&knowledge));
         assert!(
             super::forced_routed_question(&knowledge, "美的烤箱保修期多久", IntentRoute::Data,)
                 .is_none()
@@ -3979,15 +3901,22 @@ mod tests {
             "强制切路由不能把 Data 合同重新包装成伪 Knowledge Ready"
         );
 
-        assert!(!super::intent_contract_ready(&IntentAttempt::Unavailable));
+        // 🔴 forced chip 不许把作废/歧义合同「洗」成可执行请求 —— 这一半判据现在由
+        // `forced_routed_question` 自己承担（`intent_contract_ready` 那道 server 侧的
+        // 前置闸 2026-08-16 整体删除：它在确定性成员跑之前就拒答，正是裸单号吃反问卡的成因）。
+        assert!(
+            super::forced_routed_question(&IntentAttempt::Unavailable, "任意问句", IntentRoute::Data)
+                .is_none(),
+            "作废合同不许被 chip 洗成可执行"
+        );
         let ambiguous = parse_intent_strict(
             r#"{"mode":"data","goals":["查询销售额"],"metrics":["销售额"],"entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":["请明确时间"]}"#,
         )
         .expect("合法歧义意图");
-        assert!(!super::intent_contract_ready(&IntentAttempt::validated(
-            ambiguous,
-            "销售额，请明确时间"
-        )));
+        // 带歧义的 Data 合同：chip 投影仍成立（那是**路由**不是执行许可），
+        // 真正的执行闸是 `LlmAnswerer::accept == is_data_executable()`，与 route 无关。
+        let ambiguous = IntentAttempt::validated(ambiguous, "销售额，请明确时间");
+        assert!(!ambiguous.is_data_executable(), "歧义合同不许可执行自由 SQL");
     }
 
     #[test]
@@ -4009,121 +3938,112 @@ mod tests {
         assert_eq!(knowledge.question, "美的烤箱保修期多久");
     }
 
-    /// 🔴 合同判 Unknown 时**必须先问一次知识库**，不许直接出澄清卡。
+    /// 🔴 合同判 Unknown 时**必须走两臂编排**，不许直接出澄清卡、也不许只问知识库。
     ///
-    /// 业主 2026-08-14 实测「线下设备申请的政策」：知识库问句天生没有指标/时间/实体，
-    /// 正是数据合同最容易判 Unknown 的那一类 —— 而 `IntentRoute::Unknown` 那一臂
-    /// 直接返回澄清卡、**一次都不查知识库**，于是「问知识库无论问什么都不回答」。
-    /// 卡上还写着「请补充明确的对象、指标和时间」，对一句政策问句毫无意义。
+    /// 这条判据的历史就是这一族缺陷的历史：
+    /// - 2026-08-14 业主实测「线下设备申请的政策」：`Unknown` 那一臂直接返回澄清卡、
+    ///   一次都不查知识库 → 补了 `unknown_route_kb_fallback`（只问知识库）；
+    /// - 2026-08-16 业主实测「长沙鸣望供应链管理有限公司」：只问知识库那条路上
+    ///   确定性问数成员（实体卡 / 单据点查 / business-lookup）一个都没跑过 →
+    ///   用户拿到「知识库里没有关于…」，而这家客户有客户卡、本月 67 单。
     ///
-    /// 判据同时守两件事：兜底真的存在；**两个端点都接上**（流式与非流式对同一句话
-    /// 给出不同答案，是本仓反复付过账的那类分叉）。
+    /// 两次的成因是同一个：**server 在 Router 之前替它做了决定**。
+    /// 现在 server 一个决定都不做 —— 六个入口全部把 `Unknown` 交给两臂编排，
+    /// 「先问数还是先知识库、要不要出澄清卡」全部由 agent 一处裁决。
+    /// `unknown_route_kb_fallback` 与 `reads_as_not_found` 随之整体删除
+    ///（判据搬去了 `dms_knowledge::answer::reads_as_not_found`，与写它的 SYSTEM 段同居）。
     #[test]
-    fn unknown_contract_consults_the_kb_before_giving_up() {
-        let src = include_str!("main.rs");
-        let prod = src.split("\n#[cfg(test)]").next().unwrap();
-        // 兜底函数在，且只在「查到带引用的内容」时才顶替卡片
-        let f = prod
-            .split("async fn unknown_route_kb_fallback")
-            .nth(1)
-            .expect("Unknown 的知识库兜底没了：知识库问句会重新被澄清卡挡死")
-            .split("\n}")
-            .next()
-            .unwrap();
-        assert!(f.contains("kb_answer("), "兜底没真去查知识库：{f}");
-        assert!(f.contains("citations") && f.contains("is_empty"), "没判「有没有引用」：{f}");
-        // 有引用**不等于**有答案：模型会一边说「未出现在任何资料中」一边打角标
-        assert!(
-            f.contains("reads_as_not_found("),
-            "没判「答的是不是『查不到』」：带引用的非答案会顶掉正确的路（实测单号那次）：{f}"
-        );
-        assert!(f.contains("tracing::warn!"), "兜底失败必须留痕，否则这条路哑了没人知道");
-    }
-
-    /// 带引用的**非答案**不许顶替卡片。
-    #[test]
-    fn a_cited_not_found_is_not_an_answer() {
-        assert!(super::reads_as_not_found(
+    fn unknown_contract_goes_through_the_two_arm_orchestration() {
+        let needle = ["unknown_route_kb", "_fallback"].concat();
+        for (name, src) in [
+            ("main.rs", include_str!("main.rs")),
+            ("xcx_api.rs", include_str!("xcx_api.rs")),
+            ("mcp_api.rs", include_str!("mcp_api.rs")),
+            ("deep_api.rs", include_str!("deep_api.rs")),
+        ] {
+            let prod = src.split("
+#[cfg(test)]").next().unwrap_or(src);
+            let offender = prod
+                .lines()
+                .enumerate()
+                .find(|(_, line)| !line.trim_start().starts_with("//") && line.contains(&needle));
+            assert!(
+                offender.is_none(),
+                "{name}:{} 又长出「只问知识库」那条路",
+                offender.map_or(0, |(i, _)| i + 1)
+            );
+        }
+        // 判据本体活在 knowledge crate（与生成那些措辞的 SYSTEM 段同一个文件）
+        assert!(dms_knowledge::answer::reads_as_not_found(
             "## 直接结论
 该订单号未出现在任何资料中，无法查询其订单状态、商品明细或金额。"
         ));
-        assert!(super::reads_as_not_found("知识库里没有相关内容。已检索 104 篇文档"));
-        // 真答案不许被误杀 —— 「未提及」出现在正文后段是正常行文
-        assert!(!super::reads_as_not_found(
+        assert!(dms_knowledge::answer::reads_as_not_found(
+            "知识库里没有相关内容。已检索 104 篇文档"
+        ));
+        assert!(!dms_knowledge::answer::reads_as_not_found(
             "## 直接结论
-客户打款退款政策分两类：结束合作走云之家【线下客户退出申请】；             继续合作仅打款错误走人人费用通用报销 [^1][^2]。
+客户打款退款政策分两类[^1][^2]。
 
 ## 关键要点
-             * 文中未提及跨主体充值的例外情形。"
+* 文中未提及跨主体充值的例外情形。"
         ));
     }
 
-    /// 🔴 **判据的扫描面必须覆盖缺陷面** —— 本仓为这条付了三次账。
+    /// 🔴 **判据的扫描面必须覆盖缺陷面** —— 本仓为这条付了四次账。
     ///
-    /// 上一版判据写成「`main.rs` 里 `unknown_route_kb_fallback(` 出现 5 次」：
-    /// 单文件、且是硬编码次数。于是 `deep_api.rs` 与 `xcx_api.rs::ask_stream` 天然漏网，
-    /// 业主从深度模式进来，同一句「下载 押金转货款申请书」拿到 38 行账余充值明细 ——
-    /// 「我修一个入口，你从第五个入口进来又复发」的结构成因就是这个：
-    /// **判据只扫了 1/4 的入口**。
+    /// 历史：判据一开始只扫 `main.rs`（1/4 入口）→ 深度模式漏网；
+    /// 扩到四个文件后只要求「出卡前问过知识库」→ 只问知识库那条路合法、永远绿；
+    /// 2026-08-16 业主实测「长沙鸣望供应链管理有限公司」，才发现缺的是对称的那一半。
     ///
-    /// 现在按**形状**扫四个入口文件：每一个 `Unknown` 臂、每一道合同就绪闸，
-    /// 后面都必须跟一次知识库兜底。新增入口只要抄了这两个形状就会被自动纳入判据。
+    /// 现在的不变量是**最强的那一条**：`Unknown` 臂必须与 `Data` 臂走**同一个出口**。
+    /// 一句问句被判成 Unknown（裸客户名 / 裸单号 / fast 抖动）不代表答不了 ——
+    /// 它必须走完整的两臂编排，由 agent 一处裁决先问数还是先知识库、要不要出澄清卡。
+    /// server 在 Router 之前**一个决定都不做**。
     ///
-    /// 自匹配说明：本测试自身的字面量也会被 `include_str!` 扫到，形成两处恒真的匹配 ——
-    /// 无害（每个匹配点各自独立判定，真站点漏了仍然会红），不值得为它引入剥离测试模块的
-    /// 逻辑（`deep_api.rs` 有多个 `#[cfg(test)]` 标记，按标记切会切错）。
+    /// 自匹配说明：本测试自身的字面量也会被 `include_str!` 扫到，形成恒真的匹配 ——
+    /// 无害（每个匹配点各自独立判定，真站点漏了仍然会红）。
     #[test]
-    fn every_entry_consults_the_kb_before_showing_a_card() {
+    fn every_unknown_arm_exits_through_the_two_arm_orchestration() {
         const ENTRIES: [(&str, &str); 4] = [
             ("main.rs", include_str!("main.rs")),
             ("deep_api.rs", include_str!("deep_api.rs")),
             ("xcx_api.rs", include_str!("xcx_api.rs")),
             ("mcp_api.rs", include_str!("mcp_api.rs")),
         ];
-        // 两个出卡形状 → 各自的检查窗口（够装下 match 臂/守卫体，不至于跨到下一个分支）
-        const SHAPES: [(&str, usize); 2] = [
-            (concat!("IntentRoute::Unknown", " => {"), 600),
-            (concat!("prepared_contract", "_ready(&prepared) {"), 800),
-        ];
-        // 🔴 深度模式的**臂序**：知识臂必须在「转问数」之前。它是 fall-through 结构
-        // （没有 `IntentRoute::Unknown =>` 臂），一旦有人把知识臂挪到问数之后，
-        // 「下载 押金转货款申请书」又会掉回 38 行账余表 —— 而上面按形状扫的判据看不见这个。
-        // 收窄到那一个 handler 再比先后：`deep_api.rs` 有多个端点，全文件 `find` 拿到的
-        // `ProgressStage::Query` 是别人的（第一版就是这么误红的）。
+        // 合格出口只有这三种写法（全部是两臂编排）：
+        //   `ask_arms_payload(`  = /api/ask 两个 handler
+        //   `ask_data_payload(`  = 小程序两个 handler
+        //   `crate::ask_prepared(` = MCP 直接调编排
+        // 深度模式没有 `Unknown =>` 臂（fall-through 到问数），由下面的臂序判据管。
+        const EXITS: [&str; 3] = ["ask_arms_payload(", "ask_data_payload(", "crate::ask_prepared("];
+        let unknown_arm = concat!("IntentRoute::Unknown", " =>");
+        for (name, src) in ENTRIES {
+            for (at, _) in src.match_indices(unknown_arm) {
+                // 按**字符**取窗口：`&src[at..at+n]` 会切在中文注释的 UTF-8 中间直接 panic
+                let body: String = src[at..].chars().take(600).collect();
+                // `=> None` 是**投影判据**不是答案出口（`forced_routed_question` 里
+                // 「Unknown 合同不许被 chip 洗成可执行」那一臂），跳过。
+                if body.starts_with(concat!("IntentRoute::Unknown", " => None")) {
+                    continue;
+                }
+                assert!(
+                    EXITS.iter().any(|exit| body.contains(exit)),
+                    "{name} 的 Unknown 臂没走两臂编排（确定性问数成员一个都不跑）：{body}"
+                );
+            }
+        }
+        // 🔴 深度模式的**臂序**：知识臂必须在「转问数」之前。它是 fall-through 结构，
+        // 一旦有人把知识臂挪到问数之后，「下载 押金转货款申请书」又会掉回 38 行账余表 ——
+        // 上面按形状扫的判据看不见这个。收窄到那一个 handler 再比先后。
         let deep = include_str!("deep_api.rs");
-        let at = deep
-            .find(concat!("if !crate::prepared_contract", "_ready(&prepared) {"))
-            .expect("深度模式的合同闸没了");
+        let at = deep.find("async fn compose_inner(").expect("深度模式的 compose_inner 改名了");
         let handler = &deep[at..];
         let knowledge_arm = handler
             .find("if route == dms_agent::intent::IntentRoute::Knowledge {")
             .expect("深度模式没有知识臂了：文档/资料问句会直接掉进问数");
-        let to_data = handler
-            .find("note(&rid, ProgressStage::Query);")
-            .unwrap_or(usize::MAX);
+        let to_data = handler.find("note(&rid, ProgressStage::Query);").unwrap_or(usize::MAX);
         assert!(knowledge_arm < to_data, "深度模式的知识臂被挪到问数之后了");
-
-        for (name, src) in ENTRIES {
-            for (shape, window) in SHAPES {
-                for (at, _) in src.match_indices(shape) {
-                    // 按**字符**取窗口：`&src[at..at+window]` 会切在中文注释的 UTF-8 中间
-                    // 直接 panic（第一版就是这么红的，且报的是切片越界不是判据不满足）。
-                    let body: String = src[at..].chars().take(window).collect();
-                    // 合格出口全部是**两臂**形态（2026-08-16 起只剩这三种写法）：
-                    // `ask_arms_payload(` = /api/ask 两个 handler；
-                    // `ask_data_payload(` = 小程序两个 handler；
-                    // `crate::ask_prepared(` 带 `true` = deep / MCP 直接调编排。
-                    // 🔴 `unknown_route_kb_fallback(` **不再是合格出口** —— 它只做检索，
-                    // 确定性问数成员一个都不跑（见 `no_entry_answers_from_the_kb_...`）。
-                    assert!(
-                        body.contains("ask_arms_payload(")
-                            || body.contains("ask_data_payload(")
-                            || body.contains("crate::ask_prepared("),
-                        "{name} 有一条出卡路径没走两臂编排就出卡了（形状 `{shape}`）：{body}"
-                    );
-                }
-            }
-        }
     }
 
     /// 🔴 `unknown_route_kb_fallback` 只做检索，确定性问数成员（实体卡 / 单据点查 /
@@ -4172,31 +4092,42 @@ mod tests {
     /// R1.5（单号点查）判 Data 且 deterministic，合同必然作废（一个裸号抽不出任何槽位），
     /// 于是三份闸把全系统最不含糊的问数信号拦在 Router 之前。
     ///
-    /// **判官看不见它们**：`tools/regression.py` 走 CLI 子命令，结构上不过这三道闸。
-    /// 所以这一族「改过多次还回潮」——每次只修被碰到的那一份。这条守卫就是那个缺口。
+    /// **判官看不见它们**：`tools/regression.py` 走 CLI 子命令，结构上不过这几道闸。
+    /// 所以这一族「改过多次还回潮」——每次只修被碰到的那一份。
+    ///
+    /// 最终处置不是「收成一处」而是**整体删除**：那几道闸在确定性成员跑之前就拒答，
+    /// 而 agent 侧本来就有正确的兜底（摘掉接不了单的 `llm` 成员 → 跑完全部确定性成员 →
+    /// 一个都不接才出澄清卡）。真正的执行闸只有一道，在 `run.rs`：
+    /// `LlmAnswerer::accept == is_data_executable()`，无条件、与 route 判成什么无关。
+    /// 而且旧闸与仓里 E10 的既有裁决直接矛盾（「模型说它不确定 ≠ 证明为错：
+    /// 答案照出、收据降 review」）。
     #[test]
-    fn only_one_contract_gate() {
+    fn the_server_has_no_pre_router_contract_gate() {
         // needle 运行时拼：写成字面量的话这条测试自己会被自己命中
-        let needle = ["is_data", "_executable()"].concat();
+        let needles = [
+            ["is_data", "_executable()"].concat(),
+            ["prepared_contract", "_ready("].concat(),
+            ["needs_", "clarification()"].concat(),
+        ];
         for (name, src) in [
             ("main.rs", include_str!("main.rs")),
             ("deep_api.rs", include_str!("deep_api.rs")),
             ("xcx_api.rs", include_str!("xcx_api.rs")),
             ("mcp_api.rs", include_str!("mcp_api.rs")),
         ] {
-            // 只扫**代码行**：注释里要写清楚判据搬哪去了、为什么，扫进去等于禁止解释
-            let offender = src
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap_or(src)
-                .lines()
-                .enumerate()
-                .find(|(_, line)| !line.trim_start().starts_with("//") && line.contains(&needle));
-            assert!(
-                offender.is_none(),
-                "{name}:{} 又长出第二份合同闸：判据只许写在 PreparedQuestion::needs_clarification",
-                offender.map_or(0, |(i, _)| i + 1)
-            );
+            // 只扫**代码行**：注释里要写清楚判据去哪了、为什么，扫进去等于禁止解释
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for needle in &needles {
+                let offender = production
+                    .lines()
+                    .enumerate()
+                    .find(|(_, line)| !line.trim_start().starts_with("//") && line.contains(needle));
+                assert!(
+                    offender.is_none(),
+                    "{name}:{} 又长出一道 Router 之前的合同闸（`{needle}`）——                     它会在确定性成员跑之前拒答，正是裸单号在 web 上吃反问卡的成因",
+                    offender.map_or(0, |(i, _)| i + 1)
+                );
+            }
         }
         // 判据本体：裸单号的合同必然作废，但它是确定性问数，必须放行
         let plan = dms_agent::ask::decide(
@@ -4223,34 +4154,37 @@ mod tests {
     fn both_ask_endpoints_share_one_arms_exit() {
         let src = include_str!("main.rs");
         let production = src.split("#[cfg(test)]").next().unwrap();
-        // 5 = `/api/ask` 的 Data 一档 + `/api/ask/stream` 的 Data 与 Hybrid|Unknown 两档
-        //   + **两个端点各自的「合同没就绪」早退**（2026-08-16 从 `unknown_route_kb_fallback`
-        //   改过来的那两处 —— 只问知识库就是把实体卡/单据卡挡在门外，
-        //   业主实测「长沙鸣望供应链管理有限公司」拿到「知识库里没有关于…」）。
+        // 3 = `/api/ask` 的唯一出口 + `/api/ask/stream` 的 Data 与 Hybrid|Unknown 两档。
+        // 🔴 2026-08-16 从 5 降回 3：那两处「合同没就绪」早退**整体删掉**了 ——
+        // server 在 Router 之前一个决定都不做，两个 handler 因此各自只剩
+        // 「prepare → forced 投影 → 交给两臂」。数字变小是这一刀的**目的**，不是退步。
         assert_eq!(
             production.matches("ask_arms_payload(&st, &req, &gate, &prepared)").count(),
-            5,
-            "两个端点的 Data/Knowledge/Unknown 三档 + 两处合同早退没有全部走 ask_arms_payload"
+            3,
+            "两个端点的 Data/Knowledge/Unknown 三档没有全部走 ask_arms_payload"
         );
-        // 🔴 「合同没就绪」不许再退回「只问知识库」：那条路上确定性问数成员一个都没跑过
+        // 🔴 「纯资料档重塑成整份 Answer」的分档现在是**全仓唯一一份**
+        //（`knowledge_arm_payload`），web / 小程序 / MCP 三个入口共用。
+        // 2026-08-16 之前小程序与 MCP 各写各的（直连 `kb_answer`），于是
+        // 「线下-浏阳品元商贸有限公司」在 web 上修好了、从另外两个入口进来照旧错。
+        let one = production
+            .split("pub(crate) fn knowledge_arm_payload(")
+            .nth(1)
+            .expect("knowledge_arm_payload 改名了");
         assert!(
-            !production.contains("if !prepared_contract_ready(&prepared) {
-        let payload = match unknown_route_kb_fallback("),
-            "合同早退又退回只问知识库了"
+            one.contains(r#"if r.route != "knowledge" {"#) && one.contains("let Some(a) = &r.kb else"),
+            "纯资料档没有按整份 Answer 重塑形状（角标会点不开）：{one}"
         );
-        // 老出口不许再长回来（`unknown_route_kb_fallback` 本体仍被 deep_api 用着，
-        // 这里只禁 `/api/ask` 两个 handler 里的 `match route` 分支形态）
-        assert!(
-            !production.contains("IntentRoute::Knowledge => {
-            let a = kb_answer("),
-            "Knowledge 又绕过两臂直连 kb_answer 了"
-        );
-        // 分档判据：`route == "knowledge"` ⇒ `kb` 必然在（`hybrid::fuse` 的约定）
-        let arms = production.split("async fn ask_arms_payload(").nth(1).expect("ask_arms_payload 改名了");
-        assert!(
-            arms.contains(r#"if r.route == "knowledge" {"#) && arms.contains("if let Some(a) = &r.kb {"),
-            "纯资料档没有按整份 Answer 重塑形状（角标会点不开）：{arms}"
-        );
+        for (name, src) in [
+            ("xcx_api.rs", include_str!("xcx_api.rs")),
+            ("mcp_api.rs", include_str!("mcp_api.rs")),
+        ] {
+            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            assert!(
+                prod.contains("knowledge_arm_payload("),
+                "{name} 没用共享的纯资料分档 —— 又要各写各的了"
+            );
+        }
     }
 
     #[test]
