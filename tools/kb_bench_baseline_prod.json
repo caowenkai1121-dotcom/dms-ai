@@ -2,7 +2,7 @@
   "meta": {
     "version": 1,
     "tool": "tools/kb_bench.py",
-    "created_at": "2026-08-16T10:35:45+00:00",
+    "created_at": "2026-08-16T19:20:18+00:00",
     "base": "http://172.17.0.1:8100",
     "source": "/api/kb/search",
     "login": "admin",
@@ -17,7 +17,7 @@
   "metrics": {
     "recall@k": 0.9821,
     "precision@k": 0.1637,
-    "mrr": 0.7348
+    "mrr": 0.7512
   },
   "per_case": [
     {
@@ -42,35 +42,35 @@
           "rank": 2,
           "chunk_id": 1084,
           "doc_name": "客户下单及售后全流程指引.docx",
-          "score": 0.03053613007068634,
+          "score": 0.03030303120613098,
           "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 1653,
           "doc_name": "客户下单及售后全流程指引.docx",
-          "score": 0.01515151560306549,
+          "score": 0.014925372786819935,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 1735,
           "doc_name": "线下复杂客诉反馈流程指引.pdf",
-          "score": 0.013888888992369175,
+          "score": 0.013698630034923553,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1610,
           "doc_name": "售后事项申请流程指引.docx",
-          "score": 0.014705882407724857,
+          "score": 0.013513513840734959,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 1716,
           "doc_name": "样品、物料商城小程序指引.docx",
-          "score": 0.016129031777381897,
+          "score": 0.01587301678955555,
           "relevant": false
         }
       ]
@@ -97,21 +97,21 @@
           "rank": 2,
           "chunk_id": 1610,
           "doc_name": "售后事项申请流程指引.docx",
-          "score": 0.03226646035909653,
+          "score": 0.03201844170689583,
           "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 1307,
           "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
-          "score": 0.012820512987673283,
+          "score": 0.013333333656191826,
           "relevant": false
         },
         {
           "rank": 4,
-          "chunk_id": 1735,
+          "chunk_id": 1734,
           "doc_name": "线下复杂客诉反馈流程指引.pdf",
-          "score": 0.031054403632879257,
+          "score": 0.03128054738044739,
           "relevant": false
         },
         {
@@ -125,7 +125,7 @@
           "rank": 6,
           "chunk_id": 1931,
           "doc_name": "企业微信截图_17851466294353.png",
-          "score": 0.02808326855301857,
+          "score": 0.028624001890420914,
           "relevant": false
         }
       ]
@@ -166,14 +166,14 @@
           "rank": 4,
           "chunk_id": 1533,
           "doc_name": "产品工厂.xlsx",
-          "score": 0.04529532790184021,
+          "score": 0.04550236836075783,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1806,
           "doc_name": "重申皇家小虎建议终端销售底价通知.pdf",
-          "score": 0.01515151560306549,
+          "score": 0.014705882407724857,
           "relevant": false
         },
         {
@@ -214,28 +214,28 @@
           "rank": 3,
           "chunk_id": 1496,
           "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
-          "score": 0.028693530708551407,
+          "score": 0.02903091162443161,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 1533,
           "doc_name": "产品工厂.xlsx",
-          "score": 0.02991071343421936,
+          "score": 0.030330881476402283,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 1806,
-          "doc_name": "重申皇家小虎建议终端销售底价通知.pdf",
-          "score": 0.014925372786819935,
+          "chunk_id": 2100,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.01515151560306549,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 2100,
-          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
-          "score": 0.01515151560306549,
+          "chunk_id": 1022,
+          "doc_name": "新品上市激励方案（手工老面小笼包0400G00）.pdf",
+          "score": 0.016129031777381897,
           "relevant": false
         }
       ]
@@ -260,16 +260,16 @@
         },
         {
           "rank": 2,
-          "chunk_id": 1540,
+          "chunk_id": 1539,
           "doc_name": "产品工厂.xlsx",
-          "score": 0.04483232647180557,
+          "score": 0.04670342803001404,
           "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 1496,
           "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
-          "score": 0.0476270467042923,
+          "score": 0.0473790317773819,
           "relevant": false
         },
         {
@@ -290,7 +290,7 @@
           "rank": 6,
           "chunk_id": 1493,
           "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
-          "score": 0.02817460335791111,
+          "score": 0.027984343469142914,
           "relevant": false
         }
       ]
@@ -310,21 +310,21 @@
           "rank": 1,
           "chunk_id": 1647,
           "doc_name": "售后登记模板.xlsx",
-          "score": 0.03177805617451668,
+          "score": 0.03201844170689583,
           "relevant": true
         },
         {
           "rank": 2,
           "chunk_id": 1533,
           "doc_name": "产品工厂.xlsx",
-          "score": 0.029877368360757828,
+          "score": 0.03009049780666828,
           "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 1493,
           "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
-          "score": 0.04515994340181351,
+          "score": 0.045011527836322784,
           "relevant": false
         },
         {
@@ -365,21 +365,21 @@
           "rank": 1,
           "chunk_id": 1342,
           "doc_name": "线下鲜食专业客户认证流程指....docx",
-          "score": 0.04891591519117355,
+          "score": 0.049180325120687485,
           "relevant": false
         },
         {
           "rank": 2,
           "chunk_id": 1790,
           "doc_name": "线下鲜食专业客户认证流程指引.docx",
-          "score": 0.04865150526165962,
+          "score": 0.04838709533214569,
           "relevant": true
         },
         {
           "rank": 3,
           "chunk_id": 1029,
           "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
-          "score": 0.02765064872801304,
+          "score": 0.02715098112821579,
           "relevant": false
         },
         {
@@ -398,8 +398,8 @@
         },
         {
           "rank": 6,
-          "chunk_id": 2084,
-          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "chunk_id": 1932,
+          "doc_name": "关于鲜食设备押金政策调整的补充协议_.pdf",
           "score": 0.01587301678955555,
           "relevant": false
         }
@@ -441,7 +441,7 @@
           "rank": 4,
           "chunk_id": 1041,
           "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
-          "score": 0.029957523569464684,
+          "score": 0.029206350445747375,
           "relevant": false
         },
         {
@@ -487,16 +487,16 @@
         },
         {
           "rank": 3,
-          "chunk_id": 1041,
+          "chunk_id": 1027,
           "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
-          "score": 0.03083491325378418,
+          "score": 0.03067915514111519,
           "relevant": false
         },
         {
           "rank": 4,
-          "chunk_id": 1026,
+          "chunk_id": 1041,
           "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
-          "score": 0.03067915514111519,
+          "score": 0.03083491325378418,
           "relevant": false
         },
         {
@@ -508,9 +508,9 @@
         },
         {
           "rank": 6,
-          "chunk_id": 1013,
-          "doc_name": "关于鲜食业务发展定位的通告.pdf",
-          "score": 0.012987012974917889,
+          "chunk_id": 1657,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.012820512987673283,
           "relevant": false
         }
       ]
@@ -549,14 +549,14 @@
         },
         {
           "rank": 4,
-          "chunk_id": 1513,
+          "chunk_id": 1071,
           "doc_name": "2026年皇家小虎线下重点客户激励方案.docx",
-          "score": 0.016129031777381897,
+          "score": 0.016393441706895828,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 1071,
+          "chunk_id": 1513,
           "doc_name": "2026年皇家小虎线下重点客户激励方案.docx",
           "score": 0.01587301678955555,
           "relevant": false
@@ -565,7 +565,7 @@
           "rank": 6,
           "chunk_id": 1406,
           "doc_name": "致皇家小虎全体业务伙伴的沟通倡议.pdf",
-          "score": 0.015625,
+          "score": 0.014925372786819935,
           "relevant": false
         }
       ]
@@ -599,7 +599,7 @@
           "rank": 3,
           "chunk_id": 2084,
           "doc_name": "皇家小虎鲜食设备政策说明.pdf",
-          "score": 0.014285714365541935,
+          "score": 0.014492753893136978,
           "relevant": false
         },
         {
@@ -618,9 +618,9 @@
         },
         {
           "rank": 6,
-          "chunk_id": 1358,
-          "doc_name": "设备政策及设备流程（申请、....docx",
-          "score": 0.014285714365541935,
+          "chunk_id": 1278,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.013698630034923553,
           "relevant": false
         }
       ]
@@ -661,7 +661,7 @@
           "rank": 4,
           "chunk_id": 2086,
           "doc_name": "皇家小虎鲜食设备政策说明.pdf",
-          "score": 0.014925372786819935,
+          "score": 0.01515151560306549,
           "relevant": false
         },
         {
@@ -700,16 +700,16 @@
         },
         {
           "rank": 2,
-          "chunk_id": 2101,
+          "chunk_id": 2099,
           "doc_name": "皇家小虎鲜食设备政策说明.pdf",
-          "score": 0.014492753893136978,
+          "score": 0.015625,
           "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 1647,
           "doc_name": "售后登记模板.xlsx",
-          "score": 0.012658228166401386,
+          "score": 0.013513513840734959,
           "relevant": false
         },
         {
@@ -721,16 +721,16 @@
         },
         {
           "rank": 5,
-          "chunk_id": 1649,
-          "doc_name": "售后登记模板.xlsx",
-          "score": 0.013333333656191826,
+          "chunk_id": 1971,
+          "doc_name": "皇家小虎冰箱设备投放管理暂行办法.pdf",
+          "score": 0.0297619067132473,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 1971,
-          "doc_name": "皇家小虎冰箱设备投放管理暂行办法.pdf",
-          "score": 0.029957523569464684,
+          "chunk_id": 1022,
+          "doc_name": "新品上市激励方案（手工老面小笼包0400G00）.pdf",
+          "score": 0.015384615398943424,
           "relevant": false
         }
       ]
@@ -764,28 +764,28 @@
           "rank": 3,
           "chunk_id": 1036,
           "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
-          "score": 0.014285714365541935,
+          "score": 0.014925372786819935,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 2006,
           "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
-          "score": 0.014705882407724857,
+          "score": 0.014492753893136978,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 1563,
-          "doc_name": "冰淇淋箱拆单标准.xlsx",
-          "score": 0.013333333656191826,
+          "chunk_id": 1642,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.015384615398943424,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 1643,
-          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
-          "score": 0.015384615398943424,
+          "chunk_id": 2005,
+          "doc_name": "皇家小虎设备投放框架协议模板（鲜食政策）清洁版SBTF-2026-A3.1.docx",
+          "score": 0.01515151560306549,
           "relevant": false
         }
       ]
@@ -826,21 +826,21 @@
           "rank": 4,
           "chunk_id": 1932,
           "doc_name": "关于鲜食设备押金政策调整的补充协议_.pdf",
-          "score": 0.029213953763246536,
+          "score": 0.03009207174181938,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1035,
           "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
-          "score": 0.015384615398943424,
+          "score": 0.01515151560306549,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 2011,
           "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
-          "score": 0.014084506779909134,
+          "score": 0.015384615398943424,
           "relevant": false
         }
       ]
@@ -867,7 +867,7 @@
           "rank": 2,
           "chunk_id": 2092,
           "doc_name": "皇家小虎鲜食设备政策说明.pdf",
-          "score": 0.03151364624500275,
+          "score": 0.0317540317773819,
           "relevant": false
         },
         {
@@ -879,23 +879,23 @@
         },
         {
           "rank": 4,
-          "chunk_id": 1932,
-          "doc_name": "关于鲜食设备押金政策调整的补充协议_.pdf",
-          "score": 0.03125,
+          "chunk_id": 2007,
+          "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
+          "score": 0.012820512987673283,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 2007,
-          "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
-          "score": 0.013698630034923553,
+          "chunk_id": 1932,
+          "doc_name": "关于鲜食设备押金政策调整的补充协议_.pdf",
+          "score": 0.03100961446762085,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 1037,
           "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
-          "score": 0.03057890012860298,
+          "score": 0.030365770682692528,
           "relevant": false
         }
       ]
@@ -936,7 +936,7 @@
           "rank": 4,
           "chunk_id": 1066,
           "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
-          "score": 0.02877846732735634,
+          "score": 0.02838164195418358,
           "relevant": false
         },
         {
@@ -977,7 +977,7 @@
           "rank": 2,
           "chunk_id": 1110,
           "doc_name": "活动管理及费用核销.docx",
-          "score": 0.02911604568362236,
+          "score": 0.02964254468679428,
           "relevant": false
         },
         {
@@ -991,14 +991,14 @@
           "rank": 4,
           "chunk_id": 1626,
           "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
-          "score": 0.030365770682692528,
+          "score": 0.03057890012860298,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1250,
           "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
-          "score": 0.02903091162443161,
+          "score": 0.0297619067132473,
           "relevant": false
         },
         {
@@ -1025,7 +1025,7 @@
           "rank": 1,
           "chunk_id": 1624,
           "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
-          "score": 0.03201844170689583,
+          "score": 0.03177805617451668,
           "relevant": false
         },
         {
@@ -1060,7 +1060,7 @@
           "rank": 6,
           "chunk_id": 1961,
           "doc_name": "皇家小虎冰箱设备投放管理暂行办法.pdf",
-          "score": 0.014084506779909134,
+          "score": 0.013513513840734959,
           "relevant": false
         }
       ]
@@ -1087,7 +1087,7 @@
           "rank": 2,
           "chunk_id": 1618,
           "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
-          "score": 0.0476270467042923,
+          "score": 0.0478750616312027,
           "relevant": false
         },
         {
@@ -1106,16 +1106,16 @@
         },
         {
           "rank": 5,
-          "chunk_id": 1063,
+          "chunk_id": 1069,
           "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
           "score": 0.013513513840734959,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 1069,
-          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
-          "score": 0.014492753893136978,
+          "chunk_id": 2102,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.012987012974917889,
           "relevant": false
         }
       ]
@@ -1154,16 +1154,16 @@
         },
         {
           "rank": 4,
-          "chunk_id": 2007,
-          "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
-          "score": 0.013333333656191826,
+          "chunk_id": 1560,
+          "doc_name": "冰淇淋箱拆单标准.xlsx",
+          "score": 0.013513513840734959,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1069,
           "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
-          "score": 0.014084506779909134,
+          "score": 0.01315789483487606,
           "relevant": false
         },
         {
@@ -1237,36 +1237,36 @@
       "gold_chunk_id": 1666,
       "recall@k": 1.0,
       "precision@k": 0.1667,
-      "rr": 0.5,
-      "first_relevant_rank": 2,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
       "hits_returned": 6,
       "hits": [
         {
           "rank": 1,
-          "chunk_id": 1088,
-          "doc_name": "客户合同签订流程、线下品牌授权指....docx",
-          "score": 0.032786883413791656,
-          "relevant": false
+          "chunk_id": 1666,
+          "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+          "score": 0.032522473484277725,
+          "relevant": true
         },
         {
           "rank": 2,
-          "chunk_id": 1666,
-          "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
-          "score": 0.032258063554763794,
-          "relevant": true
+          "chunk_id": 1088,
+          "doc_name": "客户合同签订流程、线下品牌授权指....docx",
+          "score": 0.032522473484277725,
+          "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 1682,
           "doc_name": "新签2026年经销商合同规范.docx",
-          "score": 0.029323630034923553,
+          "score": 0.028445512056350708,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 1571,
           "doc_name": "合同签订指引.docx",
-          "score": 0.03015873208642006,
+          "score": 0.030365770682692528,
           "relevant": false
         },
         {
@@ -1300,14 +1300,14 @@
           "rank": 1,
           "chunk_id": 1575,
           "doc_name": "合同签订指引.docx",
-          "score": 0.030414745211601257,
+          "score": 0.030621785670518875,
           "relevant": false
         },
         {
           "rank": 2,
           "chunk_id": 1088,
           "doc_name": "客户合同签订流程、线下品牌授权指....docx",
-          "score": 0.028039216995239258,
+          "score": 0.027692895382642746,
           "relevant": false
         },
         {
@@ -1493,14 +1493,14 @@
           "rank": 5,
           "chunk_id": 1654,
           "doc_name": "客户准入、主数据修改、退出.docx",
-          "score": 0.028370220214128494,
+          "score": 0.02857142873108387,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 1945,
           "doc_name": "客户准入、主数据修改、退出.docx",
-          "score": 0.014285714365541935,
+          "score": 0.014492753893136978,
           "relevant": false
         }
       ]
@@ -1527,35 +1527,35 @@
           "rank": 2,
           "chunk_id": 1794,
           "doc_name": "终端连锁系统合作准入流程指引.docx",
-          "score": 0.04838709533214569,
+          "score": 0.04865150526165962,
           "relevant": true
         },
         {
           "rank": 3,
           "chunk_id": 1690,
           "doc_name": "新签2026年经销商合同规范.docx",
-          "score": 0.016393441706895828,
+          "score": 0.016129031777381897,
           "relevant": false
         },
         {
           "rank": 4,
-          "chunk_id": 1999,
-          "doc_name": "皇家小虎设备投放框架协议模板（鲜食政策）清洁版SBTF-2026-A3.1.docx",
-          "score": 0.015384615398943424,
+          "chunk_id": 1902,
+          "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
+          "score": 0.013888888992369175,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 1659,
-          "doc_name": "客户准入流程指引.docx",
-          "score": 0.01587301678955555,
+          "chunk_id": 1999,
+          "doc_name": "皇家小虎设备投放框架协议模板（鲜食政策）清洁版SBTF-2026-A3.1.docx",
+          "score": 0.015625,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 1581,
-          "doc_name": "品牌授权与运营管理协议PPSQ-2026-A1.1.docx",
-          "score": 0.014084506779909134,
+          "chunk_id": 1659,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.01587301678955555,
           "relevant": false
         }
       ]
@@ -1594,23 +1594,23 @@
         },
         {
           "rank": 4,
-          "chunk_id": 1085,
+          "chunk_id": 1945,
           "doc_name": "客户准入、主数据修改、退出.docx",
-          "score": 0.028370220214128494,
+          "score": 0.028577260673046112,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 1945,
+          "chunk_id": 1654,
           "doc_name": "客户准入、主数据修改、退出.docx",
-          "score": 0.02747976779937744,
+          "score": 0.027912385761737823,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 1654,
+          "chunk_id": 1085,
           "doc_name": "客户准入、主数据修改、退出.docx",
-          "score": 0.014925372786819935,
+          "score": 0.028665028512477875,
           "relevant": false
         }
       ]
@@ -1630,7 +1630,7 @@
           "rank": 1,
           "chunk_id": 1344,
           "doc_name": "终端连锁系统合作准入流程指引.docx",
-          "score": 0.04865150526165962,
+          "score": 0.048395488411188126,
           "relevant": false
         },
         {
@@ -1740,7 +1740,7 @@
           "rank": 1,
           "chunk_id": 1344,
           "doc_name": "终端连锁系统合作准入流程指引.docx",
-          "score": 0.048659902065992355,
+          "score": 0.04891591519117355,
           "relevant": false
         },
         {
@@ -1754,21 +1754,21 @@
           "rank": 3,
           "chunk_id": 1085,
           "doc_name": "客户准入、主数据修改、退出.docx",
-          "score": 0.028594771400094032,
+          "score": 0.028039216995239258,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 1654,
           "doc_name": "客户准入、主数据修改、退出.docx",
-          "score": 0.027799228206276894,
+          "score": 0.02678571455180645,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1945,
           "doc_name": "客户准入、主数据修改、退出.docx",
-          "score": 0.014084506779909134,
+          "score": 0.01315789483487606,
           "relevant": false
         },
         {
@@ -1809,7 +1809,7 @@
           "rank": 3,
           "chunk_id": 1579,
           "doc_name": "合同签订指引.docx",
-          "score": 0.028258707374334335,
+          "score": 0.028438886627554893,
           "relevant": false
         },
         {
@@ -1830,7 +1830,7 @@
           "rank": 6,
           "chunk_id": 1690,
           "doc_name": "新签2026年经销商合同规范.docx",
-          "score": 0.01515151560306549,
+          "score": 0.014705882407724857,
           "relevant": false
         }
       ]
@@ -1871,7 +1871,7 @@
           "rank": 4,
           "chunk_id": 1666,
           "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
-          "score": 0.04713065177202225,
+          "score": 0.0473710298538208,
           "relevant": false
         },
         {
@@ -1885,7 +1885,7 @@
           "rank": 6,
           "chunk_id": 1061,
           "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
-          "score": 0.014705882407724857,
+          "score": 0.013888888992369175,
           "relevant": false
         }
       ]
@@ -1897,48 +1897,48 @@
       "gold_chunk_id": 1685,
       "recall@k": 1.0,
       "precision@k": 0.1667,
-      "rr": 0.5,
-      "first_relevant_rank": 2,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
       "hits_returned": 6,
       "hits": [
         {
           "rank": 1,
+          "chunk_id": 1684,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.04891591519117355,
+          "relevant": true
+        },
+        {
+          "rank": 2,
           "chunk_id": 1762,
           "doc_name": "线下销售支持流程.docx",
           "score": 0.04865150526165962,
           "relevant": false
         },
         {
-          "rank": 2,
-          "chunk_id": 1683,
-          "doc_name": "新签2026年经销商合同规范.docx",
-          "score": 0.04891591519117355,
-          "relevant": true
-        },
-        {
           "rank": 3,
           "chunk_id": 1572,
           "doc_name": "合同签订指引.docx",
-          "score": 0.03030998818576336,
+          "score": 0.03009049780666828,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 2017,
           "doc_name": "出差申请&报销操作指引(2)(1).pdf",
-          "score": 0.027984343469142914,
+          "score": 0.014285714365541935,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1770,
           "doc_name": "线下销售支持流程.docx",
-          "score": 0.014492753893136978,
+          "score": 0.014285714365541935,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 1085,
+          "chunk_id": 1086,
           "doc_name": "客户准入、主数据修改、退出.docx",
           "score": 0.015625,
           "relevant": false
@@ -1960,14 +1960,14 @@
           "rank": 1,
           "chunk_id": 1684,
           "doc_name": "新签2026年经销商合同规范.docx",
-          "score": 0.048659902065992355,
+          "score": 0.048171497881412506,
           "relevant": true
         },
         {
           "rank": 2,
           "chunk_id": 1762,
           "doc_name": "线下销售支持流程.docx",
-          "score": 0.04865150526165962,
+          "score": 0.048131078481674194,
           "relevant": false
         },
         {
@@ -1981,21 +1981,21 @@
           "rank": 4,
           "chunk_id": 1572,
           "doc_name": "合同签订指引.docx",
-          "score": 0.03030303120613098,
+          "score": 0.03007688745856285,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1908,
           "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
-          "score": 0.014705882407724857,
+          "score": 0.014492753893136978,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 1873,
           "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
-          "score": 0.014285714365541935,
+          "score": 0.013888888992369175,
           "relevant": false
         }
       ]
@@ -2015,7 +2015,7 @@
           "rank": 1,
           "chunk_id": 1686,
           "doc_name": "新签2026年经销商合同规范.docx",
-          "score": 0.0643005296587944,
+          "score": 0.06504494696855545,
           "relevant": true
         },
         {
@@ -2029,28 +2029,28 @@
           "rank": 3,
           "chunk_id": 1846,
           "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
-          "score": 0.03053613007068634,
+          "score": 0.03030998818576336,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 1729,
           "doc_name": "江西虎虎生风收款账户说明（盖章版）.pdf",
-          "score": 0.04599076882004738,
+          "score": 0.04575038701295853,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1330,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.03226646035909653,
+          "score": 0.03201844170689583,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 2021,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.03128054738044739,
+          "score": 0.03102453239262104,
           "relevant": false
         }
       ]
@@ -2075,37 +2075,37 @@
         },
         {
           "rank": 2,
+          "chunk_id": 1766,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 3,
           "chunk_id": 1729,
           "doc_name": "江西虎虎生风收款账户说明（盖章版）.pdf",
           "score": 0.03177805617451668,
           "relevant": false
         },
         {
-          "rank": 3,
-          "chunk_id": 1765,
-          "doc_name": "线下销售支持流程.docx",
-          "score": 0.01587301678955555,
-          "relevant": false
-        },
-        {
           "rank": 4,
-          "chunk_id": 1762,
-          "doc_name": "线下销售支持流程.docx",
-          "score": 0.013888888992369175,
+          "chunk_id": 1846,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.014705882407724857,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1330,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.01515151560306549,
+          "score": 0.014925372786819935,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 2021,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.014492753893136978,
+          "score": 0.014084506779909134,
           "relevant": false
         }
       ]
@@ -2125,7 +2125,7 @@
           "rank": 1,
           "chunk_id": 1882,
           "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
-          "score": 0.047447845339775085,
+          "score": 0.047673989087343216,
           "relevant": true
         },
         {
@@ -2137,30 +2137,30 @@
         },
         {
           "rank": 3,
-          "chunk_id": 1764,
+          "chunk_id": 1765,
           "doc_name": "线下销售支持流程.docx",
-          "score": 0.04765107482671738,
+          "score": 0.04738666117191315,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 1804,
           "doc_name": "重庆虎腾收款账户说明（盖章版本）.pdf",
-          "score": 0.048147473484277725,
+          "score": 0.048411883413791656,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 1330,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.04578372836112976,
+          "score": 0.04554334655404091,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 2021,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.03053613007068634,
+          "score": 0.03077651560306549,
           "relevant": false
         }
       ]
@@ -2192,16 +2192,16 @@
         },
         {
           "rank": 3,
-          "chunk_id": 1864,
-          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
-          "score": 0.03055037185549736,
+          "chunk_id": 1846,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.03125763311982155,
           "relevant": false
         },
         {
           "rank": 4,
-          "chunk_id": 1846,
-          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
-          "score": 0.03125763311982155,
+          "chunk_id": 1864,
+          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
+          "score": 0.03055037185549736,
           "relevant": false
         },
         {
@@ -2233,30 +2233,30 @@
       "hits": [
         {
           "rank": 1,
-          "chunk_id": 1851,
-          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
-          "score": 0.03079839050769806,
-          "relevant": false
-        },
-        {
-          "rank": 2,
           "chunk_id": 1869,
           "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
           "score": 0.03067915514111519,
           "relevant": false
         },
         {
+          "rank": 2,
+          "chunk_id": 1851,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.030621785670518875,
+          "relevant": false
+        },
+        {
           "rank": 3,
           "chunk_id": 1833,
           "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
-          "score": 0.030330881476402283,
+          "score": 0.03057890012860298,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 1815,
           "doc_name": "销售协议书XS2026A1.1(宿迁虎家).docx",
-          "score": 0.03079839050769806,
+          "score": 0.03055037185549736,
           "relevant": false
         },
         {
@@ -2282,43 +2282,43 @@
       "gold_chunk_id": 1888,
       "recall@k": 1.0,
       "precision@k": 0.1667,
-      "rr": 0.3333,
-      "first_relevant_rank": 3,
+      "rr": 0.25,
+      "first_relevant_rank": 4,
       "hits_returned": 6,
       "hits": [
         {
           "rank": 1,
-          "chunk_id": 1852,
-          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
-          "score": 0.0478750616312027,
+          "chunk_id": 1834,
+          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
+          "score": 0.04838709533214569,
           "relevant": false
         },
         {
           "rank": 2,
-          "chunk_id": 1834,
-          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
-          "score": 0.047642678022384644,
+          "chunk_id": 1852,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.04813947528600693,
           "relevant": false
         },
         {
           "rank": 3,
-          "chunk_id": 1888,
-          "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
-          "score": 0.04716267064213753,
-          "relevant": true
+          "chunk_id": 1870,
+          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
+          "score": 0.0471230149269104,
+          "relevant": false
         },
         {
           "rank": 4,
-          "chunk_id": 1870,
-          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
-          "score": 0.046875,
-          "relevant": false
+          "chunk_id": 1888,
+          "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+          "score": 0.04615384712815285,
+          "relevant": true
         },
         {
           "rank": 5,
           "chunk_id": 1905,
           "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
-          "score": 0.04617604613304138,
+          "score": 0.04592803120613098,
           "relevant": false
         },
         {
@@ -2345,42 +2345,42 @@
           "rank": 1,
           "chunk_id": 1911,
           "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
-          "score": 0.015384615398943424,
+          "score": 0.016129031777381897,
           "relevant": false
         },
         {
           "rank": 2,
           "chunk_id": 1821,
           "doc_name": "销售协议书XS2026A1.1(宿迁虎家).docx",
-          "score": 0.047183435410261154,
+          "score": 0.04696394503116608,
           "relevant": false
         },
         {
           "rank": 3,
-          "chunk_id": 1839,
-          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
-          "score": 0.046875,
-          "relevant": false
-        },
-        {
-          "rank": 4,
           "chunk_id": 1857,
           "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
           "score": 0.04669647291302681,
           "relevant": false
         },
         {
+          "rank": 4,
+          "chunk_id": 1839,
+          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
+          "score": 0.04663461446762085,
+          "relevant": false
+        },
+        {
           "rank": 5,
           "chunk_id": 1875,
           "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
-          "score": 0.045284781605005264,
+          "score": 0.045036762952804565,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 1893,
           "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
-          "score": 0.04470045864582062,
+          "score": 0.04444444552063942,
           "relevant": true
         }
       ]
@@ -2405,30 +2405,30 @@
         },
         {
           "rank": 2,
+          "chunk_id": 1858,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.03015873208642006,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1840,
+          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
+          "score": 0.030117753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 4,
           "chunk_id": 1876,
           "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
           "score": 0.03055037185549736,
           "relevant": false
         },
         {
-          "rank": 3,
-          "chunk_id": 1858,
-          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
-          "score": 0.029571646824479103,
-          "relevant": false
-        },
-        {
-          "rank": 4,
-          "chunk_id": 1840,
-          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
-          "score": 0.029877368360757828,
-          "relevant": false
-        },
-        {
           "rank": 5,
           "chunk_id": 1894,
           "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
-          "score": 0.028898129239678383,
+          "score": 0.028205128386616707,
           "relevant": true
         },
         {
@@ -2462,14 +2462,14 @@
           "rank": 2,
           "chunk_id": 1328,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.03125763311982155,
+          "score": 0.03102453239262104,
           "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 2019,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.03125,
+          "score": 0.03100961446762085,
           "relevant": false
         },
         {
@@ -2483,14 +2483,14 @@
           "rank": 5,
           "chunk_id": 2040,
           "doc_name": "线下人员补贴报销指引.pdf",
-          "score": 0.028790388256311417,
+          "score": 0.028991596773266792,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 2012,
           "doc_name": "出差申请&报销操作指引(2)(1).pdf",
-          "score": 0.02943722903728485,
+          "score": 0.028850145637989044,
           "relevant": false
         }
       ]
@@ -2524,28 +2524,28 @@
           "rank": 3,
           "chunk_id": 1328,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.016129031777381897,
+          "score": 0.01587301678955555,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 2019,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.01587301678955555,
+          "score": 0.015625,
           "relevant": false
         },
         {
           "rank": 5,
           "chunk_id": 2060,
           "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
-          "score": 0.015625,
+          "score": 0.016129031777381897,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 2014,
-          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
-          "score": 0.014705882407724857,
+          "chunk_id": 2028,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.014084506779909134,
           "relevant": false
         }
       ]
@@ -2565,42 +2565,42 @@
           "rank": 1,
           "chunk_id": 2058,
           "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
-          "score": 0.04771225526928902,
+          "score": 0.049180325120687485,
           "relevant": true
         },
         {
           "rank": 2,
           "chunk_id": 2060,
           "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
-          "score": 0.032258063554763794,
+          "score": 0.04595669358968735,
           "relevant": false
         },
         {
           "rank": 3,
-          "chunk_id": 2045,
-          "doc_name": "线下人员补贴报销指引.pdf",
-          "score": 0.01515151560306549,
+          "chunk_id": 2017,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.016129031777381897,
           "relevant": false
         },
         {
           "rank": 4,
-          "chunk_id": 2017,
-          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
-          "score": 0.016393441706895828,
+          "chunk_id": 2040,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.02991071343421936,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 2040,
+          "chunk_id": 2032,
           "doc_name": "线下人员补贴报销指引.pdf",
-          "score": 0.030330881476402283,
+          "score": 0.014492753893136978,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 2013,
-          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
-          "score": 0.013333333656191826,
+          "chunk_id": 1328,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.03007688745856285,
           "relevant": false
         }
       ]
@@ -2625,37 +2625,37 @@
         },
         {
           "rank": 2,
-          "chunk_id": 2060,
-          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
-          "score": 0.048131078481674194,
-          "relevant": false
-        },
-        {
-          "rank": 3,
           "chunk_id": 2040,
           "doc_name": "线下人员补贴报销指引.pdf",
           "score": 0.030621785670518875,
           "relevant": false
         },
         {
-          "rank": 4,
+          "rank": 3,
           "chunk_id": 1449,
           "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
-          "score": 0.01515151560306549,
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2015,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.014084506779909134,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 2015,
-          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
-          "score": 0.014492753893136978,
+          "chunk_id": 1416,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01587301678955555,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 1416,
-          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
-          "score": 0.01587301678955555,
+          "chunk_id": 2046,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.02877846732735634,
           "relevant": false
         }
       ]
@@ -2680,30 +2680,30 @@
         },
         {
           "rank": 2,
-          "chunk_id": 2012,
+          "chunk_id": 2013,
           "doc_name": "出差申请&报销操作指引(2)(1).pdf",
-          "score": 0.0320020467042923,
+          "score": 0.03128054738044739,
           "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 1328,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.03077651560306549,
+          "score": 0.03100961446762085,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 2019,
           "doc_name": "线下业务个人报销指引.docx",
-          "score": 0.02967032976448536,
+          "score": 0.02991071343421936,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 2032,
+          "chunk_id": 2031,
           "doc_name": "线下人员补贴报销指引.pdf",
-          "score": 0.014084506779909134,
+          "score": 0.014285714365541935,
           "relevant": false
         },
         {
@@ -2737,35 +2737,35 @@
           "rank": 2,
           "chunk_id": 2040,
           "doc_name": "线下人员补贴报销指引.pdf",
-          "score": 0.02967032976448536,
+          "score": 0.02921108715236187,
           "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 2034,
           "doc_name": "线下人员补贴报销指引.pdf",
-          "score": 0.031054403632879257,
+          "score": 0.03128054738044739,
           "relevant": false
         },
         {
           "rank": 4,
-          "chunk_id": 1093,
-          "doc_name": "市场费用项适用场景及核销标准说明....docx",
-          "score": 0.013333333656191826,
+          "chunk_id": 1446,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014705882407724857,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 1373,
-          "doc_name": "市场费用项适用场景及核销标准说明（2026 版）.docx",
-          "score": 0.01315789483487606,
+          "chunk_id": 1091,
+          "doc_name": "市场费用项适用场景及核销标准说明....docx",
+          "score": 0.01515151560306549,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 1446,
-          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
-          "score": 0.014705882407724857,
+          "chunk_id": 1371,
+          "doc_name": "市场费用项适用场景及核销标准说明（2026 版）.docx",
+          "score": 0.014925372786819935,
           "relevant": false
         }
       ]
@@ -2792,7 +2792,7 @@
           "rank": 2,
           "chunk_id": 1227,
           "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
-          "score": 0.012820512987673283,
+          "score": 0.013698630034923553,
           "relevant": false
         },
         {
@@ -2806,21 +2806,21 @@
           "rank": 4,
           "chunk_id": 1218,
           "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
-          "score": 0.014925372786819935,
+          "score": 0.014492753893136978,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 1660,
-          "doc_name": "客户准入流程指引.docx",
-          "score": 0.015384615398943424,
+          "chunk_id": 1680,
+          "doc_name": "快递单拆分流程.docx",
+          "score": 0.029857397079467773,
           "relevant": false
         },
         {
           "rank": 6,
-          "chunk_id": 1775,
-          "doc_name": "线下销售支持流程.docx",
-          "score": 0.014705882407724857,
+          "chunk_id": 1660,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.015384615398943424,
           "relevant": false
         }
       ]
@@ -2868,14 +2868,14 @@
           "rank": 5,
           "chunk_id": 1775,
           "doc_name": "线下销售支持流程.docx",
-          "score": 0.01515151560306549,
+          "score": 0.015384615398943424,
           "relevant": false
         },
         {
           "rank": 6,
           "chunk_id": 1681,
           "doc_name": "快递单拆分流程.docx",
-          "score": 0.014705882407724857,
+          "score": 0.014492753893136978,
           "relevant": false
         }
       ]
@@ -2909,7 +2909,7 @@
           "rank": 3,
           "chunk_id": 1559,
           "doc_name": "冰淇淋箱拆单标准.xlsx",
-          "score": 0.013513513840734959,
+          "score": 0.013888888992369175,
           "relevant": false
         },
         {
@@ -2964,7 +2964,7 @@
           "rank": 3,
           "chunk_id": 1559,
           "doc_name": "冰淇淋箱拆单标准.xlsx",
-          "score": 0.014705882407724857,
+          "score": 0.013888888992369175,
           "relevant": false
         },
         {
@@ -3012,21 +3012,21 @@
           "rank": 2,
           "chunk_id": 1773,
           "doc_name": "线下销售支持流程.docx",
-          "score": 0.016129031777381897,
+          "score": 0.03021353855729103,
           "relevant": false
         },
         {
           "rank": 3,
           "chunk_id": 1230,
           "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
-          "score": 0.02881426177918911,
+          "score": 0.02985074557363987,
           "relevant": false
         },
         {
           "rank": 4,
           "chunk_id": 1771,
           "doc_name": "线下销售支持流程.docx",
-          "score": 0.01515151560306549,
+          "score": 0.016129031777381897,
           "relevant": false
         },
         {
@@ -3038,9 +3038,9 @@
         },
         {
           "rank": 6,
-          "chunk_id": 1227,
+          "chunk_id": 1194,
           "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
-          "score": 0.014285714365541935,
+          "score": 0.01515151560306549,
           "relevant": false
         }
       ]
@@ -3065,29 +3065,29 @@
         },
         {
           "rank": 2,
-          "chunk_id": 1490,
-          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
-          "score": 0.015384615398943424,
-          "relevant": false
-        },
-        {
-          "rank": 3,
           "chunk_id": 1760,
           "doc_name": "线下销售支持流程.docx",
           "score": 0.015384615398943424,
           "relevant": false
         },
         {
-          "rank": 4,
+          "rank": 3,
           "chunk_id": 1715,
           "doc_name": "样品、物料商城小程序指引.docx",
-          "score": 0.013513513840734959,
+          "score": 0.013888888992369175,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1785,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.01587301678955555,
           "relevant": false
         },
         {
           "rank": 5,
-          "chunk_id": 1785,
-          "doc_name": "线下销售支持流程.docx",
+          "chunk_id": 1491,
+          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
           "score": 0.014705882407724857,
           "relevant": false
         },
@@ -3095,7 +3095,7 @@
           "rank": 6,
           "chunk_id": 1301,
           "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
-          "score": 0.013698630034923553,
+          "score": 0.014285714365541935,
           "relevant": false
         }
       ]

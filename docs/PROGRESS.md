@@ -4937,9 +4937,39 @@ LLM 出题失败 0 次），金块是 `chunk_id + ord`（重新入库即 stale �
 抽到了就死、没抽到反而活 —— 它天然表现为「随机」。今天同一个根因逮到四档：
 光杆维度词 / 疑问代词「谁」/ 单号 / 量词前缀「各省区」。
 
+## AX158（2026-08-17，向量维度 512 → 1024）
+
+业主问「千问的向量是不是 1024」。实测确认：`text-embedding-v4` **不传 `dimensions` 就是 1024**，
+支持 64/128/256/512/768/1024/1536/2048，且**按 token 计费、与维度无关**。
+昨天用 512 是为了零 schema 迁移（库里六列都是 512 维），不是因为千问只有 512。
+
+升级三层：`EMBED_DIM` 成为唯一事实源 → 五处 DDL 字面量 + kb 迁移一起改 →
+**已有库靠幂等改型拉齐**（meta 五张在 `retype_embedding_columns`，`kb.chunk` 在 KB_DDL_DELTA 的
+DO 块里；两处都先读 `atttypmod` 再决定改不改，无条件 ALTER 会每次启动重建一次 HNSW）。
+改型顺带清 NULL 并把 kb.doc 退回 `chunked` —— 维度变了旧向量本来就作废，
+而 revec 的 KB_SEL 只扫 chunked，不退状态会扫到 0 行还退 0（昨天刚踩过）。
+
+同一批 56 题、同一套语料，三趟的账：
+
+| | recall@1 | recall@2 | recall@6 | MRR | 未命中 |
+|---|---|---|---|---|---|
+| 512 维 · 无精排 | 0.4643 | 0.8036 | 0.9464 | 0.6670 | 3 |
+| 512 维 · 精排开 | 0.5536 | 0.8571 | 0.9821 | 0.7348 | 1 |
+| **1024 维 · 精排开** | **0.5893** | 0.8571 | 0.9821 | **0.7512** | 1 |
+
+1024 比 512 再 **+3.6 个点**（recall@1），MRR +1.6 个点；recall@2/@6 不动（已经贴顶）。
+从「换千问之前」算起，recall@1 一共 **+12.5 个点**。基线报告已换成 1024 那份。
+
+判据 `the_vector_dimension_is_declared_once`：扫 ddl.rs / kb 迁移 / store.rs 里每一处
+`vector(<纯数字>)` 都必须等于 `EMBED_DIM`，并逐字核对**另一个进程**里的
+`tools/embed_service.py::DIM`；断言至少扫到 6 处，防它扫空成恒真。反向验证过。
+
+顺带把生产从昨晚的手工补丁 release 拉回了正路：这一轮走的是完整 `deploy_update.sh`。
+
 ### 七、未结（下一手接着查）
 
-0. **生产当前跑的是手工补丁 release**（`20260816T150000Z-hotfix2`）：今晚 sshd 连接
+0. ~~生产当前跑的是手工补丁 release~~ —— 已在 AX158 那一轮用完整 `deploy_update.sh` 拉回正路。
+   下面这段留作记录（SSH 不稳时的应急路子）：**生产曾跑过手工补丁 release**（`20260816T150000Z-hotfix2`）：今晚 sshd 连接
    连续掉线（`Error reading SSH protocol banner` / `Socket is closed`，一天几百条短连接
    打满 MaxStartups），`deploy_update.sh` 的 bput 连挂三次。改法是：拷贝上一个 release、
    **只**把改动的 `crates/agent/src/intent.rs` 用分块 base64 传上去、原地 `server-build.sh`
