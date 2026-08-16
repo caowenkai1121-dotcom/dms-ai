@@ -2126,7 +2126,18 @@ fn is_bare_dimension_word(surface: &str) -> bool {
     // `entity:各省区`，整词不等于「省区」，第一版的判据放过了它，于是同一题时绿时红 ——
     // 模型报「省区」就绿、报「各省区」就红。这类分组量词恰恰证明它**不是**某一个实体。
     // 只剥这几个确定的量词：不做通用前缀剥离，那会伤到真名字。
-    for prefix in ["各", "每", "所有", "全部", "全", "各个", "每个"] {
+    // 🔴 疑问代词更不是实体（2026-08-16 `--entries` 实测）：
+    // 「昨天都有谁下过单啊」→ 模型报 `entity:谁`，而「谁」在 SQL 里永远证不出来
+    // （那正是用户要问的东西）→ coverage blocked → 确定性臂哑掉 → 反问卡。
+    // 同一句换个说法「昨天下单的有哪些客户」就答得出 200 行 —— 差别只在这一个字。
+    const INTERROGATIVES: &[&str] =
+        &["谁", "哪些", "哪个", "哪家", "哪几个", "什么", "啥", "多少", "几个"];
+    if INTERROGATIVES.contains(&s) {
+        return true;
+    }
+    // 疑问词 + 类别词（「哪些客户」「什么商品」）同理：问的是这一类，不是某一个
+    for prefix in ["各", "每", "所有", "全部", "全", "各个", "每个",
+                   "哪些", "哪个", "哪家", "什么", "多少"] {
         if let Some(rest) = s.strip_prefix(prefix) {
             if dms_semantic::fastpath::derive::DIMENSION_CLASS_WORDS.contains(&rest) {
                 return true;
@@ -2663,6 +2674,8 @@ mod tests {
                 EntityMention { surface: "客户".into(), kind: EntityKind::Customer },
                 EntityMention { surface: "各省区".into(), kind: EntityKind::Organization },
                 EntityMention { surface: "所有门店".into(), kind: EntityKind::Other },
+                EntityMention { surface: "谁".into(), kind: EntityKind::Other },
+                EntityMention { surface: "哪些客户".into(), kind: EntityKind::Customer },
                 EntityMention { surface: "省区".into(), kind: EntityKind::Organization },
                 EntityMention { surface: " 门店 ".into(), kind: EntityKind::Other },
                 // 真名字一个都不许被误伤
