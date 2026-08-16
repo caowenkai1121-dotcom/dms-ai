@@ -399,6 +399,13 @@ pub fn sales_fact_province_filter(
                 direct.push(value);
             }
         }
+        if direct.len() > 1
+            && !warehouse_sales_dimensions(question)
+                .iter()
+                .any(|(dimension, _)| *dimension == Dimension::Region)
+        {
+            return Err(()); // 同上：多值不出分组就是把两个大区合成一个数
+        }
         if !direct.is_empty() {
             let mut consumed: Vec<String> = direct.iter().map(|v| (*v).to_string()).collect();
             consumed.extend(enumeration_separators(question, direct.len()));
@@ -425,7 +432,6 @@ pub fn sales_fact_province_filter(
             format!("{name}自治区"),
             format!("{name}省区"),
             format!("{name}战区"),
-            format!("{name}大区"),
             format!("{name}省"),
             format!("{name}市"),
             name.to_string(),
@@ -441,6 +447,18 @@ pub fn sales_fact_province_filter(
     }
     // 单值时保持原样；多值枚举（「山东省区和河南省区」）拼一条 region IN。
     let multi = hits.len() > 1;
+    // 🔴 多值枚举必须**同时**出分组，否则 IN 把两个省 SUM 成一个数（第三种翻车形态：
+    // 不是查全国、也不是只取一个省，而是静默合并 —— 而且收据糊不掉，`name_value_matches`
+    // 是子串匹配，'山东省区' contains '山东省'，region 槽照样判「已证明」，trust 仍是 verified）。
+    // `Dimension::Region` 的别名里**没有裸「省」**：「山东省和江苏省本月销售额」一个维度词都不命中，
+    // 所以那一族维持既有的 fail-closed，只有明说「省区/区域/省份…」的才放行。
+    if multi
+        && !warehouse_sales_dimensions(question)
+            .iter()
+            .any(|(dimension, _)| *dimension == Dimension::Region)
+    {
+        return Err(());
+    }
     let mut values: Vec<String> = Vec::new();
     let mut consumed: Vec<String> = Vec::new();
     for (name, phrase) in &hits {
@@ -496,7 +514,11 @@ fn enumeration_separators(question: &str, hits: usize) -> Vec<String> {
     if hits < 2 {
         return Vec::new();
     }
-    ["和", "与", "跟", "、", "以及", "还有"]
+    // 只有「跟」是承重的：「和」「与」在 STRIP_WORDS、「、」被标点过滤器吃掉。
+    // 🔴 不许往这张表加「还有」「以及」：`lexicon.rs` 的
+    // `residual_semantics_words_must_not_be_stripped` 钉着「还有」隐含 `> 0` 不许剥，
+    // 而进 consumed 与进 STRIP_WORDS 对残留守卫是同一效果 —— 从这里加就是绕过那道闸。
+    ["和", "与", "跟", "、"]
         .iter()
         .filter(|word| question.contains(**word))
         .map(|word| (*word).to_string())
@@ -561,10 +583,11 @@ mod range_surface_tests {
         let (_, p) = sales_fact_province_filter("山东省本月销售额", None).unwrap().unwrap();
         let sql = format!("{p:?}");
         assert!(sql.contains("山东省区") && sql.contains("山东战区"), "{sql}");
-        // 🔴 两个大区不再是「不猜」而是**枚举**（2026-08-16）：单值路径本来就走 `Predicate::one_of`，
-        // 拒答只是因为扫描器命中第二个值时直接 Err。分隔符要一起消化，否则残留守卫照旧拒。
+        // 🔴 两个大区不再是「不猜」而是**枚举**（2026-08-16），但**必须同时出分组**：
+        // 不带维度词的「西北大区和线下私域本月销售额」会把两个大区 SUM 成一个数，仍旧 Err。
+        assert!(sales_fact_province_filter("西北大区和线下私域本月销售额", None).is_err());
         let (consumed, p) =
-            sales_fact_province_filter("西北大区和线下私域本月销售额", None).unwrap().unwrap();
+            sales_fact_province_filter("西北大区和线下私域各省区本月销售额", None).unwrap().unwrap();
         let sql = format!("{p:?}");
         assert!(sql.contains("西北大区") && sql.contains("线下私域") && sql.contains(" IN ("), "{sql}");
         assert!(consumed.contains(&"和".to_string()), "分隔符要进消化词表：{consumed:?}");
@@ -579,6 +602,14 @@ mod range_surface_tests {
     /// （「跟」既不在 STRIP_WORDS 也不是标点）；1:1 与非 1:1 两种口径不许混着枚举。
     #[test]
     fn provinces_enumerated_become_one_in_list() {
+        // 🔴 最重的一条：多值**不出分组**就是把两个省 SUM 成一个数（不是查全国、也不是只取
+        // 一个省，是静默合并），而且收据糊不掉 —— `name_value_matches` 是子串匹配，
+        // '山东省区' contains '山东省'，region 槽照样判「已证明」，trust 仍是 verified。
+        // `Dimension::Region` 的别名里没有裸「省」，所以这一族维持既有 fail-closed。
+        assert!(
+            sales_fact_province_filter("山东省和江苏省本月销售额", None).is_err(),
+            "多值不出分组 = 合并数，必须拒"
+        );
         let (consumed, p) =
             sales_fact_province_filter("山东省区和河南省区本月销售额", None).unwrap().unwrap();
         let sql = format!("{p:?}");
