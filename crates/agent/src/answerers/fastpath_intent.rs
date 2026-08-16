@@ -657,6 +657,26 @@ pub async fn try_compose(pg: &sqlx::PgPool, ds: &str, question: &str) -> Option<
 /// Router 顺序仍是 graph 在先，所以全量账号不会被这里抢走。
 pub fn relation_rows(question: &str) -> Option<DirectHit> {
     let rel = detect_relation(question)?;
+    // 🔴 这三条模板**自报**它兑现了哪个实体（2026-08-17 审计逮到）。
+    //
+    // 共购那条尤其非报不可：它的正向谓词写在 **JOIN 的派生表**里
+    // （`JOIN (SELECT DISTINCT … WHERE sku_name LIKE '%X%' OR sku_code='X') target`），
+    // 而覆盖闸的谓词抽取只读主 select 的 WHERE 与 INNER/SEMI 的 JOIN ON，
+    // 派生表内部一个字不读（那是对的：CTE 里写句无关条件不该冒充限定）。
+    // 主 WHERE 里那次还是 `NOT (…)` —— 按定义就该证不出来（共购要把该商品排除在结果之外）。
+    // 于是「用户写的商品名确实被 SQL 兑现了（靠 JOIN 收窄订单集合）」在闸门眼里完全不存在，
+    // entity 永远进 unclaimed_scope → land 硬拦 → 回落自由 SQL 现编关联购买口径。
+    //
+    // ⚠️ 只在**剥出来的名字确实出自问句**时自报：`strip_relation_words` 是黑名单剥词，
+    // 「小虎烤肠一起买过什么」会剥出「小虎烤肠过」这种残词。无条件自报会把今天的
+    // 「回落 LLM」变成「确定性地答一张空表」—— 那更坏。
+    let entity = match &rel {
+        Relation::BuyersOfGoods(name)
+        | Relation::GoodsOfCustomer(name)
+        | Relation::Copurchase(name) => {
+            question.contains(name.as_str()).then(|| name.clone())
+        }
+    };
     let sql = match rel {
         Relation::BuyersOfGoods(name) => {
             let safe = rel_quote(&name);
@@ -714,7 +734,13 @@ pub fn relation_rows(question: &str) -> Option<DirectHit> {
             )
         }
     };
-    Some(hit(sql, "direct-doc"))
+    let mut out = hit(sql, "direct-doc");
+    if let Some(entity) = entity {
+        out.intent_evidence = out
+            .intent_evidence
+            .resolve(crate::intent::IntentSlotKind::Entity, entity);
+    }
+    Some(out)
 }
 
 

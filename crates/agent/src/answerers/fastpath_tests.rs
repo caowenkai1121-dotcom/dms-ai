@@ -51,6 +51,27 @@ const DETERMINISTIC_SRC: &str = concat!(
 #[cfg(test)]
 mod tests {
 
+    /// 🔴 三条关系模板必须自报兑现了哪个实体（2026-08-17 审计）。
+    ///
+    /// 共购那条的正向谓词写在 **JOIN 的派生表**里，覆盖闸的谓词抽取根本读不到；
+    /// 主 WHERE 里那次还是 `NOT (…)`，按定义就该证不出来。不自报 ⇒ entity 恒进
+    /// unclaimed_scope ⇒ land 硬拦 ⇒ 「买过烤肠的客户还买过什么」整族回落自由 SQL。
+    ///
+    /// 反面同样钉住：剥出来的名字不出自问句时**不许**自报 ——
+    /// `strip_relation_words` 是黑名单剥词，无条件自报会把「回落 LLM」变成「确定性空表」。
+    #[test]
+    fn relation_templates_report_the_entity_they_fulfilled() {
+        use crate::answerers::fastpath_intent::relation_rows;
+        use crate::intent::IntentSlotKind;
+        for q in ["买过烤肠的客户", "买烤肠的还买什么", "潍坊程祥商贸买过什么"] {
+            let hit = relation_rows(q).unwrap_or_else(|| panic!("{q} 该命中关系模板"));
+            let reported = ["烤肠", "潍坊程祥商贸"]
+                .iter()
+                .any(|name| hit.intent_evidence.proves(IntentSlotKind::Entity, name));
+            assert!(reported, "{q} 没自报兑现的实体：{:?}", hit.intent_evidence);
+        }
+    }
+
     /// 🔴 「线上」不许被当成已兑现（2026-08-17 审计）：取数表 `dws_off_offline_sale_dfn`
     /// 是线下专表，消化「线上」等于拿线下的数当线上的数答，而且是单值 KPI，用户无从察觉。
     /// 「线下」照旧要消化 —— 否则带实体的「X本月线下销售额」被残留守卫整条拒
