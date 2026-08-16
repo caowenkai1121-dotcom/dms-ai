@@ -23,6 +23,10 @@ const INTENT_SYSTEM: &str = r#"你是企业 AI Agent 的意图解析器。只提
 1. surface/value_surface/regions 必须保留用户原文，不得改名、缩写或补造。
 2. 禁止输出数据库列名、表名、编码、canonical id 或实体 ID；这些由后续确定性解析器完成。
 3. 一个问句有多个可独立执行的子任务时，必须把每个原文子任务写入 subgoals（即使都是 data 也要写）；同时查文档与查数据时 mode=hybrid。每个 subgoal 必须是完整的小意图：把属于它的实体、指标、筛选、地区、时间、分组、比较和明细要求写在该 subgoal 内。槽位原文若不在 surface 内，必须把证明它归属该子任务的原文片段写入 evidence_surfaces；共享条件在每个相关 subgoal 中重复，禁止让系统猜归属。version=2 且存在 subgoals 时，根级 goals 以外的执行槽位必须为空，执行只认子任务局部槽位。
+3.1 「分别…和…」「A 和 B 分别是多少」「同时看 A 与 B」这类**并列**问句，必须拆成多个 subgoal —— 每个并列项一个，共享的时间/地区/筛选在每个 subgoal 里重复写。
+   例：「分别查本月销售额和本月订单数」→ subgoals 两个：{"mode":"data","surface":"本月销售额","metrics":["销售额"],"time":{"surface":"本月"}} 与 {"mode":"data","surface":"本月订单数","metrics":["订单数"],"time":{"surface":"本月"}}。
+   例：「分别统计各省区销售额和各商品销量」→ subgoals 两个：{"mode":"data","surface":"各省区销售额","metrics":["销售额"],"breakdowns":["省区"]} 与 {"mode":"data","surface":"各商品销量","metrics":["销量"],"breakdowns":["商品"]}。
+   不拆的后果是**只答一半**：系统只会按第一个指标和第一个分组取数，另一半静默消失。
 4. 没提到的槽位用空数组、null 或 false；拿不准写入 ambiguities，不得猜。
 5. 只输出 JSON，不要 Markdown、解释或额外文本。"#;
 
