@@ -4627,18 +4627,34 @@ async fn compose_inner(
     // 深度模式此前是唯一没接兜底的入口 —— 业主从这里进来，同一句「下载 押金转货款申请书」
     // 拿到的是 38 行账余表，而 CLI 拿到的是知识库回答。同题不同答的成因就在这里。
     if !crate::prepared_contract_ready(&prepared) {
-        let result = match crate::unknown_route_kb_fallback(
-            &st,
+        // 🔴 **两臂编排，不是只问知识库**（2026-08-16 与另外四个入口一起收）。
+        // 上一版只做检索，确定性问数成员（实体卡 / 单据点查 / business-lookup）一个都没跑过：
+        // 整句就是一个客户名时用户拿到「知识库里没有关于…」，而那家客户有客户卡。
+        // 这一档不出深度报告是对的 —— 合同都没就绪，拼板块没有意义；给一张正常答案卡。
+        let (answered, _log) = crate::ask_prepared(
+            &st.llm,
+            &st.auth_mysql,
+            &st.mysql,
+            &st.sources,
+            st.owned.pool(),
+            &st.embed,
             &p,
-            None,
-            &prepared.question.effective_question,
+            &prepared,
+            req.ds.as_deref(),
+            req.conv_id.map(|c| c.to_string()).as_deref(),
+            st.sc_samples,
+            req.space_id.as_deref(),
+            true, // 两臂：资料半照旧跑，只是不再是唯一一条
         )
-        .await
-        {
-            Some(a) => serde_json::to_value(&a)
-                .expect("Answer 是纯数据 struct，派生 Serialize 不会失败"),
-            None => serde_json::to_value(prepared.question.clarification_result())
+        .await;
+        let result = match answered {
+            Ok(r) => serde_json::to_value(&r)
                 .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
+            Err(e) => {
+                tracing::warn!(error = %e, "深度模式合同未就绪的两臂兜底失败 → 出澄清卡");
+                serde_json::to_value(prepared.question.clarification_result())
+                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败")
+            }
         };
         if let Some(cid) = req.conv_id {
             save_chat_msg(st.owned.pool(), cid, "user", display_question, None).await;

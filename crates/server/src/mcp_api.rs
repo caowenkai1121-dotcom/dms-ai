@@ -400,24 +400,12 @@ async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, 
     let ds = opt_str(args, "ds");
     let prepared = crate::prepare_ask(st, &question, None).await;
     let out: Value = match prepared.question.route() {
-        // 合同不可用 ≠ 知识库不能答（同 `/api/ask`，见 `unknown_route_kb_fallback` 的红字）。
-        // 只做检索、不生成任何 SQL；查到带引用的内容才顶替卡片。
-        IntentRoute::Unknown => {
-            match crate::unknown_route_kb_fallback(
-                st,
-                p,
-                None,
-                &prepared.question.effective_question,
-            )
-            .await
-            {
-                Some(a) => serde_json::to_value(&a)
-                    .map_err(|e| internal_fail("知识库结果序列化", &e))?,
-                None => serde_json::to_value(prepared.question.clarification_result())
-                    .map_err(|e| internal_fail("澄清结果序列化", &e))?,
-            }
-        }
-        IntentRoute::Data => {
+        // 🔴 合同不可用 → **两臂编排**，不是只问知识库（2026-08-16 与 `/api/ask` 一起收）。
+        // 只做检索那一版把确定性问数成员（实体卡 / 单据点查 / business-lookup）整块跳过：
+        // 整句就是一个客户名时，用户拿到「知识库里没有关于…的任何信息」，
+        // 而那家客户在业务库里有客户卡。走 Data 同一条出口即可 ——
+        // `ask_prepared` 内部按 route 决定问数臂开不开自由 SQL，Unknown 档本就不开。
+        IntentRoute::Unknown | IntentRoute::Data => {
             let (r, _log) = crate::ask_prepared(
                 &st.llm,
                 &st.auth_mysql,

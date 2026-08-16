@@ -459,23 +459,12 @@ pub async fn ask(
         .map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
     let prepared = crate::prepare_ask(&st, &gate.question, prev).await;
     let payload = match prepared.question.route() {
-        // 合同不可用 ≠ 知识库不能答（同 `/api/ask`，见 `unknown_route_kb_fallback` 的红字）。
-        // 只做检索、不生成任何 SQL；查到带引用的内容才顶替卡片。
-        IntentRoute::Unknown => {
-            match crate::unknown_route_kb_fallback(
-                &st,
-                &gate.p,
-                None,
-                &prepared.question.effective_question,
-            )
-            .await
-            {
-                Some(a) => serde_json::to_value(&a)
-                    .expect("Answer 是纯数据 struct，派生 Serialize 不会失败"),
-                None => serde_json::to_value(prepared.question.clarification_result())
-                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
-            }
-        }
+        // 🔴 合同不可用 → **两臂编排**，不是只问知识库（2026-08-16 与 `/api/ask` 一起收）。
+        // 上一版只做检索，确定性问数成员（实体卡 / 单据点查 / business-lookup）一个都没跑过：
+        // 整句就是一个客户名时，用户拿到「知识库里没有关于…的任何信息」，
+        // 而那家客户在业务库里有客户卡。fail-closed 没松 —— 合同不可执行时
+        // `LlmAnswerer::accept` 结构上不接单，自由 SQL 那条路照旧关着。
+        IntentRoute::Unknown => ask_data_payload(&st, &gate, &prepared).await?,
         IntentRoute::Hybrid => xcx_hybrid_payload(&st, &gate, &prepared).await?,
         IntentRoute::Data => ask_data_payload(&st, &gate, &prepared).await?,
         IntentRoute::Knowledge => {
@@ -520,22 +509,10 @@ pub async fn ask_stream(
         .map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
     let prepared = crate::prepare_ask(&st, &gate.question, prev).await;
     match prepared.question.route() {
-        // 与同文件非流式版逐字同义：合同不可用先问一次库，查到带引用的内容才顶替卡片。
-        // 少了这一处，同一个人在小程序里换个开关（流式/非流式）就得到两种答案。
+        // 与同文件非流式版逐字同义（两臂编排）。少了这一处，同一个人在小程序里
+        // 换个开关（流式/非流式）就得到两种答案。
         IntentRoute::Unknown => {
-            let payload = match crate::unknown_route_kb_fallback(
-                &st,
-                &gate.p,
-                None,
-                &prepared.question.effective_question,
-            )
-            .await
-            {
-                Some(a) => serde_json::to_value(&a)
-                    .expect("Answer 是纯数据 struct，派生 Serialize 不会失败"),
-                None => serde_json::to_value(prepared.question.clarification_result())
-                    .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败"),
-            };
+            let payload = ask_data_payload(&st, &gate, &prepared).await?;
             Ok(ask_finish(&st, &gate, payload).await.into_response())
         }
         IntentRoute::Hybrid => {

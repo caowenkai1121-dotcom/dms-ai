@@ -4115,16 +4115,57 @@ mod tests {
                     // 按**字符**取窗口：`&src[at..at+window]` 会切在中文注释的 UTF-8 中间
                     // 直接 panic（第一版就是这么红的，且报的是切片越界不是判据不满足）。
                     let body: String = src[at..].chars().take(window).collect();
-                    // 两个合格出口：`unknown_route_kb_fallback(` 只问知识库；
-                    // `ask_arms_payload(` 走两臂并行（问数 + 知识库），更强的同一条不变量。
-                    // 2026-08-14 起 `/api/ask` 与 `/api/ask/stream` 的 Data/Knowledge/Unknown
-                    // 三档统一走后者 —— 那正是「浏阳品元商贸」在 web 上拿不到客户卡的修法。
+                    // 合格出口全部是**两臂**形态（2026-08-16 起只剩这三种写法）：
+                    // `ask_arms_payload(` = /api/ask 两个 handler；
+                    // `ask_data_payload(` = 小程序两个 handler；
+                    // `crate::ask_prepared(` 带 `true` = deep / MCP 直接调编排。
+                    // 🔴 `unknown_route_kb_fallback(` **不再是合格出口** —— 它只做检索，
+                    // 确定性问数成员一个都不跑（见 `no_entry_answers_from_the_kb_...`）。
                     assert!(
-                        body.contains("unknown_route_kb_fallback(") || body.contains("ask_arms_payload("),
-                        "{name} 有一条出卡路径没问过知识库就出卡了（形状 `{shape}`）：{body}"
+                        body.contains("ask_arms_payload(")
+                            || body.contains("ask_data_payload(")
+                            || body.contains("crate::ask_prepared("),
+                        "{name} 有一条出卡路径没走两臂编排就出卡了（形状 `{shape}`）：{body}"
                     );
                 }
             }
+        }
+    }
+
+    /// 🔴 `unknown_route_kb_fallback` 只做检索，确定性问数成员（实体卡 / 单据点查 /
+    /// business-lookup）一个都不跑。任何入口拿它当**出口**，就是把 Router 七位整块跳过 ——
+    /// 「长沙鸣望供应链管理有限公司」拿到一张「知识库里没有关于…」的全部成因
+    /// （2026-08-16 业主实测；同族缺陷 2026-08-14 在「线下-浏阳品元商贸」上治过一次，
+    /// 那次只收了 `Knowledge` 那条臂，剩下五个入口原样留着）。
+    ///
+    /// 五个入口：`api_ask` / `api_ask_stream` / `deep_api::compose` / `xcx_api::ask` /
+    /// `xcx_api::ask_stream` / `mcp_api::tool_ask`。它们今天全部改走两臂编排。
+    /// 这条守卫的作用是：谁再把某个入口的出口换回「只问知识库」，当场红。
+    #[test]
+    fn no_entry_answers_from_the_kb_without_running_the_deterministic_lane() {
+        let needle = ["unknown_route_kb", "_fallback("].concat();
+        for (name, src) in [
+            ("main.rs", include_str!("main.rs")),
+            ("xcx_api.rs", include_str!("xcx_api.rs")),
+            ("mcp_api.rs", include_str!("mcp_api.rs")),
+            ("deep_api.rs", include_str!("deep_api.rs")),
+        ] {
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            // main.rs 里还留着**定义**（两臂编排内部的资料半仍要用它）：只禁调用点。
+            let call_sites = production
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    !line.trim_start().starts_with("//")
+                        && line.contains(&needle)
+                        && !line.contains("async fn ")
+                })
+                .map(|(i, _)| i + 1)
+                .collect::<Vec<_>>();
+            assert!(
+                call_sites.is_empty(),
+                "{name}:{call_sites:?} 还有绕过 Router 的知识库出口"
+            );
         }
     }
 

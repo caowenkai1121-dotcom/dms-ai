@@ -519,7 +519,14 @@ pub async fn ask_prepared(
     // `Knowledge` 同样进兜底档：资料问句的问数臂**不许开自由 SQL**（硬答就是编），
     // 但实体卡、单据点查这些代码写死的确定性成员该跑就跑 —— 那正是「浏阳品元商贸」
     // 这类问句本该拿到的东西。
-    let deterministic_fallback = prepared.route() != R::Data;
+    // 🔴 判据要与**真闸**对齐（2026-08-16）：`llm` 成员的 `accept` 恒等于
+    // `is_data_executable()`。只按 route 摘成员，会把「route=Data 但合同不可执行」
+    //（模型抽出了指标、同时诚实写了一句 ambiguities）的问句把 `llm` 留在表里 ——
+    // 它谁都不接，最后撞上本文件下方那条 `bail!("Router 未产出答案…")`，
+    // 而那条 bail 的语义是「ROUTER_ORDER 被改坏」，不是「合同有歧义」。
+    // 之前这一档由 server 的合同闸挡在门外，闸放行之后它才现形。
+    let deterministic_fallback =
+        prepared.route() != R::Data || !prepared.intent_attempt.is_data_executable();
     crate::hybrid::dual(d, p, prepared, explicit_ds, deterministic_fallback).await
 }
 
@@ -535,7 +542,9 @@ pub async fn ask_prepared_data_only(
     prepared: &PreparedQuestion,
     explicit_ds: Option<&str>,
 ) -> anyhow::Result<AskResult> {
-    let deterministic_fallback = prepared.route() != crate::intent::IntentRoute::Data;
+    // 与上面同一条判据（`llm` 成员接不了单就不该在表里）
+    let deterministic_fallback = prepared.route() != crate::intent::IntentRoute::Data
+        || !prepared.intent_attempt.is_data_executable();
     ask_data_arm(d, p, prepared, explicit_ds, deterministic_fallback).await
 }
 
@@ -2657,10 +2666,16 @@ mod tests {
             .split("pub(crate) async fn ask_data_arm(")
             .next()
             .expect("ask_data_arm 改名了");
-        // ①②：Data 之外（Unknown / Knowledge）一律进兜底档
+        // ①②：Data 之外（Unknown / Knowledge）一律进兜底档；
+        // 🔴 2026-08-16 补第二半 —— **合同不可执行时同样进兜底档**。
+        // `llm` 成员的 `accept` 恒等于 `is_data_executable()`，只按 route 摘成员会把
+        // 「route=Data 但有歧义」的问句把 llm 留在表里：它谁都不接，最后撞 `bail!`
+        // （那条 bail 的语义是「ROUTER_ORDER 被改坏」，不是「合同有歧义」）。
+        // 这一档此前由 server 的合同闸挡在门外，闸收窄之后才现形。
         assert!(
-            dispatch.contains("let deterministic_fallback = prepared.route() != R::Data;"),
-            "Unknown/Knowledge 的自由 SQL 闸门没了：{dispatch}"
+            dispatch.contains("prepared.route() != R::Data")
+                && dispatch.contains("!prepared.intent_attempt.is_data_executable()"),
+            "Unknown/Knowledge 或合同不可执行的自由 SQL 闸门没了：{dispatch}"
         );
         // ③
         assert!(
