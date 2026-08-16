@@ -8,7 +8,6 @@ mod artifact_api;
 mod auth;
 mod chat;
 mod db;
-mod embed;
 mod ds_api;
 mod embed_fill;
 mod daily_digest;
@@ -1040,8 +1039,14 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 3 && args[1] == "retrieve" {
         let owned = owned_store(&cfg).await?;
         let pg = owned.pool();
-        // 问句向量在调用侧算一次（semantic 不持 HTTP 客户端）；embed 缺席则向量路降级跳过
-        let qvec = embed::embed_query(&args[2]).await.map(|v| embed::to_pgvector(&v));
+        // 问句向量在调用侧算一次（semantic 不持 HTTP 客户端）；embed 缺席则向量路降级跳过。
+        // 🔴 走 `cfg.service_url`，不是写死的 127.0.0.1:8077 —— 生产 embed 服务在 :8078，
+        // 写死那份在容器里根本无人监听，于是这条冒烟**恒静默跳过向量路**却照样打印结果。
+        // 「CLI 上验过了」不能当验收，前提是 CLI 打的是同一个后端。
+        let qvec = dms_connector::embed::EmbedClient::new(&cfg.service_url)
+            .embed_query(&args[2])
+            .await
+            .map(|v| dms_connector::embed::to_pgvector(&v));
         let cx = dms_semantic::recall::RecallCtx {
             question: &args[2],
             tables: &[],

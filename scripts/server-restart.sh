@@ -183,6 +183,14 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 DMS_SECRET_KEY="$(< "$SECRET_FILE")"
+# 精排默认接本机的 embed 服务 —— 它已经是千问适配层（`/rerank` 走 gte-rerank-v2），
+# 与 `/embed` 同一个进程同一个端口，所以 base 直接取 settings 的 `service_url`。
+# 🔴 默认接上而不是默认关：关着的时候检索**不报错、只是排不到第一**（生产实测
+# recall@6=0.95 / recall@1=0.15），这类「哑掉的降级」在本仓按默认开处理。
+# 显式传空串即可关掉（`${VAR+set}` 判的是「设过没有」，不是「是不是空」）。
+if [ -z "${DMS_RERANK_BASE_URL+set}" ]; then
+  DMS_RERANK_BASE_URL="$(python3 -c "import json,io;print(json.load(io.open('$SETTINGS_FILE',encoding='utf-8')).get('service_url',''))" 2>/dev/null || true)"
+fi
 # 🔴 rerank（B5 精排）的三个变量随 docker run 透传：接一个 Cohere/Jina 形状的端点即生效，
 # 不改代码。它是唯一专治「块召回到了但排不到第一」的组件 —— 生产度量
 # recall@6=0.95 / recall@1=0.15，0.80 的头寸全在这条链上。变量未设时
@@ -195,7 +203,7 @@ if ! docker run -d --name dms-ai-server --restart unless-stopped \
   --env DMS_SECRET_KEY="$DMS_SECRET_KEY" \
   --env DMS_RERANK_BASE_URL="${DMS_RERANK_BASE_URL:-}" \
   --env DMS_RERANK_API_KEY="${DMS_RERANK_API_KEY:-}" \
-  --env DMS_RERANK_MODEL="${DMS_RERANK_MODEL:-}" \
+  --env DMS_RERANK_MODEL="${DMS_RERANK_MODEL:-gte-rerank-v2}" \
   --mount "type=bind,source=$SETTINGS_FILE,target=/app/settings.json" \
   --mount "type=bind,source=$KBDATA_REAL,target=/kbdata" \
   --mount "type=bind,source=$TOOLS_DIR,target=/app/tools" \

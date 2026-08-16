@@ -166,6 +166,44 @@ mod tests {
         }
     }
 
+    /// 上面那条只把 Rust 侧钉在字面量上 —— 它**读不到离线脚本**，所以「离线少覆盖一张表」
+    /// 它一个字都不会红。2026-08-16 换向量空间那次就是这么漏的：`build` 覆盖四张、
+    /// `meta.memory` 只长在 Rust 这边，重算之后库里同时存着两套不可比的向量。
+    /// 这条判据真去读 `tools/embed_service.py`：每个目标的表名与文本配方都得在里面出现。
+    #[test]
+    fn the_offline_builder_covers_every_meta_vector_target() {
+        let py = include_str!("../../../../tools/embed_service.py");
+        // 只看 build() 那一段：selftest/注释里出现表名不算覆盖
+        let build = py
+            .split_once("def build(ds='dms'):")
+            .expect("tools/embed_service.py 里找不到 build()")
+            .1;
+        // 切到「第五个 build 目标」那条分节线为止：`_revec_datasources` 是 build 调用的
+        // 私有助手，配方长在它里面，按换行加 def 切会把它切掉（第一版就是这么漏判的）
+        let build = build.split("# ============ 第五个 build 目标").next().unwrap();
+        for t in MetaVecTarget::ALL {
+            let table = match t {
+                MetaVecTarget::TableDoc => "table_doc",
+                MetaVecTarget::Element => "element",
+                MetaVecTarget::Datasource => "datasource",
+                MetaVecTarget::SqlExemplar => "sql_exemplar",
+                MetaVecTarget::Memory => "memory",
+            };
+            // datasource 走 build 调用的 `_revec_datasources`，函数名里带表名即算覆盖
+            let covered = build.contains(&format!("meta.{table}"))
+                || build.contains(&format!("_revec_{table}s"));
+            assert!(covered, "{t:?}（meta.{table}）在离线 build() 里没有写入点");
+        }
+        // 配方也对一遍：同一列写两套文本 = 同一列混两套向量
+        for frag in [
+            "coalesce(nullif(search_doc, ''), table_name)",
+            "name || '。' || description",
+            "SELECT id, content FROM meta.memory",
+        ] {
+            assert!(build.contains(frag), "离线 build() 缺配方片段：{frag}");
+        }
+    }
+
     /// 写回必须带主键谓词（`ds_id` 双写的两张表尤其）：少了就是把别的源的向量盖掉。
     #[test]
     fn updates_are_scoped_to_the_row_key() {

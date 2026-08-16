@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""向量层 + 文档服务：bge-small-zh-v1.5(512维, fastembed 本地自包含)。
+"""向量层 + 精排 + 文档服务：**千问（DashScope）适配层**，512 维。
+  本地模型（fastembed / bge-small-zh-v1.5）已按业主裁决废除（2026-08-16）。
+  Rust 侧的 wire 契约一个字没动：`/embed` 收 `{"texts":[...],"query":bool}`，
+  `/rerank` 收 Cohere/Jina 形状 —— 这里当适配层，Rust 不认识 DashScope。
   build    —— 为 meta.table_doc / sql_exemplar / element / datasource 算 embedding 存 pgvector
                + HNSW 索引（离线跑；`--ds` 限定注册表行属于哪个源，默认 dms）
   revec    —— build 的第五个目标，**单独跑**（`revec` 或 `build --revec`）：
@@ -21,16 +24,38 @@
   DMS_TESSERACT tesseract 可执行文件（图片 OCR）
   DMS_OCR_LANG  OCR 语言包，默认 chi_sim+eng
 """
-import os, sys, json, re, csv, io, math, itertools, importlib.util, shutil, subprocess, tempfile, threading, urllib.request
+import os, sys, json, re, csv, io, math, itertools, importlib.util, shutil, subprocess, tempfile, threading, urllib.request, urllib.error
 from html.parser import HTMLParser   # _p_html 去标签用标准库（SAC 拦的是编译扩展，stdlib 两侧都一定有）
 # pythonw（stdout=None）/pytest 捕获流没有 reconfigure：缺席就跳过，不许为编码起不来
 for _s in (sys.stdout, sys.stderr):
     if getattr(_s, 'reconfigure', None):
         _s.reconfigure(encoding='utf-8')
 
-MODEL = 'BAAI/bge-small-zh-v1.5'
+# ── 向量与精排：全部走千问（DashScope），本地模型已废除 ────────────────────────
+#
+# 🔴 业主裁决（2026-08-16）：「千问大模型就支持向量，可以废除之前的本地模型，全部使用千问的」。
+#
+# 改这里而不是改 Rust：`connector/src/embed.rs` 与 `connector/src/rerank.rs` 的 wire 契约
+# （`{"texts":[...],"query":bool}` / Cohere 形状的 `/rerank`）一个字不动，本文件当适配层。
+# 一个进程一份适配，Rust 侧不认识 DashScope，也就不会长出第二套 provider 分支。
+#
+# 维度**必须留在 512**：`kb.chunk.embedding` / `meta.table_doc.embedding` 等列都是
+# `vector(512)`，换维度要迁全部向量列。千问 v3/v4 都支持 `dimensions` 参数，512 在其中 ——
+# 所以这次换模型**零 schema 改动**。
+# ⚠️ 但向量空间变了：bge 与千问的向量不可比，**全量语料必须重新向量化**（`revec` 那条路）。
+MODEL = os.environ.get('DMS_EMBED_MODEL', 'text-embedding-v4')
 DIM = 512
-QUERY_INSTRUCT = '为这个句子生成表示以用于检索相关文章：'
+# 千问兼容端点的单批上限实测 = 10（12 起报 `batch size is invalid`）。
+# 这个数**不是**语料侧的批大小（`KB_BATCH=64`）：那一层按 64 组批，本层再切成 10 一组发。
+QWEN_EMBED_BATCH = 10
+# 精排模型（`gte-rerank` 已下线为 AccessDenied，v2 可用）
+RERANK_MODEL = os.environ.get('DMS_RERANK_QWEN_MODEL', 'gte-rerank-v2')
+RERANK_URL = os.environ.get(
+    'DMS_RERANK_QWEN_URL',
+    'https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank')
+# bge 需要给 query 加指令前缀才有对称性；千问不需要（v3/v4 训练时已对称）。
+# 留空常量而不是删掉：`_selftest_*` 与历史注释都引它，改成空串比删更少的漂移面。
+QUERY_INSTRUCT = ''
 
 
 def pg_conf():
@@ -44,13 +69,10 @@ def pg_conf():
     from settings import pg_kwargs   # tools/ 与本文件同目录，走 sys.path[0]
     return pg_kwargs()
 
-_embedder = None
-def embedder():
-    global _embedder
-    if _embedder is None:
-        from fastembed import TextEmbedding
-        _embedder = TextEmbedding(model_name=MODEL)
-    return _embedder
+# 🔴 本地模型（fastembed / BAAI/bge-small-zh-v1.5）已按业主裁决废除（2026-08-16）。
+# 不留「配了 key 走千问、没配回落本地」的双档：双档意味着两套向量空间，
+# 而向量空间一混，检索质量下降**不会报错**，只会悄悄变差 —— 本仓最不能有的那一类。
+# key 缺失时 `embed()` 直接抛，服务起不来比悄悄用另一套向量强。
 
 # 推理的全局锁：fastembed/onnxruntime 的 session 不是线程安全的，所以推理**仍然串行**。
 # 它存在的唯一理由是让 `serve` 能换成 ThreadingHTTPServer（见那里的注释）——
@@ -60,11 +82,102 @@ def embedder():
 # ponytail: 一把进程级锁 —— 本进程只有一个模型；真要并发推理得起多进程，那时再拆。
 _EMBED_LOCK = threading.Lock()
 
+def _qwen_key():
+    """千问 key。顺序：`DMS_EMBED_KEY` → `QWEN_KEY` → settings `llm_keys.qwen`
+    → settings `llm_api_key`（**仅当 `llm_provider == 'qwen'`**）。
+
+    🔴 最后那条限定是踩出来的：本机 settings 是 `llm_provider=deepseek`，
+    早一版无条件读 `llm_api_key`，于是拿 deepseek 的 key 打 DashScope。
+    对话 LLM 换供应商是常事，向量层不该跟着换 —— 两者是**两笔账**。"""
+    k = os.environ.get('DMS_EMBED_KEY') or os.environ.get('QWEN_KEY')
+    if k:
+        return k.strip()
+    from settings import load
+    cfg = load()
+    k = ((cfg.get('llm_keys') or {}).get('qwen') or '').strip()
+    if k:
+        return k
+    if (cfg.get('llm_provider') or '').strip().lower() == 'qwen':
+        return (cfg.get('llm_api_key') or '').strip()
+    return ''
+
+
+QWEN_BASE = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+
+def _qwen_base():
+    """DashScope 兼容端点。**不读 settings 的 `llm_base_url`** —— 那是对话 LLM 的地址，
+    本机就指着 deepseek；跟着它走等于把 /embeddings 打到一个没有该路由的域名（404）。
+    要改只有 `DMS_EMBED_BASE` 一个旋钮。"""
+    return (os.environ.get('DMS_EMBED_BASE') or QWEN_BASE).rstrip('/')
+
+
+def _post_json(url, payload, key, timeout=60):
+    """POST JSON + Bearer。非 2xx 把响应体带进异常 —— 400 的原因（批太大/模型名错/额度）
+    只在响应体里，吞掉它等于让运维猜。"""
+    req = urllib.request.Request(
+        url, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+        headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f'{url} HTTP {e.code}: {e.read().decode("utf-8", "replace")[:300]}') from e
+
+
 def embed(texts, is_query=False):
-    if is_query:
-        texts = [QUERY_INSTRUCT + t for t in texts]
+    """千问向量。`is_query` 保留在签名里（Rust 侧 wire 契约带这个位），
+    但千问 v3/v4 的 query/passage 是对称的，不再加指令前缀。
+
+    单批上限 10（兼容端点实测）：这里按 `QWEN_EMBED_BATCH` 切片顺序发，
+    **顺序与输入逐一对应** —— 上游 `ingest.rs` 靠 `ids.zip(vecs)` 写库，错位就是静默写错向量。
+    """
+    if not texts:
+        return []
+    key = _qwen_key()
+    if not key:
+        raise RuntimeError('千问 key 未配置（DMS_EMBED_KEY / QWEN_KEY / settings.llm_api_key）')
+    url = _qwen_base() + '/embeddings'
+    out = []
     with _EMBED_LOCK:
-        return [v.tolist() for v in embedder().embed(texts)]
+        for i in range(0, len(texts), QWEN_EMBED_BATCH):
+            batch = texts[i:i + QWEN_EMBED_BATCH]
+            d = _post_json(url, {'model': MODEL, 'input': batch, 'dimensions': DIM}, key)
+            rows = d.get('data') or []
+            if len(rows) != len(batch):
+                raise RuntimeError(f'千问返回 {len(rows)} 条向量，期望 {len(batch)} 条')
+            # 🔴 按 `index` 归位，不信返回顺序：错位一次就是整篇文档的向量与文本对不上，
+            # 而那种错**查不出来**（检索只是变差，不会报错）。
+            rows = sorted(rows, key=lambda r: r.get('index', 0))
+            for r in rows:
+                v = r.get('embedding')
+                if not isinstance(v, list) or len(v) != DIM:
+                    raise RuntimeError(f'千问向量维度 {len(v) if isinstance(v, list) else "?"} ≠ {DIM}')
+                out.append(v)
+    return out
+
+
+def rerank(query, documents, top_n=None, model=None):
+    """千问精排 → **Cohere/Jina 形状**（`{"results":[{"index":i,"relevance_score":s}]}`）。
+
+    Rust 侧 `connector/src/rerank.rs` 认的就是这个形状，且要求**条数与输入等长**
+    （`parse_scores`：条数不符整体降级）。所以这里 `top_n` 恒等于文档数，且不返回原文。
+    """
+    key = _qwen_key()
+    if not key:
+        raise RuntimeError('千问 key 未配置')
+    n = len(documents)
+    d = _post_json(RERANK_URL, {
+        'model': (model or '').strip() or RERANK_MODEL,
+        'input': {'query': query, 'documents': documents},
+        'parameters': {'top_n': top_n or n, 'return_documents': False},
+    }, key)
+    results = ((d.get('output') or {}).get('results')) or []
+    # 一行 stderr（journalctl -u dms-ai-embed 可见）：精排「有没有真跑」必须有**正面证据**。
+    # 只看「没有『未接线』日志」不算证据 —— 那句是 debug 级，生产日志级别根本不打。
+    print(f'rerank {len(documents)} 篇 → {len(results)} 分（{(model or "").strip() or RERANK_MODEL}）',
+          file=sys.stderr, flush=True)
+    return {'results': [{'index': r['index'], 'relevance_score': r['relevance_score']}
+                        for r in results]}
 
 # ============ 文档服务：解析（K1）============
 # 解析库一律惰性 import：缺依赖只让该类型报 unsupported，embed 功能不受影响。
@@ -926,7 +1039,8 @@ def parse_caps():
 # ============ 文档服务：分块（K1）============
 CHARS_PER_TOKEN = 1.6      # 中文口径：1.6 字符/token（不是英文那套 4 字符/token，照搬会切出两倍大的块）
 TARGET_TOKENS, OVERLAP = 400, 60
-MAX_TOKENS = 480           # 硬上限：bge-small-zh-v1.5 max_seq_len=512，超了 fastembed 静默截断（症状是检索时好时坏）
+MAX_TOKENS = 480           # 硬上限：沿用 512 窗口的保守值。千问 v4 单条上限远大于此，
+                           # 但**块大小是检索粒度**，不是模型窗口 —— 放大块会让引用定位变粗，另开一票
 _SENT = re.compile(r'(?<=[。！？；!?;\n])')
 
 def est_tokens(text):
@@ -1142,10 +1256,20 @@ def build(ds='dms'):
         cur.execute("CREATE INDEX idx_element_hnsw ON meta.element"
                     " USING hnsw (embedding vector_cosine_ops)")
         n_ds = _revec_datasources(cur)
+        # 🔴 经验（meta.memory）是第五张有向量的注册表。它一度只长在 Rust 侧
+        # `registry/embed_fill.rs` 的五连里，本函数只覆盖四张 —— 于是 2026-08-16 换
+        # 向量空间那次，前四张重算了、经验这张留着旧空间的 91 条，**两套空间混在库里**。
+        # 混空间不报错，只是召回悄悄变差。离线入口必须与 embed_fill 的 `ALL` 逐条对齐。
+        # 文本 = content 原文，与 embed_fill 的 Memory 分支一致（蒸馏时已截 400 字）。
+        n_mem = _revec(
+            cur, '条经验',
+            "SELECT id, content FROM meta.memory WHERE embedding IS NULL AND ds_id = %s",
+            "UPDATE meta.memory SET embedding = %s WHERE id = %s AND ds_id = %s",
+            (ds,), (ds,))
     finally:
         pg.close()                  # 中途异常也不许残留连接（revec 同口径）
     print(f'完成[ds={ds}]：{n_tbl} 表 / {n_ex} 语料问句 / {n_el} 元素 / {n_ds} 数据源'
-          f' 向量化 + HNSW 索引', flush=True)
+          f' / {n_mem} 条经验 向量化 + HNSW 索引', flush=True)
 
 def _revec_datasources(cur):
     """向量选源（`pipeline::select_source` → `meta::nearest_datasources`）的唯一写入点。
@@ -1334,6 +1458,19 @@ def handle_post(path, body):
         if (p is not None and not isinstance(p, str)) or (m is not None and not isinstance(m, str)):
             raise ParseError('bad_request', 'path/mime 必须是字符串', 400)
         return parse_doc(p or '', m or '')
+    if path == '/rerank':
+        # Cohere/Jina 形状的入参（Rust 侧 `connector/src/rerank.rs` 发的就是它）
+        q, docs = body.get('query'), body.get('documents')
+        if not isinstance(q, str) or not isinstance(docs, list) or any(not isinstance(d, str) for d in docs):
+            raise ParseError('bad_request', 'query 必须是字符串、documents 必须是字符串数组', 400)
+        if not docs:
+            raise ParseError('bad_request', 'documents 不能为空', 400)
+        if len(docs) > EMBED_MAX_TEXTS:
+            raise ParseError('too_large', f'documents {len(docs)} 条超上限 {EMBED_MAX_TEXTS}', 413)
+        # model 用调用方给的（Rust 侧 `DMS_RERANK_MODEL` 就是那个旋钮）——
+        # 忽略它会让「改了 env 却没生效」变成一次静默的空转排查。
+        return rerank(q, docs, _int_param(body, 'top_n', len(docs)),
+                      body.get('model') if isinstance(body.get('model'), str) else None)
     if path == '/chunk':
         blocks = body.get('blocks')
         if blocks is None:
@@ -1372,13 +1509,18 @@ def serve(port=8077, host='127.0.0.1'):
     # host 显式可选（默认回环不松）：Linux 服务器部署时容器要经 docker 网桥（172.17.0.1）
     # 访问本服务 —— 绑网桥地址即可，0.0.0.0 会把解析/向量面暴露给公网。
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    embedder()
+    # 起飞前先证明 key 在：此前这里是 `embedder()` 预热本地模型。
+    # 现在没有本地模型可热，但**必须**在这里把「key 没配」暴露成起不来 ——
+    # 否则服务活着、每个 /embed 都 500，而 Rust 侧只会看到「熔断 300s」。
+    if not _qwen_key():
+        raise SystemExit('千问 key 未配置：DMS_EMBED_KEY / QWEN_KEY / settings.llm_api_key 三者取一')
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a): pass
         def do_GET(self):
             # 健康检查（run.ps1 常驻化轮询用）
             if self.path.split('?')[0] == '/health':   # 探活常带 ?ts=… 防缓存
                 resp = json.dumps({'ok': True, 'model': MODEL, 'dim': DIM,
+                                   'rerank_model': RERANK_MODEL,
                                    'parse_ok': parse_ok(), 'parse_caps': parse_caps()},
                                   ensure_ascii=False).encode()
                 self.send_response(200)
@@ -1500,6 +1642,7 @@ def selftest():
     _selftest_emit_guard()
     _selftest_revec_len_guard()
     _selftest_handle_post()
+    _selftest_qwen_embed()
     dt = _selftest_serve_unblocked()
     _selftest_http_errors()
     shutil.rmtree(d, ignore_errors=True)     # 临时目录不留（以前每跑一次 selftest 留一个）
@@ -1508,6 +1651,59 @@ def selftest():
           f'\n  parse_ok={parse_ok()}', flush=True)
     for ext, c in sorted(caps.items()):
         print(f"  {'✅' if c['ok'] else '⛔'} {ext:<10}{c['why']}", flush=True)
+
+
+def _selftest_qwen_embed():
+    """千问适配层的钉。四段，每段对应一种**不会报错、只会变差**的错法：
+    ① 切片按 10 —— 超了千问返回 `batch size is invalid`（实测 12 条即挂），
+       一次批量 build 全挂在半路。
+    ② 归位按 `index` —— 返回顺序若与输入不同而这里照单全收，写库就是文本配错向量。
+       这条**查不出来**：检索只是变差，没有任何报错。桩故意把返回顺序倒过来。
+    ③ 条数不符 → 抛。宁可 build 失败，不要少一条静默错位后面所有的。
+    ④ 维度不符 → 抛。512 是库里 `vector(512)` 的形状，换维度必须先迁移。
+
+    不碰网络：patch 掉 `_post_json` 与 `_qwen_key`。"""
+    g = globals()
+    keep = g['_post_json'], g['_qwen_key']
+    g['_qwen_key'] = lambda: 'sk-selftest'
+    seen = []
+
+    def fake(url, payload, key, timeout=60):
+        batch = payload['input']
+        seen.append(len(batch))
+        assert payload['dimensions'] == DIM and payload['model'] == MODEL, payload
+        # 倒序返回 + 每条向量灌自己的序号：错位一眼可见
+        return {'data': [{'index': j, 'embedding': [float(j)] * DIM}
+                         for j in reversed(range(len(batch)))]}
+    try:
+        g['_post_json'] = fake
+        assert embed([]) == []                                          # 空入参不发请求
+        assert seen == []
+        vecs = embed([f't{i}' for i in range(23)])
+        assert seen == [10, 10, 3], seen                                # ①
+        # ② 每批内必须按 index 升序归位（桩倒序返回；批内第 j 条的值就是 j）
+        assert [v[0] for v in vecs] == [float(j) for j in range(10)]             + [float(j) for j in range(10)] + [float(j) for j in range(3)], [v[0] for v in vecs]
+        g['_post_json'] = lambda *a, **k: {'data': [{'index': 0, 'embedding': [0.0] * DIM}]}
+        try:
+            embed(['a', 'b'])                                           # ③
+            raise AssertionError('条数不符必须抛')
+        except RuntimeError as e:
+            assert '期望 2' in str(e), e
+        g['_post_json'] = lambda *a, **k: {'data': [{'index': 0, 'embedding': [0.0] * (DIM - 1)}]}
+        try:
+            embed(['a'])                                                # ④
+            raise AssertionError('维度不符必须抛')
+        except RuntimeError as e:
+            assert str(DIM) in str(e), e
+        # rerank：DashScope 的 `output.results` → Cohere 形状（Rust 侧 parse_scores 认这个）
+        g['_post_json'] = lambda url, payload, key, timeout=60: {
+            'output': {'results': [{'index': 1, 'relevance_score': 0.9, 'document': {'text': 'x'}},
+                                   {'index': 0, 'relevance_score': 0.1}]}}
+        assert rerank('q', ['a', 'b']) == {
+            'results': [{'index': 1, 'relevance_score': 0.9},
+                        {'index': 0, 'relevance_score': 0.1}]}
+    finally:
+        g['_post_json'], g['_qwen_key'] = keep
 
 
 def _selftest_pdf_scan(tmpdir):
@@ -2012,11 +2208,11 @@ def _selftest_http_errors():
     import socket
     import time
     g = globals()
-    keep = g['embed'], g['embedder']
+    keep = g['embed'], g['_qwen_key']
     def _boom(texts, is_query=False):
         raise RuntimeError('内部细节-D:/secret/path 不该外泄')
     g['embed'] = _boom
-    g['embedder'] = lambda: None
+    g['_qwen_key'] = lambda: 'sk-selftest'   # serve() 起飞前查 key；selftest 不碰真 key
     with socket.socket() as s:                 # 借一个空闲端口：别撞常驻的 8077
         s.bind(('127.0.0.1', 0))
         port = s.getsockname()[1]
@@ -2062,7 +2258,7 @@ def _selftest_http_errors():
         assert b' 413' in raw_status(b'999999999'), '超大 Content-Length 必须 413'      # ⑤
         assert b' 400' in raw_status(b'abc'), '畸形 Content-Length 必须 400'
     finally:
-        g['embed'], g['embedder'] = keep
+        g['embed'], g['_qwen_key'] = keep
 
 def _selftest_serve_unblocked():
     """**真起一次 serve**：/embed 慢的时候 /health 必须仍在 500ms 内返回。
@@ -2076,16 +2272,16 @@ def _selftest_serve_unblocked():
     `check-arch.ps1` 的 reqwest 那条把**注释里的字**当真实用点。注释里提一句
     ThreadingHTTPServer、代码里照旧 `HTTPServer(...)`，字符串断言会绿。所以这里量的是墙钟。
 
-    不加载模型（patch 掉 `embedder`/`embed`）：selftest 的纪律是不碰第三方库与 95MB 模型。"""
+    不打千问（patch 掉 `_qwen_key`/`embed`）：selftest 的纪律是不碰网络、不碰真 key。"""
     import socket
     import time
     g = globals()
-    keep = g['embed'], g['embedder']
+    keep = g['embed'], g['_qwen_key']
     # 桩睡 2s。**别调小**：断言在 /embed 发出后 0.15s 才开始计时，剩余时间必须仍远超 500ms 阈值。
     # 第一版写 0.6s，单线程时剩 0.45s < 0.5s ⇒ 反向验证时这条判据是**绿的**（恒真）。
     # 修好后这 2s 不进 selftest 的墙钟：/health 立刻返回，embed 桩在 daemon 线程里被丢下。
     g['embed'] = lambda texts, is_query=False: (time.sleep(2), [[0.0] * DIM] * len(texts))[1]
-    g['embedder'] = lambda: None
+    g['_qwen_key'] = lambda: 'sk-selftest'
     with socket.socket() as s:                 # 借一个空闲端口：别撞常驻的 8077
         s.bind(('127.0.0.1', 0))
         port = s.getsockname()[1]
@@ -2119,7 +2315,7 @@ def _selftest_serve_unblocked():
                           '一次上传会把每个问句的 embed 顶到超时 + 300s 熔断')
         return dt
     finally:
-        g['embed'], g['embedder'] = keep
+        g['embed'], g['_qwen_key'] = keep
 
 
 if __name__ == '__main__':
