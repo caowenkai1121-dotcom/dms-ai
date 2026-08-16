@@ -504,7 +504,10 @@ pub fn data_has_substance(r: &AskResult) -> bool {
 pub fn kb_has_substance(a: &Answer) -> bool {
     match &a.body {
         dms_kernel::AnswerBody::Text { markdown, citations, .. } => {
-            !citations.is_empty() && !markdown.trim().starts_with(dms_knowledge::answer::NO_HIT)
+            // 判据是 `dms_knowledge::answer` 那一份（与 SYSTEM 段同居）：此前这里只认
+            // `starts_with(NO_HIT)`，认不出 SYSTEM 自己规定的「知识库里没有关于 X」开头 ——
+            // 于是一句「没有」带着角标就算「资料半有实质内容」，能压过问数半。
+            !citations.is_empty() && !dms_knowledge::answer::reads_as_not_found(markdown)
         }
         _ => true,
     }

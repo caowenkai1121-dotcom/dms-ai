@@ -29,6 +29,48 @@ const ANSWER_TEMPERATURE: f32 = 0.0;
 /// 不许把它的自由发挥当答案 —— 那条路有命中但给不出结论，不是「空结果」，保持基干文案）。
 pub const NO_HIT: &str = "知识库里没有相关内容。";
 
+/// 「资料里没有这一项」的**开头措辞**。它不是猜的 —— 上面那段 SYSTEM 亲手规定：
+/// 资料只覆盖问题一部分时「**第一条**必须原样以「知识库里没有关于」开头」。
+pub const PARTIAL_MISS_PREFIX: &str = "知识库里没有关于";
+
+/// 这段回答**读起来就是「没有」**（判据的唯一事实源）。
+///
+/// 🔴 为什么必须住在这里（2026-08-16 业主实测）：此前有**三份**判据各自演化 ——
+/// `server::main::reads_as_not_found` 的 7 条 MARKERS、`agent::hybrid::kb_has_substance`
+/// 的 `starts_with(NO_HIT)`、以及本文件的 SYSTEM 段。而 SYSTEM 规定模型写的
+/// 「知识库里没有关于 X 的任何信息」**三份里没有一份认得**，于是一句「知识库里没有关于
+/// 「长沙鸣望供应链管理有限公司」的任何信息」带着 5 篇无关文档的角标当成答案上了屏。
+/// 判据表与产生那个字符串的提示词是同一件事，不许分居两个 crate。
+///
+/// 🔴 判据刻意**不是**「含有这句话就算没有」：SYSTEM 要求**部分覆盖**时也用这个开头
+/// （「知识库里没有关于 X 的规定」+ 从第二条起给能答的部分）。一刀切会把大量真答案
+/// 误杀。所以只有「这句之后再没有任何带角标的结论」才算真没有 ——
+/// 角标是 SYSTEM 对每条实质结论的硬要求，拿它当「还有实质内容」的证据是同一份纪律。
+pub fn reads_as_not_found(markdown: &str) -> bool {
+    let text = markdown.trim();
+    if text.is_empty() || text.starts_with(NO_HIT) {
+        return true;
+    }
+    const MARKERS: &[&str] = &[
+        "未出现在任何资料",
+        "知识库里没有相关内容",
+        "未找到相关",
+        "没有相关资料",
+        "资料中未提及",
+        "无法查询",
+        "无法回答",
+    ];
+    let head: String = text.chars().take(160).collect();
+    if MARKERS.iter().any(|marker| head.contains(marker)) {
+        return true;
+    }
+    // 「知识库里没有关于 X…」：只有这句**之后**再没有角标，才是真的什么都没答上
+    let Some(at) = text.find(PARTIAL_MISS_PREFIX) else {
+        return false;
+    };
+    !text[at + PARTIAL_MISS_PREFIX.len()..].contains("[^")
+}
+
 /// 空结果兜底文案（KB 审查⑥）：说清检索范围（哪个空间、几篇文档）并给下一步建议，
 /// 不再是一句孤零零的「没有」。`searched_docs = None` = 本次没真正检索
 /// （归一化后为空的问题），不带范围，保持基干文案。
@@ -2542,6 +2584,31 @@ mod tests {
         );
         assert!(SYSTEM.contains("表格数据行") && SYSTEM.contains("来源角标"), "{SYSTEM}");
         assert!(SYSTEM.contains("综合多份资料") && SYSTEM.contains("全部来源角标"), "{SYSTEM}");
+    }
+
+    /// 🔴 判据表必须覆盖**我们自己的提示词**让模型写的措辞。
+    ///
+    /// 由来（2026-08-16 业主实测）：一句「知识库里没有关于「长沙鸣望供应链管理有限公司」
+    /// 的任何信息」带着 5 篇无关文档的角标当成答案上了屏。三份判据
+    /// （server 的 MARKERS / hybrid 的 starts_with(NO_HIT) / 这里的 SYSTEM）
+    /// 没有一份认得它 —— 而 SYSTEM 正是规定模型这么写的那一份。
+    #[test]
+    fn the_marker_table_covers_what_our_own_prompt_tells_the_model_to_write() {
+        assert!(SYSTEM.contains(PARTIAL_MISS_PREFIX), "提示词改了措辞，判据要跟着改");
+        assert!(reads_as_not_found(NO_HIT));
+        assert!(reads_as_not_found("知识库里没有关于「长沙鸣望供应链管理有限公司」的任何信息。"));
+        assert!(reads_as_not_found("   "));
+        // 🔴 **部分覆盖不是「没有」**：SYSTEM 要求这一档也用同一个开头，
+        // 一刀切会把大量真答案误杀。判据是「这句之后还有没有带角标的结论」。
+        assert!(!reads_as_not_found(
+            "## 直接结论
+知识库里没有关于押金比例的规定。
+
+- 退款需在 7 个工作日内提交[^1]。"
+        ));
+        // 反面（防恒真）：正常答案一条都不许被判成「没有」
+        assert!(!reads_as_not_found("## 直接结论
+报销上限 800 元[^1]。"));
     }
 
     #[test]

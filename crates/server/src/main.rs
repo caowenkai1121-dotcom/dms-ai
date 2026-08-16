@@ -3056,17 +3056,11 @@ pub(crate) async fn unknown_route_kb_fallback(
 /// 只扫开头 160 字（「直接结论」那一段）：正文后段出现「未提及」是正常的行文，
 /// 拿它判非答案会把大量真答案误杀。
 fn reads_as_not_found(markdown: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "未出现在任何资料",
-        "知识库里没有相关内容",
-        "未找到相关",
-        "没有相关资料",
-        "资料中未提及",
-        "无法查询",
-        "无法回答",
-    ];
-    let head: String = markdown.chars().take(160).collect();
-    MARKERS.iter().any(|m| head.contains(m))
+    // 判据搬到了 `dms_knowledge::answer`（与生成那些措辞的 SYSTEM 段同一个文件）：
+    // 此前这份副本的 7 条 MARKERS 里没有「知识库里没有关于」，而那正是 SYSTEM 亲手
+    // 规定模型必须写的开头 —— 一句「知识库里没有关于「长沙鸣望…」的任何信息」
+    // 带着 5 篇无关文档的角标当答案上了屏（2026-08-16 业主实测）。
+    dms_knowledge::answer::reads_as_not_found(markdown)
 }
 
 /// 可选角色列表：多角色账号必须显式选角色（1:1 对齐 DMS「请选择登录角色」，
