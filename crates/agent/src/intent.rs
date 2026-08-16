@@ -2224,13 +2224,27 @@ fn entity_proved(surface: &str, predicates: &[PredicateProof]) -> bool {
     // 判据不按列名扩表（`order`/`bill`/`invoice`… 加不完，还会把 `order_status` 这类
     // 状态列一起放进来），而是问 `document::resolve_code`：**这个表面词本身是不是一个
     // 合法单号**。是单号，那它被拿去等值比较的那一列按定义就是单号列。
-    // 自证那一支用 `has_value_exact`：单号「差一个字符就是另一个单」——
-    // `has_value` 的模糊匹配会让 base 号 `HJXH-DSO…838` 证明拆单号 `HJXH-DSO…838*2`，
-    // 而这两个正是本仓明写过的「静默查错表返错数」那一对。
+    // 自证那一支的值判定是**单向**的：只认「SQL 里的值比表面词更具体」。
+    //
+    // 生产日志逐字为证（2026-08-16）：
+    //   unclaimed=["entity:HJXH-DSO2026080300838"]   ← 模型把 `*2` 顺手抹了
+    //   sql: WHERE r.ywzt_order = 'HJXH-DSO2026080300838*2' OR r.base_ref_order = '…*2'
+    // SQL 查的是**拆单号**，用户说的是它的 base —— SQL 更窄且仍落在用户说的那张单上，
+    // 限定没被丢，算认领。
+    //
+    // 反方向坚决不认：表面词 `…838*2` 而 SQL 只过滤 `…838`，那是 SQL **更宽** ——
+    // 从 WarehouseShipment 静默变成 SalesOrder、查错表返错数，正是 `triage::code_tokens`
+    // 红字里写过的那一对。`has_value` 的对称包含在这里会把两个方向一起放行，所以不能用它。
+    // 表面词是单号时**只走这一条规则**：不能再回落到名称列那条模糊匹配 ——
+    // 那条是对称包含，会把「SQL 只过滤 base、用户说的是拆单号」也放行（`sales_order_code`
+    // 含 `code`，正在 ENTITY_COLUMNS 里）。单号是精确标识，模糊匹配在这里没有位置。
     let self_evident = surface_is_document_code(surface);
     predicates.iter().any(|predicate| {
-        (self_evident && predicate.has_value_exact(surface))
-            || (predicate.has_value(surface) && predicate.has_column(ENTITY_COLUMNS))
+        if self_evident {
+            predicate.has_value_covering(surface)
+        } else {
+            predicate.has_value(surface) && predicate.has_column(ENTITY_COLUMNS)
+        }
     })
 }
 
@@ -2314,6 +2328,16 @@ impl PredicateProof {
     /// 放宽成子串会让 `2026-08-1` 证明 `2026-08-10`。
     fn has_value_exact(&self, value: &str) -> bool {
         self.values.iter().any(|seen| folded_eq(seen, value))
+    }
+
+    /// **单向**包含：SQL 里的值等于、或比 `value` 更具体（`seen ⊇ value`）。
+    /// 单号专用 —— 反方向（SQL 更宽）意味着限定被丢掉，绝不能算证明。
+    fn has_value_covering(&self, value: &str) -> bool {
+        let want = value.trim().trim_matches('%').trim();
+        self.values.iter().any(|seen| {
+            let seen = seen.trim().trim_matches('%').trim();
+            folded_eq(seen, want) || (want.chars().count() >= 2 && contains_folded(seen, want))
+        })
     }
 
     fn has_column(&self, families: &[&str]) -> bool {
@@ -2702,10 +2726,20 @@ mod tests {
             entity_proved("HJXH-DSO2026080300838*2", std::slice::from_ref(&doc)),
             "单号被拿去等值比较的那一列，按定义就是单号列"
         );
-        // 🔴 base 号不许被拆单号证明：自证那一支是**精确**等值。
-        // 这两个号本仓明写过 —— 丢掉 `*2` 就从 WarehouseShipment 静默变成 SalesOrder，
-        // 查错表返错数（`triage::code_tokens` 的红字）。
-        assert!(!entity_proved("HJXH-DSO2026080300838", std::slice::from_ref(&doc)));
+        // SQL 更**窄**（查的是这张 base 单的拆单号）算认领：限定没被丢。
+        // 这正是生产日志里那一条 —— 模型把 `*2` 顺手抹了，报上来的表面词是 base 号。
+        assert!(entity_proved("HJXH-DSO2026080300838", std::slice::from_ref(&doc)));
+        // 🔴 反方向坚决不认：用户说拆单号，SQL 只过滤 base —— SQL 更**宽**，
+        // 从 WarehouseShipment 静默变成 SalesOrder，查错表返错数。
+        let base_only = PredicateProof {
+            text: "o.sales_order_code = 'HJXH-DSO2026080300838'".into(),
+            columns: vec!["sales_order_code".into()],
+            values: vec!["HJXH-DSO2026080300838".into()],
+        };
+        assert!(
+            !entity_proved("HJXH-DSO2026080300838*2", std::slice::from_ref(&base_only)),
+            "SQL 比用户说的更宽 = 限定被丢掉，不许算证明"
+        );
         // 非单号的表面词照旧要落在名称型列上（这条不许被上面那条带松）
         let noname = PredicateProof {
             text: "o.order_status = '小虎烤肠'".into(),
