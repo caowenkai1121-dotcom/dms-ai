@@ -1418,19 +1418,38 @@ fn normalize_time(time: &mut Option<TimeSlot>) {
 
 /// 指标允许同一业务族的用户表面别名，但不允许模型从“查数据/查情况”补造一个指标。
 /// `goals` 仅用于解释意图，不参与执行覆盖；真正会约束 SQL 的 metrics 必须在这里落地。
+/// 指标表面词有没有落到问句上。
+///
+/// 🔴 **销售族的别名只有一份**（2026-08-17 审计逮到）：这里原来手抄了第二张别名表，
+/// 抄漏了一堆 —— 比如「毛利额」那一档只列了 `毛利额/毛利润`，没有「毛利」。
+/// 而模型会把用户的口语**归一成注册表的登记名**：用户问「本月毛利多少」，
+/// 合同里写的是 `metrics:["毛利额"]`，于是这里拿「毛利额」去问句里找，找不到 ⇒
+/// grounding 整份合同判废 ⇒ 自由 SQL 关、语义缓存关、知识库路由拿不到、混合问句拆不开，
+/// 用户看到「先问清再查」，而模型其实完全理解了他的问题。
+///
+/// 现在销售族转调唯一事实源（`sales_fact::Metric` 的 `name()`/`aliases()` 加
+/// `fastpath::sales_fact_metric_extra_words()`）；库存/订单数这两族在
+/// `sales_fact` 里没有对应物，仍留本地小表，但只剩它们两条。
 fn metric_surface_grounded(metric: &str, question: &str) -> bool {
-    let aliases: &[&str] = match metric {
-        "销售额" | "销售总额" | "销售金额" | "营业额" => {
-            &["销售额", "销售总额", "销售金额", "营业额"]
+    if contains_folded(question, metric) {
+        return true;
+    }
+    // 销售族：`metric` 命中某个指标的任一称呼 ⇒ 问句里出现该指标的任一称呼即算落地
+    for m in dms_semantic::sales_fact::METRICS {
+        let names = || {
+            std::iter::once(m.name())
+                .chain(m.aliases().iter().copied())
+                .chain(dms_semantic::fastpath::sales_fact_metric_extra_words(*m).iter().copied())
+        };
+        if names().any(|name| folded_eq(name, metric)) {
+            return names().any(|name| contains_folded(question, name));
         }
-        "销量" | "销售量" | "销售数量" => &["销量", "销售量", "销售数量"],
+    }
+    // 这两族不在 sales_fact 注册表里（库存走 WMS、订单数走生产订单表），本地列举
+    let aliases: &[&str] = match metric {
         "库存量" | "库存数量" | "库存总量" => &["库存", "存货"],
         "订单数" | "订单数量" => &["订单数", "订单数量", "多少订单", "几笔订单"],
-        "毛利额" | "毛利润" => &["毛利额", "毛利润"],
-        "毛利率" => &["毛利率"],
-        "不含税成本" => &["不含税成本"],
-        "不含税收入" => &["不含税收入"],
-        _ => return contains_folded(question, metric),
+        _ => return false,
     };
     aliases.iter().any(|alias| contains_folded(question, alias))
 }
@@ -2758,6 +2777,31 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 指标别名只有一份（2026-08-17 审计）。
+    ///
+    /// 模型会把用户口语**归一成注册表登记名**：用户问「本月毛利多少」，
+    /// 合同写 `metrics:["毛利额"]`。原来这里手抄的第二张别名表漏了「毛利」，
+    /// 于是拿「毛利额」去问句里找不到 ⇒ grounding 整份合同判废 ⇒ 用户吃反问卡，
+    /// 而模型其实完全理解了他的问题。
+    #[test]
+    fn a_metric_normalised_to_its_registry_name_still_grounds_on_the_spoken_word() {
+        use super::metric_surface_grounded;
+        // 模型归一到登记名，用户说的是口语 —— 两边都要认
+        assert!(metric_surface_grounded("毛利额", "本月毛利多少"), "「毛利」是毛利额的别名");
+        assert!(metric_surface_grounded("销售额", "本月销售金额是多少"));
+        assert!(metric_surface_grounded("销售额", "本月业绩怎么样"));
+        assert!(metric_surface_grounded("销量", "本月卖了多少箱"));
+        assert!(metric_surface_grounded("不含税收入", "本月收入是多少"));
+        // 原样出现照旧算
+        assert!(metric_surface_grounded("毛利率", "本月毛利率是多少"));
+        // 不在 sales_fact 里的两族仍走本地小表
+        assert!(metric_surface_grounded("库存量", "现在库存还有多少"));
+        assert!(metric_surface_grounded("订单数", "本月有多少订单"));
+        // 反面（防恒真）：问句里压根没提这个指标就是没落地
+        assert!(!metric_surface_grounded("毛利额", "本月销售额是多少"));
+        assert!(!metric_surface_grounded("库存量", "本月销售额是多少"));
+    }
 
     /// 同值析取仍然是证据；`OR 1=1` 这种一个字都不许放松。
     /// C03 的真因就在这里：单据卡的 WHERE 是「这个号在两列里的任意一列」，
