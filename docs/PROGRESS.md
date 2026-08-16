@@ -4574,6 +4574,100 @@ R2（doc-topic）的正判据命中了（「流程」在 `DOC_NOUNS` 里），�
 登录页铺了品牌图（主体在左半边，卡片靠右放；窄屏退回居中 + 暗罩），
 图标切三档（logo 256 / apple-touch 180 / favicon 64，2.7MB → 151KB）。
 
+## AX156（2026-08-16 下午，业主三条系统性要求：全量扫描 / 血缘 / 知识库）
+
+业主原话：「对所有单号、所有实体、所有主数据进行扫描，**不能我说什么你就解决什么**」、
+「对每个表的定义、上下游关系、血缘关系都了解透彻」、「对知识库彻底加强」。
+方法改成 **先量分母 → 再按证据修 → 最后锁**，四路并行清点 + 四路对抗复核（8 agent 零失败）。
+
+### 一、量出来的分母（生产 meta 库倒的，不是猜的）
+
+| 项 | 现状 | 判断 |
+|---|---|---|
+| 表定义 | 115/115 有注释、**3089/3121 列有注释（99%）**、38/38 指标有口径 | **这块其实很齐** |
+| 关联边 `join_edge` | 27（人工精修，带口径陷阱注释） | 少但质量高 |
+| **血缘 `datamap_edge`** | **2**（人工种子） | 空 |
+| 单据族 | 14 | 6 族两侧无源 |
+| 知识库 | 104 文档 / 1102 块（全部有向量） | — |
+| KB 基线（20 题） | **recall@1 0.15** / recall@3 0.90 / recall@5 0.95 / answer_acc 0.85 | 排序层病 |
+
+⇒ 第二条要求的根因**不是「不了解表」**，是两个构建器（`meta lineage-build` /
+`meta datamap-build`）**从来没跑过** —— 前者文件头自己写着「纯 PG 元数据，秒级可重跑」。
+
+### 二、跑了构建器，然后立刻撤回
+
+```
+lineage-build → 2 → 82 条
+datamap-build → 191714 条（joinable 38780 / synonym 146959 / …）
+```
+
+**没当成好消息。** JOIN 证据闸读的正是 `joinable`，阈值 0.9，落进生效档 365 条，抽样：
+
+```
+ads_fin_profit_loss_dnf.rebate_other ~ ..._fresh_dnf.rebate_other   conf 0.95
+ads_off_new_product_sales_dnf.amount ~ dws_off_third_party_sales_dnf.amount  conf 0.95
+```
+
+拿金额列做 JOIN 键会把两张表按金额撞在一起 —— 而 ODS 推导路正是当天上午编出 151 亿那条。
+复核同时指出：`lineage-build` 的最强信号 `catalog_mention` 在真实目录上**恒等于 0**，
+列重叠判据对本仓 ETL 命名风格结构性失效（连唯一确认为真的边都过不了），
+而 80 条 pending 边**立即**参与 direct-derive 候选加权（锚点 3 张、池子 6 张，足以摊平成随机序）。
+
+处置：80 条 lineage 置 `rejected`；两个消费者改成**只认 `accepted`** —— 写入侧承诺
+「待人工复核」，读取侧就不许收 pending。行为面为零（改动前 accepted 的 joinable 是 0 条），
+变的是将来。另加**键形正判据**：只有 `*_code`/`*_no`/`*_id`/`*_key`、合同登记的维度列、
+数仓分区列才算 JOIN 证据。用正判据而非「排除度量列」是因为两种漏法代价不对称。
+
+### 三、单据族全量矩阵逮到的最高危一条（唯一会**答错**而不是白拒的）
+
+两套分词器分隔符集不同（`document` 保留 `_`/`*`，`triage` 不保留）：
+
+```
+HJXH-DSO2026080400071_2  →  triage 切出 base，_2 丢掉
+                         →  改写守卫据此判「单号还活着」放行
+                         →  resolve_code 从 WarehouseShipment 静默变成 SalesOrder
+                         →  查错表、返错数、无任何提示
+```
+
+顺带 `DEV_XQ100`（注册表明写允许）被切碎后 R1.5 不触发，真单号掉进知识库兜底。
+收成一个事实源：`document::ascii_code_candidates` 提 pub，`triage::code_tokens` 转调。
+
+### 四、知识库排序层（第三条要求的落点）
+
+`recall@6 = 0.95` 而 `recall@1 = 0.15` —— **对的块召回得到、就是排不到第一**，
+0.80 缺口 100% 在排序层。真凶是 `merge_adjacent` 的收尾排序：
+
+```rust
+b.score.total_cmp(&a.score).then(a.chunk_id.cmp(&b.chunk_id))   // 入库顺序决胜
+```
+
+次序键改成**与问句的向量距离**（单一量纲、零标定，候选集加载时那张表就在手上）。
+**没用**复核否掉的原方案「每路归一分取最大」—— 那是跨路比较，量纲差得离谱
+（元数据路命中标签时 sim 恒 1.0、向量强命中只有 0.45），偏好序会与本文件字面量
+钉死的权重序**恰好相反**。
+
+同批：`RERANK_WINDOW` 从 `TOP_K*2=12` 放到 `CANDIDATE_K=24`（旧值够不到第 13-24 名，
+拿它测「精排有没有收益」必然测出「没收益」，然后这条链会被删掉）；精排关着时留一句日志；
+`server-restart.sh` 透传三个 `DMS_RERANK_*`。**但全仓没有 rerank 服务** —— 接外部端点
+还是本地起一个，是业主的决定。
+
+### 五、这一轮修掉的三条「护栏自己会哑」
+
+1. `kg_and_ext_kb_routes_need_a_body_anchor`（**我自己上午写的**）结尾
+   `for gate in [...] { assert!(src.contains(gate)) }`，而 `src` 是整份文件、
+   **包含这个数组字面量本身** —— 五条断言恒真，把五个阈值常量全删了也绿。改成钉值。
+2. `every_unknown_arm_exits_...` 按 `IntentRoute::Unknown =>` 形状扫，而同一刀把
+   xcx/mcp 塌成 `_ =>` —— 当场变哑。改成扫**承重的那个调用**（`kb_answer` 家族）。
+3. `both_ask_endpoints_share_one_arms_exit` 的 `count() == 3` 计数判据（本仓记过账的坏味道）
+   换成按 handler 判形状。
+
+### 六、我自己踩的两个坑（都记账）
+
+1. 两个 `deploy_update.sh` 并发 → docker 导出层撞
+   （`failed to export layer … lstat …/target/debug/deps/*.rlib`）。好消息是它 fail-closed。
+2. `docker run` 的行继续符后面接 `#` 注释，会把命令**剩余参数整段吃成注释**，
+   而 `bash -n` 查不出来（语法仍合法）。注释只能写在命令之外。
+
 ## 明天的起点（2026-08-16 收工）
 
 ### 现状
