@@ -1973,6 +1973,16 @@ fn merge_adjacent(mut hits: Vec<Hit>) -> Vec<Hit> {
                 p.text.push_str(JOIN);
                 p.text.push_str(&h.text);
                 p.score = p.score.max(h.score);
+                // 🔴 **向量距离也要跟着合并**（2026-08-17 审计逮到）：`score` 取了 max，
+                // 而并列决胜键 `vec_dist` 没取 min —— 合并块继承的是**第一块**的距离，
+                // 被合进来的那块可能离问句近得多。于是昨天刚修好的
+                // 「RRF 同分不许按入库顺序决胜」在合并块上原样复发：
+                // 同分时比的是一个不完整的距离，排序照样不稳。
+                // 取 min 与 score 取 max 同义：合并块的相关度按**最好的那一块**算。
+                p.vec_dist = match (p.vec_dist, h.vec_dist) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
                 p.page = p.page.or(h.page);
                 if p.heading_path.is_empty() && !h.heading_path.is_empty() {
                     p.heading_path = h.heading_path.clone();
@@ -2785,6 +2795,28 @@ mod tests {
     /// 而 `/api/kb/chunk/{id}` 的 `window` 被 `clamp(0,3)` 钉死 —— 读者点开引用**看不到那句话**，
     /// 而 `kb_eval` 的「引用块原文必须含关键词」那条校验因此把「引用其实有据」误判成缺关键词。
     /// 引用的全部价值在可核对；`merged` 是 `Citation.span` 的唯一来源。
+    /// 🔴 合并块的向量距离要取**最近的那一块**（2026-08-17 审计）。
+    ///
+    /// `score` 早就取了 max，而并列决胜键 `vec_dist` 没跟上 —— 合并块继承第一块的距离，
+    /// 被合进来的那块可能离问句近得多。于是 2026-08-16 刚修好的
+    /// 「RRF 同分不许按入库顺序决胜」在合并块上原样复发。
+    #[test]
+    fn merging_keeps_the_closest_blocks_vector_distance() {
+        let mut first = hit(11, "a", 0, 0.5);
+        first.vec_dist = Some(0.42);
+        let mut second = hit(12, "a", 1, 0.4);
+        second.vec_dist = Some(0.11); // 被合进来的这块离问句近得多
+        let out = merge_adjacent(vec![first, second]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].vec_dist, Some(0.11), "合并块的距离按最近的那一块算");
+        assert_eq!(out[0].score, 0.5, "score 照旧取 max（两条同义，一起动）");
+        // 一侧缺距离时取有的那个（向量路没覆盖到的块 vec_dist 为 None）
+        let mut only_second = hit(22, "b", 1, 0.3);
+        only_second.vec_dist = Some(0.2);
+        let out = merge_adjacent(vec![hit(21, "b", 0, 0.3), only_second]);
+        assert_eq!(out[0].vec_dist, Some(0.2));
+    }
+
     #[test]
     fn merge_adjacent_records_the_span() {
         // 连续 3 块 → 一条命中，跨度 3，chunk_id 取首块
