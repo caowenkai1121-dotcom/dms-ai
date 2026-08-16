@@ -2312,6 +2312,7 @@ struct SqlProof {
     projections: Vec<String>,
 }
 
+#[cfg_attr(test, derive(Debug))]
 struct PredicateProof {
     text: String,
     columns: Vec<String>,
@@ -2514,6 +2515,42 @@ fn collect_provable_conjuncts(expr: &sqlparser::ast::Expr, out: &mut Vec<Predica
             collect_provable_conjuncts(right, out);
         }
         Expr::Nested(inner) => collect_provable_conjuncts(inner, out),
+        // 🔴 **每一支都绑同一个值的 OR，仍然约束所有结果行**（2026-08-16，C03 的真因）。
+        //
+        // 单据卡的 WHERE 是 `r.ywzt_order = 'X' OR r.base_ref_order = 'X'`——
+        // 「这个号在两列里的任意一列」。上面那条「OR 分支内的不算证据」的纪律本身没错
+        // （`region='山东' OR 1=1` 确实什么都不证明），但它把这种**同值析取**也一并丢了：
+        // predicates 变成空的 → 实体永远证不出来 → `unclaimed_scope()` 硬拦 →
+        // direct-doc 回落 → 用户拿到一张反问卡。追这条追了一整天。
+        //
+        // 判据是**交集**：两支各自能证的值取交，非空才算。`OR 1=1` 那一支一个值都证不出，
+        // 交集必空 —— 原来的保护一个字没松。
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            let (mut l, mut r) = (Vec::new(), Vec::new());
+            collect_provable_conjuncts(left, &mut l);
+            collect_provable_conjuncts(right, &mut r);
+            let shared: Vec<String> = l
+                .iter()
+                .flat_map(|p| p.values.iter())
+                .filter(|v| r.iter().any(|q| q.values.iter().any(|w| w == *v)))
+                .cloned()
+                .collect();
+            if !shared.is_empty() {
+                let mut columns: Vec<String> = Vec::new();
+                for proof in l.iter().chain(r.iter()) {
+                    for column in &proof.columns {
+                        if !columns.iter().any(|seen| seen.eq_ignore_ascii_case(column)) {
+                            columns.push(column.clone());
+                        }
+                    }
+                }
+                out.push(PredicateProof { text: expr.to_string(), columns, values: shared });
+            }
+        }
         _ if !expr_is_not_locally_provable(expr) => out.push(PredicateProof {
             text: expr.to_string(),
             columns: predicate_columns(expr),
@@ -2709,6 +2746,43 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 同值析取仍然是证据；`OR 1=1` 这种一个字都不许放松。
+    /// C03 的真因就在这里：单据卡的 WHERE 是「这个号在两列里的任意一列」，
+    /// 而原来的收集器把整条 OR 丢掉 → predicates 空 → 实体永远证不出来 → 反问卡。
+    #[test]
+    fn a_disjunction_that_binds_one_value_on_every_branch_still_proves_it() {
+        use super::{collect_provable_conjuncts, PredicateProof};
+        fn proofs(where_sql: &str) -> Vec<PredicateProof> {
+            let sql = format!("SELECT 1 FROM t WHERE {where_sql}");
+            let ast = sqlparser::parser::Parser::parse_sql(
+                &sqlparser::dialect::MySqlDialect {},
+                &sql,
+            )
+            .expect("测试 SQL 必须能解析");
+            let sqlparser::ast::Statement::Query(q) = &ast[0] else { panic!("不是查询") };
+            let sqlparser::ast::SetExpr::Select(select) = q.body.as_ref() else { panic!("不是 select") };
+            let mut out = Vec::new();
+            collect_provable_conjuncts(select.selection.as_ref().expect("有 where"), &mut out);
+            out
+        }
+
+        // ① 同值析取：两列任意一列等于同一个号 —— 每一行都被这个号约束住
+        let same = proofs("ywzt_order = 'HJXH-DSO2026080300838*2' OR base_ref_order = 'HJXH-DSO2026080300838*2'");
+        assert_eq!(same.len(), 1, "同值析取要合成一条证据：{same:?}");
+        assert!(same[0].has_value_exact("HJXH-DSO2026080300838*2"));
+        assert!(same[0].has_column(&["ywzt_order"]) && same[0].has_column(&["base_ref_order"]),
+                "两支的列都要留下：{:?}", same[0].columns);
+
+        // ② 异值析取：证不出任何单一值 —— 交集为空
+        assert!(proofs("a = 'X' OR b = 'Y'").is_empty(), "异值析取不许当证据");
+
+        // ③ `OR 1=1`：原来的保护一个字没松
+        assert!(proofs("region = '山东' OR 1 = 1").is_empty(), "OR 恒真不许当证据");
+
+        // ④ 合取仍照旧逐条收
+        assert_eq!(proofs("a = 'X' AND b = 'Y'").len(), 2);
+    }
 
     /// 🔴 单号自证（C03，2026-08-16 追了一整天）：单据卡的 SQL 把单号放在
     /// `ywzt_order` / `base_ref_order` 上做等值，而那两列不含 ENTITY_COLUMNS 的任何词根，
