@@ -420,6 +420,21 @@ pub fn is_measure_col(col: &str, cmt: &str) -> bool {
 /// ③ 别名是核心销售口径词且取数表有度量列（合同覆盖外的 ODS 推导映射，结果标注未经合同验证）。
 ///
 /// 🔴 **合同拥有这个指标名时，①③一律不算数，只认②**（2026-08-16）。理由见函数体内红字。
+/// `label` 是不是注册指标 `registered` 的别名。
+///
+/// 别名的唯一事实源是 `sales_fact::Metric` 自己的 `aliases()` 加
+/// `fastpath::sales::sales_fact_metric_extra_words()` —— 这里**不抄第三份**。
+/// 为什么需要它：`metrics` 来自 `SELECT name, source_table FROM meta.metric`，只有登记名；
+/// 而模型写列别名时用的是口语（「销售金额」而不是「销售额」）。字符串等值一比就漏，
+/// 于是通道③ 放行，`t_master_shop.monthly_sales` 冒充销售额出处 —— ¥151 亿那一族。
+fn metric_alias_of(registered: &str, label: &str) -> bool {
+    crate::sales_fact::METRICS.iter().any(|metric| {
+        metric.name() == registered
+            && (metric.aliases().contains(&label)
+                || super::sales::sales_fact_metric_extra_words(*metric).contains(&label))
+    })
+}
+
 pub fn derive_labels_ungrounded(
     shape: &DeriveShape,
     corpus: &[(String, Vec<(String, String)>)],
@@ -436,7 +451,22 @@ pub fn derive_labels_ungrounded(
         //
         // 降级的语义是「合同**没覆盖**这个问题」，不是「合同覆盖了但这一轮 fastpath 没命中」。
         // 后者是 fastpath 的问题，用推导编一个数顶上，是把一次白拒换成一次倍数级错答。
-        let contract_owns = metrics.iter().any(|(name, _)| name == label);
+        // 🔴 **别名也算合同已覆盖**（2026-08-17 审计逮到的漏）：上一版这里是**字符串等值**，
+        // 而 `metrics` 来自 `load_metric_sources`（`SELECT name, source_table FROM meta.metric`），
+        // 一个别名都没读。合同六指标的登记名只有
+        // 销售额/销量/不含税成本/不含税收入/毛利额/毛利率；
+        // 而 `CORE_SALES_METRIC_WORDS` 里的 销售金额/销售数量/毛利/成本/收入/营收
+        // **恰好都不是登记名、又恰好都是这六个的别名**。于是模型把列别名写成「销售金额」
+        // 而不是「销售额」，`contract_owns` 就是 false，通道③ 原封不动放行 ——
+        // 挡住的只是那一个字面量，同一族错答换个别名照旧出 ¥151 亿。
+        //
+        // 收口方式：`contract_owns` 认**别名**，别名的唯一事实源是 `sales_fact::Metric`
+        // 自己的 `aliases()` + `fastpath::sales::sales_fact_metric_extra_words()`（不抄第三份）。
+        // 只放宽这一处 —— 合同**真的没覆盖**的标签（返利率、门店月销…）照旧走通道①③，
+        // 那条路的存在意义没被砍掉。
+        let contract_owns = metrics
+            .iter()
+            .any(|(name, _)| name == label || metric_alias_of(name, label));
         let grounded = tables.iter().any(|table| {
             let cols_of = || {
                 corpus
@@ -459,7 +489,7 @@ pub fn derive_labels_ungrounded(
                         .split(|c: char| c.is_whitespace() || c == '/')
                         .any(|seg| seg.rsplit('.').next() == Some(table.as_str()))
             });
-            // 合同拥有这个指标名时，判据收紧成「必须是它自己的登记源表」——
+            // 合同拥有这个指标名（登记名或它的别名）时，判据收紧成「必须是它自己的登记源表」——
             // 通道①（列注释里有这三个字）与通道③（核心词 + 任意度量列）都不算数：
             // `t_master_shop.monthly_sales` 的注释里就有「销售额」，通道①一样会放行。
             if contract_owns {
@@ -749,6 +779,34 @@ mod contract_owned_label_tests {
             derive_labels_ungrounded(&shape("销量", "t_master_shop"), &uncovered, &[]),
             None,
             "核心销售词在合同没登记时仍走通道③"
+        );
+        // 🔴 别名那个漏（2026-08-17 审计逮到，本条判据是它的钉）：合同登记名是「销售额」，
+        // 模型把列别名写成「销售金额」—— 上一版 `contract_owns` 是字符串等值，于是 false，
+        // 通道③ 原封不动放行，同一族错答换个别名照旧出 ¥151 亿。
+        //
+        // ⚠️ 这个 fixture 必须有**真的度量列**（`total_amount` 注释「订单总金额」），
+        // 否则通道③ 本来就不放行、断言两边都成立 —— 第一版就是这么写成恒真的，
+        // 反向验证时一声不吭。
+        let with_measure = vec![(
+            "t_master_shop".to_string(),
+            vec![
+                ("monthly_sales".to_string(), "月销售额".to_string()),
+                ("total_amount".to_string(), "订单总金额".to_string()),
+            ],
+        )];
+        for alias in ["销售金额", "销售总额", "营业额", "业绩", "卖了多少"] {
+            assert_eq!(
+                derive_labels_ungrounded(&shape(alias, "t_master_shop"), &with_measure, &metrics),
+                Some(alias.to_string()),
+                "{alias} 是「销售额」的别名，ODS 门店主档不许冒充它的出处（哪怕表里有度量列）"
+            );
+        }
+        // 合同**真的没覆盖**的标签照旧能走通道③ —— 只放宽了「别名」这一处，没有株连。
+        // 用核心销售词里那个合同没登记的（`metrics` 里只有「销售额」一条）。
+        assert_eq!(
+            derive_labels_ungrounded(&shape("销量", "t_master_shop"), &with_measure, &metrics),
+            None,
+            "合同没登记「销量」时它照旧能走通道③"
         );
         // 无出处的虚构标签照旧拒
         assert_eq!(
