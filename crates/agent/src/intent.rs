@@ -2190,6 +2190,12 @@ fn folded_eq(left: &str, right: &str) -> bool {
 ///
 /// 护栏：两侧都至少 2 字（单字子串歧义太大），且只作用于谓词里已解析出的字面量 ——
 /// 闸门只证明「该谓词确实约束了这个词」，映射权威仍在语义注册表与权威映射表。
+/// 剥掉 LIKE 的通配百分号与两侧空白。`%X%`、`X%`、`X` 归一成同一个 `X` ——
+/// 「同值析取」判交集时两支必须能对上，否则一对百分号就让整条 OR 白丢。
+fn like_core(value: &str) -> &str {
+    value.trim().trim_matches('%').trim()
+}
+
 fn name_value_matches(seen: &str, want: &str) -> bool {
     let seen = seen.trim().trim_matches('%').trim();
     let want = want.trim().trim_matches('%').trim();
@@ -2533,11 +2539,17 @@ fn collect_provable_conjuncts(expr: &sqlparser::ast::Expr, out: &mut Vec<Predica
             let (mut l, mut r) = (Vec::new(), Vec::new());
             collect_provable_conjuncts(left, &mut l);
             collect_provable_conjuncts(right, &mut r);
+            // 取交集前先剥 LIKE 的 `%`：模板里「名 LIKE '%X%' OR 码 = 'X'」两支绑的是**同一个值**，
+            // 裸字符串比会因为一对百分号判成异值，整条 OR 又被丢掉 —— 与 C03 同一个坑的第二档。
+            // 剥完仍按**整值**比（不是包含），`OR 1=1` 与真异值析取照旧交集为空。
             let shared: Vec<String> = l
                 .iter()
                 .flat_map(|p| p.values.iter())
-                .filter(|v| r.iter().any(|q| q.values.iter().any(|w| w == *v)))
-                .cloned()
+                .filter(|v| {
+                    r.iter()
+                        .any(|q| q.values.iter().any(|w| folded_eq(like_core(w), like_core(v))))
+                })
+                .map(|v| like_core(v).to_string())
                 .collect();
             if !shared.is_empty() {
                 let mut columns: Vec<String> = Vec::new();
@@ -2774,8 +2786,15 @@ mod tests {
         assert!(same[0].has_column(&["ywzt_order"]) && same[0].has_column(&["base_ref_order"]),
                 "两支的列都要留下：{:?}", same[0].columns);
 
+        // ①b 一支是 LIKE、另一支是等值，绑的仍是同一个值（relation_rows 三条模板就是这个形）
+        let liked = proofs("d.sku_name LIKE '%小虎烤肠%' OR d.sku_code = '小虎烤肠'");
+        assert_eq!(liked.len(), 1, "LIKE 与等值绑同值也要合成一条：{liked:?}");
+        assert!(liked[0].has_value_exact("小虎烤肠"), "交集要存剥掉 % 之后的值：{:?}", liked[0].values);
+
         // ② 异值析取：证不出任何单一值 —— 交集为空
         assert!(proofs("a = 'X' OR b = 'Y'").is_empty(), "异值析取不许当证据");
+        // 剥 % 只归一通配符，不许把「烤肠」与「小虎烤肠」也当成同一个值
+        assert!(proofs("a LIKE '%烤肠%' OR b = '小虎烤肠'").is_empty(), "剥 % 后仍按整值比");
 
         // ③ `OR 1=1`：原来的保护一个字没松
         assert!(proofs("region = '山东' OR 1 = 1").is_empty(), "OR 恒真不许当证据");
