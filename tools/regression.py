@@ -45,7 +45,7 @@ def _check_argv(args):
     """未知 `--xxx` 旗标当场报错：`--fliter` 打错若被静默忽略 = 不过滤跑全量，
     而「filter 打错」预检拦得住打错的**关键词**，拦不住打错的**旗标本**。"""
     takes_value = {"--cases", "--filter", "--slice", "--bless"}
-    known = takes_value | {"--bless-all", "--selfcheck", "--yes"}
+    known = takes_value | {"--bless-all", "--selfcheck", "--yes", "--http"}
     i = 0
     while i < len(args):
         a = args[i]
@@ -332,7 +332,63 @@ def _ask_timeout():
     return budget + int(_boot_cost())
 
 
+# ── HTTP 传输档 ──────────────────────────────────────────────────────────────
+# 🔴 判官为什么必须能打 HTTP（2026-08-16 业主实测）：
+# 「HJXH-DSO2026081500390」在网页上吃「先问清再查」，同一句走 CLI 出 18 行单据明细；
+# 「长沙鸣望供应链管理有限公司」在网页上答「知识库里没有关于…」，CLI 出客户卡。
+# 差别是 HTTP 那条路上有三道**只在 server 层存在**的合同闸，而判官走 CLI 子命令 ——
+# 结构上跑不到它们。这一族「改过多次还复发」的周期，就等于「下一个入口被业主碰到」。
+#
+# 身份走 `X-API-Key`（settings.docker.json 的 mcp_keys 明文键名 → login）。
+# 一把 key 只映射一个 login，所以本档**只跑 login=admin 的题**，其余诚实跳过而不是假绿。
+HTTP = "--http" in argv
+API_KEY = os.environ.get("DMSAI_API_KEY", "")
+
+
+def http_skip_reason(c):
+    """本题在 HTTP 档跑不了的理由；None = 能跑。跑不了要**说出来**，不许静默当过。"""
+    if not API_KEY:
+        return "DMSAI_API_KEY 未设置（HTTP 档要 mcp_keys 里的一把 key）"
+    if (c.get("login") or "") != "admin":
+        return f"HTTP 档一把 key 只映射一个 login，跑不了 login={c.get('login')}"
+    if c.get("prev") or c.get("prev_sql"):
+        return "两轮题在 HTTP 上靠 conv_id 承载上下文，与 CLI 的 prev/prev_sql 不同形"
+    if c.get("type"):
+        return f"type={c['type']} 题不走问答端点"
+    return None
+
+
+def ask_http(c):
+    """打 `/api/ask`，返回与 CLI 同形的 AskResult JSON。一切失败 = {"error": ...}。"""
+    import urllib.error
+    import urllib.request
+
+    base = os.environ.get("DMSAI_BASE", "http://172.17.0.1:8100")
+    body = json.dumps({"question": c["q"], "role_code": c.get("role") or None}).encode()
+    req = urllib.request.Request(
+        f"{base}/api/ask",
+        data=body,
+        headers={"Content-Type": "application/json", "X-API-Key": API_KEY},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_ask_timeout()) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        return {"error": f"HTTP {e.code}：{detail}"}
+    except Exception as e:  # 超时/连不上/回包不是 JSON：一律当本题失败，不吞
+        return {"error": f"HTTP 传输失败：{str(e)[:300]}"}
+
+
 def ask(c, retries=1):
+    if HTTP:
+        last = {}
+        for _ in range(retries + 1):
+            j = ask_http(c)
+            if j.get("columns") or j.get("route") == "compound":
+                return j
+            last = j
+        return last
     cmd = ask_argv(c)
     # 公网链路 CLI 单次问答实测 ~100s（启动探针 + LLM 往返都在公网）；内网 60s 的
     # 速度门禁照常，公网跑用 DMS_REGRESSION_TIMEOUT 放宽（超时仍是失败，只是阈值适配链路）。
@@ -578,6 +634,10 @@ def run_case(c, results):
         results.append((name, None, "embed 服务缺席跳过")); return
     if c.get("requires_graph") and not GRAPH_UP:
         results.append((name, None, "PG 容器缺席跳过")); return
+    if HTTP:
+        why = http_skip_reason(c)
+        if why:
+            results.append((name, None, f"HTTP 档跳过：{why}")); return
 
     if c.get("type") == "gate":
         ok, detail = gate_verdict(c["gate_sql"])
@@ -838,12 +898,32 @@ def selfcheck():
     assert ok is True and "为什么" not in d, (n, ok, d)
     n, ok, d = rule_verdict({"lt": ["A", "B"], "note": "为什么"}, {})
     assert ok is None and "取值缺失跳过" in d and "为什么" in d, (n, ok, d)
+    # ⑯ HTTP 档的跳过判据：跑不了要**说出来**。写成「静默当过」的话，
+    #    `--http` 会变成一轮全绿的假象 —— 而它存在的全部意义就是补 CLI 看不见的那条路。
+    old_key = os.environ.get("DMSAI_API_KEY")
+    try:
+        os.environ["DMSAI_API_KEY"] = ""
+        globals()["API_KEY"] = ""
+        assert "DMSAI_API_KEY" in (http_skip_reason({"login": "admin", "q": "x"}) or "")
+        os.environ["DMSAI_API_KEY"] = "k"
+        globals()["API_KEY"] = "k"
+        assert http_skip_reason({"login": "admin", "q": "x"}) is None
+        assert "login=" in (http_skip_reason({"login": "city_manager", "q": "x"}) or "")
+        assert "两轮题" in (http_skip_reason({"login": "admin", "q": "x", "prev": "上一句"}) or "")
+        assert "type=" in (http_skip_reason({"login": "admin", "q": "x", "type": "gate"}) or "")
+    finally:
+        globals()["API_KEY"] = old_key or ""
+        if old_key is None:
+            os.environ.pop("DMSAI_API_KEY", None)
+        else:
+            os.environ["DMSAI_API_KEY"] = old_key
+
     print("selfcheck 通过: 未知键 / rules 未知键+缺 lt+lt 形状与题名校验 / redline 静默断言 / "
           "DML 探测器正反对照 / 无 SQL 第三态 / 金文件缺失 / 金文件不一致 / "
           "两轮题 prev 进 argv + 两个静默退化陷阱 / "
           "chart_series 的 0 与 None 两档 / 实体详情四层合同 / "
           "typed intent/coverage 五键正反对照 / 缺必需 meta 键 / 未知旗标拦截 / "
-          "gate 超时判红 / rule note 进 detail 全部会红")
+          "gate 超时判红 / rule note 进 detail 全部会红 / HTTP 档跳过判据四档")
 
 
 if "--selfcheck" in argv:
