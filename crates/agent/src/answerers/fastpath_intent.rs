@@ -246,10 +246,18 @@ pub fn warehouse_sales_fact_predicated(
     // 已探明客户的名字自带渠道前缀（线下-/线上-）：问句里的渠道词由实体解释，不算残留——
     // 「潍坊程祥商贸有限公司本月线下销售额」的「线下」不许把整条拦回落（2026-08-12 生产实测）。
     // 只在有实体时消化渠道词：无实体的「本月线上销售额」族不受本路径影响。
+    //
+    // 🔴 **「线上」不许一起消化**（2026-08-17 审计逮到）：这条事实合同的取数表是
+    // `sales_dw.dws_off_offline_sale_dfn`—— **线下专表**。「线下」由表本身兑现，可以消化；
+    // 「线上」在这张表上永远兑现不了，消化它等于把线下的数当成线上的数答出去，
+    // 而且是单值 KPI，用户无从察觉（「潍坊程祥商贸本月线上销售额是多少」）。
+    // 不消化 ⇒ 残留守卫看到「线上」整条拒 ⇒ 用户拿到的是拒答而不是错数。
     let mut consumed = consumed;
-    if customer.is_some() {
-        consumed.extend(["线下".to_string(), "线上".to_string()]);
-    }
+    consumed.extend(
+        channel_words_consumed(customer.is_some())
+            .iter()
+            .map(|word| (*word).to_string()),
+    );
     let province = sales_fact_province_filter(
         question,
         customer.map(|binding| binding.canonical_name.as_str()),
@@ -1139,6 +1147,23 @@ pub fn compose_hit<'a>(cx: &'a crate::ctx::AskCtx<'a>) -> dms_kernel::BoxFut<'a,
 }
 
 /// 手工模板（单号直查 / 高频聚合）：Router 的 `direct-doc` 成员。同步判定，包一层 future。
+/// 渠道词里哪些算「已被兑现」。
+///
+/// 取数表 `sales_dw.dws_off_offline_sale_dfn` 是**线下专表**：
+/// - 「线下」：表本身就是这个口径，兑现了，可以消化（否则带实体的「X本月线下销售额」
+///   会被残留守卫整条拒 —— 2026-08-12 生产实测过的那条）。
+/// - 「线上」：这张表上**永远**兑现不了。消化它 = 拿线下数当线上数答，
+///   而且是单值 KPI，用户无从察觉。宁可让残留守卫整条拒。
+///
+/// `has_customer` 为假时一个都不消化：无实体的「本月线上销售额」族由别的路径判。
+pub(crate) fn channel_words_consumed(has_customer: bool) -> &'static [&'static str] {
+    if has_customer {
+        &["线下"]
+    } else {
+        &[]
+    }
+}
+
 pub fn direct_hit<'a>(cx: &'a crate::ctx::AskCtx<'a>) -> dms_kernel::BoxFut<'a, Option<DirectHit>> {
     Box::pin(async move {
         // 总量、库存金额、省份/仓库拆解先由同步模板兑现。具体商品库存会被

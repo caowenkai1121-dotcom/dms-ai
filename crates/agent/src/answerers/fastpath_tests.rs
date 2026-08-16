@@ -50,6 +50,21 @@ const DETERMINISTIC_SRC: &str = concat!(
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 「线上」不许被当成已兑现（2026-08-17 审计）：取数表 `dws_off_offline_sale_dfn`
+    /// 是线下专表，消化「线上」等于拿线下的数当线上的数答，而且是单值 KPI，用户无从察觉。
+    /// 「线下」照旧要消化 —— 否则带实体的「X本月线下销售额」被残留守卫整条拒
+    /// （2026-08-12 生产实测过的那条，不许回退）。
+    #[test]
+    fn the_online_channel_word_is_never_consumed_by_the_offline_fact() {
+        use crate::answerers::fastpath_intent::channel_words_consumed;
+        assert_eq!(channel_words_consumed(true), ["线下"], "线下由线下专表本身兑现");
+        assert!(
+            !channel_words_consumed(true).contains(&"线上"),
+            "线上在这张表上永远兑现不了，消化它就是错答"
+        );
+        assert!(channel_words_consumed(false).is_empty(), "无实体时不消化任何渠道词");
+    }
     use super::*;
 
     use std::sync::Mutex;
