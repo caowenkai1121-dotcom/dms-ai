@@ -1152,7 +1152,15 @@ pub fn direct_hit<'a>(cx: &'a crate::ctx::AskCtx<'a>) -> dms_kernel::BoxFut<'a, 
         {
             return Some(hit);
         }
-        match try_direct_for(cx.question, cx.source.is_warehouse()) {
+        // 🔴 诊断钩子（2026-08-16 C03 未结）：同一句 `HJXH-DSO2026080300838*2`
+        // 在 `docker exec … ask admin` 下 direct-doc 9 行，走 /api/ask 与 /api/mcp 却
+        // 恒 need-intent（direct-doc miss）；而只把 `*` 换成 `_` 两条路都 hit。
+        // 二进制同一个、源同一份、显式 `ds=dms` 也一样 —— 黑盒探到这里为止，
+        // 下一步要的就是这行：进来的问句到底是什么、warehouse 位是什么。
+        // 开法：`docker run … --env RUST_LOG=dms_agent=debug`（默认级别下它不打）。
+        let wh = cx.source.is_warehouse();
+        tracing::debug!(question = %cx.question, warehouse = wh, "direct_hit 入参");
+        match try_direct_for(cx.question, wh) {
             // 「未确认限定」兜底卡：残留可能只是客户名。先探一次主档，探明是客户就改走
             // 共享事实合同；探不到再试 ODS 推导，推导也不成照旧返回这张卡（fail-closed 语义不变）。
             // 顺序即行为：合同（共享事实）永远在推导之前，推导只是合同缺失时的降级。

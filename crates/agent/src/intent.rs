@@ -213,6 +213,9 @@ impl IntentV1 {
         clean_strings(&mut self.goals);
         clean_strings(&mut self.metrics);
         clean_strings(&mut self.regions);
+        // 与 entity_mentions 同一条理由：`region:` 也是硬闸（`unclaimed_scope`），
+        // 光杆「省区」「大区」进了 regions 就永远证不出来 —— SQL 里是 GROUP BY 不是 WHERE。
+        self.regions.retain(|r| !is_bare_dimension_word(r));
         clean_strings(&mut self.breakdowns);
         clean_strings(&mut self.comparisons);
         clean_strings(&mut self.ambiguities);
@@ -224,6 +227,7 @@ impl IntentV1 {
             clean_strings(&mut subgoal.goals);
             clean_strings(&mut subgoal.metrics);
             clean_strings(&mut subgoal.regions);
+            subgoal.regions.retain(|r| !is_bare_dimension_word(r));
             clean_strings(&mut subgoal.breakdowns);
             clean_strings(&mut subgoal.comparisons);
             subgoal.goals.truncate(MAX_ITEMS);
@@ -2666,6 +2670,16 @@ mod tests {
         let left: Vec<&str> = intent.entity_mentions.iter().map(|e| e.surface.as_str()).collect();
         assert_eq!(left, vec!["潍坊程祥商贸有限公司", "线下客户"],
                    "整词等于类别词的才剔；「线下客户」是带限定的表面词，交给下游剥");
+        // regions 走同一条闸（`unclaimed_scope` 把 region: 也当硬拦），同样得剔
+        let mut geo = IntentV1 {
+            mode: super::IntentMode::Data,
+            metrics: vec!["销售额".into()],
+            regions: vec!["省区".into(), "各大区".into(), "湖南省区".into(), "华东".into()],
+            ..Default::default()
+        };
+        assert!(geo.normalize());
+        assert_eq!(geo.regions, vec!["湖南省区".to_string(), "华东".to_string()],
+                   "光杆「省区」「各大区」不是用户写出来的地域限定");
     }
 
     /// 裸实体名不看 mode：fast 模型把一个裸公司名判成 knowledge 是常事，
