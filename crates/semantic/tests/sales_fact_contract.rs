@@ -44,6 +44,7 @@ fn trusted_builder_owns_fact_filters_sort_and_limit() {
             predicates: &predicates,
             sort: Some(Sort::metric(Metric::SalesAmount, SortDirection::Desc)),
             limit: Some(20),
+            offset: None,
         },
     );
     assert!(sql.contains("FROM sales_dw.dws_off_offline_sale_dfn sf"), "{sql}");

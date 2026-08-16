@@ -294,6 +294,8 @@ pub fn sales_fact_sql(
     predicates: &[crate::sales_fact::Predicate],
     sort: Option<crate::sales_fact::Sort>,
     limit: Option<u32>,
+    // 序数排名（「排名第二」）才有值；其余调用一律 None。
+    offset: Option<u32>,
 ) -> String {
     use crate::sales_fact::{self, QueryOptions};
     sales_fact::aggregate_sql_with_options(
@@ -301,7 +303,7 @@ pub fn sales_fact_sql(
         dimensions,
         begin,
         end,
-        QueryOptions { predicates, sort, limit },
+        QueryOptions { predicates, sort, limit, offset },
     )
 }
 

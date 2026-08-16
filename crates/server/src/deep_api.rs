@@ -2100,7 +2100,7 @@ fn sales_section_sql(
         &dimensions,
         "'1970-01-01'",
         "'9999-12-31'",
-        QueryOptions { predicates: &[], sort: Some(sort), limit: Some(200) },
+        QueryOptions { predicates: &[], sort: Some(sort), limit: Some(200), offset: None },
     );
     let predicate = dms_kernel::nl::time::time_predicate(question)
         .and_then(|time| sales_where_for_time(primary_sql, &time))

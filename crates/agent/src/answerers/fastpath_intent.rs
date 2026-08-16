@@ -186,15 +186,15 @@ pub(crate) fn lone_customer_code(question: &str) -> Option<String> {
 }
 
 /// 问句里的**序数排名**（「排名第二的客户」「销售额第3名的省区」）。
+/// 返回 `(名次, 数字表面词)` —— 表面词要进消化词表，否则残留守卫会把「二」当实义残留
+/// 整条拒掉（`STRIP_WORDS` 里有「第」「名」，唯独没有中文数字）。
 ///
-/// 🔴 本模板表达不了它（2026-08-15 生产直打 + 复验 2/2）：`QueryOptions` 只有 `limit`、
-/// 没有 `offset`，于是「第二名」此前被静默丢掉、回落默认 LIMIT 200 —— 返回整张 200 行榜，
-/// 确定性摘要还把**第一名**标成「榜首」推给用户。用户问第二，拿到的是第一。
-///
-/// 加 OFFSET 要改 `QueryOptions` 的全部调用点，不是这一刀的范围；
-/// 按本仓纪律（识别到却兑现不了的限定，不许静默丢）先 fail-closed ——
-/// 让它去出「不可计算·未确认限定」，而不是继续返回一张答非所问的榜。
-fn ordinal_rank(question: &str) -> Option<u32> {
+/// 🔴 由来（2026-08-15 生产直打 + 复验 2/2）：`QueryOptions` 当时只有 `limit` 没有 `offset`，
+/// 「第二名」被静默丢掉、回落默认 LIMIT 200 —— 返回整张 200 行榜，确定性摘要还把**第一名**
+/// 标成「榜首」推给用户。用户问第二，拿到的是第一。当天按纪律先 fail-closed；
+/// 2026-08-16 给 `QueryOptions` 补了 `offset`（只有 6 处字面量构造，不是当初估的「全部调用点」），
+/// 于是改成真答：`LIMIT 1 OFFSET n-1`。
+fn ordinal_rank(question: &str) -> Option<(u32, String)> {
     for marker in ["排名第", "第"] {
         for (pos, _) in question.match_indices(marker) {
             let rest = &question[pos + marker.len()..];
@@ -215,7 +215,7 @@ fn ordinal_rank(question: &str) -> Option<u32> {
             }
             if let Some(n) = dms_kernel::nl::time::cn_num(&digits) {
                 if (1..=200).contains(&n) {
-                    return Some(n);
+                    return Some((n, digits));
                 }
             }
         }
@@ -233,12 +233,9 @@ pub fn warehouse_sales_fact_predicated(
     if metric_hits.is_empty() || warehouse_sales_has_unsupported_semantics(question) {
         return None;
     }
-    // 序数排名（「第二名」）本模板表达不了：没有 OFFSET。不接，让它去出「不可计算」——
-    // 继续跑的话会返回整张 200 行榜，还把第一名当「榜首」推给问第二的人。
-    if let Some(n) = ordinal_rank(question) {
-        tracing::debug!(question = %question, n, "序数排名无 OFFSET 可表达 → 不接（fail-closed）");
-        return None;
-    }
+    // 序数排名（「排名第二的省区」）：判据在这里认，兑现在下面的 `limit`/`offset`。
+    // 没有分类维度时它无意义（「本月第二名销售额」不成句），那一档仍旧不接。
+    let ordinal = ordinal_rank(question);
     let dimension_hits = warehouse_sales_dimensions(question);
     let metrics = metric_hits.iter().map(|(metric, _)| *metric).collect::<Vec<_>>();
     let dimensions = dimension_hits.iter().map(|(dimension, _)| *dimension).collect::<Vec<_>>();
@@ -287,6 +284,11 @@ pub fn warehouse_sales_fact_predicated(
             consumed.extend(["客户编码".into(), "客户代码".into(), "客户编号".into(), "客户".into()]);
         }
     }
+    // 名次的数字要跟着判据一起消化（本仓反复踩的那一半：判据认了、消化词没跟上，
+    // 残留守卫照样整条拒）。「第」「名」「排名」本就在 `STRIP_WORDS` 里，缺的只是「二」/「3」。
+    if let Some((_, surface)) = &ordinal {
+        consumed.push(surface.clone());
+    }
     if has_residue(question, &consumed) {
         return None;
     }
@@ -298,7 +300,10 @@ pub fn warehouse_sales_fact_predicated(
     let ranking = ["排行", "排名", "最高", "最多", "最大", "最少", "最小", "最低", "最好", "倒数"]
         .iter()
         .any(|word| question.contains(word))
-        || explicit_limit.is_some();
+        || explicit_limit.is_some()
+        // 序数本身就是名次诉求：不并上它，「各月销售额第二名」会掉进「有时间维度且非排行」
+        // 那一支按月份升序排，OFFSET 就切在了一个与名次无关的序上。
+        || ordinal.is_some();
     let direction = if rank_direction(question) == "ASC" {
         SortDirection::Asc
     } else {
@@ -329,6 +334,15 @@ pub fn warehouse_sales_fact_predicated(
     } else {
         explicit_limit
     };
+    // 序数排名兑现在这里：第 N 名 = `LIMIT 1 OFFSET N-1`。
+    // 必须**覆盖** `explicit_limit` —— 「排名第2」里的「第2」会被 `ranking_limit` 读成 top-2，
+    // 那样 `LIMIT 2 OFFSET 1` 出的是第 2、3 名两行，而用户只问了第 2 名。
+    let (limit, offset) = match ordinal {
+        Some((n, _)) if has_categorical_dimension => (Some(1), Some(n - 1)),
+        // 无分类维度时序数没有落点：不许静默丢，交回上游出「不可计算」。
+        Some(_) => return None,
+        None => (limit, None),
+    };
     let sql = sales_fact_sql(
         &metrics,
         &dimensions,
@@ -337,6 +351,7 @@ pub fn warehouse_sales_fact_predicated(
         &predicates,
         sort,
         limit,
+        offset,
     );
 
     // 问句点名「同比」时，同比就是主 delta（KPI 卡第一个比较位），环比退居 comparisons；
@@ -349,7 +364,7 @@ pub fn warehouse_sales_fact_predicated(
     let prev = scalar.then(|| primary).flatten().and_then(|(template, label)| {
         let (begin, end) = dms_semantic::sales_fact::comparison_time_bounds(question, template)?;
         Some((
-            sales_fact_sql(&metrics, &[], &begin, &end, &predicates, None, None),
+            sales_fact_sql(&metrics, &[], &begin, &end, &predicates, None, None, None),
             label.to_string(),
         ))
     });
@@ -359,7 +374,7 @@ pub fn warehouse_sales_fact_predicated(
         .and_then(|(template, label)| {
             let (begin, end) = dms_semantic::sales_fact::comparison_time_bounds(question, template)?;
             Some((
-                sales_fact_sql(&metrics, &[], &begin, &end, &predicates, None, None),
+                sales_fact_sql(&metrics, &[], &begin, &end, &predicates, None, None, None),
                 label.to_string(),
             ))
         })
@@ -375,6 +390,7 @@ pub fn warehouse_sales_fact_predicated(
             &begin,
             &end,
             &predicates,
+            None,
             None,
             None,
         )

@@ -1808,7 +1808,7 @@ fn build_dimension_value_hit(
             &[],
             b,
             e,
-            QueryOptions { predicates: &predicates, sort: None, limit: None },
+            QueryOptions { predicates: &predicates, sort: None, limit: None, offset: None },
         )
     };
     let sql = with(&begin, &end, metrics);

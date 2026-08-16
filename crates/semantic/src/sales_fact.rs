@@ -481,6 +481,10 @@ pub struct QueryOptions<'a> {
     pub predicates: &'a [Predicate],
     pub sort: Option<Sort>,
     pub limit: Option<u32>,
+    /// 跳过的名次数（序数排名「排名第二的省区」= `offset: Some(1), limit: Some(1)`）。
+    /// 🔴 Doris/MySQL 的 `OFFSET` 必须挂在 `LIMIT` 上，裸 OFFSET 是语法错误；
+    /// 因此 `offset` 有值而 `limit` 没有时，这里按 1 补一个 LIMIT，而不是静默丢掉偏移。
+    pub offset: Option<u32>,
 }
 
 /// SQL 字符串字面量引用：只转义 `\` 和 `'`。值域约定：维度取值来自枚举/码值，
@@ -718,9 +722,13 @@ pub fn aggregate_sql_with_options(
         sql.push(' ');
         sql.push_str(sort.direction.sql());
     }
-    if let Some(limit) = options.limit {
+    if let Some(limit) = options.limit.or(options.offset.map(|_| 1)) {
         sql.push_str(" LIMIT ");
         sql.push_str(&limit.clamp(1, 1000).to_string());
+        if let Some(offset) = options.offset {
+            sql.push_str(" OFFSET ");
+            sql.push_str(&offset.clamp(0, 1000).to_string());
+        }
     }
     sql
 }
@@ -914,6 +922,7 @@ mod tests {
                 predicates: &[],
                 sort: Some(Sort::dimension(Dimension::WarZone, SortDirection::Desc)),
                 limit: None,
+                offset: None,
             },
         );
     }

@@ -568,6 +568,7 @@ pub(super) fn dws_entity_sql(
             predicates,
             sort: None,
             limit: None,
+            offset: None,
         },
     ))
 }
@@ -609,7 +610,7 @@ fn dws_relation_sql(
         dimensions,
         &begin,
         &end,
-        QueryOptions { predicates, sort: Some(sort), limit: Some(10) },
+        QueryOptions { predicates, sort: Some(sort), limit: Some(10), offset: None },
     ))
 }
 

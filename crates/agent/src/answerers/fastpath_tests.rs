@@ -730,23 +730,41 @@ mod tests {
         assert!(try_direct("昨天有哪些设备").is_none(), "泛设备名词不能误认成设备订单");
     }
 
-    /// 序数排名表达不了就**不接**，不许返回一张答非所问的榜。
+    /// 序数排名要**真答**：第 N 名 = `LIMIT 1 OFFSET N-1`，不是一张 200 行的榜。
     ///
     /// 🔴 由来（2026-08-15 生产直打 + 复验 2/2）：「本月销售额排名第二的客户」返回
     /// 200 行全榜，确定性摘要还把**第一名**标成「榜首」——用户问第二，拿到的是第一。
-    /// `QueryOptions` 只有 limit 没有 offset，加它要动全部调用点；按纪律先 fail-closed。
+    /// 当天 `QueryOptions` 没有 offset，按纪律先 fail-closed；2026-08-16 补上 offset
+    /// （字面量构造只有 6 处，不是当初估的「全部调用点」）改成真答。
     #[test]
-    fn an_ordinal_rank_is_refused_not_silently_widened() {
-        for q in ["本月销售额排名第二的客户", "本月销售额第3名的省区", "本月销量第一名的商品"] {
-            assert!(warehouse_sales_fact(q).is_none(), "{q} 该 fail-closed");
+    fn an_ordinal_rank_is_answered_at_that_rank_only() {
+        for (q, offset) in [
+            ("本月销售额排名第二的客户", 1),
+            ("本月销售额第3名的省区", 2),
+            ("本月销量第一名的商品", 0),
+        ] {
+            let sql = warehouse_sales_fact(q).unwrap_or_else(|| panic!("{q} 该命中")).sql;
+            assert!(
+                sql.contains(&format!("LIMIT 1 OFFSET {offset}")),
+                "{q} 该只取第 {} 名：{sql}",
+                offset + 1
+            );
         }
+        // 🔴 「排名第2」里的「第2」会被 `ranking_limit` 读成 top-2：序数必须**覆盖**它，
+        // 否则 `LIMIT 2 OFFSET 1` 出的是第 2、3 名两行，而用户只问了第 2 名。
+        let two = warehouse_sales_fact("本月销售额排名第2的客户").expect("该命中").sql;
+        assert!(two.contains("LIMIT 1 OFFSET 1"), "{two}");
         // 时间里的序数不许被误判成名次（「第一季度」「第3个月」）
+        let quarter = warehouse_sales_fact("今年第一季度销售额").expect("季度序数不是名次").sql;
+        assert!(!quarter.contains("OFFSET"), "{quarter}");
+        // 没有分类维度时序数没有落点：仍旧不接（不许静默丢）
         assert!(
-            warehouse_sales_fact("今年第一季度销售额").is_some(),
-            "季度序数不是名次"
+            warehouse_sales_fact("本月第二名销售额").is_none(),
+            "无分类维度的序数该 fail-closed"
         );
-        // 普通 TopN 照旧
-        assert!(warehouse_sales_fact("本月销售额前十的客户").is_some());
+        // 普通 TopN 照旧，且不带 OFFSET
+        let top10 = warehouse_sales_fact("本月销售额前十的客户").expect("该命中").sql;
+        assert!(top10.contains("LIMIT 10") && !top10.contains("OFFSET"), "{top10}");
     }
 
     /// 「最高/最多」是 N=1 的取值限定，不是「给我整张榜」。
