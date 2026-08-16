@@ -198,12 +198,15 @@ fi
 #
 # ⚠️ 注释**只能写在 docker run 之外**：行继续符后面接 `#` 会把命令的剩余参数
 # 整段吃成注释，而 `bash -n` 查不出来（语法仍合法）—— 第一版就是这么写的。
+# RUST_LOG 透传（默认空 = 与接线前逐字一致）：要诊断某条路时
+# `RUST_LOG=dms_agent=debug bash scripts/server-restart.sh` 就能开，不改脚本、不重建镜像。
 if ! docker run -d --name dms-ai-server --restart unless-stopped \
   --add-host host.docker.internal:host-gateway \
   --env DMS_SECRET_KEY="$DMS_SECRET_KEY" \
   --env DMS_RERANK_BASE_URL="${DMS_RERANK_BASE_URL:-}" \
   --env DMS_RERANK_API_KEY="${DMS_RERANK_API_KEY:-}" \
   --env DMS_RERANK_MODEL="${DMS_RERANK_MODEL:-gte-rerank-v2}" \
+  --env RUST_LOG="${RUST_LOG:-}" \
   --mount "type=bind,source=$SETTINGS_FILE,target=/app/settings.json" \
   --mount "type=bind,source=$KBDATA_REAL,target=/kbdata" \
   --mount "type=bind,source=$TOOLS_DIR,target=/app/tools" \
