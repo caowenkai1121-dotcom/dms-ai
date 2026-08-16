@@ -75,6 +75,7 @@ GOLDEN = ROOT / "tools" / "regression_golden"
 # 那条负向断言从写下那天起就是绿的。于是键集在此显式收口，preflight 对不上就硬失败。
 # 注意: 想加新键（tags/…）必须先让 check() 真的消费它，再登记进来——只登记不消费还是假绿。
 META_KEYS = {"name", "login", "q", "role", "llm", "note", "type", "requires_embed", "requires_graph",
+              "entries_volatile",
              # 两轮题：`prev` = 上一轮问句，`prev_sql` = 上一轮**实际执行的 SQL**（口径的真载荷）。
              # 消费方是 `ask_argv`（CLI 的第 5、6 位），selfcheck 里有断言证它真的进了 argv ——
              # 只登记不消费还是假绿，那正是这道 preflight 自己的立意。
@@ -357,7 +358,16 @@ def entries_verdict(c):
     比全文会把协议差异误报成口径不一致；而**口径**就是这三样。"""
     seen = {}
     for entry in ENTRIES:
-        seen[entry] = entry_shape(ask_entry(c, entry))
+        shape = entry_shape(ask_entry(c, entry))
+        # 🔴 `entries_volatile`：首格是**会自己变**的实时值时只比 (route, 行数)。
+        # 由来（2026-08-16 实测）：「现在库存量是多少」连打三次
+        # 106605152.098 / 106605152.098 / 106605016.098 —— 中台 WMS 是活的，
+        # 三入口串行打完本来就跨了几秒。把它判成「口径不一致」是判官自己的假红，
+        # 而假红比漏判更贵：真的不一致会被淹在里面。
+        # **只对显式标了这个键的题放宽**，且理由必须写进 note —— 不许当通用降级。
+        if c.get("entries_volatile"):
+            shape = (shape[0], shape[1])
+        seen[entry] = shape
     shapes = set(seen.values())
     detail = " | ".join(f"{k}={v[0]}:{v[1]}" for k, v in seen.items())
     if len(shapes) == 1:
