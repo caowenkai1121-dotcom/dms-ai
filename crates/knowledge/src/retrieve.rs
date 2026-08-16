@@ -225,7 +225,28 @@ const METADATA_MIN: f32 = 0.35;
 /// 这是**标定值不是常数**：换 embedding 模型或换语料域必须重量一遍再改
 /// （量法：逐题取 `embedding <=> 问句向量` 全表分布，找「判据块最远的那个」与
 /// 「远域 nohit 最近的那个」之间的缝）。
+///
+/// 🔴 **2026-08-17 重量**（向量层已换千问 `text-embedding-v4` @1024，上面那组数字是
+/// bge-small-zh/512 时代、14 篇本地夹具上量的，已作废但留作对照）。
+/// 这次用 56 题**生产语料**基准（`tools/kb_fixtures/prod_cases.json`）：
+///
+/// | | 距离 |
+/// |---|---|
+/// | 判据块 最近 / 中位 / P90 / **最远** | 0.1322 / 0.2528 / 0.3618 / **0.5004** |
+/// | 远域 nohit 最近块（月球基地/给猫绝育/量子纠错/世界杯比分/光伏 MPPT 五题） | **0.6149** |
+///
+/// 缝是 [0.5004, 0.6149]，中点 0.5577 —— **0.55 仍然落在缝里**，
+/// 判据块一个不掉、远域一个不进。换了模型换了维度它还成立，是运气也是结论：
+/// 这个数不用改，但**必须重量过才知道不用改**。
+///
+/// `VEC_CALIBRATED_ON` 把这次标定的上下文钉住：模型或维度一变，
+/// `the_vector_threshold_records_what_it_was_calibrated_on` 当场红 ——
+/// 逼下一手重量一遍，而不是让一个作废的阈值继续无声地当门。
 const VEC_MAX_DIST: f64 = 0.55;
+
+/// `VEC_MAX_DIST` 是在**哪个向量空间**上量出来的。形状 `模型@维度`。
+/// 阈值本身是个数，看不出它已经作废 —— 这一行就是它的保质期标签。
+const VEC_CALIBRATED_ON: &str = "text-embedding-v4@1024";
 /// 相邻块合并时的正文分隔
 const JOIN: &str = "\n\n";
 
@@ -2009,6 +2030,51 @@ fn opposite_version_sections(left: &Hit, right: &Hit) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// 🔴 标定值必须记住自己是在哪个向量空间上量的。
+    ///
+    /// `VEC_MAX_DIST` 是**标定值不是常数**（它自己的注释里写着）。2026-08-16~17 两天里
+    /// 向量层换了模型（bge-small-zh → 千问 text-embedding-v4）又换了维度（512 → 1024），
+    /// 而这个阈值一动不动、五条既有判据也全绿 —— 因为它们只钉「值等于 0.55」，
+    /// 钉不住「0.55 还成立吗」。阈值作废了也**不会有人知道**：检索只是悄悄少给几块。
+    ///
+    /// 这条判据把标定上下文与**当前真实配置**绑在一起：模型名取自
+    /// `tools/embed_service.py` 的 MODEL，维度取自 `semantic::ddl::EMBED_DIM`。
+    /// 任一变化 ⇒ 当场红 ⇒ 逼下一手按注释里的量法重量一遍。
+    #[test]
+    fn the_vector_threshold_records_what_it_was_calibrated_on() {
+        let py = include_str!("../../../tools/embed_service.py");
+        let model_line = py
+            .lines()
+            .find(|l| l.starts_with("MODEL = "))
+            .expect("embed_service.py 里找不到 `MODEL = ` 那一行");
+        // 形如 MODEL = os.environ.get(...默认模型名在最后一对单引号里)。
+        // 用 char::from(39) 取单引号：源码里写单引号字面量要转义，转义在这一行里读着更容易看错
+        let model = model_line
+            .rsplit(char::from(39))
+            .nth(1)
+            .expect("MODEL 那一行取不到默认模型名");
+        // knowledge 不依赖 semantic（分层纪律），维度从 semantic 的 DDL 源文件里读 ——
+        // 那一行本身又被 `the_vector_dimension_is_declared_once` 钉着，链条闭合。
+        let ddl = include_str!("../../semantic/src/ddl.rs");
+        let dim_line = ddl
+            .lines()
+            .find(|l| l.starts_with("pub const EMBED_DIM"))
+            .expect("semantic/src/ddl.rs 里找不到 EMBED_DIM");
+        // 只取等号右边的数字：左边的 `u32` 里也有数字（第一版就被它坑成 321024）
+        let dim: String = dim_line
+            .rsplit_once('=')
+            .expect("EMBED_DIM 那一行没有等号")
+            .1
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        let want = format!("{model}@{dim}");
+        assert_eq!(
+            VEC_CALIBRATED_ON, want,
+            "向量空间已从 {VEC_CALIBRATED_ON} 变成 {want}，而 VEC_MAX_DIST={VEC_MAX_DIST} 还是旧空间上量的。             按注释里的量法重量一遍（判据块最远的那个 vs 远域 nohit 最近的那个，取缝的中点），             再把新数字与 VEC_CALIBRATED_ON 一起更新。"
+        );
+    }
+
 
     /// 🔴 图谱路与外部 KB 路必须与关系路共用同一条锚：**没有正文直接命中就不出候选**。
     ///
