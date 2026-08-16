@@ -278,6 +278,12 @@ pub enum Dimension {
     /// 市（`city` 列，318 个取值）。与 `State` 同一处置：**不进 `DIMENSIONS`**，
     /// 只给成员值探针与过滤用。
     City,
+    /// 商品分类（`class2` 列，39 个取值，以「…系列」结尾）。与行政省/城市同一处置：
+    /// **不进 `DIMENSIONS`**，只给成员值探针与过滤用 —— 分组口径仍旧 fail-closed
+    /// （见 `warehouse_catalog.md` §5，「各商品分类销量」不许被这条顺手放开）。
+    /// 🔴 与 `DW.dim_sku.class2`（19 个「…类」）取值**不相交**：那是另一张表的另一列，
+    /// 由实体卡（`entity/category.rs`）承接，两套值合并只会把白拒换成静默空结果。
+    Category,
     Month,
 }
 
@@ -307,6 +313,7 @@ impl Dimension {
             Self::Region => "sales_region",
             Self::State => "state",
             Self::City => "city",
+            Self::Category => "goods_category",
             Self::Month => "month",
         }
     }
@@ -322,6 +329,7 @@ impl Dimension {
             Self::Region => "省区",
             Self::State => "行政省",
             Self::City => "城市",
+            Self::Category => "商品分类",
             Self::Month => "月份",
         }
     }
@@ -347,6 +355,8 @@ impl Dimension {
             // 而「本月销售额最高的城市」「各城市本月销售额」此前被判「合同没有该维度」——
             // 把「没登记」讲成「库里没有」是错的。
             Self::City => &["城市", "各市", "按市", "地级市"],
+            // 刻意为空（与 State 同）：不参与自然语言维度匹配，只给成员值探针与过滤用
+            Self::Category => &[],
             Self::Month => &["按月", "每月", "每个月", "按月份", "各月", "月度"],
         }
     }
@@ -362,6 +372,7 @@ impl Dimension {
             Self::Region => "region",
             Self::State => "state",
             Self::City => "city",
+            Self::Category => "class2",
         }
     }
 
@@ -382,6 +393,7 @@ impl Dimension {
             // 而这一桶本月 4618 万、排行第一 —— 用户看到「销售额最高的城市：未知」
             // 只会以为系统坏了。只改 City 一处，其余维度这次不动。
             Self::City => "COALESCE(NULLIF(sf.city,''),'未登记城市')",
+            Self::Category => "COALESCE(NULLIF(sf.class2,''),'未分类')",
             Self::Month => "DATE_FORMAT(sf.order_date,'%Y-%m')",
         }
     }
@@ -397,6 +409,7 @@ impl Dimension {
             Self::CustomerCode | Self::Customer | Self::SkuCode | Self::Goods | Self::State => {
                 Some("未知")
             }
+            Self::Category => Some("未分类"),
             Self::City => Some("未登记城市"),
         }
     }
@@ -412,6 +425,8 @@ impl Dimension {
             Self::Region => "省区只取业务确认字段 region，空值归未归属；不得改用 state",
             Self::State => "行政省取 state（38 个取值，官方全称如「海南省」「新疆维吾尔自治区」）。它**不是**省区：region 是销售组织口径，与行政省多对一（广东省区含海南、浙江省区含上海、川渝藏大区含川渝藏）。只用于行政省过滤，不用于分组",
             Self::City => "城市取 city（318 个取值）。与行政省同一处置：只用于过滤与成员值探针，不参与自然语言维度匹配",
+            Self::Category => "商品分类取 class2（39 个取值，以「…系列」结尾）。与行政省/城市同一处置：只用于过滤与成员值探针，不参与分组 —— 分组口径仍旧 fail-closed。它与 DW.dim_sku.class2（19 个「…类」）取值不相交，后者由商品分类实体卡承接",
+            Self::Category => "商品分类取 class2（39 个取值，以「…系列」结尾）。与行政省/城市同一处置：只用于过滤与成员值探针，不参与分组 —— 分组口径仍旧 fail-closed。它与 DW.dim_sku.class2（19 个「…类」）取值不相交，后者由商品分类实体卡承接",
             Self::Month => "月份由 order_date 截取到 YYYY-MM",
         }
     }

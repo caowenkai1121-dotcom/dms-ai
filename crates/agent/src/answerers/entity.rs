@@ -139,6 +139,17 @@ struct ParsedEntity {
     value: String,
 }
 
+/// 商品分类的维度词前缀（「商品分类烤肠系列」里的「商品分类」）。
+/// 唯一事实源是 `ENTITY_PREFIXES` 里 `Kind::Category` 那几条 —— 抄第二份必漂：
+/// 那边今天就在剥「产品类型」，成员值探针若自己列一张表，同一个用户两种说法两种结果。
+pub(crate) fn category_noun_heads() -> Vec<&'static str> {
+    ENTITY_PREFIXES
+        .iter()
+        .filter(|(_, kind, _)| matches!(kind, Kind::Category))
+        .map(|(prefix, _, _)| *prefix)
+        .collect()
+}
+
 /// 顺序即最长前缀优先；短前缀永远放在同族长前缀之后。
 const ENTITY_PREFIXES: &[(&str, Kind, MatchField)] = &[
     ("商品分类", Kind::Category, MatchField::Name),

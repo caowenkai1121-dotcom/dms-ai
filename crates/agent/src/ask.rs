@@ -1266,11 +1266,17 @@ const OUT_OF_SCOPE_ROUTES: &[&str] = &["direct-derive", "llm", "llm+repair", "ll
 ///   各城市本月销售额   → 同上，拒答理由是「库里没有」，其实是没登记。
 /// 探针读的是**真数据**，新增取值自动跟上 —— 比再维护一张词表可靠。
 /// 组织口径排在行政口径前：老问法（省区/战区）不受影响。
-const PROBE_DIMS: [dms_semantic::sales_fact::Dimension; 4] = [
+const PROBE_DIMS: [dms_semantic::sales_fact::Dimension; 5] = [
     dms_semantic::sales_fact::Dimension::WarZone,
     dms_semantic::sales_fact::Dimension::Region,
     dms_semantic::sales_fact::Dimension::State,
     dms_semantic::sales_fact::Dimension::City,
+    // 🔴 商品分类排**最后**（2026-08-16）：地域列先探，撞名时地域优先（与「战区先于省区」
+    // 同一纪律），常见问句也就少一次往返。
+    // 它治的是「商品分类烤肠系列的销售额」「蛋挞系列卖了多少」这一族白拒 ——
+    // `sf.class2` 那 39 个「…系列」取值在 Rust 侧一个落点都没有，
+    // 而分组口径（「各商品分类销量」）仍旧 fail-closed：Category 不进 `DIMENSIONS`。
+    dms_semantic::sales_fact::Dimension::Category,
 ];
 
 /// 换文案判据（纯函数，故有单测）：空结果 + route 在圈内 + 无既有风险标注
@@ -1704,9 +1710,29 @@ fn dimension_probe_values(dim: dms_semantic::sales_fact::Dimension, word: &str) 
     // 调用点只传 `PROBE_DIMS` 里的四个；给 Dimension 加变体时这里必须同步，不许静默产空串
     debug_assert!(matches!(
         dim,
-        Dimension::WarZone | Dimension::Region | Dimension::State | Dimension::City
+        Dimension::WarZone
+            | Dimension::Region
+            | Dimension::State
+            | Dimension::City
+            | Dimension::Category
     ));
-    let stem = DIMENSION_NOUN_TAILS.iter().find_map(|t| word.strip_suffix(t)).unwrap_or(word);
+    // 分类值的维度词在**前缀**位（「商品分类烤肠系列」），与地域值的词尾位相反。
+    // 🔴 词表直接借 `ENTITY_PREFIXES` 里 `Kind::Category` 那四条（`category_noun_heads()`）——
+    // 另起一份必漂：那边今天就在剥「产品类型」，这边若自己列一张，同一个用户两种说法
+    // 会得到两种结果，正是本文件「剥词表必须与命中判据同一份」那条纪律要防的事。
+    let stem = DIMENSION_NOUN_TAILS
+        .iter()
+        .find_map(|tail| word.strip_suffix(tail))
+        .or_else(|| {
+            matches!(dim, Dimension::Category)
+                .then(|| {
+                    crate::answerers::entity::category_noun_heads()
+                        .iter()
+                        .find_map(|head| word.strip_prefix(head))
+                })
+                .flatten()
+        })
+        .unwrap_or(word);
     // 🔴 空候选一个都不许产（2026-08-15 生产 panic）：问句「本月销售额按省区」的残留就是
     // 「省区」本身，剥掉维度词尾之后 stem 是**空串** —— 它会被拼进 `IN ('省区','')`，
     // 探到一行 `city = ''` 就把空串当成员值返回，最终 `Predicate::eq(dim, "")` 触发
@@ -1844,10 +1870,22 @@ fn build_dimension_value_hit(
     for metric in metrics {
         intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Metric, metric.name());
     }
-    // `PROBE_DIMS` 恒是 WarZone/Region 两个地域列 —— 两者都归 Region 槽位。
-    // 将来这张表加了非地域维度，这里必须跟着分档（不许把商品分类值报成 Region）。
+    // 🔴 证据要按维度分档（2026-08-16 加 Category 时兑现）：不许把商品分类值报成 Region。
     debug_assert!(PROBE_DIMS.contains(&dim), "探针维度表变了，证据分档要跟着改");
-    intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Region, member);
+    if matches!(
+        dim,
+        dms_semantic::sales_fact::Dimension::WarZone
+            | dms_semantic::sales_fact::Dimension::Region
+            | dms_semantic::sales_fact::Dimension::State
+            | dms_semantic::sales_fact::Dimension::City
+    ) {
+        intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Region, member);
+    } else {
+        // 分类值是 fast 意图最可能塞进 `entity_mentions` 的东西，而 `ENTITY_COLUMNS`
+        // 里有 "category" 没有 "class2" → `entity_proved` 恒假 → `entity:烤肠系列`
+        // 进 unverifiable。而实体/地区未认领现在是**硬闸**（hits.rs），不报就当场白拒。
+        intent_evidence = intent_evidence.resolve(crate::intent::IntentSlotKind::Entity, member);
+    }
     // 🔴 同一个值再按 `Filter` 报一次：模型未必把它归成地域。实测「本月直营销售额」
     // 的合同写的是 `filters:[{name:"渠道类型", value:"直营"}]`，而 `filter_columns("渠道类型")`
     // 认不出这个名字 → 恒判 `unverifiable` → 一条 verified 的确定性答案被降成 review。
@@ -1889,11 +1927,25 @@ mod dimension_hit_evidence_tests {
             (Dimension::WarZone, "战区"),
             (Dimension::Region, "区域"),
             (Dimension::City, "市"),
+            // 分类的维度词在前缀位：单说「商品分类」剥完是空串，同一道闸要接住
+            (Dimension::Category, "商品分类"),
+            (Dimension::Category, "分类"),
         ] {
             let values = super::dimension_probe_values(dim, word);
             assert!(!values.is_empty(), "{word} 该有候选");
             assert!(values.iter().all(|v| !v.trim().is_empty()), "{word} 产出了空候选：{values:?}");
         }
+        // 🔴 分类是**前缀**剥（与地域的词尾位相反），而且词表借的是 `ENTITY_PREFIXES`
+        // 那份唯一事实源 —— 四种说法都要通，否则同一个用户两种说法两种结果。
+        for word in ["商品分类烤肠系列", "商品类型烤肠系列", "商品品类烤肠系列", "产品类型烤肠系列"] {
+            let values = super::dimension_probe_values(Dimension::Category, word);
+            assert!(values.iter().any(|v| v == "烤肠系列"), "{word} 该剥出裸值：{values:?}");
+        }
+        // 地域四维一个字都不许被前缀剥影响
+        assert_eq!(
+            super::dimension_probe_values(Dimension::Region, "商品分类烤肠系列"),
+            vec!["商品分类烤肠系列".to_string(), "商品分类烤肠系列省区".to_string()],
+        );
         // 空成员值不许装配成谓词
         assert!(super::build_dimension_value_hit(
             "本月销售额",
@@ -1928,6 +1980,23 @@ mod dimension_hit_evidence_tests {
         assert!(ev.proves(crate::intent::IntentSlotKind::Filter, "西北大区"), "{ev:?}");
         // 证据来自这次真的建进 SQL 的东西，不是照抄问句
         assert!(hit.sql.contains("西北大区"), "{}", hit.sql);
+
+        // 🔴 非地域维度必须报 **Entity** 不是 Region（2026-08-16 加商品分类时兑现）。
+        // `ENTITY_COLUMNS` 里有 "category" 没有 "class2" → `entity_proved` 恒假，
+        // 而分类值正是 fast 意图最可能塞进 `entity_mentions` 的东西；
+        // 实体未认领现在是硬闸（hits.rs），不报就当场白拒。
+        let category = super::build_dimension_value_hit(
+            "本月烤肠系列销售额",
+            Dimension::Category,
+            "烤肠系列",
+            &[Metric::SalesAmount],
+        )
+        .expect("该命中");
+        let ev = &category.intent_evidence;
+        assert!(ev.proves(crate::intent::IntentSlotKind::Entity, "烤肠系列"), "{ev:?}");
+        assert!(!ev.proves(crate::intent::IntentSlotKind::Region, "烤肠系列"), "分类值不许报成地域：{ev:?}");
+        assert!(ev.proves(crate::intent::IntentSlotKind::Filter, "烤肠系列"), "{ev:?}");
+        assert!(category.sql.contains("sf.class2") && category.sql.contains("'烤肠系列'"), "{}", category.sql);
     }
 }
 
