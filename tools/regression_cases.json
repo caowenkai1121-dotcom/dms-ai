@@ -1330,6 +1330,22 @@
       "q": "客户退出申请流程",
       "route": "knowledge",
       "note": "2026-08-16 业主实测：答成 200 行「退出申请金额」排行 + 深度 BI，三条验收断言全「未满足」，而库里就有《客户退出申请流程填写详细指引》。成因不在词表（「流程」在 DOC_NOUNS 里），在 R2 的否决键：模型把标题碎片「退出申请」「客户」当成槽位否决掉 doc-topic。现在否决要双条件，见 ask::doc_noun_claimed。"
+    },
+    {
+      "name": "W04-事实表商品编码不许白拒",
+      "login": "admin",
+      "q": "QY-HJXHPSDTP600G本月销量",
+      "route": "direct-agg",
+      "min_rows": 1,
+      "note": "2026-08-16 跨入口度量：裸编码三入口全 need-intent。成因是成员值探针表只有地域四维+商品分类，实体卡查的 t_goods(2883 行) 与事实表是两套编码空间。修法是让事实表自己当成员值事实源（PROBE_DIMS 加 SkuCode/Goods/CustomerCode/Customer）。"
+    },
+    {
+      "name": "W05-带规格的商品名不许被削掉数字",
+      "login": "admin",
+      "q": "牛油蛋挞皮600g本月销量",
+      "route": "direct-agg",
+      "min_rows": 1,
+      "note": "2026-08-16 跨入口度量：三入口全出「不可计算·未能识别的限定「牛油蛋挞皮g」」——注意残留里 600 被数字过滤器吃掉了。规格数字是商品名的一部分，值探针那一侧必须保留数字（residue_after_strip_with）。"
     }
   ],
   "rules": [

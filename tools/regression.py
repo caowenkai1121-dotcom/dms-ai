@@ -45,7 +45,7 @@ def _check_argv(args):
     """未知 `--xxx` 旗标当场报错：`--fliter` 打错若被静默忽略 = 不过滤跑全量，
     而「filter 打错」预检拦得住打错的**关键词**，拦不住打错的**旗标本**。"""
     takes_value = {"--cases", "--filter", "--slice", "--bless"}
-    known = takes_value | {"--bless-all", "--selfcheck", "--yes", "--http"}
+    known = takes_value | {"--bless-all", "--selfcheck", "--yes", "--http", "--entries"}
     i = 0
     while i < len(args):
         a = args[i]
@@ -342,7 +342,27 @@ def _ask_timeout():
 # 身份走 `X-API-Key`（settings.docker.json 的 mcp_keys 明文键名 → login）。
 # 一把 key 只映射一个 login，所以本档**只跑 login=admin 的题**，其余诚实跳过而不是假绿。
 HTTP = "--http" in argv
+# 🔴 跨入口一致性档（业主 2026-08-16 原话：「同一个问题无论是小程序还是 web 端答案
+# 应该都是一样的，不然口径不一致，那么系统就没意义了」）：同一题打三个 HTTP 入口，
+# (route, 行数, 首格) 必须逐字相同。判官走 CLI 一个入口都验不到这件事。
+ENTRIES_MODE = "--entries" in argv
+ENTRIES = ["ask", "stream", "mcp"]
 API_KEY = os.environ.get("DMSAI_API_KEY", "")
+
+
+def entries_verdict(c):
+    """同一题打三个入口 → (通过?, 详情)。不一致 = 红。
+
+    只比 (route, 行数, 首格)：wire 形状按入口不同（AskResult 壳 / 整份 Answer / MCP 文本），
+    比全文会把协议差异误报成口径不一致；而**口径**就是这三样。"""
+    seen = {}
+    for entry in ENTRIES:
+        seen[entry] = entry_shape(ask_entry(c, entry))
+    shapes = set(seen.values())
+    detail = " | ".join(f"{k}={v[0]}:{v[1]}" for k, v in seen.items())
+    if len(shapes) == 1:
+        return True, f"三入口一致 {detail}"
+    return False, f"口径不一致 {detail}"
 
 
 def http_skip_reason(c):
@@ -356,6 +376,82 @@ def http_skip_reason(c):
     if c.get("type"):
         return f"type={c['type']} 题不走问答端点"
     return None
+
+
+def ask_entry(c, entry):
+    """把同一题打到指定入口，返回与 CLI 同形的 AskResult JSON。
+
+    🔴 为什么要**多入口**（业主 2026-08-16 原话：「同一个问题无论是小程序还是 web 端
+    答案应该都是一样的，不然口径不一致，那么系统就没意义了」）：
+    HTTP 那条路上曾经有六个 handler、三种管线形状，判官走 CLI 一个都看不见。
+    实测同一句「180524本月销售额」三个入口给过 2×direct-agg + 1×need-intent。
+    """
+    import urllib.error
+    import urllib.request
+
+    base = os.environ.get("DMSAI_BASE", "http://172.17.0.1:8100")
+    if entry == "mcp":
+        path, payload = "/api/mcp", {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "ask", "arguments": {"question": c["q"]}},
+        }
+    else:
+        path = "/api/ask/stream" if entry == "stream" else "/api/ask"
+        payload = {"question": c["q"], "role_code": c.get("role") or None}
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "X-API-Key": API_KEY},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_ask_timeout()) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            ctype = resp.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP {e.code}：{e.read().decode('utf-8','replace')[:300]}"}
+    except Exception as e:
+        return {"error": f"HTTP 传输失败：{str(e)[:300]}"}
+    if entry == "mcp":
+        try:
+            body = json.loads(raw)
+            text = ((body.get("result") or {}).get("content") or [{}])[0].get("text") or ""
+            return json.loads(text)
+        except Exception as e:
+            return {"error": f"MCP 回包不是预期形状（{type(e).__name__}）：{raw[:200]}"}
+    if "event-stream" in ctype:
+        # 资料问句的流式档：末个 done 事件里的 answer 就是终态
+        answer = None
+        for line in raw.splitlines():
+            if not line.startswith("data:"):
+                continue
+            try:
+                ev = json.loads(line[5:].strip())
+            except Exception:
+                continue
+            if isinstance(ev, dict) and ev.get("answer"):
+                answer = ev["answer"]
+        return answer or {"error": "SSE 没有 done 事件"}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"error": f"回包不是 JSON：{raw[:200]}"}
+
+
+def entry_shape(j):
+    """答案 → 可跨入口比对的三元组（route, 行数, 首格）。
+
+    只比这三样是刻意的：wire 形状按入口不同（AskResult 壳 / 整份 Answer / MCP 文本），
+    而**口径**就是这三样。比全文会把协议差异误报成口径不一致。"""
+    if not isinstance(j, dict):
+        return ("?", None, None)
+    route = j.get("route") or ("knowledge" if j.get("kind") == "text" else "?")
+    rows = j.get("rows") or []
+    first = rows[0][0] if rows and rows[0] else None
+    if route == "knowledge":
+        body = j.get("body") or {}
+        md = body.get("markdown") or j.get("markdown") or ""
+        first = md[:40].replace(chr(10), " ")
+    return (route, j.get("row_count"), first)
 
 
 def ask_http(c):
@@ -634,10 +730,14 @@ def run_case(c, results):
         results.append((name, None, "embed 服务缺席跳过")); return
     if c.get("requires_graph") and not GRAPH_UP:
         results.append((name, None, "PG 容器缺席跳过")); return
-    if HTTP:
+    if HTTP or ENTRIES_MODE:
         why = http_skip_reason(c)
         if why:
-            results.append((name, None, f"HTTP 档跳过：{why}")); return
+            label = "跨入口档" if ENTRIES_MODE else "HTTP 档"
+            results.append((name, None, f"{label}跳过：{why}")); return
+    if ENTRIES_MODE:
+        ok, detail = entries_verdict(c)
+        results.append((name, ok, detail)); return
 
     if c.get("type") == "gate":
         ok, detail = gate_verdict(c["gate_sql"])
