@@ -220,6 +220,11 @@ pub fn stock_product_unavailable(fragment: &str, reason: &str) -> DirectHit {
 /// 而这些 SQL 是代码写死的、指标名就是它自己写的列别名（生产回归 E10 的最后一格）。
 ///
 /// 六个 return 各写一遍必漂：证据取自**产出的 SQL 别名本身**，一处收口。
+/// 兜底桶的字面量。**只许写这一处**：`COALESCE(NULLIF(x,''),'未知')` 造出来的不是成员，
+/// 是「这些行没登记」。排行要排掉它、分布要留着它，两处判据都得引同一个字面量，
+/// 抄第二遍就会漂（2026-08-16 城市那条就是只改了一边）。
+const UNREGISTERED_BUCKET: &str = "未知";
+
 pub fn stock_snapshot(question: &str) -> Option<DirectHit> {
     let mut hit = stock_snapshot_sql(question)?;
     let metric = if hit.sql.contains("`库存金额`") { "库存金额" } else { "库存量" };
@@ -353,20 +358,30 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
         None => format!("deleted_flag = 0 AND {latest}"),
     };
     if grouped_warehouse {
-        return Some(hit(
-            format!(
-                "SELECT COALESCE(NULLIF(warehouse_name,''),'未知') AS `仓库`, \
-                        SUM({column}) AS `{label}` \
-                 FROM t_winc_stock_report WHERE {where_sql} \
-                 GROUP BY COALESCE(NULLIF(warehouse_name,''),'未知') \
-                 ORDER BY `{label}` {} LIMIT {}",
-                rank_direction(question),
-                ranking_limit(question)
-            ),
-            "direct-agg",
-        ));
+        // 🔴 **合成兜底桶不许占名次**（2026-08-17 审计；与 2026-08-16「最高的城市答『未知』」
+        // 是同一个病，那次只修了 sales_fact 一边）。
+        //
+        // `COALESCE(…,'未知')` 造出来的不是一个成员，是「这些行没登记仓库名」。
+        // 而 grouped_warehouse 的触发词里就有 哪个/最高/最多/排行/top/前N ——
+        // 这条 SQL 确确实实在发名次。榜首返回「未知」，用户读成「有个仓库叫未知」
+        // 或者「系统坏了」，真实的第一名被挤到第二。
+        //
+        // 排掉它，同时把「被排掉的那一桶有多少」用同窗同谓词的单值查询挂进 detail ——
+        // **排除必须说出来**，否则合计对不上又成了另一个谜。
+        let bucket = format!("COALESCE(NULLIF(warehouse_name,''),'{UNREGISTERED_BUCKET}')");
+        let ranked = format!(
+            "SELECT {bucket} AS `仓库`, SUM({column}) AS `{label}`              FROM t_winc_stock_report WHERE {where_sql} AND {bucket} <> '{UNREGISTERED_BUCKET}'              GROUP BY {bucket} ORDER BY `{label}` {} LIMIT {}",
+            rank_direction(question),
+            ranking_limit(question)
+        );
+        let excluded = format!(
+            "SELECT '{UNREGISTERED_BUCKET}' AS `仓库`, SUM({column}) AS `{label}`              FROM t_winc_stock_report WHERE {where_sql} AND {bucket} = '{UNREGISTERED_BUCKET}'"
+        );
+        return Some(DirectHit { detail: Some(excluded), ..hit(ranked, "direct-agg") });
     }
     if grouped_province {
+        // 省份那支是**分布**不是名次（无 LIMIT），按同一条裁决可以留桶 ——
+        // 排行发名次才必须排掉；分布排掉反而把「有多少没登记」这件事藏起来。
         return Some(hit(
             format!(
                 "SELECT COALESCE(NULLIF(province,''),'未知') AS `省份`, \
@@ -432,6 +447,29 @@ pub fn stock_product_snapshot(sku_predicate: &str, surface: &str) -> DirectHit {
 
 #[cfg(test)]
 mod warehouse_group_tests {
+    /// 🔴 排行不许把合成兜底桶发成名次（2026-08-17 审计）。
+    ///
+    /// 与 2026-08-16「本月销售额最高的城市：未知」是同一个病 —— 那次只修了 sales_fact 一边，
+    /// 库存这边照旧。`COALESCE(…,'未知')` 造出来的不是一个仓库，是「这些行没登记仓库名」。
+    /// 榜首返回「未知」，用户读成「有个仓库叫未知」，真实第一名被挤到第二。
+    #[test]
+    fn a_warehouse_ranking_never_awards_a_place_to_the_synthetic_bucket() {
+        let hit = stock_snapshot("库存金额最高的10个仓库").expect("该命中仓库排行");
+        assert!(
+            hit.sql.contains("<> '未知'"),
+            "合成桶不许占名次：{}",
+            hit.sql
+        );
+        assert!(
+            hit.detail.as_deref().is_some_and(|d| d.contains("= '未知'")),
+            "被排掉的那一桶必须单独说出来，否则合计对不上又成了一个谜：{:?}",
+            hit.detail
+        );
+        // 省份那支是分布不是名次：留桶（排掉反而把「有多少没登记」藏起来）
+        let dist = stock_snapshot("各省份库存量分布").expect("该命中省份分布");
+        assert!(!dist.sql.contains("<> '未知'"), "分布不该排掉兜底桶：{}", dist.sql);
+    }
+
     use super::*;
 
     /// 「各仓库/按仓库」是分组诉求，不是排行诉求。

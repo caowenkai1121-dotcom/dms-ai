@@ -280,7 +280,15 @@ mod tests {
         assert!(warehouses.sql.contains("AS `仓库`"), "{}", warehouses.sql);
         assert!(warehouses.sql.contains("GROUP BY COALESCE(NULLIF(warehouse_name,''),'未知')"), "{}", warehouses.sql);
         assert!(warehouses.sql.contains("ORDER BY `库存金额` DESC LIMIT 10"), "{}", warehouses.sql);
-        assert!(warehouses.detail.is_none());
+        // 2026-08-17 反转：合成兜底桶不许占名次，而**被排掉的那一桶必须能单独看到**
+        // （detail 挂同窗同谓词的单值查询）。原来这里断言 detail 为空 ——
+        // 那是「排行榜首可能是『未知』」那一版的形状。
+        assert!(warehouses.sql.contains("<> '未知'"), "合成桶不许占名次：{}", warehouses.sql);
+        assert!(
+            warehouses.detail.as_deref().is_some_and(|d| d.contains("= '未知'")),
+            "被排掉的那一桶必须单独说出来：{:?}",
+            warehouses.detail
+        );
 
         let largest = stock_snapshot("库存金额最大的7个仓库").expect("最大仓库排行不能退化成库存总额");
         assert!(largest.sql.contains("AS `仓库`"), "{}", largest.sql);
@@ -291,7 +299,13 @@ mod tests {
             let low = stock_snapshot(&q).unwrap_or_else(|| panic!("低值仓库排行未识别：{q}"));
             assert!(low.sql.contains("AS `仓库`"), "{q}: {}", low.sql);
             assert!(low.sql.contains("ORDER BY `库存金额` ASC LIMIT 10"), "{q}: {}", low.sql);
-            assert!(low.detail.is_none(), "低值排行的主结果就是仓库明细：{q}");
+            // 同上：低值排行同样排掉合成桶，并把被排掉的那一桶挂进 detail。
+            // 「未知」在低值榜上一样会占名次（而且更容易占 —— 没登记的行往往量也小）。
+            assert!(low.sql.contains("<> '未知'"), "{q}: 合成桶不许占名次：{}", low.sql);
+            assert!(
+                low.detail.as_deref().is_some_and(|d| d.contains("= '未知'")),
+                "{q}: 被排掉的那一桶必须单独说出来"
+            );
         }
     }
 
