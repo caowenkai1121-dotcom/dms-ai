@@ -2212,9 +2212,34 @@ const ENTITY_COLUMNS: &[&str] = &[
 /// evidence 恒空 → **每一个带客户名/商品名的自由问句都硬失败**（2026-08-13 实测
 /// 「山西省的烤肠卖给了哪些客户」：无法证明 entity:烤肠）。SQL 里有名称谓词就是证明。
 fn entity_proved(surface: &str, predicates: &[PredicateProof]) -> bool {
-    predicates
-        .iter()
-        .any(|predicate| predicate.has_value(surface) && predicate.has_column(ENTITY_COLUMNS))
+    // 🔴 单号是**自证**的（2026-08-16，C03 追了一整天的那条）：
+    // 「HJXH-DSO2026080300838*2」的单据卡 SQL 是
+    //   `WHERE r.ywzt_order = 'HJXH-DSO…*2' OR r.base_ref_order = 'HJXH-DSO…*2'`,
+    // 值就在谓词里、一个字不差 —— 但 `ywzt_order` / `base_ref_order` 不含
+    // ENTITY_COLUMNS 里任何一个词根（那张表是给客户名/商品名设计的），
+    // 于是「证不出来」→ `unclaimed_scope()` 硬拦 → `land` 回落 → direct-doc **miss**
+    // → 整题落反问卡。而同一句话在 CLI 上是好的 —— 差别只在那一轮模型有没有把单号
+    // 抽成 entity（抽了就死，没抽反而活），所以它表现为「时好时坏、换台机器就变」。
+    //
+    // 判据不按列名扩表（`order`/`bill`/`invoice`… 加不完，还会把 `order_status` 这类
+    // 状态列一起放进来），而是问 `document::resolve_code`：**这个表面词本身是不是一个
+    // 合法单号**。是单号，那它被拿去等值比较的那一列按定义就是单号列。
+    // 自证那一支用 `has_value_exact`：单号「差一个字符就是另一个单」——
+    // `has_value` 的模糊匹配会让 base 号 `HJXH-DSO…838` 证明拆单号 `HJXH-DSO…838*2`，
+    // 而这两个正是本仓明写过的「静默查错表返错数」那一对。
+    let self_evident = surface_is_document_code(surface);
+    predicates.iter().any(|predicate| {
+        (self_evident && predicate.has_value_exact(surface))
+            || (predicate.has_value(surface) && predicate.has_column(ENTITY_COLUMNS))
+    })
+}
+
+/// 表面词本身是否是一个合法单号（两种数据面各问一次：数仓独有的拆单号只在
+/// `warehouse=true` 下成立，生产独有的族只在 `false` 下成立）。
+fn surface_is_document_code(surface: &str) -> bool {
+    let s = surface.trim();
+    dms_semantic::document::resolve_code(s, true).is_some()
+        || dms_semantic::document::resolve_code(s, false).is_some()
 }
 
 /// 投影里有没有聚合函数。`unverifiable` 降级为 review 的前提护栏：
@@ -2660,6 +2685,41 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 单号自证（C03，2026-08-16 追了一整天）：单据卡的 SQL 把单号放在
+    /// `ywzt_order` / `base_ref_order` 上做等值，而那两列不含 ENTITY_COLUMNS 的任何词根，
+    /// 于是「用户写的实体没被 SQL 认领」→ 硬拦 → direct-doc 回落 → 反问卡。
+    /// 表现是「同一句话 CLI 好、网页坏」，其实差别只在那一轮模型有没有把单号抽成 entity。
+    #[test]
+    fn a_document_code_proves_itself_on_any_column() {
+        use super::{entity_proved, PredicateProof};
+        let doc = PredicateProof {
+            text: "r.ywzt_order = 'HJXH-DSO2026080300838*2'".into(),
+            columns: vec!["ywzt_order".into()],
+            values: vec!["HJXH-DSO2026080300838*2".into()],
+        };
+        assert!(
+            entity_proved("HJXH-DSO2026080300838*2", std::slice::from_ref(&doc)),
+            "单号被拿去等值比较的那一列，按定义就是单号列"
+        );
+        // 🔴 base 号不许被拆单号证明：自证那一支是**精确**等值。
+        // 这两个号本仓明写过 —— 丢掉 `*2` 就从 WarehouseShipment 静默变成 SalesOrder，
+        // 查错表返错数（`triage::code_tokens` 的红字）。
+        assert!(!entity_proved("HJXH-DSO2026080300838", std::slice::from_ref(&doc)));
+        // 非单号的表面词照旧要落在名称型列上（这条不许被上面那条带松）
+        let noname = PredicateProof {
+            text: "o.order_status = '小虎烤肠'".into(),
+            columns: vec!["order_status".into()],
+            values: vec!["小虎烤肠".into()],
+        };
+        assert!(!entity_proved("小虎烤肠", std::slice::from_ref(&noname)));
+        let named = PredicateProof {
+            text: "d.sku_name LIKE '%小虎烤肠%'".into(),
+            columns: vec!["sku_name".into()],
+            values: vec!["小虎烤肠".into()],
+        };
+        assert!(entity_proved("小虎烤肠", std::slice::from_ref(&named)));
+    }
 
     /// 光杆维度词不许留在 entity_mentions 里 —— 留着 coverage 恒 blocked，
     /// 确定性那条臂整条哑掉且不报错（2026-08-16 回归 E04/E17/SALE17/C07 四题同因）。

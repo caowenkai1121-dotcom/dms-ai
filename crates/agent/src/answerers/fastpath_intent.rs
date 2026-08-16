@@ -1159,8 +1159,14 @@ pub fn direct_hit<'a>(cx: &'a crate::ctx::AskCtx<'a>) -> dms_kernel::BoxFut<'a, 
         // 下一步要的就是这行：进来的问句到底是什么、warehouse 位是什么。
         // 开法：`docker run … --env RUST_LOG=dms_agent=debug`（默认级别下它不打）。
         let wh = cx.source.is_warehouse();
-        tracing::debug!(question = %cx.question, warehouse = wh, "direct_hit 入参");
-        match try_direct_for(cx.question, wh) {
+        let probe = try_direct_for(cx.question, wh);
+        tracing::debug!(
+            question = %cx.question,
+            warehouse = wh,
+            hit = probe.as_ref().map(|h| h.sql.chars().take(60).collect::<String>()).unwrap_or_else(|| "None".into()),
+            "direct_hit 入参与 try_direct_for 结果"
+        );
+        match probe {
             // 「未确认限定」兜底卡：残留可能只是客户名。先探一次主档，探明是客户就改走
             // 共享事实合同；探不到再试 ODS 推导，推导也不成照旧返回这张卡（fail-closed 语义不变）。
             // 顺序即行为：合同（共享事实）永远在推导之前，推导只是合同缺失时的降级。
