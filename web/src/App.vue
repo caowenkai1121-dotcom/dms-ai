@@ -3348,7 +3348,7 @@ function exportSupplementalCsv(t: Turn) {
 
     <div v-if="loginVisible" class="login-mask" role="dialog" aria-modal="true" aria-label="登录">
       <form class="login-box" @submit.prevent="passwordLogin">
-        <div class="login-brand">皇家小虎</div>
+        <div class="login-brand"><img src="/logo.png" alt="" width="34" height="34" />皇家小虎</div>
         <h1>DMS 数据智能</h1>
         <p>使用 DMS 账号登录，数据权限与 DMS 完全一致</p>
         <template v-if="!loginRoles.length">
@@ -3806,9 +3806,20 @@ function exportSupplementalCsv(t: Turn) {
 .think-step.current { color: var(--text-primary); }
 .think-step.current .ts-ok { animation: thinkPulse 1.1s ease-in-out infinite; }
 @keyframes thinkPulse { 50% { opacity: .35; transform: translateX(2px); } }
-.login-mask { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; background: color-mix(in srgb, var(--bg-body) 92%, transparent); backdrop-filter: blur(8px); padding: 20px; }
-.login-box { width: min(400px, 100%); background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 24px 70px rgba(20, 28, 50, .16); padding: 34px 36px 36px; }
-.login-brand { color: var(--primary); font-size: 13px; font-weight: 700; margin-bottom: 18px; }
+/* 登录页铺品牌图。主体（虎 + 字标）在图的**左半边**，所以卡片靠右放 ——
+   居中会正好压住脸。窄屏没有右半边可站，退回居中并压一层暗罩保对比度。 */
+.login-mask { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center end; padding: 20px clamp(20px, 7vw, 110px);
+  background: url('/login-bg.jpg') center left / cover no-repeat, var(--bg-body); }
+/* 图是品牌资产，不做模糊/去色：只在卡片一侧压一层同色渐变，让白卡不糊在亮黄上 */
+.login-mask::before { content: ''; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(90deg, transparent 40%, rgba(120, 78, 0, .22) 100%); }
+.login-box { position: relative; width: min(400px, 100%); background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 24px 70px rgba(60, 40, 0, .28); padding: 34px 36px 36px; }
+.login-brand { display: flex; align-items: center; gap: 9px; color: var(--primary); font-size: 15px; font-weight: 700; margin-bottom: 18px; }
+.login-brand img { border-radius: 8px; }
+@media (max-width: 900px) {
+  .login-mask { place-items: center; padding: 20px; background-position: center center; }
+  .login-mask::before { background: rgba(20, 14, 0, .34); }
+}
 .login-box h1 { margin: 0 0 8px; color: var(--text-primary); font-size: 24px; letter-spacing: 0; }
 .login-box > p { margin: 0 0 26px; color: var(--text-muted); font-size: 13px; line-height: 1.6; }
 .login-box label { display: flex; flex-direction: column; gap: 7px; margin-bottom: 16px; }
