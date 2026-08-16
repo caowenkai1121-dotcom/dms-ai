@@ -136,6 +136,27 @@ pub async fn land(
         );
         return Ok(None);
     }
+    // 🔴 用户**明写的实体/地区**没被 SQL 认领 → 回落下一成员（2026-08-16）。
+    //
+    // 此前这一类只落 `unverifiable` → `needs_review()` → 照常出数、收据降 review。
+    // 而「湖南省区市场费用」答成全国 1.04 亿（真值 111 万）、「180135本月销售额」
+    // 答成全公司 6.34 亿（真值 7.2 万）都是这一档：**抽到了、没用上、也没拦**，
+    // 单值 KPI，用户无从察觉。少给一个数（metric/comparison/detail）与答成另一个人的数
+    // 不是一回事，所以只硬拦这两类 —— 分档的完整理由见 `CoverageReport::unclaimed_scope`。
+    //
+    // 回落而不是出拒答卡：与上面那条硬闸同一个出口。自由 SQL 那条路上还有 `run.rs` 的
+    // 覆盖闸兜底（对 LLM SQL 读不懂就硬拦），比在这里新造一张卡的面小得多。
+    if !unavailable && !coverage.only_unreadable() {
+        let unclaimed = coverage.unclaimed_scope();
+        if !unclaimed.is_empty() {
+            tracing::warn!(
+                route = %hit.route, ?unclaimed, evidence = ?planned_evidence,
+                sql = %hit.sql.chars().take(200).collect::<String>(),
+                "确定性模板未认领用户明写的实体/地区 → 回落下一成员"
+            );
+            return Ok(None);
+        }
+    }
     if coverage.only_unreadable() {
         tracing::warn!(route = %hit.route, sql = %hit.sql, "覆盖闸读不懂模板 SQL → 照常执行，收据标 review");
     }
@@ -664,6 +685,50 @@ mod unavailable_card_tests {
     /// **名字像**的字段替代 —— 实测「本月开票金额」被答成
     /// `fin_ads.ads_fin_profit_loss_dnf.financial_income` 的合计，收据还是 verified。
     /// 正是这张卡当初要拦的那件事。
+    #[test]
+    /// 「用户明写的实体/地区没被 SQL 认领」要硬拦，其余 `unverifiable` 分档照旧软降级。
+    ///
+    /// 🔴 分档不是取舍是纪律：少给一个数（metric/comparison/detail）与**答成另一个人的数**
+    /// 不是一回事。`filter:` 刻意不在内 —— `filter_columns` 认不出名字时无条件进 unverifiable，
+    /// 那一类永远无法从 SQL 证明，当硬闸会把「本月直营销售额」这一大族翻成拒答。
+    /// `ambiguity:` 也不在内（E10 已裁决：模型说不确定 ≠ 证明为错，答案照出）。
+    #[test]
+    fn unclaimed_entity_or_region_is_blocking_but_the_soft_buckets_are_not() {
+        use crate::intent::CoverageReport;
+        let scoped = CoverageReport {
+            unverifiable: vec!["entity:小虎烤肠".into(), "region:湖南省区".into()],
+            ..Default::default()
+        };
+        assert_eq!(scoped.unclaimed_scope().len(), 2);
+        let soft = CoverageReport {
+            unverifiable: vec![
+                "metric:销售额".into(),
+                "comparison:同比".into(),
+                "detail:result-shape".into(),
+                "ambiguity:指代不明".into(),
+                "filter:渠道类型=直营".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(soft.unclaimed_scope().is_empty(), "软降级那五档不许被硬拦：{soft:?}");
+        assert!(CoverageReport::default().unclaimed_scope().is_empty());
+        // 闸门自己读不懂 SQL 那一档结构上进不来（四桶里只有 conflicts 有东西）
+        let unreadable = CoverageReport {
+            conflicts: vec!["sql:coverage-unverifiable".into()],
+            ..Default::default()
+        };
+        assert!(unreadable.unclaimed_scope().is_empty());
+
+        // 落点：`land` 里必须与「不可计算」卡和 only_unreadable 两条豁免同处一段
+        let src = include_str!("hits.rs");
+        let body = src.split("pub async fn land(").nth(1).expect("land 没了");
+        assert!(
+            body.contains("if !unavailable && !coverage.only_unreadable() {")
+                && body.contains("coverage.unclaimed_scope()"),
+            "实体/地区硬闸没了，或者丢了那两条豁免"
+        );
+    }
+
     #[test]
     fn unavailable_card_bypasses_the_coverage_gate() {
         let src = include_str!("hits.rs");

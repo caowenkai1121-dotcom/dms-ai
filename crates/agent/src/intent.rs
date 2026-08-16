@@ -1941,6 +1941,24 @@ impl CoverageReport {
             && !self.conflicts.is_empty()
     }
 
+    /// 用户**明写出来的范围限定**没被 SQL 认领：实体名与地区名这两类。
+    ///
+    /// 🔴 与其余 `unverifiable` 分档的理由（2026-08-16）：
+    /// - `metric:` / `comparison:` / `detail:` —— 兑现不了顶多是少给一个数，不改变「答的是谁」；
+    /// - `ambiguity:` —— 「模型说它不确定」是无法证明，不是证明为错（E10 已裁决：答案照出）；
+    /// - `filter:` —— `filter_columns` 认不出名字时**无条件**进 unverifiable，而那一类
+    ///   永远无法从 SQL 证明（唯一出路是 `evidence.proves(Filter, …)`，全仓只有一处登记）。
+    ///   拿它当硬闸会把「本月直营销售额」这一大族当场翻成拒答。
+    /// - `entity:` / `region:` —— 用户写了「小虎烤肠」「湖南省」，SQL 里一个字都没有，
+    ///   答出来的是**另一个问题的数**，而且是单值 KPI，用户无从察觉。这一类才配硬拦。
+    pub fn unclaimed_scope(&self) -> Vec<&str> {
+        self.unverifiable
+            .iter()
+            .filter(|issue| issue.starts_with("entity:") || issue.starts_with("region:"))
+            .map(String::as_str)
+            .collect()
+    }
+
     /// 软降级：证不出来，但也没有证据表明模型删了用户的限定。放行执行，收据降 review，
     /// 缺口逐条写进 `IntentSummary.coverage.issues`（前端「问题理解与结果依据」直接读它）。
     pub fn needs_review(&self) -> bool {
