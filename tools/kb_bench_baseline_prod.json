@@ -1,0 +1,3104 @@
+{
+  "meta": {
+    "version": 1,
+    "tool": "tools/kb_bench.py",
+    "created_at": "2026-08-16T10:35:45+00:00",
+    "base": "http://172.17.0.1:8100",
+    "source": "/api/kb/search",
+    "login": "admin",
+    "k": 6,
+    "cases_path": "/opt/dms-ai/prod_cases.json",
+    "cases_total": 56,
+    "cases_stale": 0,
+    "cases_run": 56,
+    "search_errors": 0,
+    "judge": false
+  },
+  "metrics": {
+    "recall@k": 0.9821,
+    "precision@k": 0.1637,
+    "mrr": 0.7348
+  },
+  "per_case": [
+    {
+      "id": "272c1fdacc7a",
+      "question": "售后登记表里需要记录哪些关于产品本身的信息？",
+      "doc_name": "售后登记模板.xlsx",
+      "gold_chunk_id": 1646,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1646,
+          "doc_name": "售后登记模板.xlsx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1084,
+          "doc_name": "客户下单及售后全流程指引.docx",
+          "score": 0.03053613007068634,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1653,
+          "doc_name": "客户下单及售后全流程指引.docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1735,
+          "doc_name": "线下复杂客诉反馈流程指引.pdf",
+          "score": 0.013888888992369175,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1610,
+          "doc_name": "售后事项申请流程指引.docx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1716,
+          "doc_name": "样品、物料商城小程序指引.docx",
+          "score": 0.016129031777381897,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "6e520900cf7a",
+      "question": "登记售后问题时，除了问题描述和数量，还需要上传哪几张图片？",
+      "doc_name": "售后登记模板.xlsx",
+      "gold_chunk_id": 1646,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1646,
+          "doc_name": "售后登记模板.xlsx",
+          "score": 0.03154495730996132,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1610,
+          "doc_name": "售后事项申请流程指引.docx",
+          "score": 0.03226646035909653,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1307,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.012820512987673283,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1735,
+          "doc_name": "线下复杂客诉反馈流程指引.pdf",
+          "score": 0.031054403632879257,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1480,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1931,
+          "doc_name": "企业微信截图_17851466294353.png",
+          "score": 0.02808326855301857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "8e356820e886",
+      "question": "皇家小虎火山石肉肠有哪些规格和口味？",
+      "doc_name": "售后登记模板.xlsx",
+      "gold_chunk_id": 1647,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1504,
+          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
+          "score": 0.04865150526165962,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1647,
+          "doc_name": "售后登记模板.xlsx",
+          "score": 0.04715356230735779,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1493,
+          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
+          "score": 0.0314980149269104,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1533,
+          "doc_name": "产品工厂.xlsx",
+          "score": 0.04529532790184021,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1806,
+          "doc_name": "重申皇家小虎建议终端销售底价通知.pdf",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1293,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "7da4d9eb78ba",
+      "question": "有没有400g规格的皇家小虎烤肠或肉肠产品？",
+      "doc_name": "售后登记模板.xlsx",
+      "gold_chunk_id": 1647,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1647,
+          "doc_name": "售后登记模板.xlsx",
+          "score": 0.03154495730996132,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1493,
+          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
+          "score": 0.032522473484277725,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1496,
+          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
+          "score": 0.028693530708551407,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1533,
+          "doc_name": "产品工厂.xlsx",
+          "score": 0.02991071343421936,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1806,
+          "doc_name": "重申皇家小虎建议终端销售底价通知.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 2100,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.01515151560306549,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "17c8f7784ee4",
+      "question": "皇家小虎猪肉大葱水饺有1kg装的吗？",
+      "doc_name": "售后登记模板.xlsx",
+      "gold_chunk_id": 1649,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1647,
+          "doc_name": "售后登记模板.xlsx",
+          "score": 0.04865150526165962,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1540,
+          "doc_name": "产品工厂.xlsx",
+          "score": 0.04483232647180557,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1496,
+          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
+          "score": 0.0476270467042923,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1564,
+          "doc_name": "冰淇淋箱拆单标准.xlsx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1543,
+          "doc_name": "产品工厂.xlsx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1493,
+          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
+          "score": 0.02817460335791111,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "b90a950e1023",
+      "question": "500g装的皇家小虎烤肠是什么口味的？",
+      "doc_name": "售后登记模板.xlsx",
+      "gold_chunk_id": 1649,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1647,
+          "doc_name": "售后登记模板.xlsx",
+          "score": 0.03177805617451668,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1533,
+          "doc_name": "产品工厂.xlsx",
+          "score": 0.029877368360757828,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1493,
+          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
+          "score": 0.04515994340181351,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1806,
+          "doc_name": "重申皇家小虎建议终端销售底价通知.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1561,
+          "doc_name": "冰淇淋箱拆单标准.xlsx",
+          "score": 0.014492753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1563,
+          "doc_name": "冰淇淋箱拆单标准.xlsx",
+          "score": 0.014285714365541935,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "be02facac8fd",
+      "question": "在云之家提交鲜食专业客户认证时，'累计投放设备数'具体指的是什么？",
+      "doc_name": "线下鲜食专业客户认证流程指引.docx",
+      "gold_chunk_id": 1791,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1342,
+          "doc_name": "线下鲜食专业客户认证流程指....docx",
+          "score": 0.04891591519117355,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1790,
+          "doc_name": "线下鲜食专业客户认证流程指引.docx",
+          "score": 0.04865150526165962,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1029,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.02765064872801304,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1938,
+          "doc_name": "关于鲜食设备押金政策调整的通知.pdf",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1041,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 2084,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "19f729cb0364",
+      "question": "申请鲜食专业客户认证时，'认证月份'应该选择哪个月份？",
+      "doc_name": "线下鲜食专业客户认证流程指引.docx",
+      "gold_chunk_id": 1791,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1341,
+          "doc_name": "线下鲜食专业客户认证流程指....docx",
+          "score": 0.04891591519117355,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1790,
+          "doc_name": "线下鲜食专业客户认证流程指引.docx",
+          "score": 0.04865150526165962,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1030,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.03030998818576336,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1041,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.029957523569464684,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1479,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1363,
+          "doc_name": "门头报备申请单流程指引.docx",
+          "score": 0.014285714365541935,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "c3382d2d9165",
+      "question": "申请线下鲜食专业客户认证，对专职业务员的人数和兼职有什么要求？",
+      "doc_name": "线下鲜食专业客户认证流程指引.docx",
+      "gold_chunk_id": 1792,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1341,
+          "doc_name": "线下鲜食专业客户认证流程指....docx",
+          "score": 0.0460377112030983,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1790,
+          "doc_name": "线下鲜食专业客户认证流程指引.docx",
+          "score": 0.0317540317773819,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1041,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.03083491325378418,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1026,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.03067915514111519,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1357,
+          "doc_name": "设备政策及设备流程（申请、....docx",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1013,
+          "doc_name": "关于鲜食业务发展定位的通告.pdf",
+          "score": 0.012987012974917889,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "fb2dca9595be",
+      "question": "跟虎合作需要满足哪些经营指标才能通过认证？",
+      "doc_name": "线下鲜食专业客户认证流程指引.docx",
+      "gold_chunk_id": 1792,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.3333,
+      "first_relevant_rank": 3,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1029,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.016393441706895828,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1342,
+          "doc_name": "线下鲜食专业客户认证流程指....docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1791,
+          "doc_name": "线下鲜食专业客户认证流程指引.docx",
+          "score": 0.014705882407724857,
+          "relevant": true
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1513,
+          "doc_name": "2026年皇家小虎线下重点客户激励方案.docx",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1071,
+          "doc_name": "2026年皇家小虎线下重点客户激励方案.docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1406,
+          "doc_name": "致皇家小虎全体业务伙伴的沟通倡议.pdf",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "702b328bf9ee",
+      "question": "DMS后台创建设备订单有哪两种具体方式？",
+      "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+      "gold_chunk_id": 2077,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2064,
+          "doc_name": "线下设备申请操作手册.pdf",
+          "score": 0.049180325120687485,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2077,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.047883063554763794,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 2084,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.014285714365541935,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1272,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 2069,
+          "doc_name": "线下设备申请操作手册.pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1358,
+          "doc_name": "设备政策及设备流程（申请、....docx",
+          "score": 0.014285714365541935,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "ea3802e21872",
+      "question": "在DMS里新建完设备订单后，点击哪个按钮可以把流程推送到云之家审批？",
+      "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+      "gold_chunk_id": 2077,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2064,
+          "doc_name": "线下设备申请操作手册.pdf",
+          "score": 0.032786883413791656,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2077,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.0314980149269104,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 2073,
+          "doc_name": "线下设备申请操作手册.pdf",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2086,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1274,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1458,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.02854251116514206,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "155bd2f0916a",
+      "question": "皇家小虎用的美的和酷福烤箱具体是什么型号？",
+      "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+      "gold_chunk_id": 2091,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.25,
+      "first_relevant_rank": 4,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2006,
+          "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
+          "score": 0.03226646035909653,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2101,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.014492753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1647,
+          "doc_name": "售后登记模板.xlsx",
+          "score": 0.012658228166401386,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2090,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.032522473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1649,
+          "doc_name": "售后登记模板.xlsx",
+          "score": 0.013333333656191826,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1971,
+          "doc_name": "皇家小虎冰箱设备投放管理暂行办法.pdf",
+          "score": 0.029957523569464684,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "be35b8f78ace",
+      "question": "这两款烤箱的功率和电压分别是多少？",
+      "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+      "gold_chunk_id": 2091,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2090,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2101,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.0320020467042923,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1036,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.014285714365541935,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2006,
+          "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1563,
+          "doc_name": "冰淇淋箱拆单标准.xlsx",
+          "score": 0.013333333656191826,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1643,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "3e76ff644281",
+      "question": "有押投放模式下，客户购买设备需要交多少押金？",
+      "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+      "gold_chunk_id": 2102,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2102,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.047907087951898575,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2092,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.048395492136478424,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1938,
+          "doc_name": "关于鲜食设备押金政策调整的通知.pdf",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1932,
+          "doc_name": "关于鲜食设备押金政策调整的补充协议_.pdf",
+          "score": 0.029213953763246536,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1035,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 2011,
+          "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
+          "score": 0.014084506779909134,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "d1c5694765d0",
+      "question": "商用烤肠销售达到多少钱可以返还单套对应的押金？",
+      "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+      "gold_chunk_id": 2102,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2102,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.049180325120687485,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2092,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.03151364624500275,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1938,
+          "doc_name": "关于鲜食设备押金政策调整的通知.pdf",
+          "score": 0.02967032976448536,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1932,
+          "doc_name": "关于鲜食设备押金政策调整的补充协议_.pdf",
+          "score": 0.03125,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 2007,
+          "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
+          "score": 0.013698630034923553,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1037,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.03057890012860298,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "6386b6dfcf5e",
+      "question": "皇家小虎2026年终端活动标准化手册里，促销活动主要分哪几类？",
+      "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+      "gold_chunk_id": 1611,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1611,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.048395492136478424,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1110,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.032522473484277725,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1407,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.0320020467042923,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1066,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.02877846732735634,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1070,
+          "doc_name": "2026年皇家小虎线下重点客户激励方案.docx",
+          "score": 0.014285714365541935,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1022,
+          "doc_name": "新品上市激励方案（手工老面小笼包0400G00）.pdf",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "ce3628de4154",
+      "question": "这份2026年4月发布的手册中，除了促销活动的定义分类，还包含了哪些标准化的执行工具？",
+      "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+      "gold_chunk_id": 1611,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1611,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1110,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.02911604568362236,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1407,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.02828322723507881,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1626,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.030365770682692528,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1250,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.02903091162443161,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1193,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.013698630034923553,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "19ddcf96d07a",
+      "question": "皇家小虎2026年活动布场时，陈列冰柜和试吃桌分别最少需要准备多少台？",
+      "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+      "gold_chunk_id": 1622,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1624,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.03201844170689583,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1621,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.03154495730996132,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1110,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.032522473484277725,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1407,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.0320020467042923,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1014,
+          "doc_name": "关于鲜食业务发展定位的通告.pdf",
+          "score": 0.014285714365541935,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1961,
+          "doc_name": "皇家小虎冰箱设备投放管理暂行办法.pdf",
+          "score": 0.014084506779909134,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "e53056f3f17d",
+      "question": "在店外活动物料中，烤肠机和品牌试吃盒（含竹签、纸巾）是必须配备的吗？",
+      "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+      "gold_chunk_id": 1622,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1621,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.0466422475874424,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1618,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.0476270467042923,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1095,
+          "doc_name": "市场费用项适用场景及核销标准说明....docx",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1375,
+          "doc_name": "市场费用项适用场景及核销标准说明（2026 版）.docx",
+          "score": 0.014492753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1063,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.013513513840734959,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1069,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.014492753893136978,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "26270cec3e31",
+      "question": "烤肠机组装和清洗的教程在哪里看？",
+      "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+      "gold_chunk_id": 1633,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1633,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.048411883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2100,
+          "doc_name": "皇家小虎鲜食设备政策说明.pdf",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1636,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.016393441706895828,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2007,
+          "doc_name": "皇家小虎设备投放确认单（历史存量客户）.docx最新版.docx",
+          "score": 0.013333333656191826,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1069,
+          "doc_name": "【品牌至上 决胜终端】品牌专区大单品爆破赛-V4.pdf",
+          "score": 0.014084506779909134,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1532,
+          "doc_name": "产品工厂.xlsx",
+          "score": 0.014492753893136978,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "ba09ba8bee2c",
+      "question": "怎么通过手机APP或企业微信找到这些视频教程的网盘链接？",
+      "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+      "gold_chunk_id": 1633,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1633,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.03226646035909653,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1635,
+          "doc_name": "皇家小虎2026年全国终端【活动】标准化执行手册20260408(2).pdf",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1113,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1410,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.014492753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 2013,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1406,
+          "doc_name": "致皇家小虎全体业务伙伴的沟通倡议.pdf",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "5c7a5dea58e2",
+      "question": "客户合同的截止日期是固定的哪一天？合同开始时间能往前追溯吗？",
+      "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+      "gold_chunk_id": 1666,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1088,
+          "doc_name": "客户合同签订流程、线下品牌授权指....docx",
+          "score": 0.032786883413791656,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1666,
+          "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+          "score": 0.032258063554763794,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1682,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.029323630034923553,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1571,
+          "doc_name": "合同签订指引.docx",
+          "score": 0.03015873208642006,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1659,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1672,
+          "doc_name": "客户退出申请流程填写详细指引.docx",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "5770c74bd684",
+      "question": "如果发起流程时选错了印章类型（比如选了实体章想改电子章），应该怎么处理？",
+      "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+      "gold_chunk_id": 1666,
+      "recall@k": 0.0,
+      "precision@k": 0.0,
+      "rr": 0.0,
+      "first_relevant_rank": null,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1575,
+          "doc_name": "合同签订指引.docx",
+          "score": 0.030414745211601257,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1088,
+          "doc_name": "客户合同签订流程、线下品牌授权指....docx",
+          "score": 0.028039216995239258,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1524,
+          "doc_name": "云之家文件盖章流程指引.docx",
+          "score": 0.032786883413791656,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1573,
+          "doc_name": "合同签订指引.docx",
+          "score": 0.012820512987673283,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1566,
+          "doc_name": "合同用章操作指引（含电子章）.docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1787,
+          "doc_name": "线下销售服务（服务商合作）流程指引.docx",
+          "score": 0.02881426177918911,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "355dc55a4dee",
+      "question": "线下客户申请品牌授权时，在云之家提交前必须完成什么前置流程？",
+      "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+      "gold_chunk_id": 1667,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1088,
+          "doc_name": "客户合同签订流程、线下品牌授权指....docx",
+          "score": 0.049180325120687485,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1666,
+          "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+          "score": 0.04838709533214569,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1529,
+          "doc_name": "云之家文件盖章流程指引.docx",
+          "score": 0.03015873208642006,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1363,
+          "doc_name": "门头报备申请单流程指引.docx",
+          "score": 0.02985074557363987,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1919,
+          "doc_name": "门头报备申请单流程指引.docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1085,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "774dec61fcb2",
+      "question": "填写品牌授权申请的渠道类型时，有哪些具体的禁止性规定？",
+      "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+      "gold_chunk_id": 1667,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1089,
+          "doc_name": "客户合同签订流程、线下品牌授权指....docx",
+          "score": 0.032786883413791656,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1667,
+          "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+          "score": 0.032258063554763794,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1583,
+          "doc_name": "品牌授权与运营管理协议PPSQ-2026-A1.1.docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1580,
+          "doc_name": "品牌授权与运营管理协议PPSQ-2026-A1.1.docx",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1529,
+          "doc_name": "云之家文件盖章流程指引.docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1812,
+          "doc_name": "销售协议书XS2026A1.1(宿迁虎家).docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "e19756c16a11",
+      "question": "门店数量超过多少家的终端连锁系统合作必须走云之家准入审批流程？",
+      "doc_name": "终端连锁系统合作准入流程指引.docx",
+      "gold_chunk_id": 1794,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1344,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.04891591519117355,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1794,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.04865150526165962,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1659,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.03007688745856285,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1085,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.029411764815449715,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1654,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.028370220214128494,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1945,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.014285714365541935,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "4668775edd76",
+      "question": "未经公司审批通过，经销商能不能擅自跟连锁系统签小虎产品的合作合同？",
+      "doc_name": "终端连锁系统合作准入流程指引.docx",
+      "gold_chunk_id": 1794,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1344,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.048659902065992355,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1794,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.04838709533214569,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1690,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.016393441706895828,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1999,
+          "doc_name": "皇家小虎设备投放框架协议模板（鲜食政策）清洁版SBTF-2026-A3.1.docx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1659,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1581,
+          "doc_name": "品牌授权与运营管理协议PPSQ-2026-A1.1.docx",
+          "score": 0.014084506779909134,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "e87a51b0924b",
+      "question": "在填写终端连锁系统合作准入流程表单时，标题、流水号这些表头信息需要手动修改吗？",
+      "doc_name": "终端连锁系统合作准入流程指引.docx",
+      "gold_chunk_id": 1795,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1344,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.048659902065992355,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1794,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.047642678022384644,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1659,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1085,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.028370220214128494,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1945,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.02747976779937744,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1654,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.014925372786819935,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "addc92733749",
+      "question": "如果我要一次性申请多个终端连锁系统的合作准入，除了点击添加明细，还有什么批量操作的方法？",
+      "doc_name": "终端连锁系统合作准入流程指引.docx",
+      "gold_chunk_id": 1795,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1344,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.04865150526165962,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1794,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.048147473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1659,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1657,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.013698630034923553,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1085,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1945,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "c0ca23793b72",
+      "question": "如果我要同时申请多个终端连锁系统合作准入，除了点添加明细，还有什么批量操作的方法？",
+      "doc_name": "终端连锁系统合作准入流程指引.docx",
+      "gold_chunk_id": 1796,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1344,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.048395488411188126,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1794,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.048147473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1657,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.013333333656191826,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1659,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1085,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1945,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "3c910b1663a7",
+      "question": "终端连锁系统合作准入审批流里，营销中心秘书长兼COO助理江流负责审核什么内容？",
+      "doc_name": "终端连锁系统合作准入流程指引.docx",
+      "gold_chunk_id": 1796,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1344,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.048659902065992355,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1794,
+          "doc_name": "终端连锁系统合作准入流程指引.docx",
+          "score": 0.04865150526165962,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1085,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.028594771400094032,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1654,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.027799228206276894,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1945,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.014084506779909134,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1355,
+          "doc_name": "营销物料及设备准入流程指引.docx",
+          "score": 0.014492753893136978,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "edbd0c006019",
+      "question": "2026年经销商合同里，销售范围具体要写到哪一级行政区划？",
+      "doc_name": "新签2026年经销商合同规范.docx",
+      "gold_chunk_id": 1682,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1682,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.04749276489019394,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1571,
+          "doc_name": "合同签订指引.docx",
+          "score": 0.04664953052997589,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1579,
+          "doc_name": "合同签订指引.docx",
+          "score": 0.028258707374334335,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1088,
+          "doc_name": "客户合同签订流程、线下品牌授权指....docx",
+          "score": 0.0320020467042923,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1666,
+          "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+          "score": 0.029631255194544792,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1690,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "57532a79cbb3",
+      "question": "新签的2026年合同期限截止日期统一定在什么时候？",
+      "doc_name": "新签2026年经销商合同规范.docx",
+      "gold_chunk_id": 1682,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1682,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.04764344170689583,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1571,
+          "doc_name": "合同签订指引.docx",
+          "score": 0.04838709533214569,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1088,
+          "doc_name": "客户合同签订流程、线下品牌授权指....docx",
+          "score": 0.048659902065992355,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1666,
+          "doc_name": "客户合同签订流程、线下品牌授权指引.docx",
+          "score": 0.04713065177202225,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1579,
+          "doc_name": "合同签订指引.docx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1061,
+          "doc_name": "皇家小虎_鲜食客户分级运营方案（含设备管理）(2).pdf",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "793d7738a804",
+      "question": "目前哪些客户在商贸板块不能变更主体，并且后续没法保证开票额度？",
+      "doc_name": "新签2026年经销商合同规范.docx",
+      "gold_chunk_id": 1685,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.5,
+      "first_relevant_rank": 2,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1762,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.04865150526165962,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1683,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.04891591519117355,
+          "relevant": true
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1572,
+          "doc_name": "合同签订指引.docx",
+          "score": 0.03030998818576336,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2017,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.027984343469142914,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1770,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.014492753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1085,
+          "doc_name": "客户准入、主数据修改、退出.docx",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "ea759cee7d47",
+      "question": "社团分销和海外客户的销售主体分别是谁？",
+      "doc_name": "新签2026年经销商合同规范.docx",
+      "gold_chunk_id": 1685,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1684,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.048659902065992355,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1762,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.04865150526165962,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1659,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1572,
+          "doc_name": "合同签订指引.docx",
+          "score": 0.03030303120613098,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1908,
+          "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1873,
+          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
+          "score": 0.014285714365541935,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "2f2a6ab0c662",
+      "question": "江西虎虎生风食品销售有限公司的统一社会信用代码是多少？",
+      "doc_name": "新签2026年经销商合同规范.docx",
+      "gold_chunk_id": 1688,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1686,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.0643005296587944,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1764,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.06427650153636932,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1846,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.03053613007068634,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1729,
+          "doc_name": "江西虎虎生风收款账户说明（盖章版）.pdf",
+          "score": 0.04599076882004738,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1330,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.03226646035909653,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 2021,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.03128054738044739,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "39e9752f9177",
+      "question": "跟江西虎虎生风签2026年合同，收款账户开户行和账号分别是什么？",
+      "doc_name": "新签2026年经销商合同规范.docx",
+      "gold_chunk_id": 1688,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1686,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.032258063554763794,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1729,
+          "doc_name": "江西虎虎生风收款账户说明（盖章版）.pdf",
+          "score": 0.03177805617451668,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1765,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1762,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.013888888992369175,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1330,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 2021,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.014492753893136978,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "a4f464a54f82",
+      "question": "甲方重庆虎腾食品销售有限公司的开户行和银行账号分别是多少？",
+      "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+      "gold_chunk_id": 1882,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1882,
+          "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+          "score": 0.047447845339775085,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1688,
+          "doc_name": "新签2026年经销商合同规范.docx",
+          "score": 0.0476270467042923,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1764,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.04765107482671738,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1804,
+          "doc_name": "重庆虎腾收款账户说明（盖章版本）.pdf",
+          "score": 0.048147473484277725,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1330,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.04578372836112976,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 2021,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.03053613007068634,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "35bf4c7ff9dc",
+      "question": "乙方在仓储和运输甲方产品时，需要遵循什么原则来防止食品污染和损坏？",
+      "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+      "gold_chunk_id": 1882,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.1667,
+      "first_relevant_rank": 6,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1828,
+          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
+          "score": 0.0320020467042923,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1900,
+          "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1864,
+          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
+          "score": 0.03055037185549736,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1846,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.03125763311982155,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1810,
+          "doc_name": "销售协议书XS2026A1.1(宿迁虎家).docx",
+          "score": 0.032786883413791656,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1882,
+          "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+          "score": 0.029877368360757828,
+          "relevant": true
+        }
+      ]
+    },
+    {
+      "id": "1514b5764737",
+      "question": "如果因为乙方的原因导致产品不符合终端销售要求，乙方需要承担什么责任？",
+      "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+      "gold_chunk_id": 1888,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.2,
+      "first_relevant_rank": 5,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1851,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.03079839050769806,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1869,
+          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
+          "score": 0.03067915514111519,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1833,
+          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
+          "score": 0.030330881476402283,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1815,
+          "doc_name": "销售协议书XS2026A1.1(宿迁虎家).docx",
+          "score": 0.03079839050769806,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1887,
+          "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+          "score": 0.015384615398943424,
+          "relevant": true
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1905,
+          "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
+          "score": 0.03030303120613098,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "f4092d283456",
+      "question": "收到甲方召回通知后，乙方如果不配合退回相关批次产品，会被视为根本违约吗？违约金是多少？",
+      "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+      "gold_chunk_id": 1888,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.3333,
+      "first_relevant_rank": 3,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1852,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.0478750616312027,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1834,
+          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
+          "score": 0.047642678022384644,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1888,
+          "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+          "score": 0.04716267064213753,
+          "relevant": true
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1870,
+          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
+          "score": 0.046875,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1905,
+          "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
+          "score": 0.04617604613304138,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1815,
+          "doc_name": "销售协议书XS2026A1.1(宿迁虎家).docx",
+          "score": 0.04793839901685715,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "29774b63b47c",
+      "question": "如果乙方逾期接收产品，从哪天开始要承担产品灭失或毁损的风险？",
+      "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+      "gold_chunk_id": 1894,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.1667,
+      "first_relevant_rank": 6,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1911,
+          "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1821,
+          "doc_name": "销售协议书XS2026A1.1(宿迁虎家).docx",
+          "score": 0.047183435410261154,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1839,
+          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
+          "score": 0.046875,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1857,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.04669647291302681,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1875,
+          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
+          "score": 0.045284781605005264,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1893,
+          "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+          "score": 0.04470045864582062,
+          "relevant": true
+        }
+      ]
+    },
+    {
+      "id": "a3d1c8a9878c",
+      "question": "乙方要是泄露了甲方的商业秘密，甲方除了解除合同和撤销授权，还能要求乙方退还奖励扶持款吗？具体要在多久内退完？",
+      "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+      "gold_chunk_id": 1894,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 0.2,
+      "first_relevant_rank": 5,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1912,
+          "doc_name": "销售协议书XS2026A1.2（常温产品&速冻产品）清洁版.docx",
+          "score": 0.03154495730996132,
+          "relevant": false
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1876,
+          "doc_name": "销售协议书XS2026A1.1(虎家商贸).docx",
+          "score": 0.03055037185549736,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1858,
+          "doc_name": "销售协议书XS2026A1.1(江西虎虎生风).docx",
+          "score": 0.029571646824479103,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1840,
+          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
+          "score": 0.029877368360757828,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1894,
+          "doc_name": "销售协议书XS2026A1.1(重庆虎腾).docx",
+          "score": 0.028898129239678383,
+          "relevant": true
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1822,
+          "doc_name": "销售协议书XS2026A1.1(宿迁虎家).docx",
+          "score": 0.02808326855301857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "1f3c92d6c2cc",
+      "question": "这个差旅和市内交通费的报销指引是给哪些岗位的人用的？",
+      "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+      "gold_chunk_id": 2056,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2056,
+          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1328,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.03125763311982155,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 2019,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.03125,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2031,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.02758360095322132,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 2040,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.028790388256311417,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 2012,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.02943722903728485,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "b17f5b3f86ab",
+      "question": "除了线下城市经理，其他同事现在能按这个手册报销吗？",
+      "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+      "gold_chunk_id": 2056,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2056,
+          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1416,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1328,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2019,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 2060,
+          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 2014,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "82383a285878",
+      "question": "跨省出差报销时，费用承担公司应该选哪个？怎么在北森APP里查自己的工资主体公司？",
+      "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+      "gold_chunk_id": 2058,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2058,
+          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+          "score": 0.04771225526928902,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2060,
+          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+          "score": 0.032258063554763794,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 2045,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2017,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.016393441706895828,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 2040,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.030330881476402283,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 2013,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.013333333656191826,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "1422ec191be1",
+      "question": "在‘人人费用’或‘金蝶云星空’填差旅报销单，业务分类和所属店铺分别要选什么？",
+      "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+      "gold_chunk_id": 2058,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2057,
+          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+          "score": 0.049180325120687485,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2060,
+          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+          "score": 0.048131078481674194,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 2040,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.030621785670518875,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1449,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 2015,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.014492753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1416,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.01587301678955555,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "9ba71cec3108",
+      "question": "城市经理省内出差，差旅费报销需要在什么时候之前完成？",
+      "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+      "gold_chunk_id": 2060,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2056,
+          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+          "score": 0.032522473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2012,
+          "doc_name": "出差申请&报销操作指引(2)(1).pdf",
+          "score": 0.0320020467042923,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1328,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.03077651560306549,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 2019,
+          "doc_name": "线下业务个人报销指引.docx",
+          "score": 0.02967032976448536,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 2032,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.014084506779909134,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1664,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "c57aae9b0498",
+      "question": "自驾电车报销时，上传的替票必须跟什么相关？能不能用滴滴打车或停车费的电子发票？",
+      "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+      "gold_chunk_id": 2060,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 2058,
+          "doc_name": "线下销售人员差旅费及市内交通费报销指引手册-终版.docx",
+          "score": 0.032522473484277725,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 2040,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.02967032976448536,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 2034,
+          "doc_name": "线下人员补贴报销指引.pdf",
+          "score": 0.031054403632879257,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1093,
+          "doc_name": "市场费用项适用场景及核销标准说明....docx",
+          "score": 0.013333333656191826,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1373,
+          "doc_name": "市场费用项适用场景及核销标准说明（2026 版）.docx",
+          "score": 0.01315789483487606,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1446,
+          "doc_name": "操作手册-DMS市场费用报销核销-26.4.16.pdf",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "bc08e7469fcc",
+      "question": "快递单重量小于13kg时，应该优先选择哪个仓库发货？",
+      "doc_name": "快递单拆分流程.docx",
+      "gold_chunk_id": 1676,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1676,
+          "doc_name": "快递单拆分流程.docx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1227,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.012820512987673283,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1785,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.030621785670518875,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1218,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.014925372786819935,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1660,
+          "doc_name": "客户准入流程指引.docx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1775,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "d56871e02c78",
+      "question": "哪些中心仓不支持发顺丰快递（即不发快递）？",
+      "doc_name": "快递单拆分流程.docx",
+      "gold_chunk_id": 1676,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1676,
+          "doc_name": "快递单拆分流程.docx",
+          "score": 0.03128054738044739,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1785,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1112,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.016393441706895828,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1409,
+          "doc_name": "活动管理及费用核销.docx",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1775,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1681,
+          "doc_name": "快递单拆分流程.docx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "f1513349e96b",
+      "question": "除了华东、华中、华西列出的那些仓库，其他发冰淇淋箱子的仓库应该用什么规格的箱子？",
+      "doc_name": "快递单拆分流程.docx",
+      "gold_chunk_id": 1678,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1678,
+          "doc_name": "快递单拆分流程.docx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1547,
+          "doc_name": "冰淇淋箱拆单标准.xlsx",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1559,
+          "doc_name": "冰淇淋箱拆单标准.xlsx",
+          "score": 0.013513513840734959,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1230,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.014492753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1814,
+          "doc_name": "销售协议书XS2026A1.1(宿迁虎家).docx",
+          "score": 0.01587301678955555,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1832,
+          "doc_name": "销售协议书XS2026A1.1(江西小虎).docx",
+          "score": 0.015625,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "44a39f2d219f",
+      "question": "全国范围内哪些仓库可以直接使用6号箱来代替冰淇淋箱子发货？",
+      "doc_name": "快递单拆分流程.docx",
+      "gold_chunk_id": 1678,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1676,
+          "doc_name": "快递单拆分流程.docx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1547,
+          "doc_name": "冰淇淋箱拆单标准.xlsx",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1559,
+          "doc_name": "冰淇淋箱拆单标准.xlsx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1771,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.014492753893136978,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1339,
+          "doc_name": "线下退货申请单流程指引.docx",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1746,
+          "doc_name": "线下退货申请单流程指引.docx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "6c7862f49391",
+      "question": "在销售管理里查出库单时，怎么把刚才复制的来源单号填进去并查询状态？",
+      "doc_name": "快递单拆分流程.docx",
+      "gold_chunk_id": 1680,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1680,
+          "doc_name": "快递单拆分流程.docx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1773,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.016129031777381897,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1230,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.02881426177918911,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1771,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.01515151560306549,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1715,
+          "doc_name": "样品、物料商城小程序指引.docx",
+          "score": 0.015625,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1227,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.014285714365541935,
+          "relevant": false
+        }
+      ]
+    },
+    {
+      "id": "a7ab220eed7a",
+      "question": "导出快递单号前，需要核对右下角的订单条数和审核时的数量是否一致吗？",
+      "doc_name": "快递单拆分流程.docx",
+      "gold_chunk_id": 1680,
+      "recall@k": 1.0,
+      "precision@k": 0.1667,
+      "rr": 1.0,
+      "first_relevant_rank": 1,
+      "hits_returned": 6,
+      "hits": [
+        {
+          "rank": 1,
+          "chunk_id": 1679,
+          "doc_name": "快递单拆分流程.docx",
+          "score": 0.032786883413791656,
+          "relevant": true
+        },
+        {
+          "rank": 2,
+          "chunk_id": 1490,
+          "doc_name": "DMS销售订单导入模版2.0-1027(2).xlsx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 3,
+          "chunk_id": 1760,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.015384615398943424,
+          "relevant": false
+        },
+        {
+          "rank": 4,
+          "chunk_id": 1715,
+          "doc_name": "样品、物料商城小程序指引.docx",
+          "score": 0.013513513840734959,
+          "relevant": false
+        },
+        {
+          "rank": 5,
+          "chunk_id": 1785,
+          "doc_name": "线下销售支持流程.docx",
+          "score": 0.014705882407724857,
+          "relevant": false
+        },
+        {
+          "rank": 6,
+          "chunk_id": 1301,
+          "doc_name": "皇家小虎ROYALTIGER小程序操作手册-最新26.7.23docx.pdf",
+          "score": 0.013698630034923553,
+          "relevant": false
+        }
+      ]
+    }
+  ]
+}

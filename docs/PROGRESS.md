@@ -4835,6 +4835,25 @@ SALE17 省区毛利率 / C07 昨日下单客户）。生产直打 E04 的 `inten
   而 `resolve_code` 把同一份前缀知识又硬编码了一遍。写这条时 `SPC-` 当场红了一次
 - `bare_dimension_words_are_not_entities`：entity 与 region 两侧，真名字不许被误伤
 
+### 六点五、精排的收益第一次量出来了（同一批题、同一批向量，只切精排开关）
+
+旧基准 `kb_bench_cases.json` 是 8/8 的 18 题本地夹具，基线 `recall@k=1.0 / MRR=1.0`——
+**已经饱和**，排序层再差它也是满分，这正是「recall@1=0.15」那个头寸一直看不见的原因。
+新冻了 56 题生产语料基准（`tools/kb_fixtures/prod_cases.json`，10 篇 embedded 文档，
+LLM 出题失败 0 次），金块是 `chunk_id + ord`（重新入库即 stale 剔除）。
+
+| | recall@1 | recall@2 | recall@6 | MRR | 未命中 |
+|---|---|---|---|---|---|
+| 精排**关**（纯九路 RRF） | 0.4643 | 0.8036 | 0.9464 | 0.6670 | 3 |
+| 精排**开**（gte-rerank-v2） | **0.5536** | 0.8571 | 0.9821 | 0.7348 | 1 |
+| Δ | **+8.9pt** | +5.4pt | +3.6pt | +6.8pt | −2 |
+
+口径说明：两趟之间**只**改了 `DMS_RERANK_BASE_URL`（容器重启一次），
+语料、向量、题集、身份全同。所以这 8.9 个点就是精排本身的收益 ——
+而这条链在生产上**今天之前一次都没跑过**。
+报告落 `tools/kb_bench_baseline_prod.json`，下次改检索用
+`kb_bench.py run --baseline tools/kb_bench_baseline_prod.json` 对比，有回退退出码 1。
+
 ### 七、未结（下一手接着查）
 
 1. **C03 `HJXH-DSO2026080300838*2`**：`docker exec … ask admin` 下 direct-doc 9 行；
