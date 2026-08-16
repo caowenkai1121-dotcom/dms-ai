@@ -4870,14 +4870,48 @@ LLM 出题失败 0 次），金块是 `chunk_id + ord`（重新入库即 stale �
 剩下的 12 跳过全是结构性的，不是掩盖：3 条闸门题不走问答端点、
 3 条要非 admin 身份（HTTP 档一把 key 只映射一个 login）、其余是依赖它们的关系题。
 
+### 六点九、跨入口档（`--entries`：同一题打 ask/stream/mcp 比 route+行数+首格）
+
+87 项 / 77 通过 / 3 失败 / 7 跳过。三条失败**都不是协议差异**，是三个真问题：
+
+1. **C08 时间列排序没有并列键**：客户卡的 5 条最近订单，三个入口**不是同一批**
+   （ask 第 0 行 …600157、stream 第 0 行 …600315；第 4 行更是 …500559 vs …500555）。
+   `order_time` 落到天，整批同值，`ORDER BY 时间 DESC LIMIT 5` 从并列组里任取。
+   八处一次补齐（entity 卡五处、ops 两处、深度板块一处），判据扫三个文件并断言至少 8 条。
+2. **C12「昨天都有谁下过单啊」**：模型把「谁」抽成 entity —— 而「谁」**正是用户要问的东西**，
+   SQL 里永远证不出来 → 硬拦 → 反问卡。同一件事换成「昨天下单的有哪些客户」就出 200 行。
+   疑问代词整词剔，与「客户」「各省区」是同一个根因的第三档。
+3. **E10 是判官自己的假红**：中台 WMS 现行库存是活的，连打三次
+   106605152.098 / 106605152.098 / 106605016.098，而 `--entries` 串行打三个入口本来就跨几秒。
+   给这一档加了显式出口 `entries_volatile`（只比 route+行数，理由连同三个实测值写进 note），
+   **不做通用降级** —— 那等于把这一档整个关掉，真的不一致会被淹在假红里。
+
+### 六点九点五、C03 结案：单号是自证的
+
+追了一整天。`HJXH-DSO2026080300838*2`：CLI 下 direct-doc 9 行，
+`/api/ask` 与 `/api/mcp` 恒 need-intent；只把 `*` 换成 `_`，HTTP 两条路都 hit。
+二进制同一个、显式 `ds=dms` 也一样、连打三次稳定 —— 不是抖动、不是选源、不是编排器。
+
+`RUST_LOG=dms_agent=debug` 拿到地面真相：进 `direct_hit` 的问句**一字不差**、
+`warehouse=true`，与 `_` 那次完全相同。事出在 `try_direct_for` 之后：
+
+    hits.rs::land → coverage.unclaimed_scope() 硬拦（用户明写的实体没被 SQL 认领 → 回落）
+      → entity_proved 要求谓词列命中 ENTITY_COLUMNS（name/code/sku/customer/shop…）
+      → 单据卡的 SQL 是 `WHERE r.ywzt_order = 'HJXH-DSO…*2' OR r.base_ref_order = '…'`
+      → ywzt_order / base_ref_order 一个词根都不沾（那张表是给客户名/商品名设计的）
+      → 「证不出来」→ 回落 → direct-doc miss → 反问卡
+
+`_` 那次之所以活着，纯属那一轮模型没把单号抽成 entity。**抽了就死，没抽反而活** ——
+所以它表现为「时好时坏、换个入口就变」，这也是它躲过之前每一轮排查的原因。
+
+修法不扩列名表（order/bill/invoice… 加不完，还会把 `order_status` 这类状态列放进来），
+改问 `document::resolve_code`：**这个表面词本身是不是合法单号**。是单号，
+那它被拿去等值比较的那一列按定义就是单号列。自证那一支用 `has_value_exact` ——
+单号差一个字符就是另一张单，模糊匹配会让 base 号证明拆单号，
+而那正是 `triage::code_tokens` 红字里写过的「静默查错表返错数」。
+
 ### 七、未结（下一手接着查）
 
-1. **C03 `HJXH-DSO2026080300838*2`**：`docker exec … ask admin` 下 direct-doc 9 行；
-   走 `/api/ask` 与 `/api/mcp` 恒 need-intent（direct-doc miss）。只把 `*` 换成 `_`
-   两条路都 hit。二进制同一个、源同一份、显式 `ds=dms` 也一样，连打三次结果稳定 ——
-   不是抖动，也不是选源（`meta.datasource` 最近邻两者都是同一张 upload 表）。
-   黑盒能问的都问完了；`direct_hit` 里留了一行 `tracing::debug!`，
-   开法 `--env RUST_LOG=dms_agent=debug`，下一手先读它。
-2. **E10 的口径披露**：`coverage_status: blocked` 是过期期望（同日 64c37e7 裁决 ambiguity 不再硬闸），
+1. **E10 的口径披露**：`coverage_status: blocked` 是过期期望（同日 64c37e7 裁决 ambiguity 不再硬闸），
    已改成 complete。但原本要钉的事**没了出口**：库存有多口径，而 coverage 不提、
    caliber_note 空、正文也不提。要治是给库存族补一条口径披露。
