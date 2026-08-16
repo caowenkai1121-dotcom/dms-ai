@@ -4938,6 +4938,13 @@ LLM 出题失败 0 次），金块是 `chunk_id + ord`（重新入库即 stale �
 
 ### 七、未结（下一手接着查）
 
+0. **生产当前跑的是手工补丁 release**（`20260816T150000Z-hotfix2`）：今晚 sshd 连接
+   连续掉线（`Error reading SSH protocol banner` / `Socket is closed`，一天几百条短连接
+   打满 MaxStartups），`deploy_update.sh` 的 bput 连挂三次。改法是：拷贝上一个 release、
+   **只**把改动的 `crates/agent/src/intent.rs` 用分块 base64 传上去、原地 `server-build.sh`
+   再切。代码内容与仓库 HEAD 一致（其余文件只有 `docs/PROGRESS.md` 变过），
+   但**下一手要跑一次正常的 `deploy_update.sh`**，让 release 回到「从 tar 包整包构建」那条正路。
+
 1. **E10 的口径披露**：`coverage_status: blocked` 是过期期望（同日 64c37e7 裁决 ambiguity 不再硬闸），
    已改成 complete。但原本要钉的事**没了出口**：库存有多口径，而 coverage 不提、
    caliber_note 空、正文也不提。要治是给库存族补一条口径披露。
