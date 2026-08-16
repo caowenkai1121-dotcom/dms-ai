@@ -238,6 +238,7 @@ impl IntentV1 {
             }
             subgoal.entity_mentions.retain(|entity| {
                 !entity.surface.is_empty()
+                    && !is_bare_dimension_word(&entity.surface)
                     && seen_entities.insert(format!(
                         "{:?}:{}",
                         entity.kind,
@@ -273,6 +274,7 @@ impl IntentV1 {
         }
         self.entity_mentions.retain(|entity| {
             !entity.surface.is_empty()
+                && !is_bare_dimension_word(&entity.surface)
                 && seen.insert(format!(
                     "{:?}:{}",
                     entity.kind,
@@ -2093,6 +2095,24 @@ fn clean_strings(values: &mut Vec<String>) {
     values.truncate(MAX_ITEMS);
 }
 
+/// 光杆维度词不是实体。大模型对「销量最高的前5的客户」会同时报
+/// `breakdowns:["客户"]` **和** `entity_mentions:[{surface:"客户",kind:"customer"}]`——
+/// 前者对，后者是把分组维度当成了某一家客户。
+///
+/// 🔴 不剔的代价是整条确定性臂哑掉，而且**不报错**（2026-08-16 回归实测 4 题）：
+/// 生成的 SQL 是 `GROUP BY 客户` 而不是 `WHERE 客户 = '客户'`，于是 `entity_proved` 恒 false
+/// → `unverifiable: ["entity:客户"]` → `coverage.status=blocked` → fastpath 拒答 →
+/// 由 LLM 臂兜底（`route=llm+repair`）。答案往往还是对的，所以没人会去看 —— 但口径、
+/// 时间窗、权限过滤全走了非确定性的那条路，而且每题多花 10 秒。
+///
+/// 判据是「**整词等于**类别词」而不是「以类别词结尾」：`customer_name_fragment` 那边
+/// 是在剥完前后缀之后判的，这里拿到的是大模型原样吐的表面词，
+/// 「潍坊程祥商贸」这种真名字一个都不许被误伤。
+fn is_bare_dimension_word(surface: &str) -> bool {
+    let s = surface.trim();
+    dms_semantic::fastpath::derive::DIMENSION_CLASS_WORDS.contains(&s)
+}
+
 fn clean(value: &str) -> String {
     value
         .trim()
@@ -2606,6 +2626,31 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 光杆维度词不许留在 entity_mentions 里 —— 留着 coverage 恒 blocked，
+    /// 确定性那条臂整条哑掉且不报错（2026-08-16 回归 E04/E17/SALE17/C07 四题同因）。
+    #[test]
+    fn bare_dimension_words_are_not_entities() {
+        use super::{EntityKind, EntityMention, IntentV1};
+        let mut intent = IntentV1 {
+            mode: super::IntentMode::Data,
+            metrics: vec!["销量".into()],
+            breakdowns: vec!["客户".into()],
+            entity_mentions: vec![
+                EntityMention { surface: "客户".into(), kind: EntityKind::Customer },
+                EntityMention { surface: "省区".into(), kind: EntityKind::Organization },
+                EntityMention { surface: " 门店 ".into(), kind: EntityKind::Other },
+                // 真名字一个都不许被误伤
+                EntityMention { surface: "潍坊程祥商贸有限公司".into(), kind: EntityKind::Customer },
+                EntityMention { surface: "线下客户".into(), kind: EntityKind::Customer },
+            ],
+            ..Default::default()
+        };
+        assert!(intent.normalize());
+        let left: Vec<&str> = intent.entity_mentions.iter().map(|e| e.surface.as_str()).collect();
+        assert_eq!(left, vec!["潍坊程祥商贸有限公司", "线下客户"],
+                   "整词等于类别词的才剔；「线下客户」是带限定的表面词，交给下游剥");
+    }
 
     /// 裸实体名不看 mode：fast 模型把一个裸公司名判成 knowledge 是常事，
     /// 而它该出实体卡（2026-08-14 生产回归 C06/C08）。

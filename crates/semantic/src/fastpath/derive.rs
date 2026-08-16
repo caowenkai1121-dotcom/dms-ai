@@ -549,6 +549,18 @@ pub fn derive_pool_winc_guard(pool: &mut Vec<&'static str>, question: &str) {
 
 
 /// 剥掉指标词/时间词/通用虚词后的残留 = 候选客户名片段。至少两个汉字才值得探库。
+/// 类别 / 维度词表：它们是「哪一类、哪一片」，不是「哪一家、哪一个」。
+///
+/// 两个消费方共用这一份（唯一事实源）：
+/// - `customer_name_fragment`：剥完还等于类别词 ⇒ 不拿它去探客户主档；
+/// - `intent::Intent::sanitize`：大模型把「客户」「省区」这种分组维度报成 entity_mention 时剔掉 ——
+///   不剔的后果是 coverage 恒 blocked（实体永远证不出来），确定性那条臂整条哑掉。
+pub const DIMENSION_CLASS_WORDS: &[&str] = &[
+    "客户", "门店", "商品", "产品", "经销商", "分类", "类型", "类别",
+    // 组织/地域单位后缀：它们是「哪一片」，不是「哪一家」
+    "省区", "省份", "战区", "大区", "片区",
+];
+
 pub fn customer_name_fragment(question: &str) -> Option<String> {
     let mut name = question.to_string();
     for (metric, _) in warehouse_sales_metrics(question) {
@@ -629,12 +641,7 @@ pub fn customer_name_fragment(question: &str) -> Option<String> {
     }
     // 类别/维度词不是名字：「线下客户」是客户分类（未验证维度），不是某个客户 —
     // 拿它去探主档会把分类问句错配成「名称含这两个字的客户」。
-    const CLASS_WORDS: &[&str] = &[
-        "客户", "门店", "商品", "产品", "经销商", "分类", "类型", "类别",
-        // 组织/地域单位后缀：它们是「哪一片」，不是「哪一家」
-        "省区", "省份", "战区", "大区", "片区",
-    ];
-    if CLASS_WORDS.iter().any(|w| name.ends_with(w)) {
+    if DIMENSION_CLASS_WORDS.iter().any(|w| name.ends_with(w)) {
         return None;
     }
     // 🔴 大区名同样不是客户名（2026-08-15 生产直打）：

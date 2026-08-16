@@ -4,15 +4,16 @@
   本地模型（fastembed / bge-small-zh-v1.5）已按业主裁决废除（2026-08-16）。
   Rust 侧的 wire 契约一个字没动：`/embed` 收 `{"texts":[...],"query":bool}`，
   `/rerank` 收 Cohere/Jina 形状 —— 这里当适配层，Rust 不认识 DashScope。
-  build    —— 为 meta.table_doc / sql_exemplar / element / datasource 算 embedding 存 pgvector
+  build    —— 为 meta.table_doc / sql_exemplar / element / datasource / memory 算 embedding 存 pgvector
                + HNSW 索引（离线跑；`--ds` 限定注册表行属于哪个源，默认 dms）
   revec    —— build 的第五个目标，**单独跑**（`revec` 或 `build --revec`）：
                补 kb.chunk 里 embedding IS NULL 的行 + 把 kb.doc 从 chunked 推到 embedded。
                仍缺一行即非 0 退出（理由见 `revec_exit`）
-  serve    —— 常驻 HTTP :8077（裁决 V1：文档解析复用本进程本端口）
+  serve    —— 常驻 HTTP（裁决 V1：文档解析/精排复用本进程本端口；生产在 :8078，见 settings.service_url）
                POST /embed  {"texts":[...],"query":true} → {"embeddings":[[...]]}
                POST /parse  {"path":"<绝对路径>","mime":""} → {"blocks":[...],"page_count":n,"sheets":[...]}
                POST /chunk  {"blocks":[...],"target_tokens":400,"overlap":60} → {"chunks":[...]}
+               POST /rerank {"query":"…","documents":[...],"model":"…"} → {"results":[{"index","relevance_score"}]}
                GET  /health → {"ok","model","dim","parse_ok":{...},"parse_caps":{".docx":{ok,why}, ".pdf":{...,tiers:{text,ocr}}}}
   selftest —— 自造 md/csv/json/html 跑一遍 parse+chunk（不需要任何第三方解析库）+ 把**每种扩展名**的
                可用/不可用与原因列全 + 钉住能力表纪律（见 `_selftest_caps`）
@@ -53,9 +54,6 @@ RERANK_MODEL = os.environ.get('DMS_RERANK_QWEN_MODEL', 'gte-rerank-v2')
 RERANK_URL = os.environ.get(
     'DMS_RERANK_QWEN_URL',
     'https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank')
-# bge 需要给 query 加指令前缀才有对称性；千问不需要（v3/v4 训练时已对称）。
-# 留空常量而不是删掉：`_selftest_*` 与历史注释都引它，改成空串比删更少的漂移面。
-QUERY_INSTRUCT = ''
 
 
 def pg_conf():
@@ -74,13 +72,12 @@ def pg_conf():
 # 而向量空间一混，检索质量下降**不会报错**，只会悄悄变差 —— 本仓最不能有的那一类。
 # key 缺失时 `embed()` 直接抛，服务起不来比悄悄用另一套向量强。
 
-# 推理的全局锁：fastembed/onnxruntime 的 session 不是线程安全的，所以推理**仍然串行**。
-# 它存在的唯一理由是让 `serve` 能换成 ThreadingHTTPServer（见那里的注释）——
-# /parse（上限 120s）与 /health 从此不再排在一次 275 块的 /embed 后面。
-# 实测（本文件 `_selftest_serve_unblocked`；数字出自旧版 0.6s 桩，现桩睡 2s，量级结论不变）：
-# 单线程 /health 要 0.605s，多线程 0.002s。顺带把首次惰性加载也串了：两个线程同时进来会各造一个 TextEmbedding。
-# ponytail: 一把进程级锁 —— 本进程只有一个模型；真要并发推理得起多进程，那时再拆。
-_EMBED_LOCK = threading.Lock()
+# 🔴 这里曾经有一把进程级 `_EMBED_LOCK`。它的**唯一**理由是 onnxruntime 的 session
+# 不是线程安全的 —— 本地模型废除之后那个理由没了，而锁留着会重造一个已经修过的故障：
+# 向量化变成一次 HTTP 往返，一趟 revec（1102 块 = 110 次往返）会把每一个问句的 /embed
+# 堵在锁后面，超过 Rust 侧 3s 超时 → 进程级熔断 300s → 之后 5 分钟语义缓存、
+# KB 向量路、表召回向量路**全降级且零报错**。这正是 `_selftest_serve_unblocked` 钉的那件事。
+# 千问侧的并发由 DashScope 自己限流，本进程不需要再串一道。
 
 def _qwen_key():
     """千问 key。顺序：`DMS_EMBED_KEY` → `QWEN_KEY` → settings `llm_keys.qwen`
@@ -138,21 +135,20 @@ def embed(texts, is_query=False):
         raise RuntimeError('千问 key 未配置（DMS_EMBED_KEY / QWEN_KEY / settings.llm_api_key）')
     url = _qwen_base() + '/embeddings'
     out = []
-    with _EMBED_LOCK:
-        for i in range(0, len(texts), QWEN_EMBED_BATCH):
-            batch = texts[i:i + QWEN_EMBED_BATCH]
-            d = _post_json(url, {'model': MODEL, 'input': batch, 'dimensions': DIM}, key)
-            rows = d.get('data') or []
-            if len(rows) != len(batch):
-                raise RuntimeError(f'千问返回 {len(rows)} 条向量，期望 {len(batch)} 条')
-            # 🔴 按 `index` 归位，不信返回顺序：错位一次就是整篇文档的向量与文本对不上，
-            # 而那种错**查不出来**（检索只是变差，不会报错）。
-            rows = sorted(rows, key=lambda r: r.get('index', 0))
-            for r in rows:
-                v = r.get('embedding')
-                if not isinstance(v, list) or len(v) != DIM:
-                    raise RuntimeError(f'千问向量维度 {len(v) if isinstance(v, list) else "?"} ≠ {DIM}')
-                out.append(v)
+    for i in range(0, len(texts), QWEN_EMBED_BATCH):
+        batch = texts[i:i + QWEN_EMBED_BATCH]
+        d = _post_json(url, {'model': MODEL, 'input': batch, 'dimensions': DIM}, key)
+        rows = d.get('data') or []
+        if len(rows) != len(batch):
+            raise RuntimeError(f'千问返回 {len(rows)} 条向量，期望 {len(batch)} 条')
+        # 🔴 按 `index` 归位，不信返回顺序：错位一次就是整篇文档的向量与文本对不上，
+        # 而那种错**查不出来**（检索只是变差，不会报错）。
+        rows = sorted(rows, key=lambda r: r.get('index', 0))
+        for r in rows:
+            v = r.get('embedding')
+            if not isinstance(v, list) or len(v) != DIM:
+                raise RuntimeError(f'千问向量维度 {len(v) if isinstance(v, list) else "?"} ≠ {DIM}')
+            out.append(v)
     return out
 
 
@@ -1433,7 +1429,7 @@ def revec():
 
 
 # /embed 一次请求的条数上限：Rust 侧 embed.rs BATCH=64，这里给 4 倍余量；
-# 不封顶的批量会长时间占住 `_EMBED_LOCK`（推理串行），把其它请求全饿死
+# 不封顶的批量是一串同步 HTTP 往返，单个请求能占住一个 worker 线程很久
 EMBED_MAX_TEXTS = 256
 
 def _int_param(body, name, default):
@@ -1565,7 +1561,7 @@ def serve(port=8077, host='127.0.0.1'):
     # /health 探针也一起被堵（容器编排读成「服务挂了」）。
     # 同一件事 `docker/parser/parse_service.py:142` 早就修了，宿主这份漏了 —— 一份实现两个入口，
     # 只修一个入口等于没修。判据：`_selftest_serve_unblocked`（换回 HTTPServer 立刻红）。
-    # 模型推理仍然串行（`_EMBED_LOCK`），并发的只有 IO 与解析。
+    # 向量化是 HTTP 往返，天然可并发；本进程不再串任何一道（锁已随本地模型一起删）。
     srv = ThreadingHTTPServer((host, port), H)
     # 先 bind 成功再报就绪：端口被占时上面那行就抛 OSError —— 先说就绪再炸会误导运维。
     # 启动就把「哪些扩展名不可用 + 为什么」打全：这条日志是运维唯一会看的地方，
