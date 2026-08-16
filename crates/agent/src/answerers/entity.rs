@@ -1131,7 +1131,7 @@ async fn shop_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Opt
         "SELECT sales_order_code AS `单号`, order_time AS `时间`, customer_name AS `客户`, \
                 total_amount AS `订单金额`, order_status AS `状态` \
          FROM t_sales_order o WHERE deleted_flag = 0 AND {shop_predicate}{otime} \
-         ORDER BY order_time DESC LIMIT 5"
+         ORDER BY order_time DESC, sales_order_code DESC LIMIT 5"
     );
     let (stats, recent) = futures::join!(fetch_rows(cx, &stats_sql), fetch_rows(cx, &recent_sql));
     let Some(stats) = stats? else { return Ok(None) };
@@ -1175,7 +1175,7 @@ async fn employee_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result
         "SELECT sales_order_code AS `单号`, order_time AS `时间`, customer_name AS `客户`, \
                 total_amount AS `订单金额`, order_status AS `状态` \
          FROM t_sales_order o WHERE deleted_flag = 0 AND o.owner_manager = '{e}'{otime} \
-         ORDER BY order_time DESC LIMIT 5"
+         ORDER BY order_time DESC, sales_order_code DESC LIMIT 5"
     );
     let (profile, stats, recent) = futures::join!(
         fetch_rows(cx, &profile_sql),
@@ -1264,14 +1264,14 @@ async fn customer_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result
                     COALESCE(e.actual_name,o.owner_manager,'') AS `业务员`, o.total_amount AS `金额`, o.order_status AS `状态` \
              FROM t_sales_order o LEFT JOIN t_employee e ON e.employee_id = o.owner_manager AND e.deleted_flag = 0 \
              WHERE o.deleted_flag = 0 AND o.customer_code = '{c}'{otime} \
-             ORDER BY order_time DESC LIMIT 5"
+             ORDER BY order_time DESC, o.sales_order_code DESC LIMIT 5"
         )
     } else {
         format!(
             "SELECT o.sales_order_code AS `单号`, o.order_time AS `时间`, COALESCE(o.shop_name,'') AS `门店`, \
                     o.total_amount AS `金额`, o.order_status AS `状态` \
              FROM t_sales_order o WHERE o.deleted_flag = 0 AND o.customer_code = '{c}'{otime} \
-             ORDER BY order_time DESC LIMIT 5"
+             ORDER BY order_time DESC, o.sales_order_code DESC LIMIT 5"
         )
     };
     let sales_future = async {
@@ -1451,7 +1451,7 @@ async fn goods_card(cx: &AskCtx<'_>, candidate: &Candidate) -> anyhow::Result<Op
          FROM t_sales_order_detail d \
          JOIN t_sales_order o ON o.sales_order_code = d.sales_order_code AND o.deleted_flag = 0 \
          WHERE d.deleted_flag = 0 AND d.item_type = '1' AND d.sku_code = '{safe_code}'{otime} \
-         ORDER BY o.order_time DESC LIMIT 5"
+         ORDER BY o.order_time DESC, d.sales_order_code DESC LIMIT 5"
     );
     let sales_future = async {
         if !cx.source.is_warehouse() {
@@ -1725,6 +1725,45 @@ fn build_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 时间列排序**必须**带并列键（2026-08-16 `--entries` 实测逮到）：
+    /// 「线下-广东横琴雨燕供应链管理有限公司」的客户卡，`/api/ask` 与 `/api/ask/stream`
+    /// 返回的 5 条最近订单**不是同一批**（第 4 行一个是 …500559、另一个是 …500555）——
+    /// `order_time` 落到天（`2026-08-16 00:00:00`），整批同值，`ORDER BY 时间 DESC LIMIT 5`
+    /// 于是从并列组里任取 5 条。用户看到的是「同一个问题，网页和小程序给的明细不一样」。
+    ///
+    /// 与 `knowledge::retrieve::merge_adjacent` 那条并列键是同一条纪律：
+    /// 排序键有并列就得有第二把钥匙，否则「同一句话两次不同结果」无法排查。
+    ///
+    /// 扫三个文件而不是一个：这一族散在 entity 卡、ops 快路径和深度板块里，
+    /// 只钉自己这份等于放另外两份继续漂。
+    #[test]
+    fn time_ordered_queries_all_carry_a_tie_break() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("answerers/entity.rs", include_str!("entity.rs")),
+            ("semantic/fastpath/ops.rs", include_str!("../../../semantic/src/fastpath/ops.rs")),
+            ("server/deep_api.rs", include_str!("../../../server/src/deep_api.rs")),
+        ];
+        let mut checked = 0;
+        for (name, src) in SOURCES {
+            for (idx, _) in src.match_indices("ORDER BY ") {
+                let rest = &src[idx + "ORDER BY ".len()..];
+                let Some(end) = rest.find("LIMIT") else { continue };
+                let clause = &rest[..end];
+                // 只管「排序键里有时间/日期列」的那一族；其余（金额、计数）不在本判据范围
+                if !(clause.contains("time") || clause.contains("date")) {
+                    continue;
+                }
+                // 跨过换行拼接的 SQL 字面量：`\` 续行与引号都可能落在中间，只看有没有第二个键
+                checked += 1;
+                assert!(
+                    clause.contains(','),
+                    "{name} 的 `ORDER BY {clause}LIMIT` 只有一个时间键，并列组会任取 ——                      同一句话两次结果不同。补一个唯一列（单号/主键）当第二把钥匙。"
+                );
+            }
+        }
+        assert!(checked >= 8, "只扫到 {checked} 条时间排序，判据可能已经扫空（文件改名/路径漂了）");
+    }
 
     /// 形态自证的实体名不看合同：同一句连打三次给出两种 route（2026-08-14 生产直打）——
     /// 差别只在 fast 那一轮抽没抽出实体表面词，而「是不是实体名」是问句的形态属性。

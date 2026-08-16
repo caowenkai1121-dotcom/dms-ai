@@ -306,7 +306,7 @@ pub fn sales_order_rows(question: &str) -> Option<DirectHit> {
              FROM t_sales_order o \
              LEFT JOIN t_employee e ON e.employee_id = o.owner_manager AND e.deleted_flag = 0 \
              LEFT JOIN t_dict_value d ON d.dict_key_id = '67' AND d.value_code = o.order_type \
-             WHERE o.deleted_flag = 0 AND {time}{region_sql} ORDER BY o.order_time DESC LIMIT 200",
+             WHERE o.deleted_flag = 0 AND {time}{region_sql} ORDER BY o.order_time DESC, o.sales_order_code DESC LIMIT 200",
             sales_status_sql("o.order_status")
         ),
         "direct-doc",
@@ -376,7 +376,7 @@ pub fn device_orders(question: &str) -> Option<DirectHit> {
         format!("SELECT sales_order_code AS `单号`, order_time AS `下单时间`, \
                  customer_name AS `客户`, source_code AS `设备需求单号`, \
                  total_amount AS `押金金额`, {status_sql} AS `状态` \
-                 FROM t_sales_order WHERE {where_sql} ORDER BY order_time DESC LIMIT 200")
+                 FROM t_sales_order WHERE {where_sql} ORDER BY order_time DESC, sales_order_code DESC LIMIT 200")
     };
     Some(hit(sql, "direct-doc"))
 }

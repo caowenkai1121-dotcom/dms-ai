@@ -2309,7 +2309,7 @@ async fn recent_orders(
     }
     let sql = "SELECT sales_order_code AS `单号`, order_time AS `时间`, customer_name AS `客户`, \
          total_amount AS `金额`, order_status AS `状态` FROM t_sales_order \
-         WHERE deleted_flag = 0 ORDER BY order_time DESC LIMIT 8";
+         WHERE deleted_flag = 0 ORDER BY order_time DESC, sales_order_code DESC LIMIT 8";
     let scope = dms_policy::scope::compute_scope_cached(&st.auth_mysql, p).await.ok()?;
     let scoped = dms_agent::gate_on(p, &sql, &scope, false, st.mysql.dialect())
         .map_err(|e| tracing::warn!(err = %e, "深度模式明细闸门未过 → 该 section 缺席"))
