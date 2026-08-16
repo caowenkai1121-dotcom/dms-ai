@@ -25,7 +25,7 @@
   DMS_TESSERACT tesseract 可执行文件（图片 OCR）
   DMS_OCR_LANG  OCR 语言包，默认 chi_sim+eng
 """
-import os, sys, json, re, csv, io, math, itertools, importlib.util, shutil, subprocess, tempfile, threading, urllib.request, urllib.error
+import os, sys, json, re, csv, io, math, itertools, importlib.util, shutil, subprocess, tempfile, threading, time, urllib.request, urllib.error
 from html.parser import HTMLParser   # _p_html 去标签用标准库（SAC 拦的是编译扩展，stdlib 两侧都一定有）
 # pythonw（stdout=None）/pytest 捕获流没有 reconfigure：缺席就跳过，不许为编码起不来
 for _s in (sys.stdout, sys.stderr):
@@ -108,9 +108,16 @@ def _qwen_base():
     return (os.environ.get('DMS_EMBED_BASE') or QWEN_BASE).rstrip('/')
 
 
-def _post_json(url, payload, key, timeout=60):
+# 值得重试的状态码：限流与网关抖动。**400 不在内** —— 那是我们发错了（批太大/模型名错），
+# 重试只会再错一次。一次退避即可：Rust 侧 /embed 的超时是 3s，重试太多等于把超时变成必然。
+_RETRY_CODES = (429, 500, 502, 503, 504)
+
+def _post_json(url, payload, key, timeout=60, _retry=1):
     """POST JSON + Bearer。非 2xx 把响应体带进异常 —— 400 的原因（批太大/模型名错/额度）
-    只在响应体里，吞掉它等于让运维猜。"""
+    只在响应体里，吞掉它等于让运维猜。
+
+    429/5xx 退避重试一次：不重试的代价不是「慢一点」，而是一次限流抖动 →
+    /embed 500 → Rust 侧进程级熔断 300s → 之后 5 分钟全部向量路静默降级。"""
     req = urllib.request.Request(
         url, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
         headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key})
@@ -118,7 +125,12 @@ def _post_json(url, payload, key, timeout=60):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f'{url} HTTP {e.code}: {e.read().decode("utf-8", "replace")[:300]}') from e
+        body = e.read().decode('utf-8', 'replace')[:300]
+        if e.code in _RETRY_CODES and _retry > 0:
+            print(f'{url} HTTP {e.code}，1s 后重试一次：{body[:120]}', file=sys.stderr, flush=True)
+            time.sleep(1)
+            return _post_json(url, payload, key, timeout, _retry - 1)
+        raise RuntimeError(f'{url} HTTP {e.code}: {body}') from e
 
 
 def embed(texts, is_query=False):
@@ -132,7 +144,8 @@ def embed(texts, is_query=False):
         return []
     key = _qwen_key()
     if not key:
-        raise RuntimeError('千问 key 未配置（DMS_EMBED_KEY / QWEN_KEY / settings.llm_api_key）')
+        raise RuntimeError('千问 key 未配置（DMS_EMBED_KEY / QWEN_KEY / settings.llm_keys.qwen；'
+                           'settings.llm_api_key 只在 llm_provider=qwen 时才算）')
     url = _qwen_base() + '/embeddings'
     out = []
     for i in range(0, len(texts), QWEN_EMBED_BATCH):
@@ -1639,6 +1652,7 @@ def selftest():
     _selftest_revec_len_guard()
     _selftest_handle_post()
     _selftest_qwen_embed()
+    _selftest_post_retry()
     dt = _selftest_serve_unblocked()
     _selftest_http_errors()
     shutil.rmtree(d, ignore_errors=True)     # 临时目录不留（以前每跑一次 selftest 留一个）
@@ -1700,6 +1714,47 @@ def _selftest_qwen_embed():
                         {'index': 0, 'relevance_score': 0.1}]}
     finally:
         g['_post_json'], g['_qwen_key'] = keep
+
+
+def _selftest_post_retry():
+    """429/5xx 退避重试一次、400 不重试。
+
+    为什么值得一条判据：不重试的代价不是「慢一点」—— 一次限流抖动就让 /embed 返 500，
+    Rust 侧当即进程级熔断 300s，之后 5 分钟语义缓存/KB 向量路/表召回向量路全静默降级。
+    而 400（批太大 / 模型名错）重试只是再错一次，必须**不**重试。"""
+    import urllib.error
+    calls = []
+
+    class FakeResp:
+        def read(self): return b'{"ok":1}'
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    def make(codes):
+        it = iter(codes)
+        def fake(req, timeout=None):
+            code = next(it); calls.append(code)
+            if code == 200:
+                return FakeResp()
+            raise urllib.error.HTTPError(req.full_url, code, 'x', {}, io.BytesIO(b'boom'))
+        return fake
+
+    orig_open, orig_sleep = urllib.request.urlopen, time.sleep
+    try:
+        time.sleep = lambda *_: None          # 判据不真等 1s
+        urllib.request.urlopen = make([429, 200])
+        assert _post_json('http://x', {}, 'k') == {'ok': 1}
+        assert calls == [429, 200], calls
+        calls.clear()
+        urllib.request.urlopen = make([400])
+        try:
+            _post_json('http://x', {}, 'k')
+            raise AssertionError('400 必须当场抛，不许重试')
+        except RuntimeError as e:
+            assert 'HTTP 400' in str(e), e
+        assert calls == [400], calls
+    finally:
+        urllib.request.urlopen, time.sleep = orig_open, orig_sleep
 
 
 def _selftest_pdf_scan(tmpdir):
