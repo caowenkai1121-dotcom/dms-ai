@@ -3990,52 +3990,55 @@ mod tests {
         ));
     }
 
-    /// 🔴 **判据的扫描面必须覆盖缺陷面** —— 本仓为这条付了四次账。
+    /// 🔴 **判据的扫描面必须覆盖缺陷面** —— 本仓为这条付了五次账。
     ///
-    /// 历史：判据一开始只扫 `main.rs`（1/4 入口）→ 深度模式漏网；
-    /// 扩到四个文件后只要求「出卡前问过知识库」→ 只问知识库那条路合法、永远绿；
-    /// 2026-08-16 业主实测「长沙鸣望供应链管理有限公司」，才发现缺的是对称的那一半。
+    /// 前四次：判据只扫 main.rs（1/4 入口）；扩到四文件后只要求「出卡前问过知识库」
+    /// （于是「只问知识库」永远合法、永远绿）；按 `IntentRoute::Unknown =>` **形状**扫
+    /// （2026-08-16 把 xcx/mcp 的四臂塌成 `_ =>` 兜底之后，这条判据对它们**当场变哑** ——
+    /// 我自己写的守卫，我自己的下一刀就绕过去了）。
     ///
-    /// 现在的不变量是**最强的那一条**：`Unknown` 臂必须与 `Data` 臂走**同一个出口**。
-    /// 一句问句被判成 Unknown（裸客户名 / 裸单号 / fast 抖动）不代表答不了 ——
-    /// 它必须走完整的两臂编排，由 agent 一处裁决先问数还是先知识库、要不要出澄清卡。
-    /// server 在 Router 之前**一个决定都不做**。
-    ///
-    /// 自匹配说明：本测试自身的字面量也会被 `include_str!` 扫到，形成恒真的匹配 ——
-    /// 无害（每个匹配点各自独立判定，真站点漏了仍然会红）。
+    /// 第五版不扫形状，扫**承重的那个调用**：`kb_answer` 是「只问知识库」的唯一入口，
+    /// 除 `main.rs`（它是定义处，且两臂编排内部的资料半要用它）外，
+    /// 任何入口文件出现它就是又一次绕过 Router。
+    /// 形状可以随便重构，这条判据不受影响 —— 这正是上一版缺的性质。
     #[test]
-    fn every_unknown_arm_exits_through_the_two_arm_orchestration() {
-        const ENTRIES: [(&str, &str); 4] = [
-            ("main.rs", include_str!("main.rs")),
-            ("deep_api.rs", include_str!("deep_api.rs")),
+    fn no_entry_calls_the_kb_directly() {
+        // needle 运行时拼：写成字面量的话本测试自己会被自己命中
+        let banned = [
+            ["kb_", "answer("].concat(),
+            ["unknown_route_kb", "_fallback("].concat(),
+        ];
+        for (name, src) in [
             ("xcx_api.rs", include_str!("xcx_api.rs")),
             ("mcp_api.rs", include_str!("mcp_api.rs")),
-        ];
-        // 合格出口只有这三种写法（全部是两臂编排）：
-        //   `ask_arms_payload(`  = /api/ask 两个 handler
-        //   `ask_data_payload(`  = 小程序两个 handler
-        //   `crate::ask_prepared(` = MCP 直接调编排
-        // 深度模式没有 `Unknown =>` 臂（fall-through 到问数），由下面的臂序判据管。
-        const EXITS: [&str; 3] = ["ask_arms_payload(", "ask_data_payload(", "crate::ask_prepared("];
-        let unknown_arm = concat!("IntentRoute::Unknown", " =>");
-        for (name, src) in ENTRIES {
-            for (at, _) in src.match_indices(unknown_arm) {
-                // 按**字符**取窗口：`&src[at..at+n]` 会切在中文注释的 UTF-8 中间直接 panic
-                let body: String = src[at..].chars().take(600).collect();
-                // `=> None` 是**投影判据**不是答案出口（`forced_routed_question` 里
-                // 「Unknown 合同不许被 chip 洗成可执行」那一臂），跳过。
-                if body.starts_with(concat!("IntentRoute::Unknown", " => None")) {
-                    continue;
-                }
+            ("deep_api.rs", include_str!("deep_api.rs")),
+        ] {
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for needle in &banned {
+                let offender = production.lines().enumerate().find(|(_, line)| {
+                    !line.trim_start().starts_with("//") && line.contains(needle)
+                });
                 assert!(
-                    EXITS.iter().any(|exit| body.contains(exit)),
-                    "{name} 的 Unknown 臂没走两臂编排（确定性问数成员一个都不跑）：{body}"
+                    offender.is_none(),
+                    "{name}:{} 又直连知识库（`{needle}`）—— 确定性问数成员一个都不跑，                     「线下-浏阳品元商贸有限公司」那一族当场复活",
+                    offender.map_or(0, |(i, _)| i + 1)
                 );
             }
         }
+        // main.rs 里 `kb_answer` 只许出现在**定义**与两臂编排内部（流式那条探针之后），
+        // 不许成为某个 route 臂的直接出口。
+        let production = include_str!("main.rs").split("#[cfg(test)]").next().unwrap();
+        let arm_exit = [
+            "IntentRoute::Knowledge => {
+            let a = kb_",
+            "IntentRoute::Unknown => {
+            let a = kb_",
+        ];
+        for shape in arm_exit {
+            assert!(!production.contains(shape), "main.rs 的 route 臂又直连知识库了");
+        }
         // 🔴 深度模式的**臂序**：知识臂必须在「转问数」之前。它是 fall-through 结构，
-        // 一旦有人把知识臂挪到问数之后，「下载 押金转货款申请书」又会掉回 38 行账余表 ——
-        // 上面按形状扫的判据看不见这个。收窄到那一个 handler 再比先后。
+        // 一旦有人把知识臂挪到问数之后，「下载 押金转货款申请书」又会掉回 38 行账余表。
         let deep = include_str!("deep_api.rs");
         let at = deep.find("async fn compose_inner(").expect("深度模式的 compose_inner 改名了");
         let handler = &deep[at..];
@@ -4154,15 +4157,34 @@ mod tests {
     fn both_ask_endpoints_share_one_arms_exit() {
         let src = include_str!("main.rs");
         let production = src.split("#[cfg(test)]").next().unwrap();
-        // 3 = `/api/ask` 的唯一出口 + `/api/ask/stream` 的 Data 与 Hybrid|Unknown 两档。
-        // 🔴 2026-08-16 从 5 降回 3：那两处「合同没就绪」早退**整体删掉**了 ——
-        // server 在 Router 之前一个决定都不做，两个 handler 因此各自只剩
-        // 「prepare → forced 投影 → 交给两臂」。数字变小是这一刀的**目的**，不是退步。
-        assert_eq!(
-            production.matches("ask_arms_payload(&st, &req, &gate, &prepared)").count(),
-            3,
-            "两个端点的 Data/Knowledge/Unknown 三档没有全部走 ask_arms_payload"
-        );
+        // 🔴 **不用计数判据**（本仓明确记过这笔账：上一版写成「出现 5 次」，
+        // 一重构就得跟着改数字，而改数字的人不会去想为什么）。改成按 handler 判形状：
+        // 两个 handler 各自必须有 `ask_arms_payload` 出口，且**都不许**有第二个出口形态。
+        for handler in ["async fn api_ask(", "async fn api_ask_stream("] {
+            let body = production
+                .split(handler)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{handler} 改名了"))
+                .split("
+}
+")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("ask_arms_payload(&st, &req, &gate, &prepared)"),
+                "{handler} 没走两臂出口"
+            );
+            // 只扫**代码行**：注释里要写清楚旧出口去哪了、为什么，扫进去等于禁止解释
+            for banned in ["unknown_route_kb", "prepared_contract_ready", "needs_clarification"] {
+                let offender = body
+                    .lines()
+                    .find(|line| !line.trim_start().starts_with("//") && line.contains(banned));
+                assert!(
+                    offender.is_none(),
+                    "{handler} 又长出 Router 之前的第二个出口（`{banned}`）：{offender:?}"
+                );
+            }
+        }
         // 🔴 「纯资料档重塑成整份 Answer」的分档现在是**全仓唯一一份**
         //（`knowledge_arm_payload`），web / 小程序 / MCP 三个入口共用。
         // 2026-08-16 之前小程序与 MCP 各写各的（直连 `kb_answer`），于是
