@@ -1120,54 +1120,31 @@ fn worth_learning(st: &State, rs: &dms_connector::source::RowSet) -> bool {
 
 // ─────────────────────── 【判官实测·问题 1②】LLM 出口的合同绕开降级 ───────────────────────
 
-/// 销售合同指标匹配：**镜像** `server/src/direct.rs` 的 `warehouse_sales_metrics`
-/// （词表源头是同一份合同 `sales_fact::METRICS` 的 name/aliases + 三个额外问法词；
-/// direct.rs 另一路在改、agent 不许反向引 server，故守一份镜像，漂移由单测锁）。
-/// 判据逐条对齐：每指标取最长命中词 → 按词长排序去重（被已选词真包含的让位）→ 按问句位置排序。
+/// 销售合同指标匹配。**曾经是一份镜像**（原判据抄自 `server/src/direct.rs`，
+/// 理由是「agent 不许反向引 server」）—— 那个理由 2026-08-16 已经不成立：
+/// 判据早就搬进了 `dms_semantic::fastpath::warehouse_sales_metrics`，而 agent 本来就依赖
+/// dms-semantic（`fastpath_intent.rs` 全程在用）。留着镜像的代价是**两种「什么算销售指标」**：
+///
+///   - 镜像少了 `QTY_UNITS` 改判（「多少箱」问的是件数不是钱），
+///   - 镜像的额外问法词只有三条，缺销量那一族（「买了多少/卖了多少/进了多少」+ 13 个单位）。
+///
+/// 后果不是少认几个词，是**认成另一个指标**：走镜像这条门的问句会拿销售额去答箱数。
+/// 现在直接转调唯一事实源，镜像与它的漂移锁一起删掉。
+///
 /// 两个消费者：本文件 `contract_bypass_note`（LLM 出口降级）与
 /// `ask.rs` 的「维度成员值优先」门（direct-doc 外包）。
 pub(crate) fn sales_contract_metrics(
     question: &str,
 ) -> Vec<(dms_semantic::sales_fact::Metric, &'static str)> {
-    let candidates = dms_semantic::sales_fact::METRICS
-        .iter()
-        .copied()
-        .filter_map(|m| {
-            std::iter::once(m.name())
-                .chain(m.aliases().iter().copied())
-                .chain(sales_metric_extra_words(m).iter().copied())
-                .filter(|w| question.contains(w))
-                .max_by_key(|w| w.chars().count())
-                .map(|w| (m, w))
-        })
-        .collect::<Vec<_>>();
-    // 词长只算一次再排：`sort_by_key` 的比较器会按比较次数重算 key（O(n log n) 次 `chars().count()`）
-    let mut candidates: Vec<(usize, (dms_semantic::sales_fact::Metric, &'static str))> =
-        candidates.into_iter().map(|c| (c.1.chars().count(), c)).collect();
-    candidates.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-    let mut selected: Vec<(dms_semantic::sales_fact::Metric, &'static str)> = vec![];
-    for (_, candidate) in candidates {
-        if selected.iter().any(|(_, word)| word.contains(candidate.1)) {
-            continue;
-        }
-        selected.push(candidate);
-    }
-    selected.sort_by_key(|(_, w)| question.find(*w).unwrap_or(usize::MAX));
-    selected
+    dms_semantic::fastpath::warehouse_sales_metrics(question)
 }
 
-/// 额外问法词：与 `direct.rs` 的 `sales_fact_metric_extra_words` 逐字同源（镜像关系见上）。
+/// 额外问法词：同上，转调唯一事实源。
 /// `pub(crate)` 的第二消费者：`ask.rs` 的值词残留提取（剥词表必须与命中判据同一份）。
 pub(crate) fn sales_metric_extra_words(
     metric: dms_semantic::sales_fact::Metric,
 ) -> &'static [&'static str] {
-    use dms_semantic::sales_fact::Metric;
-    match metric {
-        Metric::SalesAmount => &["销售金额"],
-        Metric::RevenueExcludingTax => &["收入"],
-        Metric::GrossProfit => &["毛利"],
-        _ => &[],
-    }
+    dms_semantic::fastpath::sales_fact_metric_extra_words(metric)
 }
 
 /// 与已验证销售合同（`sales_fact` DWS 日事实）**主题重叠**的 ODS 表：同一批线下销售业务的
@@ -2010,11 +1987,12 @@ mod steer_tests {
 mod contract_bypass_tests {
     use super::*;
 
-    /// 🔴 镜像漂移锁：`sales_contract_metrics` 与合同的 name/aliases + 三个额外问法词同源。
-    /// direct.rs 那份匹配器另一路在改 —— 两边词表源头都是 `sales_fact::METRICS`，
-    /// 谁改了合同词表，这里当场红（而不是静默漂成两种「什么算销售指标」）。
+    /// 🔴 曾经是「镜像漂移锁」，2026-08-16 镜像删掉后改成**转调判据**：
+    /// 这道门与确定性快路径必须是同一个 `warehouse_sales_metrics`，
+    /// 否则同一句话在两条路上算成两个指标（镜像少了 QTY_UNITS 改判与销量那族额外词，
+    /// 实测后果是拿销售额去答箱数）。
     #[test]
-    fn contract_metric_matcher_mirrors_the_sales_contract() {
+    fn contract_metric_matcher_is_the_fastpath_matcher() {
         use dms_semantic::sales_fact::Metric;
         // 每个合同指标的正式名都必须命中
         for m in dms_semantic::sales_fact::METRICS {
@@ -2039,6 +2017,26 @@ mod contract_bypass_tests {
         let hits = sales_contract_metrics("上月销售额和毛利");
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert!(hits[0].0 == Metric::SalesAmount && hits[1].0 == Metric::GrossProfit, "{hits:?}");
+        // 🔴 转调判据：两条路必须给出**同一个**指标集，含 QTY_UNITS 改判那一档
+        for q in [
+            "浏阳品元本月买了多少箱",
+            "本月销售额是多少",
+            "上月各省区销量",
+            "本月毛利率",
+        ] {
+            assert_eq!(
+                sales_contract_metrics(q),
+                dms_semantic::fastpath::warehouse_sales_metrics(q),
+                "两条路对「{q}」算出了不同的指标"
+            );
+        }
+        // 「多少箱」问的是件数不是钱（镜像时代这里是 SalesAmount）
+        assert!(
+            sales_contract_metrics("浏阳品元本月买了多少箱")
+                .iter()
+                .any(|(m, _)| *m == Metric::SalesQuantity),
+            "「多少箱」必须改判成销量"
+        );
     }
 
     /// 🔴 判官原案（问题 1②）：「上个月消售额多少」落 LLM 全目录路径打了 ODS 订单表
