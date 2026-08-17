@@ -762,7 +762,29 @@ pub fn answerable_tail_words(question: &str, scalar: bool) -> Vec<String> {
         .filter(|word| question.contains(**word))
         .map(|word| (*word).to_string())
         .collect();
+    // 🔴 分组问法的**结果形状词**：模板出的那张按维度分组的表，本身就是「分布/构成」。
+    // 2026-08-17 判官实测：「本月销售额按省份的分布是多少」——指标「销售额」、维度
+    // 「省份」、时间「本月」全部命中并消化，唯独「分布」没有任何一张表认领，
+    // 于是一个**不携带任何过滤或口径含义**的词把一条已装配好的确定性 SQL 整条拒了，
+    // 落「未确认限定」卡 → 归一重试撞同一行 → need-intent。
+    // 而「本月销售额按省区」「销售额按省份」两条是绿的 direct-agg，
+    // 与它的**全部差异**就是尾巴上「的分布是多少」。
+    //
+    // 门开在 `!scalar` 上：`scalar` 为假 ⇔ 问句里真的命中了分类维度 ⇔ GROUP BY 出来的
+    // 那张表就是分布，模板已经兑现了它。没有分组轴时一个字都不剥 ——
+    // 「本月销售额的分布是多少」照旧拒（那问的是别的东西，答一个标量是错的）。
+    //
+    // 刻意**不收**「占比/比例/环比」：那要一列百分比，而销售事实模板出不了
+    // （结果表没有百分比列，占比只出现在洞察文案里）。剥它就是拿绝对金额答占比 ——
+    // 单值形态用户无从察觉，正是本仓「还/剩」那条纪律挡的东西。
+    // 也不收「结构」：可能出现在商品名里（结构胶）。按「只加实测挡住过的词」办。
+    const BREAKDOWN_SHAPE_WORDS: &[&str] = &["分布", "构成"];
     if !scalar {
+        for word in BREAKDOWN_SHAPE_WORDS {
+            if question.contains(word) {
+                words.push((*word).to_string());
+            }
+        }
         return words;
     }
     // 「同比」由 yoy_window 兑现、「环比」由 prev_window 兑现；窗口认不得就不剥。
@@ -1489,4 +1511,41 @@ async fn customer_filtered_sales(cx: &crate::ctx::AskCtx<'_>) -> Option<DirectHi
         }
     };
     warehouse_sales_fact_predicated(cx.question, Some(&binding))
+}
+
+
+#[cfg(test)]
+mod tests {
+    /// 分组问法的结果形状词（分布/构成）不许把确定性 SQL 整条拒掉。
+    #[test]
+    fn a_breakdown_shape_word_does_not_reject_an_assembled_grouping_sql() {
+        // 正：有分组轴时，「分布」被消化，与不带它的那句同待遇
+        let with_shape = super::answerable_tail_words("本月销售额按省份的分布是多少", false);
+        assert!(
+            with_shape.iter().any(|w| w == "分布"),
+            "有分组轴时「分布」必须被消化：模板出的那张分组表本身就是分布。实际 {with_shape:?}"
+        );
+        assert!(
+            super::answerable_tail_words("本月销售额按省份的构成", false)
+                .iter()
+                .any(|w| w == "构成"),
+            "「构成」同族"
+        );
+        // 反向①：没有分组轴时一个字都不剥 —— 那问的是别的东西，答标量是错的
+        assert!(
+            !super::answerable_tail_words("本月销售额的分布是多少", true)
+                .iter()
+                .any(|w| w == "分布"),
+            "没有分组轴时不许剥：会把「分布」静默答成一个标量"
+        );
+        // 反向②：占比/比例/环比刻意不收 —— 模板出不了百分比列，剥它就是拿金额答占比
+        for banned in ["占比", "比例", "环比"] {
+            assert!(
+                !super::answerable_tail_words(&format!("本月销售额按省份的{banned}"), false)
+                    .iter()
+                    .any(|w| w == banned),
+                "「{banned}」不许进这张表：销售事实模板的结果表没有百分比列，剥它就是拿绝对金额答占比"
+            );
+        }
+    }
 }

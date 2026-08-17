@@ -821,6 +821,20 @@ def run_case(c, results):
         results.append((name, False, f"执行错误: {j['error'][:120]}")); return
 
     fails = check(c, j)
+    # 🔴 全局正判据：**每一条真实应答**都必须带收据（2026-08-17）。
+    # `check()` 里那行把「键不存在」静默降级成空 dict，于是「答不出来还不说自己
+    # 理解成了什么」只有恰好钉了 intent_mode 的那一题能发现 —— 101 题里只有 1 题在守。
+    # 收据是用户判断「该不该信」的唯一依据，缺席就是最坏的那种降级。
+    # 守在这里（真实应答）而不是 `check()` 里：那个函数被 selfcheck 拿合成载荷单测，
+    # 合成载荷本来就没有收据。也不加第 102 条用例：一次覆盖全题集，
+    # 将来任何新出口漏填当场红。
+    raw_summary = j.get("intent_summary")
+    if raw_summary is None:
+        fails.append("应答缺 intent_summary（答不出来也要说自己理解成了什么）")
+    elif not isinstance(raw_summary, dict):
+        fails.append(f"intent_summary 不是对象：{type(raw_summary).__name__}")
+    elif raw_summary.get("mode") not in INTENT_MODES:
+        fails.append(f"intent.mode={raw_summary.get('mode')} 不在合法取值里")
     # 🔴 反问卡有**两档**，判官输出里原来长得一模一样（2026-08-17）：
     #   ① 合同失败型：意图模型超时/回包不合约 —— caliber_note 有固定文案，是上游抖动；
     #   ② 真·歧义型：问句本身没说清 —— caliber_note 为 None。

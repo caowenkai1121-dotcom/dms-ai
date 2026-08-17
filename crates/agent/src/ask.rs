@@ -871,7 +871,21 @@ pub(crate) async fn ask_data_arm(
         out.intent_summary = Some(prepared.intent_summary());
         return Ok(out);
     }
-    one(rewritten).await
+    // 🔴 兜底出口不造收据，答案空、收据也空（2026-08-17 判官实测：G03 拿到
+    // `intent.mode=None`，不是 `unknown`——是整个 `intent_summary` 键都不在）。
+    // 命中路径的三个出口都走 `attach_trust` 顺手填了收据，两个 need-intent 兜底出口
+    // 没有，而 `empty_reply` 把 `intent_summary` 写死 None。于是「答不出来」这件事
+    // 连「我理解成了什么」都不说 —— 用户与判官都无从判断是没听懂还是没数据。
+    //
+    // 填在**唯一漏斗**上：这里是 `ask_data_arm` 所有单问出口的必经之路（复合容器那支
+    // 上面已提前 return）。三个兜底卡与将来任何新兜底卡一次覆盖，
+    // CLI / HTTP / deep 三个入口同时修好，事实源仍是 `PreparedQuestion::intent_summary()`。
+    // **不**在 server 的 wire 层补键：那只修 HTTP，还会造第二份实现。
+    let mut r = one(rewritten).await?;
+    if r.intent_summary.is_none() {
+        r.intent_summary = Some(prepared.intent_summary());
+    }
+    Ok(r)
 }
 
 // ─────────────────────── 【判官实测 2026-08-11】「不可计算」卡的 AI 重新理解层 ───────────────────────

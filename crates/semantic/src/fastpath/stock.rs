@@ -231,17 +231,6 @@ pub fn stock_product_fragment(question: &str) -> Option<String> {
     // 这次钉**词类**：比较词与计数疑问词在中文里是封闭类虚词，不会像业务名词那样年年长新的。
     // 商品名里不会出现「超过」「有几个」——出现了就说明这段是筛选条件，
     // 该交给能写 HAVING + COUNT 的自由 SQL 那条路，不是拿去做商品唯一性匹配。
-    const CONDITION_WORDS: &[&str] = &[
-        // 比较
-        "超过", "大于", "小于", "高于", "低于", "不足", "不到", "多于", "少于",
-        "以上", "以下", "至少", "至多", "以内", "之上", "之下",
-        // 计数疑问
-        "几个", "几家", "几笔", "几条", "几种", "几款", "几人", "有多少", "多少个",
-        "多少家", "多少种", "多少款",
-    ];
-    if CONDITION_WORDS.iter().any(|w| fragment.contains(w)) {
-        return None;
-    }
     (!fragment.is_empty()).then_some(fragment)
 }
 
@@ -287,8 +276,41 @@ pub fn stock_snapshot(question: &str) -> Option<DirectHit> {
     Some(hit)
 }
 
+/// 比较词与计数疑问词。中文里这两类是**封闭类虚词**，不像业务名词那样年年长新的 ——
+/// 所以钉词类，不钉名单（前两次「冻结/锁定被当商品名」「『总』被当商品名」都是往名单里补词）。
+const CONDITION_WORDS: &[&str] = &[
+    // 比较
+    "超过", "大于", "小于", "高于", "低于", "不足", "不到", "多于", "少于",
+    "以上", "以下", "至少", "至多", "以内", "之上", "之下",
+    // 计数疑问
+    "几个", "几家", "几笔", "几条", "几种", "几款", "几人",
+    // 🔴 裸的「有多少」**不在表里**：它问的是**数量**不是**个数**。
+    // 「库存还有多少」是一句普通的总量问句，被它误伤就等于把快路整条关掉
+    // （2026-08-17 被既有单测 `stock_product_fragment_separates_generic_totals_from_entity_questions` 当场逮到）。
+    // 真正表示「数一数有几个」的是后面那个**量词**（个/家/种/款）——判据钉量词，不钉「多少」。
+    "多少个", "多少家", "多少种", "多少款",
+];
+
+/// 问句里带阈值/计数要求时，**整条库存快路让路**（返回 `None`，交给能写
+/// `HAVING` + 外层 `COUNT` 的自由 SQL）。
+///
+/// 🔴 门必须开在**所有分支之前**（2026-08-17 当天自查逮到）：
+/// 我先把这张词表加在 `stock_product_fragment` 内部，于是那个函数返 `None`、
+/// `is_some()` 为假，控制流**掉进下面的通用总量分支** ——「超过100万」「有几个」
+/// 被静默丢掉，「库存量超过100万的仓库有几个」会被答成全仓 1.06 亿。
+/// 把一张红卡换成一个静默错答，那比原来更糟：用户看不出它答错了。
+///
+/// 开在这里一行同时管住六个出口（冻结/锁定、按仓分组、中台总量、WinC 三支）——
+/// 它们**全都没有 HAVING 能力**，全都会静默吞掉阈值。
+fn stock_ask_needs_more_than_a_snapshot(question: &str) -> bool {
+    CONDITION_WORDS.iter().any(|w| question.contains(w))
+}
+
 fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
     if !["库存", "存货"].iter().any(|w| question.contains(w)) {
+        return None;
+    }
+    if stock_ask_needs_more_than_a_snapshot(question) {
         return None;
     }
     let wants_amount = ["金额", "货值", "库存额"].iter().any(|w| question.contains(w));
@@ -542,31 +564,38 @@ pub fn stock_product_snapshot(sku_predicate: &str, surface: &str) -> DirectHit {
 #[cfg(test)]
 mod warehouse_group_tests {
 
-    /// 剥完剩的是**条件**就不是商品名 —— 同族第三次（冻结/锁定、「总」、这次）。
+    /// 带阈值/计数要求的库存问句，整条快路**让路**——不许静默答成总量。
     #[test]
-    fn a_threshold_or_counting_residue_is_a_condition_not_a_product_name() {
+    fn a_threshold_or_counting_stock_ask_yields_instead_of_silently_summing() {
         for q in [
             "库存量超过100万的仓库有几个",
             "库存大于50万的商品有多少个",
             "库存量不足100的商品",
-            "库存量最多的前3个仓库有几家",
+            "库存量超过10万的仓库",
         ] {
+            // 🔴 钉的是**整条快路返 None**，不是 `stock_product_fragment` 返 None。
+            // 后者正是造成静默错答的那个形状：fragment 一 None，`is_some()` 为假，
+            // 控制流掉进通用总量分支，阈值和计数被吞掉，答成全仓 1.06 亿。
             assert!(
-                stock_product_fragment(q).is_none(),
-                "{q}：残余是筛选条件，不许当商品名拿去唯一性匹配（会落终止卡）：{:?}",
-                stock_product_fragment(q)
+                stock_snapshot(q).is_none(),
+                "{q}：快路没有 HAVING 能力，必须让路给自由 SQL，不许答成总量：{:?}",
+                stock_snapshot(q).map(|h| h.sql)
             );
         }
-        // 反向：真商品名一个不许被误伤
+        // 反向①：不带阈值/计数的库存问句照旧命中快路
+        // （商品限定那一族不由 stock_snapshot 承接，走 stock_product_snapshot，另测）
+        for q in ["现在总库存量是多少", "各仓库库存量", "库存量最多的仓库"] {
+            assert!(
+                stock_snapshot(q).is_some(),
+                "{q}：普通库存问句不许被这道门误伤"
+            );
+        }
+        // 反向②：真商品名一个不许被误伤（`stock_product_fragment` 语义不变）
         for (q, want) in [
             ("烤肠的库存量", "烤肠"),
             ("小虎黑椒味烤肠500G的库存", "小虎黑椒味烤肠500G"),
         ] {
-            assert_eq!(
-                stock_product_fragment(q).as_deref(),
-                Some(want),
-                "{q}：真商品名被误伤"
-            );
+            assert_eq!(stock_product_fragment(q).as_deref(), Some(want), "{q}：真商品名被误伤");
         }
     }
     /// 🔴 排行不许把合成兜底桶发成名次（2026-08-17 审计）。
