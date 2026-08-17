@@ -716,6 +716,8 @@ pub(crate) async fn ask_data_arm(
                 intent_attempt: &intent_attempt,
                 // 裁决而非合同：chip 定的路要一路带到收据（见 `IntentAttempt::summary`）
                 decided_route: child_route,
+                // 整轮起点：澄清卡要盖它，不是成员循环那个 t0（见 ctx.rs 上的红字）
+                turn_t0: prepared.started_at,
                 intent: intent_attempt.ready().map(|intent| intent.as_ref()),
                 ds,
                 source_name,
@@ -1529,6 +1531,21 @@ fn out_of_scope_topic(question: &str) -> Option<String> {
     if crate::answerers::entity::entity_form_hit(&s) {
         return None;
     }
+    // 🔴 主题必须是问句里的**一段连续文字**（2026-08-17 生产实测）。
+    // `residue_after_strip` 是逐词删除，剩下的可能是散碎片段的拼接 —— 那不是主题。
+    // 业主问「京东仓有哪些大日期商品，大日期的意思是失效日期小于3个月」，
+    // 剥完拼出「京东仓大大意思是失效小于」，于是整题被换成 no-topic 卡，
+    // 卡面说「『京东仓大大意思是失效小于』这个主题还没有接入数据，目前能查的是：
+    // 销售、订单、客户、商品、门店、**库存**、…、**仓库**」——
+    // 一边说没接入，一边在同一句话里列着库存和仓库。自相矛盾的卡比不换文案更糟：
+    // 它让用户以为这类问题系统根本不支持，从此不再问。
+    //
+    // 连续性是**这条判据本来就该有的形状**：现有单测那句「火星上销售额多少 → 火星」，
+    // 「火星」正是原句里的一段连续文字。碎片拼接从来不在设计意图里，只是没人钉住。
+    if !question.contains(&s) {
+        tracing::debug!(residue = %s, question = %question, "剥完的残余不是问句里的连续片段 → 不当主题");
+        return None;
+    }
     Some(s)
 }
 
@@ -1687,7 +1704,7 @@ async fn ask_single(
         steps.push(Step { stage: a.route(), kind: "miss", ms: t.elapsed().as_millis() });
     }
     if let Some(note) = cx.intent_attempt.user_note() {
-        let mut r = intent_reply(cx.question, cx.t0, vec![]);
+        let mut r = intent_reply(cx.question, cx.turn_t0, vec![]);
         r.caliber_note = Some(note.to_string());
         r.steps = steps;
         return Ok(r);
@@ -1696,7 +1713,7 @@ async fn ask_single(
     // 回澄清卡，而不是 bail 成 500。`user_note()` 只覆盖 Unavailable/Invalid 两态，
     // 「解析成功但 mode=unknown/自报歧义」那一档它是 None（2026-08-13 实测同题不同答）。
     if !members.iter().any(|m| m.route() == "llm") {
-        let mut r = intent_reply(cx.question, cx.t0, vec![]);
+        let mut r = intent_reply(cx.question, cx.turn_t0, vec![]);
         r.steps = steps;
         return Ok(r);
     }
@@ -2515,6 +2532,23 @@ fn looks_like_sql(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// 主题必须是问句里的一段**连续文字**；碎片拼接不是主题（2026-08-17 生产实测）。
+    #[test]
+    fn a_topic_must_be_a_contiguous_span_of_the_question() {
+        let q = "京东仓有哪些大日期商品，大日期的意思是失效日期小于3个月";
+        assert_eq!(
+            out_of_scope_topic(q),
+            None,
+            "剥完拼出的碎片不是主题：卡面会说「…这个主题还没有接入数据，目前能查的是：             …库存…仓库…」，一边说没接入一边列着库存和仓库，自相矛盾"
+        );
+        // 反向：真出界主题照旧认出来，而且它本来就是原句里的连续一段
+        for (q, want) in [("火星上销售额多少", "火星"), ("火星上有多少订单", "火星")] {
+            let got = out_of_scope_topic(q);
+            assert_eq!(got.as_deref(), Some(want), "{q}：真出界主题不许被一起放过");
+            assert!(q.contains(want), "判据自洽性：认出来的主题必须真的在原句里");
+        }
+    }
 
     /// chip 必须**真的**进 `decide()`。此前 `plan()` 把 `forced` 写死 `None`，
     /// R0「用户自己点的 chip 最大」是死代码，却有一条恒绿单测（直接调 `decide` 传 `Some`）

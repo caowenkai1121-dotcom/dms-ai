@@ -222,6 +222,26 @@ pub fn stock_product_fragment(question: &str) -> Option<String> {
     if crate::direct_types::QUANTIFIER_PREFIXES.contains(&fragment.as_str()) {
         return None;
     }
+    // 🔴 残余里带**比较词或计数疑问词**时，它是个**条件**，不是商品名（2026-08-17 生产实测）。
+    // 「库存量超过100万的仓库有几个」剥掉库存词后剩「超过100万的仓库有几个」，被当成商品限定
+    // 拿去唯一性探针，于是整题落终止卡：「商品限定「超过100万的仓库有几个」还不能唯一匹配到
+    // 一个库存商品」。这是同一族的第三次（前两次：冻结/锁定被当商品名、「总」被当商品名），
+    // 前两次都是往名单里补词，名单永远有下一个漏项。
+    //
+    // 这次钉**词类**：比较词与计数疑问词在中文里是封闭类虚词，不会像业务名词那样年年长新的。
+    // 商品名里不会出现「超过」「有几个」——出现了就说明这段是筛选条件，
+    // 该交给能写 HAVING + COUNT 的自由 SQL 那条路，不是拿去做商品唯一性匹配。
+    const CONDITION_WORDS: &[&str] = &[
+        // 比较
+        "超过", "大于", "小于", "高于", "低于", "不足", "不到", "多于", "少于",
+        "以上", "以下", "至少", "至多", "以内", "之上", "之下",
+        // 计数疑问
+        "几个", "几家", "几笔", "几条", "几种", "几款", "几人", "有多少", "多少个",
+        "多少家", "多少种", "多少款",
+    ];
+    if CONDITION_WORDS.iter().any(|w| fragment.contains(w)) {
+        return None;
+    }
     (!fragment.is_empty()).then_some(fragment)
 }
 
@@ -521,6 +541,34 @@ pub fn stock_product_snapshot(sku_predicate: &str, surface: &str) -> DirectHit {
 
 #[cfg(test)]
 mod warehouse_group_tests {
+
+    /// 剥完剩的是**条件**就不是商品名 —— 同族第三次（冻结/锁定、「总」、这次）。
+    #[test]
+    fn a_threshold_or_counting_residue_is_a_condition_not_a_product_name() {
+        for q in [
+            "库存量超过100万的仓库有几个",
+            "库存大于50万的商品有多少个",
+            "库存量不足100的商品",
+            "库存量最多的前3个仓库有几家",
+        ] {
+            assert!(
+                stock_product_fragment(q).is_none(),
+                "{q}：残余是筛选条件，不许当商品名拿去唯一性匹配（会落终止卡）：{:?}",
+                stock_product_fragment(q)
+            );
+        }
+        // 反向：真商品名一个不许被误伤
+        for (q, want) in [
+            ("烤肠的库存量", "烤肠"),
+            ("小虎黑椒味烤肠500G的库存", "小虎黑椒味烤肠500G"),
+        ] {
+            assert_eq!(
+                stock_product_fragment(q).as_deref(),
+                Some(want),
+                "{q}：真商品名被误伤"
+            );
+        }
+    }
     /// 🔴 排行不许把合成兜底桶发成名次（2026-08-17 审计）。
     ///
     /// 与 2026-08-16「本月销售额最高的城市：未知」是同一个病 —— 那次只修了 sales_fact 一边，

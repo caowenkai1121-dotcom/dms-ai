@@ -1935,12 +1935,21 @@ pub async fn understand(
         let req = ChatRequest::text(ModelTier::Fast, INTENT_SYSTEM, question, Some(0.0));
         let reply = match tokio::time::timeout(INTENT_TIMEOUT, llm.chat(req)).await {
             Ok(Ok(reply)) => reply,
+            // 🔴 失败也要记一次调用（token 记 0，一分不多算）。
+            // `Trace::add` 的唯一驱动是 `on_usage`，而 `on_usage` 原来只在**成功回包后**才走
+            // （下面那行）——于是收据上的 `llm_calls=0` 同时表示「压根没调」和「调了但失败」。
+            // 2026-08-17 我就是被这个数字带偏的：回归里五条题落 need-intent，
+            // 收据写着 llm_calls=0、耗时 44ms，我据此判定「有东西在调模型之前早退」，
+            // 开了三路调查才发现模型**调了**、超时了，44ms 只是成员循环那一段。
+            // 记上之后，「llm_calls>=1 且 route=need-intent」一眼就是合同失败，不用再猜。
             Ok(Err(err)) => {
                 tracing::warn!(err = %err, "结构化意图 Fast 调用失败 → 关闭自由查询路径");
+                on_usage(&Usage::default());
                 return IntentAttempt::Unavailable;
             }
             Err(_) => {
                 tracing::warn!("结构化意图 Fast 调用超时 → 关闭自由查询路径");
+                on_usage(&Usage::default());
                 return IntentAttempt::Unavailable;
             }
         };

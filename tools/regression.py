@@ -821,7 +821,16 @@ def run_case(c, results):
         results.append((name, False, f"执行错误: {j['error'][:120]}")); return
 
     fails = check(c, j)
-    detail = f"route={j.get('route')} {j.get('elapsed_ms', '?')}ms" + (" · " + ";".join(fails) if fails else "")
+    # 🔴 反问卡有**两档**，判官输出里原来长得一模一样（2026-08-17）：
+    #   ① 合同失败型：意图模型超时/回包不合约 —— caliber_note 有固定文案，是上游抖动；
+    #   ② 真·歧义型：问句本身没说清 —— caliber_note 为 None。
+    # 一档要重试/看上游，另一档要改判据或改问法，处置完全不同。
+    # 不带出来的代价：五条红全落 ① 而我按 ② 去查，开了三路调查才分清。
+    # 正判据优于负判据 —— 让卡自己报是哪一档。
+    note = " ".join((j.get("caliber_note") or "").split())
+    detail = f"route={j.get('route')} {j.get('elapsed_ms', '?')}ms" + (
+        f" · 卡面「{note[:24]}」" if note else ""
+    ) + (" · " + ";".join(fails) if fails else "")
     results.append((name, not fails, detail))
     # 供关系断言取数
     if j.get("rows") and j["rows"][0]:
