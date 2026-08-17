@@ -91,8 +91,8 @@ impl Answerer for CacheAnswerer {
     }
 }
 
-/// 回放前的**三关护栏**（纯函数，一关都不许少）：距离、时间词集合、数字词集合。
-/// 三关都是「语义近似 ≠ 问的是同一件事」的补丁：向量把「上月销售额」和「本月销售额」
+/// 回放前的**四关护栏**（纯函数，一关都不许少）：距离、时间词、数字词、**限定词**。
+/// 前三关都是「语义近似 ≠ 问的是同一件事」的补丁：向量把「上月销售额」和「本月销售额」
 /// 认成 0.03 的距离，直接复用就是给用户一个月份错的数字，而它长得完全正常。
 fn passes_guards(question: &str, hit_q: &str, dist: f64) -> bool {
     if dist > MAX_DIST {
@@ -103,7 +103,49 @@ fn passes_guards(question: &str, hit_q: &str, dist: f64) -> bool {
     {
         return false;
     }
-    true
+    // 🔴 第四关：本问句里的**范围限定词**必须在被命中的那句里逐字出现（2026-08-17）。
+    //
+    // 前三关只管时间和数字，管不住「谁/哪个/哪里」这一维：
+    // 「京东仓的库存量是多少」与「现在库存量是多少」时间词都空、数字词都空、
+    // 向量距离很近 —— 于是前者会 replay 后者的全仓总量 SQL，答出 1.06 亿，
+    // **收据还全绿**（回放走的是 `table_answer`，绕开了覆盖闸）。
+    // 用户看不出这个数少了一个 WHERE。这正是本仓最不能接受的一类错答。
+    //
+    // 判据是**单向**的：本问的限定必须在命中问句里出现，反过来不要求 ——
+    // 命中问句更窄不会让答案变宽（它的 SQL 带着更严的 WHERE，最多是答不全，
+    // 而距离门已经把差太远的挡在外面）。
+    // 判据钉「问句里出现过的实词」而不是某张实体名单：名单永远有下一个漏项，
+    // 而这里要防的恰恰是「没人登记过的那个词」。
+    scope_tokens(question)
+        .iter()
+        .all(|token| hit_q.contains(token.as_str()))
+}
+
+/// 问句里的**范围限定词**：剥掉时间词、数字、以及纯功能词之后剩下的实词片段。
+///
+/// 不追求分词精确 —— 它只需要回答一个问题：「这两句话限定的范围是不是同一个」。
+/// 宁可多留几个词（缓存少命中一次，代价是慢一点），也不能少留（代价是答错一个数）。
+fn scope_tokens(question: &str) -> Vec<String> {
+    // 功能词/句式词：出现在几乎每一句里，留着它们等于要求两句话逐字相同
+    const NOISE: &[&str] = &[
+        "是", "多少", "的", "了", "吗", "呢", "有", "在", "和", "与", "及", "或",
+        "查", "查询", "看", "看看", "统计", "一下", "请", "帮我", "我", "你", "现在",
+        "目前", "当前", "总", "共", "全部", "所有", "合计", "汇总", "整体", "累计",
+        "怎么样", "如何", "什么", "哪些", "几", "个", "、", "，", ",", "。", "?", "？",
+    ];
+    let mut stripped = question.to_string();
+    for word in time_tokens(question) {
+        stripped = stripped.replace(word, " ");
+    }
+    for word in NOISE {
+        stripped = stripped.replace(word, " ");
+    }
+    stripped
+        .split(|c: char| c.is_whitespace() || c.is_ascii_digit() || c.is_ascii_punctuation())
+        .map(str::trim)
+        .filter(|piece| piece.chars().filter(|c| !c.is_ascii()).count() >= 2)
+        .map(str::to_string)
+        .collect()
 }
 
 /// 时间词集合（护栏：命中缓存的问题时间词必须与本问全等，"上月"≠"本月"）。
@@ -138,6 +180,40 @@ fn number_tokens(q: &str) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 第四关：范围限定不同的两句话不许互相回放（2026-08-17）。
+    #[test]
+    fn a_narrower_question_never_replays_a_broader_ones_answer() {
+        // 🔴 这一对是本关的存在理由：时间词都空、数字词都空、向量距离很近，
+        // 前三关全过 —— 回放出来就是全仓 1.06 亿，少了一个 WHERE，收据还全绿。
+        assert!(
+            !super::passes_guards("京东仓的库存量是多少", "现在库存量是多少", 0.02),
+            "带仓库限定的问句不许回放全量答案"
+        );
+        for (q, hit) in [
+            ("华东区的销售额", "销售额是多少"),
+            ("烤肠的库存量", "库存量是多少"),
+            ("线上渠道的订单数", "订单数是多少"),
+        ] {
+            assert!(!super::passes_guards(q, hit, 0.02), "{q} 不许回放 {hit}");
+        }
+        // 正向：同一件事的不同说法照旧命中（不然缓存就废了）
+        for (q, hit) in [
+            ("本月销售额", "本月销售额是多少"),
+            ("本月销售额是多少", "查一下本月销售额"),
+        ] {
+            assert!(super::passes_guards(q, hit, 0.02), "{q} 应当能命中 {hit}");
+        }
+        // 单向：命中问句更窄不拦（它的 SQL 带更严的 WHERE，不会把答案变宽）
+        assert!(
+            super::passes_guards("库存量是多少", "京东仓的库存量是多少", 0.02),
+            "反方向不要求 —— 更窄的命中不会让答案变宽"
+        );
+        // 前三关一个字没松
+        assert!(!super::passes_guards("本月销售额", "上月销售额", 0.02), "时间词那关还在");
+        assert!(!super::passes_guards("前5名商品", "前10名商品", 0.02), "数字词那关还在");
+        assert!(!super::passes_guards("本月销售额", "本月销售额", 0.9), "距离那关还在");
+    }
     use super::*;
 
     // `cache_time_guard`（时间词护栏）随词表落在 `triage.rs`，不在这里抄第二份断言；

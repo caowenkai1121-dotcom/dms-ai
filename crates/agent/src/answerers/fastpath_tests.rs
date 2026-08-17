@@ -517,18 +517,22 @@ mod tests {
                 stock_snapshot(question).is_none(),
                 "同步总量模板不许吞掉额外限定：{question}"
             );
-            let hit = product_stock_hit(question, vec![("SKU-500G", "小虎黑椒味烤肠500G")])
-                .await
-                .expect("未兑现限定必须返回终止澄清卡");
+            // 🔴 2026-08-17 判据改向：从「必须出终止卡」改成「必须让路」。
+            // 意图一个字没变 —— 不许吞掉额外限定（上面那条断言仍在钉它）。
+            // 变的是**兑现不了之后该干什么**：这一档说的是「本适配器做不了仓库/效期/
+            // 历史窗口」，那是能力边界，不是用户问错了。出卡会让整轮在 ROUTER_ORDER
+            // 第 3 位收口，第 7 位的自由 SQL 永远轮不到 —— 而「京东仓的库存量是多少」
+            // 只要 JOIN 一下主数据就有答案，却死在单字「仓」上（库里 12+ 个仓名全以
+            // 「仓」结尾，这条命中率 100%）。
+            //
+            // 能力边界 ⇒ 让路；事实缺失 ⇒ 才出卡。探针那三档（0 匹配 / 多匹配 /
+            // 探针失败）说的是「这段文字指不到唯一商品」，是事实结论，照旧出卡 ——
+            // 由本文件另一条判据钉着，本条不碰。
             assert!(
-                matches!(&hit.outcome, DirectOutcome::Clarification(note) if note.contains("无法兑现")),
-                "{question}: {:?}",
-                hit.outcome
-            );
-            assert!(
-                hit.sql.is_empty(),
-                "澄清结果不得携带占位 SQL：{question}: {}",
-                hit.sql
+                product_stock_hit(question, vec![("SKU-500G", "小虎黑椒味烤肠500G")])
+                    .await
+                    .is_none(),
+                "兑现不了的限定要让路给自由 SQL，不许在第 3 位把整轮收口：{question}"
             );
         }
     }
