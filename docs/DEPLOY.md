@@ -7,10 +7,33 @@
 | 组件 | 形态 | 说明 |
 |---|---|---|
 | 元数据 PG | `docker/age`（postgres16 + Apache AGE + pgvector + pg_trgm） | 唯一可写库（注册表/知识库/会话/日志） |
-| 解析+向量+精排服务 | `tools/embed_service.py`（Python 3.10+） | 文档解析（含扫描件 OCR 档）+ 千问 `text-embedding-v4`(512维) 向量化 + `gte-rerank-v2` 精排 |
+| 解析+向量+精排服务 | `tools/embed_service.py`（Python 3.10+） | 文档解析（含扫描件 OCR 档）+ 千问 `text-embedding-v4`(**1024 维**，2026-08-17 由 512 升级) 向量化 + `gte-rerank-v2` 精排 |
 | Rust API | `dms-ai-server`（容器或裸机 exe） | 问数/知识库/数据地图全部 API |
 | Web | `web/`（Vue3 构建产物，nginx 托管） | `docker/web` 有现成 nginx 配置 |
 | 业务源 | Doris（warehouse）/ DMS 生产 MySQL（production_lookup，仅只读点查） | 部署方提供只读账号 |
+
+## 最省事的路：用部署包
+
+`bash tools/make_bundle.sh <输出目录>` 打出一个**自带真实配置**的独立包（源码 + 已构建的前端 +
+业务字典种子 + `settings.docker.json` 与配套 `.secret_key`）。拿到包的人：
+
+```bash
+bash deploy.sh              # 更新已经在跑的服务器
+bash deploy.sh --bootstrap  # 全新机器：连 PG/venv/systemd/web 容器一起铺
+bash deploy.sh --dry-run    # 只自检不连服务器
+```
+
+包里的 `deploy.sh` 不重写任何服务器侧行为，它只是把包内产物喂给 `source/tools/deploy_update.sh`
+（`DEPLOY_SRC_TAR` / `DEPLOY_WEB_TAR` 两个逃生门），所以目标机不需要 git，也不需要 Node。
+
+打包脚本会在生成前**校验配置与密钥成对**（密文解不开就拒绝出包）、校验 `kb_root=/kbdata` 与
+`listen` 绑 0.0.0.0，并拒绝把带凭据的成品写进仓库工作区（`.secret_key` 这个名字不被 `.gitignore`
+命中，落进工作区一次 `git add .` 就进历史）。
+
+⚠️ 包 = 密码本：密文 + 配套主钥合在一起等价于明文凭据。放在会自动同步的网盘目录里，
+凭据就跟着同步走了一份。
+
+下面是不用包、手工从零起的完整路径。
 
 ## 步骤
 
@@ -25,9 +48,9 @@ cp settings.example.json "$DMS_RUNTIME_ROOT/settings.docker.json"   # 容器部�
 
 容器部署必须把 `settings.docker.json` 的 `kb_root` 改为精确的 `"/kbdata"`。启动脚本会硬校验这一项；保留示例默认值 `data/kb` 会把原件写进容器镜像层，解析服务和下次重建后的容器都看不到。
 
-必填：`pg_url`（自有 PG）、`mysql_targets`（数仓目标 `type: warehouse`）、`mysql_url`（DMS 身份源）、`llm_keys`（各家模型供应商 key）。`service_url` 指向解析/向量服务：Rust API 在容器、Python 服务在宿主机时使用宿主机可达地址（例如 `http://host.docker.internal:8077`），不能沿用容器内的 `127.0.0.1`。
+必填：`pg_url`（自有 PG）、`mysql_targets`（数仓目标 `type: warehouse`）、`mysql_url`（DMS 身份源）、`llm_keys`（各家模型供应商 key）。`service_url` 指向解析/向量服务：Rust API 在容器、Python 服务在宿主机时使用宿主机可达地址（现网是 `http://host.docker.internal:8078`，靠 `server-restart.sh` 的 `--add-host host.docker.internal:host-gateway` 解析），不能沿用容器内的 `127.0.0.1`。
 
-**必须把 `DMS_SECRET_KEY`（≥32 字节随机串）持久化到 `$DMS_RUNTIME_ROOT/.secret_key`**。启动脚本从这里注入容器；settings 里的凭据落盘即 AES-256-GCM 加密（enc:v1）。运行时密钥丢失后，容器重建/换机将无法解密既有配置。
+**必须把 `DMS_SECRET_KEY`（≥32 字节随机串）持久化到 `$DMS_RUNTIME_ROOT/.secret_key`**。🔴 只有**全新空库**部署才现生成：钥匙是 `sha256(DMS_SECRET_KEY 原始字节)`，拿一把新钥匙配一份既有的 `enc:v1:` 密文配置，启动会直接拒绝（「敏感字段解密失败」）——带配置迁移时必须把 settings 与 `.secret_key` **成对**搬过去。启动脚本从这里注入容器；settings 里的凭据落盘即 AES-256-GCM 加密（enc:v1）。运行时密钥丢失后，容器重建/换机将无法解密既有配置。
 
 ### 2. 起依赖
 
@@ -36,7 +59,23 @@ cp settings.example.json "$DMS_RUNTIME_ROOT/settings.docker.json"   # 容器部�
 .\scripts\run.ps1
 ```
 
-裸机 Linux（PG 仍走容器）：`docker compose -f docker/age/docker-compose.yml up -d`；embed 服务 `python3 tools/embed_service.py serve <port> <bind>`（**生产是 systemd 单元 `dms-ai-embed`，绑 172.17.0.1:8078**，端口以 `settings.docker.json` 的 `service_url` 为准）。它现在是千问适配层，没有本地模型可下载，但**必须能读到千问 key**：单元里带 `DMSAI_SETTINGS=/opt/dms-ai/settings.docker.json`，并由 `sh -c` 现读 `.secret_key` 注入 `DMS_SECRET_KEY`。生产脚本显式使用 `python3`，不兼容仍把 `python` 指向 Python 2 的旧系统。
+裸机 Linux（PG 仍走容器）的这一整段前置 —— PG 容器、Python venv、systemd 单元 `dms-ai-embed`、
+`/kbdata` 软链、nginx 前端容器 —— 已经收口成一个幂等脚本，不要再手敲：
+
+```bash
+DMS_RUNTIME_ROOT=/opt/dms-ai DMS_SEED_DIR=/opt/dms-ai/seed bash <release>/scripts/server-bootstrap.sh
+```
+
+它从 `$DMS_SEED_DIR` 读 `settings.docker.json` / `secret.key`（**已存在则保留现网那份，绝不覆盖**），
+从 `pg_url` 反解密码与绑定地址起 PG 并核对 age/vector/pg_trgm 三个扩展，建 venv 装
+`tools/requirements-embed.txt`（`cryptography` 是必填：`enc:v1:` 凭据靠它解，缺了 embed 服务起不来
+而 API 侧只表现为检索变差），写 systemd 单元并探 `/health`，最后建 `dms-ai-web` 容器
+（`--add-host host.docker.internal:host-gateway` 不能省，nginx 启动期解析不到就 emerg 拒启、全站宕）。
+
+单元的 `ExecStart` 指向 `$RUNTIME_ROOT/app/tools/embed_service.py` —— **跟着 release 走的那一份**。
+现网历史上指的是 `$RUNTIME_ROOT/tools/` 下一份独立拷贝，部署换了代码它不会跟着变，
+症状只是检索/解析变差、不报任何错；`scripts/embed-sync.sh` 在每次部署时同步并自证
+（比对 sha256 + 重启后探 `/health`），两种布局都收得住。
 
 知识库解析接口接收的是 `/kbdata/<doc_id>.<ext>` **路径，不是文件字节**，所以 Rust 容器和解析服务必须读取同一宿主目录：
 

@@ -44,6 +44,14 @@ except Exception as exc:
 if cfg.get("kb_root") != "/kbdata":
     print("容器部署要求 settings.docker.json 的 kb_root 严格等于 /kbdata", file=sys.stderr)
     raise SystemExit(1)
+# 🔴 listen 必须绑 0.0.0.0：容器里绑 127.0.0.1 就只绑**容器自己的**回环，
+# 下面 `-p 172.17.0.1:8100:8100` 的转发永远接不上，表现是容器 Up、健康检查一直超时
+# 90 次后回滚 —— 而 settings.example.json 的默认值恰好就是 127.0.0.1:8100，
+# 照抄示例的新机器必踩。裸机部署不走这个脚本，不受影响。
+listen = str(cfg.get("listen", ""))
+if not listen.startswith(("0.0.0.0:", "[::]:")):
+    print(f"容器部署要求 settings.docker.json 的 listen 绑 0.0.0.0（当前：{listen or '未设置'}）", file=sys.stderr)
+    raise SystemExit(1)
 service_url = str(cfg.get("service_url", "")).rstrip("/")
 if not service_url.startswith(("http://", "https://")):
     print("settings.docker.json 的 service_url 必须是 http/https 地址", file=sys.stderr)

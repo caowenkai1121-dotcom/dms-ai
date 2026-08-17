@@ -5047,3 +5047,107 @@ DO 块里；两处都先读 `atttypmod` 再决定改不改，无条件 ALTER 会
 1. **E10 的口径披露**：`coverage_status: blocked` 是过期期望（同日 64c37e7 裁决 ambiguity 不再硬闸），
    已改成 complete。但原本要钉的事**没了出口**：库存有多口径，而 coverage 不提、
    caliber_note 空、正文也不提。要治是给库存族补一条口径披露。
+
+---
+
+## AX160 · 独立部署包（2026-08-17）
+
+业主要求：本地打一个部署包放 `C:\Users\caowe\OneDrive\Desktop\AICoding\dmsai`，
+「要有完整的文件和配置文件，包括数据库链接信息和大模型 key，这样我就可以一键部署到服务器了」。
+先把 173 个提交推了 origin/main（`eb56bfd..4628926`），推前扫了一遍出站 diff，
+唯一命中 `enc:v1:` 的一行是格式说明，不是真凭据。
+
+### 这件事真正的难点不是打包，是「包里少什么没人会知道」
+
+`tools/deploy_update.sh` 打包用 `git ls-files -co --exclude-standard`，
+而 `.gitignore:8` 一条 `settings*.json` 把配置整族挡在包外。现网之所以一直能部署，
+只是因为 `/opt/dms-ai` 上早就常驻着一份 `settings.docker.json` + `.secret_key`。
+换台机器解包，`server-restart.sh:27` 当场 die。
+
+物证：`target/pkg/` 里躺着 2026-08-12 那次的部署包 ——
+`src.tar.gz` 里确实没有凭据，而成品 tar 的包根上有，中间还散着手工贴进去的
+`settings.docker.json` 与 `secret_key.txt`。**上一次已经断过一回，是人手绕开的。**
+手工步骤不会自己重复，也不会自己校验。所以这一轮的产物是脚本，不是一个包。
+
+### 五条维度并行审计 → 35 条发现 / 10 条挺过反驳 / 已修八条
+
+其中两条是我自己没抓到、只有跑到真机上才暴露的：
+
+1. **CRLF 判据在 Windows 上恒绿**（`deploy_update.sh` 与 `test-deploy-contract.sh` 各一份）。
+   msys 的 grep 以文本模式读文件，匹配前先把 CR 吃掉：对逐行 `\r\n` 的脚本
+   `grep -c $'\r'` 返 0/rc=1 **放行**，`grep -Uc` 才返 6/rc=0。而 msys 的 bash 能正常跑
+   CRLF 脚本，于是同一段里的 `bash -n` 也一起放行 —— 本机 1/5 全绿，CRLF 随 tar 上服务器，
+   Linux 侧报 `$'\r': command not found`。**恒绿的判据比没有判据更坏**，它让人以为查过了。
+   顺手把点名清单换成正判据（`tools/*.sh scripts/*.sh` 全查）：点名版漏掉了
+   `web-update.sh` 与 `server-cleanup.sh`，这两个都在服务器上真跑。
+
+2. **systemd 单元的 ExecStart 是相对路径**。现网那条是
+   `sh -c '... exec venv/bin/python tools/embed_service.py serve 8078 ...'` 配
+   `WorkingDirectory=/opt/dms-ai`。第一版 `embed-sync.sh` 只 grep 不还原工作目录，
+   拿到 `tools/embed_service.py` 就去 cp —— 会打到脚本自己所在的 release 上，
+   同步到错地方还一声不吭。**这条只有连真机核对才看得见**（本机没有 systemd）。
+
+### 顺带挖出一条一直在的哑降级
+
+`/opt/dms-ai/tools` 与 `/opt/dms-ai/docker` 是**独立目录，不是 app/ 的符号链接**。
+systemd 跑的是前者里的 `embed_service.py`，web 容器 bind 的是后者里的 `nginx.conf`，
+而 `deploy_update.sh` 从头到尾没同步过任何一份。也就是说：
+
+> **改 `embed_service.py` 或 `nginx.conf` 部署上去 = 没改。**
+> 不报错、健康检查全绿，只是检索/解析用着旧代码。
+
+8-16 换千问那次两份能对上，纯粹因为当时手工传过一遍。
+`scripts/embed-sync.sh` 收口这件事：问 systemd 自己在跑哪一份（不假设路径）→
+同步 → 重启 → 探 `/health` → **收尾比对 sha256**。最后那条判据是关键 ——
+没有它，「全绿」也可能只是旧代码依然健康，正是这个脚本要消灭的那种绿。
+接线位置有意放在**切 app 之前**：向量层先换、先自证，再切 API；反过来失败会留下
+「API 新、向量层半新不旧」的中间态。
+
+### 落地清单
+
+| 文件 | 做什么 |
+|---|---|
+| `tools/make_bundle.sh` 🆕 | 打包唯一事实源。出包前校验凭据成对（解不开就拒绝出包）、`kb_root=/kbdata`、`listen` 绑 0.0.0.0；**拒绝把带凭据的成品写进仓库工作区**（`.secret_key` 这名字不被 `.gitignore` 命中，`*.key` 只吃 `.key` 后缀） |
+| `tools/bundle-deploy.sh` 🆕 | 包内 `deploy.sh`。三种模式 update / `--bootstrap` / `--dry-run`；不重写任何服务器侧行为，只把包内产物喂给 `deploy_update.sh` |
+| `scripts/server-bootstrap.sh` 🆕 | 全新机器前置，每步幂等：PG（从 `pg_url` 反解密码与绑定地址）+ 三扩展核对 → venv → OCR 依赖 → systemd 单元 → web 容器 |
+| `scripts/embed-sync.sh` 🆕 | 上面那条哑降级的解药 |
+| `tools/deploy_update.sh` | 加 `DEPLOY_SRC_TAR`/`DEPLOY_WEB_TAR` 逃生门（成对必填，只给一个会发布半套）；CRLF 判据补 `-U` 并换正判据；新增 embed 同步与 nginx.conf 同步两步 |
+| `scripts/server-restart.sh` | 预检加 `listen` 必须绑 `0.0.0.0`/`[::]` —— 照抄 `settings.example.json` 的新机器会容器内 healthy、外部映射打不通，空转 90×2s 后超时回滚，报错一个字都不指向 listen |
+| `docker/age/docker-compose.yml` | 端口绑定改 `${DMS_AI_PG_BIND:-127.0.0.1}`：容器里的 API 走 `host.docker.internal`（网桥网关），绑 127.0.0.1 连不上 |
+| `tools/requirements-embed.txt` | 删 `fastembed`（本地模型 8-16 已废除，留着白拖 onnxruntime 几百 MB），补 `cryptography`（**必填**：`enc:v1:` 靠它解，缺了 embed 服务起不来而 API 侧只表现为检索变差）与 `psycopg2-binary`/`pytesseract` |
+| `scripts/test-deploy-contract.sh` | 新增 11 条判据钉住上述全部 |
+
+**11 条新判据逐条反向验证**：拆掉任意一条都当场变红（`scripts/test-deploy-contract.sh` rc≠0），
+还原后全绿。第一版里有一条是假的 —— 负判据写成 `[^/]tools/embed_service\.py`，
+而真实的坏写法是 `$RUNTIME_ROOT/tools/...`，前面恰好是斜杠，反向验证时纹丝不动。
+换成钉 ExecStart 那一行本身的正判据后才有牙。
+
+### 包的形态
+
+```
+dmsai/
+  一键部署.cmd / deploy.sh / 部署说明.md / MANIFEST.json
+  source/      397 个文件（完整源码树，可浏览）
+  payload/     web-dist.tar.gz（已构建，目标机不需要 Node）
+               registry_snapshot.json（1902 行注册表 + 58 条人工注释）
+               requirements-embed.lock.txt（现网 freeze）
+  config/      settings.docker.json（enc:v1 密文）+ secret.key（配套主钥）
+```
+
+**不进包的**：`kbdata/` 原件与 PG 数据 —— 那是状态，几百个文件随包走没有意义，
+迁移要整目录搬（库里有记录而原件缺失是永久损坏）。
+
+凭据处理选的是「密文 + 配套主钥」而不是明文：形态与现网一致、与 systemd/容器的注入路径一致，
+不需要在部署时多一步加密迁移。代价是两个文件合起来等价于明文，所以包必须当密码本对待 ——
+`部署说明.md` 里明写了这一条，包括「放在自动同步的网盘目录里凭据会跟着上云」。
+
+### 已验 / 未验
+
+- ✅ `make_bundle.sh` 全流程跑通，成品 `deploy.sh --dry-run` 自检通过（405 文件 / 17.7 MB）
+- ✅ 部署契约测试全绿 + 11 条新判据反向验证全部变红
+- ✅ 新脚本在**真实生产**上核对了判定逻辑（只读）：ExecStart 相对路径还原成
+  `/opt/dms-ai/tools/embed_service.py`、判定为「独立拷贝需同步」、`PROBE_URL` 推导出
+  `http://172.17.0.1:8078`、nginx.conf 运行时副本存在
+- ❌ **没有跑真实的端到端部署** —— 业主说的是「这样我就可以一键部署」，
+  部署动作留给业主。下一手第一次真跑时重点看两处新接线：3.6 步 embed 同步、
+  4 步之后的 nginx.conf 同步。

@@ -1,10 +1,28 @@
-# embed_service.py（解析/向量服务）依赖 —— 与生产 venv 对齐（2026-08-12）
-fastembed==0.8.0
-numpy==2.5.2
+# 服务器侧 venv 依赖（systemd 单元 dms-ai-embed 跑 embed_service.py，外加 registry_snapshot.py
+# 的快照导入）—— 与现网 venv 对齐（2026-08-17 从生产 pip freeze 反推真实使用面）。
+#
+# 🔴 这份清单曾经带着 `fastembed==0.8.0`：本地模型 2026-08-16 已按业主裁决废除，
+# embed_service.py 全文再无 fastembed 引用（向量走千问 text-embedding-v4，精排走 gte-rerank-v2，
+# 两条都用 stdlib urllib 发 HTTP）。留着它会在新机器上拖下 onnxruntime + tokenizers +
+# huggingface_hub 几百 MB，装完一行也不会被 import。
+#
+# 🔴 `cryptography` 是**必填**，不是可选：settings.docker.json 的 DSN 与 LLM key 全是
+# `enc:v1:` 密文，tools/settings.py 只在真撞上密文时才 import AESGCM，缺了直接
+# SystemExit「读它需要先 pip install cryptography」——于是 embed 服务取不到千问 key，
+# systemd 每 5 秒重启一次，而 API 侧只表现为「检索质量变差」。
+#
+# 只列直接 import 的包（transitive 交给 pip）：
+#   embed_service.py  → pymupdf4llm/fitz、pypdf、docx、pptx、openpyxl、PIL、pytesseract、psycopg2
+#   registry_snapshot.py → psycopg2
+#   settings.py       → cryptography
+# 宿主机还需 apt 装 tesseract-ocr + tesseract-ocr-chi-sim（扫描件 OCR 档）与 libreoffice（原件预览）。
+cryptography==50.0.0
 openpyxl==3.1.5
 pillow==12.3.0
+psycopg2-binary==2.9.12
 pymupdf==1.28.2
 pymupdf4llm==0.0.17
 pypdf==6.14.2
+pytesseract==0.3.13
 python-docx==1.2.0
 python-pptx==1.0.2

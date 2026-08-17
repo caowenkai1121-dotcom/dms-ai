@@ -3,9 +3,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-for script in tools/deploy_update.sh scripts/server-build.sh scripts/server-restart.sh scripts/web-update.sh; do
+# 🔴 `-U`：msys 的 grep 文本模式会先吃掉 CR，不加 -U 这条闸在 Windows 上恒绿（实测
+# `grep -c $'\r'` 对逐行 CRLF 的脚本返 0/rc=1 放行，`grep -Uc` 才返 6/rc=0）。
+# 名单也换成正判据：凡是 .sh 全查，不点名 —— 点名版漏过 server-cleanup.sh 与 server-bootstrap.sh。
+for script in tools/*.sh scripts/*.sh; do
+  [ -f "$script" ] || continue
   bash -n "$script"
-  ! LC_ALL=C grep -q $'\r' "$script" || {
+  ! LC_ALL=C grep -Uq $'\r' "$script" || {
     echo "CRLF shell script: $script" >&2
     exit 1
   }
@@ -123,5 +127,70 @@ grep -Fq 'git ls-files -co --exclude-standard -z' <<<"$deploy" || {
   echo "server-restart 又退回检查固定 parser 容器而非 settings service_url" >&2
   exit 1
 }
+
+# 🔴 CRLF 判据自身的判据：`-U` 被谁改回去，这里当场红。少了它整条闸在 Windows 上恒绿，
+# 而恒绿的闸比没有闸更坏 —— 它让人以为查过了。
+for required in "grep -Uq \$'\\r'" 'for script in tools/*.sh scripts/*.sh'; do
+  grep -Fq "$required" <<<"$deploy" || {
+    echo "deploy_update 的 CRLF 判据退回无牙版（缺 -U 或退回点名清单）：$required" >&2
+    exit 1
+  }
+done
+
+# 容器部署下 listen 必须绑 0.0.0.0：绑 127.0.0.1 时容器内 loopback healthy、
+# 外部端口映射打不通，症状是 90×2s 空转后超时回滚，报错一个字都不指向 listen。
+grep -Fq '"0.0.0.0:", "[::]:"' <<<"$restart" || {
+  echo "server-restart 缺 listen 绑定校验：照抄 settings.example.json 的新机器会静默不可达" >&2
+  exit 1
+}
+
+# 部署包模式（DEPLOY_SRC_TAR/DEPLOY_WEB_TAR）必须成对，只给一个会把旧前端留在现网。
+grep -Fq 'DEPLOY_SRC_TAR 与 DEPLOY_WEB_TAR 必须同时提供' <<<"$deploy" || {
+  echo "deploy_update 的部署包模式丢了成对校验，可能只发布半套" >&2
+  exit 1
+}
+
+# 全新机器 bootstrap：这几条是现网靠人手搭出来、仓库里长期没有记录的部分，掉一条就得重新摸索。
+bootstrap="$(cat scripts/server-bootstrap.sh)"
+for required in \
+  'app/tools/embed_service.py' \
+  'DMSAI_SETTINGS=' \
+  '--add-host host.docker.internal:host-gateway' \
+  'DMS_AI_PG_BIND' \
+  "unnest(ARRAY['age','vector','pg_trgm'])" \
+  'nginx:1.27-alpine' \
+  'requirements-embed'; do
+  grep -Fq -- "$required" <<<"$bootstrap" || {
+    echo "server-bootstrap 缺全新机器前置：$required" >&2
+    exit 1
+  }
+done
+# 单元里的 ExecStart 必须走 app/（跟着 release 走）。指回 RUNTIME_ROOT 下的独立拷贝，
+# 部署换了代码 embed 服务不会跟着变，而症状只是「检索变差」，不报任何错。
+# 正判据：直接钉 ExecStart 那一行本身，而不是「不许出现某种写法」——
+# 第一版写的是负判据 `[^/]tools/...`，而真实的坏写法是 `$RUNTIME_ROOT/tools/...`，
+# 前面恰好是斜杠，于是那条判据反向验证时纹丝不动（2026-08-17 实测 rc=0）。
+grep -Eq 'ExecStart=.*app/tools/embed_service\.py' <<<"$bootstrap" || {
+  echo "server-bootstrap 的 systemd 单元没指向 app/tools，改 embed_service.py 将不生效" >&2
+  exit 1
+}
+
+# embed 服务与 nginx.conf 都是宿主机上跟 release 无关的独立拷贝，部署不同步 = 改了等于没改，
+# 且两条都不报错（哑掉的降级）。这两条判据钉住「部署会去同步它们」这件事本身。
+grep -Fq 'scripts/embed-sync.sh' <<<"$deploy" || {
+  echo "deploy_update 不再同步 embed 服务：改 embed_service.py 将静默不生效" >&2
+  exit 1
+}
+grep -Fq "docker/web/nginx.conf" <<<"$deploy" || {
+  echo "deploy_update 不再同步 nginx.conf：改 Web 网关配置将静默不生效" >&2
+  exit 1
+}
+embed_sync="$(cat scripts/embed-sync.sh)"
+for required in 'systemctl show -p ExecStart' 'systemctl show -p WorkingDirectory' 'sha256sum' 'restore' 'd.get("ok") is not True'; do
+  grep -Fq -- "$required" <<<"$embed_sync" || {
+    echo "embed-sync 缺同步/自证/回滚合同：$required" >&2
+    exit 1
+  }
+done
 
 echo "deploy contract ok"

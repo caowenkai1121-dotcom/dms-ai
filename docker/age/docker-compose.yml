@@ -11,8 +11,12 @@ services:
       POSTGRES_PASSWORD: ${DMS_AI_PG_PASSWORD:?set DMS_AI_PG_PASSWORD（或由 scripts/run.ps1 自动注入）}
       POSTGRES_DB: dms_ai
     ports:
-      # 偏移到 15433：避让本机可能已装的 PG（5432）；只绑 127.0.0.1，不对局域网开放
-      - "127.0.0.1:15433:5432"
+      # 偏移到 15433：避让本机可能已装的 PG（5432）。
+      # 🔴 绑定地址必须可变：容器里的 API 走 `host.docker.internal`（= Docker 网桥网关
+      # 172.17.0.1）连 PG，而 127.0.0.1 只绑宿主回环，容器**连不上** —— 现网因此绑的是
+      # 172.17.0.1。默认值保持 127.0.0.1（本机开发不对外开放），服务器侧由
+      # `scripts/server-bootstrap.sh` 传 DMS_AI_PG_BIND=172.17.0.1。
+      - "${DMS_AI_PG_BIND:-127.0.0.1}:15433:5432"
     volumes:
       - dms_ai_pgdata:/var/lib/postgresql
       - ./init:/docker-entrypoint-initdb.d:ro
