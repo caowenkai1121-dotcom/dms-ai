@@ -62,11 +62,38 @@ impl ExecutionEvidence {
     }
 
     /// 跨 crate 可见：覆盖闸住在 agent，而本类型下沉到了 semantic（原为同模块私有）。
+    ///
+    /// 相等之外多认一种形态：**槽位表面 = 量词前缀 + 证据**（`总库存量` ← `库存量`）。
+    /// 🔴 2026-08-17 生产实测：「现在总库存量是多少」答出 1.06 亿，收据却标 blocked
+    /// —— SQL 别名是 `库存量`、槽位表面是 `总库存量`，精确相等对不上。
+    /// **给了数字又说证不出来**，比干脆答不出更糟：用户不知道该不该信。
+    ///
+    /// 只认「量词/汇总修饰词」这一类前缀，且剥完必须**逐字等于**证据 —— 不是子串包含。
+    /// 子串包含会让「额」证明「销售额」，那是把闸门拆了。
+    /// 同族一次收口：总销售额/全部订单数/合计毛利/累计退款额……
     pub fn proves(&self, kind: IntentSlotKind, surface: &str) -> bool {
-        self.resolved
-            .iter()
-            .any(|slot| slot.kind == kind && folded_eq(&slot.surface, surface))
+        self.resolved.iter().any(|slot| {
+            slot.kind == kind
+                && (folded_eq(&slot.surface, surface)
+                    || quantifier_stripped_eq(&slot.surface, surface))
+        })
     }
+}
+
+/// `surface` 去掉开头的量词/汇总修饰词后是否逐字等于 `evidence`。
+/// 词表与 `fastpath::stock` 里那份「残余只剩修饰词就不是商品名」同源同义 ——
+/// 一个管「别把修饰词当实体」，一个管「别因为修饰词认不出指标」，两面同一件事。
+fn quantifier_stripped_eq(evidence: &str, surface: &str) -> bool {
+    const QUANTIFIERS: &[&str] = &[
+        "总共", "一共", "全部", "所有", "合计", "整体", "累计", "汇总", "总", "全", "共",
+    ];
+    let surface = surface.trim();
+    QUANTIFIERS.iter().any(|q| {
+        surface
+            .strip_prefix(q)
+            // 剥完不能是空的：「总」自己不是指标
+            .is_some_and(|rest| !rest.trim().is_empty() && folded_eq(rest, evidence))
+    })
 }
 
 
@@ -114,4 +141,36 @@ pub enum Relation {
     GoodsOfCustomer(String),
     /// 买某商品还买什么（共购）
     Copurchase(String),
+}
+
+#[cfg(test)]
+mod quantifier_tests {
+    use super::*;
+
+    /// 量词前缀不改变指标本身：`库存量` 应当证明 `总库存量`。
+    ///
+    /// 2026-08-17 生产实测：「现在总库存量是多少」答出 1.06 亿，收据却标 blocked
+    /// （`metric-unverified:总库存量`）—— **给了数字又说证不出来**，比干脆答不出更糟。
+    /// 反向那一半同样重要：不许放宽成子串包含，否则「额」能证明「销售额」，闸门就废了。
+    #[test]
+    fn quantifier_prefix_does_not_break_metric_proof() {
+        let e = ExecutionEvidence::default().resolve(IntentSlotKind::Metric, "库存量");
+        for surface in ["库存量", "总库存量", "全部库存量", "合计库存量", "累计库存量"] {
+            assert!(e.proves(IntentSlotKind::Metric, surface), "{surface} 该被证明");
+        }
+        // 🔴 不许放宽成子串/后缀包含
+        // 🔴「剥完仍**包含**证据但不相等」——这一族专防把 folded_eq 放宽成 contains。
+        // 少了它，`总库存量明细`、`全部库存量占比` 都会被当成已证明（2026-08-17 反向验证抓到）。
+        for surface in ["总库存量明细", "全部库存量占比", "合计库存量环比"] {
+            assert!(!e.proves(IntentSlotKind::Metric, surface), "{surface} 不该被证明（剥完只是包含，不是相等）");
+        }
+        for surface in ["库存金额", "冻结库存量", "门店库存量", "总额"] {
+            assert!(!e.proves(IntentSlotKind::Metric, surface), "{surface} 不该被证明");
+        }
+        // 「总」自己不是指标：剥完为空不算证明
+        let bare = ExecutionEvidence::default().resolve(IntentSlotKind::Metric, "");
+        assert!(!bare.proves(IntentSlotKind::Metric, "总"), "空证据不许证明任何东西");
+        // 槽位种类不许串：同名不同 kind 不算证明
+        assert!(!e.proves(IntentSlotKind::Breakdown, "库存量"), "kind 必须一致");
+    }
 }

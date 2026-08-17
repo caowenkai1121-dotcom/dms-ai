@@ -347,7 +347,7 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
         if stock_product_fragment(question).is_some() {
             return None;
         }
-        return Some(DirectHit {
+        let mut total = DirectHit {
             detail: Some(format!(
                 "SELECT sku_code AS `商品编码`, sku_name AS `商品`, \
                         SUM(in_stock_quantity) AS `库存量` \
@@ -362,7 +362,15 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
                 ),
                 "direct-agg",
             )
-        });
+        };
+        // 🔴 总量这一支此前**不自报指标**，于是「现在总库存量是多少」答出 1.06 亿、
+        // 收据却标 blocked（`metric-unverified:总库存量`）—— 给了数字又说证不出来，
+        // 比干脆答不出更糟：用户不知道该不该信。
+        // 与 freeze/lock、仓库分组两支同一条纪律：模板知道自己算了什么，就要说出来。
+        // 「总」这个量词前缀由 `ExecutionEvidence::proves` 认（见那里的注释）。
+        total.intent_evidence =
+            std::mem::take(&mut total.intent_evidence).resolve(IntentSlotKind::Metric, "库存量");
+        return Some(total);
     }
 
     // ── 营销通门店进销存快照路径（金额/省份限定专用；库存量的默认源已是中台表）──
