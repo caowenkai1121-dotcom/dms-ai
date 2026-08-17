@@ -510,6 +510,8 @@ async fn seed_value_domains(pg: &PgPool) -> anyhow::Result<()> {
          "门店业务省区名称的权威落库字段。问门店省区/所属省区时必须过滤 t_master_shop.province_department_name；\
           province 是行政省份，t_customer.province 是行政区划码，t_customer.department_id 是客户所属部门且生产可为空，三者都不得替代。\
           生产映射存在非字面特例：上海→浙江省区、海南→广东省区；禁止用省份拼接“省区”或模糊裁剪后缀"),
+        ("master_wms", "wms_desc",
+         "仓库名的权威落库字段（中台主数据）。🔴 2026-08-17 业主实测：问「京东和顺丰的大日期商品」          模型把「京东」「顺丰」当成客户/组织去筛，答 0 行——而它们是**仓库名的一部分**，          实际取值形如「皇家小虎海南京东代发仓xs」「皇家小虎陕西顺丰仓xs」「北京京东拼拼仓」。          所以必须写 w.wms_desc LIKE '%京东%'（模糊），【不要】写 = '京东仓'：          名字前面带公司前缀（皇家小虎/饱饱博士/肥大圣/社区团购），后面常带 xs 等后缀。          从库存过来的连法：ywzt_ods.scm_warehous_manage s LEFT JOIN ywzt_ods.master_wms w           ON w.wms_code = s.wms_code。          禁止拿供应商名（sup_name）冒充承运仓——顺丰同时是供应商，按那一列筛是错的。"),
     ];
     for (t, c, note) in DOMAINS {
         sqlx::query(
@@ -726,6 +728,31 @@ pub async fn seed_datasources(pg: &PgPool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 值域登记的表必须在目录白名单里，否则召回够不着它（哑登记）。
+    #[test]
+    fn every_value_domain_table_is_in_the_catalog() {
+        // 与 seed_value_domains 的 DOMAINS 同源：改那里要同步改这里，否则本条先红
+        for (schema, table) in [("dms", "t_goods_category"), ("dms", "t_master_shop"), ("ywzt_ods", "master_wms")] {
+            assert!(
+                crate::warehouse_catalog::ASSETS
+                    .iter()
+                    .any(|a| a.table == table)
+                    || schema == "dms",
+                "{schema}.{table} 登记了值域却不在目录里 —— 召回够不着，等于没登记"
+            );
+        }
+        // 仓库名这条是 2026-08-17 业主那道题的收口：京东/顺丰是仓库名子串，不是客户
+        let src = include_str!("seed.rs");
+        assert!(
+            src.contains(r#"("master_wms", "wms_desc","#),
+            "master_wms.wms_desc 的值域登记不见了：京东/顺丰又会被当成客户去筛，答 0 行"
+        );
+        assert!(
+            src.contains("LIKE '%京东%'"),
+            "值域说明里必须写明用模糊匹配：仓库名带公司前缀，等值匹配永远落空"
+        );
+    }
 
     /// 关键词强制补表的**目标必须在目录里**，否则那条钉子是句谎话。
     ///
