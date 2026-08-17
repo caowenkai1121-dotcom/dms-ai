@@ -70,6 +70,24 @@ pub fn stock_province_predicate(question: &str) -> Result<Option<String>, ()> {
 
 /// 仅提取库存问句里的商品限定；空串表示用户问的是通用库存总量。
 /// 这里不猜 SKU：返回的片段还必须经过 WMS 实表唯一性探针才能进入查询谓词。
+/// 现行快照天然兑现的时间限定词。
+///
+/// 🔴 中台库存表按它自己的资产合同就是**现行库存、无经营时间轴**
+/// （`warehouse_catalog`：「现行库存表无经营时间轴」）。用户说「现在」时，
+/// 这张表**结构上**就是现在 —— 没有也不可能有一个 WHERE 子句去「证明」它。
+///
+/// 不自报的代价（2026-08-17 生产实测）：「现在总库存量是多少」答出 1.06 亿，
+/// 收据却因 `time:现在` 标 blocked —— **数字给了、收据说证不出来**，
+/// 用户不知道该不该信，比干脆答不出更糟。
+///
+/// 只对现行快照这一族成立，不许上提到通用层：同一个「现在」在销售问句里
+/// 指的是今天这个时间窗，那是要真过滤的。
+fn snapshot_time_surface(question: &str) -> Option<&'static str> {
+    ["现在", "目前", "当前", "此刻", "实时"]
+        .into_iter()
+        .find(|word| question.contains(word))
+}
+
 pub fn stock_product_fragment(question: &str) -> Option<String> {
     // 只剥问句边界，绝不在实体内部 `replace`。旧实现会把「美的冰箱」里的「的」删成
     // 「美冰箱」，随后唯一性探针零命中；同理「有友」等合法品牌也不能被单字虚词破坏。
@@ -300,6 +318,10 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
             // 模板自报兑现了哪个指标（与外层出口同一条纪律）
             freeze.intent_evidence = std::mem::take(&mut freeze.intent_evidence)
                 .resolve(IntentSlotKind::Metric, label);
+            if let Some(word) = snapshot_time_surface(question) {
+                freeze.intent_evidence =
+                    std::mem::take(&mut freeze.intent_evidence).resolve(IntentSlotKind::Time, word);
+            }
             return Some(freeze);
         }
         // 🔴 仓库分组的判断**排在商品残留守卫之前**（2026-08-15）：
@@ -339,6 +361,10 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
             grouped.intent_evidence = std::mem::take(&mut grouped.intent_evidence)
                 .resolve(IntentSlotKind::Breakdown, "仓库")
                 .resolve(IntentSlotKind::Metric, "库存量");
+            if let Some(word) = snapshot_time_surface(question) {
+                grouped.intent_evidence = std::mem::take(&mut grouped.intent_evidence)
+                    .resolve(IntentSlotKind::Time, word);
+            }
             return Some(grouped);
         }
         // 带商品残留的库存题必须走 `stock_product_filtered` 实表探针；
@@ -369,6 +395,10 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
         // 「总」这个量词前缀由 `ExecutionEvidence::proves` 认（见那里的注释）。
         total.intent_evidence =
             std::mem::take(&mut total.intent_evidence).resolve(IntentSlotKind::Metric, "库存量");
+        if let Some(word) = snapshot_time_surface(question) {
+            total.intent_evidence =
+                std::mem::take(&mut total.intent_evidence).resolve(IntentSlotKind::Time, word);
+        }
         return Some(total);
     }
 
@@ -592,5 +622,30 @@ mod warehouse_group_tests {
         // 不含「仓库」的通用总量照旧走单值
         let total = stock_snapshot("现在库存量是多少").expect("总量照旧");
         assert!(!total.sql.contains("GROUP BY"), "{}", total.sql);
+    }
+
+    /// 现行快照天然兑现「现在」——不自报的代价：答出 1.06 亿、收据却标 blocked。
+    #[test]
+    fn a_current_snapshot_proves_its_own_now() {
+        use crate::direct_types::IntentSlotKind;
+        for q in ["现在总库存量是多少", "目前各仓库库存量", "当前冻结库存量是多少"] {
+            let hit = stock_snapshot(q).unwrap_or_else(|| panic!("{q} 该命中"));
+            let word = snapshot_time_surface(q).expect("该识出时间词");
+            assert!(
+                hit.intent_evidence.proves(IntentSlotKind::Time, word),
+                "{q}：现行快照必须自报兑现了「{word}」，否则收据标 blocked 而数字照给"
+            );
+        }
+        // 反向：问句里没有现行词，就不许凭空自报一个时间槽位 ——
+        // 「上月库存量」是真要过滤的，冒充兑现等于把闸门拆了。
+        let past = stock_snapshot("库存量最多的仓库").expect("该命中");
+        assert!(
+            !past
+                .intent_evidence
+                .resolved
+                .iter()
+                .any(|s| s.kind == IntentSlotKind::Time),
+            "问句没给现行词，不许自报时间槽位"
+        );
     }
 }
