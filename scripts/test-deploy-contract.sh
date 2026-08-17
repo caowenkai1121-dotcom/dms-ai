@@ -60,7 +60,10 @@ for required in \
 done
 
 deploy_py="$(code_only < tools/_deploy.py)"
-for required in 'RejectPolicy()' 'sha256sum' 'sys.exit(rc)'; do
+# 🔴 远端输出带 emoji 时不许崩：server-verify.sh 打 ✅/❌，而 Windows 控制台是 GBK。
+# 2026-08-17 实测：部署在服务器上做完之后，客户端崩在 `sys.stdout.write` 上，
+# set -e 当场退出 —— 切换成功了，但前端没更新、清理没跑，日志只剩一句编码错。
+for required in 'RejectPolicy()' 'sha256sum' 'sys.exit(rc)' 'reconfigure(encoding="utf-8"'; do
   grep -Fq "$required" <<<"$deploy_py" || {
     echo "_deploy.py 缺安全上传合同：$required" >&2
     exit 1

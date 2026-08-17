@@ -56,7 +56,11 @@ else
     WANT="$(python3 - "$SNAPSHOT" <<'PY'
 import json, sys
 tables = json.load(open(sys.argv[1], encoding="utf-8"))["tables"]
-for name in ("dimension", "value_map", "sql_exemplar", "term", "kw_force", "memory"):
+# 🔴 `kw_force` 不在对账清单里：它是**代码种子**（seed.rs::KW_FORCE），不是人工沉淀，
+# 启动时按代码重建。拿快照行数当基准会把「有意退役」误报成「种子没导全」——
+# 2026-08-17 退役 16 条指向目录外的哑钉后，52→36 是**对的**，而验收报了红。
+# 这条清单只该收人工沉淀的表：那些东西代码里没有，丢了就真丢了。
+for name in ("dimension", "value_map", "sql_exemplar", "term", "memory"):
     rows = tables.get(name)
     rows = rows.get("rows") if isinstance(rows, dict) else rows
     print(f"{name}|{len(rows or [])}")

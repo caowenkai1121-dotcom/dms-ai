@@ -9,6 +9,18 @@ import sys
 
 import paramiko
 
+# 🔴 远端输出可能带 emoji（`server-verify.sh` 的 ✅/❌）。Windows 控制台默认 GBK，
+# 一个 ✅ 就让 `sys.stdout.write` 抛 UnicodeEncodeError —— 而这条异常发生在
+# **部署已经在服务器上做完之后**，客户端 `set -e` 当场退出，于是「切换成功了，
+# 但前端产物没更新、清理没跑」，日志里只有一句看不懂的编码错。
+# 2026-08-17 实测踩到：4/5 步远端 server-restart 跑完、app 已切，客户端崩在打印上。
+# errors="replace" 而不是 "ignore"：宁可显示成 ? 也不要静默吞字符。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass  # 非 TextIO（被重定向成别的对象）时跳过，不影响主流程
+
 HOST = os.environ.get("DEPLOY_HOST", "127.0.0.1")
 USER = os.environ.get("DEPLOY_USER", "root")
 

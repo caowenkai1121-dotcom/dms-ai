@@ -298,7 +298,11 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
             // 用户看到的是「京东常温酱料虚拟仓」而不是 `GZHYC-777` —— 后者他没法据以行动。
             // LEFT JOIN + COALESCE：实测 31258 行库存里有 12 行没有仓档，
             // 内连会把它们**静默丢掉**（合计对不上），左连回落到编码，一行不丢。
-            return Some(hit(
+            // 🔴 `GROUP BY 1, 2` 不许用（2026-08-17 生产实测回退）：覆盖闸的
+            // `sql_mentions_breakdown` 读的是 **GROUP BY 子句文本**，序号里没有任何可匹配的
+            // 东西 —— 于是 `breakdown:仓库` 证不出来、整题落 need-intent 反问卡。
+            // 写回真表达式，`wms_code` 三个字留在子句里（改动前正是靠它证出来的）。
+            let mut grouped = hit(
                 format!(
                     "SELECT COALESCE(NULLIF(w.wms_desc,''), s.wms_code) AS `仓库`, \
                             s.location AS `库位`, \
@@ -306,13 +310,20 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
                      FROM {ZT_FROM} s \
                      LEFT JOIN ywzt_ods.master_wms w ON w.wms_code = s.wms_code \
                      WHERE s.{ZT_WHERE} \
-                     GROUP BY 1, 2 \
+                     GROUP BY COALESCE(NULLIF(w.wms_desc,''), s.wms_code), s.location \
                      ORDER BY `库存量` {} LIMIT {}",
                     rank_direction(question),
                     ranking_limit(question)
                 ),
                 "direct-agg",
-            ));
+            );
+            // 🔴 模板**自报**兑现了哪个槽位，不指望闸门从 SQL 文本里重新猜出来。
+            // 与 freeze/lock 那两支、以及 `fastpath_intent` 的关系模板同一条纪律：
+            // 文本匹配是脆的（换个写法、加个 JOIN 就断），自报是确定的。
+            grouped.intent_evidence = std::mem::take(&mut grouped.intent_evidence)
+                .resolve(IntentSlotKind::Breakdown, "仓库")
+                .resolve(IntentSlotKind::Metric, "库存量");
+            return Some(grouped);
         }
         // 带商品残留的库存题必须走 `stock_product_filtered` 实表探针；
         // 同步模板只接通用总量（仓库分组已在上面接走）。
@@ -507,7 +518,13 @@ mod warehouse_group_tests {
     fn grouping_by_warehouse_is_a_grouping_ask_not_only_a_ranking_one() {
         for q in ["各仓库库存量", "按仓库看库存量", "每个仓库的库存量", "分仓库库存量"] {
             let hit = stock_snapshot(q).unwrap_or_else(|| panic!("{q} 该命中"));
-            assert!(hit.sql.contains("GROUP BY 1, 2"), "{q}：{}", hit.sql);
+            // 🔴 不许写成 `GROUP BY 1, 2`：覆盖闸的 sql_mentions_breakdown 读 GROUP BY 子句
+            // 文本，序号里没有可匹配的东西 —— 2026-08-17 生产实测整题落 need-intent 反问卡。
+            assert!(
+                hit.sql.contains("GROUP BY COALESCE(NULLIF(w.wms_desc,''), s.wms_code), s.location"),
+                "{q}：GROUP BY 必须写真表达式（wms_code 要留在子句里，闸门靠它证 breakdown）：{}",
+                hit.sql
+            );
             // 🔴 2026-08-17 起必须出**仓库名**：`wms_code` 是 GZHYC-777 这种不透明编码，
             // 用户没法据以行动。名字唯一活在 master_wms.wms_desc 上。
             assert!(
