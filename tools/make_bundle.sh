@@ -155,10 +155,27 @@ def digest(p):
     return h.hexdigest()
 
 
+# 🔴 只记**本脚本产出的东西**。此前是 `out.rglob("*")` 全收 —— 于是业主自己放在包根下的
+# 一个 18.9MB payload.tar（他手工打包传服务器用的）被算进了完整性清单，包"大了一倍"，
+# 而清单本该回答的问题是「我发出去的这一份是什么」，不是「这个目录里现在有什么」。
+OWNED = ("source", "payload", "config")
+FILES_AT_ROOT = ("deploy.sh", "一键部署.cmd", "部署说明.md")
 files = {}
-for p in sorted(out.rglob("*")):
-    if p.is_file() and p.name != "MANIFEST.json":
-        files[p.relative_to(out).as_posix()] = {"sha256": digest(p), "bytes": p.stat().st_size}
+for top in OWNED:
+    for f in sorted((out / top).rglob("*")):
+        if f.is_file():
+            files[f.relative_to(out).as_posix()] = {"sha256": digest(f), "bytes": f.stat().st_size}
+for name in FILES_AT_ROOT:
+    f = out / name
+    if f.is_file():
+        files[name] = {"sha256": digest(f), "bytes": f.stat().st_size}
+# 包根下的陌生文件不进清单，但要说出来 —— 它们会跟着一起被打包/同步走。
+strays = sorted(
+    f.name for f in out.iterdir()
+    if f.is_file() and f.name not in FILES_AT_ROOT and f.name != "MANIFEST.json"
+)
+if strays:
+    print("NOTE 包根下有非本脚本产出的文件（不进清单，但同步/打包会带走）：" + ", ".join(strays))
 
 dirty = sh("git", "status", "--porcelain")
 manifest = {
