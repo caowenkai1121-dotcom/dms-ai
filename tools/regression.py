@@ -349,6 +349,41 @@ HTTP = "--http" in argv
 ENTRIES_MODE = "--entries" in argv
 ENTRIES = ["ask", "stream", "mcp"]
 API_KEY = os.environ.get("DMSAI_API_KEY", "")
+# 🔴 第二条身份通道：账号密码换会话 token。
+# 没有它时 HTTP 档整档跳过，而 HTTP 是**唯一**能看见 chip 那类出口的尺子 ——
+# 2026-08-17 业主截图里那条「点了问数还被反问要问数还是知识库」在 CLI 上
+# 结构上就跑不到（CLI 的 ask 是位置参数，压根没有 chip 这一位）。
+# 跳过久了就等于没有判据：那族「改过多次还复发」的周期，等于「下一个入口被业主碰到」。
+LOGIN_USER = os.environ.get("DMSAI_LOGIN", "")
+LOGIN_PASS = os.environ.get("DMSAI_PASSWORD", "")
+_SESSION_TOKEN = None
+
+
+def auth_headers():
+    """HTTP 档的身份头。API key 优先；否则账号密码换一次会话 token 后复用。"""
+    global _SESSION_TOKEN
+    if API_KEY:
+        return {"X-API-Key": API_KEY}
+    if not (LOGIN_USER and LOGIN_PASS):
+        return {}
+    if _SESSION_TOKEN is None:
+        import urllib.error
+        import urllib.request
+
+        base = os.environ.get("DMSAI_BASE", "http://172.17.0.1:8100")
+        body = json.dumps({"login_name": LOGIN_USER, "password": LOGIN_PASS}).encode()
+        req = urllib.request.Request(
+            f"{base}/api/login", data=body, headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                _SESSION_TOKEN = json.loads(resp.read().decode("utf-8", "replace")).get("token") or ""
+        except Exception as e:
+            # 空串而不是 None：只登录一次，失败了也不要每题重试一遍把账号锁掉
+            # （服务端有 per-IP 令牌桶 + 按账号的失败计数）。
+            print("登录失败：%s" % str(e)[:200], flush=True)
+            _SESSION_TOKEN = ""
+    return {"Authorization": "Bearer %s" % _SESSION_TOKEN} if _SESSION_TOKEN else {}
 
 
 def entries_verdict(c):
@@ -377,10 +412,11 @@ def entries_verdict(c):
 
 def http_skip_reason(c):
     """本题在 HTTP 档跑不了的理由；None = 能跑。跑不了要**说出来**，不许静默当过。"""
-    if not API_KEY:
-        return "DMSAI_API_KEY 未设置（HTTP 档要 mcp_keys 里的一把 key）"
-    if (c.get("login") or "") != "admin":
-        return f"HTTP 档一把 key 只映射一个 login，跑不了 login={c.get('login')}"
+    if not (API_KEY or (LOGIN_USER and LOGIN_PASS)):
+        return "身份未配置（要 DMSAI_API_KEY，或 DMSAI_LOGIN + DMSAI_PASSWORD）"
+    who = LOGIN_USER if (LOGIN_USER and not API_KEY) else "admin"
+    if (c.get("login") or "") != who:
+        return f"HTTP 档一条身份只映射一个 login，跑不了 login={c.get('login')}（本轮身份 {who}）"
     if c.get("prev") or c.get("prev_sql"):
         return "两轮题在 HTTP 上靠 conv_id 承载上下文，与 CLI 的 prev/prev_sql 不同形"
     if c.get("type"):
@@ -415,7 +451,7 @@ def ask_entry(c, entry):
     req = urllib.request.Request(
         f"{base}{path}",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "X-API-Key": API_KEY},
+        headers={"Content-Type": "application/json", **auth_headers()},
     )
     try:
         with urllib.request.urlopen(req, timeout=_ask_timeout()) as resp:
@@ -481,7 +517,7 @@ def ask_http(c):
     req = urllib.request.Request(
         f"{base}/api/ask",
         data=body,
-        headers={"Content-Type": "application/json", "X-API-Key": API_KEY},
+        headers={"Content-Type": "application/json", **auth_headers()},
     )
     try:
         with urllib.request.urlopen(req, timeout=_ask_timeout()) as resp:
@@ -752,6 +788,17 @@ def run_case(c, results):
         if why:
             label = "跨入口档" if ENTRIES_MODE else "HTTP 档"
             results.append((name, None, f"{label}跳过：{why}")); return
+    elif c.get("ask_intent"):
+        # 🔴 CLI 的 `ask` 是位置参数（login/问句/role/prev/prev_sql），**没有 chip 这一位**，
+        # 于是 ask_argv 一直把 ask_intent 静默丢掉 —— 题照跑照绿，跑的却是另一道题。
+        # 2026-08-17 业主截图那条「点了问数还被反问要问数还是知识库」，G03 本该抓到，
+        # 而那一轮 G03 根本没发出 chip。跳过要**说出来**，与 http_skip_reason 同一条纪律。
+        results.append((
+            name, None,
+            "CLI 档跳过：ask_intent=%s 只在 HTTP 上存在（CLI 的 ask 是位置参数，没有 chip 这一位）"
+            % c["ask_intent"],
+        ))
+        return
     if ENTRIES_MODE:
         ok, detail = entries_verdict(c)
         results.append((name, ok, detail)); return
