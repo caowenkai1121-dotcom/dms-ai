@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 pub use dms_semantic::direct_types::{ExecutionEvidence, IntentSlotKind, ResolvedSlot};
 
 const INTENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 升档重试的预算。比 Fast 那档宽得多：Precise 模型本来就慢，而能走到这里的问句
+/// 已经证明自己「不好办」——多半长、多半绕、要抽的槽位多，输出的 JSON 也长。
+/// 卡在 5 秒上等于专门把复杂问句筛掉，而那恰恰是最需要答对的一批。
+const INTENT_ESCALATION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ITEMS: usize = 12;
 const MAX_SLOT_CHARS: usize = 160;
 
@@ -1928,12 +1933,33 @@ pub async fn understand(
     // 知识库路由拿不到、混合问句拆不开 —— 用户看到的是「先问清再查」，
     // 而模型其实完全理解了他的问题（生产日志三条为证）。
     //
-    // 重试的边界：只在**解析失败**时重试，调用失败/超时照旧一次就退（那是链路问题，
-    // 重试只会把 10s 变 20s）。第二次仍不成才判 Invalid —— fail-closed 一个字没松。
+    // 🔴 第二次**升档**（2026-08-17）：Fast 5s 拿不到合同就换 Precise、给 20s。
+    //
+    // 原来两次都是 Fast/5s，且只在解析失败时重试 —— 理由写的是「调用失败/超时是链路
+    // 问题，重试只会把 10s 变 20s」。那句话对**同一档**成立，对换档不成立：换档改的是
+    // 概率，不是掷同一颗骰子。
+    //
+    // 而这一档失败的分布不是随机的：**问句越复杂越容易失败**。业主 2026-08-17 明确
+    // 要求「用户的问题可能很复杂、很绕，需要准确理解并回答」，而复杂问句正是
+    // ① 输入长、② 要抽的槽位多、③ 输出的 JSON 长 —— 三件事都顶着 5 秒和 fast 档的
+    // 能力上限。回归里那批落 need-intent 的题（多步拆解、排除式、跨仓对比、阈值聚合）
+    // 全是这一族。
+    //
+    // 代价对比：今天是 5 秒后给一张「先问清再查」；改后最坏是 25 秒后给出正确答案。
+    // 上面那段红字自己写着「这一次抖动的代价极不成比例：合同一 Invalid，自由 SQL 关、
+    // 语义缓存关、知识库路由拿不到、混合问句拆不开」—— 既然代价这么大，
+    // 就值得多花 20 秒去换一次。**只在失败后才发生**，成功路径一毫秒不加。
+    //
+    // fail-closed 一个字没松：两次都不成，照旧 Unavailable/Invalid。
     let mut last: Option<(String, u32)> = None;
     for attempt in 0..2 {
-        let req = ChatRequest::text(ModelTier::Fast, INTENT_SYSTEM, question, Some(0.0));
-        let reply = match tokio::time::timeout(INTENT_TIMEOUT, llm.chat(req)).await {
+        let (tier, budget) = if attempt == 0 {
+            (ModelTier::Fast, INTENT_TIMEOUT)
+        } else {
+            (ModelTier::Precise, INTENT_ESCALATION_TIMEOUT)
+        };
+        let req = ChatRequest::text(tier, INTENT_SYSTEM, question, Some(0.0));
+        let reply = match tokio::time::timeout(budget, llm.chat(req)).await {
             Ok(Ok(reply)) => reply,
             // 🔴 失败也要记一次调用（token 记 0，一分不多算）。
             // `Trace::add` 的唯一驱动是 `on_usage`，而 `on_usage` 原来只在**成功回包后**才走
@@ -1943,13 +1969,24 @@ pub async fn understand(
             // 开了三路调查才发现模型**调了**、超时了，44ms 只是成员循环那一段。
             // 记上之后，「llm_calls>=1 且 route=need-intent」一眼就是合同失败，不用再猜。
             Ok(Err(err)) => {
-                tracing::warn!(err = %err, "结构化意图 Fast 调用失败 → 关闭自由查询路径");
                 on_usage(&Usage::default());
+                if attempt == 0 {
+                    tracing::warn!(err = %err, "结构化意图 Fast 调用失败 → 升档 Precise 再试一次");
+                    continue;
+                }
+                tracing::warn!(err = %err, "结构化意图升档后仍调用失败 → 关闭自由查询路径");
                 return IntentAttempt::Unavailable;
             }
             Err(_) => {
-                tracing::warn!("结构化意图 Fast 调用超时 → 关闭自由查询路径");
                 on_usage(&Usage::default());
+                if attempt == 0 {
+                    tracing::warn!(
+                        budget_s = INTENT_TIMEOUT.as_secs(),
+                        "结构化意图 Fast 超时 → 升档 Precise 再试一次（复杂问句是这一档的常客）"
+                    );
+                    continue;
+                }
+                tracing::warn!("结构化意图升档后仍超时 → 关闭自由查询路径");
                 return IntentAttempt::Unavailable;
             }
         };
@@ -3100,6 +3137,55 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 第一次 Fast 失败必须**升档**再试一次 —— 复杂问句正是这一档的常客。
+    #[tokio::test]
+    async fn a_failed_fast_contract_escalates_to_the_precise_tier() {
+        struct Escalating {
+            calls: Mutex<Vec<ModelTier>>,
+        }
+        impl ChatModel for Escalating {
+            fn chat<'a>(&'a self, req: ChatRequest) -> BoxFut<'a, Result<ChatReply, LlmError>> {
+                let n = {
+                    let mut calls = self.calls.lock().unwrap();
+                    calls.push(req.tier);
+                    calls.len()
+                };
+                Box::pin(async move {
+                    if n == 1 {
+                        // 第一次：链路失败（旧实现到此就 Unavailable 了）
+                        Err(LlmError::Transport("down".into()))
+                    } else {
+                        Ok(ChatReply {
+                            content: Some(INVENTORY.to_string()),
+                            usage: Default::default(),
+                        })
+                    }
+                })
+            }
+        }
+
+        let llm = Escalating { calls: Mutex::new(Vec::new()) };
+        let attempt = understand(&llm, &|_| {}, "小虎黑椒味烤肠500G的库存信息").await;
+        assert!(
+            attempt.is_ready(),
+            "第一次失败不该让整题作废：升档再试一次就拿到了合同"
+        );
+        assert_eq!(
+            *llm.calls.lock().unwrap(),
+            vec![ModelTier::Fast, ModelTier::Precise],
+            "第一次 Fast、第二次必须换 Precise —— 同一档重试只是把 10s 变 20s"
+        );
+
+        // 反向：成功路径**一次都不许**多调（升档只在失败后发生）
+        let once = Fake { reply: Some(INVENTORY), seen: Mutex::new(None) };
+        assert!(understand(&once, &|_| {}, "小虎黑椒味烤肠500G的库存信息").await.is_ready());
+        assert_eq!(
+            *once.seen.lock().unwrap(),
+            Some((ModelTier::Fast, Some(0.0))),
+            "顺利那次必须只走 Fast，成功路径一毫秒不加"
+        );
+    }
 
     /// 答对了却说自己证不出来 —— 2026-08-17 业主那题的收据面收口。
     #[test]
