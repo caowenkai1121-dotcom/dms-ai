@@ -239,6 +239,13 @@ for _ in $(seq 1 90); do
     LAST_HEALTH="$HEALTH_BODY"
     if printf '%s' "$HEALTH_BODY" | health_ok; then
       printf 'HEALTH: %s\n' "$HEALTH_BODY"
+      # 🔴 health 的 ok=true 答的是「进程活着、库连得上」，答不了「这台机器答题能力和现网一样吗」。
+      # 2026-08-17 现场：第二台生产机 health 全绿（ok/vector_ready/breakers 一个不缺），
+      # 而业务字典种子从没导入（SQL 样例少 90 行、教训少 48 行）、98 条样例无向量、
+      # embed 服务是个手工起的孤儿进程。部署"成功"、服务"健康"、答案变差。
+      # 挂在这里是因为：**谁部署、怎么部署都要过 server-restart.sh**，手工解包也躲不开。
+      # ADVISORY=1 只报不拦 —— 缺快照不该让一次正常重启失败，但绝不许它不出声。
+      ADVISORY=1 DMS_RUNTIME_ROOT="$RUNTIME_ROOT" bash "$APP_ROOT/scripts/server-verify.sh" || true
       if [ "$HAD_OLD_SERVER" -eq 1 ]; then
         docker rm -f "$ROLLBACK_CONTAINER" >/dev/null
       fi

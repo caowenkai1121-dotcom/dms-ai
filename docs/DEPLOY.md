@@ -33,6 +33,28 @@ bash deploy.sh --dry-run    # 只自检不连服务器
 ⚠️ 包 = 密码本：密文 + 配套主钥合在一起等价于明文凭据。放在会自动同步的网盘目录里，
 凭据就跟着同步走了一份。
 
+### ⚠️ 不要把包打成 tar 手工传上去解开
+
+2026-08-17 第二台生产机就是这么上的，代价（四条在 `/api/health` 上**全是绿的**）：
+业务字典种子没导 → SQL 样例少 90 行、教训少 48 行，「销售额按省份的分布」这类问句
+直接不可计算；98 条样例没有向量；`dms-ai-embed` 是手工起的裸进程（单元 `inactive`，
+重启机器即失、部署换代码也不跟着变）；源码平铺在 `/opt/dms-ai/` 根上，没有 `app` 链接
+与 `releases/`，**没有回滚位**。
+
+`health` 的 `vector_ready` 只覆盖 `datasource`/`element`/`table_doc` 三张表，
+样例表根本不在里面 —— 所以「部署成功、服务健康、答案变差」不会有人发现。
+
+### 验收：`scripts/server-verify.sh`
+
+```bash
+DMS_RUNTIME_ROOT=/opt/dms-ai bash /opt/dms-ai/app/scripts/server-verify.sh
+```
+
+核对 `health` 答不了的四件事：注册表逐表行数（基准取自 seed 里那份快照自己，不写死数字）、
+SQL 样例向量覆盖率、`dms-ai-embed` 是否真由 systemd 托管、版本布局是否带回滚位。
+`deploy.sh` 的第 5/5 步与 `server-restart.sh` 的收尾（`ADVISORY=1` 只报不拦）都调它 ——
+一份判据，谁怎么部署都躲不开。
+
 下面是不用包、手工从零起的完整路径。
 
 ## 步骤

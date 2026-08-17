@@ -5388,3 +5388,54 @@ patternFill 再从 BytesIO 重读。个数必须守恒（`cellXfs` 按下标引�
 那台机器要恢复到与现网同等水平，跑一次包里的 `bash deploy.sh` 即可（现在会自己探测出
 缺 seed/app/releases 并补齐、导快照、最后逐表对账）。孤儿 embed 进程需要人工确认后
 `systemctl enable --now dms-ai-embed` 收编 —— 那一步会短暂中断向量服务，留给业主决定时机。
+
+---
+
+## AX164 · 判据挪到「谁部署都躲不开」的地方（2026-08-17）
+
+业主纠正了一个前提：**第二台生产机不是他部署的**（「我是让小龙虾部署的」）。
+那 AX163 那条修法就只对了一半 —— 我把探测与对账做进了 `deploy.sh`，
+而**不跑 `deploy.sh` 的人根本碰不到它**。手工解包正是那台机器的实际形态。
+
+### 判据要挂在唯一的必经之路上
+
+谁部署、怎么部署，都要过 `scripts/server-restart.sh`（起容器就得跑它）。所以：
+
+- 新增 `scripts/server-verify.sh` —— 一份共享裁决，核对 `/api/health` **答不了**的四件事：
+  ① 注册表逐表行数（基准**取自 seed 里那份快照自己**，不写死数字 —— 写死的下个月就是假的）；
+  ② SQL 样例的向量覆盖率（health 的 `vector_ready` 只覆盖 datasource/element/table_doc，样例表不在里面）；
+  ③ `dms-ai-embed` 是否真由 systemd 托管（端口有响应 ≠ 单元活着）；
+  ④ 版本布局是不是带回滚位的 `app`+`releases`（源码平铺 = 手工解包，没有原子切换）。
+- `server-restart.sh` 收尾调它，`ADVISORY=1` **只报不拦** —— 缺快照不该让一次正常重启失败，
+  但绝不许它不出声。
+- `bundle-deploy.sh` 的第 5 步改成调同一份（原来那段内联逻辑删掉）。一份判据两处用。
+- `部署说明.md` 头条改成「⚠️ 不要手工解包上传」，把四条代价与「health 全绿」写在最前面，
+  并给出验收命令；`docs/DEPLOY.md` 同步。
+
+### 真机实测：一条命令复现了我手工查的全部
+
+在 1.95.7.181 上只读跑（跑完清掉了自己传的临时文件）：
+
+```
+✅ meta.dimension：91 / 91      ✅ meta.value_map：1168 / 1168
+❌ meta.sql_exemplar：库里 173 行 < 快照 263 行
+❌ meta.memory：库里 50 行 < 快照 98 行
+❌ SQL 样例向量 75/173
+❌ 没有 dms-ai-embed systemd 单元 —— 向量/解析服务没有被托管
+❌ 源码平铺在 /opt/dms-ai（没有 app 链接与 releases/）
+退出码=1
+```
+
+比我手工查的还准一条：那台**根本没有 systemd 单元**（`systemctl show` 返回
+`ActiveState=inactive` 我读成了「单元停了」，其实是「单元不存在」——`systemctl cat` 才分得清）。
+
+### 反向验证时第二次踩到同一个形状
+
+九条变异里有三条「仍绿」，查下来**全是判据匹配到了注释**：
+`grep -Fq 'server-verify.sh'` 被 `# 判据本体在 scripts/server-verify.sh` 这句注释喂饱，
+拆掉真正的调用照样绿。今天早些时候 `every_meta_recall_is_ds_scoped` 是同一个病
+（守卫扫到文档注释里的 `FROM meta.metric`）。
+
+**纪律记这里：源码扫描型判据必须钉在「调用/赋值」上，不能钉在「文里提到过」上。**
+钉宽了的代价是双向的 —— 要么注释喂饱判据（假绿），要么判据逼着人把注释写模糊（真损失）。
+三条断言全部改成钉逐字的调用行，九条变异这才全红。

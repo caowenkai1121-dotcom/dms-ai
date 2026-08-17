@@ -197,7 +197,9 @@ done
 # 业务字典种子没导（sql_exemplar 少 90 行、memory 少 48 行），而 health 的 vector_ready
 # 只覆盖 datasource/element/table_doc 三张表，样例表根本不在里面。三条一起钉。
 bundle="$(cat tools/bundle-deploy.sh)"
-for required in   '探测目标形态'   'registry_snapshot.py import'   'systemctl is-active dms-ai-embed'   'done < "$TMP/actual.txt"'; do
+# 判据本体 2026-08-17 起收口进 scripts/server-verify.sh（下面另有一组钉它），
+# 入口这边只需保证「探测缺口 + 导种子 + 调那份共享判据」三件都还在。
+for required in   '探测目标形态'   'registry_snapshot.py import'   'server-verify.sh'; do
   grep -Fq -- "$required" <<<"$bundle" || {
     echo "部署包入口缺上线判据：$required" >&2
     exit 1
@@ -206,6 +208,31 @@ done
 # 快照导入不许再退回「只在 --bootstrap 下跑」：忘了加开关的代价是静默变笨。
 ! grep -Fq 'if [ "$MODE" = bootstrap ] && [ -s payload/registry_snapshot.json ]' <<<"$bundle" || {
   echo "快照导入又被关回 --bootstrap 专属：忘加开关就静默少 90 条样例" >&2
+  exit 1
+}
+
+# 上线判据必须是**一份**，且挂在「谁部署都躲不开」的位置上：server-restart.sh 收尾。
+# 手工解包的人不会跑 deploy.sh，但一定会跑 server-restart.sh（2026-08-17 现场教训）。
+verify="$(cat scripts/server-verify.sh)"
+# 🔴 断言必须钉在**代码**上，不能钉在「文里提到过」上：注释里写清楚为什么，
+# 结果判据被注释喂饱、拆掉真正的实现照样绿 —— 2026-08-17 反向验证当场抓到三条这样的。
+for required in   'meta.sql_exemplar'   'count(*) FILTER (WHERE embedding IS NOT NULL)'   'STATE="$(systemctl is-active dms-ai-embed'   '[ "$ADVISORY" = 1 ]'   '"$RUNTIME_ROOT/seed/registry_snapshot.json"'; do
+  grep -Fq -- "$required" <<<"$verify" || {
+    echo "server-verify 缺验收项：$required" >&2
+    exit 1
+  }
+done
+grep -Fq 'ADVISORY=1 DMS_RUNTIME_ROOT="$RUNTIME_ROOT" bash "$APP_ROOT/scripts/server-verify.sh"' <<<"$restart" || {
+  echo "server-restart 收尾不再跑上线验收（或丢了 ADVISORY 只报不拦）：手工部署的机器将无人告知它缺东西" >&2
+  exit 1
+}
+grep -Fq "bash '\$RUNTIME_ROOT/app/scripts/server-verify.sh'" <<<"$bundle" || {
+  echo "部署包入口不再调共享验收：判据要么两份要么没有" >&2
+  exit 1
+}
+# 基准不许写死数字：写死的下个月就是假的，必须从快照现读。
+grep -Fq 'json.load(open(sys.argv[1]' <<<"$verify" || {
+  echo "server-verify 的基准不再取自快照本身" >&2
   exit 1
 }
 

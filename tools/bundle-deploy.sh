@@ -176,47 +176,12 @@ else
 fi
 
 echo "== 5/5 上线判据（注册表真进去了吗 —— 光看 /api/health 是看不出来的）"
-# 🔴 这一步是 2026-08-17 现场补的：那台机器 `/api/health` 的 ok / vector_ready / breakers
-# **全绿**，而 sql_exemplar 少 90 行、memory 少 48 行、98 条样例没有向量。
-# health 的 vector_ready 只覆盖 datasource/element/table_doc 三张表，样例表根本不在里面。
-# 判据的基准就是包里那份快照自己的行数 —— 带上来多少行，库里就该不少于多少行。
-"$PY" - "$RUNTIME_ROOT" <<'PY' > "$TMP/expect.sql"
-import json, pathlib, sys
-tables = json.loads(pathlib.Path("payload/registry_snapshot.json").read_text(encoding="utf-8"))["tables"]
-checks = []
-for name in ("dimension", "value_map", "sql_exemplar", "term", "kw_force", "memory"):
-    rows = tables.get(name)
-    rows = rows.get("rows") if isinstance(rows, dict) else rows
-    if rows:
-        checks.append(f"SELECT '{name}', count(*), {len(rows)} FROM meta.{name}")
-checks.append("SELECT 'sql_exemplar 有向量', count(*) FILTER (WHERE embedding IS NOT NULL), count(*) FROM meta.sql_exemplar")
-print("\nUNION ALL\n".join(checks) + ";")
-PY
-"$PY" source/tools/_deploy.py bput "$(native "$TMP/expect.sql")" "$RUNTIME_ROOT/expect.sql"
-"$PY" source/tools/_deploy.py run "
-  docker cp '$RUNTIME_ROOT/expect.sql' dms-ai-pg:/tmp/expect.sql >/dev/null 2>&1
-  docker exec dms-ai-pg psql -U postgres -d dms_ai -tA -F'|' -f /tmp/expect.sql
-" 120 > "$TMP/actual.txt"
-# 🔴 先落盘再判：`while` 跟在管道后面是**子 shell**，里面的赋值出不来 ——
-# 这条判据要是写成管道，短缺时照样打印 ❌ 却退出码 0，等于没判。
-SHORT=0
-while IFS='|' read -r name got want; do
-  [ -n "${name:-}" ] || continue
-  if [ "${got:-0}" -lt "${want:-0}" ] 2>/dev/null; then
-    echo "  ❌ $name：库里 $got 行 < 应有 $want 行"
-    SHORT=1
-  else
-    echo "  ✅ $name：$got / $want"
-  fi
-done < "$TMP/actual.txt"
-[ "$SHORT" -eq 0 ] || echo "⚠️ 注册表短缺：问数准确性会明显低于现网。先看上面这几行，再重跑一次本脚本（导入幂等）。" >&2
-# systemd 单元必须真的在跑：端口有响应不等于单元活着 —— 2026-08-17 现场那台
-# `ActiveState=inactive`，8078 上是个手工起的裸 python 孤儿，重启机器就没了。
-"$PY" source/tools/_deploy.py run "
-  s=\$(systemctl is-active dms-ai-embed 2>/dev/null || echo unknown)
-  if [ \"\$s\" = active ]; then echo '  ✅ dms-ai-embed 单元 active'
-  else echo \"  ❌ dms-ai-embed 单元 \$s —— 端口若有响应则是孤儿进程（重启即失，且不随部署更新）\"; fi
-" 60
+# 判据本体在 `scripts/server-verify.sh`，随源码一起上了服务器。这里只是调它 ——
+# 一份判据两处用（部署脚本裁决 / server-restart 收尾只报不拦），不抄第二份。
+# 手工解包的人不会跑本脚本，但一定会跑 server-restart.sh，那边也挂着同一条。
+"$PY" source/tools/_deploy.py run \
+  "DMS_RUNTIME_ROOT='$RUNTIME_ROOT' bash '$RUNTIME_ROOT/app/scripts/server-verify.sh'" 180 \
+  || die "上线验收未通过（见上面带 ❌ 的行）。全部幂等，修完缺口重跑本脚本即可"
 
 echo
 echo "部署完成。人工冒烟三题：本月销售额 / 现在总库存量是多少 / 市场费用的报销政策是什么"
