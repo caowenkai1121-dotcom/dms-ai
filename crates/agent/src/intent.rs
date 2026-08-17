@@ -206,10 +206,27 @@ impl ResolvedIntent {
             IntentRoute::Unknown => false,
         };
         if !route_is_owned {
+            tracing::warn!(?route, contract = ?self.route(), "投影失败：这条路不属于本合同");
             return None;
         }
-        let projected = self.0.project(question, route)?.ground(question)?;
-        (projected.route() == route).then_some(projected)
+        // 🔴 三个 `?` 连着、一条日志都不打，失败原因就此消失 —— 本仓在 `ground()` 上
+        // 已经付过一次这个账（见 `grounding_reject_reason` 的红字：「ground 有十来个
+        // return None，此前一条日志都不打」，定位花了半小时）。2026-08-17 又付了一次：
+        // 引号修好、grounding 也过了，合同却仍判 Invalid，而日志里**什么都没有** ——
+        // 因为把它作废的是这里，不是那里。
+        let Some(shaped) = self.0.project(question, route) else {
+            tracing::warn!(?route, "投影失败：按该路收窄槽位时被拒");
+            return None;
+        };
+        let Some(projected) = shaped.ground(question) else {
+            tracing::warn!(?route, "投影失败：收窄后的合同过不了 grounding");
+            return None;
+        };
+        if projected.route() != route {
+            tracing::warn!(?route, got = ?projected.route(), "投影失败：收窄后路由与目标不一致");
+            return None;
+        }
+        Some(projected)
     }
 }
 
