@@ -712,6 +712,17 @@ pub(crate) async fn seed_terms(pg: &PgPool) -> anyhow::Result<()> {
         ("成交客户数", "dms_ods.t_sales_order 中下过有效订单的去重客户数 COUNT(DISTINCT customer_code)；默认销售 DWS 不替代订单事件口径", &["下单客户数", "成交客户"]),
         ("复购", "dms_ods.t_sales_order 中同一客户在统计期内有效订单数≥2(COUNT DISTINCT sales_order_code GROUP BY customer_code HAVING>=2)", &["复购客户", "二次购买"]),
         ("订单客单价", "订单客单价＝订单额÷订单数＝ROUND(SUM(total_amount)/NULLIF(COUNT(DISTINCT sales_order_code),0), 2)；不使用默认 Doris DWS 销售额", AVG_ORDER_VALUE_ALIASES),
+        // 🔴 2026-08-17 业主实测：问「京东和顺丰的大日期商品」整轮落到知识库，答「知识库里没有
+        // 查询方法」。而数据是**有的** —— ywzt_ods.scm_warehous_manage 带 invalid_date 失效日期，
+        // 仓库名在 master_wms.wms_desc 上，只是没人告诉过模型它们在哪、怎么接。
+        // 定义里的四条都在 2026-08-17 直连数仓验过：
+        //   ① 唯一带效期的库存表 —— t_winc_stock_report（营销通经销商库存）整张表没有效期列，
+        //      模型顺着「库存」二字很容易选中它，然后无声地答成别的口径；
+        //   ② invalid_date 有 8888/8889 年哨兵值（实测 MAX 到 8889-02-23），不滤会把「永不过期」算成临期；
+        //   ③ 承运仓只能从 master_wms.wms_desc 认，库存表里的 sup_name 是**供应商** ——
+        //      顺丰以物流公司身份出现在供应商列，按它筛等于把供货关系错认成仓储关系；
+        //   ④ 实测这道题有解：京东仓 4 个批次 360 件（3 批已过期 53-59 天、1 批当日到期），顺丰仓 0 行。
+        ("大日期", "临期库存口径：ywzt_ods.scm_warehous_manage 中 invalid_date（失效日期）落在阈值内、且 in_stock_quantity>0 的在库批次；问句没给阈值时默认「今日起 3 个月内」，给了就用问句里的。明细按 sku_code/sku_name/batch_number 展开，可带 production_date 与 DATEDIFF(invalid_date, CURDATE()) 剩余天数。按仓筛选必须 JOIN ywzt_ods.master_wms ON wms_code 用 wms_desc 匹配（「京东仓」→ wms_desc LIKE '%京东%'）。⚠️ 三条禁令：dms_ods.t_winc_stock_report 没有效期列、不得替代；invalid_date 存在 8888/8889 年哨兵值，必须加 invalid_date < '2100-01-01'；禁止拿库存表的 sup_name（供应商名）当承运仓——顺丰同时是供应商，按它筛是错的。", &["临期", "临期商品", "大日期商品", "效期临近", "近效期"]),
     ];
     // 旧术语把订单额写成销售额，保留会与 DWS 默认销售额同时召回。
     sqlx::query("DELETE FROM meta.term WHERE ds_id=$1 AND term='客单价'")

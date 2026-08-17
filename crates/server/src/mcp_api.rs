@@ -447,7 +447,8 @@ async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, 
             .await;
             // 长驻进程，写入句柄直接丢弃（fire-and-forget，同 `/api/ask`）
             let r = r.map_err(|e| internal_fail("问数执行", &e))?;
-            match crate::knowledge_arm_payload(&r, &prepared, &question) {
+            // MCP 没有能力 chip（调用方要问数就直接调问数工具），恒 false
+            match crate::knowledge_arm_payload(&r, &prepared, &question, false) {
                 Some(payload) => payload,
                 None => serde_json::to_value(&r)
                     .map_err(|e| internal_fail("问数结果序列化", &e))?,

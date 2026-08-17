@@ -336,6 +336,32 @@ pub const ASSETS: &[Asset] = &[
         "库存量=SUM(in_stock_quantity)（默认且只计 inventory_status='ZP' 正品）；锁定量=SUM(lock_quantity)；冻结量=SUM(freeze_quantity)；实际数量=SUM(actual_quantity)（与在库差着锁定/冻结/在途，不许与 in_stock 混称）；批次/效期结构",
         "禁止跨 inventory_status 混加（TS/BS/CC/GQ/LQ/XS 各是残损/报损/调出/过期/临期/滞销，点名才加）；禁止把 actual_quantity 当在库量；禁止与营销通门店进销存（t_winc_stock_report）相加或混称；本表无金额列，禁止推算库存金额",
         "禁止默认同比/环比：现行表无快照轴，历史比较需专门快照资产"),
+    // 🔴 2026-08-17 业主指出：「仓库主数据在 master_wms，一般 master 开头的都是主数据」。
+    // 在此之前 ywzt_ods 只登记了库存事实一张表，于是「京东仓/顺丰仓的大日期商品」整族答不了 ——
+    // 库存表里仓库只有不透明的 `wms_code`（GZHYC-777 / WMS000019 / 9572214），
+    // 而仓库名活在这张没进目录的主数据表里。模型看不见的表，等于不存在。
+    // 实测（2026-08-17 直连数仓）：master_wms 539 行、master_sku 5325 行，
+    // `master_wms.wms_code = scm_warehous_manage.wms_code` 一对一接得上。
+    asset!("ywzt_ods", "master_wms", "ODS", "仓库主数据", "一仓一 wms_code",
+        "当前主数据，无经营时间轴（created_date/updated_date 是档案维护时间，不是经营日期）",
+        "仓库档案：wms_desc=仓库名称（「皇家小虎京东-残次品仓」「京东常温酱料虚拟仓」这类，承运方只能从这里认）；\
+         wms_type/wms_node=仓库类型/节点；third_party_wms=是否三方仓；province/city/area=行政区划码；\
+         wms_status=状态；cargo_owner_id=货主。与 ywzt_ods.scm_warehous_manage 按 wms_code 关联",
+        "禁止从主数据推算任何库存量/金额（本表无数量列）；禁止把 sup_name（供应商，在库存表上）当承运仓 —— \
+         顺丰以物流公司身份出现在供应商列里，按它筛会把供货关系错认成仓储关系；\
+         行政区划是编码不是名称，禁止直接当省份展示",
+        "禁止默认同比/环比；主数据变化需专门快照资产"),
+    asset!("ywzt_ods", "master_sku", "ODS", "商品主数据（中台）", "一 SKU 一 sku_code",
+        "当前主数据，无经营时间轴",
+        "SKU 档案与**效期参数**：daysToExpire=保质期天数、due_date=可售期天数、\
+         receipt_warning_days/blackout_days=收货预警/封存天数、bacteria_inspection_days=菌检天数；\
+         另有 sku_name/sku_short_name、bar_code=69码、brand_code、sku_class=分类、\
+         specifications_models=规格、unit、net_weight/gross_weight、\
+         sku_sale_status/sku_cycle_status=销售/生命周期状态、sku_launch_date/sku_delisting_date=上市/退市。\
+         与 ywzt_ods.scm_warehous_manage 按 sku_code 关联",
+        "禁止与 dms_ods.t_goods（DMS 商品主数据）混用或相加——两套编码体系，先确认问的是中台还是 DMS；\
+         禁止从主数据推算销量/库存；效期参数是**档案值**，具体批次的实际效期在库存表的 invalid_date 上",
+        "禁止默认同比/环比；主数据变化需专门快照资产"),
     asset!("dms_ods", "t_customer", "ODS", "客户主数据", "一客户一 customer_code",
         "当前主数据，无经营时间轴",
         "客户档案、类型、分类、渠道、行政区划和启停状态；province 是行政区划码，不是门店业务省区",
@@ -1129,7 +1155,7 @@ mod tests {
             assert!(comment.contains(&format!("{}.{}", asset.database, asset.table)));
             assert!(comment.contains("必须使用完整库表名"));
         }
-        assert_eq!(ASSETS.len(), 59, "运行时白名单数量变化必须同步资产文档");
+        assert_eq!(ASSETS.len(), 61, "运行时白名单数量变化必须同步资产文档");
         assert_eq!(metadata_assets().len(), ASSETS.len());
         for (database, expected) in [
             ("sales_dw", 21usize),
@@ -1138,8 +1164,9 @@ mod tests {
             ("fin_ads", 5),
             ("hr_dw", 1),
             ("dms_ods", 17),
-            // 业务中台域首表（2026-08-11 用户指定库存源）：ywzt_ods.scm_warehous_manage
-            ("ywzt_ods", 1),
+            // 业务中台域：库存事实 scm_warehous_manage + 两张主数据（2026-08-17 补齐 ——
+            // 仓库名只活在 master_wms 上，不登记就没人能按「京东仓/顺丰仓」筛库存）
+            ("ywzt_ods", 3),
         ] {
             assert_eq!(
                 ASSETS.iter().filter(|asset| asset.database == database).count(),
@@ -1159,6 +1186,44 @@ mod tests {
             }));
         }
         assert!(!base_tables.contains("dws_mkt_app_distribution_inventory_dfn"));
+    }
+
+    /// 中台主数据不许再从目录里掉出去（2026-08-17）。
+    ///
+    /// 掉出去的代价不是报错，是**整族问题答不了**：库存表里仓库只有 `wms_code` 这种
+    /// 不透明编码，仓库名唯一活在 `master_wms.wms_desc` 上。表不在白名单里 = 模型看不见它 =
+    /// 「京东仓的大日期商品」只能落到知识库去答「知识库里没有查询方法」。
+    /// 反向验证：删掉任一条 `asset!` 或把 `wms_desc` 从字段合同里拿掉，这条当场红。
+    #[test]
+    fn zhongtai_master_data_stays_in_the_catalog() {
+        let wms = ASSETS
+            .iter()
+            .find(|a| a.database == "ywzt_ods" && a.table == "master_wms")
+            .expect("ywzt_ods.master_wms 掉出白名单：按仓筛库存会整族失效");
+        assert!(
+            wms.metrics.contains("wms_desc"),
+            "master_wms 的字段合同必须点名 wms_desc —— 那是唯一能认出承运仓的字段：{}",
+            wms.metrics
+        );
+        assert!(
+            wms.forbidden.contains("sup_name"),
+            "必须写明禁止拿 sup_name（供应商）当承运仓：顺丰同时是供应商，按它筛是错的：{}",
+            wms.forbidden
+        );
+        let sku = ASSETS
+            .iter()
+            .find(|a| a.database == "ywzt_ods" && a.table == "master_sku")
+            .expect("ywzt_ods.master_sku 掉出白名单");
+        assert!(
+            sku.metrics.contains("daysToExpire"),
+            "master_sku 的字段合同必须点名效期参数：{}",
+            sku.metrics
+        );
+        assert!(
+            sku.forbidden.contains("t_goods"),
+            "必须写明与 DMS 商品主数据是两套编码、不得混用：{}",
+            sku.forbidden
+        );
     }
 
     #[test]

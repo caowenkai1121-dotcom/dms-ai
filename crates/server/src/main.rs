@@ -2092,21 +2092,35 @@ pub(crate) async fn deterministic_data_probe(
         .filter(dms_agent::hybrid::data_has_substance)
 }
 
-/// 两臂产物里**纯资料**那一档 → wire 形状（`Some` = 这一轮是资料答案，已经成形）。
+/// 两臂产物里「纯资料档」的还原：资料半是**主答案**时把整份 `Answer` 摊平回 wire 形状。
 ///
-/// 🔴 抽出来是为了让 `/api/ask`、小程序、MCP 用**同一份**分档（2026-08-16）：
-/// 此前只有 `/api/ask` 会先探一次确定性问数车道再决定要不要出资料卡，
-/// 小程序与 MCP 的 `Knowledge` 臂直连 `kb_answer` —— 于是
-/// 「线下-浏阳品元商贸有限公司」在 web 上修好了，在小程序上照旧只答
-/// 「知识库里没有这家公司的规定」，而这家公司在业务库里有客户卡。
-/// 同一个缺陷在不同入口上各活各的，正是本仓反复付账的那个形状。
+/// `forced_data` = 用户在前端 chip 上**明确点了「问数」**。这一档下资料半不许当主答案：
+/// 🔴 2026-08-17 业主实测：明确选了问数，问「京东和顺丰的大日期商品」，拿回来的是
+/// 一张知识库回答卡（「知识库里没有关于大日期商品的查询方法」）。链路是这样的 ——
+/// 合同判成 Data、forced 投影通过，然后两臂都跑（这是 2026-08-14 有意为之，见下面的红字），
+/// 问数半没取到实质、资料半有命中，`hybrid::fuse` 就把资料半选成了答案。
+/// 对 `auto` 档这是对的；对**用户已经明确表态**的档，这等于把他的选择静默丢掉。
+/// 现在：问数半没答上来就照实说（澄清卡带 coverage 收据），资料半降为附属挂在 `kb` 键上
+/// （前端本来就渲染它）—— 不藏任何东西，但主答案必须是用户点的那条路。
 pub(crate) fn knowledge_arm_payload(
     r: &dms_agent::AskResult,
     prepared: &PreparedAsk,
     original_question: &str,
+    forced_data: bool,
 ) -> Option<serde_json::Value> {
     if r.route != "knowledge" {
         return None;
+    }
+    if forced_data {
+        // `Answer` 没有 `Clone`，也不需要：直接摊进 JSON 的 `kb` 键 ——
+        // 与 `hybrid_payload` 手工塞 `v["kb"]` 是同一条既有协议，前端零改。
+        let mut payload = serde_json::to_value(prepared.question.clarification_result())
+            .expect("AskResult 是纯数据 struct，派生 Serialize 不会失败");
+        if let Some(a) = &r.kb {
+            payload["kb"] =
+                serde_json::to_value(a).expect("Answer 是纯数据 struct，派生 Serialize 不会失败");
+        }
+        return Some(payload);
     }
     let Some(a) = &r.kb else {
         // 两臂都空：澄清卡（`hybrid::fuse` 只在两边都没实质时走到这里）
@@ -2154,7 +2168,9 @@ async fn ask_arms_payload(
         true,
     )
     .await?;
-    if let Some(payload) = knowledge_arm_payload(&r, prepared, &req.question) {
+    // 用户点了「问数」chip：资料半不许当主答案（见 knowledge_arm_payload 的红字）
+    let forced_data = forced_route(req.intent.as_deref()) == Some(IntentRoute::Data);
+    if let Some(payload) = knowledge_arm_payload(&r, prepared, &req.question, forced_data) {
         return Ok(payload);
     }
     let mut payload =
@@ -4315,6 +4331,32 @@ mod tests {
         assert!(
             one.contains(r#"if r.route != "knowledge" {"#) && one.contains("let Some(a) = &r.kb else"),
             "纯资料档没有按整份 Answer 重塑形状（角标会点不开）：{one}"
+        );
+        // 🔴 用户在 chip 上点了「问数」，资料半就不许当主答案（2026-08-17 业主实测：
+        // 明确选问数问「京东和顺丰的大日期商品」，拿回一张知识库回答卡）。
+        // 三条一起钉：形参在、判定在资料成形**之前**、且把资料半降为 `kb` 附属而不是丢掉。
+        assert!(
+            one.contains("forced_data: bool"),
+            "knowledge_arm_payload 丢了 forced_data 形参：用户点的 chip 又要被静默忽略：{one}"
+        );
+        let forced_at = one.find("if forced_data {").expect("forced_data 分支不见了");
+        let shaped_at = one.find("let Some(a) = &r.kb else").unwrap();
+        assert!(
+            forced_at < shaped_at,
+            "forced_data 分支必须排在资料成形之前，否则资料半照样会被当成主答案：{one}"
+        );
+        assert!(
+            one[forced_at..shaped_at].contains(r#"payload["kb"]"#),
+            "问数档下资料半必须降为 `kb` 附属挂上去，不是丢掉（用户仍要看得见）：{one}"
+        );
+        // 出口那一侧：`ask_arms_payload` 必须真的从请求里读 chip，写死 false 等于没接线。
+        let arms = production
+            .split("async fn ask_arms_payload(")
+            .nth(1)
+            .expect("ask_arms_payload 改名了");
+        assert!(
+            arms.contains("forced_route(req.intent.as_deref()) == Some(IntentRoute::Data)"),
+            "ask_arms_payload 没从请求里读能力 chip：{arms}"
         );
         for (name, src) in [
             ("xcx_api.rs", include_str!("xcx_api.rs")),

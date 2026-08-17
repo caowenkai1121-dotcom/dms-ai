@@ -688,7 +688,8 @@ async fn ask_data_payload(
     })?;
     // 纯资料答案走**与 `/api/ask` 同一份分档**：整份 `Answer`（角标要点得开），
     // 不是 AskResult 壳。抄第二份必漂 —— 那正是这一族缺陷的形状。
-    if let Some(payload) = crate::knowledge_arm_payload(&r, prepared, &gate.question) {
+    // 小程序目前没有能力 chip；有了之后按 web 同款传进来
+    if let Some(payload) = crate::knowledge_arm_payload(&r, prepared, &gate.question, false) {
         return Ok(payload);
     }
     Ok(serde_json::to_value(&r).unwrap_or_else(|e| {

@@ -4720,7 +4720,8 @@ async fn compose_inner(
         )
         .await;
         let result = match answered {
-            Ok(r) => match crate::knowledge_arm_payload(&r, &prepared, &requested_execution_question)
+            // 深度分析的子问句是系统自己生成的，没有用户 chip —— 恒 false
+            Ok(r) => match crate::knowledge_arm_payload(&r, &prepared, &requested_execution_question, false)
             {
                 Some(payload) => payload,
                 None => serde_json::to_value(&r)

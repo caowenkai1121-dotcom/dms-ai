@@ -548,6 +548,14 @@ async fn seed_join_edges(pg: &PgPool) -> anyhow::Result<()> {
          "设备台账→商品主档"),
         ("dws_fin_shipment_check_dnf", "dms_order_code", "t_sales_order", "sales_order_code", "N:1",
          "数仓发货对账行→DMS销售单；只用于单号映射和差异核对，金额聚合仍以各自系统口径为准"),
+        // 中台库存 → 两张主数据（2026-08-17 业主指路「仓库主数据在 master_wms」）。
+        // 两证齐：主键唯一（master_wms 539/539、master_sku 5325/5325 distinct）+
+        // 左连实测不丢行（库存 31258 行全留，12 行无仓档、0 行无 SKU 档）。
+        // 没有这两条边，仓库在库存表里只剩不透明的 wms_code，「京东仓的大日期商品」问不出来。
+        ("scm_warehous_manage", "wms_code", "master_wms", "wms_code", "N:1",
+         "中台库存行→仓库主数据；wms_desc 是唯一能认出承运仓（京东仓/顺丰仓等）的字段"),
+        ("scm_warehous_manage", "sku_code", "master_sku", "sku_code", "N:1",
+         "中台库存行→中台商品主数据；带 daysToExpire 等效期档案参数。注意与 dms_ods.t_goods 是两套编码，勿混"),
     ];
     // ✅ 二·AW 的前置**已完成**（AX71，2026-08-03）：装配器路径/桥接一律 LEFT JOIN +
     // 被连表口径进 ON、`scope_parts` 跳过 ON 里已带口径的表 —— 售后边据此进图。
