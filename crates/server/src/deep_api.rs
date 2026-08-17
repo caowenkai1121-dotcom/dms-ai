@@ -3845,6 +3845,35 @@ fn weekly_periods(question: &str) -> Option<WeeklyScope> {
     weekly_periods_at(question, chrono::Local::now().date_naive())
 }
 
+/// 周报窗口里**一个完整经营日都还没有**时的人话。
+///
+/// 🔴 2026-08-17 是周一，业主点「生成周报」得到的是「意图解析服务暂时不可用」。
+/// 与 LLM 无关：前端取本周一到本周日，`weekly_periods_at` 把结束日夹到昨天
+/// （今天数据不完整，不许与完整日并排比较），周一那天 `effective_end < start`
+/// 恒成立 → None → 那份 1.5 KB 的周报模板原样丢给意图模型（5 秒预算）→ 超时
+/// → 澄清卡。**每个周一都踩**，而现有判据只覆盖周中。
+///
+/// 周一确实报不了本周——这是事实，不是故障。所以修的是**降级的形状**：
+/// 说清楚为什么、什么时候能报，而不是丢一张「先问清再查」让用户以为是自己没问清。
+fn weekly_not_started_yet(question: &str, today: chrono::NaiveDate) -> Option<String> {
+    if !is_weekly_report(question) {
+        return None;
+    }
+    let (_, period) = weekly_scope(question)?;
+    let (start, _) = period.split_once("至")?;
+    let start = chrono::NaiveDate::parse_from_str(start.trim(), "%Y-%m-%d").ok()?;
+    // 只认「一个完整经营日都没有」这一种成因；格式坏、跨度超 7 天等照旧走原路。
+    (start > today.pred_opt()?).then(|| {
+        format!(
+            "{} 这一周还没有完整的经营日（今天 {} 的数据尚未收尾，不能与完整日并排比较），             所以本周周报暂时生成不了。最早可在 {} 生成，届时会覆盖 {} 一天；             想现在就看，可以把周期改成上一周。",
+            start.format("%Y-%m-%d"),
+            today.format("%Y-%m-%d"),
+            (start + chrono::Duration::days(1)).format("%Y-%m-%d"),
+            start.format("%Y-%m-%d"),
+        )
+    })
+}
+
 fn weekly_periods_at(question: &str, today: chrono::NaiveDate) -> Option<WeeklyScope> {
     let (province, period) = weekly_scope(question)?;
     let (start, end) = period.split_once("至")?;
@@ -4631,6 +4660,14 @@ async fn compose_inner(
         .map(str::trim)
         .filter(|question| !question.is_empty())
         .unwrap_or(req.question.trim());
+    // 🔴 排在 `prepare_ask`（意图解析，5 秒 LLM 预算）**之前**：周报是程序拼的固定
+    // 模板，周一报不出来是确定性事实，不该先花一次模型调用去猜它想问什么，
+    // 更不该在超时后变成一张「先问清再查」——那是把系统的日历约束说成用户没问清。
+    if let Some(note) = weekly_not_started_yet(&req.question, chrono::Local::now().date_naive()) {
+        return Ok(Json(serde_json::json!({
+            "result": { "answer": note, "route": "weekly-not-started", "rows": [], "columns": [] }
+        })));
+    }
     let requested_execution_question = execution_question_of(&req.question);
     let (login_name, role_code) =
         crate::resolve_identity(&st, &headers, &req.login_name, &req.role_code).ok_or_else(
@@ -5599,6 +5636,45 @@ pub async fn resume(
 
 #[cfg(test)]
 mod tests {
+
+    /// 周一点「生成周报」必踩：本周一个完整经营日都没有。
+    /// 此前它变成「意图解析服务暂时不可用」（1.5 KB 模板超 5 秒预算），
+    /// 现有判据只覆盖周中，所以每个周一都漏。
+    #[test]
+    fn a_week_with_no_finished_day_says_so_instead_of_asking_the_user_to_rephrase() {
+        let nl = char::from(10);
+        let q = [
+            "请生成【单省区周度经营分析报告】",
+            "省区：湖南省",
+            "周期：2026-08-17 至 2026-08-23",
+        ]
+        .join(&nl.to_string());
+        let q = q.as_str();
+        let monday = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        // 🔴 先钉住问句**真的被解析出来了**：不加这条，下面那句 `is_none()` 会因为
+        // 「字段没解析出来」而空过 —— 判据绿着，测的却不是要测的东西（第一版就踩了）。
+        assert!(super::weekly_scope(q).is_some(), "测试问句本身没被解析出来");
+        assert!(super::is_weekly_report(q), "测试问句要能被认成周报");
+        // 前提复核：周一那天确实拿不到窗口（这条不成立，下面就没意义）
+        assert!(
+            super::weekly_periods_at(q, monday).is_none(),
+            "前提变了：周一居然能算出窗口，这条判据要重写"
+        );
+        let note = super::weekly_not_started_yet(q, monday).expect("周一必须给出人话");
+        assert!(note.contains("2026-08-18"), "要告诉用户最早什么时候能报：{note}");
+        // 周二起就该照常走原路，不许被这条拦住
+        let tuesday = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
+        assert!(
+            super::weekly_not_started_yet(q, tuesday).is_none(),
+            "周二有一个完整经营日了，不许再拦"
+        );
+        assert!(
+            super::weekly_periods_at(q, tuesday).is_some(),
+            "周二应当能算出窗口"
+        );
+        // 反向：非周报问句一概不碰
+        assert!(super::weekly_not_started_yet("本月销售额是多少", monday).is_none());
+    }
     use super::*;
 
     fn kpi_result() -> dms_agent::AskResult {

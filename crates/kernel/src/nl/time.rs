@@ -525,6 +525,27 @@ fn rule_month(q: &str) -> Option<String> {
     }
     digits.reverse();
     let num: String = digits.into_iter().collect();
+    // 🔴 「小于3月」是**时长**，不是自然月（2026-08-17 业主原话：「大日期的意思是
+    // 失效日期小于3月」）。`contains("个月")` 那道逃生口只挡带「个」的写法，
+    // 业主没打「个」，于是整句被读成「2026 年 3 月这一个自然月」——与「距今不足
+    // 三个月」意思正好相反，而 `gather.rs` 会把它当**已解析好的权威区间**交给 LLM。
+    // `time.rs` 自己的注释给这类事故起过名：「把错的口径当权威交给 LLM」。
+    //
+    // 判断看紧邻数字的那个词：比较词/时长词在前 ⇒ 这不是月份，弃权交兜底。
+    // 保守 None 是本规则一贯的做法（见上面「一律交兜底/LLM，不臆造窗口」）。
+    const DURATION_MARKERS: &[&str] = &[
+        "小于", "少于", "不到", "不足", "低于", "短于", "超过", "大于", "多于", "长于",
+        "剩余", "剩", "还有", "距今", "间隔", "相差",
+    ];
+    let head = &q[..pos - num.len()];
+    if DURATION_MARKERS.iter().any(|m| head.trim_end().ends_with(m)) {
+        return None;
+    }
+    // 「3月内 / 3月以内 / 3月之内」同理：跟在后面的「内」也把它变成时长。
+    let tail = q[pos..].trim_start_matches('月').trim_start();
+    if tail.starts_with('内') || tail.starts_with("以内") || tail.starts_with("之内") {
+        return None;
+    }
     let m = cn_num(&num).filter(|m| (1..=12).contains(m))?;
     // 同 `rule_quarter`：显式年份/去年走字面日期，今年那一支字节不变
     if let YearBase::Explicit(_) | YearBase::LastYear = year_base(q) {
@@ -634,6 +655,31 @@ pub fn time_phrase_of(q: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 「小于3月」是时长不是月份 —— 2026-08-17 业主原话踩的正是这条。
+    #[test]
+    fn a_duration_is_not_a_calendar_month() {
+        for q in [
+            "京东和顺丰的大日期商品，大日期的意思是失效日期小于3月",
+            "失效日期不到3月的商品",
+            "保质期不足6月的批次",
+            "失效日期3月内的商品",
+            "有效期剩余2月的库存",
+        ] {
+            assert!(
+                time_predicate(q).is_none(),
+                "{q}：时长写法不许被读成自然月（会给 LLM 一个权威但相反的区间）：{:?}",
+                time_predicate(q)
+            );
+        }
+        // 反向：真月份不许被这条误伤
+        for q in ["3月销售额是多少", "2026年6月的订单数", "十二月毛利率"] {
+            assert!(
+                time_predicate(q).is_some(),
+                "{q}：真月份被误伤了"
+            );
+        }
+    }
     use super::*;
 
     fn tp(q: &str) -> String {
