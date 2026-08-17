@@ -2123,12 +2123,29 @@ fn coverage_with_evidence(
             );
             continue;
         };
-        if !value.is_empty()
-            && !proof
-                .predicates
-                .iter()
-                .any(|predicate| predicate.has_value(value) && predicate.has_column(columns))
-        {
+        // 🔴 区间型筛选的 `value_surface` 是**描述**不是字面量：业主写「小于3月」，
+        // SQL 里是 `invalid_date < DATE_ADD(CURDATE(), INTERVAL 3 MONTH)` ——
+        // 那串字永远不会作为一个值出现在谓词里，于是 `has_value` 恒假、这条恒挂
+        // 未验证。2026-08-17 业主那题答出 7 行正确数据，收据仍标 blocked。
+        // 恒挂的判据没有牙，只会把收据训练成噪音，让人连真的缺口也不看了。
+        //
+        // 分档：等值/包含型照旧比值（那类的 value_surface 就是字面量）；
+        // 区间型证到「该列族上确有**比较型**谓词」为止 —— 能证的就证到这一步，
+        // 证不了的边界值不假装证过（`invalid_date > '1970-01-01'` 这种糊弄写法
+        // 仍算一次比较，这是本判据的已知上限，不掩饰）。
+        let ranged = matches!(
+            filter.operator.trim(),
+            "range" | "gt" | "lt" | "gte" | "lte" | "ge" | "le" | "between" | ">" | "<" | ">=" | "<="
+        );
+        let proved = proof.predicates.iter().any(|predicate| {
+            predicate.has_column(columns)
+                && if ranged {
+                    predicate_is_comparison(&predicate.text)
+                } else {
+                    predicate.has_value(value)
+                }
+        });
+        if !value.is_empty() && !proved {
             push_unique(
                 &mut report.unverifiable,
                 format!("filter:{}={value}", filter.name),
@@ -2443,6 +2460,12 @@ fn like_core(value: &str) -> &str {
     value.trim().trim_matches('%').trim()
 }
 
+/// 谓词文本里有没有比较/区间算子。区间型筛选只能证到这一步（值是描述不是字面量）。
+fn predicate_is_comparison(text: &str) -> bool {
+    let t = text.to_ascii_uppercase();
+    t.contains('<') || t.contains('>') || t.contains("BETWEEN")
+}
+
 fn name_value_matches(seen: &str, want: &str) -> bool {
     let seen = seen.trim().trim_matches('%').trim();
     let want = want.trim().trim_matches('%').trim();
@@ -2459,6 +2482,15 @@ fn name_value_matches(seen: &str, want: &str) -> bool {
 const ENTITY_COLUMNS: &[&str] = &[
     "name", "code", "sku", "goods", "product", "customer", "cust", "store", "shop", "title",
     "brand", "category", "spec",
+    // 🔴 `desc` / `label`：**人读标签列的通用后缀**，与 `name` 同类（2026-08-17）。
+    // 业主问「京东和顺丰的大日期商品」，模型写出的谓词是
+    //   `mw.wms_desc LIKE '%京东%' OR mw.wms_desc LIKE '%顺丰%'`
+    // —— 限定一字不差地进了 SQL，收据却说 `entity:京东` 证不出来，因为
+    // `wms_desc` 不含上面任何词根（这张表本来就是给客户名/商品名设计的，
+    // 见本函数上方那段红字）。**答对了却说自己证不出来**，比答不出更糟。
+    // 加的是后缀不是业务词：`_desc`/`_label` 与 `_name` 一样是「这列存人读的名字」，
+    // 而且这条判据同时要求**值也对得上**，两边都中才算认领。
+    "desc", "label",
 ];
 
 /// 实体槽的 SQL 侧证明。今天只认 `ExecutionEvidence`（实体解析器产出），而 LLM 路的
@@ -2553,10 +2585,28 @@ fn filter_columns(name: &str) -> Option<&'static [&'static str]> {
         .any(|word| name.contains(word))
     {
         Some(REGION_COLUMNS)
+    } else if ["日期", "时间", "期限", "时限", "有效期", "保质期"]
+        .iter()
+        .any(|word| name.contains(word))
+    {
+        // 🔴 按**词形**收，不是再往上面那张业务名单里加一个名字。
+        // 上面五族是「状态/商品/客户/仓库/省区」——认不出的名字一律落 `None`，
+        // 而 `None` 的后果是**无条件判未验证**：`失效日期` 这类永远转不了绿，
+        // 纯负判据、零牙（2026-08-17 业主那题答对了 7 行，收据仍挂
+        // `filter:失效日期=小于3月`）。名单永远有下一个漏项，词形不会：
+        // 中文里凡是「X日期 / X时间 / X期限」，落库的就是个日期列。
+        Some(DATE_FILTER_COLUMNS)
     } else {
         None
     }
 }
+
+/// 日期型筛选名对应的列名词根。`TIME_COLUMNS` 之外多认效期这一族 ——
+/// `invalid_date`（失效日期）、`expire_*`、`valid_*`、`shelf_life` 都是它。
+const DATE_FILTER_COLUMNS: &[&str] = &[
+    "date", "time", "day", "month", "year", "created", "updated", "occurred",
+    "invalid", "valid", "expire", "expiry", "due", "shelf", "deadline",
+];
 
 #[derive(Default)]
 struct SqlProof {
@@ -2798,16 +2848,52 @@ fn collect_provable_conjuncts(expr: &sqlparser::ast::Expr, out: &mut Vec<Predica
                 })
                 .map(|v| like_core(v).to_string())
                 .collect();
-            if !shared.is_empty() {
-                let mut columns: Vec<String> = Vec::new();
-                for proof in l.iter().chain(r.iter()) {
-                    for column in &proof.columns {
-                        if !columns.iter().any(|seen| seen.eq_ignore_ascii_case(column)) {
-                            columns.push(column.clone());
-                        }
+            let mut columns: Vec<String> = Vec::new();
+            for proof in l.iter().chain(r.iter()) {
+                for column in &proof.columns {
+                    if !columns.iter().any(|seen| seen.eq_ignore_ascii_case(column)) {
+                        columns.push(column.clone());
                     }
                 }
-                out.push(PredicateProof { text: expr.to_string(), columns, values: shared });
+            }
+            // 🔴 OR 有**两种**形态，判据不同（2026-08-17 补上第二种）：
+            //
+            // ① 同一个值出现在不同列：`名 LIKE '%X%' OR 码 = 'X'` —— 交集，见上。
+            // ② 同一列上的不同值：`wms_desc LIKE '%京东%' OR wms_desc LIKE '%顺丰%'`
+            //    —— 这就是 `IN (京东, 顺丰)` 的展开写法，**并集**才对。
+            //
+            // 只写了①的代价：业主问「京东和顺丰的大日期商品」，模型写出正确 SQL、
+            // 答出 7 行真实数据，收据却说 `entity:京东`「证不出来」——因为两支的值取交
+            // 必然为空。**答对了却说自己证不出来**，比答不出更糟。
+            //
+            // ② 的成立条件是**所有分支落在同一列集**：那时 `A OR B` 约束的正是
+            // 「这一列 ∈ {A, B}」，用户说的两个限定一个都没丢。分支跨列时不成立
+            // （`region='山东' OR amount>100` 并不保证任何一个限定生效），照旧走交集。
+            let same_column = {
+                let cols_of = |ps: &[PredicateProof]| {
+                    let mut c: Vec<String> =
+                        ps.iter().flat_map(|p| p.columns.iter().cloned()).collect();
+                    c.sort_unstable();
+                    c.dedup();
+                    c
+                };
+                let (lc, rc) = (cols_of(&l), cols_of(&r));
+                !lc.is_empty() && lc.len() == rc.len()
+                    && lc.iter().zip(rc.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b))
+            };
+            let values = if !shared.is_empty() {
+                shared
+            } else if same_column {
+                l.iter()
+                    .chain(r.iter())
+                    .flat_map(|p| p.values.iter())
+                    .map(|v| like_core(v).to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if !values.is_empty() {
+                out.push(PredicateProof { text: expr.to_string(), columns, values });
             }
         }
         _ if !expr_is_not_locally_provable(expr) => out.push(PredicateProof {
@@ -3005,6 +3091,61 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 答对了却说自己证不出来 —— 2026-08-17 业主那题的收据面收口。
+    #[test]
+    fn a_warehouse_label_predicate_proves_the_entity_and_a_date_filter_can_go_green() {
+        // 逐字取自生产（模型按表注释写出来的 SQL）
+        let sql = "SELECT mw.wms_desc AS `仓库`, SUM(wm.in_stock_quantity) AS `在库数量`                    FROM ywzt_ods.scm_warehous_manage AS wm                    JOIN ywzt_ods.master_wms AS mw ON wm.wms_code = mw.wms_code                    WHERE wm.inventory_status = 'ZP'                    AND wm.invalid_date < DATE_ADD(CURDATE(), INTERVAL 3 MONTH)                    AND (mw.wms_desc LIKE '%京东%' OR mw.wms_desc LIKE '%顺丰%')                    GROUP BY mw.wms_desc";
+        let raw = concat!(
+            r#"{"version":2,"mode":"data","subgoals":[],"goals":[],"metrics":[],"#,
+            r#""entity_mentions":[{"surface":"京东","kind":"organization"},{"surface":"顺丰","kind":"organization"}],"#,
+            r#""filters":[{"name":"失效日期","operator":"range","value_surface":"小于3月"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#
+        );
+        let intent = parse_intent_strict(raw).expect("合法合同");
+        let report = super::coverage_with_evidence(
+            Some(&intent),
+            sql,
+            &dms_kernel::MysqlDialect,
+            &ExecutionEvidence::default(),
+        );
+        for gone in ["entity:京东", "entity:顺丰", "filter:失效日期=小于3月"] {
+            assert!(
+                !report.unverifiable.iter().any(|i| i == gone),
+                "「{gone}」限定一字不差地进了 SQL，不许再说证不出来。实际：{:?}",
+                report.unverifiable
+            );
+        }
+
+        // 反向①：SQL 里**没有**那个仓库限定时，照旧证不出来
+        let no_wh = "SELECT SUM(wm.in_stock_quantity) FROM ywzt_ods.scm_warehous_manage AS wm                      WHERE wm.inventory_status = 'ZP'";
+        let report = super::coverage_with_evidence(
+            Some(&parse_intent_strict(raw).expect("合法合同")),
+            no_wh,
+            &dms_kernel::MysqlDialect,
+            &ExecutionEvidence::default(),
+        );
+        assert!(
+            report.unverifiable.iter().any(|i| i == "entity:京东"),
+            "限定没进 SQL 就必须报出来，不许被一起放行：{:?}",
+            report.unverifiable
+        );
+
+        // 反向②：值对不上也不算证明（谓词在别的仓上）
+        let other = "SELECT SUM(wm.in_stock_quantity) FROM ywzt_ods.scm_warehous_manage AS wm                      JOIN ywzt_ods.master_wms AS mw ON wm.wms_code = mw.wms_code                      WHERE mw.wms_desc LIKE '%中通%'";
+        let report = super::coverage_with_evidence(
+            Some(&parse_intent_strict(raw).expect("合法合同")),
+            other,
+            &dms_kernel::MysqlDialect,
+            &ExecutionEvidence::default(),
+        );
+        assert!(
+            report.unverifiable.iter().any(|i| i == "entity:京东"),
+            "谓词筛的是别的仓，不算证明：{:?}",
+            report.unverifiable
+        );
+    }
 
     /// 模型给中文词打引号 → 整份回包不是合法 JSON（2026-08-17 生产日志逐字取样）。
     #[test]
