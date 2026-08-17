@@ -188,6 +188,23 @@ pub fn stock_product_fragment(question: &str) -> Option<String> {
             break;
         }
     }
+    // 🔴 残余只剩量词/汇总修饰词时，**它不是商品名**（2026-08-17 生产实测）：
+    // 「现在总库存量是多少」剥完剩一个「总」字，被当成商品限定拿去唯一性探针，
+    // 于是整题落终止卡：「商品限定「总」还不能唯一匹配到一个库存商品」——
+    // 而这是三道人工冒烟题之一。
+    //
+    // 与 2026-08-15 那次「冻结/锁定被当成商品名」**完全同形**：度量词/修饰词落进
+    // 商品限定槽位，唯一匹配必然失败。那次的修法是在名单里补两个词；
+    // 这次改用**正判据** —— 名单永远有下一个漏项（这次漏的正是「总库存量」这个组合，
+    // 而 `STOCK_WORDS` 里「库存量」「总库存」两条都有，偏偏没有它们的合体）。
+    //
+    // 一次收口的同族：「全部库存量」「所有库存」「合计库存量」「整体库存量」「共有多少库存」。
+    const MODIFIER_ONLY: &[&str] = &[
+        "总", "全部", "所有", "合计", "整体", "全", "共", "总共", "一共", "累计", "汇总",
+    ];
+    if MODIFIER_ONLY.contains(&fragment.as_str()) {
+        return None;
+    }
     (!fragment.is_empty()).then_some(fragment)
 }
 
@@ -512,6 +529,29 @@ mod warehouse_group_tests {
         // 通用总量照旧走在库数量，不许被这条带偏
         let total = stock_snapshot("现在库存量是多少").expect("总量照旧");
         assert!(total.sql.contains("SUM(in_stock_quantity)"), "{}", total.sql);
+        // 🔴 量词/汇总修饰词不是商品名（2026-08-17 生产实测：三道冒烟题之一挂在这）。
+        // 「现在总库存量是多少」剥完只剩一个「总」字，被当成商品限定 → 唯一性探针必然落空 →
+        // 整题落终止卡。与 2026-08-15「冻结/锁定被当成商品名」同形，这次用正判据一次收口。
+        for q in [
+            "现在总库存量是多少",
+            "全部库存量是多少",
+            "所有库存量",
+            "合计库存量是多少",
+            "整体库存量",
+        ] {
+            let h = stock_snapshot(q).unwrap_or_else(|| panic!("{q} 该命中总量，不该被当成商品限定"));
+            assert!(
+                h.sql.contains("SUM(in_stock_quantity)") && !h.sql.contains("sku_"),
+                "{q}：应走总量而不是商品限定：{}",
+                h.sql
+            );
+        }
+        // 反向：真商品名不许被这条误伤
+        assert!(
+            stock_product_fragment("烤肠的库存量").as_deref() == Some("烤肠"),
+            "真商品名被误伤：{:?}",
+            stock_product_fragment("烤肠的库存量")
+        );
     }
 
     #[test]
