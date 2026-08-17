@@ -368,6 +368,8 @@ mod tests {
             ds: DMS_DS_ID,
             embed: None,
             embed_slices: &[],
+            // 召回上下文的形状样例：现场口径在这条判据里没有消费者
+            inline_terms: &[],
         };
         assert_eq!(cx.limit, 6, "cx 仅为召回上下文形状样例");
         assert!(catalog_table(DMS_DS_ID, "dws_off_offline_sale_dfn"));

@@ -47,6 +47,11 @@ pub struct RecallCtx<'a> {
     /// 问句向量的 pgvector 字面量；`None` = embed 缺席，向量路降级跳过。
     /// 优先级：`embed_slices` 非空时本字段被 `recall_elements` 忽略；仅在切片为空时兜底。
     pub embed: Option<&'a str>,
+    /// 问句里**现场给出的口径**（`X 的意思是 Y`，由 `lexicon::extract_inline_terms` 抽）。
+    /// 与登记术语走**同一条**注入管道（`recall_terms` 进 prompt、`recall_term_mapped` 拿定义
+    /// 再召回真表），不造第二套。空 = 这一句没给临时口径，行为与从前逐字一致。
+    /// 只有 `recall_terms` / `recall_term_mapped` 读它。
+    pub inline_terms: &'a [crate::registry::lexicon::TermDef],
     /// 【A8】问句切片向量（pgvector 字面量）。元素召回按「任一片最近」取 MIN 距离 ——
     /// 整句向量被长问句稀释时，专名片段照样打得中。**需含整句向量，顺序无关**（MIN 与
     /// 顺序无关）。空 = 只有整句向量（走单向量老路）。只有 `recall_elements` 读它。

@@ -5600,3 +5600,100 @@ tar -xzf dms-ai-部署包-*.tar.gz -C /root && cd /root/dms-ai-部署包-* && ba
 必须写明保留 `settings.docker.json` / `.secret_key` / `kbdata` / `venv` 四样运行时状态；
 全部 `docker inspect` 必须带 `--type container`。打包器新增成品自检：包内每个 `.sh`
 过 `bash -n` 且全 LF —— 装到一半才发现语法错，生产已经动过了。
+
+---
+
+## AX167 · 三线全面优化第一轮（2026-08-17）
+
+业主：「不能说 A 改 A，要全面优化迭代。『大日期』**这类的问题还会有很多**。
+① 所有问数相关的问题；② 知识库参考 Yuxi 开源项目；③ 智能与自我学习参考 prime agent。」
+
+先弄清两个外部项目的可迁移内核（不弄清就没法谈「参考」）：
+- **Yuxi-Know**（xerrors/Yuxi-Know）：LightRAG 图索引 + 知识图谱(Neo4j) + MinerU 解析 +
+  **知识库评估** + Embedding/Rerank 可配 + DeepAgents/MCP。
+- **Prime Agent**（PrimeIntellect-ai/prime-agent）的 Continual Harness：
+  **基座提示不可变、只增补**；更新必须**小步且有证据**；**快照 + 可回滚**；
+  默认只在本会话生效，沉淀要显式提升；四类工件（补充提示/记忆/技能/子智能体规格）。
+
+五条线并行审计 + 逐条反驳式核验：**14 条发现，只有 1 条挺过反驳**（另有 4 个核验员
+掉线，那 4 条按「未经核验」丢弃，不是被证伪 —— 目录覆盖与复杂问句形状两条线因此没有结论）。
+
+### 一、问数：问句里现场给的口径，系统用不上
+
+业主原话是「查看下京东和顺丰的大日期商品，**大日期的意思是失效日期小于3月的**」——
+他已经把口径讲清楚了，而系统还是去知识库问「有没有大日期的查询方法」。
+
+查下来：`IntentV1` 里**根本没有承载临时口径的字段**，模型就算读懂了也无处安放。
+
+修法**不造第二套注入**，走已有那条管道：
+- `lexicon::extract_inline_terms(question)` 抽出 `TermDef`（纯正则式扫描，
+  不过模型 —— 所以意图解析失败的那些轮次它照样在）；
+- `RecallCtx` 加 `inline_terms`，`recall_terms` 把它排**最前**并带「本轮口径：用户在问句中给出」
+  标注、同名的登记口径**让位**（两条定义同时进 prompt 等于把「按哪条算」推给模型自己挑）；
+- `recall_term_mapped` 也走它 —— **这是最关键的一环**：拿「失效日期」再召回一次，
+  带 `invalid_date` 的那张表才会进上下文。少了它，prompt 里有定义却没有能落地的表。
+
+覆盖面（同一条路，不是一个 case，判据里逐条钉死）：
+```
+「我们说的活跃客户是指近30天下过单的客户」
+「所谓大客户就是指年销售额超过100万的」
+「毛利率定义为 (收入-成本)/收入」
+「财年指的是4月到次年3月」
+```
+**保守优先**：术语名 2–12 字、字符白名单、代词/纯数字剔除；只认显式下定义的连接词
+（裸「就是」不认 ——「这就是我要的」会中招，只在「所谓…就是」这种带锚点的形态里认）。
+逗号断句，但「A，且 B」跨过去接着吃。6 条反例逐条钉「一条都不许抽」——
+**错抽一条＝把用户没说过的口径塞进 prompt，比不抽坏得多**。
+
+### 二、自我学习：一条「证不出来」的 SQL 被蒸馏成自称「修正后通过」的经验
+
+`run.rs:744` 覆盖闸软降级放行支只 log 只 warn，**不碰 `st.note`**；而 `worth_learning`
+的唯一否决条件就是 `st.note.is_some()`。链条是**确定性**的不是概率性的：
+`repair_round` 无条件把 route 写成 `llm+repair` → n==0 必回炉 → n==1 必然仍 needs_review
+→ 经验蒸馏那三个条件天然凑齐。蒸出来的正文逐字写着
+
+> 「首版 SQL 未过口径复核或执行出错，**修正后通过**。正确写法：…」
+
+而 `coverage.needs_review()` 此刻还是真的 —— 它压根没通过。系统一边给用户挂 review 收据说
+「这个槽位我证不出来」，一边把同一条 SQL 当「正确写法」写进 `meta.memory`；
+而 memory **既没有状态列也没有复核闸**，下次同族问句它就回到这个用户的 prompt 里。
+
+**这正是 Prime Agent 那条原则的反面：更新必须有证据支撑。覆盖闸说「证不出来」的那一条，
+定义上就不是证据。**
+
+修法一行收口：软降级二轮放行时把 note 挂到 `st.note`（合并写法与 `contract_overlap_note`
+那处逐字同族）。裁决抽成纯函数 `soft_outcome(&CoverageReport, n) -> (Option<String>, bool)`，
+理由与既有的 `outcome(v)` 同族：判据打不到原处。
+
+核验员纠正了原报告夸大的两处，记在这里免得下次误判：
+① `meta.sql_exemplar` 那一半是**人工闸**（沉淀写 pending，`fewshot` 只取
+`enabled AND valid`），是待复核队列不是活的投毒；② memory 召回按
+`login_name = $3 OR ''`，**只毒本人**，不是「进后面每个人的 prompt」。
+活的那一半是 memory 这条：无状态列、无复核闸、向量自愈会把它补上。
+
+### 三、知识库：本轮没有挺过反驳的发现
+
+对标 Yuxi 那条线报的几条全被核验驳回。**如实记下：这一轮没有结论，不是没有问题。**
+下一轮换角度：把 Yuxi 的**知识库评估**（我们有 `kb_eval_api.rs`，覆盖什么？）
+与 LightRAG 的图索引单独立题，别混在一次宽泛审计里。
+
+### 判据
+
+| 判据 | 反向验证 |
+|---|---|
+| `inline_terms_are_extracted_conservatively`（业主原话 + 4 变体 + 逗号两向 + 6 反例 + 重复） | — |
+| `inline_caliber_is_actually_wired_into_recall`（三处接线） | 5 种改法逐个 → 红 |
+| `soft_degrade_must_block_learning_on_the_second_round` | 4 种改法逐个 → 红 |
+
+`cargo test --workspace` **2021 通过 / 0 失败**；前端 64/64；部署契约绿。
+
+### 两条方法上的账
+
+1. **`cargo check --workspace` ≠ `cargo test --workspace`** —— check 不编译测试代码。
+   加字段那次 check 全绿，`cargo test` 却在 `recall/schema.rs` 的测试里 E0063。
+   工作区扫过一遍才算扫过。
+2. **判据被喂饱，今天第四次**：`grep "本轮口径"` 被我自己写的注释喂饱，抹掉 `format!` 里
+   那段真文案照样绿。改成钉逐字文案后才红。**源码扫描判据的锚点必须是别处不会出现的构造。**
+   另外改了生产代码要顺手看它有没有当过别人判据的**切片边界** ——
+   `blocked_coverage_answers_with_a_card_not_an_error` 就是按 `if coverage.needs_review()`
+   切的，那行被我换掉后切片一路吃到文件尾，把别处的 `anyhow::bail!` 当成本段的，假红。

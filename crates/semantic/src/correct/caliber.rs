@@ -166,6 +166,7 @@ pub async fn correct_caliber(
         ds,
         embed: None,
         embed_slices: &[],
+        inline_terms: &[],
     };
     let hits = crate::recall::recall_metric_hits(pg, &cx).await?;
     let mut cur = sql.to_string();

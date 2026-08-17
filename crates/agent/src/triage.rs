@@ -315,7 +315,9 @@ pub(crate) const RELATION_WORDS: &[&str] = &[
 /// 那要多一条 SQL，而问数问句里出现真表名的比例极低（真出现时 trgm 召回照样能找到表）。
 pub(crate) async fn registry_hit(pg: &PgPool, ds: &str, q: &str) -> anyhow::Result<bool> {
     // 三条召回都只吃 `(ds, question)`：`tables`/`limit`/`embed` 本组不读（形状见 `RecallCtx`）
-    let cx = RecallCtx { question: q, tables: &[], limit: 0, ds, embed: None, embed_slices: &[] };
+    // 分诊只判「问不问得了」，不生成 SQL —— 现场口径在这一步没有消费者，显式给空
+    let cx =
+        RecallCtx { question: q, tables: &[], limit: 0, ds, embed: None, embed_slices: &[], inline_terms: &[] };
     Ok(!recall::recall_metric_hits(pg, &cx).await?.is_empty()
         || !recall::recall_dimensions(pg, &cx).await?.is_empty()
         || !recall::recall_terms(pg, &cx).await?.is_empty())

@@ -120,6 +120,14 @@ pub async fn recall_dimensions(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Resul
 
 /// 召回命中的业务术语（问句含术语名/别名）→ 注入 prompt DomainTerms 段
 pub async fn recall_terms(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec<String>> {
+    // 🔴 现场口径排在**最前**且带「本轮口径」标注：用户当场把 X 定义成 Y，这一轮就按他说的算。
+    // 标注不能省 —— 临时口径可能与登记口径冲突，prompt 里必须看得出哪条是用户现给的，
+    // 收据侧也要能把它说出来（静默换口径是本仓最不能接受的一类）。
+    let inline: Vec<String> = cx
+        .inline_terms
+        .iter()
+        .map(|t| format!("{} = {}（本轮口径：用户在问句中给出，优先于登记口径）", t.term, t.definition))
+        .collect();
     let rows = load_terms(pg, cx.ds).await?;
     let matched: Vec<(usize, String)> = rows
         .iter()
@@ -128,12 +136,15 @@ pub async fn recall_terms(pg: &PgPool, cx: &RecallCtx<'_>) -> anyhow::Result<Vec
         .collect();
     let pairs: Vec<(String, String)> =
         matched.iter().map(|(i, w)| (rows[*i].term.clone(), w.clone())).collect();
-    Ok(map_filter(&pairs)
+    // 用户当场定义过的词，登记那份不再重复注入：同一个词两条定义会让模型自己挑，
+    // 而它挑哪条我们无从预测 —— 冲突要在这里解决掉，不能推给模型。
+    let overridden: Vec<&str> = cx.inline_terms.iter().map(|t| t.term.as_str()).collect();
+    Ok(inline
         .into_iter()
-        .map(|k| {
+        .chain(map_filter(&pairs).into_iter().filter_map(|k| {
             let t = &rows[matched[k].0];
-            format!("{} = {}", t.term, t.definition)
-        })
+            (!overridden.contains(&t.term.as_str())).then(|| format!("{} = {}", t.term, t.definition))
+        }))
         .collect())
 }
 
@@ -156,8 +167,14 @@ pub async fn recall_term_mapped(
 ) -> anyhow::Result<Vec<String>> {
     let terms = load_terms(pg, cx.ds).await?;
     let mut out: Vec<String> = vec![];
-    for t in &terms {
-        if match_word(cx.question, &t.term, &t.aliases).is_none() {
+    // 🔴 现场口径**必须**也走这一层：业主那句「大日期的意思是失效日期小于3月」，
+    // 只有拿「失效日期」再去召回一次，带 invalid_date 的那张表才会进上下文。
+    // 少了这一步，prompt 里有定义、却没有能落地的表 —— 模型只能猜或者放弃。
+    // 现场口径无需 match_word（它本来就是从这句话里抽出来的，必然命中）。
+    for t in cx.inline_terms.iter().chain(terms.iter()) {
+        if !cx.inline_terms.iter().any(|i| i.term == t.term)
+            && match_word(cx.question, &t.term, &t.aliases).is_none()
+        {
             continue;
         }
         // 一层即止：definition 只当**召回问句**用，不再对它的结果递归
@@ -168,6 +185,8 @@ pub async fn recall_term_mapped(
             ds: cx.ds,
             embed: None,
             embed_slices: &[],
+            // 术语递归的子召回不再吃现场口径：一层即止（见上面的两条防线）
+            inline_terms: &[],
         };
         // 三路子召回互不依赖，一次并发取齐；拼接顺序不变（指标→维度→值域）
         let (metrics, dims, value_domains) = tokio::try_join!(

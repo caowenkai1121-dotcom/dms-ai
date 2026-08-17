@@ -730,18 +730,34 @@ impl Round<'_> {
             ));
             return Ok(Some(card));
         }
-        if coverage.needs_review() {
-            // 首轮先给 repair 一次机会把证据补进 SQL（不占 fail-closed 语义）；
-            // 二轮仍证不出就带着 review 收据放行。
-            let note = format!("SQL 未能证明部分槽位：{}", coverage.issue_text());
+        let (soft_note, retry) = soft_outcome(&coverage, n);
+        if let Some(note) = soft_note {
             log(self.cx, "intent-coverage", &note).await;
-            if n == 0 {
+            if retry {
+                // 首轮先给 repair 一次机会把证据补进 SQL（不占 fail-closed 语义）
                 self.repair_round(st, &note)
                     .await
                     .map_err(|re| repair_fail(&note, re))?;
                 return Ok(None);
             }
             tracing::warn!(%note, "覆盖闸降级放行：结果照常返回，收据标 review");
+            // 🔴 二轮仍证不出来 ⇒ **挂标注**。此前这里只 log 只 warn，不碰 `st.note` ——
+            // 而 `worth_learning` 的唯一否决条件就是 `st.note.is_some()`，于是：
+            //   ① `repair_round` 无条件把 `st.route` 写成 "llm+repair"；
+            //   ② n==0 必回炉、n==1 必然仍 needs_review；
+            //   ③ 于是经验蒸馏那三个条件天然凑齐，蒸出来的正文逐字是
+            //      「首版 SQL 未过口径复核或执行出错，**修正后通过**。正确写法：…」
+            //      —— 而 `coverage.needs_review()` 此刻还是真的，它压根没通过。
+            // 系统一边给用户挂 review 收据说「这个槽位我证不出来」，一边把同一条 SQL
+            // 当「正确写法」写进 `meta.memory`；而 memory 既没有状态列也没有复核闸
+            // （learn.rs 亲口写「memory 没有可撤的状态列」），下次同族问句它就回到 prompt 里。
+            // 对照 Prime Agent 的 Continual Harness：**更新必须有证据支撑** ——
+            // 覆盖闸说「证不出来」的那一条，定义上就不是证据。
+            // 合并写法与十行开外的 `contract_overlap_note` 那处逐字同族，不新开第二种。
+            st.note = Some(match st.note.take() {
+                Some(old) => format!("{old}\n{note}"),
+                None => note,
+            });
         }
         // 先落地成局部再 match：`st` 后面要按可变借用改（`repair_round`），闸门的入参借的是它的字段。
         let gated = gate_on(
@@ -1091,6 +1107,26 @@ fn grader_reads(sql: &str) -> bool {
         human: "判据自检探针（只判解析，不进任何 prompt、不落任何日志）".into(),
     };
     !dms_kernel::check_caliber(sql, &[probe]).is_empty()
+}
+
+/// 覆盖闸软降级的裁决 → (本轮该挂的标注, 是否再来一轮)。
+///
+/// 抽成纯函数的唯一理由与 `outcome(v)` 同族：判据打不到原处（原处在 `async fn` 里、
+/// 要真 `State`/真连接才跑得起来），而这一段的对错正是「学不学一条自称正确的错样例」。
+///
+/// 语义：
+/// - 覆盖闸没意见 → 不挂标注、不重来；
+/// - 首轮（n==0）有意见 → **不挂标注**，先回炉让 repair 把证据补进 SQL；
+/// - 二轮及以后仍有意见 → **必须挂标注**：它同时是给用户的说明与给学习闸的一票否决。
+fn soft_outcome(c: &crate::intent::CoverageReport, n: usize) -> (Option<String>, bool) {
+    if !c.needs_review() {
+        return (None, false);
+    }
+    let note = format!("SQL 未能证明部分槽位：{}", c.issue_text());
+    if n == 0 {
+        return (None, true);
+    }
+    (Some(note), false)
 }
 
 /// 这条问答**值不值得沉淀成 few-shot 语料**。纯判断，故有单测。
@@ -1605,6 +1641,61 @@ mod sc_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// 覆盖闸软降级的裁决（`soft_outcome`）：**二轮仍证不出来必须挂标注**。
+    ///
+    /// 不挂的代价不是答错，是**把一次没证明的回答升级成往后所有回答的口径**：
+    /// `worth_learning` 的唯一否决条件就是 `st.note.is_some()`，不挂就学；
+    /// 而 `repair_round` 无条件把 route 写成 "llm+repair"、n==0 必回炉、n==1 必然仍
+    /// needs_review —— 经验蒸馏那三个条件天然凑齐，蒸出来的正文逐字写着
+    /// 「首版 SQL 未过口径复核或执行出错，**修正后通过**。正确写法：…」，
+    /// 而 `coverage.needs_review()` 此刻还是真的。`meta.memory` 没有状态列也没有复核闸，
+    /// 于是它下次就回到这个用户的 prompt 里。
+    ///
+    /// 对照 Prime Agent 的 Continual Harness：**更新必须有证据支撑**。
+    /// 覆盖闸说「证不出来」的那一条，定义上就不是证据。
+    #[test]
+    fn soft_degrade_must_block_learning_on_the_second_round() {
+        use crate::intent::CoverageReport;
+        let clean = CoverageReport::default();
+        assert!(!clean.needs_review(), "空报告不该 needs_review，判据前提就不成立");
+        assert_eq!(soft_outcome(&clean, 0), (None, false), "没问题时不许恒挂标注");
+        assert_eq!(soft_outcome(&clean, 3), (None, false), "没问题时第几轮都不挂");
+
+        let dirty = CoverageReport {
+            unverifiable: vec!["filter:直营".into()],
+            ..CoverageReport::default()
+        };
+        assert!(dirty.needs_review(), "夹具没复现软降级档，后面的断言会是空的");
+
+        let (note0, retry0) = soft_outcome(&dirty, 0);
+        assert!(retry0 && note0.is_none(), "首轮该回炉、且**不**先挂标注（挂了就永远学不到东西）");
+
+        let (note1, retry1) = soft_outcome(&dirty, 1);
+        assert!(!retry1, "二轮不该再回炉");
+        let note1 = note1.expect("二轮仍证不出来必须挂标注 —— 没有它就会被蒸馏成一条自称正确的经验");
+        assert!(note1.contains("filter:直营"), "标注要说清是哪个槽位证不出来：{note1}");
+
+        // 与学习闸串起来：有标注 ⇒ 一票否决。这一环断了，上面的标注就白挂。
+        let learning_gate = include_str!("run.rs");
+        let body = learning_gate
+            .split("fn worth_learning(")
+            .nth(1)
+            .expect("worth_learning 改名了");
+        assert!(
+            body[..body.find("\n}\n").unwrap_or(body.len())].contains("st.note.is_some()"),
+            "worth_learning 不再看 st.note：软降级的标注就挂了个寂寞"
+        );
+        // 放行支必须真的写 st.note（不是只 log 只 warn —— 那正是 2026-08-17 之前的行为）
+        let attempt = learning_gate
+            .split("let (soft_note, retry) = soft_outcome(")
+            .nth(1)
+            .expect("软降级支被改回旧写法了");
+        assert!(
+            attempt[..attempt.find("\n        }\n").unwrap_or(attempt.len())].contains("st.note = Some("),
+            "软降级放行支不写 st.note：证不出来的 SQL 又会被当成「正确写法」学走"
+        );
+    }
 
     /// 🔴 失败复盘的两条纪律（2026-08-14）：
     /// ① 素材必须是**闸门前**候选 SQL —— `scoped.wire()` 带着本轮注入的行级权限条件，
@@ -2141,7 +2232,10 @@ mod contract_bypass_tests {
             .split(r#"let err = format!("SQL 未覆盖结构化意图槽位"#)
             .nth(1)
             .expect("覆盖闸没了")
-            .split("if coverage.needs_review()")
+            // 右边界＝软降级那一支的起点。2026-08-17 这行从 `if coverage.needs_review()`
+            // 换成了 `soft_outcome(...)`（软降级要挂 st.note 才能否决学习），锚点跟着换 ——
+            // 不换的话切片会一路吃到文件尾，把后面别处的 `anyhow::bail!` 当成本段的，假红。
+            .split("let (soft_note, retry) = soft_outcome(")
             .next()
             .unwrap();
         assert!(!body.contains("anyhow::bail!"), "又变回抛错了：用户拿到的是一条技术错误串");

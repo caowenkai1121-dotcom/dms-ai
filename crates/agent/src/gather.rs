@@ -75,6 +75,12 @@ pub async fn gather(
         .collect();
     // 波1。`rc0` 的 embed 字段给 None：这几路本来就不读它（读 `embed`/`embed_slices` 的只有
     // `retrieve` 与 `recall_elements`，grep 可证）——哪天给某一路加了向量读取，必须把它挪去波2。
+    // 🔴 问句里现场给的口径（`X 的意思是 Y`）在这里抽一次，随召回上下文往下走。
+    // 业主原话「大日期的意思是失效日期小于3月」—— 抽不出来这一条，
+    // 「失效日期」就不会被拿去召回，带 invalid_date 的那张表永远进不了上下文，
+    // 模型只能去知识库问「有没有大日期的查询方法」。
+    // 纯确定性（正则式扫描，不过模型），所以意图解析失败的那些轮次它照样在。
+    let inline_terms = dms_semantic::registry::lexicon::extract_inline_terms(cx.question);
     let rc0 = RecallCtx {
         question: cx.question,
         tables: &[],
@@ -82,6 +88,7 @@ pub async fn gather(
         ds: cx.ds,
         embed: None,
         embed_slices: &[],
+        inline_terms: &inline_terms,
     };
     let (qvec, slice_vecs, metric_hits, dims, terms, fewshot, value_hints, domain_hits, edges, ds_row) =
         tokio::join!(
@@ -560,6 +567,8 @@ async fn schema_section(cx: &AskCtx<'_>, qvec: Option<&str>) -> anyhow::Result<(
         ds: cx.ds,
         embed: qvec,
         embed_slices: &[],
+        // 这一路是二次召回，问句已被改写，现场口径由波1 那次负责
+        inline_terms: &[],
     };
     let ctxs = recall::retrieve(cx.pg, &rc).await?;
     let tables = ctxs.iter().map(|c| c.table_name.clone()).collect();
@@ -833,6 +842,66 @@ fn join_lines_for(ds: &str, edges: &[JoinEdge], recalled: &[String]) -> Vec<Stri
 
 #[cfg(test)]
 mod tests {
+
+    /// 现场口径的**接线**判据（源码扫描）。
+    ///
+    /// 为什么要钉：`inline_terms: &[]` 是个合法值 —— 谁在主召回路径上把它填成空，
+    /// 这条能力就**静默消失**，没有任何测试会红、没有任何日志会响。
+    /// 这正是本仓最不能接受的那一类（哑掉的降级），所以三处接线逐一钉住：
+    ///   ① gather 波1 真的抽（不是给空）；
+    ///   ② `recall_terms` 把它排在登记术语**之前**并带「本轮口径」标注；
+    ///   ③ `recall_term_mapped` 也走它 —— 少了这步，定义进了 prompt 却没有能落地的表。
+    #[test]
+    fn inline_caliber_is_actually_wired_into_recall() {
+        let gather = include_str!("gather.rs");
+        let body = gather
+            .split("let rc0 = RecallCtx {")
+            .nth(1)
+            .expect("gather 波1 的 rc0 改名了");
+        let head = &body[..body.find("};").expect("rc0 没闭合")];
+        assert!(
+            head.contains("inline_terms: &inline_terms"),
+            "gather 波1 没把现场口径带进召回（填成空 = 这条能力静默消失）：{head}"
+        );
+        assert!(
+            gather.contains("lexicon::extract_inline_terms(cx.question)"),
+            "gather 不再抽取问句内口径"
+        );
+
+        let cards = include_str!("../../semantic/src/recall/cards.rs");
+        let terms_fn = cards
+            .split("pub async fn recall_terms(")
+            .nth(1)
+            .expect("recall_terms 改名了");
+        let terms_fn = &terms_fn[..terms_fn.find("\n}\n").unwrap_or(terms_fn.len())];
+        assert!(
+            terms_fn.contains("cx.inline_terms"),
+            "recall_terms 不再读现场口径：{terms_fn}"
+        );
+        // 钉 format! 里那段**逐字文案**，不是「本轮口径」四个字出现过 ——
+        // 注释里也写着这四个字（第四次踩到这个形状了）。
+        assert!(
+            terms_fn.contains("（本轮口径：用户在问句中给出"),
+            "现场口径进 prompt 时必须带标注 —— 临时口径与登记口径冲突时，\
+             prompt 里要看得出哪条是用户现给的（静默换口径是最坏的一类）：{terms_fn}"
+        );
+        assert!(
+            terms_fn.contains("overridden"),
+            "同一个词被现场定义后，登记那份必须让位 —— 两条定义同时进 prompt \
+             等于把「按哪条算」推给模型自己挑：{terms_fn}"
+        );
+
+        let mapped = cards
+            .split("pub async fn recall_term_mapped(")
+            .nth(1)
+            .expect("recall_term_mapped 改名了");
+        let mapped = &mapped[..mapped.find("\n}\n").unwrap_or(mapped.len())];
+        assert!(
+            mapped.contains("cx.inline_terms.iter().chain("),
+            "recall_term_mapped 不走现场口径：定义进了 prompt 却没人拿它去召回真表，\
+             模型只能猜或者放弃：{mapped}"
+        );
+    }
 
     /// 🔴 习惯**不许覆盖用户这一轮的显式表达**（那是猜，不是懂）。
     ///

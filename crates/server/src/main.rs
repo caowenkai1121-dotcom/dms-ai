@@ -1054,6 +1054,8 @@ async fn main() -> anyhow::Result<()> {
             ds: ds_reg::DMS_DS_ID,
             embed: qvec.as_deref(),
             embed_slices: &[],
+            // `retrieve` 子命令是检索探针，只看召回了什么表；现场口径没有消费者
+            inline_terms: &[],
         };
         let ctxs = dms_semantic::recall::retrieve(pg, &cx).await?;
         let table_names: Vec<String> = ctxs.iter().map(|c| c.table_name.clone()).collect();
