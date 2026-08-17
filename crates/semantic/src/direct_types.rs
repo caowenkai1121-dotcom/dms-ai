@@ -84,16 +84,37 @@ impl ExecutionEvidence {
 /// 词表与 `fastpath::stock` 里那份「残余只剩修饰词就不是商品名」同源同义 ——
 /// 一个管「别把修饰词当实体」，一个管「别因为修饰词认不出指标」，两面同一件事。
 fn quantifier_stripped_eq(evidence: &str, surface: &str) -> bool {
-    const QUANTIFIERS: &[&str] = &[
-        "总共", "一共", "全部", "所有", "合计", "整体", "累计", "汇总", "总", "全", "共",
-    ];
+    strip_quantifier_prefix(surface).is_some_and(|rest| folded_eq(rest, evidence))
+}
+
+/// 量词/汇总修饰词。**全仓唯一一份**：三个消费者共用 ——
+/// ① `quantifier_stripped_eq`（指标证明：`库存量` 要能证明 `总库存量`）；
+/// ② `agent::ctx::metric_has_actual_value`（结果列核对：别名表里没有 `总库存量` 这个键）；
+/// ③ `fastpath::stock`（残余只剩修饰词就不是商品名）。
+/// 抄第二份的代价立刻可见：2026-08-17 同一个「总」字在三处各绊了一次，
+/// 表现分别是 need-intent 反问卡、收据标 blocked、答出数却说证不出来。
+pub const QUANTIFIER_PREFIXES: &[&str] = &[
+    "总共", "一共", "全部", "所有", "合计", "整体", "累计", "汇总", "总", "全", "共",
+];
+
+/// 剥掉开头的量词修饰词；剥完为空（「总」自己）或压根没有前缀时返 `None`。
+/// 🔴 调用方拿到的是**剩余部分**，必须再做逐字比对 —— 子串包含会让「额」冒充「销售额」。
+pub fn strip_quantifier_prefix(surface: &str) -> Option<&str> {
     let surface = surface.trim();
-    QUANTIFIERS.iter().any(|q| {
+    // 整串就是修饰词 → 没有指标可言
+    if QUANTIFIER_PREFIXES.contains(&surface) {
+        return None;
+    }
+    let stripped = QUANTIFIER_PREFIXES.iter().find_map(|q| {
         surface
             .strip_prefix(q)
-            // 剥完不能是空的：「总」自己不是指标
-            .is_some_and(|rest| !rest.trim().is_empty() && folded_eq(rest, evidence))
-    })
+            .map(str::trim)
+            .filter(|rest| !rest.is_empty())
+    })?;
+    // 🔴 剥完**仍然**是修饰词（`总共` → `共`）也不算：判据当场逮到的真 bug ——
+    // `find_map` 命中最长的「总共」时剥成空被过滤掉，于是退而命中「总」，留下一个「共」。
+    // 词表里的叠词（总共/一共）天然会撞上这个形状。
+    (!QUANTIFIER_PREFIXES.contains(&stripped)).then_some(stripped)
 }
 
 
@@ -172,5 +193,40 @@ mod quantifier_tests {
         assert!(!bare.proves(IntentSlotKind::Metric, "总"), "空证据不许证明任何东西");
         // 槽位种类不许串：同名不同 kind 不算证明
         assert!(!e.proves(IntentSlotKind::Breakdown, "库存量"), "kind 必须一致");
+    }
+}
+
+#[cfg(test)]
+mod quantifier_prefix_tests {
+    use super::*;
+
+    /// 量词前缀的剥法：全仓三个消费者共用这一份，所以判据也钉在这里。
+    ///
+    /// 2026-08-17 同一个「总」字在三处各绊了一次，表现各不相同却同源：
+    /// ① `fastpath::stock` 把「总」当商品名 → 整题落 need-intent 反问卡；
+    /// ② `ExecutionEvidence::proves` 精确相等对不上 → 收据标 blocked；
+    /// ③ `agent::ctx::metric_has_actual_value` 的别名表没有这个键 → 答出数却说证不出来。
+    /// 抄第二份词表的代价，这三条就是账单。
+    #[test]
+    fn quantifier_prefix_strips_only_when_something_remains() {
+        for (surface, rest) in [
+            ("总库存量", "库存量"),
+            ("全部订单数", "订单数"),
+            ("合计毛利额", "毛利额"),
+            ("累计退款额", "退款额"),
+            ("总共销售额", "销售额"),
+        ] {
+            assert_eq!(strip_quantifier_prefix(surface), Some(rest), "{surface}");
+        }
+        // 🔴 剥完为空 = 它本身就只是个修饰词，不是指标名
+        for bare in QUANTIFIER_PREFIXES {
+            assert_eq!(strip_quantifier_prefix(bare), None, "「{bare}」自己不是指标");
+        }
+        // 没有前缀就不动它（不许无中生有地剥）
+        for plain in ["库存量", "销售额", "毛利率", "订单数"] {
+            assert_eq!(strip_quantifier_prefix(plain), None, "{plain} 不该被剥");
+        }
+        // 前缀在中间不算：「库存总量」是完整指标名，不是「库存」+「总量」
+        assert_eq!(strip_quantifier_prefix("库存总量"), None);
     }
 }

@@ -199,10 +199,9 @@ pub fn stock_product_fragment(question: &str) -> Option<String> {
     // 而 `STOCK_WORDS` 里「库存量」「总库存」两条都有，偏偏没有它们的合体）。
     //
     // 一次收口的同族：「全部库存量」「所有库存」「合计库存量」「整体库存量」「共有多少库存」。
-    const MODIFIER_ONLY: &[&str] = &[
-        "总", "全部", "所有", "合计", "整体", "全", "共", "总共", "一共", "累计", "汇总",
-    ];
-    if MODIFIER_ONLY.contains(&fragment.as_str()) {
+    // 词表全仓唯一一份（`direct_types::QUANTIFIER_PREFIXES`）：同一个「总」字
+    // 2026-08-17 在三处各绊了一次，抄第二份的代价立刻可见。
+    if crate::direct_types::QUANTIFIER_PREFIXES.contains(&fragment.as_str()) {
         return None;
     }
     (!fragment.is_empty()).then_some(fragment)

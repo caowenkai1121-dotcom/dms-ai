@@ -658,6 +658,13 @@ fn comparison_is_valid(comparison: &KpiComparison) -> bool {
 }
 
 fn metric_has_actual_value(metric: &str, r: &AskResult) -> bool {
+    // 🔴 量词前缀不改变指标本身：`总库存量` 要按 `库存量` 查别名表。
+    // 别名表是**硬编码的键匹配**（`_ => return false`），`总库存量` 不在键里 ——
+    // 2026-08-17 生产实测：答出 1.06 亿，收据却挂 `result:metric-unverified:总库存量`，
+    // 给了数字又说证不出来。词表在 `dms_semantic::direct_types`，全仓唯一一份。
+    let metric = dms_semantic::direct_types::strip_quantifier_prefix(metric)
+        .filter(|stripped| *stripped != metric)
+        .unwrap_or(metric);
     let aliases: &[&str] = match metric {
         "销售额" | "销售总额" | "销售金额" | "营业额" => {
             &[
