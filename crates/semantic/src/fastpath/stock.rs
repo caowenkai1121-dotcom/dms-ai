@@ -291,13 +291,22 @@ fn stock_snapshot_sql(question: &str) -> Option<DirectHit> {
         // 于是整条被那道守卫拒掉 —— 而它要的正是下面这句 GROUP BY，与商品无关。
         // 顺序即行为：先判「这是不是按仓库分组」，再判「有没有商品限定」。
         if grouped_warehouse {
-            // 仓库码表（t_warehouse）未镜像进数仓，按码与库位出（名称接入后再换名）
+            // 🔴 出**仓库名**而不是 `wms_code`（2026-08-17）：此前这里的注释写着
+            // 「仓库码表未镜像进数仓，按码与库位出（名称接入后再换名）」—— 那一天到了。
+            // 仓库名唯一活在 `ywzt_ods.master_wms.wms_desc` 上（539 行，主键唯一），
+            // 今天已随业主指路（「一般 master 开头的都是主数据」）进目录并登记 JOIN 边。
+            // 用户看到的是「京东常温酱料虚拟仓」而不是 `GZHYC-777` —— 后者他没法据以行动。
+            // LEFT JOIN + COALESCE：实测 31258 行库存里有 12 行没有仓档，
+            // 内连会把它们**静默丢掉**（合计对不上），左连回落到编码，一行不丢。
             return Some(hit(
                 format!(
-                    "SELECT wms_code AS `仓库编码`, location AS `库位`, \
-                            SUM(in_stock_quantity) AS `库存量` \
-                     FROM {ZT_FROM} WHERE {ZT_WHERE} \
-                     GROUP BY wms_code, location \
+                    "SELECT COALESCE(NULLIF(w.wms_desc,''), s.wms_code) AS `仓库`, \
+                            s.location AS `库位`, \
+                            SUM(s.in_stock_quantity) AS `库存量` \
+                     FROM {ZT_FROM} s \
+                     LEFT JOIN ywzt_ods.master_wms w ON w.wms_code = s.wms_code \
+                     WHERE s.{ZT_WHERE} \
+                     GROUP BY 1, 2 \
                      ORDER BY `库存量` {} LIMIT {}",
                     rank_direction(question),
                     ranking_limit(question)
@@ -498,7 +507,20 @@ mod warehouse_group_tests {
     fn grouping_by_warehouse_is_a_grouping_ask_not_only_a_ranking_one() {
         for q in ["各仓库库存量", "按仓库看库存量", "每个仓库的库存量", "分仓库库存量"] {
             let hit = stock_snapshot(q).unwrap_or_else(|| panic!("{q} 该命中"));
-            assert!(hit.sql.contains("GROUP BY wms_code, location"), "{q}：{}", hit.sql);
+            assert!(hit.sql.contains("GROUP BY 1, 2"), "{q}：{}", hit.sql);
+            // 🔴 2026-08-17 起必须出**仓库名**：`wms_code` 是 GZHYC-777 这种不透明编码，
+            // 用户没法据以行动。名字唯一活在 master_wms.wms_desc 上。
+            assert!(
+                hit.sql.contains("master_wms") && hit.sql.contains("wms_desc"),
+                "{q}：仓库分组必须 JOIN 主数据出名字，不能只给编码：{}",
+                hit.sql
+            );
+            // 左连不丢行：实测 31258 行库存里有 12 行没有仓档，内连会把它们静默丢掉，合计对不上
+            assert!(
+                hit.sql.contains("LEFT JOIN ywzt_ods.master_wms"),
+                "{q}：必须 LEFT JOIN —— 内连会把无仓档的行静默丢掉：{}",
+                hit.sql
+            );
         }
         // 排行诉求照旧（不许被这条改动带偏）
         let rank = stock_snapshot("库存量最多的仓库").expect("排行照旧");

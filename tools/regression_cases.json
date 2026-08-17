@@ -1405,6 +1405,88 @@
         "wms_desc"
       ],
       "note": "一族：问句里给的是**名称**，而事实表里只有不透明编码（wms_code=GZHYC-777）。名称唯一活在主数据表 master_wms.wms_desc 上，不 JOIN 就认不出「京东仓」。禁止拿 sup_name（供应商）冒充承运仓 —— 顺丰同时是供应商，按它筛是错的。同族：任何「XX仓/XX门店/XX客户」而事实表只存编码的问句。"
+    },
+    {
+      "name": "H01-多步拆解·上月冠军省区的本月表现",
+      "login": "admin",
+      "q": "上个月销售额最高的那个省区，它这个月的销售额是多少",
+      "llm": true,
+      "route_not": "knowledge",
+      "sql_contains": [
+        "sales_dw.dws_off_offline_sale_dfn"
+      ],
+      "min_rows": 1,
+      "note": "复杂度：**两步拆解**（先在上月窗口里求 argmax 省区，再拿它去本月窗口取数）。只答一步就是错答：只给上月冠军名字、或只给本月全量，都不是问的东西。实测数据可答：上月冠军『直营』，本月 5253 万。同族：「去年卖得最好的商品今年卖了多少」「上周订单最多的客户这周下了几单」"
+    },
+    {
+      "name": "H02-多指标同问",
+      "login": "admin",
+      "q": "本月销售额、订单数和毛利率各是多少",
+      "llm": true,
+      "route_not": "knowledge",
+      "min_cols": 2,
+      "note": "复杂度：**一问多指标**，且三个指标不同源 —— 销售额/毛利率在销售 DWS，订单数在订单头。答一个漏两个是最常见的失败形态（静默缩窄）。实测：本月销售额 1.25 亿、毛利率 19.61%。"
+    },
+    {
+      "name": "H03-问数与知识库混合",
+      "login": "admin",
+      "q": "本月市场费用花了多少，报销流程是什么",
+      "llm": true,
+      "note": "复杂度：**一句话跨两条链路** —— 前半句要查数、后半句要查制度。两条都得答，只答一半就是没听懂。这题专门盯 hybrid 编排：问数半有实质时资料半要挂 `kb` 键，不是二选一。"
+    },
+    {
+      "name": "H04-复杂计算·问句自带公式",
+      "login": "admin",
+      "q": "本月毛利率是多少，毛利率定义为 不含税收入减去不含税成本再除以不含税收入",
+      "llm": true,
+      "route_not": "knowledge",
+      "sql_contains": [
+        "sales_dw.dws_off_offline_sale_dfn"
+      ],
+      "note": "复杂度：**现场给公式**（G01 那一族的计算版）。口径由 extract_inline_terms 抽出后注入，SQL 要按用户给的算法算，而不是套用登记口径然后不吭声。"
+    },
+    {
+      "name": "H05-阈值聚合后计数",
+      "login": "admin",
+      "q": "库存量超过100万的仓库有几个",
+      "llm": true,
+      "route_not": "knowledge",
+      "sql_contains": [
+        "scm_warehous_manage"
+      ],
+      "note": "复杂度：**先分组聚合、再按阈值筛、最后计数**（HAVING + 外层 COUNT）。写成 WHERE 过滤明细行是典型错法，数会大得离谱。实测答案：14 个。顺带钉住库存源必须是中台 —— 业主 2026-08-17 二次明确「库存就是这张表」。"
+    },
+    {
+      "name": "H06-排除式·除了冠军以外",
+      "login": "admin",
+      "q": "除了销售额最高的那个省区以外，其他省区本月合计销售额是多少",
+      "llm": true,
+      "route_not": "knowledge",
+      "sql_contains": [
+        "sales_dw.dws_off_offline_sale_dfn"
+      ],
+      "note": "复杂度：**排除式 + 子查询求 argmax**。「除了 X 以外」这类否定限定极易被静默丢掉 —— 丢了就答成全量，数字看着合理却是错的（silent-wrong）。同族：「不含样品单的订单数」「除华东外各省区的毛利」"
+    },
+    {
+      "name": "H07-跨仓对比",
+      "login": "admin",
+      "q": "哪些商品在京东仓临期但在别的仓还有大量库存",
+      "llm": true,
+      "route_not": "knowledge",
+      "sql_contains_any": [
+        "scm_warehous_manage",
+        "master_wms"
+      ],
+      "note": "复杂度：**同一张表按仓自连对比** + 「临期」要落到 invalid_date + 「京东仓」要落到 master_wms.wms_desc。三件事任一断掉整题就错。这是业主原始那道题的进阶版。"
+    },
+    {
+      "name": "H08-相对时间窗分组",
+      "login": "admin",
+      "q": "最近三个月每个月的订单数",
+      "llm": true,
+      "route_not": "knowledge",
+      "min_rows": 2,
+      "note": "复杂度：**相对时间窗 + 按月分组**。「最近三个月」的边界（含不含当月、当月是否不完整）是常见错源，当月不完整必须标注，不能与完整月并排比较而不吭声。"
     }
   ],
   "rules": [

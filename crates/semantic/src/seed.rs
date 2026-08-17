@@ -355,7 +355,12 @@ async fn seed_kw_force(pg: &PgPool) -> anyhow::Result<()> {
         ("开票", "t_invoice_apply_header"), ("发票", "t_invoice_apply_header"),
         ("发货", "t_sales_order_logistics"), ("运单", "t_sales_order_logistics"), ("物流", "t_sales_order_logistics"),
         ("新上架", "t_goods"), ("新品", "t_goods"), ("上架", "t_goods"),
-        ("库存", "t_winc_stock_report"),
+        // 🔴 2026-08-17 业主二次明确：**库存就是 `scm_warehous_manage` 这张表**。
+        // `t_winc*` 那几张是同步工具从门店直接搬来的进销存数据，只用于分析门店，
+        // **与 DMS 独立、没有任何业务逻辑** —— 拿它当「库存」的默认源是把两个体系混成一个。
+        // 这条钉子此前指着营销通，而 `warehouse_catalog` 的注释、`fastpath::stock` 的默认源
+        // 都已经是中台了：三处口径不一致，自由 SQL 那条路被钉歪。
+        ("库存", "scm_warehous_manage"),
         // 专项费用短语必须先于泛「活动」登记；同一句会同时命中时，专项表先进入候选。
         ("活动临促人员费用", "t_activity_promoter_fee"),
         ("活动临促人员的费用", "t_activity_promoter_fee"),
