@@ -598,15 +598,32 @@ fn build_registry(cfg: &db::Settings) -> SourceRegistry {
     sources
 }
 
+/// 日志过滤指令：**空串按未设置处理**。
+///
+/// 🔴 `EnvFilter::try_from_default_env()` 对空串返回的是 `Ok(空过滤器)` —— 什么都不记，
+/// 而不是 `Err`，所以 `unwrap_or_else(|_| "info")` 那道兜底压根不触发。
+/// `scripts/server-restart.sh` 里 `--env RUST_LOG="${RUST_LOG:-}"` 正是传空串：
+/// 2026-08-17 生产实测 `docker logs dms-ai-server | wc -l` = **0**，服务好好跑着、
+/// 一行日志没有。出事时全哑 —— 这是本仓最不能接受的一类降级。
+///
+/// 想真关日志的人写 `RUST_LOG=off`，那是**明确表态**，照旧生效。
+/// 指令写坏了也退回 info：宁可多记，不可全哑。
+fn log_filter(raw: Option<&str>) -> String {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .filter(|v| tracing_subscriber::EnvFilter::try_new(v).is_ok())
+        .unwrap_or("info")
+        .to_string()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 日志一律走 stderr：stdout 留给子命令的 JSON 输出（判官脚本要解析）
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter(
+            std::env::var("RUST_LOG").ok().as_deref(),
+        )))
         .init();
 
     // 判官模式总闸：`DMSAI_JUDGE=1` 的进程只读不学（`registry::judge_mode` 的唯一设置点）。
@@ -3421,6 +3438,19 @@ pub(crate) fn production_only(src: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// 空 `RUST_LOG` 不许把日志全关掉（2026-08-17 生产实测：整机零行日志）。
+    #[test]
+    fn an_empty_rust_log_is_absent_not_silent() {
+        assert_eq!(super::log_filter(None), "info");
+        assert_eq!(super::log_filter(Some("")), "info", "空串必须按未设置处理");
+        assert_eq!(super::log_filter(Some("   ")), "info", "全空白同理");
+        assert_eq!(super::log_filter(Some("!!not a filter!!")), "info", "写坏了也退回 info，不许全哑");
+        // 明确表态照旧生效：想关的人写 off，想调级的人写 debug
+        assert_eq!(super::log_filter(Some("off")), "off");
+        assert_eq!(super::log_filter(Some("debug")), "debug");
+        assert_eq!(super::log_filter(Some(" dms_server=debug ")), "dms_server=debug");
+    }
     #[test]
     fn eval_batch_ndjson_protocol_is_strict_and_sparse() {
         let req: super::EvalBatchReq = serde_json::from_str(
