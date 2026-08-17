@@ -623,6 +623,57 @@ def _sheet(name, rows):
         return {'name': name, 'header': [], 'rows': []}
     return {'name': name, 'header': keep[0], 'rows': keep[1:]}
 
+_XLSX_FILLS = re.compile(rb'<fills[^>]*>.*?</fills>', re.S)
+
+
+def _xlsx_neutralize_fills(raw):
+    """把 styles.xml 里的 `<fills>` 换成**等量**的空 patternFill。
+
+    个数必须保持：`cellXfs` 的每个 `<xf fillId="N">` 都按下标引用这张表，少一个就 IndexError。
+    颜色/图案我们一个都不用（`data_only=True` + `values_only=True` 只取值），丢掉是无损的。"""
+    def repl(m):
+        n = max(len(re.findall(rb'<fill[ >/]', m.group(0))), 2)
+        return b'<fills count="%d">%s</fills>' % (
+            n, b'<fill><patternFill patternType="none"/></fill>' * n)
+    return _XLSX_FILLS.sub(repl, raw, count=1)
+
+
+def _xlsx_open(path, read_only):
+    """载入 xlsx；样式表异常时中和 `<fills>` 后**从内存**重试。
+
+    🔴 现网实测（2026-08-17）：某份模板让 openpyxl 在 **load_workbook 内部**抛
+    `TypeError: expected <class 'openpyxl.styles.fills.Fill'>` —— WPS/ERP 导出的 styles.xml 里
+    `<fill>` 带了 openpyxl 描述符不认的子元素。它发生在读任何单元格**之前**，于是整份 500，
+    Rust 侧落进未分类分支，用户看到「文档服务不可用：文档处理失败」——把用户的文件问题
+    报成我们的故障（`connector/src/doc.rs` 头注正是在防这件事）。
+    我们不读样式，所以把 fills 整段中和掉再读一遍，值一个不少。
+
+    重试走 BytesIO 而不是临时文件：`read_only=True` 的 workbook 是**惰性**读 zip 的，
+    临时文件删早了后面 iter_rows 就炸，删晚了要把清理职责漏给调用方。"""
+    import openpyxl
+    try:
+        return openpyxl.load_workbook(path, read_only=read_only, data_only=True)
+    except TypeError as e:
+        import zipfile
+        try:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(path) as zin, \
+                    zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename == 'xl/styles.xml':
+                        data = _xlsx_neutralize_fills(data)
+                    zout.writestr(item, data)
+            buf.seek(0)
+            return openpyxl.load_workbook(buf, read_only=read_only, data_only=True)
+        except Exception:
+            # 中和也救不回来：这是**文件**的问题，必须报成 422（确定性失败），
+            # 而不是继续冒成 500 被读成「我们的服务挂了」。
+            raise ParseError(
+                'unsupported',
+                f'Excel 样式表异常，openpyxl 无法读取（{e}）；请用 Excel/WPS 另存为 .xlsx 后重传',
+            ) from e
+
 def _p_xlsx(path):
     """表格只出 sheets（单元格矩阵），markdown 文本通道由 knowledge::tabular 的 sheet_blocks 出。
 
@@ -631,8 +682,8 @@ def _p_xlsx(path):
     openpyxl ≥ 3.1 用 `ws.reset_dimensions()` 让它忽略声明、按实际单元格重算边界；
     更老的版本没有它：声明列数与首行实长不符时降级非 read_only 重读（内存换正确性）。
     判据钉在 `_selftest_xlsx_dims`（篡改 dimension 声明的夹具）。"""
-    import openpyxl                    # 依赖门在 parse_doc，同 _p_docx
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    # 依赖门在 parse_doc，同 _p_docx；样式表异常的重试收口在 `_xlsx_open`
+    wb = _xlsx_open(path, read_only=True)
     try:
         out = []
         for ws in wb.worksheets:
@@ -659,8 +710,7 @@ def _dims_suspect(ws):
 
 def _xlsx_eager(path):
     """非 read_only 重读整本：矩阵按实际单元格建，<dimension> 声明够不着它。"""
-    import openpyxl
-    wb = openpyxl.load_workbook(path, read_only=False, data_only=True)
+    wb = _xlsx_open(path, read_only=False)
     try:
         return [], 0, [_sheet(ws.title, ([_cell(c) for c in r]
                                          for r in ws.iter_rows(values_only=True)))
@@ -1646,6 +1696,7 @@ def selftest():
     _selftest_pages()
     _selftest_pdf_scan(d)
     _selftest_xlsx_dims(d)
+    _selftest_xlsx_bad_fills(d)
     _selftest_table_chunks()
     _selftest_revec()
     _selftest_md_heading()
@@ -1910,6 +1961,53 @@ def _selftest_xlsx_dims(tmpdir):
     assert sheet['header'] == ['单号', '金额', '备注'], f'静默丢列复现：{sheet}'
     assert sheet['rows'] == [['A-1', '10', '甲'], ['B-2', '20', '乙']], sheet
 
+
+def _selftest_xlsx_bad_fills(tmpdir):
+    """样式表异常的 xlsx 仍要出值（`_xlsx_open`）。
+
+    现网 2026-08-17 实测：`[500] /parse: TypeError: expected <class 'openpyxl.styles.fills.Fill'>`
+    —— 一份模板让 openpyxl 在 load_workbook 内部就抛，用户看到的却是「文档服务不可用」。
+    夹具复刻这个形态：往 styles.xml 的 `<fill>` 里塞一个 openpyxl 不认的子元素。
+    先断言**原生 load_workbook 确实炸**（否则这条判据是恒真的），再断言我们的路子把值全取回来。"""
+    if not _have('openpyxl'):
+        print('  ⏭️  xlsx 坏样式表判据跳过（openpyxl 不可用）', flush=True)
+        return
+    import openpyxl
+    import zipfile
+    src = os.path.join(tmpdir, 'fills_src.xlsx')
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '客户模板'
+    ws.append(['客户', '月度金额'])
+    ws.append(['皇家小虎', '1200'])
+    wb.save(src)
+    bad = os.path.join(tmpdir, 'fills_bad.xlsx')
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(bad, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == 'xl/styles.xml':
+                # 空 `<fill/>` 是现网那份文件的形态：openpyxl 的 `Fill.from_tree` 对无子元素
+                # 的 fill 返 None，而 `Stylesheet.fills` 是 `Sequence(expected_type=Fill)` ——
+                # None 进去就抛 `expected <class 'openpyxl.styles.fills.Fill'>`。
+                data = re.sub(rb'<fills[^>]*>', rb'\g<0><fill/>', data, count=1)
+            zout.writestr(item, data)
+
+    # ① 判据不许恒真：原生载入必须真的炸在这个夹具上
+    try:
+        openpyxl.load_workbook(bad, read_only=True, data_only=True).close()
+        raise AssertionError('夹具没能复现 openpyxl 的样式表异常，这条判据会恒真')
+    except TypeError:
+        pass
+
+    # ② 我们的路子把值一个不少地取回来
+    r = parse_doc(bad)
+    sheet = r['sheets'][0]
+    assert sheet['header'] == ['客户', '月度金额'], f'坏样式表下丢了表头：{sheet}'
+    assert sheet['rows'] == [['皇家小虎', '1200']], sheet
+
+    # ③ fills 个数必须守恒：cellXfs 按下标引用它，少一个就 IndexError
+    raw = b'<fills count="3"><fill><a/></fill><fill><b/></fill><fill><c/></fill></fills>'
+    assert _xlsx_neutralize_fills(raw).count(b'<fill>') == 3, _xlsx_neutralize_fills(raw)
 
 def _selftest_table_chunks():
     """表格行感知分块的钉（`_fill_table`）：每块必须重复表头、一行不丢不重、顺序不乱；

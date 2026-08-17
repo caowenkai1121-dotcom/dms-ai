@@ -71,6 +71,14 @@ fn every_meta_recall_is_ds_scoped() {
     for (name, src) in &sources() {
         let lines: Vec<&str> = src.lines().collect();
         for (i, line) in lines.iter().enumerate() {
+            // 🔴 注释行不算 SQL：本守卫扫的是原始文本，而说明「这段数据打哪来」时
+            // 自然会写出 `SELECT … FROM meta.metric` —— derive.rs 的 `metric_alias_of`
+            // 文档注释就是这么把守卫打红的（2026-08-17）。注释里的 SQL 不会被执行，
+            // 跳过它是严格正确的；把注释改写成不含表名反而是让判据逼着人写模糊的注释。
+            // 末尾的 `checked >= 10` 空转跳闸保证这条豁免不会把守卫掏空。
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
             let Some(rest) = line.split("FROM meta.").nth(1) else { continue };
             let table: String =
                 rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
@@ -136,6 +144,11 @@ const ALLOW: &[(&str, &str)] = &[
     // ddl::rekey_ds_pk 的 ALTER TABLE：表名/主键列来自本文件的 &'static 数组，标识符无法参数化
     ("ddl.rs", "t"),
     ("ddl.rs", "cols"),
+    // ddl::retype_embedding_columns 的 ALTER TABLE：`table` 来自本函数里那个 &'static 五元数组
+    // （五张带 embedding 列的 meta 表），`EMBED_DIM` 是本文件的编译期常量（向量维度唯一事实源）。
+    // 两者都无法参数化（标识符与类型修饰不能 bind），也没有任何外部输入入口。
+    ("ddl.rs", "table"),
+    ("ddl.rs", "EMBED_DIM"),
     // 均为 datasource.rs 自己的 &'static str 常量：固定列清单 / kb.acl 可见性判据
     // （判据里的 login 与 roles 走 $1/$2 bind，拼进去的只有判据骨架本身）
     ("datasource.rs", "DS_COLS"),
@@ -151,6 +164,16 @@ const ALLOW: &[(&str, &str)] = &[
     // （freeze_quantity / lock_quantity），没有任何外部输入入口。
     ("stock.rs", "col"),
     ("stock.rs", "label"),
+    // stock.rs 仓库排行（2026-08-17 起排除合成兜底桶）用到的五个：
+    //   bucket / UNREGISTERED_BUCKET —— 由本文件的 &'static 常量 '未知' 与硬编码列名 warehouse_name 组成；
+    //   column —— 二选一的 &'static ("stock_amount" / "stock_quantity")；
+    //   where_sql —— `deleted_flag = 0 AND <最新快照日子查询>` 再拼 province 谓词，而那条谓词由
+    //     `stock_province_predicate` **只从 `present::PROVINCE_LABELS` 静态表**取 (code, name) 拼出来：
+    //     用户问句只用于**挑中哪一行**，原文一个字都不进 SQL（该函数还要求残余文本为空才认）。
+    ("stock.rs", "bucket"),
+    ("stock.rs", "column"),
+    ("stock.rs", "where_sql"),
+    ("stock.rs", "UNREGISTERED_BUCKET"),
     // finance.rs 的 SNAP_FROM 是本函数私有的 &'static str：账户余额两档（排行/总额）
     // 共用同一个快照 FROM 子句。抄第二份必漂 —— 排行档的 SQL 是钉着逐字快照的，
     // 而总额档要与它同一张表同一批过滤，否则两个数对不上。无任何外部输入入口。

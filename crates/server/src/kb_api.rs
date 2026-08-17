@@ -20,11 +20,21 @@ use std::sync::Arc;
 type ApiErr = (StatusCode, Json<serde_json::Value>);
 type ApiOk = Json<serde_json::Value>;
 
-/// 上传并发闸：20MB（`kb_max_mb` 默认）全量入内存 × N 并发会打爆进程。
-/// 拿不到许可**直接 429 而不排队**——排队只是把内存问题推迟到队列长度上。
-/// 许可数只许从这里改：429 文案（`upload_gate_full`）与单测都读这个常量。
-const UPLOAD_PERMITS: usize = 4;
+/// 入库并发闸。**许可跟着后台重活走**（parse→chunk→embed，见 `spawn_ingest_job`），
+/// 所以它限的是「同时在跑的入库任务数」，不是「同时有几个人在传文件」。
+///
+/// 🔴 2026-08-17 之前这里是 `try_acquire()` —— 满了当场 429。而前端是**串行**上传的：
+/// 第 5 个文件被拒，仅仅因为前 4 个还在后台解析。用户看到的是一整屏「上传并发已满，
+/// 请稍后重试」的红叉，而系统其实一点都不忙（API 容器 233MB / 16GB）。
+/// 「等一会儿就有位子」不该表达成失败 —— 现在满了就排队等，队列和等待都有上限。
+const UPLOAD_PERMITS: usize = 8;
 static UPLOAD_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(UPLOAD_PERMITS);
+/// 排队上限：无界排队只是把内存问题换成连接数问题，那是原注释担心的事，仍然成立。
+const UPLOAD_QUEUE_MAX: usize = 32;
+/// 单个请求最多等多久。nginx 的 `proxy_read_timeout` 是 300s，这里留足余量；
+/// 上限本身不能去掉 —— 上游卡死时排队会把连接一直挂着。
+const UPLOAD_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+static UPLOAD_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const UPLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// 下载并发闸（`download_doc`）：整文件入内存 × N 并发，与上传闸防的是同一个问题。
 const DOWNLOAD_PERMITS: usize = 8;
@@ -93,11 +103,52 @@ const MSG_KB_UNAVAILABLE: &str = "知识库服务暂时不可用，请稍后重�
 /// 落盘文件读失败的 500 文案（reprocess/download_doc 两处共用）。
 const MSG_FILE_UNREADABLE: &str = "文档文件暂时不可读取";
 
-/// 上传/URL 入库并发闸占满的统一 429：许可数与文案同源（`UPLOAD_PERMITS`），改数不漂。
-fn upload_gate_full() -> ApiErr {
+/// 取一个入库许可：有位子直接拿，没位子**排队等**，队列满或等超时才拒。
+///
+/// 为什么不是 `try_acquire()`：许可要持有到后台入库结束（几十秒），而客户端多半是
+/// 一个接一个地传。当场拒绝等于把「前几个还在解析」翻译成「你的文件失败了」——
+/// 用户无从分辨，只能对着一屏红叉一个个手动重试。
+///
+/// 两条上限仍在，原注释担心的事没被放掉：
+/// - 同时在跑的入库任务仍是 `UPLOAD_PERMITS` 个（内存上界没变）；
+/// - 排队的连接数封顶 `UPLOAD_QUEUE_MAX`，等待封顶 `UPLOAD_QUEUE_WAIT`。
+async fn upload_permit() -> Result<tokio::sync::SemaphorePermit<'static>, ApiErr> {
+    use std::sync::atomic::Ordering;
+    if let Ok(permit) = UPLOAD_GATE.try_acquire() {
+        return Ok(permit);
+    }
+    // 先占排队位再等：`fetch_add` 返回的是**加之前**的值，所以 >= 上限即已满。
+    if UPLOAD_WAITING.fetch_add(1, Ordering::SeqCst) >= UPLOAD_QUEUE_MAX {
+        UPLOAD_WAITING.fetch_sub(1, Ordering::SeqCst);
+        return Err(upload_queue_full());
+    }
+    let waited = tokio::time::timeout(UPLOAD_QUEUE_WAIT, UPLOAD_GATE.acquire()).await;
+    UPLOAD_WAITING.fetch_sub(1, Ordering::SeqCst);
+    match waited {
+        Ok(Ok(permit)) => Ok(permit),
+        // 信号量被 close 只会发生在进程收尾；与超时同样按「稍后重试」表达。
+        _ => Err(upload_queue_timeout()),
+    }
+}
+
+/// 排队位也满了：这时确实是过载，拒绝是对的。文案给出两个数，用户知道该等还是该分批。
+fn upload_queue_full() -> ApiErr {
     err(
         StatusCode::TOO_MANY_REQUESTS,
-        format!("上传并发已满（同时最多 {UPLOAD_PERMITS} 个），请稍后重试"),
+        format!(
+            "入库排队已满（{UPLOAD_PERMITS} 个正在处理、{UPLOAD_QUEUE_MAX} 个在排队），请稍后重试"
+        ),
+    )
+}
+
+/// 排了很久仍没轮到：多半是某个上游（解析/向量服务）卡住了，让用户重试而不是无限挂着。
+fn upload_queue_timeout() -> ApiErr {
+    err(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "入库排队超时（等待超过 {} 秒仍未轮到），请稍后重试",
+            UPLOAD_QUEUE_WAIT.as_secs()
+        ),
     )
 }
 
@@ -388,7 +439,7 @@ pub async fn upload(
     let v = session_viewer(&st, &headers).await?;
     // 许可跟着重活走（move 进 spawn 的任务里持有到结束）：字节与解析产物都活在后台任务里，
     // 许可若随请求返回就释放，「4 并发」闸门形同虚设。
-    let permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
+    let permit = upload_permit().await?;
     let form = tokio::time::timeout(UPLOAD_READ_TIMEOUT, read_form(mp))
         .await
         .map_err(|_| err(StatusCode::REQUEST_TIMEOUT, "上传读取超时，请重试"))??;
@@ -655,7 +706,7 @@ pub async fn reprocess(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "原始文件已不存在，请重新上传"))?;
     // 与 upload 同一条内存闸：重处理同样整文件入内存，不占许可就绕过了 20MB × N 的防线；
     // 429 语义与 upload 一致（拿不到直接拒，不排队）。许可随重活 move 进后台任务。
-    let permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
+    let permit = upload_permit().await?;
     let bytes = tokio::time::timeout(UPLOAD_READ_TIMEOUT, tokio::fs::read(&path))
         .await
         .map_err(|_| err(StatusCode::REQUEST_TIMEOUT, "文档文件读取超时，请重试"))?
@@ -793,7 +844,7 @@ mod ops_pack {
         Json(req): Json<IngestUrlReq>,
     ) -> Result<ApiOk, ApiErr> {
         let v = manager_viewer(&st, &headers, &req.q).await?;
-        let permit = UPLOAD_GATE.try_acquire().map_err(|_| upload_gate_full())?;
+        let permit = upload_permit().await?;
         let page = url_fetch::fetch_guarded(req.url.trim()).await.map_err(url_fetch_err)?;
         let space_id = space_of(&v, &req.q);
         let up = ingest::UploadReq {
@@ -1873,7 +1924,9 @@ async fn serve_file(
         out.insert(header::CONTENT_LENGTH, HeaderValue::from(buf.len() as u64));
         return Ok((StatusCode::PARTIAL_CONTENT, out, buf).into_response());
     }
-    // 先过 ACL 再占下载槽（无权请求不耗许可）；拿不到直接 429（不排队，同 UPLOAD_GATE 的理由）。
+    // 先过 ACL 再占下载槽（无权请求不耗许可）；拿不到直接 429，**这里不排队**：
+    // 下载许可只在构造响应期间持有（毫秒级），满了说明真的在打满带宽，等待没有意义；
+    // 入库闸的许可要持有到后台解析结束（几十秒），那才需要排队 —— 两条闸理由不同，别再互相引用。
     let _permit = DOWNLOAD_GATE.try_acquire().map_err(|_| {
         err(
             StatusCode::TOO_MANY_REQUESTS,
@@ -3832,13 +3885,63 @@ mod tests {
         assert!(spawn_body.contains("register_source("), "后台任务必须登记通道②数据源: {spawn_body}");
     }
 
-    /// 上传闸：4 个许可用完即 429（拿不到许可这一支不许悄悄排队）
-    #[test]
-    fn upload_gate_has_four_permits() {
-        let held: Vec<_> = (0..4).map(|_| UPLOAD_GATE.try_acquire().unwrap()).collect();
-        assert!(UPLOAD_GATE.try_acquire().is_err());
+    /// 入库闸：许可用完后**排队等**，不是当场失败。
+    /// 反向验证：把 `upload_permit` 退回 `try_acquire()` 这条立刻红（50ms 内就返回了 Err）。
+    #[tokio::test]
+    async fn upload_gate_queues_instead_of_failing() {
+        // 抽干而不是假定恰好 N 个：同一测试二进制里别的用例也可能正持有许可。
+        let mut held = Vec::new();
+        while let Ok(permit) = UPLOAD_GATE.try_acquire() {
+            held.push(permit);
+        }
+        assert!(!held.is_empty(), "至少应能拿到一个许可");
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(50), upload_permit()).await;
+        assert!(pending.is_err(), "闸满时必须排队等待，而不是当场 429");
         drop(held);
-        assert!(UPLOAD_GATE.try_acquire().is_ok());
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), upload_permit()).await;
+        assert!(matches!(got, Ok(Ok(_))), "有位子后排队者必须拿到许可");
+    }
+
+    /// 闸满且**队列也满**时才拒绝——这一支仍是 429，文案要带上限数，用户才知道是等还是分批。
+    #[test]
+    fn upload_gate_still_rejects_when_queue_is_full() {
+        let full = upload_queue_full();
+        assert_eq!(full.0, StatusCode::TOO_MANY_REQUESTS);
+        let text = full.1 .0.to_string();
+        assert!(
+            text.contains(&UPLOAD_PERMITS.to_string())
+                && text.contains(&UPLOAD_QUEUE_MAX.to_string()),
+            "排队已满的文案必须同时给出并发上限与队列上限: {text}"
+        );
+        let slow = upload_queue_timeout();
+        assert_eq!(slow.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            slow.1 .0.to_string().contains(&UPLOAD_QUEUE_WAIT.as_secs().to_string()),
+            "排队超时的文案必须给出等待上限"
+        );
+    }
+
+    /// 三个入库入口（upload / reprocess / ingest_url）必须走同一条排队取许可。
+    /// 任何一处退回 `try_acquire()`，那条入口在闸满时又会把「等一会就有位子」表达成失败。
+    #[test]
+    fn every_ingest_entry_queues_for_a_permit() {
+        let src = include_str!("kb_api.rs");
+        for (name, next) in [
+            ("pub async fn upload", "pub async fn spaces"),
+            ("pub async fn reprocess", "pub async fn set_doc_state"),
+            ("pub async fn ingest_url", "async fn read_form"),
+        ] {
+            let body = src.split(name).nth(1).unwrap().split(next).next().unwrap();
+            assert!(
+                body.contains("upload_permit().await?"),
+                "{name} 必须走排队取许可（满了等，不是当场 429）"
+            );
+            assert!(
+                !body.contains("UPLOAD_GATE.try_acquire"),
+                "{name} 不许退回 try_acquire：闸满时会把「等一会就有位子」表达成失败"
+            );
+        }
     }
 
     #[test]
@@ -3852,7 +3955,7 @@ mod tests {
             .next()
             .unwrap();
         let auth = body.find("session_viewer").unwrap();
-        let permit = body.find("UPLOAD_GATE.try_acquire").unwrap();
+        let permit = body.find("upload_permit().await").unwrap();
         let read = body.find("read_form(mp)").unwrap();
         assert!(auth < permit && permit < read, "上传必须先认证，再占许可，最后读取 multipart: {body}");
         assert!(body.contains("tokio::time::timeout(UPLOAD_READ_TIMEOUT"), "上传读取必须有超时: {body}");
@@ -3929,9 +4032,9 @@ mod tests {
         let src = include_str!("kb_api.rs");
         let body = src.split("pub async fn reprocess").nth(1).unwrap();
         let body = body.split("pub async fn set_doc_state").next().unwrap();
-        assert!(body.contains("UPLOAD_GATE.try_acquire"), "reprocess 必须占上传许可");
+        assert!(body.contains("upload_permit().await?"), "reprocess 必须占上传许可（排队取）");
         assert!(body.contains("UPLOAD_READ_TIMEOUT"), "reprocess 读取必须有超时");
-        let permit = body.find("UPLOAD_GATE.try_acquire").unwrap();
+        let permit = body.find("upload_permit().await").unwrap();
         let read = body.find("tokio::fs::read").unwrap();
         assert!(permit < read, "先占许可再读文件: {body}");
     }

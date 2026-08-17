@@ -5151,3 +5151,107 @@ dmsai/
 - ❌ **没有跑真实的端到端部署** —— 业主说的是「这样我就可以一键部署」，
   部署动作留给业主。下一手第一次真跑时重点看两处新接线：3.6 步 embed 同步、
   4 步之后的 nginx.conf 同步。
+
+---
+
+## AX161 · 知识库上传：满了要排队，不是判失败（2026-08-17）
+
+业主给了三张现网截图，指着第一张说：「上传并发要提高，另外如果满了你应该是在队列等待啊，
+不应该是失败啊」。
+
+### 一屏红叉的真实原因：闸限的不是「上传」，是「后台解析」
+
+`kb_api.rs` 的 `UPLOAD_GATE` 许可是 **`move` 进后台任务**的（`spawn_ingest_job`），
+持有到 parse→chunk→embed 全部结束——几十秒。而前端是**串行**上传的
+（`for (const file of files) { await uploadViaXhr(...) }`，一次只传一个）。
+
+于是：传第 5 个文件时被拒，**仅仅因为前 4 个还在后台解析**。用户看到的是
+「上传并发已满（同时最多 4 个），请稍后重试」×一屏，而系统一点都不忙 ——
+API 容器 233MB / 16GB，8 核，可用内存 6.4GB。
+
+原注释写的是「拿不到许可**直接 429 而不排队**——排队只是把内存问题推迟到队列长度上」。
+这个理由在「许可只覆盖读文件那一瞬」时成立，但许可实际覆盖的是几十秒的后台重活：
+**「等一会儿就有位子」被表达成了「你的文件失败了」**，用户无从分辨，只能一个个手动重试。
+
+### 两端一起改，纪律是同一条：队列里的东西在等，不是挂了
+
+**服务端**（`crates/server/src/kb_api.rs`）
+- `UPLOAD_PERMITS` 4 → 8（20MB × 8 = 160MB 上界，对着 6.4GB 可用内存）
+- `try_acquire()` → `upload_permit()`：有位子直接拿，没位子**排队等**，
+  队列封顶 `UPLOAD_QUEUE_MAX=32`、等待封顶 `UPLOAD_QUEUE_WAIT=180s`（nginx 是 300s）。
+  原注释担心的两件事一件没放：同时在跑的入库任务仍是 8 个，排队连接数也有上限。
+- 三个入库入口（`upload` / `reprocess` / `ingest_url`）统一走它。真过载时仍然 429，
+  但文案分成两条：「排队已满（8 个在处理、32 个在排队）」与「排队超时（等待超过 180 秒）」，
+  用户能分辨该等还是该分批。
+- 下载闸**保持 `try_acquire`**：它的许可只在构造响应期间持有（毫秒级），满了说明真在打满带宽，
+  等待没有意义。原来那条注释写着「同 UPLOAD_GATE 的理由」，现在两条闸理由不同了，
+  改成各自说清，不再互相引用。
+
+**前端**（`web/src/KbPanel.vue`）
+- 串行 → 固定宽度取号器，`UPLOAD_PARALLEL = 4`（服务端 8 个位子，留一半给别的用户）
+- `send()` 拆成两段：**同步规划**（预校验 + 建行 + 同名提示）→ **并发执行**。
+  同名判定原来是隐式依赖串行顺序的，不拆开就会随网络时序漂。
+- 429 不再落失败行：指数退避自动重试 4 次（1s/2s/4s/8s），行上显示第几次。
+- 超出并发宽度的行显示「排队中」——用户要能一眼分辨「在等」和「挂了」。
+
+### 顺带修掉第二张图那条红：`[500] /parse: TypeError: expected ...Fill`
+
+那份 `重点客户月度共享数据模板.xlsx` 显示「文档服务不可用：文档处理失败」，0 切片。
+去现网 `journalctl -u dms-ai-embed` 捞到真因：
+
+```
+[500] /parse: TypeError: expected <class 'openpyxl.styles.fills.Fill'>
+```
+
+WPS/ERP 导出的 `styles.xml` 里有个**空 `<fill/>`**：openpyxl 的 `Fill.from_tree` 对无子元素的
+fill 返 `None`，而 `Stylesheet.fills` 是 `Sequence(expected_type=Fill)` —— `None` 进去就抛。
+它发生在读任何单元格**之前**，整份 500，Rust 侧落进 `sanitize_doc_error` 的未分类分支，
+于是**把用户的文件问题报成我们的故障**（`connector/src/doc.rs:250` 的头注正是在防这件事）。
+
+`tools/embed_service.py` 加 `_xlsx_open()`：样式表异常时把 `<fills>` 整段换成**等量**的空
+patternFill 再从 BytesIO 重读。个数必须守恒（`cellXfs` 按下标引用它，少一个就 IndexError），
+颜色我们一个都不用（`data_only` + `values_only` 只取值），丢掉无损。中和也救不回来时
+报 `422 unsupported` 并给出「另存为 .xlsx 后重传」——文件问题就说成文件问题。
+
+判据 `_selftest_xlsx_bad_fills` 先断言**原生 load_workbook 确实炸在这个夹具上**，
+否则这条判据是恒真的。第一版夹具（`<fill><dmsBogusFill/></fill>`）没能复现，
+当场被这条自检挡下来——openpyxl 容忍未知子元素，真正触发的是**空 `<fill/>`**。
+
+### 判据与反向验证
+
+| 判据 | 拆掉它 |
+|---|---|
+| `upload_gate_queues_instead_of_failing`（闸满时 50ms 内不许返回） | 退回 `try_acquire` → 红 |
+| `every_ingest_entry_queues_for_a_permit`（三个入口都走排队取） | 任一处退回 → 红 |
+| `upload_gate_still_rejects_when_queue_is_full`（文案带两个上限数） | — |
+| `kb-upload-queue.test.ts` ×4（宽度>1 / 规划与执行分段 / 429 重试 / 排队中文案） | 5 种改法逐个 → 红 |
+| `_selftest_xlsx_bad_fills` | 退回原生 load_workbook → 红（且复现现网原话） |
+
+全量：`cargo test -p dms-ai-server` **581 通过 / 0 失败**；前端 `npm test` **64 通过 / 0 失败**；
+`embed_service.py selftest` 退出码 0。
+
+### 第三张图没动（另一族，留给下一手）
+
+「湖南经营周报（2026-08-17 至 2026-08-23）」问两遍拿到两张不同的反问卡：
+① 「意图解析结果未通过一致性校验」② 「意图解析服务暂时不可用」，都是 0 行。
+两条的理解缺口都是「尚未确定应使用问数还是知识检索」。现网日志里捞不到对应记录
+（那两行是 debug 级，生产日志级别不打），**要复现得先
+`RUST_LOG=dms_agent=debug bash scripts/server-restart.sh`**。
+注意问的是个**未来区间**（今天 08-17，区间到 08-23），且「经营周报」这个词没进任何指标/意图词表。
+
+### 顺手补一笔：`cargo test --workspace` 在 HEAD 上是红的，我早些时候漏了
+
+跑全量时发现 `dms-semantic` 的两条架构判据在 **HEAD 上就红**（`git stash` 验证过，
+不是本轮碰出来的）——是今天前两轮改完只跑了受影响的 crate，没跑全量：
+
+1. `sql_interpolation_is_allowlisted` —— 1024 升级新增的 `ddl::retype_embedding_columns`
+   把 `{table}`/`{EMBED_DIM}` 拼进 `ALTER TABLE`；AX159 的仓库排行又新增了
+   `{bucket}`/`{column}`/`{where_sql}`/`{UNREGISTERED_BUCKET}`。逐个追到源头后放行并写清理由
+   （`where_sql` 里的省区谓词只从 `present::PROVINCE_LABELS` 静态表取值，用户原文一个字不进 SQL）。
+2. `every_meta_recall_is_ds_scoped` —— 假红：守卫扫的是**原始行**，而 `derive.rs::metric_alias_of`
+   的文档注释里写了「`metrics` 来自 `SELECT name, source_table FROM meta.metric`」。
+   修守卫而不是改注释：**逼着人把注释写模糊，是判据在损害可读性**。
+   注释里的 SQL 不会被执行，跳过它严格正确，末尾的 `checked >= 10` 空转跳闸保证不会被掏空。
+
+教训写在这儿：**改了 A crate 就只跑 A crate 的测试，会漏掉别的 crate 里扫全仓的架构判据。**
+本仓这类判据（drift.rs / 部署契约 / 判据的判据）都是跨 crate 扫源码的，只有 `--workspace` 看得见。

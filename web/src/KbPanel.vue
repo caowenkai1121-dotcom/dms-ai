@@ -68,6 +68,13 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 const MAX_RELATED = 50
 // 上传队列上限：队列只增不清，批量上传大目录时行数封顶（保留最近 N 条）
 const UPLOAD_QUEUE_MAX = 200
+// 同时在传的文件数。此前是 1（`for` + `await` 串行），而服务端的入库许可有 8 个 ——
+// 客户端一次只用一个位子，传得慢，还容易被「前几个还在后台解析」撞出 429。
+// 取 4 是留余量：多用户同时传时服务端还有位子接得住，超出的在服务端排队而不是失败。
+const UPLOAD_PARALLEL = 4
+// 429 自动重试：服务端排队仍没轮到才会给 429，那时退避重来，别让用户手动一个个重试。
+const UPLOAD_RETRY_MAX = 4
+const UPLOAD_RETRY_BASE_MS = 1000
 // 上传秒回后的轮询节奏：每 2s 重拉列表按 doc_id 对状态，5 分钟未落定即停（防无限轮询）
 const UPLOAD_POLL_MS = 2000
 const UPLOAD_POLL_TIMEOUT_MS = 5 * 60 * 1000
@@ -1667,6 +1674,10 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
   busy.value = true
   actionErr.value = ''
   try {
+    // ① 同步规划：预校验 + 建行 + 同名提示。这一趟不发任何请求，所以同名判定的顺序
+    //    只取决于用户选文件的顺序，不受下面并发调度影响（串行时代它是隐式成立的，
+    //    并发之后必须显式分成两段才还成立）。
+    const jobs: Array<{ rowId: number; file: File; folder: string }> = []
     for (const file of files) {
       const routed = route?.(file)
       // route 显式给 '' 是「根目录」的意思，不能用 || 回退（?? 只认 null/undefined）
@@ -1690,47 +1701,79 @@ async function send(files: File[], route?: (file: File) => { folderId: string; d
       seenDocNames.add(dupKey)
       const row: UploadRow = {
         id: ++uploadId, name: displayName, state: 'doing',
-        msg: '等待上传', warn,
-        destination: fileDestination, progress: 0, phase: 'upload',
+        msg: jobs.length < UPLOAD_PARALLEL ? '等待上传' : '排队中',
+        warn, destination: fileDestination, progress: 0, phase: 'upload',
       }
       pushUpload(row)
-      const rowId = row.id
-      try {
-        const { status, data } = await uploadViaXhr(file, requestSpace, fileFolder, (pct) => {
-          updateUpload(rowId, { progress: pct, msg: pct >= 100 ? '等待服务端响应' : `上传中 ${pct}%` })
-        })
-        if (status === 401) emit('auth-expired')
-        if (status < 200 || status >= 300) {
-          // 失败原因必须说清：服务端 JSON 错误原文优先；网关/反代 HTML 或空体折叠成可行动文案
-          const why = data.error ?? (status >= 500
-            ? `服务暂时不可用（网关错误 ${status}），请稍后重试`
-            : `请求未成功（HTTP ${status}），请重试`)
-          updateUpload(rowId, { state: 'fail', msg: why, progress: null, phase: undefined })
-          continue
-        }
-        // 同名覆盖响应带回的是切换前的旧线上行（通常已 embedded），不能按旧终态
-        // 立即收口；必须继续轮询到 updated_at 变化，才知道本次覆盖成功还是失败。
-        if (!data.replaced && isTerminalIngest(data)) {
-          // 终态（同步处理完/失败/带降级文案的 chunked）：按原口径落行；同名覆盖带「已覆盖旧版本」
-          const coverNote = data.replaced ? ' · 已覆盖旧版本' : ''
-          updateUpload(rowId, {
-            state: uploadState(data), msg: ingestOutcomeText(data) + coverNote,
-            ds: data.datasource ?? null, progress: null, phase: undefined,
-          })
-        } else {
-          // 进行态（秒回 parsing / 无降级文案的 chunked）：行挂「解析中」，轮询跟踪到终态
-          const docId = String(data.doc_id ?? data.id ?? '')
-          updateUpload(rowId, { msg: '解析中…（后台建立索引）', progress: null, phase: 'parse' })
-          if (docId) pollUploadDoc(rowId, docId, requestSpace, requestEpoch, String(data.updated_at ?? ''))
-          else updateUpload(rowId, { state: 'partial', phase: undefined, msg: '已提交后台处理：服务端未返回文档标识，请稍后刷新列表查看结果。' })
-        }
-      } catch (e) {
-        updateUpload(rowId, { state: 'fail', msg: errorText(e), progress: null, phase: undefined })
-      }
+      jobs.push({ rowId: row.id, file, folder: fileFolder })
     }
+
+    // ② 并发执行：固定宽度的取号器。队列里的文件是「等着」，不是「失败」——
+    //    这条纪律两端都要成立，服务端闸满时也排队（kb_api.rs::upload_permit）。
+    let cursor = 0
+    const width = Math.min(UPLOAD_PARALLEL, jobs.length)
+    await Promise.all(
+      Array.from({ length: width }, async () => {
+        while (cursor < jobs.length) {
+          const job = jobs[cursor++]
+          await sendOne(job.rowId, job.file, requestSpace, job.folder, requestEpoch)
+        }
+      }),
+    )
   } finally {
     if (requestId === uploadRequestId) busy.value = false
     if (contextIsCurrent(requestEpoch, requestSpace) && attempted) await loadSpaces(requestSpace)
+  }
+}
+
+// 单个文件的上传 + 结果收口。429（入库排队满/超时）不算失败：退避后重排，
+// 重试用尽才落失败行 —— 「稍后重试」这件事不该甩给用户手动做。
+async function sendOne(rowId: number, file: File, requestSpace: string, fileFolder: string, requestEpoch: number) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const { status, data } = await uploadViaXhr(file, requestSpace, fileFolder, (pct) => {
+        updateUpload(rowId, { progress: pct, msg: pct >= 100 ? '等待服务端响应' : `上传中 ${pct}%` })
+      })
+      if (status === 401) emit('auth-expired')
+      if (status === 429 && attempt < UPLOAD_RETRY_MAX) {
+        // 服务端已经排过一轮队还是没轮到：说明真的在忙，退避后再来（1s、2s、4s…）
+        const wait = UPLOAD_RETRY_BASE_MS * 2 ** attempt
+        updateUpload(rowId, {
+          msg: `服务端繁忙，${Math.round(wait / 1000)} 秒后自动重试（第 ${attempt + 1}/${UPLOAD_RETRY_MAX} 次）`,
+          progress: 0,
+        })
+        await new Promise((resolve) => setTimeout(resolve, wait))
+        continue
+      }
+      if (status < 200 || status >= 300) {
+        // 失败原因必须说清：服务端 JSON 错误原文优先；网关/反代 HTML 或空体折叠成可行动文案
+        const why = data.error ?? (status >= 500
+          ? `服务暂时不可用（网关错误 ${status}），请稍后重试`
+          : `请求未成功（HTTP ${status}），请重试`)
+        updateUpload(rowId, { state: 'fail', msg: why, progress: null, phase: undefined })
+        return
+      }
+      // 同名覆盖响应带回的是切换前的旧线上行（通常已 embedded），不能按旧终态
+      // 立即收口；必须继续轮询到 updated_at 变化，才知道本次覆盖成功还是失败。
+      if (!data.replaced && isTerminalIngest(data)) {
+        // 终态（同步处理完/失败/带降级文案的 chunked）：按原口径落行；同名覆盖带「已覆盖旧版本」
+        const coverNote = data.replaced ? ' · 已覆盖旧版本' : ''
+        updateUpload(rowId, {
+          state: uploadState(data), msg: ingestOutcomeText(data) + coverNote,
+          ds: data.datasource ?? null, progress: null, phase: undefined,
+        })
+      } else {
+        // 进行态（秒回 parsing / 无降级文案的 chunked）：行挂「解析中」，轮询跟踪到终态
+        const docId = String(data.doc_id ?? data.id ?? '')
+        updateUpload(rowId, { msg: '解析中…（后台建立索引）', progress: null, phase: 'parse' })
+        if (docId) pollUploadDoc(rowId, docId, requestSpace, requestEpoch, String(data.updated_at ?? ''))
+        else updateUpload(rowId, { state: 'partial', phase: undefined, msg: '已提交后台处理：服务端未返回文档标识，请稍后刷新列表查看结果。' })
+      }
+      return
+    } catch (e) {
+      updateUpload(rowId, { state: 'fail', msg: errorText(e), progress: null, phase: undefined })
+      return
+    }
   }
 }
 
@@ -2328,7 +2371,7 @@ void loadSpaces(props.initialSpace)
             <span class="upload-mark" aria-hidden="true">↑</span>
             <div class="drop-copy">
               <strong>{{ busy ? '正在处理上传队列' : '拖放文件到此处，或点击选择（可多选）' }}</strong>
-              <span>支持 PDF/Word/Excel/PPT/txt/md/csv/json/log/html 与 png/jpg/webp/gif/bmp 等图片；单文件 ≤{{ MAX_UPLOAD_BYTES / 1024 / 1024 }}MB，逐个上传逐个反馈。</span>
+              <span>支持 PDF/Word/Excel/PPT/txt/md/csv/json/log/html 与 png/jpg/webp/gif/bmp 等图片；单文件 ≤{{ MAX_UPLOAD_BYTES / 1024 / 1024 }}MB；同时上传 {{ UPLOAD_PARALLEL }} 个，其余排队等待，逐个反馈。</span>
             </div>
             <span class="primary-btn upload-action" aria-hidden="true">{{ busy ? '处理中' : '选择文件' }}</span>
           </div>
