@@ -424,6 +424,20 @@ impl IntentV1 {
         match (self.mode, has_data_slots) {
             (IntentMode::Data, true) => IntentRoute::Data,
             (IntentMode::Knowledge, _) => IntentRoute::Knowledge,
+            // 🔴 `mode=hybrid` 但 subgoals 为空 —— 模型说「这是个混合问题」却没给出拆解。
+            // 真 hybrid（带 subgoals）在上面 `route_from_subgoals` 就 return 了，
+            // 到得了这里的只有**说了 hybrid 却没拆**这一种：那不是分解，是模型的措辞。
+            // 而槽位（指标/实体/筛选/地区/时间/分组/比较）明明都抽出来了。
+            //
+            // 原来它落进 `_ => Unknown`，整份合同作废 → `is_data_executable()` 为假
+            // → `deterministic_fallback` 摘掉自由 SQL 成员 → 确定性成员全 miss
+            // → need-intent 反问卡。一份**抽对了的**合同因为 mode 字段的一个措辞被丢掉。
+            //
+            // 条件是 `has_data_slots` 为真：零槽位的空合同仍然落 Unknown（下面那支），
+            // 否则等于让一份什么都没抽到的合同打开自由 SQL，fail-closed 会翻成 fail-open。
+            // 另外两道闸一个字没松：`is_data_executable()` 仍要 ambiguities 为空；
+            // 资料半照旧由 `hybrid::dual` 并行跑，不会因为这里判 Data 就消失。
+            (IntentMode::Hybrid, true) => IntentRoute::Data,
             _ => IntentRoute::Unknown,
         }
     }
@@ -789,7 +803,11 @@ impl IntentV1 {
         if self.filters.iter().any(|f| !grounded(&f.value_surface)) {
             return Some("filter-value-not-in-question");
         }
-        if self.breakdowns.iter().any(|b| !grounded(b)) {
+        if self
+            .breakdowns
+            .iter()
+            .any(|b| !breakdown_grounded(question, b))
+        {
             return Some("breakdown-not-in-question");
         }
         if self.comparisons.iter().any(|c| !grounded(c)) {
@@ -844,7 +862,10 @@ impl IntentV1 {
                 .filters
                 .iter()
                 .any(|filter| !grounded(&filter.value_surface))
-            || self.breakdowns.iter().any(|breakdown| !grounded(breakdown))
+            || self
+                .breakdowns
+                .iter()
+                .any(|breakdown| !breakdown_grounded(question, breakdown))
             || self
                 .comparisons
                 .iter()
@@ -2359,7 +2380,7 @@ pub fn reinterpret_coverage(
             push_unique(&mut report.missing, format!("region:{full}"));
         }
     }
-    for (name, aliases) in BREAKDOWN_FAMILIES {
+    for (name, aliases, _) in BREAKDOWN_FAMILIES {
         if has_breakdown(original, aliases) && !has_breakdown(rewritten, aliases) {
             push_unique(&mut report.missing, format!("breakdown:{name}"));
         }
@@ -3058,7 +3079,8 @@ fn iso_dates(text: &str) -> Vec<String> {
 
 fn has_breakdown(question: &str, aliases: &[&str]) -> bool {
     aliases.iter().any(|alias| {
-        ["按", "按照", "各", "每"]
+        // 「每个月」「各个省份」是最常见的口语分组说法，而原来只认「每月」「各省份」
+        ["按", "按照", "各", "每", "每个", "各个"]
             .iter()
             .any(|prefix| question.contains(&format!("{prefix}{alias}")))
             || ["分组", "拆分", "统计", "分布"]
@@ -3068,35 +3090,50 @@ fn has_breakdown(question: &str, aliases: &[&str]) -> bool {
 }
 
 fn sql_mentions_breakdown(sql: &str, breakdown: &str) -> bool {
-    let needles: &[&str] = if ["省份", "省区", "区域", "地区"].contains(&breakdown) {
-        &["region", "province", "state"]
-    } else if ["商品", "产品", "货品", "sku"]
-        .iter()
-        .any(|v| v.eq_ignore_ascii_case(breakdown))
-    {
-        &["sku", "goods", "product", "item"]
-    } else if ["客户", "经销商"].contains(&breakdown) {
-        &["customer", "cust", "storecode", "storename"]
-    } else if ["战区", "大战区"].contains(&breakdown) {
-        &["war_zone", "warzone"]
-    } else if ["仓库", "库位", "批次"].contains(&breakdown) {
-        &["warehouse", "location", "batch"]
-    } else if ["日期", "天", "日", "月份", "月"].contains(&breakdown) {
-        &["date", "day", "month", "time"]
-    } else {
-        &[]
-    };
-    needles.iter().any(|needle| sql.contains(needle))
+    // 词根表在 `BREAKDOWN_FAMILIES` 第三列，全仓一份（原来这里是逐字重复的第二份）
+    // 🔴 折叠大小写：GROUP BY 子句里写 `DATE_FORMAT(...)` 是常态，而词根表是小写。
+    // 原实现是 `sql.contains(needle)`（大小写敏感），于是按月分组的 SQL 证不出
+    // `breakdown:月份` —— 一个大写把判据废掉一半，且没有任何断言覆盖过它。
+    breakdown_family(breakdown)
+        .is_some_and(|(_, _, needles)| needles.iter().any(|needle| contains_folded(sql, needle)))
 }
 
-const BREAKDOWN_FAMILIES: &[(&str, &[&str])] = &[
-    ("地区", &["省份", "省区", "区域", "地区"]),
-    ("战区", &["战区", "大战区"]),
-    ("商品", &["商品", "产品", "货品", "SKU"]),
-    ("客户", &["客户", "经销商"]),
-    ("仓库", &["仓库", "库位", "批次"]),
-    ("日期", &["日期", "天", "日", "月份", "月"]),
+/// 分组维度的家族表：`(族名, 中文别名, SQL 侧列名词根)`。
+/// 🔴 第三列是 2026-08-17 从 `sql_mentions_breakdown` 里那份**逐字重复的名单**并过来的：
+/// 同一件事两份实现，改一处忘一处就会出现「问句这边认得、SQL 那边不认」的半边瘫。
+const BREAKDOWN_FAMILIES: &[(&str, &[&str], &[&str])] = &[
+    ("地区", &["省份", "省区", "区域", "地区"], &["region", "province", "state"]),
+    ("战区", &["战区", "大战区"], &["war_zone", "warzone"]),
+    ("商品", &["商品", "产品", "货品", "SKU"], &["sku", "goods", "product", "item"]),
+    ("客户", &["客户", "经销商"], &["customer", "cust", "storecode", "storename"]),
+    ("仓库", &["仓库", "库位", "批次"], &["warehouse", "location", "batch"]),
+    ("日期", &["日期", "天", "日", "月份", "月"], &["date", "day", "month", "time"]),
 ];
+
+/// 这个分组词属于哪一族。
+fn breakdown_family(breakdown: &str) -> Option<&'static (&'static str, &'static [&'static str], &'static [&'static str])> {
+    BREAKDOWN_FAMILIES
+        .iter()
+        .find(|(_, aliases, _)| aliases.iter().any(|a| a.eq_ignore_ascii_case(breakdown)))
+}
+
+/// 分组槽位的落地判据：**字面出现**，或者**同族的说法在问句里出现**。
+///
+/// 🔴 原判据是裸子串（`contains_folded(question, breakdown)`），于是
+/// 「最近三个月**每个月**的订单数」里模型报的 `breakdowns:["月份"]` 落不了地
+/// —— 「月份」两个字确实不在问句里 —— 整份合同判 `breakdown-not-in-question`
+/// 作废，自由 SQL 关掉，整题落 need-intent（2026-08-17 判官实测，耗时 40 秒）。
+///
+/// 模型报的是**规范名**，用户说的是**口语**，两者本来就不必逐字相同。
+/// 要求逐字相同等于要求用户按数据字典说话。同族即算落地：
+/// 判据仍然咬得住 —— 问句里得真有「每个月 / 按月 / 各省份 / 按商品」这样的**分组表达**，
+/// 而不是随便提到一个词就算。
+fn breakdown_grounded(question: &str, breakdown: &str) -> bool {
+    if contains_folded(question, breakdown) {
+        return true;
+    }
+    breakdown_family(breakdown).is_some_and(|(_, aliases, _)| has_breakdown(question, aliases))
+}
 
 const GEO_NAMES: &[(&str, &str)] = &[
     ("北京市", "北京"),
@@ -3137,6 +3174,107 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 分组槽位：模型报规范名、用户说口语，不必逐字相同。
+    #[test]
+    fn a_breakdown_grounds_on_its_family_not_on_the_literal_string() {
+        // 正：判官那条 40 秒的红题 —— 「月份」两个字确实不在问句里
+        assert!(
+            super::breakdown_grounded("最近三个月每个月的订单数", "月份"),
+            "「每个月」就是按月分组，不许因为「月份」两个字不在问句里就整份作废"
+        );
+        for (q, b) in [
+            ("各个省份的销售额", "省区"),
+            ("按商品看本月销量", "产品"),
+            ("每个仓库的库存量", "库位"),
+            ("本月销售额按省区", "地区"),
+        ] {
+            assert!(super::breakdown_grounded(q, b), "{q} / {b}：同族说法应当算落地");
+        }
+        // 反向①：问句里压根没有分组表达 ⇒ 不许落地（判据还得咬得住）
+        for (q, b) in [
+            ("本月销售额是多少", "月份"),
+            ("烤肠卖了多少钱", "省区"),
+            ("这个月的订单金额", "客户"),
+        ] {
+            assert!(
+                !super::breakdown_grounded(q, b),
+                "{q} / {b}：没有分组表达就不许放行 —— 放行等于让模型凭空加一个 GROUP BY"
+            );
+        }
+        // 反向②：不在任何族里的词照旧只认字面
+        assert!(!super::breakdown_grounded("按渠道看销售额", "渠道类型"));
+        assert!(super::breakdown_grounded("按渠道类型看销售额", "渠道类型"));
+
+        // 唯一事实源：SQL 侧词根与中文别名同表，两边不许再分家
+        assert!(super::sql_mentions_breakdown("GROUP BY DATE_FORMAT(d, '%Y-%m')", "月份"));
+        assert!(super::sql_mentions_breakdown("GROUP BY sf.region", "省区"));
+        assert!(!super::sql_mentions_breakdown("GROUP BY sf.region", "商品"));
+    }
+
+    /// mode=hybrid 却没给拆解时，槽位说了算 —— 四条边界一条都不许松。
+    #[test]
+    fn a_hybrid_without_subgoals_is_judged_by_its_slots() {
+        let mk = |json: &str, q: &str| IntentAttempt::validated(
+            parse_intent_strict(json).expect("合法合同"), q);
+
+        // ① 有槽位 ⇒ Data（原来整份作废，落 need-intent 反问卡）
+        let with_slots = mk(
+            concat!(
+                r#"{"version":2,"mode":"hybrid","subgoals":[],"goals":[],"metrics":["销售额"],"#,
+                r#""entity_mentions":[],"filters":[],"regions":[],"#,
+                r#""time":{"surface":"本月","start":"","end":"","grain":"month"},"#,
+                r#""breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#
+            ),
+            "本月销售额是多少",
+        );
+        assert_eq!(with_slots.route(), IntentRoute::Data, "槽位都在，不许整份作废");
+        assert!(with_slots.is_data_executable(), "无歧义 + 有槽位 ⇒ 可执行");
+
+        // ② 零槽位 ⇒ 必须仍是 Unknown。放行等于让一份什么都没抽到的合同打开自由 SQL，
+        //    fail-closed 当场翻成 fail-open —— 这是本条改动的分界线。
+        let empty = mk(
+            concat!(
+                r#"{"version":2,"mode":"hybrid","subgoals":[],"goals":[],"metrics":[],"#,
+                r#""entity_mentions":[],"filters":[],"regions":[],"time":null,"#,
+                r#""breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#
+            ),
+            "随便说点什么",
+        );
+        assert_ne!(empty.route(), IntentRoute::Data, "零槽位的空合同绝不许判 Data");
+        assert!(!empty.is_data_executable());
+
+        // ③ 有槽位但模型报了歧义 ⇒ 路由是 Data，执行许可仍然没有（两件事分开）
+        let ambiguous = mk(
+            concat!(
+                r#"{"version":2,"mode":"hybrid","subgoals":[],"goals":[],"metrics":["销售额"],"#,
+                r#""entity_mentions":[],"filters":[],"regions":[],"time":null,"#,
+                r#""breakdowns":[],"comparisons":[],"requested_detail":false,"#,
+                r#""ambiguities":["含税还是不含税"]}"#
+            ),
+            "销售额是多少",
+        );
+        assert_eq!(ambiguous.route(), IntentRoute::Data);
+        assert!(
+            !ambiguous.is_data_executable(),
+            "歧义仍然关自由 SQL —— 路由不是执行许可"
+        );
+
+        // ④ 真 hybrid（带两个 subgoal）一个字不许动：它在 route_from_subgoals 就 return 了
+        let real = mk(
+            concat!(
+                r#"{"version":2,"mode":"hybrid","subgoals":["#,
+                r#"{"mode":"knowledge","surface":"报销流程","evidence_surfaces":[],"goals":[],"metrics":[],"#,
+                r#""entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false},"#,
+                r#"{"mode":"data","surface":"本月市场费用","evidence_surfaces":[],"goals":[],"metrics":["市场费用"],"#,
+                r#""entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false}],"#,
+                r#""goals":[],"metrics":[],"entity_mentions":[],"filters":[],"regions":[],"time":null,"#,
+                r#""breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#
+            ),
+            "本月市场费用花了多少，报销流程是什么",
+        );
+        assert_eq!(real.route(), IntentRoute::Hybrid, "真复合问句不许被这条改动碰到");
+    }
 
     /// 第一次 Fast 失败必须**升档**再试一次 —— 复杂问句正是这一档的常客。
     #[tokio::test]
