@@ -353,11 +353,7 @@ async fn seed_kw_force(pg: &PgPool) -> anyhow::Result<()> {
         ("押金", "t_customer_balance"), ("信控", "t_customer_balance"), ("余额", "t_customer_balance"), ("欠款", "t_customer_balance"),
         ("售后", "t_after_sales_order_header"), ("退货", "t_after_sales_order_header"), ("退款", "t_after_sales_order_header"),
         ("开票", "t_invoice_apply_header"), ("发票", "t_invoice_apply_header"),
-        ("对账", "t_account_bill_header"), ("账单", "t_account_bill_header"),
         ("发货", "t_sales_order_logistics"), ("运单", "t_sales_order_logistics"), ("物流", "t_sales_order_logistics"),
-        ("分类", "t_goods_category"), ("品类", "t_goods_category"), ("类别", "t_goods_category"),
-        ("市场费用", "t_market_total_expense"), ("营销费用", "t_market_total_expense"),
-        ("推广费", "t_market_total_expense"), ("费用总额", "t_market_total_expense"),
         ("新上架", "t_goods"), ("新品", "t_goods"), ("上架", "t_goods"),
         ("库存", "t_winc_stock_report"),
         // 专项费用短语必须先于泛「活动」登记；同一句会同时命中时，专项表先进入候选。
@@ -376,8 +372,32 @@ async fn seed_kw_force(pg: &PgPool) -> anyhow::Result<()> {
         ("订单", "t_sales_order"), ("订单额", "t_sales_order"), ("订单数", "t_sales_order"),
         ("买过", "t_sales_order_detail"), ("购买", "t_sales_order_detail"),
         ("客户", "t_customer"), ("商品", "t_goods"),
-        ("员工", "t_employee"), ("门店", "t_master_shop"),
+        ("门店", "t_master_shop"),
     ];
+    // 🔴 **退役清单**：指向**目录之外**的关键词钉子。
+    //
+    // `forced_tables`（recall/schema.rs）里有一句 `if !catalog_table(cx.ds, t) { continue; }`
+    // —— 目标表不在 `warehouse_catalog::ASSETS` 里，这条钉子**直接跳过**。
+    // 2026-08-17 实测：52 条钉子里有 16 条（31%）是这种哑钉，登记者以为钉上了，实际一次都没生效。
+    // 五族逐个实测「召回不到」：市场费用 / 品类 / 对账单 / 巡店 / 员工。
+    //
+    // 为什么是删而不是把表加进目录：这些域**早已由目录里的 DWS/ADS 表覆盖**
+    // （费用→dws_off_sales_cost_dnf 等四张、对账→dws_fin_*_check_dnf 三张、品类→t_goods），
+    // 当年排除 ODS 原表是有意的口径裁决。留着钉子只是registry 里的一句谎话。
+    // `t_employee` 更不能加：那张表有 `login_pwd` 列，绝不许暴露给自由 SQL。
+    //
+    // 「大日期 / 临期」两条由 `ops_caliber` 钉向巡店表，一并退役 —— 见那边的注释：
+    // 那两个词在通用业务语境里指的是**库存效期**，不是巡店文本命中。
+    const KW_FORCE_RETIRED: &[&str] = &[
+        "分类", "品类", "类别",
+        "市场费用", "营销费用", "推广费", "费用总额",
+        "对账", "账单", "员工",
+        "巡店", "陈列", "竞品", "专柜", "大日期", "临期",
+    ];
+    sqlx::query("DELETE FROM meta.kw_force WHERE keyword = ANY($1)")
+        .bind(&KW_FORCE_RETIRED.to_vec())
+        .execute(pg)
+        .await?;
     // 召回读取允许 ds_id='*'；历史全局核心词会与当前 DMS 锚点同时命中，必须先 fail-closed 清掉。
     // 清理清单从 KW_FORCE 派生（锚到默认销售事实与订单头的那些词），不手抄第二份。
     let core_kws: Vec<&str> = KW_FORCE
@@ -701,6 +721,77 @@ pub async fn seed_datasources(pg: &PgPool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 关键词强制补表的**目标必须在目录里**，否则那条钉子是句谎话。
+    ///
+    /// 机制：`recall/schema.rs::forced_tables` 里有一句
+    /// `if !catalog_table(cx.ds, t) { continue; }` —— 目标表不在 `ASSETS` 白名单里，
+    /// 这条钉子**直接跳过**，登记者以为钉上了，实际一次都没生效。
+    ///
+    /// 2026-08-17 实测：52 条钉子里 **16 条（31%）**是这种哑钉，
+    /// 五族逐个验过「召回不到」：市场费用 / 品类 / 对账单 / 巡店 / 员工。
+    /// 其中「大日期 / 临期」被巡店模块按自己的语境占了全局命名空间，
+    /// 于是业主问「京东仓的大日期商品」时，那两个词指向的是巡店记录表而不是库存效期。
+    ///
+    /// 这条判据把「漏项」从**静默**变成**编译期可见**：谁再往 kw_force 里塞一个
+    /// 目录外的表，这里当场红，逼着做一次显式选择 —— 要么把表加进目录（连同五段合同），
+    /// 要么别登记这条钉子。**手工名单永远有下一个漏项，但漏了必须有人知道。**
+    #[test]
+    fn every_forced_keyword_points_into_the_catalog() {
+        let catalog: std::collections::HashSet<&str> =
+            crate::warehouse_catalog::ASSETS.iter().map(|a| a.table).collect();
+
+        // 两处种子各扫一遍源码（它们是 const/字面量表，源码扫描比跑 DB 便宜且确定）
+        let mut pins: Vec<(&str, String, String)> = vec![];
+        for (file, src, head, tail) in [
+            ("seed.rs", include_str!("seed.rs"), "const KW_FORCE: &[(&str, &str)] = &[", "];"),
+            (
+                "ops_caliber.rs",
+                include_str!("ops_caliber.rs"),
+                "INSERT INTO meta.kw_force",
+                "\n",
+            ),
+        ] {
+            let Some(block) = src.split(head).nth(1) else { continue };
+            let block = block.split(tail).next().unwrap_or("");
+            for cap in block.split("(\"").skip(1) {
+                let Some((kw, rest)) = cap.split_once("\",") else { continue };
+                let rest = rest.trim_start();
+                let Some(table) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) else {
+                    continue; // 形如 `crate::sales_fact::TABLE_NAME` 的常量引用，下面单独放行
+                };
+                if table.is_empty() || table.contains(' ') {
+                    continue;
+                }
+                pins.push((file, kw.to_string(), table.to_string()));
+            }
+        }
+        // 空转跳闸：解析漂了就会一条都不检查而「永远绿」。
+        assert!(pins.len() >= 20, "只解析出 {} 条钉子，判据已成哑测试", pins.len());
+
+        let dead: Vec<String> = pins
+            .iter()
+            .filter(|(_, _, t)| !catalog.contains(t.as_str()))
+            .map(|(f, k, t)| format!("{f}: 「{k}」-> {t}"))
+            .collect();
+        assert!(
+            dead.is_empty(),
+            "这些关键词钉向**目录之外**的表 —— `forced_tables` 会静默跳过它们，\
+             登记了等于没登记。要么把表加进 warehouse_catalog::ASSETS（连同五段合同），\
+             要么别登记这条钉子：\n{}",
+            dead.join("\n")
+        );
+
+        // 「大日期 / 临期」不许再被任何模块钉走：它们在通用业务语境里指库存效期
+        // （`scm_warehous_manage.invalid_date`），不是巡店文本命中。
+        for banned in ["大日期", "临期"] {
+            assert!(
+                !pins.iter().any(|(_, k, _)| k == banned),
+                "「{banned}」又被钉到某张表上了：这个词在通用语境里指库存效期，\
+                 钉给某个领域模块会让「京东仓的大日期商品」这类问句整族走偏"
+            );
+        }
+    }
     use super::{family_of, TABLE_SCOPES};
 
     #[test]

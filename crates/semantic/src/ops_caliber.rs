@@ -521,17 +521,21 @@ async fn seed_graph_and_docs(pg: &PgPool) -> anyhow::Result<()> {
         )
         .bind(DMS_DS_ID).bind(table).bind(filter).bind(note).execute(pg).await?;
     }
-    for (kw, table) in [
-        ("巡店", "t_shop_inspection_records"), ("陈列", "t_shop_inspection_records"),
-        ("竞品", "t_shop_inspection_records"), ("大日期", "t_shop_inspection_records"),
-        ("临期", "t_shop_inspection_records"), ("专柜", "t_shop_inspection_records"),
-    ] {
-        sqlx::query(
-            "INSERT INTO meta.kw_force(ds_id,keyword,table_name) VALUES ($1,$2,$3)
-             ON CONFLICT (ds_id,keyword) DO UPDATE SET table_name=$3",
-        )
-        .bind(DMS_DS_ID).bind(kw).bind(table).execute(pg).await?;
-    }
+    // 🔴 这里原来钉六个关键词到 `t_shop_inspection_records`，2026-08-17 全部退役，两个理由：
+    //
+    // ① **它们从来没生效过**：`forced_tables` 有一句
+    //    `if !catalog_table(cx.ds, t) { continue; }`，而巡店表不在 `ASSETS` 白名单里 ——
+    //    六条钉子一次都没命中过。实测「巡店记录有多少条」召回不到该表。
+    //
+    // ② **「大日期 / 临期」根本不属于巡店语境**：`meta.kw_force` 是**全局命名空间**
+    //    （PK 只有 ds_id+keyword），本模块按运营看板的语境把这两个通用词据为己有。
+    //    在通用业务语境里它们指的是**库存效期**（`scm_warehous_manage.invalid_date`），
+    //    而不是巡店文本里命中「大日期」三个字。业主 2026-08-17 问
+    //    「京东仓的大日期商品」正是撞在这上面。
+    //    本模块的「大日期风险」指标（`meta.term`）保留 —— 那是巡店看板里的另一件事，
+    //    有自己的定义，不需要靠劫持全局关键词来实现。
+    //
+    // 退役由 `seed.rs::KW_FORCE_RETIRED` 统一执行（要真删库里的旧行，不是不再写入就完事）。
     let docs = [
         ("t_shop_inspection_records", "运营巡店台账：业务日期inspection_date；客户/门店/省市；陈列SKU、冰柜、烤肠/蛋挞价格、竞品信息、改进项。运营统计须做标准省区归一、职位排除与ID去重。"),
         ("t_activity_main", "运营活动主表：开始/结束日期、持续天数、活动级别、客户/门店/经理。total_amount是六张费用明细合计；活动销售额不在本表，来自促销员明细actual_sales。"),
