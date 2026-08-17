@@ -193,4 +193,20 @@ for required in 'systemctl show -p ExecStart' 'systemctl show -p WorkingDirector
   }
 done
 
+# 部署包的上线判据：2026-08-17 现场那台「部署成功、/api/health 全绿、答案变差」——
+# 业务字典种子没导（sql_exemplar 少 90 行、memory 少 48 行），而 health 的 vector_ready
+# 只覆盖 datasource/element/table_doc 三张表，样例表根本不在里面。三条一起钉。
+bundle="$(cat tools/bundle-deploy.sh)"
+for required in   '探测目标形态'   'registry_snapshot.py import'   'systemctl is-active dms-ai-embed'   'done < "$TMP/actual.txt"'; do
+  grep -Fq -- "$required" <<<"$bundle" || {
+    echo "部署包入口缺上线判据：$required" >&2
+    exit 1
+  }
+done
+# 快照导入不许再退回「只在 --bootstrap 下跑」：忘了加开关的代价是静默变笨。
+! grep -Fq 'if [ "$MODE" = bootstrap ] && [ -s payload/registry_snapshot.json ]' <<<"$bundle" || {
+  echo "快照导入又被关回 --bootstrap 专属：忘加开关就静默少 90 条样例" >&2
+  exit 1
+}
+
 echo "deploy contract ok"
