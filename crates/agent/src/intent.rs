@@ -1486,6 +1486,7 @@ fn metric_surface_grounded(metric: &str, question: &str) -> bool {
 
 fn intent_from_reply(content: &str, question: &str) -> Option<ResolvedIntent> {
     let mut intent = parse_intent(content)?;
+    normalize_before_grounding(&mut intent, question);
     // 归属下推要在判理由**之前**跑一次，否则报出来的理由是下推前的旧状态
     push_down_root_slots(&mut intent);
     if let Some(reason) = intent.grounding_reject_reason(question) {
@@ -1507,6 +1508,18 @@ enum IntentAttemptState {
     Ready(ResolvedIntent),
     Unavailable,
     Invalid,
+}
+
+/// 合同进入 grounding 之前的**唯一**一次规整。
+///
+/// 🔴 这个函数存在的全部理由是「两个入口」：`IntentAttempt::validated`（外部输入、
+/// fastpath 造的最小合同）与 `intent_from_reply`（模型回复 —— **生产走的是这条**）。
+/// 2026-08-17 我把退化 subgoal 的展平只加在 `validated` 上，单测绿、线上原样红：
+/// 判据钉在了另一条路上。本文件顶部第 170 行的文档早写明了这两个入口，
+/// 而我只读了其中一个。
+fn normalize_before_grounding(intent: &mut IntentV1, question: &str) {
+    flatten_degenerate_single_subgoal(intent, question);
+    drop_ambiguities_the_user_already_answered(intent, question);
 }
 
 /// 单个 subgoal 就是整句话时，把它展平掉——它根本不是「子」目标。
@@ -1619,8 +1632,7 @@ impl IntentAttempt {
         if !intent.normalize() {
             return Self::Invalid;
         }
-        flatten_degenerate_single_subgoal(&mut intent, question);
-        drop_ambiguities_the_user_already_answered(&mut intent, question);
+        normalize_before_grounding(&mut intent, question);
         match intent.ground(question) {
             Some(intent) => Self::from_resolved(intent),
             None => Self::Invalid,
@@ -2911,6 +2923,45 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 判据必须钉**生产那条路**：模型回复走 `intent_from_reply`，
+    /// 不是 `IntentAttempt::validated`。2026-08-17 我把展平只加在 validated 上，
+    /// 单测绿、线上原样红——这条测试就是那次的记账。
+    #[test]
+    fn the_model_reply_path_gets_the_same_normalization_as_validated() {
+        let q = "库存量超过100万的仓库有几个";
+        // 逐字取自生产日志的模型回包
+        let reply = concat!(
+            r#"{"version":2,"mode":"data","subgoals":[{"mode":"data","surface":"库存量超过100万的仓库有几个","#,
+            r#""evidence_surfaces":[],"goals":["统计仓库数量"],"metrics":["仓库数量"],"#,
+            r#""entity_mentions":[{"surface":"仓库","kind":"other"}],"#,
+            r#""filters":[{"name":"库存量","operator":"gt","value_surface":"100万"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false}],"#,
+            r#""goals":["统计仓库数量"],"metrics":["仓库数量"],"#,
+            r#""entity_mentions":[{"surface":"仓库","kind":"other"}],"#,
+            r#""filters":[{"name":"库存量","operator":"gt","value_surface":"100万"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#
+        );
+        let resolved = super::intent_from_reply(reply, q)
+            .expect("模型回复这条路也必须过——生产走的正是它");
+        assert!(resolved.subgoals.is_empty(), "退化 subgoal 在模型回复这条路上也要展平");
+        assert!(resolved.metrics.iter().any(|m| m == "仓库数量"), "槽位不许丢");
+
+        // 同一份内联口径的问句，也走模型回复这条路验一遍
+        let q2 = "你需要你查看下 京东 和 顺丰 的大日期 商品，大日期的意思是 失效日期 小于3月的的";
+        let reply2 = concat!(
+            r#"{"version":2,"mode":"data","subgoals":[],"goals":[],"metrics":[],"#,
+            r#""entity_mentions":[{"surface":"京东","kind":"customer"},{"surface":"顺丰","kind":"customer"}],"#,
+            r#""filters":[{"name":"失效日期","operator":"range","value_surface":"小于3月"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"#,
+            r#""ambiguities":["“大日期”定义与“失效日期小于3月”可能存在歧义，需确认"]}"#
+        );
+        let resolved = super::intent_from_reply(reply2, q2).expect("该过");
+        assert!(
+            resolved.ambiguities.is_empty(),
+            "用户已在同一句里定义过的词，模型回复这条路上也不许拿它反问"
+        );
+    }
 
     /// 计数族指标的落地判据是**结构**，不是名单（名单永远有下一个漏项）。
     #[test]
