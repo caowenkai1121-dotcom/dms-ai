@@ -75,7 +75,7 @@ GOLDEN = ROOT / "tools" / "regression_golden"
 # 那条负向断言从写下那天起就是绿的。于是键集在此显式收口，preflight 对不上就硬失败。
 # 注意: 想加新键（tags/…）必须先让 check() 真的消费它，再登记进来——只登记不消费还是假绿。
 META_KEYS = {"name", "login", "q", "role", "llm", "note", "type", "requires_embed", "requires_graph",
-              "entries_volatile",
+              "entries_volatile", "ask_intent",
              # 两轮题：`prev` = 上一轮问句，`prev_sql` = 上一轮**实际执行的 SQL**（口径的真载荷）。
              # 消费方是 `ask_argv`（CLI 的第 5、6 位），selfcheck 里有断言证它真的进了 argv ——
              # 只登记不消费还是假绿，那正是这道 preflight 自己的立意。
@@ -408,6 +408,10 @@ def ask_entry(c, entry):
     else:
         path = "/api/ask/stream" if entry == "stream" else "/api/ask"
         payload = {"question": c["q"], "role_code": c.get("role") or None}
+        # 能力 chip（`data`=问数 / `knowledge`=知识库）。缺省不发 = 自动分诊，
+        # 与前端 `intent.value === 'auto'` 时不传 body.intent 逐字同口径。
+        if c.get("ask_intent"):
+            payload["intent"] = c["ask_intent"]
     req = urllib.request.Request(
         f"{base}{path}",
         data=json.dumps(payload).encode(),
@@ -470,7 +474,10 @@ def ask_http(c):
     import urllib.request
 
     base = os.environ.get("DMSAI_BASE", "http://172.17.0.1:8100")
-    body = json.dumps({"question": c["q"], "role_code": c.get("role") or None}).encode()
+    payload = {"question": c["q"], "role_code": c.get("role") or None}
+    if c.get("ask_intent"):
+        payload["intent"] = c["ask_intent"]
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"{base}/api/ask",
         data=body,

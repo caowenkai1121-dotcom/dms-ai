@@ -1347,6 +1347,64 @@
       "route": "direct-agg",
       "min_rows": 1,
       "note": "2026-08-16 跨入口度量：三入口全出「不可计算·未能识别的限定「牛油蛋挞皮g」」——注意残留里 600 被数字过滤器吃掉了。规格数字是商品名的一部分，值探针那一侧必须保留数字（residue_after_strip_with）。"
+    },
+    {
+      "name": "G01-现场口径·大日期商品",
+      "login": "admin",
+      "q": "京东仓有哪些大日期商品，大日期的意思是失效日期小于3个月",
+      "llm": true,
+      "route_not": "knowledge",
+      "sql_contains_any": [
+        "scm_warehous_manage",
+        "invalid_date"
+      ],
+      "note": "一族：用户在问句里现场下定义（`X的意思是Y`）。此前整轮落知识库答「知识库里没有大日期商品的查询方法」——而 invalid_date 一直都在。口径由 lexicon::extract_inline_terms 抽出后走术语召回管道。同族：「活跃客户有多少，活跃客户是指近30天下过单的」「本财年销售额，财年指4月到次年3月」"
+    },
+    {
+      "name": "G02-现场口径·自定义活跃客户",
+      "login": "admin",
+      "q": "活跃客户有多少，活跃客户是指近30天下过单的客户",
+      "llm": true,
+      "route_not": "knowledge",
+      "note": "同 G01 一族，换一种说法与一个完全不同的业务对象：证明它是通用能力而不是给大日期开的后门。"
+    },
+    {
+      "name": "G03-明确问数不许被资料半抢答",
+      "login": "admin",
+      "q": "京东和顺丰的大日期商品有哪些",
+      "ask_intent": "data",
+      "llm": true,
+      "route_not": "knowledge",
+      "note": "一族：用户点了「问数」chip。此前两臂都跑、问数半没实质时 hybrid::fuse 把资料半选成主答案，用户的明确选择被静默丢掉。现在资料半降为 kb 附属。同族：任何点了 chip 而问数半答不上来的问句 —— 主答案必须是问数侧的说明，不是资料卡。"
+    },
+    {
+      "name": "G04-明确知识库不许被问数抢答",
+      "login": "admin",
+      "q": "市场费用的报销政策是什么",
+      "ask_intent": "knowledge",
+      "route": "knowledge",
+      "note": "G03 的反方向：点了「知识库」就走知识库。两个方向都钉住，免得修一边把另一边弄反。"
+    },
+    {
+      "name": "G05-口语分布问法",
+      "login": "admin",
+      "q": "本月销售额按省份的分布是多少",
+      "route": "direct-agg",
+      "min_rows": 10,
+      "coverage_status": "complete",
+      "note": "一族：带「分布/构成/占比」这类口语限定词的分组问法。2026-08-17 在第二台生产机上答「问句含未能识别的限定『分布』」，而老服务器 direct-agg 出 27 行 —— 两台机器同一问句两种答案，尺子里没有这条就永远发现不了。同族：「销售额按省区的构成」「订单数按客户类型的占比」"
+    },
+    {
+      "name": "G06-仓库名要落到主数据",
+      "login": "admin",
+      "q": "京东仓的库存量是多少",
+      "llm": true,
+      "route_not": "knowledge",
+      "sql_contains_any": [
+        "master_wms",
+        "wms_desc"
+      ],
+      "note": "一族：问句里给的是**名称**，而事实表里只有不透明编码（wms_code=GZHYC-777）。名称唯一活在主数据表 master_wms.wms_desc 上，不 JOIN 就认不出「京东仓」。禁止拿 sup_name（供应商）冒充承运仓 —— 顺丰同时是供应商，按它筛是错的。同族：任何「XX仓/XX门店/XX客户」而事实表只存编码的问句。"
     }
   ],
   "rules": [
