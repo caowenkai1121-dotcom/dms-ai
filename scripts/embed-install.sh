@@ -57,7 +57,7 @@ step "2/5 构建镜像 $IMAGE（首次几分钟，之后 apt/pip 两层走缓存
 
 step "3/5 端口 $BIND:$PORT 的占用情况"
 OCCUPANT=""
-if docker inspect "$NAME" >/dev/null 2>&1; then
+if docker inspect --type container "$NAME" >/dev/null 2>&1; then
   OCCUPANT="本服务的旧容器 $NAME"
 elif command -v systemctl >/dev/null 2>&1 && systemctl cat dms-ai-embed >/dev/null 2>&1 \
      && [ "$(systemctl is-active dms-ai-embed 2>/dev/null || true)" = active ]; then

@@ -5513,3 +5513,90 @@ bootstrap 不装容器 / bootstrap 又写单元 / 解析容器名写死。
 
 另外记一条 grep 看不见的事：「把 `TAKEOVER` 默认从 0 翻成 1」是**语义**变更，
 语法纹丝不动。所以除了钉闸门骨架，还要单独钉默认值 `TAKEOVER="${DMS_EMBED_TAKEOVER:-0}"`。
+
+---
+
+## AX166 · 包要长成使用者的形状（2026-08-17）
+
+业主：「你看下现在服务器的部署方式是什么，针对性的生成对应所需的部署包，
+记住我是让小龙虾部署的。而且你不能在服务器做别的操作，这是生产环境。」
+
+### 只读勘查把前因后果补齐了
+
+1.95.7.181 上有一份 `.staging/` —— **就是我上一版的包**（deploy.sh / MANIFEST.json /
+config/ / source/ / 一键部署.cmd），时间戳 09:33–09:52。紧接着 `source/*` 被拷到了
+`/opt/dms-ai/` 根上（crates/docker/docs/tools/web 全是 09:52）。
+
+而服务器上还躺着一份 2026-08-12 的 `部署说明.txt`，它的流程是：
+
+```
+3. nohup venv/bin/python tools/embed_service.py serve 8078 172.17.0.1 > embed.out.log 2>&1 &
+4. bash scripts/server-build.sh && bash scripts/server-restart.sh
+```
+
+**小龙虾是照着这份说明做的，一步没错。** 我此前认定的「手工解包、孤儿进程」不是操作失误，
+是**说明书教出来的**。而我上一版包的入口 `deploy.sh` 是 Windows 客户端脚本 ——
+运维在服务器上工作，根本碰不到它。
+
+> **包要长成使用者的形状，不是作者的形状。**
+
+### 运维还替我抓了个真 bug
+
+`scripts/server-restart.sh.bak-20260817` 显示他打了一个补丁：
+
+```diff
+-if docker inspect dms-ai-parser >/dev/null 2>&1; then
++if docker inspect --type container dms-ai-parser >/dev/null 2>&1; then
+```
+
+`docker inspect NAME` 不加 `--type` 会**连镜像一起匹配** —— 存在同名镜像时「容器存在吗」
+这个判断答错，随后 `.State.Running` 取空、脚本走进错的分支。全仓 15 处存在性检查都有这毛病
+（包括我昨天新写的三处），已全部吸收并加判据钉住。
+
+### 按现网布局重做包
+
+现网实测形态：源码平铺在 `/opt/dms-ai`（无 `app` 链接、无 `releases/`）；
+`dms-ai-server` 在 `172.17.0.1:8100`；`dms-ai-web` 是 `nginx:alpine` 发在 **8101**；
+`dms-ai-pg` 在 `172.17.0.1:15433`；宿主 python3 是 **3.10.12**（venv 里是 3.11）。
+
+不硬改它的目录结构 —— 把平铺改成 app+releases 的风险全落在一次生产升级上，不值。
+
+新形态：**一个 tar + 服务器上一条命令**。
+
+```
+tar -xzf dms-ai-部署包-*.tar.gz -C /root && cd /root/dms-ai-部署包-* && bash 安装.sh
+```
+
+`tools/bundle-install-inplace.sh`（包内改名 `安装.sh`）八步，全幂等：
+前置检查 → 备份（沿用现网 `rollback-before-<戳>` 的习惯）→ 同步源码 → 装配置（缺了才装）
+→ **向量服务转容器**（替掉 nohup 裸进程）→ 构建后端 + 重启 → 换前端产物 → 导入业务字典
+→ 上线验收。`--dry-run` 只看不动。
+
+`tools/bundle-README-inplace.txt`（包内 `部署说明.txt`）覆盖掉服务器上那份过时的，
+第一屏就是三条命令，并写清「为什么向量服务要改成容器」「为什么必须导入业务字典种子」。
+
+### 实测：在测试机上造同形布局，验最危险的那一步
+
+第 2 步同步源码时会不会把运行时状态一起盖掉 —— 那是**永久数据损坏**级别的问题
+（覆盖 kbdata＝库里有记录而原件没了）。在 38.76.188.118 造了个同形的平铺 `/opt/dms-ai`，
+五个哨兵文件塞进去，跑真安装器（第 4 步在哨兵配置上如期停下）：
+
+```
+✅ settings.docker.json   SENTINEL-SETTINGS        （保留）
+✅ .secret_key            SENTINEL-SECRET-…        （保留）
+✅ kbdata/important.txt   SENTINEL-KBDATA          （保留）
+✅ venv/bin/marker        SENTINEL-VENV            （保留）
+✅ web/dist/index.html    SENTINEL-OLD-DIST        （保留）
+✅ crates/old.rs 已被新源码替换，master_wms 命中 9 次
+✅ 备份目录里有 crates scripts tools web
+✅ 部署说明.txt 已覆盖成新版
+```
+
+测完把测试机还原成 0 容器 0 镜像、`/opt/dms-ai` 删除。**生产机全程只读**。
+
+### 判据
+
+契约新增：就地安装器必须含 `server-verify.sh` / `embed-install.sh` / 快照导入 / 备份四步；
+必须写明保留 `settings.docker.json` / `.secret_key` / `kbdata` / `venv` 四样运行时状态；
+全部 `docker inspect` 必须带 `--type container`。打包器新增成品自检：包内每个 `.sh`
+过 `bash -n` 且全 LF —— 装到一半才发现语法错，生产已经动过了。

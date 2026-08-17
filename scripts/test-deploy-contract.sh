@@ -264,14 +264,38 @@ grep -Fq 'ADVISORY=1 DMS_RUNTIME_ROOT="$RUNTIME_ROOT" bash "$APP_ROOT/scripts/se
   echo "server-restart 收尾不再跑上线验收（或丢了 ADVISORY 只报不拦）：手工部署的机器将无人告知它缺东西" >&2
   exit 1
 }
-grep -Fq "bash '\$RUNTIME_ROOT/app/scripts/server-verify.sh'" <<<"$bundle" || {
-  echo "部署包入口不再调共享验收：判据要么两份要么没有" >&2
-  exit 1
-}
+# 包的入口现在是**服务器侧**的就地安装器（运维传 tar 上去解开再跑），
+# 它同样必须以共享验收收口 —— 不然又回到「装完不知道成没成」。
+inplace="$(code_only < tools/bundle-install-inplace.sh)"
+for required in   'scripts/server-verify.sh'   'scripts/embed-install.sh'   'registry_snapshot.py import'   'rollback-before-'; do
+  grep -Fq -- "$required" <<<"$inplace" || {
+    echo "就地安装器缺步骤：$required" >&2
+    exit 1
+  }
+done
+# 运行时状态一律不许被源码同步覆盖：覆盖 settings 要重配，覆盖 kbdata 是永久数据损坏。
+for keep in 'settings.docker.json' '.secret_key' 'kbdata' 'venv'; do
+  grep -Fq -- "$keep" <<<"$inplace" || {
+    echo "就地安装器没写明保留 $keep：同步源码时会连运行时状态一起盖掉" >&2
+    exit 1
+  }
+done
 # 基准不许写死数字：写死的下个月就是假的，必须从快照现读。
 grep -Fq 'json.load(open(sys.argv[1]' <<<"$verify" || {
   echo "server-verify 的基准不再取自快照本身" >&2
   exit 1
 }
+
+# 🔴 `docker inspect NAME` 不加 --type 会**连镜像一起匹配** —— 存在同名镜像时
+# 「容器存在吗」这个判断会答错，随后 `.State.Running` 取空、脚本走进错误的分支。
+# 这条是运维在 1.95.7.181 生产机上自己发现并手工打的补丁（server-restart.sh.bak-20260817），
+# 现已吸收进上游全部存在性检查，别再退回去。
+for f in scripts/server-restart.sh scripts/embed-install.sh scripts/embed-sync.sh          scripts/server-verify.sh scripts/server-bootstrap.sh scripts/web-update.sh; do
+  bad="$(grep -n 'docker inspect' "$f" | grep -v -- '--type container' || true)"
+  [ -z "$bad" ] || {
+    echo "$f 的 docker inspect 少了 --type container（会把同名镜像误判成容器）：$bad" >&2
+    exit 1
+  }
+done
 
 echo "deploy contract ok"

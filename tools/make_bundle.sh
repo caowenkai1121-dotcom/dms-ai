@@ -111,28 +111,15 @@ if not str(cfg.get("listen", "")).startswith(("0.0.0.0:", "[::]:")):
 PY
 echo "OK  凭据可解密，必填键齐全，kb_root/listen 符合容器部署要求"
 
-echo "== 6/7 入口与说明"
-cp -p tools/bundle-deploy.sh "$OUT/deploy.sh"
-cp -p tools/bundle-README.md "$OUT/部署说明.md"
-# .cmd 走 CRLF：cmd.exe 对 LF 的 goto/label 会错行。这里是唯一有意用 CRLF 的文件。
-"$PY" - "$OUT" <<'PY'
-import pathlib, sys
-out = pathlib.Path(sys.argv[1])
-cmd = "\r\n".join([
-    "@echo off",
-    "rem dms-ai 一键部署（双击即可）。需要已安装 Git for Windows 与 Python 3。",
-    "setlocal",
-    'cd /d "%~dp0"',
-    'where bash >nul 2>nul || (echo 未找到 bash，请先安装 Git for Windows：https://git-scm.com/download/win & pause & exit /b 1)',
-    'bash deploy.sh %*',
-    "pause",
-    "",
-])
-(out / "一键部署.cmd").write_text(cmd, encoding="utf-8")
-PY
-echo "OK  deploy.sh + 一键部署.cmd + 部署说明.md"
+echo "== 6/7 安装器与说明（服务器侧就地安装的形态）"
+# 入口是**服务器上**跑的 `安装.sh`，不是 Windows 侧的客户端脚本 ——
+# 运维的工作方式是「传个 tar 上去解开、在服务器上跑」，包要长成使用者的形状。
+cp -p tools/bundle-install-inplace.sh "$OUT/安装.sh"
+chmod +x "$OUT/安装.sh"
+cp -p tools/bundle-README-inplace.txt "$OUT/部署说明.txt"
+echo "OK  安装.sh + 部署说明.txt"
 
-echo "== 7/7 清单与自检"
+echo "== 7/8 清单"
 "$PY" - "$OUT" "$REPO" <<'PY'
 import hashlib, json, pathlib, subprocess, sys, datetime
 
@@ -159,7 +146,7 @@ def digest(p):
 # 一个 18.9MB payload.tar（他手工打包传服务器用的）被算进了完整性清单，包"大了一倍"，
 # 而清单本该回答的问题是「我发出去的这一份是什么」，不是「这个目录里现在有什么」。
 OWNED = ("source", "payload", "config")
-FILES_AT_ROOT = ("deploy.sh", "一键部署.cmd", "部署说明.md")
+FILES_AT_ROOT = ("安装.sh", "部署说明.txt")
 files = {}
 for top in OWNED:
     for f in sorted((out / top).rglob("*")):
@@ -201,6 +188,21 @@ print(f'OK  MANIFEST.json：{len(files)} 个文件 / {manifest["total_bytes"] / 
       f'{"" if manifest["git"]["worktree_clean"] else "  ⚠️ 工作区不干净，已记进清单"}')
 PY
 
-( cd "$OUT" && bash deploy.sh --dry-run ) || die "成品包自检未通过"
+echo "== 8/8 成品自检 + 打包"
+# 包里所有 .sh 都要能过语法检查：装到一半才发现语法错，生产已经动过了。
+while IFS= read -r sh; do
+  bash -n "$sh" || die "成品包里有语法错的脚本：$sh"
+  LC_ALL=C grep -Uq $'\r' "$sh" && die "成品包里出现 CRLF 脚本：$sh"
+done < <(find "$OUT" -name '*.sh')
+# 安装器 --dry-run 只在服务器上跑得动（要 root/docker），本机只验语法。
+echo "OK  $(find "$OUT" -name '*.sh' | wc -l) 个脚本语法通过、全 LF"
+
+# 打成一个 tar：运维传一个文件就够了。tar 里带顶层目录，解开不会撒一地。
+TARBALL="$(dirname "$OUT")/$(basename "$OUT").tar.gz"
+rm -f "$TARBALL"
+tar -czf "$TARBALL" -C "$(dirname "$OUT")" "$(basename "$OUT")"
+echo "OK  $TARBALL（$(du -h "$TARBALL" | cut -f1)）"
 echo
-echo "部署包已生成：$OUT"
+echo "部署包已生成："
+echo "  目录 $OUT"
+echo "  压缩 $TARBALL   ← 传这一个文件上服务器"

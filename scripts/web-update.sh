@@ -6,12 +6,12 @@ ARCHIVE="${1:?用法: web-update.sh WEB_DIST_TAR [CONTAINER]}"
 CONTAINER="${2:-dms-ai-web}"
 DEST="/usr/share/nginx/html"
 
-if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+if ! docker inspect --type container "$CONTAINER" >/dev/null 2>&1; then
   echo "SKIP: $CONTAINER 容器不存在，请按现网 web 发布流程使用 $ARCHIVE"
   exit 0
 fi
 
-MOUNT="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/usr/share/nginx/html"}}{{.Type}}|{{.Source}}{{end}}{{end}}' "$CONTAINER")"
+MOUNT="$(docker inspect --type container --format '{{range .Mounts}}{{if eq .Destination "/usr/share/nginx/html"}}{{.Type}}|{{.Source}}{{end}}{{end}}' "$CONTAINER")"
 case "$MOUNT" in
   bind\|*) ;;
   *) echo "ERROR: $CONTAINER 必须把宿主 Web 目录 bind mount 到 $DEST，实际：${MOUNT:-无挂载}" >&2; exit 1 ;;

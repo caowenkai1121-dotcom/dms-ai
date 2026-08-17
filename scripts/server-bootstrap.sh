@@ -98,7 +98,7 @@ if [ "$PG_HOST" != "host.docker.internal" ] && [ "$PG_HOST" != "172.17.0.1" ]; t
   PG_BIND="$PG_HOST"
 fi
 echo "settings 里的 PG：$PG_USER@$PG_HOST:$PG_PORT/$PG_DB（容器绑定地址取 $PG_BIND）"
-if docker inspect dms-ai-pg >/dev/null 2>&1; then
+if docker inspect --type container dms-ai-pg >/dev/null 2>&1; then
   echo "KEEP 容器 dms-ai-pg 已存在"
 else
   ( cd "$APP_ROOT/docker/age" \
@@ -176,7 +176,7 @@ cp "$APP_ROOT/docker/web/nginx.conf" "$RUNTIME_ROOT/docker/web/nginx.conf"
 [ -s "$RUNTIME_ROOT/web/dist/index.html" ] \
   || echo '<!doctype html><meta charset="utf-8"><title>dms-ai</title>前端产物待部署' \
      > "$RUNTIME_ROOT/web/dist/index.html"
-if docker inspect dms-ai-web >/dev/null 2>&1; then
+if docker inspect --type container dms-ai-web >/dev/null 2>&1; then
   echo "KEEP 容器 dms-ai-web 已存在"
 else
   # 🔴 --add-host 不能省：nginx.conf 里 proxy_pass 写的是 host.docker.internal，

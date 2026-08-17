@@ -27,7 +27,7 @@ RELEASE_FILE="$APP_ROOT/tools/embed_service.py"
 [ -f "$RELEASE_FILE" ] || die "release 里没有 tools/embed_service.py：$RELEASE_FILE"
 
 # ── 形态①：容器。代码在镜像里，重建即换代码；install 脚本自带起飞自检。
-if command -v docker >/dev/null 2>&1 && docker inspect "$NAME" >/dev/null 2>&1; then
+if command -v docker >/dev/null 2>&1 && docker inspect --type container "$NAME" >/dev/null 2>&1; then
   echo "解析服务是容器形态（$NAME）：重建镜像并换容器"
   # 占用 8078 的就是它自己，接管无需人工确认 —— TAKEOVER 那道闸防的是「踩掉别人的服务」。
   DMS_RUNTIME_ROOT="$RUNTIME_ROOT" DMS_EMBED_CONTAINER="$NAME" DMS_EMBED_TAKEOVER=1 \

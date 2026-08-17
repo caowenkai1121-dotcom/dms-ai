@@ -35,7 +35,7 @@ ok()   { echo "  ✅ $*"; }
 
 echo "── 上线验收（$RUNTIME_ROOT）"
 
-if ! docker inspect "$PG" >/dev/null 2>&1; then
+if ! docker inspect --type container "$PG" >/dev/null 2>&1; then
   bad "找不到元数据库容器 $PG —— 注册表规模无法核对"
 else
   # 注册表规模：有快照就拿快照的行数当基准（带上来多少行，库里就该不少于多少行）；
@@ -98,10 +98,10 @@ fi
 # 托管形态：容器（新）或 systemd 单元（存量）二者有一即可。两者都没有而端口还有响应，
 # 说明那是个**没人管的裸进程** —— 重启机器即失，且部署换代码它不跟着变。
 MANAGED=""
-if command -v docker >/dev/null 2>&1 && docker inspect "${DMS_EMBED_CONTAINER:-dms-ai-embed}" >/dev/null 2>&1; then
+if command -v docker >/dev/null 2>&1 && docker inspect --type container "${DMS_EMBED_CONTAINER:-dms-ai-embed}" >/dev/null 2>&1; then
   C="${DMS_EMBED_CONTAINER:-dms-ai-embed}"
-  RUNNING="$(docker inspect --format '{{.State.Running}}' "$C" 2>/dev/null || echo false)"
-  POLICY="$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$C" 2>/dev/null || echo no)"
+  RUNNING="$(docker inspect --type container --format '{{.State.Running}}' "$C" 2>/dev/null || echo false)"
+  POLICY="$(docker inspect --type container --format '{{.HostConfig.RestartPolicy.Name}}' "$C" 2>/dev/null || echo no)"
   if [ "$RUNNING" = true ]; then
     MANAGED="容器 $C"
     ok "向量/解析服务：容器 $C 运行中"

@@ -83,15 +83,15 @@ printf '%s\n' "$PROBE_TOKEN" > "$PROBE_HOST" || die "知识库目录不可写：
 # 都没有就走宿主机分支（venv + systemd 单元，或裸跑）。
 PARSER_CONTAINER=""
 for cand in ${DMS_PARSER_CONTAINER:-} dms-ai-embed dms-ai-parser; do
-  if docker inspect "$cand" >/dev/null 2>&1; then PARSER_CONTAINER="$cand"; break; fi
+  if docker inspect --type container "$cand" >/dev/null 2>&1; then PARSER_CONTAINER="$cand"; break; fi
 done
 
 if [ -n "$PARSER_CONTAINER" ]; then
   # 解析容器必须把同一个宿主目录 bind 到 /kbdata；Docker volume 或另一目录都会稳定 404
   # ——接口收到的是 `/kbdata/<doc_id>.<ext>` **路径**，不是文件字节。
-  [ "$(docker inspect --format '{{.State.Running}}' "$PARSER_CONTAINER")" = "true" ] \
+  [ "$(docker inspect --type container --format '{{.State.Running}}' "$PARSER_CONTAINER")" = "true" ] \
     || die "$PARSER_CONTAINER 容器存在但未运行"
-  PARSER_KB_MOUNT="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/kbdata"}}{{.Type}}|{{.Source}}{{end}}{{end}}' "$PARSER_CONTAINER")"
+  PARSER_KB_MOUNT="$(docker inspect --type container --format '{{range .Mounts}}{{if eq .Destination "/kbdata"}}{{.Type}}|{{.Source}}{{end}}{{end}}' "$PARSER_CONTAINER")"
   case "$PARSER_KB_MOUNT" in
     bind\|*) ;;
     *) die "$PARSER_CONTAINER 必须把宿主目录 bind mount 到 /kbdata" ;;
@@ -167,11 +167,11 @@ if data.get("ok") is not True or caps.get("text") is not True or not document_ok
 # 所有会影响现有服务的动作都放在预检之后。旧容器先保留为回滚副本；新版本只有
 # mount 探针和 health 都通过后才删除旧容器。
 ROLLBACK_CONTAINER="dms-ai-server-rollback"
-if docker inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+if docker inspect --type container "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
   die "发现上次部署遗留容器 $ROLLBACK_CONTAINER，请先核对并人工处理"
 fi
 HAD_OLD_SERVER=0
-if docker inspect dms-ai-server >/dev/null 2>&1; then
+if docker inspect --type container dms-ai-server >/dev/null 2>&1; then
   docker rename dms-ai-server "$ROLLBACK_CONTAINER" || die "无法保留旧 server 容器"
   if ! docker stop "$ROLLBACK_CONTAINER" >/dev/null; then
     docker rename "$ROLLBACK_CONTAINER" dms-ai-server >/dev/null 2>&1 || true
