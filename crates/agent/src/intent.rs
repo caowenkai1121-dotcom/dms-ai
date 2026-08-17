@@ -1551,20 +1551,27 @@ fn normalize_before_grounding(intent: &mut IntentV1, question: &str) {
 /// surface/evidence 承载 —— 于是模型多包一层，一份本来合法的合同就翻成 Invalid。
 /// 严判据对**真**复合问句是对的（子问不许互相偷槽位），对一个假分解是误伤。
 ///
-/// 判据刻意窄：只认「surface 逐字等于整句问句」这一种退化形态。真的两段式复合
-/// 问句（surface 是问句的一部分）一个不碰，那条严判据照旧生效。
+/// 判据是**数量**，不是 surface 长得像什么：`subgoals.len() == 1` 就是退化。
+/// 分解至少要两段——一个「子」任务分不出任何东西来。
+///
+/// 第一版把判据写成「surface 逐字等于整句问句」，钉窄了：模型更常见的写法是把
+/// 口水前缀和定义从句摘掉，只在 surface 里留问题主体（业主那句里 surface 是
+/// 「京东 和 顺丰 的大日期 商品」，定义从句进了 evidence_surfaces）。于是
+/// `IntentV1::project` 那三种「subgoal 必须匹配整句问句」的形态一个都不中，
+/// 子任务被清空 → 「未找到匹配的结构化子任务」→ 整份合同 Invalid。
+/// 一句根本不复合的话，因为多包了一层就永远答不了。
+///
 /// 槽位取并集后再清空 subgoals：根级已有的不覆盖，根级没有的补上，一条不丢。
+/// 两段及以上的真复合问句一个不碰，subgoal 那条严判据照旧生效。
 fn flatten_degenerate_single_subgoal(intent: &mut IntentV1, question: &str) {
-    let [only] = intent.subgoals.as_slice() else {
-        return;
-    };
-    if !folded_eq(only.surface.trim(), question.trim()) {
+    if intent.subgoals.len() != 1 {
         return;
     }
     let only = intent.subgoals.remove(0);
     tracing::info!(
         surface = %only.surface,
-        "唯一 subgoal 的 surface 等于整句问句 → 不是分解，展平后按普通合同判"
+        question = %question,
+        "只有一个 subgoal → 不是分解，展平后按普通合同判"
     );
     // 根级为空的槽位才从 subgoal 补：模型在根级写过的东西优先，一条不覆盖。
     if intent.goals.is_empty() {
@@ -3125,6 +3132,8 @@ mod tests {
         let mut compound = parse_intent_strict(concat!(
             r#"{"version":2,"mode":"hybrid","subgoals":["#,
             r#"{"mode":"data","surface":"本月销售额","evidence_surfaces":[],"goals":[],"metrics":["销售额"],"#,
+            r#""entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false},"#,
+            r#"{"mode":"data","surface":"本月订单数","evidence_surfaces":[],"goals":[],"metrics":["订单数"],"#,
             r#""entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false}],"#,
             r#""goals":[],"metrics":[],"entity_mentions":[],"filters":[],"regions":[],"time":null,"#,
             r#""breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#
@@ -3133,8 +3142,27 @@ mod tests {
         super::flatten_degenerate_single_subgoal(&mut compound, q2);
         assert_eq!(
             compound.subgoals.len(),
-            1,
-            "surface 只是问句的一部分 ⇒ 是真分解，不许展平"
+            2,
+            "两段及以上是真分解，一个不许动"
+        );
+
+        // 单个 subgoal 即使 surface 只是问句的一部分，也是退化包装 —— 业主那句的形态
+        let q3 = "你需要你查看下 京东 和 顺丰 的大日期 商品，大日期的意思是 失效日期 小于3月的的";
+        let mut wrapped = parse_intent_strict(concat!(
+            r#"{"version":2,"mode":"data","subgoals":[{"mode":"data","surface":"京东 和 顺丰 的大日期 商品","#,
+            r#""evidence_surfaces":["大日期的意思是 失效日期 小于3月的的"],"goals":["查看商品"],"metrics":[],"#,
+            r#""entity_mentions":[{"surface":"京东","kind":"organization"}],"#,
+            r#""filters":[{"name":"失效日期","operator":"range","value_surface":"小于3月"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false}],"#,
+            r#""goals":["查看商品"],"metrics":[],"entity_mentions":[{"surface":"京东","kind":"organization"}],"#,
+            r#""filters":[{"name":"失效日期","operator":"range","value_surface":"小于3月"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#
+        ))
+        .expect("合法 JSON");
+        super::flatten_degenerate_single_subgoal(&mut wrapped, q3);
+        assert!(
+            wrapped.subgoals.is_empty(),
+            "单个 subgoal 即使 surface 是问句片段也是退化包装：project 要求它匹配整句，永远匹配不上"
         );
     }
 
