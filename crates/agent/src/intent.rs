@@ -1479,6 +1479,45 @@ enum IntentAttemptState {
     Invalid,
 }
 
+/// 用户在问句里**现场定义过**的词，模型不许再拿它当歧义否决执行。
+///
+/// 🔴 2026-08-17 生产日志实测。业主问：
+///   「京东 和 顺丰 的大日期 商品，大日期的意思是 失效日期 小于3月的的」
+/// 模型把话**听懂了**——`mode=Data`、`filters=[{name:"失效日期",operator:"range",
+/// value_surface:"小于3月"}]`、实体 京东/顺丰 全在——然后自己补了一句：
+///   「『大日期』定义与『失效日期小于3月』在业务逻辑上可能存在歧义…需确认是否指…」
+/// 而 `is_data_executable()` 要求 `ambiguities.is_empty()`，于是**一句自我怀疑
+/// 否决掉整份完整合同**，整题落 need-intent 反问卡。
+///
+/// 这条歧义问的正是用户**刚刚在同一句话里定义过**的那个词。与 chip 那条同病：
+/// 把用户已经回答过的问题再问一遍。归一重试也救不了——清洗后的问句照样 Ready
+/// 且带同一条歧义（日志里两轮一模一样）。
+///
+/// 判据刻意窄：只丢**点名了内联定义术语**的那几条，其余一条不动。
+/// 模型对别的东西拿不准仍然照旧否决——提示词第 4 条「拿不准写入 ambiguities」
+/// 这条纪律本身是对的，坏的只是它盖到了用户已经答过的地方。
+fn drop_ambiguities_the_user_already_answered(intent: &mut IntentV1, question: &str) {
+    if intent.ambiguities.is_empty() {
+        return;
+    }
+    let defined = dms_semantic::registry::lexicon::extract_inline_terms(question);
+    if defined.is_empty() {
+        return;
+    }
+    intent.ambiguities.retain(|ambiguity| {
+        let answered = defined.iter().find(|d| ambiguity.contains(&d.term));
+        if let Some(d) = answered {
+            tracing::info!(
+                term = %d.term,
+                definition = %d.definition,
+                ambiguity = %ambiguity,
+                "歧义点名的术语用户已在问句里定义，丢弃该条（不再反问用户已答过的事）"
+            );
+        }
+        answered.is_none()
+    });
+}
+
 impl IntentAttempt {
     #[allow(non_upper_case_globals)]
     pub const Unavailable: Self = Self(IntentAttemptState::Unavailable);
@@ -1495,6 +1534,7 @@ impl IntentAttempt {
         if !intent.normalize() {
             return Self::Invalid;
         }
+        drop_ambiguities_the_user_already_answered(&mut intent, question);
         match intent.ground(question) {
             Some(intent) => Self::from_resolved(intent),
             None => Self::Invalid,
@@ -2785,6 +2825,54 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 用户现场定义过的词，模型不许再拿它当歧义否决执行（2026-08-17 生产日志实测）。
+    #[test]
+    fn an_ambiguity_about_a_term_the_user_just_defined_does_not_veto() {
+        // 逐字取自生产日志：模型解析得完全正确，只是自己补了一句自我怀疑
+        let raw = concat!(
+            r#"{"mode":"data","goals":[],"metrics":[],"#,
+            r#""entity_mentions":[{"surface":"京东","kind":"customer"},{"surface":"顺丰","kind":"customer"}],"#,
+            r#""filters":[{"name":"失效日期","operator":"range","value_surface":"小于3月"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"#,
+            r#""ambiguities":["“大日期”定义与“失效日期小于3月”在业务逻辑上可能存在歧义，需确认是否指“距离失效日期不足3个月”"]}"#
+        );
+        let q = "你需要你查看下 京东 和 顺丰 的大日期 商品，大日期的意思是 失效日期 小于3月的的";
+        let attempt = IntentAttempt::validated(parse_intent_strict(raw).expect("合法合同"), q);
+        assert!(
+            attempt.is_data_executable(),
+            "用户在同一句里定义了「大日期」，模型对它的自我怀疑不许否决整份完整合同"
+        );
+        assert!(
+            attempt.ready().expect("Ready").ambiguities.is_empty(),
+            "该条歧义应当被丢弃"
+        );
+
+        // 反向①：同一份合同，问句里**没有**定义 ⇒ 歧义照旧否决
+        let attempt = IntentAttempt::validated(
+            parse_intent_strict(raw).expect("合法合同"),
+            "京东和顺丰的大日期商品有哪些",
+        );
+        assert!(
+            !attempt.is_data_executable(),
+            "没给定义时这条歧义是真的，不许被一起放行"
+        );
+
+        // 反向②：用户定义了别的词 ⇒ 与它无关的歧义一条不许动
+        let other = concat!(
+            r#"{"mode":"data","goals":[],"metrics":[],"entity_mentions":[],"filters":[],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"#,
+            r#""ambiguities":["销售额是含税还是不含税口径不明确"]}"#
+        );
+        let attempt = IntentAttempt::validated(
+            parse_intent_strict(other).expect("合法合同"),
+            "本月销售额是多少，活跃客户是指近30天下过单的客户",
+        );
+        assert!(
+            !attempt.is_data_executable(),
+            "用户定义的是「活跃客户」，与销售额口径那条歧义无关，不许顺手放行"
+        );
+    }
 
     /// 🔴 指标别名只有一份（2026-08-17 审计）。
     ///
