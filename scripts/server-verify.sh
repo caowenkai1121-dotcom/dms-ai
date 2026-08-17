@@ -95,18 +95,35 @@ fi
 
 # embed 服务：端口有响应**不等于**单元活着。现场那台单元 inactive，8078 上是个手工起的
 # 裸 python 孤儿 —— 重启机器即失，且部署换代码它不会跟着变。
-if command -v systemctl >/dev/null 2>&1; then
-  if systemctl cat dms-ai-embed >/dev/null 2>&1; then
-    STATE="$(systemctl is-active dms-ai-embed 2>/dev/null || echo unknown)"
-    if [ "$STATE" = active ]; then
-      ok "dms-ai-embed 单元 active"
-    else
-      bad "dms-ai-embed 单元 $STATE —— 端口若仍有响应，那是孤儿进程：重启机器即失，且不随部署更新"
-    fi
+# 托管形态：容器（新）或 systemd 单元（存量）二者有一即可。两者都没有而端口还有响应，
+# 说明那是个**没人管的裸进程** —— 重启机器即失，且部署换代码它不跟着变。
+MANAGED=""
+if command -v docker >/dev/null 2>&1 && docker inspect "${DMS_EMBED_CONTAINER:-dms-ai-embed}" >/dev/null 2>&1; then
+  C="${DMS_EMBED_CONTAINER:-dms-ai-embed}"
+  RUNNING="$(docker inspect --format '{{.State.Running}}' "$C" 2>/dev/null || echo false)"
+  POLICY="$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$C" 2>/dev/null || echo no)"
+  if [ "$RUNNING" = true ]; then
+    MANAGED="容器 $C"
+    ok "向量/解析服务：容器 $C 运行中"
+    # 没有重启策略 = 机器重启后服务不回来，而这正是换成容器要解决的事。
+    case "$POLICY" in
+      always|unless-stopped) ok "  重启策略 $POLICY（开机自启）" ;;
+      *) bad "  容器 $C 的重启策略是 '$POLICY' —— 机器重启后不会自己回来（重装：scripts/embed-install.sh）" ;;
+    esac
   else
-    bad "没有 dms-ai-embed systemd 单元 —— 向量/解析服务没有被托管（见 scripts/server-bootstrap.sh）"
+    bad "容器 $C 存在但没在跑"
   fi
 fi
+if [ -z "$MANAGED" ] && command -v systemctl >/dev/null 2>&1 && systemctl cat dms-ai-embed >/dev/null 2>&1; then
+  STATE="$(systemctl is-active dms-ai-embed 2>/dev/null || echo unknown)"
+  if [ "$STATE" = active ]; then
+    MANAGED="systemd 单元"
+    ok "向量/解析服务：systemd 单元 active（存量形态；新装建议换容器 scripts/embed-install.sh）"
+  else
+    bad "dms-ai-embed 单元 $STATE —— 端口若仍有响应，那是孤儿进程"
+  fi
+fi
+[ -n "$MANAGED" ] || bad "向量/解析服务没有被托管（既无容器也无 systemd 单元）—— 装法：bash scripts/embed-install.sh"
 
 # 版本布局：源码平铺在 RUNTIME_ROOT 上说明没走 release 流程，回滚位与原子切换都不存在。
 if [ -L "$RUNTIME_ROOT/app" ]; then

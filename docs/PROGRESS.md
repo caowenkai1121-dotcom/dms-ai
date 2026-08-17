@@ -5439,3 +5439,77 @@ patternFill 再从 BytesIO 重读。个数必须守恒（`cellXfs` 按下标引�
 **纪律记这里：源码扫描型判据必须钉在「调用/赋值」上，不能钉在「文里提到过」上。**
 钉宽了的代价是双向的 —— 要么注释喂饱判据（假绿），要么判据逼着人把注释写模糊（真损失）。
 三条断言全部改成钉逐字的调用行，九条变异这才全红。
+
+---
+
+## AX165 · 向量·精排·解析服务做成容器（2026-08-17）
+
+业主：「把本地系统服务做成 docker，docker 包含所有相关依赖和脚本，安装好后自动运行启动，
+后续直接让小龙虾一键安装就行」。
+
+### 为什么这是对症的
+
+这套服务此前只以「宿主机 venv + systemd 单元」的形态存在，而**那套形态没有一行在仓库里**。
+一天之内为它付了两笔账：
+- 第二台生产机上压根没装单元，8078 上是个手工起的裸 python —— 重启即失、部署换代码也不
+  跟着变，而 `/api/health` 全绿；
+- 换千问那次，`$RUNTIME_ROOT/tools/embed_service.py` 与 release 里那份是两份拷贝，靠人手同步
+  （`scripts/embed-sync.sh` 就是给它写的补丁）。
+
+装进镜像后两条一起消失：依赖、代码、启动方式一起进版本库，部署换代码＝重建镜像换容器。
+
+### 落地
+
+| 文件 | 做什么 |
+|---|---|
+| `docker/embed/Dockerfile` 🆕 | 完整服务镜像：LibreOffice 三件套 + tesseract/chi_sim + `tools/requirements-embed.txt`（**同一份清单**，不抄第二遍）+ `embed_service.py`/`settings.py`。镜像里**一个凭据都没有** |
+| `scripts/embed-install.sh` 🆕 | 一键安装：配置自检 → 构建 → 占用探测 → 起容器（`--restart unless-stopped`）→ 起飞自检。幂等 |
+| `scripts/embed-sync.sh` | 改成**形态分派器**：容器就重建换容器，systemd 就走原来的同步+比对 |
+| `scripts/server-bootstrap.sh` | 第 7 步从「写 systemd 单元」改成「装容器」 |
+| `scripts/server-restart.sh` | 解析服务容器名不再写死：按清单 `dms-ai-embed → dms-ai-parser` 找，找到就走 `/kbdata` 同源校验 |
+| `scripts/server-verify.sh` | 托管形态认容器或单元；容器还要查重启策略（没策略＝机器重启不回来） |
+
+与 `docker/parser/` 的区别写进了头注：那个是**开发机专用运输壳**（Windows SAC 拦 lxml，
+它把 `/embed` 转发给宿主机上游），本镜像是完整服务，不转发任何东西。
+
+### 真机实测（38.76.188.118，测完已还原成 0 容器 0 镜像）
+
+用的是**明文 dummy key 的最小配置**，真实凭据一个字节都没上那台机器。
+
+| 项 | 结果 |
+|---|---|
+| 镜像构建 | 1.11 GB，apt/pip 分两层，二次构建全走缓存 |
+| 解析能力 | **9/9 全绿**：pdf/docx/pptx/xlsx/text/doc/xls/ppt/image |
+| 服务自报 | `model=text-embedding-v4 dim=1024 rerank=gte-rerank-v2` |
+| 幂等 | 重跑认出「本服务的旧容器」，不要求 TAKEOVER |
+| `/kbdata` 同源 | 宿主写文件 → 容器 `/parse` 取回逐字 token |
+| **真·开机自启** | `systemctl restart docker` 后容器自己回来，**首次探活即通过** |
+| 接管闸 | 外来进程占 8078：无 `TAKEOVER` 退出码 1 + 说清占用者是谁；加 `TAKEOVER` 收掉裸进程并装上，退出码 0 |
+| `server-verify` | 认出容器形态并核对重启策略 |
+
+途中抓到一个**只在别人机器上才暴露**的 bug：起飞自检那段 `python3 -c` 用了
+`f"...{d.get(\"model\")}..."`，Python 3.10 的 f-string **不许表达式部分含反斜杠**
+（PEP 701 到 3.12 才放开）。本机与生产都是 3.12，测试机是 3.10.12 —— 容器全绿、
+自检自己 SyntaxError。两处都改成 `%` 格式化。**部署脚本要跑在别人的机器上，
+就不能只在自己的 Python 版本上验过。**
+
+### 判据：12 条，逐条反向验证全红
+
+依赖清单共用 / 少 COPY settings.py / 镜像 COPY 凭据 / 不再开机自启 / kbdata 不挂 /
+settings 挂载不只读 / 接管闸被拆 / 接管默认翻成开 / 不再构建本镜像 /
+bootstrap 不装容器 / bootstrap 又写单元 / 解析容器名写死。
+
+### 「判据被喂饱」这个病今天犯了三次，从一处根治
+
+反向验证连着抓到三批「仍绿」，全是同一形状：
+1. 注释里写了同款字面量 → `grep` 命中注释，拆掉真实现照样绿；
+2. 剥掉注释还不够 —— **echo/die 的文案**里同样会写那些字面量
+   （`step "…--restart unless-stopped…"`、die 里的用法提示），一样能喂饱判据。
+
+根治：`test-deploy-contract.sh` 加 `code_only()`，**所有源码变量统一先剥整行注释**；
+判据本身钉「可执行构造」而不是「字符串出现过」（带行继续符 `--restart unless-stopped \`、
+带判断骨架 `[ "$TAKEOVER" = 1 ] ||`）。剥注释后既有判据全部仍绿 ——
+顺带证明了没有一条老判据是靠注释撑着的。
+
+另外记一条 grep 看不见的事：「把 `TAKEOVER` 默认从 0 翻成 1」是**语义**变更，
+语法纹丝不动。所以除了钉闸门骨架，还要单独钉默认值 `TAKEOVER="${DMS_EMBED_TAKEOVER:-0}"`。

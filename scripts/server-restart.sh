@@ -76,23 +76,37 @@ trap cleanup_probe EXIT
 printf '%s\n' "$PROBE_TOKEN" > "$PROBE_HOST" || die "知识库目录不可写：$KBDATA_REAL"
 [ -s "$PROBE_HOST" ] || die "知识库目录写入探针失败：$KBDATA_REAL"
 
-if docker inspect dms-ai-parser >/dev/null 2>&1; then
-  # parser 容器必须把同一个宿主目录 bind 到 /kbdata；Docker volume 或另一目录都会稳定 404。
-  [ "$(docker inspect --format '{{.State.Running}}' dms-ai-parser)" = "true" ] \
-    || die "dms-ai-parser 容器存在但未运行"
-  PARSER_KB_MOUNT="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/kbdata"}}{{.Type}}|{{.Source}}{{end}}{{end}}' dms-ai-parser)"
+# 解析服务在容器里还是在宿主机上，按**容器名清单**认，不写死一个名字：
+#   dms-ai-embed  —— 2026-08-17 起的生产形态（embed+rerank+parse 全在一个容器，
+#                    docker/embed/Dockerfile，装法见 scripts/embed-install.sh）
+#   dms-ai-parser —— 更早的开发机运输壳（docker/parser/），保留兼容
+# 都没有就走宿主机分支（venv + systemd 单元，或裸跑）。
+PARSER_CONTAINER=""
+for cand in ${DMS_PARSER_CONTAINER:-} dms-ai-embed dms-ai-parser; do
+  if docker inspect "$cand" >/dev/null 2>&1; then PARSER_CONTAINER="$cand"; break; fi
+done
+
+if [ -n "$PARSER_CONTAINER" ]; then
+  # 解析容器必须把同一个宿主目录 bind 到 /kbdata；Docker volume 或另一目录都会稳定 404
+  # ——接口收到的是 `/kbdata/<doc_id>.<ext>` **路径**，不是文件字节。
+  [ "$(docker inspect --format '{{.State.Running}}' "$PARSER_CONTAINER")" = "true" ] \
+    || die "$PARSER_CONTAINER 容器存在但未运行"
+  PARSER_KB_MOUNT="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/kbdata"}}{{.Type}}|{{.Source}}{{end}}{{end}}' "$PARSER_CONTAINER")"
   case "$PARSER_KB_MOUNT" in
     bind\|*) ;;
-    *) die "dms-ai-parser 必须把宿主目录 bind mount 到 /kbdata" ;;
+    *) die "$PARSER_CONTAINER 必须把宿主目录 bind mount 到 /kbdata" ;;
   esac
   PARSER_KB_SOURCE="${PARSER_KB_MOUNT#bind|}"
-  [ -e "$PARSER_KB_SOURCE" ] || die "parser 的 /kbdata 源目录不存在：$PARSER_KB_SOURCE"
+  [ -e "$PARSER_KB_SOURCE" ] || die "$PARSER_CONTAINER 的 /kbdata 源目录不存在：$PARSER_KB_SOURCE"
   [ "$PARSER_KB_SOURCE" -ef "$KBDATA_REAL" ] \
-    || die "parser 与 server 的 /kbdata 不是同一宿主目录：$PARSER_KB_SOURCE != $KBDATA_REAL"
-  docker exec dms-ai-parser sh -c 'test -r "$1"' _ "/kbdata/$PROBE_NAME" \
-    || die "parser 容器看不到知识库探针，请检查 /kbdata mount"
+    || die "$PARSER_CONTAINER 与 server 的 /kbdata 不是同一宿主目录：$PARSER_KB_SOURCE != $KBDATA_REAL"
+  docker exec "$PARSER_CONTAINER" sh -c 'test -r "$1"' _ "/kbdata/$PROBE_NAME" \
+    || die "$PARSER_CONTAINER 看不到知识库探针，请检查 /kbdata mount"
+  echo "解析服务：容器 $PARSER_CONTAINER（/kbdata 与 server 同源）"
 else
-  # host parser 直接按收到的 /kbdata/<id> 路径读文件；不存在时建软链，已有异源路径绝不覆盖。
+  # 宿主机形态：解析服务直接按收到的 /kbdata/<id> 路径读文件；不存在时建软链，
+  # 已有异源路径绝不覆盖。这条路 2026-08-17 起只是兼容存量，新装一律用容器
+  # （宿主机形态没有一行在版本库里，孤儿进程与两份代码拷贝都出在它身上）。
   if [ -e /kbdata ] || [ -L /kbdata ]; then
     [ /kbdata -ef "$KBDATA_REAL" ] \
       || die "宿主 /kbdata 已存在但未指向 $KBDATA_REAL，请人工处理冲突"
@@ -103,7 +117,6 @@ else
   [ "/kbdata/$PROBE_NAME" -ef "$PROBE_HOST" ] \
     || die "宿主解析服务看到的 /kbdata 与持久目录不同源"
 fi
-
 # 宿主上的 curl 不一定能解析容器专用的 host.docker.internal；用 server 容器同款网关映射，
 # 但 URL、端口与 Host 头仍严格来自 settings。
 SERVICE_RESOLVE="$(python3 - "$SERVICE_URL" <<'PY'

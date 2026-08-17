@@ -14,7 +14,7 @@
 |---|---|
 | `registry_snapshot.json` 没导入 | **少 90 条人工沉淀的 SQL 样例 + 48 条教训**——「本月销售额按省份的分布」这类问句直接答「不可计算」，而老服务器答得出来 |
 | 98 条 SQL 样例没有向量 | 库里有也召回不到 |
-| `dms-ai-embed` 是手工起的裸进程 | systemd 单元 `inactive`，重启机器服务就没了，部署换代码它也不跟着变 |
+| `dms-ai-embed` 是手工起的裸进程 | 没有 systemd 单元，重启机器服务就没了，部署换代码它也不跟着变（**2026-08-17 起这套服务已改成容器**，见下） |
 | 源码平铺在 `/opt/dms-ai/` 根上 | 没有 `app` 链接和 `releases/`，**没有回滚位**，也没有原子切换 |
 
 **最要命的是这四条在 `/api/health` 上全是绿的**——`ok=true`、`vector_ready` 三个 true、
@@ -36,7 +36,7 @@
 bash deploy.sh
 ```
 
-它会先探测目标机的五个前置（配置 / venv / PG 容器 / web 容器 / systemd 单元），
+它会先探测目标机的五个前置（配置 / venv / PG 容器 / web 容器 / 向量服务），
 **缺任何一个就自动补齐**，不需要你记得加参数。然后：上传源码 → 服务器构建镜像（5-10 分钟）
 → 让向量服务跟上新代码 → 原子切换 API → 更新前端 → 导入业务字典种子（幂等）
 → **逐表对账验收**。任何一步失败都会退回旧版本，生产不会停在半路。
@@ -46,6 +46,26 @@ bash deploy.sh
 同一条命令。`--bootstrap` 仍然接受（强制铺前置），但**不加也不会漏**——探测会发现。
 
 机器上只需要预装 **Docker（含 compose 插件）** 和 **Python 3**。
+
+### 向量·精排·解析服务已经是容器了
+
+不用再装 systemd 单元、不用在服务器上建 venv 装 LibreOffice/tesseract ——
+`deploy.sh` 会构建并起 `dms-ai-embed` 容器，依赖与代码都在镜像里，
+带 `--restart unless-stopped`，**机器重启自己回来**。单独装/重装：
+
+```bash
+DMS_RUNTIME_ROOT=/opt/dms-ai bash /opt/dms-ai/app/scripts/embed-install.sh
+```
+
+服务器上已经有旧形态（systemd 单元或手工起的裸进程）在占 8078 时，它会**拒绝并说清占用者是谁**。
+确认可以中断向量服务几秒后：
+
+```bash
+DMS_EMBED_TAKEOVER=1 bash /opt/dms-ai/app/scripts/embed-install.sh
+```
+
+实测（2026-08-17，Ubuntu + Docker 29）：镜像 1.11GB，9 种格式解析全绿
+（pdf/docx/pptx/xlsx/txt/doc/xls/ppt/图片 OCR），重启 docker 守护进程后容器自己回来。
 
 ### 只想验证包是好的，先不连服务器
 

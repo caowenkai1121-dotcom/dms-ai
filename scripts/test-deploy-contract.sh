@@ -15,9 +15,15 @@ for script in tools/*.sh scripts/*.sh; do
   }
 done
 
-restart="$(cat scripts/server-restart.sh)"
-deploy="$(cat tools/deploy_update.sh)"
-web_update="$(cat scripts/web-update.sh)"
+# 🔴 判据必须钉在**代码**上。注释里把「为什么」写清楚是本仓的纪律，但不能让注释把判据喂饱 ——
+# 2026-08-17 一天之内在反向验证里抓到三次同一形状：`grep -Fq '--restart unless-stopped'`
+# 命中的是头注那句说明，把 `docker run` 里真正的那个参数拆掉，判据纹丝不动。
+# 所以下面所有源码变量一律先剥掉整行注释（`#` 开头），一处根治，不再逐条改字符串。
+code_only() { grep -vE '^[[:space:]]*#'; }
+
+restart="$(code_only < scripts/server-restart.sh)"
+deploy="$(code_only < tools/deploy_update.sh)"
+web_update="$(code_only < scripts/web-update.sh)"
 
 # 🔴 精排两条也在合同里：它默认接本机 embed 服务（同进程同端口的千问适配层）。
 # 掉回「未设即关」不会报错 —— 检索只是排不到第一（生产实测 recall@6=0.95 / recall@1=0.15），
@@ -53,7 +59,7 @@ for required in \
   }
 done
 
-deploy_py="$(cat tools/_deploy.py)"
+deploy_py="$(code_only < tools/_deploy.py)"
 for required in 'RejectPolicy()' 'sha256sum' 'sys.exit(rc)'; do
   grep -Fq "$required" <<<"$deploy_py" || {
     echo "_deploy.py 缺安全上传合同：$required" >&2
@@ -151,10 +157,9 @@ grep -Fq 'DEPLOY_SRC_TAR 与 DEPLOY_WEB_TAR 必须同时提供' <<<"$deploy" || 
 }
 
 # 全新机器 bootstrap：这几条是现网靠人手搭出来、仓库里长期没有记录的部分，掉一条就得重新摸索。
-bootstrap="$(cat scripts/server-bootstrap.sh)"
+bootstrap="$(code_only < scripts/server-bootstrap.sh)"
 for required in \
-  'app/tools/embed_service.py' \
-  'DMSAI_SETTINGS=' \
+  'scripts/embed-install.sh' \
   '--add-host host.docker.internal:host-gateway' \
   'DMS_AI_PG_BIND' \
   "unnest(ARRAY['age','vector','pg_trgm'])" \
@@ -165,13 +170,46 @@ for required in \
     exit 1
   }
 done
-# 单元里的 ExecStart 必须走 app/（跟着 release 走）。指回 RUNTIME_ROOT 下的独立拷贝，
-# 部署换了代码 embed 服务不会跟着变，而症状只是「检索变差」，不报任何错。
-# 正判据：直接钉 ExecStart 那一行本身，而不是「不许出现某种写法」——
-# 第一版写的是负判据 `[^/]tools/...`，而真实的坏写法是 `$RUNTIME_ROOT/tools/...`，
-# 前面恰好是斜杠，于是那条判据反向验证时纹丝不动（2026-08-17 实测 rc=0）。
-grep -Eq 'ExecStart=.*app/tools/embed_service\.py' <<<"$bootstrap" || {
-  echo "server-bootstrap 的 systemd 单元没指向 app/tools，改 embed_service.py 将不生效" >&2
+# 🔴 向量/解析服务 2026-08-17 起是**容器**：代码进镜像，部署换代码＝重建镜像换容器。
+# 退回 systemd 单元那套的代价已经付过两次（8078 上的孤儿裸进程 / RUNTIME_ROOT 下第二份
+# 代码拷贝），所以 bootstrap 里不许再出现写单元文件的写法。
+! grep -Fq 'ExecStart=' <<<"$bootstrap" || {
+  echo "server-bootstrap 又在写 systemd 单元：应改用容器（scripts/embed-install.sh）" >&2
+  exit 1
+}
+# 🔴 钉「可执行构造」，不是「字符串出现过」。剥掉注释还不够 —— echo/die 的**文案**里
+# 同样会写这些字面量（`step "…--restart unless-stopped…"`、die 里的用法提示），
+# 那和注释一样能把判据喂饱。所以带上行继续符或判断骨架。
+install="$(code_only < scripts/embed-install.sh)"
+for required in \
+  'docker build -f docker/embed/Dockerfile' \
+  '--restart unless-stopped \' \
+  'target=/kbdata' \
+  'target=/app/settings.json,readonly' \
+  '[ "$TAKEOVER" = 1 ] ||'   'TAKEOVER="${DMS_EMBED_TAKEOVER:-0}"'; do
+  grep -Fq -- "$required" <<<"$install" || {
+    echo "embed-install 缺容器安装合同：$required" >&2
+    exit 1
+  }
+done
+# 镜像里一个凭据都没有：settings 与密钥都必须运行时注入。COPY 进层就再也删不掉。
+dockerfile="$(code_only < docker/embed/Dockerfile)"
+! grep -Eq '^COPY .*settings[.]docker[.]json|^COPY .*[.]secret_key' <<<"$dockerfile" || {
+  echo "embed 镜像 COPY 了凭据：镜像层可 docker save/可推仓库，明文一旦进层就删不掉" >&2
+  exit 1
+}
+grep -Fq 'COPY tools/requirements-embed.txt' <<<"$dockerfile" || {
+  echo "embed 镜像不再用 tools/requirements-embed.txt：依赖清单会分裂成两份" >&2
+  exit 1
+}
+grep -Fq 'COPY tools/embed_service.py tools/settings.py' <<<"$dockerfile" || {
+  echo "embed 镜像少 COPY 了 settings.py：embed_service 从同目录 import 它，会 ImportError" >&2
+  exit 1
+}
+# 解析服务容器名不许写死一个：新形态叫 dms-ai-embed，旧运输壳叫 dms-ai-parser，都要认；
+# 认不出就整段跳过 /kbdata 同源校验，而那条校验防的是「稳定 404」。
+grep -Fq 'for cand in ${DMS_PARSER_CONTAINER:-} dms-ai-embed dms-ai-parser' <<<"$restart" || {
+  echo "server-restart 又把解析服务容器名写死了：容器形态的 /kbdata 同源校验会整段跳过" >&2
   exit 1
 }
 
@@ -185,7 +223,7 @@ grep -Fq "docker/web/nginx.conf" <<<"$deploy" || {
   echo "deploy_update 不再同步 nginx.conf：改 Web 网关配置将静默不生效" >&2
   exit 1
 }
-embed_sync="$(cat scripts/embed-sync.sh)"
+embed_sync="$(code_only < scripts/embed-sync.sh)"
 for required in 'systemctl show -p ExecStart' 'systemctl show -p WorkingDirectory' 'sha256sum' 'restore' 'd.get("ok") is not True'; do
   grep -Fq -- "$required" <<<"$embed_sync" || {
     echo "embed-sync 缺同步/自证/回滚合同：$required" >&2
@@ -196,7 +234,7 @@ done
 # 部署包的上线判据：2026-08-17 现场那台「部署成功、/api/health 全绿、答案变差」——
 # 业务字典种子没导（sql_exemplar 少 90 行、memory 少 48 行），而 health 的 vector_ready
 # 只覆盖 datasource/element/table_doc 三张表，样例表根本不在里面。三条一起钉。
-bundle="$(cat tools/bundle-deploy.sh)"
+bundle="$(code_only < tools/bundle-deploy.sh)"
 # 判据本体 2026-08-17 起收口进 scripts/server-verify.sh（下面另有一组钉它），
 # 入口这边只需保证「探测缺口 + 导种子 + 调那份共享判据」三件都还在。
 for required in   '探测目标形态'   'registry_snapshot.py import'   'server-verify.sh'; do
@@ -213,7 +251,7 @@ done
 
 # 上线判据必须是**一份**，且挂在「谁部署都躲不开」的位置上：server-restart.sh 收尾。
 # 手工解包的人不会跑 deploy.sh，但一定会跑 server-restart.sh（2026-08-17 现场教训）。
-verify="$(cat scripts/server-verify.sh)"
+verify="$(code_only < scripts/server-verify.sh)"
 # 🔴 断言必须钉在**代码**上，不能钉在「文里提到过」上：注释里写清楚为什么，
 # 结果判据被注释喂饱、拆掉真正的实现照样绿 —— 2026-08-17 反向验证当场抓到三条这样的。
 for required in   'meta.sql_exemplar'   'count(*) FILTER (WHERE embedding IS NOT NULL)'   'STATE="$(systemctl is-active dms-ai-embed'   '[ "$ADVISORY" = 1 ]'   '"$RUNTIME_ROOT/seed/registry_snapshot.json"'; do

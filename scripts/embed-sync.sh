@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# 让宿主机上的 embed/rerank/parse 服务跟上刚切过去的 release，并**证明**它跟上了。
+# 让向量·精排·解析服务跟上刚构建好的这份代码，并**证明**它跟上了。
+#
+# 服务有两种形态，本脚本认形态分派（部署侧只调这一条，不必知道对面是哪种）：
+#   ① 容器（2026-08-17 起的生产形态）：代码在镜像里 → 重建镜像 + 换容器，
+#      交给 `scripts/embed-install.sh`（幂等；占用者是自家容器时不需要 TAKEOVER）；
+#   ② 宿主机 systemd 单元（存量兼容）：代码是 RUNTIME_ROOT 下一份**独立拷贝**。
 #
 # 为什么需要这一步：dms-ai-server 走容器、跟着 app 链接换版本，而向量服务是宿主机 systemd
 # 单元。现网这个单元执行的是 `$RUNTIME_ROOT/tools/embed_service.py` —— 一份与 release 无关的
@@ -16,12 +21,25 @@ APP_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 RUNTIME_ROOT="${DMS_RUNTIME_ROOT:-/opt/dms-ai}"
 RUNTIME_ROOT="${RUNTIME_ROOT%/}"
 UNIT="${DMS_EMBED_UNIT:-dms-ai-embed}"
+NAME="${DMS_EMBED_CONTAINER:-dms-ai-embed}"
 RELEASE_FILE="$APP_ROOT/tools/embed_service.py"
 
 [ -f "$RELEASE_FILE" ] || die "release 里没有 tools/embed_service.py：$RELEASE_FILE"
 
+# ── 形态①：容器。代码在镜像里，重建即换代码；install 脚本自带起飞自检。
+if command -v docker >/dev/null 2>&1 && docker inspect "$NAME" >/dev/null 2>&1; then
+  echo "解析服务是容器形态（$NAME）：重建镜像并换容器"
+  # 占用 8078 的就是它自己，接管无需人工确认 —— TAKEOVER 那道闸防的是「踩掉别人的服务」。
+  DMS_RUNTIME_ROOT="$RUNTIME_ROOT" DMS_EMBED_CONTAINER="$NAME" DMS_EMBED_TAKEOVER=1 \
+    bash "$APP_ROOT/scripts/embed-install.sh"
+  exit 0
+fi
+
+# ── 形态②：宿主机 systemd 单元（存量）。
 if ! command -v systemctl >/dev/null || ! systemctl cat "$UNIT" >/dev/null 2>&1; then
-  echo "SKIP: 没有 systemd 单元 $UNIT（裸机/开发机形态），embed 服务请自行重启"
+  echo "SKIP: 既没有容器 $NAME，也没有 systemd 单元 $UNIT。"
+  echo "      若 8078 上仍有响应，那是个**没人管的裸进程**：重启机器即失，部署换代码它也不跟着变。"
+  echo "      装成容器：DMS_RUNTIME_ROOT=$RUNTIME_ROOT DMS_EMBED_TAKEOVER=1 bash $APP_ROOT/scripts/embed-install.sh"
   exit 0
 fi
 
@@ -85,7 +103,8 @@ import json, sys
 d = json.load(sys.stdin)
 if d.get("ok") is not True or not d.get("model") or not d.get("dim"):
     raise SystemExit(f"embed 服务不健康：{d}")
-print(f"embed-synced: model={d.get(\"model\")} dim={d.get(\"dim\")} rerank={d.get(\"rerank_model\")}")
+# 同 embed-install.sh：3.10 的 f-string 表达式里不许有反斜杠，改 %% 格式化
+print("embed-synced: model=%s dim=%s rerank=%s" % (d.get("model"), d.get("dim"), d.get("rerank_model")))
 ' || { restore; die "$UNIT 重启后健康检查未通过"; }
 
 # 🔴 收尾判据：跑着的那份必须与 release 逐字节一致。没有这一条，上面全绿也可能只是
@@ -93,3 +112,5 @@ print(f"embed-synced: model={d.get(\"model\")} dim={d.get(\"dim\")} rerank={d.ge
 [ "$(sha256sum < "$RUNNING_FILE")" = "$(sha256sum < "$RELEASE_FILE")" ] \
   || { restore; die "同步后 $RUNNING_FILE 仍与 release 不一致"; }
 [ -z "$BACKUP" ] || rm -f "$BACKUP"
+echo "提示：宿主机形态是存量兼容。新装/迁移一律用容器（scripts/embed-install.sh）——"
+echo "      依赖、代码、启动方式一起进版本库，且 --restart unless-stopped 天然开机自启。"

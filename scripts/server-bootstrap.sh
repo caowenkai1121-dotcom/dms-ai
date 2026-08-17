@@ -155,48 +155,18 @@ else
   echo "WARN 无 apt-get 且无 tesseract：扫描件走不了 OCR 档"
 fi
 
-step "7/9 systemd 单元 dms-ai-embed（千问 text-embedding-v4 + gte-rerank-v2 + 文档解析）"
-# 🔴 ExecStart 走 $RUNTIME_ROOT/app/tools/…，即**跟着 release 走的那一份**。
-# 现网历史上是 WorkingDirectory=$RUNTIME_ROOT + tools/embed_service.py，指的是 RUNTIME_ROOT 下
-# 一份独立拷贝 —— 部署换了 release，这份不会跟着变，改 embed_service.py 等于没改，
-# 而症状只是「检索质量变差」，不报任何错。新机器一律用 app/ 这一份，一处收口。
-# DMS_SECRET_KEY 由 sh -c 现读 .secret_key：不在 unit 文件里留第二份密钥副本。
-if [ -f "$UNIT" ] && grep -q 'app/tools/embed_service.py' "$UNIT"; then
-  echo "KEEP $UNIT（已指向 app/tools）"
-else
-  [ -f "$UNIT" ] && echo "NOTE 覆盖旧单元（旧的没指向 app/tools，改代码不会生效）"
-  cat > "$UNIT" <<EOF
-[Unit]
-Description=dms-ai embed/rerank/parse service (Qwen text-embedding-v4 + gte-rerank-v2 + doc parse)
-After=network.target docker.service
-
-[Service]
-Type=simple
-WorkingDirectory=$RUNTIME_ROOT
-Environment=DMSAI_SETTINGS=$SETTINGS_FILE
-ExecStart=/bin/sh -c 'DMS_SECRET_KEY=\$(cat $SECRET_FILE) exec $VENV/bin/python3 $RUNTIME_ROOT/app/tools/embed_service.py serve 8078 172.17.0.1'
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  echo "OK  写入 $UNIT"
-fi
-systemctl enable --now dms-ai-embed >/dev/null 2>&1 || true
-systemctl restart dms-ai-embed
-for _ in $(seq 1 30); do
-  curl -fsS -m 3 http://172.17.0.1:8078/health >/dev/null 2>&1 && break
-  sleep 2
-done
-curl -fsS -m 5 http://172.17.0.1:8078/health | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-if d.get("ok") is not True or not (d.get("parse_ok") or {}).get("text"):
-    raise SystemExit(f"embed 服务不健康：{d}")
-print(f"OK  embed 服务：model={d.get(\"model\")} dim={d.get(\"dim\")} rerank={d.get(\"rerank_model\")}")
-' || die "embed 服务未就绪（journalctl -u dms-ai-embed -n 50）"
+step "7/9 向量·精排·解析服务（容器形态）"
+# 🔴 2026-08-17 起这套服务是**容器**，不再是宿主机 venv + systemd 单元。
+# 换形态的原因是一天之内撞到的两笔账：
+#   ① 第二台生产机上压根没装单元，8078 上是个手工起的裸 python —— 重启即失、
+#      部署换代码也不跟着变，而 `/api/health` 全绿（哑掉的降级）；
+#   ② 单元跑的 `$RUNTIME_ROOT/tools/embed_service.py` 与 release 里那份是两份拷贝，
+#      靠人手同步（`scripts/embed-sync.sh` 就是给它写的补丁）。
+# 装进镜像后：依赖、代码、启动方式一起进版本库，`--restart unless-stopped` 天然开机自启，
+# 部署换代码＝重建镜像换容器，两份拷贝的问题从根上消失。
+# venv 仍然要有 —— `registry_snapshot.py` 的快照导入跑在它上面（第 5 步），那是另一件事。
+DMS_RUNTIME_ROOT="$RUNTIME_ROOT" DMS_EMBED_TAKEOVER=1 bash "$APP_ROOT/scripts/embed-install.sh" \
+  || die "向量/解析服务安装失败"
 
 step "8/9 Web 容器 dms-ai-web（nginx 托管前端产物）"
 # web-update.sh 只更新**已存在**的容器，容器不存在时它打印 SKIP 就退出 0 ——

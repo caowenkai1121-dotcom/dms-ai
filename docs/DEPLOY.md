@@ -94,10 +94,35 @@ DMS_RUNTIME_ROOT=/opt/dms-ai DMS_SEED_DIR=/opt/dms-ai/seed bash <release>/script
 而 API 侧只表现为检索变差），写 systemd 单元并探 `/health`，最后建 `dms-ai-web` 容器
 （`--add-host host.docker.internal:host-gateway` 不能省，nginx 启动期解析不到就 emerg 拒启、全站宕）。
 
-单元的 `ExecStart` 指向 `$RUNTIME_ROOT/app/tools/embed_service.py` —— **跟着 release 走的那一份**。
-现网历史上指的是 `$RUNTIME_ROOT/tools/` 下一份独立拷贝，部署换了代码它不会跟着变，
-症状只是检索/解析变差、不报任何错；`scripts/embed-sync.sh` 在每次部署时同步并自证
-（比对 sha256 + 重启后探 `/health`），两种布局都收得住。
+### 向量·精排·解析服务：容器形态（2026-08-17 起）
+
+这套服务不再是「宿主机 venv + systemd 单元」，而是一个容器：
+
+```bash
+DMS_RUNTIME_ROOT=/opt/dms-ai bash scripts/embed-install.sh
+```
+
+`docker/embed/Dockerfile` 把依赖（LibreOffice 三件套、tesseract+chi_sim、
+`tools/requirements-embed.txt` 里那十个包）与代码（`embed_service.py` + `settings.py`）
+一起装进镜像；容器带 `--restart unless-stopped`，**机器重启自己回来**。
+
+换形态的原因是两笔实账：① 第二台生产机上压根没装单元，8078 上是个手工起的裸 python ——
+重启即失、部署换代码也不跟着变，而 `/api/health` 全绿；② 单元跑的
+`$RUNTIME_ROOT/tools/embed_service.py` 与 release 里那份是两份拷贝，靠人手同步。
+装进镜像后这两个问题从根上消失：部署换代码＝重建镜像换容器。
+
+- **接管旧形态**要显式开：`DMS_EMBED_TAKEOVER=1`（会中断向量服务数秒，时机由运维定）。
+- 镜像里**一个凭据都没有**：settings 运行时只读挂到 `/app/settings.json`，
+  `DMS_SECRET_KEY` 运行时注入。
+- `/kbdata` 与 `dms-ai-server` 挂**同一个宿主目录** —— 解析接口收到的是路径不是字节，
+  指错目录会稳定 404。`server-restart.sh` 的预检会核对这一条（按容器名清单找：
+  `dms-ai-embed` → `dms-ai-parser`）。
+- 存量的 systemd 形态仍兼容：`scripts/embed-sync.sh` 认形态分派 ——
+  容器就重建镜像换容器，单元就同步文件 + 重启 + 比对 sha256。
+
+2026-08-17 在 38.76.188.118 实测：镜像 1.11GB，解析能力 9/9 全绿
+（pdf/docx/pptx/xlsx/text/doc/xls/ppt/image），`systemctl restart docker` 后容器自己回来、
+首次探活即通过；外来进程占着 8078 时无 `TAKEOVER` 非零退出。
 
 知识库解析接口接收的是 `/kbdata/<doc_id>.<ext>` **路径，不是文件字节**，所以 Rust 容器和解析服务必须读取同一宿主目录：
 
