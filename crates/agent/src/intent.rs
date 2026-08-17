@@ -1449,9 +1449,39 @@ fn metric_surface_grounded(metric: &str, question: &str) -> bool {
     let aliases: &[&str] = match metric {
         "库存量" | "库存数量" | "库存总量" => &["库存", "存货"],
         "订单数" | "订单数量" => &["订单数", "订单数量", "多少订单", "几笔订单"],
-        _ => return false,
+        _ => &[],
     };
-    aliases.iter().any(|alias| contains_folded(question, alias))
+    if aliases.iter().any(|alias| contains_folded(question, alias)) {
+        return true;
+    }
+    // 🔴 计数族用**结构判据**，不再往上面那张手工表里加名字
+    //（2026-08-17：「库存量超过100万的仓库有几个」被判 `metric-not-in-question` —— 模型把
+    // 「仓库有几个」抽成指标「仓库数量」，语义完全对，却不是问句子串，整份合同作废、
+    // 自由 SQL 关闭、落 need-intent。本仓纪律：手工名单永远有下一个漏项）。
+    //
+    // 两个条件**同时**满足才算落地，缺一不可：
+    //   ① 指标是「<名词> + 数量/个数/总数/数」这种计数形态，且那个名词在问句里出现；
+    //   ② 问句里确实在问「几个/多少家/……」。
+    // 只放宽①会让「销售额数」这种胡诌的指标混过去；只放宽②会让任意指标搭个计数疑问词
+    // 就落地。合起来钉的是「用户问了 X 有几个，模型答 X 的数量」这一件事。
+    const COUNT_SUFFIXES: &[&str] = &["数量", "个数", "总数", "数"]; // 长的在前：「仓库数量」剥成「仓库」而不是「仓库数」
+    const COUNT_ASKS: &[&str] = &[
+        "几个", "几家", "几笔", "几条", "几人", "几位", "几张", "几种", "几款",
+        "多少个", "多少家", "多少笔", "多少条", "多少人", "多少位", "多少张",
+        "多少种", "多少款", "有多少", "数量", "个数", "总数", "计数", "统计",
+    ];
+    if let Some(head) = COUNT_SUFFIXES
+        .iter()
+        .find_map(|suffix| metric.strip_suffix(suffix))
+    {
+        if !head.is_empty()
+            && contains_folded(question, head)
+            && COUNT_ASKS.iter().any(|ask| contains_folded(question, ask))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn intent_from_reply(content: &str, question: &str) -> Option<ResolvedIntent> {
@@ -1477,6 +1507,61 @@ enum IntentAttemptState {
     Ready(ResolvedIntent),
     Unavailable,
     Invalid,
+}
+
+/// 单个 subgoal 就是整句话时，把它展平掉——它根本不是「子」目标。
+///
+/// 🔴 2026-08-17 生产日志实测。「库存量超过100万的仓库有几个」这样一句普通问句，
+/// 模型把它整句包进 `subgoals`（唯一一个 subgoal 的 surface 逐字等于原问句，
+/// 槽位与父级重复），于是 grounding 判 `subgoal-slot-not-attributable` → 整份
+/// 合同 Invalid → 自由 SQL 关闭 → need-intent 反问卡。
+///
+/// 要害在于**同一个槽位两套判据**：`metrics:["仓库数量"]` 在根级是被接受的
+/// （指标是概念名，本来就不要求是问句子串），进了 subgoal 却要求由该 subgoal 的
+/// surface/evidence 承载 —— 于是模型多包一层，一份本来合法的合同就翻成 Invalid。
+/// 严判据对**真**复合问句是对的（子问不许互相偷槽位），对一个假分解是误伤。
+///
+/// 判据刻意窄：只认「surface 逐字等于整句问句」这一种退化形态。真的两段式复合
+/// 问句（surface 是问句的一部分）一个不碰，那条严判据照旧生效。
+/// 槽位取并集后再清空 subgoals：根级已有的不覆盖，根级没有的补上，一条不丢。
+fn flatten_degenerate_single_subgoal(intent: &mut IntentV1, question: &str) {
+    let [only] = intent.subgoals.as_slice() else {
+        return;
+    };
+    if !folded_eq(only.surface.trim(), question.trim()) {
+        return;
+    }
+    let only = intent.subgoals.remove(0);
+    tracing::info!(
+        surface = %only.surface,
+        "唯一 subgoal 的 surface 等于整句问句 → 不是分解，展平后按普通合同判"
+    );
+    // 根级为空的槽位才从 subgoal 补：模型在根级写过的东西优先，一条不覆盖。
+    if intent.goals.is_empty() {
+        intent.goals = only.goals;
+    }
+    if intent.metrics.is_empty() {
+        intent.metrics = only.metrics;
+    }
+    if intent.entity_mentions.is_empty() {
+        intent.entity_mentions = only.entity_mentions;
+    }
+    if intent.filters.is_empty() {
+        intent.filters = only.filters;
+    }
+    if intent.regions.is_empty() {
+        intent.regions = only.regions;
+    }
+    if intent.time.is_none() {
+        intent.time = only.time;
+    }
+    if intent.breakdowns.is_empty() {
+        intent.breakdowns = only.breakdowns;
+    }
+    if intent.comparisons.is_empty() {
+        intent.comparisons = only.comparisons;
+    }
+    intent.requested_detail |= only.requested_detail;
 }
 
 /// 用户在问句里**现场定义过**的词，模型不许再拿它当歧义否决执行。
@@ -1534,6 +1619,7 @@ impl IntentAttempt {
         if !intent.normalize() {
             return Self::Invalid;
         }
+        flatten_degenerate_single_subgoal(&mut intent, question);
         drop_ambiguities_the_user_already_answered(&mut intent, question);
         match intent.ground(question) {
             Some(intent) => Self::from_resolved(intent),
@@ -2825,6 +2911,71 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 计数族指标的落地判据是**结构**，不是名单（名单永远有下一个漏项）。
+    #[test]
+    fn a_counting_metric_grounds_on_shape_not_on_a_hand_list() {
+        // 正：问句里既有那个名词、又在问「几个」
+        assert!(super::metric_surface_grounded("仓库数量", "库存量超过100万的仓库有几个"));
+        assert!(super::metric_surface_grounded("客户数量", "华东有多少家客户"));
+        assert!(super::metric_surface_grounded("商品个数", "临期商品有几种"));
+        // 负①：问句里没有那个名词 —— 只有计数疑问词不算
+        assert!(!super::metric_surface_grounded("仓库数量", "本月有几个大促活动"));
+        // 负②：问句里没在问计数 —— 只有名词也不算
+        assert!(!super::metric_surface_grounded("仓库数量", "仓库的库存分布"));
+        // 负③：剥完为空的不算指标
+        assert!(!super::metric_surface_grounded("数量", "有几个仓库"));
+        // 负④：胡诌的指标不许搭个计数疑问词就落地
+        assert!(!super::metric_surface_grounded("毛利率", "华东有多少家客户"));
+    }
+
+    /// 模型把整句话包进唯一一个 subgoal，本来合法的合同被翻成 Invalid
+    /// （2026-08-17 生产日志逐字取样）。
+    #[test]
+    fn a_single_subgoal_that_is_the_whole_question_is_not_a_decomposition() {
+        let q = "库存量超过100万的仓库有几个";
+        // 逐字取自生产日志的模型回包
+        let raw = concat!(
+            r#"{"version":2,"mode":"data","subgoals":[{"mode":"data","surface":"库存量超过100万的仓库有几个","#,
+            r#""evidence_surfaces":[],"goals":["统计仓库数量"],"metrics":["仓库数量"],"#,
+            r#""entity_mentions":[{"surface":"仓库","kind":"other"}],"#,
+            r#""filters":[{"name":"库存量","operator":"gt","value_surface":"100万"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false}],"#,
+            r#""goals":["统计仓库数量"],"metrics":["仓库数量"],"#,
+            r#""entity_mentions":[{"surface":"仓库","kind":"other"}],"#,
+            r#""filters":[{"name":"库存量","operator":"gt","value_surface":"100万"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#
+        );
+        let attempt = IntentAttempt::validated(parse_intent_strict(raw).expect("合法 JSON"), q);
+        let ready = attempt
+            .ready()
+            .expect("整句话包一层 subgoal 不该让合同作废");
+        assert!(ready.subgoals.is_empty(), "退化 subgoal 应被展平");
+        assert_eq!(ready.mode, IntentMode::Data);
+        // 槽位一条不丢
+        assert!(ready.metrics.iter().any(|m| m == "仓库数量"));
+        assert!(ready.filters.iter().any(|f| f.name == "库存量"));
+        assert!(attempt.is_data_executable(), "展平后应当可执行");
+
+        // 反向：**真**复合问句（surface 只是问句的一部分）一个不碰 —— 直接钉纯函数，
+        // 不经整条 validated 管线：那样这条判据只回答「我改的这件事对不对」，
+        // 不会因为别处的 grounding 规则变动而无关地红/绿。
+        let q2 = "分别查本月销售额和本月订单数";
+        let mut compound = parse_intent_strict(concat!(
+            r#"{"version":2,"mode":"hybrid","subgoals":["#,
+            r#"{"mode":"data","surface":"本月销售额","evidence_surfaces":[],"goals":[],"metrics":["销售额"],"#,
+            r#""entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false}],"#,
+            r#""goals":[],"metrics":[],"entity_mentions":[],"filters":[],"regions":[],"time":null,"#,
+            r#""breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#
+        ))
+        .expect("合法 JSON");
+        super::flatten_degenerate_single_subgoal(&mut compound, q2);
+        assert_eq!(
+            compound.subgoals.len(),
+            1,
+            "surface 只是问句的一部分 ⇒ 是真分解，不许展平"
+        );
+    }
 
     /// 用户现场定义过的词，模型不许再拿它当歧义否决执行（2026-08-17 生产日志实测）。
     #[test]
