@@ -31,6 +31,9 @@ pub struct AskCtx<'a> {
     pub question: &'a str,
     /// Fast 模型提取的表面槽位合同；仅 `Ready` 可开放缓存与自由 SQL。
     pub intent_attempt: &'a IntentAttempt,
+    /// 本轮**裁决**出来的路由（`AskPlan.route`）。收据报它，不报合同的意见 ——
+    /// 用户点了 chip 时两者会不一致，报合同就等于把用户的表态当没发生。
+    pub decided_route: crate::intent::IntentRoute,
     pub intent: Option<&'a IntentV1>,
     pub ds: &'a str,
     /// 用户可见的实际查询目标名。主逻辑源 `dms` 可能热切到 `doris_warehouse`；
@@ -792,7 +795,7 @@ pub(crate) fn attach_intent_summary(
             cx.source.dialect(),
         ))
     };
-    r.intent_summary = Some(cx.intent_attempt.summary(coverage.as_ref(), evidence));
+    r.intent_summary = Some(cx.intent_attempt.summary(coverage.as_ref(), evidence, cx.decided_route));
 }
 
 /// FNV-1a 64 位偏移基（`sql_fingerprint` 与 `summary_cache_key` 共用同一算法起点）。

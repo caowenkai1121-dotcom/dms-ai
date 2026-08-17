@@ -398,7 +398,7 @@ async fn call(st: &AppState, login: &str, params: &Value) -> Result<Value, RpcFa
 async fn tool_ask(st: &AppState, p: &Principal, args: &Value) -> Result<String, RpcFail> {
     let question = req_str(args, "question")?;
     let ds = opt_str(args, "ds");
-    let prepared = crate::prepare_ask(st, &question, None).await;
+    let prepared = crate::prepare_ask(st, &question, None, None).await;
     // 🔴 Data / Knowledge / Unknown **同一个出口**（2026-08-16）。
     // 此前 `Knowledge` 臂直连 `kb_answer` —— 与 `/api/ask` 2026-08-14 修掉的缺陷一字不差：
     // 「线下-浏阳品元商贸有限公司」在 web 上修好了，从 MCP 进来照旧只答

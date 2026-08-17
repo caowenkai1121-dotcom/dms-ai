@@ -2426,10 +2426,14 @@ impl PreparedAsk {
     }
 }
 
+/// `forced` = 用户在前端 chip 上明确点的分诊。**必须从这里进**：
+/// 三个入口（`/api/ask`、`/api/ask/stream`、`/api/deep/compose`）都经过这一处，
+/// 在每个出口各补一次的老写法 2026-08-17 已经证明会漏（补一个漏三个）。
 async fn prepare_ask(
     st: &AppState,
     question: &str,
     prev: Option<dms_agent::ask::PrevTurn<'_>>,
+    forced: Option<IntentRoute>,
 ) -> PreparedAsk {
     let started_at = std::time::Instant::now();
     let usage = std::sync::Mutex::new(Vec::new());
@@ -2443,6 +2447,7 @@ async fn prepare_ask(
     // 模型超时、传输失败或协议输出不完整，都不能把一个已被确定性销售事实完整证明的
     // 明确问题变成反问。这里只恢复 NotReady；模型明确给出歧义的 Ready/Unknown 合同仍
     // 保持 fail-closed，绝不覆盖用户真实歧义。
+    let mut question = question.with_forced(forced);
     if !question.intent_attempt.is_ready() {
         if let Some(recovered) =
             dms_agent::answerers::fastpath_intent::recover_sales_intent(&question.effective_question, st.mysql.is_warehouse())
@@ -2499,7 +2504,25 @@ fn forced_routed_question(
             route,
             question: effective_question.to_string(),
         }),
-        IntentRoute::Data | IntentRoute::Knowledge | IntentRoute::Unknown => None,
+        // 🔴 合同没就绪 ≠ 用户没说清楚。这两件事本来被折成同一个 `Unknown`，
+        // 于是用户点了「问数」还被反问「尚未确定应使用问数还是知识检索」——
+        // 他刚刚回答过这个问题（2026-08-17 业主截图）。
+        //
+        // 更糟的是**点 chip 比不点更差**：不点时 `forced=None`，问句原样进两臂编排，
+        // 确定性成员照跑、知识库臂照跑；点了反而在 Router 之前就被拒掉，0 行 + 澄清卡。
+        // 用户的明确表态不但被丢掉，还把一条本来能答的路关掉了。
+        //
+        // 「作废合同不许被 chip 洗成可执行」这条纪律是对的，但它管的是**执行许可**，
+        // 不是**路由**。真闸在 `run.rs` 的 `LlmAnswerer::accept = is_data_executable()`，
+        // 它读 `ready()`，合同没就绪时恒 false —— 与 route 判成什么结构上无关。
+        // 所以这里放行 chip，自由 SQL 照样接不了单，放行的只是确定性车道。
+        // （同一条正确原则，歧义合同档早就用了：见下方 3990 一带的判据。）
+        IntentRoute::Unknown => Some(RoutedQuestion {
+            route,
+            question: effective_question.to_string(),
+        }),
+        // 合同判 Knowledge 而 chip 要 Data：不许反向「生造」数据合同，维持原样。
+        IntentRoute::Data | IntentRoute::Knowledge => None,
     }
 }
 
@@ -2628,8 +2651,8 @@ async fn api_ask(
             history.as_slice(),
         )
     });
-    let prepared = prepare_ask(&st, &req.question, prev).await;
     let forced = forced_route(req.intent.as_deref());
+    let prepared = prepare_ask(&st, &req.question, prev, forced).await;
     // Invalid/Unavailable/歧义/Unknown 不因 forced chip 越过 fail-closed；forced 只在可路由合同上覆盖。
     // 🔴 合同不可用**不等于**知识库不能答（2026-08-14 业主连续三次实测）。
     //
@@ -2685,8 +2708,8 @@ async fn api_ask_stream(
             history.as_slice(),
         )
     });
-    let prepared = prepare_ask(&st, &req.question, prev).await;
     let forced = forced_route(req.intent.as_deref());
+    let prepared = prepare_ask(&st, &req.question, prev, forced).await;
     // 🔴 合同不可用**不等于**知识库不能答（2026-08-14 业主连续三次实测）。
     //
     // 这道早退在 `match route` 之前，于是上一版加在 Unknown 臂上的知识库兜底是**死代码** ——
@@ -3984,14 +4007,29 @@ mod tests {
             "强制切路由不能把 Data 合同重新包装成伪 Knowledge Ready"
         );
 
-        // 🔴 forced chip 不许把作废/歧义合同「洗」成可执行请求 —— 这一半判据现在由
-        // `forced_routed_question` 自己承担（`intent_contract_ready` 那道 server 侧的
-        // 前置闸 2026-08-16 整体删除：它在确定性成员跑之前就拒答，正是裸单号吃反问卡的成因）。
-        assert!(
-            super::forced_routed_question(&IntentAttempt::Unavailable, "任意问句", IntentRoute::Data)
-                .is_none(),
-            "作废合同不许被 chip 洗成可执行"
-        );
+        // 🔴 这里曾经断言「作废合同 + chip → None」，把**缺陷本身写成了正确答案**
+        // （2026-08-17 业主截图：点了「问数」还被反问「尚未确定应使用问数还是知识检索」）。
+        // 它把两件事混成一件：
+        //   (a) 走哪条臂 —— chip 说了算，用户已经明确表态；
+        //   (b) 开不开自由 SQL —— 合同说了算，作废合同一律不开。
+        // (b) 的判据本来就在 `is_data_executable()`，与 route 结构上无关；
+        // 让 (b) 去吃掉 (a)，代价是整条确定性车道 + 知识库臂一起被关掉。
+        // 注意往下 8 行对**歧义合同**写的正是这条正确原则 —— 同一份纪律，两个档位待遇不同。
+        for (label, attempt) in [
+            ("Unavailable", IntentAttempt::Unavailable),
+            ("Invalid", IntentAttempt::Invalid),
+        ] {
+            for chip in [IntentRoute::Data, IntentRoute::Knowledge] {
+                let routed = super::forced_routed_question(&attempt, "任意问句", chip)
+                    .unwrap_or_else(|| panic!("{label} + chip {chip:?}：用户的明确表态不许被丢掉"));
+                assert_eq!(routed.route, chip, "{label}：必须走 chip 指的那条臂");
+            }
+            // (b) 照旧：合同没就绪，自由 SQL 一律接不了单 —— 这才是真闸。
+            assert!(
+                !attempt.is_data_executable(),
+                "{label}：作废合同不许可执行自由 SQL"
+            );
+        }
         let ambiguous = parse_intent_strict(
             r#"{"mode":"data","goals":["查询销售额"],"metrics":["销售额"],"entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":["请明确时间"]}"#,
         )

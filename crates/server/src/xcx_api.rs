@@ -457,7 +457,7 @@ pub async fn ask(
         .prev
         .as_ref()
         .map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
-    let prepared = crate::prepare_ask(&st, &gate.question, prev).await;
+    let prepared = crate::prepare_ask(&st, &gate.question, prev, None).await;
     // 🔴 Data / Knowledge / Unknown **同一个出口**（2026-08-16）。
     // 此前这里是四臂 `match`，`Knowledge` 直连 `kb_answer` —— 与 `/api/ask` 2026-08-14
     // 修掉的那个缺陷一字不差：「线下-浏阳品元商贸有限公司」在 web 上修好了，
@@ -487,7 +487,7 @@ pub async fn ask_stream(
         .prev
         .as_ref()
         .map(|(q, s)| (q.as_str(), s.as_deref(), &[][..], &[][..]));
-    let prepared = crate::prepare_ask(&st, &gate.question, prev).await;
+    let prepared = crate::prepare_ask(&st, &gate.question, prev, None).await;
     // 🔴 `Knowledge` 开流**之前先探一次确定性问数车道**（2026-08-16，与 `/api/ask/stream`
     // 同一个 `deterministic_data_probe`）。此前这里直接开 SSE —— 与 `/api/ask` 2026-08-14
     // 修掉的缺陷一字不差：「线下-浏阳品元商贸有限公司」在 web 上修好了，

@@ -120,6 +120,17 @@ pub struct PreparedQuestion {
     pub original_question: String,
     pub effective_question: String,
     pub intent_attempt: crate::intent::IntentAttempt,
+    /// 用户在前端 chip 上**明确点的**分诊（`Some(Data)` = 点了「问数」）。
+    ///
+    /// 🔴 这个字段就是 2026-08-17 那条 bug 的收口点。此前 chip 只活在 server 层，
+    /// `plan()` 给 `decide()` 的 `forced` 形参写死 `None`，于是 `decide()` 里那条
+    /// 「R0：用户自己点的 chip 最大」是**死代码**——生产从没执行过，却有一条恒绿单测
+    /// （直接调 `decide` 传 `Some`，绕开真实调用链）替它作保。
+    ///
+    /// 后果是 chip 对 agent 层完全不可见：`hybrid` 的 `kb_is_primary`、D03 让位规则、
+    /// `deterministic_fallback` 看到的都是「没人点过 chip」的世界，server 只能在每个
+    /// 出口各补一块补丁——补一个漏三个。把它接进来，那些补丁才有唯一事实源可依。
+    forced: Option<crate::intent::IntentRoute>,
     started_at: Instant,
 }
 
@@ -137,7 +148,19 @@ impl PreparedQuestion {
     /// `// ponytail: 一次 contains 扫 ~35 个词 vs 一次 DB 往返，不值得为它引入可变状态；`
     /// `// 真成热点再加 OnceCell。`
     pub fn plan(&self) -> AskPlan {
-        decide(&self.effective_question, &self.intent_attempt, None)
+        decide(&self.effective_question, &self.intent_attempt, self.forced)
+    }
+
+    /// 挂上用户点的 chip。server 在 `prepare_ask` 之后立刻调用 —— 越早越好：
+    /// 这之后所有读 `route()`/`plan()` 的地方自动看见用户的表态。
+    pub fn with_forced(mut self, forced: Option<crate::intent::IntentRoute>) -> Self {
+        self.forced = forced;
+        self
+    }
+
+    /// 用户点过 chip 吗（收据侧要据此判「这条路是谁定的」）。
+    pub fn forced(&self) -> Option<crate::intent::IntentRoute> {
+        self.forced
     }
 
     /// 🔴 路由从此**不再**直接读合同（`intent_attempt.route()`）。
@@ -161,6 +184,8 @@ impl PreparedQuestion {
             original_question: self.original_question.clone(),
             effective_question: routed.question.clone(),
             intent_attempt: self.intent_attempt.project(&routed.question, routed.route),
+            // typed child 继承父级的 chip：`projected_forced` 本来就只选与 chip 同路的那个孩子
+            forced: self.forced,
             started_at: self.started_at,
         }
     }
@@ -178,7 +203,7 @@ impl PreparedQuestion {
 
     pub fn intent_summary(&self) -> crate::intent::IntentSummary {
         self.intent_attempt
-            .summary(None, &crate::intent::ExecutionEvidence::default())
+            .summary(None, &crate::intent::ExecutionEvidence::default(), self.route())
     }
 }
 
@@ -434,6 +459,7 @@ pub fn prepared_for_test(question: &str) -> PreparedQuestion {
         original_question: question.to_string(),
         effective_question: question.to_string(),
         intent_attempt: crate::intent::IntentAttempt::Unavailable,
+        forced: None,
         started_at: Instant::now(),
     }
 }
@@ -465,6 +491,7 @@ pub async fn prepare_question(
         original_question: question.to_string(),
         effective_question,
         intent_attempt,
+        forced: None,
         started_at,
     }
 }
@@ -687,6 +714,8 @@ pub(crate) async fn ask_data_arm(
                 // 归一重试必须继承首轮合同：覆盖闸门已证明改写没有丢槽，再调一次模型只会
                 // 增加抖动与延迟。复合问题在进入本闭包前已拆开，因此不会误带父问题槽位。
                 intent_attempt: &intent_attempt,
+                // 裁决而非合同：chip 定的路要一路带到收据（见 `IntentAttempt::summary`）
+                decided_route: child_route,
                 intent: intent_attempt.ready().map(|intent| intent.as_ref()),
                 ds,
                 source_name,
@@ -2486,6 +2515,47 @@ fn looks_like_sql(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// chip 必须**真的**进 `decide()`。此前 `plan()` 把 `forced` 写死 `None`，
+    /// R0「用户自己点的 chip 最大」是死代码，却有一条恒绿单测（直接调 `decide` 传 `Some`）
+    /// 替它作保 —— 判据长得正好像缺的那条，于是没人发现生产从没执行过它。
+    /// 这条从 `PreparedQuestion` 打进去，走的是生产那条链。
+    #[test]
+    fn the_chip_actually_reaches_the_decision_not_just_decide_directly() {
+        use crate::intent::IntentRoute as R;
+        // 合同作废（Unavailable）时，不点 chip 裁决是 Unknown
+        let bare = super::prepared_for_test("京东和顺丰的大日期商品有哪些");
+        assert_eq!(bare.route(), R::Unknown, "没点 chip 时应当仍是 Unknown");
+        // 点了就必须是那条路 —— 两个方向都钉，免得修一边把另一边弄反
+        for chip in [R::Data, R::Knowledge] {
+            let picked = super::prepared_for_test("京东和顺丰的大日期商品有哪些")
+                .with_forced(Some(chip));
+            assert_eq!(picked.route(), chip, "chip {chip:?} 必须一路走到 plan()");
+            assert_eq!(picked.plan().reason, "forced", "裁决理由要写明是 chip 定的");
+            // 路由归路由，执行许可归执行许可：作废合同照旧不许开自由 SQL
+            assert!(
+                !picked.intent_attempt.is_data_executable(),
+                "chip 不是执行许可 —— 真闸在 is_data_executable()"
+            );
+        }
+        // 收据也要跟着翻：报裁决，不报合同
+        let d = super::prepared_for_test("随便问句").with_forced(Some(R::Data));
+        assert_eq!(d.intent_summary().mode, R::Data);
+        assert!(
+            !d.intent_summary().coverage.issues.iter().any(|i| i == "route:unknown"),
+            "用户已经点了 chip，不许再反问他「是问数还是知识检索」"
+        );
+        // 反向：没点 chip 就该照旧回问
+        assert!(
+            super::prepared_for_test("随便问句")
+                .intent_summary()
+                .coverage
+                .issues
+                .iter()
+                .any(|i| i == "route:unknown"),
+            "没人点 chip 时这条回问是对的，不许被一起删掉"
+        );
+    }
 
     /// 🔴 探针探到的是**库里的存储值**，而合同里的表面词是**用户原话** —— 两者天然不同形
     /// （`dimension_probe_values` 存在的唯一理由就是这个：City 补「市」、WarZone 补「战区」）。

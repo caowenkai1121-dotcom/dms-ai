@@ -1561,10 +1561,17 @@ impl IntentAttempt {
         }
     }
 
+    /// `decided` = 本轮**裁决**出来的路由（`AskPlan.route`），不是合同自己的意见。
+    ///
+    /// 🔴 收据此前读 `self.route()`（合同），而分诊读 `AskPlan.route`（裁决）——
+    /// 两份事实源。用户点了「问数」时裁决是 Data、合同是 Unknown，收据于是照着合同
+    /// 吐一句 `route:unknown`「尚未确定应使用问数还是知识检索」，而用户刚回答过。
+    /// `ask.rs` 的注释早写过「路由从此不再直接读合同」，收据没收到这个通知。
     pub fn summary(
         &self,
         coverage: Option<&CoverageReport>,
         evidence: &ExecutionEvidence,
+        decided: IntentRoute,
     ) -> IntentSummary {
         let mut issues = coverage.map(CoverageReport::issues).unwrap_or_default();
         for issue in &evidence.issues {
@@ -1591,11 +1598,12 @@ impl IntentAttempt {
         let slots = self
             .ready()
             .map_or_else(Vec::new, |intent| intent.slot_summaries(evidence));
-        if self.route() == IntentRoute::Unknown && issues.is_empty() {
+        // 只有**裁决**也说不清时才回问用户。chip 定了路的那些轮次，这条已经被回答过了。
+        if decided == IntentRoute::Unknown && issues.is_empty() {
             issues.push("route:unknown".into());
         }
         IntentSummary {
-            mode: self.route(),
+            mode: decided,
             status,
             slots,
             coverage: IntentCoverageSummary {
@@ -3376,7 +3384,7 @@ mod tests {
     #[test]
     fn intent_summary_keeps_grounded_and_resolved_states_distinct() {
         let attempt = grounded_attempt(INVENTORY, "小虎黑椒味烤肠500G的库存信息");
-        let grounded = attempt.summary(None, &ExecutionEvidence::default());
+        let grounded = attempt.summary(None, &ExecutionEvidence::default(), attempt.route());
         assert!(grounded
             .slots
             .iter()
@@ -3388,6 +3396,7 @@ mod tests {
             &ExecutionEvidence::default()
                 .resolve(IntentSlotKind::Entity, "小虎黑椒味烤肠500G")
                 .resolve(IntentSlotKind::Metric, "库存量"),
+            attempt.route(),
         );
         assert!(resolved.slots.iter().any(|slot| {
             slot.kind == IntentSlotKind::Entity && slot.state == IntentSlotState::Resolved

@@ -4671,7 +4671,9 @@ async fn compose_inner(
     let prev_turn = prev
         .as_ref()
         .map(|(q, s)| (q.as_str(), s.as_deref(), &[] as &[&str], &[] as &[&str]));
-    let prepared = crate::prepare_ask(&st, &requested_execution_question, prev_turn).await;
+    let forced = crate::forced_route(req.intent.as_deref());
+    let prepared =
+        crate::prepare_ask(&st, &requested_execution_question, prev_turn, forced).await;
     let forced = crate::forced_route(req.intent.as_deref());
     // `rid` 只登记属主与固定脱敏阶段；进度端点不得承载问题、实体、数据或模型文本。
     // 属主登记抢在第一个 note 前：前端发起 POST 即开始轮询，早一拍是一拍。

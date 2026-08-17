@@ -279,7 +279,7 @@ pub async fn land(
         crate::intent::direct_coverage(cx.intent, &r.sql, &executed_evidence, cx.source.dialect());
     r.intent_summary = Some(
         cx.intent_attempt
-            .summary(Some(&final_coverage), &executed_evidence),
+            .summary(Some(&final_coverage), &executed_evidence, cx.decided_route),
     );
     Ok(Some(r))
 }
