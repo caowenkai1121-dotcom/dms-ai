@@ -188,6 +188,11 @@ async fn seed_table_comments(pg: &PgPool) -> anyhow::Result<()> {
             "地址对应发货仓库的库存（10227 行）",
             "库里原写「活动场地费用表」；xh-dms javadoc = 地址对应发货仓库存",
         ),
+        (
+            "master_wms",
+            "仓库主数据（中台）。wms_desc = 仓库全名，形如「皇家小虎海南京东代发仓xs」             「北京京东拼拼仓」「皇家小虎陕西顺丰仓xs」——**公司前缀 + 城市 + 承运方 + 仓型 + 后缀**。             用户说「京东仓」「顺丰仓」「京东」「顺丰」指的都是承运方那一段，             所以必须写 wms_desc LIKE '%京东%'，【不要】写 = '京东仓' 或 = '京东'（永远落空）。             与库存的连法：ywzt_ods.scm_warehous_manage s LEFT JOIN ywzt_ods.master_wms w              ON w.wms_code = s.wms_code。禁止拿供应商名冒充承运仓——顺丰同时是供应商。",
+            "2026-08-17 业主实测：问「京东和顺丰的大日期商品」答 0 行，模型把承运方当客户筛了",
+        ),
     ];
     let mut missed: Vec<&str> = vec![];
     for (t, c, _why) in FIX {
@@ -361,6 +366,17 @@ async fn seed_kw_force(pg: &PgPool) -> anyhow::Result<()> {
         // 这条钉子此前指着营销通，而 `warehouse_catalog` 的注释、`fastpath::stock` 的默认源
         // 都已经是中台了：三处口径不一致，自由 SQL 那条路被钉歪。
         ("库存", "scm_warehous_manage"),
+        // 🔴 2026-08-17 业主实测：「京东和顺丰的大日期商品」答 0 行。模型把「京东」「顺丰」
+        // 当成客户/组织去筛 —— 而它们是**仓库名的片段**（实际取值「皇家小虎海南京东代发仓xs」
+        // 「北京京东拼拼仓」「皇家小虎陕西顺丰仓xs」，12+ 个仓），活在 master_wms.wms_desc 上。
+        // 值域机制救不了这一族：`recall_value_domains` 要问句里出现**完整取值**，
+        // 用户只说片段永远命中不了。片段匹配靠钉表把主数据拉进上下文，再由表注释教怎么筛。
+        // 钉表是**加法**（把表加进候选），不排除客户那条路：京东确实也可能是客户。
+        ("京东", "master_wms"), ("顺丰", "master_wms"),
+        ("仓库", "master_wms"), ("代发仓", "master_wms"), ("承运仓", "master_wms"),
+        // 大日期/临期当初退役是因为指向目录外的表；中台库存表 2026-08-17 已进目录，捞回来。
+        ("大日期", "scm_warehous_manage"), ("临期", "scm_warehous_manage"),
+        ("失效日期", "scm_warehous_manage"), ("保质期", "scm_warehous_manage"),
         // 专项费用短语必须先于泛「活动」登记；同一句会同时命中时，专项表先进入候选。
         ("活动临促人员费用", "t_activity_promoter_fee"),
         ("活动临促人员的费用", "t_activity_promoter_fee"),
@@ -397,7 +413,7 @@ async fn seed_kw_force(pg: &PgPool) -> anyhow::Result<()> {
         "分类", "品类", "类别",
         "市场费用", "营销费用", "推广费", "费用总额",
         "对账", "账单", "员工",
-        "巡店", "陈列", "竞品", "专柜", "大日期", "临期",
+        "巡店", "陈列", "竞品", "专柜",
     ];
     sqlx::query("DELETE FROM meta.kw_force WHERE keyword = ANY($1)")
         .bind(&KW_FORCE_RETIRED.to_vec())
@@ -510,8 +526,6 @@ async fn seed_value_domains(pg: &PgPool) -> anyhow::Result<()> {
          "门店业务省区名称的权威落库字段。问门店省区/所属省区时必须过滤 t_master_shop.province_department_name；\
           province 是行政省份，t_customer.province 是行政区划码，t_customer.department_id 是客户所属部门且生产可为空，三者都不得替代。\
           生产映射存在非字面特例：上海→浙江省区、海南→广东省区；禁止用省份拼接“省区”或模糊裁剪后缀"),
-        ("master_wms", "wms_desc",
-         "仓库名的权威落库字段（中台主数据）。🔴 2026-08-17 业主实测：问「京东和顺丰的大日期商品」          模型把「京东」「顺丰」当成客户/组织去筛，答 0 行——而它们是**仓库名的一部分**，          实际取值形如「皇家小虎海南京东代发仓xs」「皇家小虎陕西顺丰仓xs」「北京京东拼拼仓」。          所以必须写 w.wms_desc LIKE '%京东%'（模糊），【不要】写 = '京东仓'：          名字前面带公司前缀（皇家小虎/饱饱博士/肥大圣/社区团购），后面常带 xs 等后缀。          从库存过来的连法：ywzt_ods.scm_warehous_manage s LEFT JOIN ywzt_ods.master_wms w           ON w.wms_code = s.wms_code。          禁止拿供应商名（sup_name）冒充承运仓——顺丰同时是供应商，按那一列筛是错的。"),
     ];
     for (t, c, note) in DOMAINS {
         sqlx::query(
@@ -733,7 +747,7 @@ mod tests {
     #[test]
     fn every_value_domain_table_is_in_the_catalog() {
         // 与 seed_value_domains 的 DOMAINS 同源：改那里要同步改这里，否则本条先红
-        for (schema, table) in [("dms", "t_goods_category"), ("dms", "t_master_shop"), ("ywzt_ods", "master_wms")] {
+        for (schema, table) in [("dms", "t_goods_category"), ("dms", "t_master_shop")] {
             assert!(
                 crate::warehouse_catalog::ASSETS
                     .iter()
@@ -742,16 +756,13 @@ mod tests {
                 "{schema}.{table} 登记了值域却不在目录里 —— 召回够不着，等于没登记"
             );
         }
-        // 仓库名这条是 2026-08-17 业主那道题的收口：京东/顺丰是仓库名子串，不是客户
-        let src = include_str!("seed.rs");
-        assert!(
-            src.contains(r#"("master_wms", "wms_desc","#),
-            "master_wms.wms_desc 的值域登记不见了：京东/顺丰又会被当成客户去筛，答 0 行"
-        );
-        assert!(
-            src.contains("LIKE '%京东%'"),
-            "值域说明里必须写明用模糊匹配：仓库名带公司前缀，等值匹配永远落空"
-        );
+        // 🔴 值域这条机制**不适用于「用户只说实体名的一个片段」**：
+        // `recall_value_domains` 要 `longest_value_hit(问句, 取值)`，即问句里必须出现
+        // **完整取值**。仓库实际取值是「皇家小虎海南京东代发仓xs」，用户只说「京东」，
+        // 永远命中不了。2026-08-17 我在这里登过 master_wms.wms_desc，登完才发现：
+        // ① 机制不对（要完整取值）；② 源也错（中台表不在 DMS MySQL 上，
+        // `meta autodiscover` 报「fixed 通道仅允许 DMS 身份查询」，取值一条都灌不进来）。
+        // 那种登记是**哑登记**：登记在册、永远零卡片。片段匹配走的是关键词钉表 + 表注释。
     }
 
     /// 关键词强制补表的**目标必须在目录里**，否则那条钉子是句谎话。
@@ -816,12 +827,17 @@ mod tests {
 
         // 「大日期 / 临期」不许再被任何模块钉走：它们在通用业务语境里指库存效期
         // （`scm_warehous_manage.invalid_date`），不是巡店文本命中。
-        for banned in ["大日期", "临期"] {
-            assert!(
-                !pins.iter().any(|(_, k, _)| k == banned),
-                "「{banned}」又被钉到某张表上了：这个词在通用语境里指库存效期，\
-                 钉给某个领域模块会让「京东仓的大日期商品」这类问句整族走偏"
-            );
+        // 原判据是「不许钉到任何表」—— 那是当时唯一能表达的说法，因为中台库存表
+        // 还不在目录里。2026-08-17 它进目录之后，正确的钉法就存在了，判据跟着收窄成
+        // **只许钉到它**：禁令针对的从来是「钉给某个领域模块」，不是「不许有归属」。
+        // 一个没有归属的词，「京东仓的大日期商品」照样召不回那张表。
+        for word in ["大日期", "临期"] {
+            for (_, k, table) in pins.iter().filter(|(_, k, _)| k == word) {
+                assert_eq!(
+                    table, &"scm_warehous_manage",
+                    "「{k}」只能钉到中台现行库存表；钉给别的模块会让这类问句整族走偏"
+                );
+            }
         }
     }
     use super::{family_of, TABLE_SCOPES};
@@ -926,11 +942,22 @@ mod tests {
         let purposes: Vec<&&str> = quoted.iter().skip(1).step_by(3).collect();
         assert!(tables.len() >= 4, "只解析出 {} 条修正，判据的解析坏了", tables.len());
         for t in &tables {
-            assert!(t.starts_with("t_"), "解析错位：`{t}` 不像表名");
+            // 🔴 原文是 starts_with("t_") —— 「所有表都在 DMS MySQL」年代的假设，
+            // 中台表（master_wms / scm_warehous_manage）不长这样，加一条注释就误报。
+            // 这条判据真正要防的是**三元组解析错位**，不是表名前缀：换成纯 ASCII
+            // 标识符（表名）对中文（用途），比前缀更强也不绑死单一数据源。
+            assert!(
+                t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && t.starts_with(|c: char| c.is_ascii_lowercase()),
+                "解析错位：`{t}` 不像表名"
+            );
             assert_eq!(tables.iter().filter(|x| x == &t).count(), 1, "表名 `{t}` 有两条修正");
         }
         for p in &purposes {
-            assert!(!p.starts_with("t_"), "解析错位：`{p}` 像表名不像用途");
+            assert!(
+                p.chars().any(|c| !c.is_ascii()),
+                "解析错位：`{p}` 全是 ASCII，像表名不像用途"
+            );
             assert_eq!(
                 purposes.iter().filter(|x| x == &p).count(),
                 1,
