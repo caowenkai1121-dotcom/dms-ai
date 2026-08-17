@@ -1796,9 +1796,67 @@ pub fn parse_intent_strict(raw: &str) -> Option<IntentV1> {
 
 /// 容错协议：严格解析失败时，允许 Markdown 围栏、前后解释或供应商重复输出；仍只接受
 /// 第一个满足严格字段合同的 JSON 对象。字段本身不放宽，避免脏输出偷偷带 canonical ID。
+/// 把字符串**内部**没转义的裸双引号补上转义。
+///
+/// 🔴 2026-08-17 生产日志逐字取样。模型给中文词打引号，吐出来的是：
+///   `"ambiguities": ["大日期"的具体含义未明确，但根据解释为失效日期小于3月"]`
+/// —— `大日期` 两边那对引号在 JSON 里没转义，整份回包**不是合法 JSON**，
+/// `parse_intent` 直接失败，连 grounding 都走不到，两次重试吐的是同一个形状。
+/// 外层只报一句「JSON 两次都不合约」，看不出是这个原因。
+/// 这是一整族：只要模型在中文里给某个词加引号就炸。
+///
+/// 判据：串内遇到 `"` 时往后看——跳过空白后若是 `,` `:` `]` `}` 或串尾，
+/// 那就是真正的收尾引号；否则是正文里的引号，补一个反斜杠。
+/// 只在严格解析失败之后才跑，成功的回包一个字节不碰。
+fn escape_stray_quotes_inside_strings(raw: &str) -> String {
+    let bytes: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &c) in bytes.iter().enumerate() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => {
+                out.push(c);
+                escaped = true;
+            }
+            '"' if !in_string => {
+                in_string = true;
+                out.push(c);
+            }
+            '"' if in_string => {
+                let closes = bytes[i + 1..]
+                    .iter()
+                    .find(|c| !c.is_whitespace())
+                    .is_none_or(|c| matches!(c, ',' | ':' | ']' | '}'));
+                if closes {
+                    in_string = false;
+                    out.push(c);
+                } else {
+                    out.push_str("\\\"");
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn parse_intent(raw: &str) -> Option<IntentV1> {
     if let Some(intent) = parse_intent_strict(raw) {
         return Some(intent);
+    }
+    // 裸引号修一次再严格解析：修得动就说明模型只是引号没转义，理解本身没问题
+    let repaired = escape_stray_quotes_inside_strings(raw);
+    if repaired != raw {
+        if let Some(intent) = parse_intent_strict(&repaired) {
+            tracing::info!("回包里有未转义的裸引号，补转义后解析成功（模型理解本身没问题）");
+            return Some(intent);
+        }
     }
     // 🔴 严格解析为什么不过，必须留下来（2026-08-14）：
     // 此前这里到 `None` 为止**一条日志都没有** —— 于是「模型多写一个字段」「JSON 被截断」
@@ -2923,6 +2981,41 @@ const GEO_NAMES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+
+    /// 模型给中文词打引号 → 整份回包不是合法 JSON（2026-08-17 生产日志逐字取样）。
+    #[test]
+    fn a_bare_quote_inside_a_string_does_not_kill_the_whole_contract() {
+        let q = "你需要你查看下 京东 和 顺丰 的大日期 商品，大日期的意思是 失效日期 小于3月的的";
+        // 逐字取自生产回包：`"大日期"` 那对引号没转义
+        let broken = concat!(
+            r#"{"version":2,"mode":"data","subgoals":[],"goals":["查看商品"],"metrics":[],"#,
+            r#""entity_mentions":[{"surface":"京东","kind":"organization"},{"surface":"顺丰","kind":"organization"}],"#,
+            r#""filters":[{"name":"失效日期","operator":"range","value_surface":"小于3月"}],"#,
+            r#""regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"#,
+            r#""ambiguities":["大日期"的具体含义未明确，但根据解释为失效日期小于3月"]}"#
+        );
+        // 前提：它确实不是合法 JSON（不加这条，下面可能空过）
+        assert!(
+            serde_json::from_str::<serde_json::Value>(broken).is_err(),
+            "样本必须真的是坏 JSON，否则这条判据没意义"
+        );
+        let intent = super::parse_intent(broken).expect("补转义后应当解析得出来");
+        assert_eq!(intent.mode, IntentMode::Data);
+        assert!(intent.filters.iter().any(|f| f.name == "失效日期"), "槽位不许丢");
+        // 内联口径把那条歧义清掉之后，整条应当可执行
+        let attempt = IntentAttempt::validated(intent, q);
+        assert!(attempt.is_data_executable(), "补转义 + 清歧义之后应当可执行");
+
+        // 反向①：合法回包一个字节不碰
+        let good = r#"{"version":2,"mode":"data","subgoals":[],"goals":[],"metrics":["销售额"],"entity_mentions":[],"filters":[],"regions":[],"time":null,"breakdowns":[],"comparisons":[],"requested_detail":false,"ambiguities":[]}"#;
+        assert_eq!(super::escape_stray_quotes_inside_strings(good), good);
+        // 反向②：真正的收尾引号（后面跟结构符）不许被当成正文引号
+        let pairs = r#"{"a":"x","b":["y","z"]}"#;
+        assert_eq!(super::escape_stray_quotes_inside_strings(pairs), pairs);
+        // 反向③：已转义的引号不许被二次转义
+        let esc = r#"{"a":"他说\"好\""}"#;
+        assert_eq!(super::escape_stray_quotes_inside_strings(esc), esc);
+    }
 
     /// 🔴 判据必须钉**生产那条路**：模型回复走 `intent_from_reply`，
     /// 不是 `IntentAttempt::validated`。2026-08-17 我把展平只加在 validated 上，
